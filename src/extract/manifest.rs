@@ -213,12 +213,12 @@ fn relative_to(base: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(base).unwrap_or(path).to_path_buf()
 }
 
-type PackageHosts = HashMap<String, String>;
+type PackageHosts = HashMap<(String, String), String>;
 
 fn load_explicit_package_hosts(roots: &[(String, PathBuf)]) -> PackageHosts {
     let mut hosts = PackageHosts::new();
 
-    for (_, root_path) in roots {
+    for (root_slug, root_path) in roots {
         let config_path = root_path.join(".oh").join("config.toml");
         let Ok(content) = std::fs::read_to_string(&config_path) else {
             continue;
@@ -241,7 +241,10 @@ fn load_explicit_package_hosts(roots: &[(String, PathBuf)]) -> PackageHosts {
 
         for (package_name, host) in table {
             if let Some(host) = host.as_str() {
-                hosts.insert(package_name.to_string(), host.to_string());
+                hosts.insert(
+                    (root_slug.clone(), package_name.to_string()),
+                    host.to_string(),
+                );
             }
         }
     }
@@ -262,6 +265,7 @@ fn add_explicit_package_host_edges(
         .iter()
         .map(|edge| (edge.from.clone(), edge.to.clone(), edge.kind.clone()))
         .collect();
+    let providers_by_name = package_provider_index(nodes);
     let mut added = std::collections::HashSet::new();
 
     let candidate_edges: Vec<(NodeId, String, NodeId)> = edges
@@ -271,11 +275,19 @@ fn add_explicit_package_host_edges(
         .collect();
 
     for (from, dependency_name, dependency_node) in candidate_edges {
-        let Some(host) = package_hosts.get(&dependency_name) else {
+        let host_key = (from.root.clone(), dependency_name.clone());
+        let Some(host) = package_hosts.get(&host_key) else {
             continue;
         };
-        let Some(provider) =
-            find_explicit_provider(nodes, &dependency_name, host, &dependency_node)
+        let Some(provider_candidates) = providers_by_name.get(&dependency_name) else {
+            tracing::debug!(
+                "manifest_pass: explicit package host '{}' for '{}' did not match an indexed package",
+                host,
+                dependency_name
+            );
+            continue;
+        };
+        let Some(provider) = find_explicit_provider(provider_candidates, host, &dependency_node)
         else {
             tracing::debug!(
                 "manifest_pass: explicit package host '{}' for '{}' did not match an indexed package",
@@ -300,16 +312,28 @@ fn add_explicit_package_host_edges(
     }
 }
 
+fn package_provider_index(nodes: &[Node]) -> HashMap<String, Vec<&Node>> {
+    let mut providers: HashMap<String, Vec<&Node>> = HashMap::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.id.kind == NodeKind::Other("package".to_string()))
+    {
+        providers
+            .entry(node.id.name.clone())
+            .or_default()
+            .push(node);
+    }
+    providers
+}
+
 fn find_explicit_provider<'a>(
-    nodes: &'a [Node],
-    package_name: &str,
+    candidates: &'a [&'a Node],
     host: &str,
     dependency_node: &NodeId,
 ) -> Option<&'a Node> {
-    let mut matches: Vec<(usize, &Node)> = nodes
+    let mut matches: Vec<(usize, &Node)> = candidates
         .iter()
-        .filter(|node| node.id.kind == NodeKind::Other("package".to_string()))
-        .filter(|node| node.id.name == package_name)
+        .copied()
         .filter(|node| node.id != *dependency_node)
         .filter_map(|node| package_node_host_rank(node, host).map(|rank| (rank, node)))
         .collect();
@@ -656,7 +680,6 @@ fn collect_cargo_dependency_table_entries(
         }
     }
 }
-
 
 fn cargo_dependency(alias: &str, spec: &toml::Value) -> CargoDependency {
     let mut package_name = alias.to_string();
@@ -1203,7 +1226,10 @@ serde_alt = { package = "serde", version = "1" }
     #[test]
     fn test_explicit_package_host_adds_cross_root_edge() {
         let mut hosts = PackageHosts::new();
-        hosts.insert("roon-api".to_string(), "rust-roon-api".to_string());
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "rust-roon-api".to_string(),
+        );
 
         let (mut app_nodes, mut edges) = parse_cargo_toml(
             r#"
@@ -1242,7 +1268,10 @@ repository = "https://github.com/open-horizon-labs/rust-roon-api"
     #[test]
     fn test_explicit_package_host_matches_nested_directory() {
         let mut hosts = PackageHosts::new();
-        hosts.insert("roon-api".to_string(), "libs/rust-roon-api".to_string());
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "libs/rust-roon-api".to_string(),
+        );
 
         let (mut app_nodes, mut edges) = parse_cargo_toml(
             r#"
@@ -1276,9 +1305,80 @@ name = "roon-api"
     }
 
     #[test]
+    fn test_explicit_package_hosts_are_scoped_to_declaring_root() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert(
+            ("app-a".to_string(), "shared-lib".to_string()),
+            "providers/a".to_string(),
+        );
+        hosts.insert(
+            ("app-b".to_string(), "shared-lib".to_string()),
+            "providers/b".to_string(),
+        );
+
+        let (mut nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "app-a"
+
+[dependencies]
+shared-lib = "1"
+"#,
+            &manifest("app-a/Cargo.toml"),
+            "app-a",
+        );
+        let (app_b_nodes, app_b_edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "app-b"
+
+[dependencies]
+shared-lib = "1"
+"#,
+            &manifest("app-b/Cargo.toml"),
+            "app-b",
+        );
+        let (provider_a_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "shared-lib"
+"#,
+            &manifest("providers/a/Cargo.toml"),
+            "repo-family",
+        );
+        let (provider_b_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "shared-lib"
+"#,
+            &manifest("providers/b/Cargo.toml"),
+            "repo-family",
+        );
+        nodes.extend(app_b_nodes);
+        nodes.extend(provider_a_nodes);
+        nodes.extend(provider_b_nodes);
+        edges.extend(app_b_edges);
+
+        add_explicit_package_host_edges(&nodes, &mut edges, &hosts);
+
+        assert!(edges.iter().any(|edge| edge.from.root == "app-a"
+            && edge.to.file == manifest("providers/a/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+        assert!(edges.iter().any(|edge| edge.from.root == "app-b"
+            && edge.to.file == manifest("providers/b/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+        assert!(!edges.iter().any(|edge| edge.from.root == "app-a"
+            && edge.to.file == manifest("providers/b/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+    }
+
+    #[test]
     fn test_explicit_package_host_prefers_declared_root_over_primary_directory_copy() {
         let mut hosts = PackageHosts::new();
-        hosts.insert("roon-api".to_string(), "rust-roon-api".to_string());
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "rust-roon-api".to_string(),
+        );
 
         let (_app_nodes, mut edges) = parse_cargo_toml(
             r#"
