@@ -345,3 +345,23 @@ Local test/binary linking was failing with `ld: library 'clang_rt.osx' not found
 - Warm `cargo check --lib --bins --no-default-features` completes in ~1.2s, then ~0.4s.
 - Warm `cargo test --lib --no-default-features manifest::tests` completes in ~0.8s.
 - `target/` remains present (~43G), and sccache is configured at `/Users/muness1/Library/Caches/Mozilla.sccache`. With a hot target tree, sccache is not exercised because Cargo does not invoke rustc for unchanged crates.
+
+
+## Ship Follow-up: Review Findings
+**Updated:** 2026-04-28
+**Status:** fixed in PR #661
+
+Independent ship review found three concrete gaps after the local build/cache fix:
+
+- CLI non-`--full` changed-file scans passed a precomputed `ScanResult` into `update_graph_with_scan` but did not commit scanner state after successful persistence. This meant repeated scans could re-detect the same changed files. Fixed by returning persistence success from `update_graph_with_scan` and committing scanner state in the CLI path only when persistence succeeded.
+- `/review-readiness` did not require hunk-level output strongly enough to satisfy #660. Fixed by requiring changed hunk ranges, mapped/unmapped/deleted-only/docs/config classification, and stable node IDs or explicit gap reasons.
+- Cargo renamed dependencies to the same package were deduplicated by actual package name, losing later alias metadata. Fixed by aggregating duplicate actual-package metadata into `dependency_aliases` while keeping a single package edge.
+
+Additional self-review found idle manifest refresh was too broad: it removed every schema `DependsOn` edge, including OpenAPI endpoint/schema dependencies. Fixed by scoping refresh removal to schema package nodes/edges only and adding a regression test.
+
+### Verification
+- `cargo check --lib --bins --no-default-features`
+- `cargo build --no-default-features`
+- `cargo test --lib --no-default-features manifest::tests` — 28 passed
+- `cargo test --lib --no-default-features manifest_refresh_filter_preserves_non_package_schema_depends_on_edges` — passed
+- Fresh smoke fixture changed scan: initial scan, append to `lib.rs`, second scan saw `0 new, 1 changed`, third scan saw `0 new, 0 changed, 0 deleted`.
