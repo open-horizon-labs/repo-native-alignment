@@ -399,12 +399,21 @@ impl EmbeddingStatus {
         self.state.store(3, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn capability_readiness(&self, semantic_index_available: bool) -> CapabilityReadiness {
+    pub fn capability_readiness(
+        &self,
+        semantic_index_attached: bool,
+        semantic_index_available: bool,
+    ) -> CapabilityReadiness {
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
             0 if semantic_index_available => CapabilityReadiness::new(
                 "embeddings / semantic search",
                 CapabilityReadinessState::Ready,
                 "semantic index is loaded",
+            ),
+            0 if semantic_index_attached => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Running,
+                "semantic index is attached but not queryable yet",
             ),
             0 => CapabilityReadiness::new(
                 "embeddings / semantic search",
@@ -550,6 +559,13 @@ pub struct LspEnrichmentStatus {
     state: std::sync::atomic::AtomicU8,
     /// Number of edges added by the most recent enrichment pass.
     edge_count: std::sync::atomic::AtomicUsize,
+    /// Best known persisted call/reference coverage across enrichment passes.
+    ///
+    /// `edge_count` is the latest pass delta/status value for footers. This
+    /// coverage count is monotonic within a process so a no-op incremental pass
+    /// does not incorrectly downgrade workflow readiness after earlier persisted
+    /// coverage was observed.
+    coverage_edge_count: std::sync::atomic::AtomicUsize,
     /// Whether the most recent persist to LanceDB failed.
     /// When true, the footer shows "persist failed" to indicate edges are
     /// in-memory but may not have been written to disk.
@@ -574,6 +590,7 @@ impl Default for LspEnrichmentStatus {
         Self {
             state: std::sync::atomic::AtomicU8::new(0),
             edge_count: std::sync::atomic::AtomicUsize::new(0),
+            coverage_edge_count: std::sync::atomic::AtomicUsize::new(0),
             persist_failed: std::sync::atomic::AtomicBool::new(false),
             completed_at: std::sync::Mutex::new(None),
             created_at: now,
@@ -647,6 +664,20 @@ impl LspEnrichmentStatus {
     pub fn set_complete(&self, edge_count: usize) {
         self.edge_count
             .store(edge_count, std::sync::atomic::Ordering::Release);
+        let mut observed = self
+            .coverage_edge_count
+            .load(std::sync::atomic::Ordering::Acquire);
+        while edge_count > observed {
+            match self.coverage_edge_count.compare_exchange(
+                observed,
+                edge_count,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
@@ -682,6 +713,8 @@ impl LspEnrichmentStatus {
     /// Mark that no LSP server was available for any of the detected languages.
     pub fn set_unavailable(&self) {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.coverage_edge_count
+            .store(0, std::sync::atomic::Ordering::Release);
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel),
@@ -691,6 +724,8 @@ impl LspEnrichmentStatus {
 
     pub fn set_failed(&self, error: &str) {
         *self.last_error.lock().unwrap() = Some(error.to_string());
+        self.coverage_edge_count
+            .store(0, std::sync::atomic::Ordering::Release);
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel),
@@ -728,32 +763,41 @@ impl LspEnrichmentStatus {
         self.edge_count.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    pub fn coverage_edge_count(&self) -> usize {
+        self.coverage_edge_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn call_reference_readiness(&self) -> CapabilityReadiness {
         self.check_server_found_timeout();
         match self.current_state() {
             LspState::Complete => {
-                let edge_count = self.edge_count();
+                let latest_edge_count = self.edge_count();
+                let coverage_edge_count = self.coverage_edge_count();
                 let persist_failed = self
                     .persist_failed
                     .load(std::sync::atomic::Ordering::Acquire);
-                match (edge_count, persist_failed) {
+                match (coverage_edge_count, persist_failed) {
                     (0, _) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
-                        "LSP completed with 0 call/reference edges; enriched workflows may be false-negative prone",
+                        "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone",
                     ),
                     (_, true) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
                         format!(
-                            "{} edges computed, but persistence failed; data may be lost after restart",
-                            edge_count
+                            "{} persisted call/reference edges available, but latest pass persistence failed after {} edges; data may be stale after restart",
+                            coverage_edge_count, latest_edge_count
                         ),
                     ),
                     (_, false) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Ready,
-                        format!("{} call/reference edges available", edge_count),
+                        format!(
+                            "{} persisted call/reference edges available",
+                            coverage_edge_count
+                        ),
                     ),
                 }
             }
@@ -1133,7 +1177,7 @@ mod tests {
         let status = EmbeddingStatus::default();
         status.set_building(10);
         status.set_progress(4);
-        let readiness = status.capability_readiness(true);
+        let readiness = status.capability_readiness(true, true);
         assert_eq!(readiness.state, CapabilityReadinessState::Partial);
         assert!(
             readiness.detail.contains("may be stale"),
@@ -1146,7 +1190,7 @@ mod tests {
     fn test_embedding_readiness_is_stale_when_update_fails_but_index_exists() {
         let status = EmbeddingStatus::default();
         status.set_failed("network down".to_string());
-        let readiness = status.capability_readiness(true);
+        let readiness = status.capability_readiness(true, true);
         assert_eq!(readiness.state, CapabilityReadinessState::Stale);
         assert!(
             readiness.detail.contains("may be stale"),
@@ -1184,6 +1228,28 @@ mod tests {
             ready.detail.contains("non-zero LSP"),
             "got: {}",
             ready.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_remains_ready_after_incremental_zero_edge_pass() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(12);
+        assert_eq!(
+            status.call_reference_readiness().state,
+            CapabilityReadinessState::Ready
+        );
+
+        status.set_running();
+        status.set_complete(0);
+
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Ready);
+        assert!(
+            readiness.detail.contains("12 persisted"),
+            "got: {}",
+            readiness.detail
         );
     }
 

@@ -91,6 +91,7 @@ pub fn format_capability_readiness(
     node_count: usize,
     lsp_status: Option<&LspEnrichmentStatus>,
     embed_status: Option<&EmbeddingStatus>,
+    semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
     let extracted = if node_count > 0 {
@@ -108,22 +109,24 @@ pub fn format_capability_readiness(
     };
 
     let embeddings = embed_status.map_or_else(
-        || {
-            if semantic_index_available {
-                CapabilityReadiness::new(
-                    "embeddings / semantic search",
-                    CapabilityReadinessState::Ready,
-                    "semantic index is loaded",
-                )
-            } else {
-                CapabilityReadiness::new(
-                    "embeddings / semantic search",
-                    CapabilityReadinessState::NotNeeded,
-                    "not required for exact symbol, graph, or file queries",
-                )
-            }
+        || match (semantic_index_attached, semantic_index_available) {
+            (_, true) => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Ready,
+                "semantic index is loaded",
+            ),
+            (true, false) => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Running,
+                "semantic index is attached but not queryable yet",
+            ),
+            (false, false) => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::NotNeeded,
+                "not required for exact symbol, graph, or file queries",
+            ),
         },
-        |status| status.capability_readiness(semantic_index_available),
+        |status| status.capability_readiness(semantic_index_attached, semantic_index_available),
     );
 
     let (lsp, dead_code) = lsp_status.map_or_else(
@@ -1143,7 +1146,7 @@ mod tests {
     fn test_format_capability_readiness_reports_dead_code_blocker() {
         let lsp_status = super::super::state::LspEnrichmentStatus::default();
         lsp_status.set_unavailable();
-        let result = format_capability_readiness(42, Some(&lsp_status), None, false);
+        let result = format_capability_readiness(42, Some(&lsp_status), None, false, false);
         assert!(
             result.contains("### Capability readiness"),
             "got: {}",
@@ -1164,5 +1167,15 @@ mod tests {
             "got: {}",
             result
         );
+    }
+    #[test]
+    fn test_format_capability_readiness_reports_attached_semantic_index_not_queryable() {
+        let result = format_capability_readiness(42, None, None, true, false);
+        assert!(
+            result.contains("embeddings / semantic search**: running"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("not queryable yet"), "got: {}", result);
     }
 }

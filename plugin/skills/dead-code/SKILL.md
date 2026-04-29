@@ -30,21 +30,23 @@ This skill requires complete enough LSP call/reference coverage. Without those e
 **Self-check (run this first):**
 
 ```text
-search(query="readiness", verbose=true, limit=1)
+search(query="capability", verbose=true, limit=1)
 ```
+
+`verbose=true` includes the `Capability readiness` section for any query; the query just gives the search tool a harmless term to return alongside the readiness footer.
 
 Read the `Capability readiness` section:
 
 - `extracted graph / exact search` must be `ready` for basic symbol listing.
 - `LSP call/reference coverage` must be `ready` with a non-zero edge count.
-- `global dead-code prerequisites` must be `ready`.
+- `global dead-code prerequisites` must be `ready` (this is the workflow gate that aggregates the LSP coverage requirement for dead-code analysis).
 
 If `global dead-code prerequisites` is `running`, `partial/degraded`, `failed`, `unavailable`, or `stale`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
 
 - The repo's language server is not on `PATH` (e.g., `pyright`, `typescript-language-server`, `gopls`, `rust-analyzer`).
-- LSP enrichment is still running or has not started.
-- LSP enrichment completed with zero call/reference edges.
-- LSP enrichment computed edges but persistence failed, so data may not survive restart.
+- Enrichment is still running or has not started.
+- Enrichment completed with zero call/reference edges.
+- Enrichment computed edges but persistence failed, so data may not survive restart.
 
 Tell the user the dead-code analysis cannot run reliably until RNA reports `global dead-code prerequisites: ready`. Do not fall back to a structural-edges-only scan.
 
