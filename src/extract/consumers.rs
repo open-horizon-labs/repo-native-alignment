@@ -2951,15 +2951,19 @@ mod tests {
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
 
-        // Emit RootDiscovered — the ScanStatsConsumer inside the bus should update stats.
-        bus.emit(crate::extract::event_bus::ExtractionEvent::RootDiscovered {
+        // Emit a cheap event that only mutates ScanStats and no-ops in other
+        // built-in consumers. `RootDiscovered` would also trigger manifest and
+        // tree-sitter extraction for the current directory, making this unit test
+        // accidentally scan the whole repository.
+        bus.emit(crate::extract::event_bus::ExtractionEvent::PassesComplete {
             slug: "test".into(),
-            path: PathBuf::from("."),
-            lsp_only: false,
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
+            detected_frameworks: std::collections::HashSet::new(),
         })
         .await;
         assert!(
-            stats.read().unwrap().has_activity(),
+            stats.read().unwrap().is_root_complete("test"),
             "stats handle must reflect events fired through the bus"
         );
     }
