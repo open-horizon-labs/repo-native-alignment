@@ -85,19 +85,19 @@ The objective is not to complete every enrichment phase. The objective is to exp
 
 ### #645 — embedding progress can reflect overlapping enrichment runs
 
-#645 is the progress-observability symptom. It shows that enrichment work needs invocation identity, caller labels, and enough lifecycle information to distinguish one slow run from overlapping foreground/background runs.
+Issue #645 is the progress-observability symptom. It shows that enrichment work needs invocation identity, caller labels, and enough lifecycle information to distinguish one slow run from overlapping foreground/background runs.
 
 ### #646 — first scan should be queryable in seconds
 
-#646 is the bootstrap/control-surface symptom. It shows that extracted graph readiness and enrichment readiness should be separate. A repo should become queryable before LSP and embeddings finish, and users/agents should know which queries are degraded.
+Issue #646 is the bootstrap/control-surface symptom. It shows that extracted graph readiness and enrichment readiness should be separate. A repo should become queryable before LSP and embeddings finish, and users/agents should know which queries are degraded.
 
 ### #657 — LSP enrichment can remain RUNNING indefinitely
 
-#657 is the safety/readiness symptom. It shows that global LSP readiness is too coarse and that LSP-dependent skills like global `/dead-code` need complete enough call/reference coverage or must fail closed.
+Issue #657 is the safety/readiness symptom. It shows that global LSP readiness is too coarse and that LSP-dependent skills like global `/dead-code` need complete enough call/reference coverage or must fail closed.
 
 ### #659 — parent problem
 
-#659 captures the shared problem: enrichment readiness is coarse, global, and not workflow-specific.
+Issue #659 captures the shared problem: enrichment readiness is coarse, global, and not workflow-specific.
 
 ## Fresh Start Direction
 

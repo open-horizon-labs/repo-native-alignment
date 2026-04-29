@@ -339,13 +339,8 @@ fn package_node_host_rank(node: &Node, host: &str) -> Option<usize> {
         return Some(0);
     }
 
-    if node
-        .id
-        .file
-        .components()
-        .next()
-        .is_some_and(|component| component.as_os_str().to_string_lossy() == normalized_host)
-    {
+    let host_path = std::path::Path::new(normalized_host);
+    if node.id.file == host_path || node.id.file.starts_with(host_path) {
         return Some(1);
     }
 
@@ -633,36 +628,35 @@ struct CargoDependency {
 
 fn cargo_dependencies(value: &toml::Value) -> Vec<CargoDependency> {
     let mut deps = Vec::new();
-    collect_cargo_dependencies(value, None, &mut deps);
-    deps
-}
-
-fn collect_cargo_dependencies(
-    value: &toml::Value,
-    table_name: Option<&str>,
-    deps: &mut Vec<CargoDependency>,
-) {
     let Some(table) = value.as_table() else {
-        return;
+        return deps;
     };
 
-    if table_name.is_some_and(is_cargo_dependency_table) {
-        for (alias, spec) in table {
-            deps.push(cargo_dependency(alias, spec));
+    collect_cargo_dependency_table_entries(table, &mut deps);
+
+    if let Some(targets) = table.get("target").and_then(|target| target.as_table()) {
+        for target in targets.values().filter_map(|target| target.as_table()) {
+            collect_cargo_dependency_table_entries(target, &mut deps);
         }
     }
 
-    for (key, nested) in table {
-        collect_cargo_dependencies(nested, Some(key), deps);
+    deps
+}
+
+fn collect_cargo_dependency_table_entries(
+    table: &toml::map::Map<String, toml::Value>,
+    deps: &mut Vec<CargoDependency>,
+) {
+    for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dep_table) = table.get(name).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        for (alias, spec) in dep_table {
+            deps.push(cargo_dependency(alias, spec));
+        }
     }
 }
 
-fn is_cargo_dependency_table(name: &str) -> bool {
-    matches!(
-        name,
-        "dependencies" | "dev-dependencies" | "build-dependencies"
-    )
-}
 
 fn cargo_dependency(alias: &str, spec: &toml::Value) -> CargoDependency {
     let mut package_name = alias.to_string();
@@ -1155,6 +1149,27 @@ tokio = "1"
     }
 
     #[test]
+    fn test_package_cargo_toml_ignores_workspace_dependencies() {
+        let content = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde = "1"
+
+[workspace.dependencies]
+tokio = "1"
+parking_lot = "1"
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        assert!(nodes.iter().any(|node| node.id.name == "serde"));
+        assert!(!nodes.iter().any(|node| node.id.name == "tokio"));
+        assert!(!nodes.iter().any(|node| node.id.name == "parking_lot"));
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
     fn test_cargo_toml_preserves_multiple_aliases_for_same_package() {
         let content = r#"
 [package]
@@ -1221,6 +1236,42 @@ repository = "https://github.com/open-horizon-labs/rust-roon-api"
                     && edge.to.name == "roon-api"
                     && edge.to.file == manifest("rust-roon-api/Cargo.toml")
                     && edge.confidence == Confidence::Confirmed)
+        );
+    }
+
+    #[test]
+    fn test_explicit_package_host_matches_nested_directory() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert("roon-api".to_string(), "libs/rust-roon-api".to_string());
+
+        let (mut app_nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "unified-hifi-control"
+
+[dependencies]
+roon-api = "1"
+"#,
+            &manifest("unified-hifi-control/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+"#,
+            &manifest("libs/rust-roon-api/Cargo.toml"),
+            "hiphi-repos",
+        );
+        app_nodes.extend(provider_nodes);
+
+        add_explicit_package_host_edges(&app_nodes, &mut edges, &hosts);
+
+        assert!(
+            edges.iter().any(|edge| edge.to.name == "roon-api"
+                && edge.to.file == manifest("libs/rust-roon-api/Cargo.toml")
+                && edge.confidence == Confidence::Confirmed),
+            "nested package host directories should match provider manifest paths"
         );
     }
 
