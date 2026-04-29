@@ -1287,7 +1287,7 @@ name = "unified-hifi-control"
 
 [dependencies]
 roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git" }
-#",
+"#,
             &manifest("unified-hifi-control/Cargo.toml"),
             "hiphi-repos",
         );
@@ -1295,7 +1295,7 @@ roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git" }
             r#"
 [package]
 name = "roon-api"
-#",
+"#,
             &manifest("rust-roon-api/Cargo.toml"),
             "hiphi-repos",
         );
@@ -1303,7 +1303,7 @@ name = "roon-api"
             r#"
 [package]
 name = "roon-api"
-#",
+"#,
             &manifest("Cargo.toml"),
             "rust-roon-api",
         );
