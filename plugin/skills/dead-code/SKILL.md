@@ -43,7 +43,7 @@ Read the `Capability readiness` section:
 
 If `global dead-code prerequisites` is `running`, `partial/degraded`, `failed`, `unavailable`, or `stale`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
 
-- The repo's language server is not on `PATH` (e.g., `pyright`, `typescript-language-server`, `gopls`, `rust-analyzer`).
+- The repo's language server is not on `PATH` (e.g., `pyright-langserver`, `typescript-language-server`, `gopls`, `rust-analyzer`).
 - Enrichment is still running or has not started.
 - Enrichment completed with zero call/reference edges.
 - Enrichment computed edges but persistence failed, so data may not survive restart.

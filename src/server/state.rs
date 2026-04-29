@@ -662,22 +662,14 @@ impl LspEnrichmentStatus {
     }
 
     pub fn set_complete(&self, edge_count: usize) {
+        self.set_complete_with_coverage(edge_count, edge_count);
+    }
+
+    pub fn set_complete_with_coverage(&self, latest_edge_count: usize, coverage_edge_count: usize) {
         self.edge_count
-            .store(edge_count, std::sync::atomic::Ordering::Release);
-        let mut observed = self
-            .coverage_edge_count
-            .load(std::sync::atomic::Ordering::Acquire);
-        while edge_count > observed {
-            match self.coverage_edge_count.compare_exchange(
-                observed,
-                edge_count,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => observed = current,
-            }
-        }
+            .store(latest_edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count
+            .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
@@ -685,7 +677,11 @@ impl LspEnrichmentStatus {
             self.state
                 .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
         );
-        self.log_transition(prev, LspState::Complete, &format!("{} edges", edge_count));
+        self.log_transition(
+            prev,
+            LspState::Complete,
+            &format!("{} edges", latest_edge_count),
+        );
     }
 
     /// Mark enrichment as complete but with a persist failure.
@@ -778,11 +774,6 @@ impl LspEnrichmentStatus {
                     .persist_failed
                     .load(std::sync::atomic::Ordering::Acquire);
                 match (coverage_edge_count, persist_failed) {
-                    (0, _) => CapabilityReadiness::new(
-                        "LSP call/reference coverage",
-                        CapabilityReadinessState::Partial,
-                        "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone",
-                    ),
                     (_, true) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
@@ -790,6 +781,11 @@ impl LspEnrichmentStatus {
                             "{} persisted call/reference edges available, but latest pass persistence failed after {} edges; data may be stale after restart",
                             coverage_edge_count, latest_edge_count
                         ),
+                    ),
+                    (0, false) => CapabilityReadiness::new(
+                        "LSP call/reference coverage",
+                        CapabilityReadinessState::Partial,
+                        "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone",
                     ),
                     (_, false) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
@@ -1242,12 +1238,48 @@ mod tests {
         );
 
         status.set_running();
-        status.set_complete(0);
+        status.set_complete_with_coverage(0, 12);
 
         let readiness = status.call_reference_readiness();
         assert_eq!(readiness.state, CapabilityReadinessState::Ready);
         assert!(
             readiness.detail.contains("12 persisted"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_blocks_when_current_coverage_drops_to_zero() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(12);
+        assert_eq!(
+            status.dead_code_readiness().state,
+            CapabilityReadinessState::Ready
+        );
+
+        status.set_running();
+        status.set_complete(0);
+
+        let readiness = status.dead_code_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness.detail.starts_with("blocked:"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_preserves_persist_failed_reason_with_no_prior_coverage() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(7);
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness.detail.contains("persistence failed"),
             "got: {}",
             readiness.detail
         );
