@@ -1788,7 +1788,7 @@ impl RnaHandler {
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
         _spawn_lsp: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
         let mut fallback_scanner: Option<Scanner> = None;
@@ -1807,7 +1807,7 @@ impl RnaHandler {
             && scan.new_files.is_empty()
             && scan.deleted_files.is_empty()
         {
-            return Ok(());
+            return Ok(true);
         }
 
         tracing::info!(
@@ -2277,6 +2277,6 @@ impl RnaHandler {
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
 
-        Ok(())
+        Ok(persist_succeeded)
     }
 }

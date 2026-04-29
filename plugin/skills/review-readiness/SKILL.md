@@ -40,6 +40,8 @@ Do not paste the whole diff unless the user asks. Summarize:
 - changed files by kind: code, tests, docs, `.oh/` artifacts, config
 - added/modified/deleted/renamed shape
 - whether the diff is mostly behavioral code, review process, docs, tests, or generated/artifact content
+- changed hunks with current-side line ranges when available (`+start,count`) and deleted-only hunks called out explicitly
+- for code hunks, whether each hunk is mapped to current extracted symbols, unmapped, deleted-only, docs/config-only, or not covered by the indexed graph
 
 ### Step 2: Decide whether graph context is worth using
 
@@ -70,6 +72,7 @@ Useful probes include:
 - `search(node=<id>, mode="neighbors", direction="both")` for local graph context
 - `search(node=<id>, mode="impact")` when exact downstream impact changes review risk
 - `outcome_progress(outcome_id=<id>)` when the diff claims outcome progress
+- For code files, map current-side hunk ranges to current extracted graph symbols where the index has line ranges. Record the stable node ID for each mapped symbol. If a hunk is deleted-only, top-of-file/import-only, docs/config-only, or outside indexed coverage, keep it at file/hunk level with an explicit reason instead of forcing a symbol mapping.
 
 For a small diff, two or three targeted probes are usually enough. Do not run full-repo LSP, embeddings, or broad enrichment as part of this skill.
 
@@ -93,12 +96,18 @@ Output this shape:
 ### Diff Shape
 - [files/change categories]
 
+
+### Hunk Map
+| File | Hunk range | Classification | Symbol/node ID or reason |
+|------|------------|----------------|--------------------------|
+| [path] | [+start,count / deleted-only / n/a] | [mapped / unmapped / deleted-only / docs / config] | [stable node ID or explicit gap] |
 ### RNA Added Value
 - [specific graph/business context that changes review decisions]
 - or: RNA adds no material value for this diff; raw diff review is sufficient because [reason].
 
 ### Review Anchors
 - [symbol/file/outcome/guardrail]: [why reviewer should inspect it]
+- [hunk range → stable node ID or explicit unmapped reason]: [why reviewer should inspect it]
 
 ### Readiness
 - Ready: [what can be reviewed now]

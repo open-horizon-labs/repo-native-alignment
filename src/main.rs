@@ -449,14 +449,18 @@ async fn async_main() -> anyhow::Result<()> {
                 None => {
                     eprintln!("No cached index found; building initial extracted graph.");
                     let graph = handler.build_full_graph_inner(true).await?;
+                    scanner.commit_state()?;
                     let elapsed = t0.elapsed();
                     print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
                     return Ok(());
                 }
             };
-            handler
+            let persist_succeeded = handler
                 .update_graph_with_scan(&mut graph, Some(scan), false)
                 .await?;
+            if persist_succeeded {
+                scanner.commit_state()?;
+            }
             let elapsed = t0.elapsed();
             print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
             return Ok(());

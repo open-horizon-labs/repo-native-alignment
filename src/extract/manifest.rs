@@ -590,21 +590,30 @@ pub fn parse_cargo_toml(
     )];
     let mut edges = Vec::new();
 
-    let mut seen_deps = std::collections::BTreeSet::new();
+    let mut deps_by_package: std::collections::BTreeMap<String, BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
     for dep in deps {
-        if !seen_deps.insert(dep.package_name.clone()) {
-            continue;
+        match deps_by_package.entry(dep.package_name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(dep.metadata);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                merge_cargo_dependency_metadata(entry.get_mut(), dep.metadata);
+            }
         }
+    }
+
+    for (dep_name, metadata) in deps_by_package {
         nodes.push(make_package_node_with_metadata(
-            &dep.package_name,
+            &dep_name,
             manifest_file,
             "rust",
             root_slug,
-            dep.metadata,
+            metadata,
         ));
         edges.push(make_dep_edge(
             &package_name,
-            &dep.package_name,
+            &dep_name,
             manifest_file,
             root_slug,
         ));
@@ -674,6 +683,39 @@ fn cargo_dependency(alias: &str, spec: &toml::Value) -> CargoDependency {
     CargoDependency {
         package_name,
         metadata,
+    }
+}
+
+fn merge_cargo_dependency_metadata(
+    existing: &mut BTreeMap<String, String>,
+    incoming: BTreeMap<String, String>,
+) {
+    let mut aliases = std::collections::BTreeSet::new();
+    if let Some(alias) = existing.get("dependency_alias") {
+        aliases.insert(alias.clone());
+    }
+    if let Some(alias_list) = existing.get("dependency_aliases") {
+        aliases.extend(
+            alias_list
+                .split(',')
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    if let Some(alias) = incoming.get("dependency_alias") {
+        aliases.insert(alias.clone());
+    }
+
+    for (key, value) in incoming {
+        existing.entry(key).or_insert(value);
+    }
+
+    if aliases.len() > 1 {
+        existing.insert(
+            "dependency_aliases".to_string(),
+            aliases.into_iter().collect::<Vec<_>>().join(","),
+        );
     }
 }
 
@@ -1084,6 +1126,37 @@ libc = "0.2"
         assert!(nodes.iter().any(|node| node.id.name == "serde"));
         assert!(nodes.iter().any(|node| node.id.name == "libc"));
         assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn test_cargo_toml_preserves_multiple_aliases_for_same_package() {
+        let content = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde_v1 = { package = "serde", version = "1" }
+serde_alt = { package = "serde", version = "1" }
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        let serde_nodes: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.id.name == "serde")
+            .collect();
+        assert_eq!(serde_nodes.len(), 1);
+        assert_eq!(
+            serde_nodes[0]
+                .metadata
+                .get("dependency_aliases")
+                .map(String::as_str),
+            Some("serde_alt,serde_v1")
+        );
+        assert_eq!(
+            edges.iter().filter(|edge| edge.to.name == "serde").count(),
+            1,
+            "aliases to the same package should not emit duplicate package edges"
+        );
     }
 
     #[test]
