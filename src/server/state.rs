@@ -334,11 +334,12 @@ impl CapabilityReadiness {
     }
 
     pub fn markdown_line(&self) -> String {
+        let normalized_detail = self.detail.split_whitespace().collect::<Vec<_>>().join(" ");
         format!(
             "- **{}**: {} — {}",
             self.name,
             self.state.label(),
-            self.detail
+            normalized_detail
         )
     }
 }
@@ -1177,6 +1178,19 @@ mod tests {
         assert_eq!(CapabilityReadinessState::Unavailable.label(), "unavailable");
         assert_eq!(CapabilityReadinessState::Stale.label(), "stale");
         assert_eq!(CapabilityReadinessState::NotNeeded.label(), "not needed");
+    }
+
+    #[test]
+    fn test_capability_readiness_markdown_line_normalizes_detail_whitespace() {
+        let readiness = CapabilityReadiness::new(
+            "demo",
+            CapabilityReadinessState::Ready,
+            "first line\n\tsecond   line\r\nthird",
+        );
+        assert_eq!(
+            readiness.markdown_line(),
+            "- **demo**: ready — first line second line third"
+        );
     }
 
     #[test]
