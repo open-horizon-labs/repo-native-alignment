@@ -64,6 +64,23 @@ impl Extractor for JsonExtractor {
     }
 }
 
+fn truncate_for_body(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut end = 0;
+    for (idx, ch) in value.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    format!("{}...", &value[..end])
+}
+
 fn extract_top_level_keys(
     object: tree_sitter::Node,
     path: &Path,
@@ -103,12 +120,7 @@ fn extract_top_level_keys(
             .map(|v| !matches!(v.kind(), "object" | "array"))
             .unwrap_or(false);
 
-        // Truncate large values
-        let body = if value_text.len() > 500 {
-            format!("{}...", &value_text[..500])
-        } else {
-            value_text.clone()
-        };
+        let body = truncate_for_body(&value_text, 500);
 
         let (kind, metadata) = if is_scalar && !value_text.trim().is_empty() {
             let mut m = BTreeMap::new();
@@ -137,5 +149,31 @@ fn extract_top_level_keys(
             metadata,
             source: ExtractionSource::TreeSitter,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_large_values_at_utf8_boundary() {
+        let value = format!("{}❌", "a".repeat(499));
+
+        let truncated = truncate_for_body(&value, 500);
+
+        assert_eq!(truncated, format!("{}...", "a".repeat(499)));
+    }
+
+    #[test]
+    fn extracts_json_with_multibyte_character_at_truncation_boundary() {
+        let content = format!(r#"{{"message":"{}❌"}}"#, "a".repeat(499));
+
+        let result = JsonExtractor::new()
+            .extract(Path::new("events.json"), &content)
+            .expect("json extraction should not panic on multibyte truncation boundary");
+
+        assert_eq!(result.nodes.len(), 1);
+        assert!(result.nodes[0].body.ends_with("..."));
     }
 }

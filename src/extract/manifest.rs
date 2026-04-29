@@ -1,13 +1,14 @@
-//! Post-extraction pass that scans package manifests for JS/TS, Python, and Go
-//! projects and emits `NodeKind::Other("package")` nodes + `EdgeKind::DependsOn`
-//! edges — mirroring the Rust crate graph emitted by the LSP Pass 0 in
-//! `src/extract/lsp/mod.rs`.
+//! Post-extraction pass that scans package manifests for JS/TS, Python, Go,
+//! and Rust projects and emits `NodeKind::Other("package")` nodes +
+//! `EdgeKind::DependsOn` edges — mirroring the Rust crate graph emitted by
+//! the LSP Pass 0 in `src/extract/lsp/mod.rs`.
 //!
 //! # Supported manifests
 //!
 //! | Language | File | Dependency source |
 //! |----------|------|-------------------|
 //! | JS / TypeScript | `package.json` | `dependencies` + `devDependencies` keys |
+//! | Rust | `Cargo.toml` | `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and target-specific dependency tables |
 //! | Python | `pyproject.toml` | `[project] dependencies` array |
 //! | Python | `requirements.txt` | one package per line |
 //! | Go | `go.mod` | `require` directives |
@@ -36,7 +37,7 @@
 //! The node name is the package name (or the bare dependency string for
 //! requirements.txt lines).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
@@ -69,6 +70,8 @@ pub fn manifest_pass(roots: &[(String, PathBuf)]) -> ManifestResult {
         all_nodes.extend(nodes);
         all_edges.extend(edges);
     }
+    let package_hosts = load_explicit_package_hosts(roots);
+    add_explicit_package_host_edges(&all_nodes, &mut all_edges, &package_hosts);
 
     ManifestResult {
         nodes: all_nodes,
@@ -117,6 +120,17 @@ fn scan_root(root_slug: &str, root_path: &Path) -> ManifestResult {
         {
             let manifest_file = relative_to(root_path, &requirements);
             let (n, e) = parse_requirements_txt(&content, &manifest_file, root_slug);
+            nodes.extend(n);
+            edges.extend(e);
+        }
+
+        // Rust — Cargo.toml
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+        {
+            let manifest_file = relative_to(root_path, &cargo_toml);
+            let (n, e) = parse_cargo_toml(&content, &manifest_file, root_slug);
             nodes.extend(n);
             edges.extend(e);
         }
@@ -199,6 +213,177 @@ fn relative_to(base: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(base).unwrap_or(path).to_path_buf()
 }
 
+type PackageHosts = HashMap<(String, String), String>;
+
+fn load_explicit_package_hosts(roots: &[(String, PathBuf)]) -> PackageHosts {
+    let mut hosts = PackageHosts::new();
+
+    for (root_slug, root_path) in roots {
+        let config_path = root_path.join(".oh").join("config.toml");
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(value) = content.parse::<toml::Value>() else {
+            tracing::debug!(
+                "manifest_pass: failed to parse package host config at {}",
+                config_path.display()
+            );
+            continue;
+        };
+
+        let Some(table) = value
+            .get("workspace")
+            .and_then(|workspace| workspace.get("package_hosts"))
+            .and_then(|package_hosts| package_hosts.as_table())
+        else {
+            continue;
+        };
+
+        for (package_name, host) in table {
+            if let Some(host) = host.as_str() {
+                hosts.insert(
+                    (root_slug.clone(), package_name.to_string()),
+                    host.to_string(),
+                );
+            }
+        }
+    }
+
+    hosts
+}
+
+fn add_explicit_package_host_edges(
+    nodes: &[Node],
+    edges: &mut Vec<Edge>,
+    package_hosts: &PackageHosts,
+) {
+    if package_hosts.is_empty() {
+        return;
+    }
+
+    let existing: std::collections::HashSet<(NodeId, NodeId, EdgeKind)> = edges
+        .iter()
+        .map(|edge| (edge.from.clone(), edge.to.clone(), edge.kind.clone()))
+        .collect();
+    let providers_by_name = package_provider_index(nodes);
+    let mut added = std::collections::HashSet::new();
+
+    let candidate_edges: Vec<(NodeId, String, NodeId)> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::DependsOn)
+        .map(|edge| (edge.from.clone(), edge.to.name.clone(), edge.to.clone()))
+        .collect();
+
+    for (from, dependency_name, dependency_node) in candidate_edges {
+        let host_key = (from.root.clone(), dependency_name.clone());
+        let Some(host) = package_hosts.get(&host_key) else {
+            continue;
+        };
+        let Some(provider_candidates) = providers_by_name.get(&dependency_name) else {
+            tracing::debug!(
+                "manifest_pass: explicit package host '{}' for '{}' did not match an indexed package",
+                host,
+                dependency_name
+            );
+            continue;
+        };
+        let Some(provider) = find_explicit_provider(provider_candidates, host, &dependency_node)
+        else {
+            tracing::debug!(
+                "manifest_pass: explicit package host '{}' for '{}' did not match an indexed package",
+                host,
+                dependency_name
+            );
+            continue;
+        };
+
+        let key = (from.clone(), provider.id.clone(), EdgeKind::DependsOn);
+        if existing.contains(&key) || !added.insert(key.clone()) {
+            continue;
+        }
+
+        edges.push(Edge {
+            from,
+            to: provider.id.clone(),
+            kind: EdgeKind::DependsOn,
+            source: ExtractionSource::Schema,
+            confidence: Confidence::Confirmed,
+        });
+    }
+}
+
+fn package_provider_index(nodes: &[Node]) -> HashMap<String, Vec<&Node>> {
+    let mut providers: HashMap<String, Vec<&Node>> = HashMap::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.id.kind == NodeKind::Other("package".to_string()))
+    {
+        providers
+            .entry(node.id.name.clone())
+            .or_default()
+            .push(node);
+    }
+    providers
+}
+
+fn find_explicit_provider<'a>(
+    candidates: &'a [&'a Node],
+    host: &str,
+    dependency_node: &NodeId,
+) -> Option<&'a Node> {
+    let mut matches: Vec<(usize, &Node)> = candidates
+        .iter()
+        .copied()
+        .filter(|node| node.id != *dependency_node)
+        .filter_map(|node| package_node_host_rank(node, host).map(|rank| (rank, node)))
+        .collect();
+
+    matches.sort_by_key(|(rank, node)| (*rank, node.id.to_stable_id()));
+    let best_rank = matches.first().map(|(rank, _)| *rank)?;
+    let best_matches: Vec<&Node> = matches
+        .into_iter()
+        .filter(|(rank, _)| *rank == best_rank)
+        .map(|(_, node)| node)
+        .collect();
+
+    if best_matches.len() == 1 {
+        Some(best_matches[0])
+    } else {
+        None
+    }
+}
+
+fn package_node_host_rank(node: &Node, host: &str) -> Option<usize> {
+    let normalized_host = host.trim().trim_matches('/');
+    if normalized_host.is_empty() {
+        return None;
+    }
+
+    if node.id.root == normalized_host {
+        return Some(0);
+    }
+
+    let host_path = std::path::Path::new(normalized_host);
+    if node.id.file == host_path || node.id.file.starts_with(host_path) {
+        return Some(1);
+    }
+
+    node.metadata
+        .get("repository")
+        .and_then(|url| repository_slug(url))
+        .and_then(|slug| {
+            let host_slug = repository_slug(normalized_host)
+                .unwrap_or_else(|| normalized_host.to_ascii_lowercase());
+            (slug == host_slug).then_some(2)
+        })
+}
+
+fn repository_slug(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let slug = trimmed.rsplit(['/', ':']).next()?.trim();
+    (!slug.is_empty()).then(|| slug.to_ascii_lowercase())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers: emit nodes + edges from a dep list
 // ---------------------------------------------------------------------------
@@ -217,6 +402,30 @@ fn make_package_node(name: &str, manifest_file: &Path, language: &str, root_slug
         signature: format!("package {}", name),
         body: name.to_string(),
         metadata: BTreeMap::new(),
+        source: ExtractionSource::Schema,
+    }
+}
+
+fn make_package_node_with_metadata(
+    name: &str,
+    manifest_file: &Path,
+    language: &str,
+    root_slug: &str,
+    metadata: BTreeMap<String, String>,
+) -> Node {
+    Node {
+        id: NodeId {
+            root: root_slug.to_string(),
+            file: manifest_file.to_path_buf(),
+            name: name.to_string(),
+            kind: NodeKind::Other("package".to_string()),
+        },
+        language: language.to_string(),
+        line_start: 0,
+        line_end: 0,
+        signature: format!("package {}", name),
+        body: name.to_string(),
+        metadata,
         source: ExtractionSource::Schema,
     }
 }
@@ -327,6 +536,208 @@ pub fn parse_package_json(
     }
 
     emit_package_graph(&package_name, &deps, manifest_file, "javascript", root_slug)
+}
+
+// ---------------------------------------------------------------------------
+// Rust: Cargo.toml
+// ---------------------------------------------------------------------------
+
+/// Parse a `Cargo.toml` file.
+///
+/// Extracts:
+/// - `[package].name` → package node name
+/// - `[package].repository` → provider metadata for explicit workspace package hosting
+/// - Cargo dependency tables → DependsOn edges and dependency metadata
+pub fn parse_cargo_toml(
+    content: &str,
+    manifest_file: &Path,
+    root_slug: &str,
+) -> (Vec<Node>, Vec<Edge>) {
+    let Ok(value) = content.parse::<toml::Value>() else {
+        tracing::debug!(
+            "manifest_pass: failed to parse Cargo.toml at {}",
+            manifest_file.display()
+        );
+        return (Vec::new(), Vec::new());
+    };
+
+    let Some(package) = value.get("package") else {
+        tracing::debug!(
+            "manifest_pass: skipping workspace-only Cargo.toml at {}",
+            manifest_file.display()
+        );
+        return (Vec::new(), Vec::new());
+    };
+    let package_name = package
+        .get("name")
+        .and_then(|name| name.as_str())
+        .unwrap_or_else(|| {
+            manifest_file
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("(unknown)")
+        })
+        .to_string();
+
+    let mut package_metadata = BTreeMap::new();
+    package_metadata.insert("manifest_kind".to_string(), "cargo".to_string());
+    if let Some(repository) = value
+        .get("package")
+        .and_then(|package| package.get("repository"))
+        .and_then(|repository| repository.as_str())
+    {
+        package_metadata.insert("repository".to_string(), repository.to_string());
+    }
+
+    let deps = cargo_dependencies(&value);
+    if deps.is_empty() {
+        return (
+            vec![make_package_node_with_metadata(
+                &package_name,
+                manifest_file,
+                "rust",
+                root_slug,
+                package_metadata,
+            )],
+            Vec::new(),
+        );
+    }
+
+    let mut nodes = vec![make_package_node_with_metadata(
+        &package_name,
+        manifest_file,
+        "rust",
+        root_slug,
+        package_metadata,
+    )];
+    let mut edges = Vec::new();
+
+    let mut deps_by_package: std::collections::BTreeMap<String, BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    for dep in deps {
+        match deps_by_package.entry(dep.package_name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(dep.metadata);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                merge_cargo_dependency_metadata(entry.get_mut(), dep.metadata);
+            }
+        }
+    }
+
+    for (dep_name, metadata) in deps_by_package {
+        nodes.push(make_package_node_with_metadata(
+            &dep_name,
+            manifest_file,
+            "rust",
+            root_slug,
+            metadata,
+        ));
+        edges.push(make_dep_edge(
+            &package_name,
+            &dep_name,
+            manifest_file,
+            root_slug,
+        ));
+    }
+
+    (nodes, edges)
+}
+
+struct CargoDependency {
+    package_name: String,
+    metadata: BTreeMap<String, String>,
+}
+
+fn cargo_dependencies(value: &toml::Value) -> Vec<CargoDependency> {
+    let mut deps = Vec::new();
+    let Some(table) = value.as_table() else {
+        return deps;
+    };
+
+    collect_cargo_dependency_table_entries(table, &mut deps);
+
+    if let Some(targets) = table.get("target").and_then(|target| target.as_table()) {
+        for target in targets.values().filter_map(|target| target.as_table()) {
+            collect_cargo_dependency_table_entries(target, &mut deps);
+        }
+    }
+
+    deps
+}
+
+fn collect_cargo_dependency_table_entries(
+    table: &toml::map::Map<String, toml::Value>,
+    deps: &mut Vec<CargoDependency>,
+) {
+    for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dep_table) = table.get(name).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        for (alias, spec) in dep_table {
+            deps.push(cargo_dependency(alias, spec));
+        }
+    }
+}
+
+fn cargo_dependency(alias: &str, spec: &toml::Value) -> CargoDependency {
+    let mut package_name = alias.to_string();
+    let mut metadata = BTreeMap::new();
+    metadata.insert("dependency_kind".to_string(), "cargo".to_string());
+    metadata.insert("dependency_alias".to_string(), alias.to_string());
+
+    if let Some(table) = spec.as_table() {
+        if let Some(actual_package) = table.get("package").and_then(|value| value.as_str()) {
+            package_name = actual_package.to_string();
+            metadata.insert("dependency_package".to_string(), actual_package.to_string());
+        }
+        for key in ["git", "path", "branch", "tag", "rev", "version"] {
+            if let Some(value) = table.get(key).and_then(|value| value.as_str()) {
+                metadata.insert(key.to_string(), value.to_string());
+            }
+        }
+    } else if let Some(version) = spec.as_str() {
+        metadata.insert("version".to_string(), version.to_string());
+    }
+
+    CargoDependency {
+        package_name,
+        metadata,
+    }
+}
+
+fn merge_cargo_dependency_metadata(
+    existing: &mut BTreeMap<String, String>,
+    incoming: BTreeMap<String, String>,
+) {
+    let mut aliases = std::collections::BTreeSet::new();
+    if let Some(alias) = existing.get("dependency_alias") {
+        aliases.insert(alias.clone());
+    }
+    if let Some(alias_list) = existing.get("dependency_aliases") {
+        aliases.extend(
+            alias_list
+                .split(',')
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    if let Some(alias) = incoming.get("dependency_alias") {
+        aliases.insert(alias.clone());
+    }
+
+    for (key, value) in incoming {
+        existing.entry(key).or_insert(value);
+    }
+
+    if aliases.len() > 1 {
+        existing.insert(
+            "dependency_aliases".to_string(),
+            aliases.into_iter().collect::<Vec<_>>().join(","),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +1103,367 @@ mod tests {
         let (nodes, edges) = parse_package_json("not json", &manifest("package.json"), "root");
         assert!(nodes.is_empty());
         assert!(edges.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cargo.toml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cargo_toml_git_dependency_metadata() {
+        let content = r#"
+[package]
+name = "unified-hifi-control"
+repository = "https://github.com/open-horizon-labs/unified-hifi-control"
+
+[dependencies]
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", branch = "ohc/main", features = ["transport"] }
+serde = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.id.name == "unified-hifi-control"
+                    && node.metadata.get("repository").map(String::as_str)
+                        == Some("https://github.com/open-horizon-labs/unified-hifi-control"))
+        );
+        let roon_dep = nodes
+            .iter()
+            .find(|node| node.id.name == "roon-api")
+            .expect("roon-api dependency node");
+        assert_eq!(
+            roon_dep.metadata.get("git").map(String::as_str),
+            Some("https://github.com/open-horizon-labs/rust-roon-api.git")
+        );
+        assert_eq!(
+            roon_dep.metadata.get("branch").map(String::as_str),
+            Some("ohc/main")
+        );
+        assert!(nodes.iter().any(|node| node.id.name == "serde"));
+        assert!(nodes.iter().any(|node| node.id.name == "libc"));
+        assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn test_workspace_only_cargo_toml_emits_no_package_or_edges() {
+        let content = r#"
+[workspace]
+members = ["crates/app"]
+
+[workspace.dependencies]
+serde = "1"
+tokio = "1"
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        assert!(
+            nodes.is_empty(),
+            "workspace-only manifests are not packages"
+        );
+        assert!(
+            edges.is_empty(),
+            "workspace.dependencies must not become package dependency edges"
+        );
+    }
+
+    #[test]
+    fn test_package_cargo_toml_ignores_workspace_dependencies() {
+        let content = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde = "1"
+
+[workspace.dependencies]
+tokio = "1"
+parking_lot = "1"
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        assert!(nodes.iter().any(|node| node.id.name == "serde"));
+        assert!(!nodes.iter().any(|node| node.id.name == "tokio"));
+        assert!(!nodes.iter().any(|node| node.id.name == "parking_lot"));
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn test_cargo_toml_preserves_multiple_aliases_for_same_package() {
+        let content = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde_v1 = { package = "serde", version = "1" }
+serde_alt = { package = "serde", version = "1" }
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        let serde_nodes: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.id.name == "serde")
+            .collect();
+        assert_eq!(serde_nodes.len(), 1);
+        assert_eq!(
+            serde_nodes[0]
+                .metadata
+                .get("dependency_aliases")
+                .map(String::as_str),
+            Some("serde_alt,serde_v1")
+        );
+        assert_eq!(
+            edges.iter().filter(|edge| edge.to.name == "serde").count(),
+            1,
+            "aliases to the same package should not emit duplicate package edges"
+        );
+    }
+
+    #[test]
+    fn test_explicit_package_host_adds_cross_root_edge() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "rust-roon-api".to_string(),
+        );
+
+        let (mut app_nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "unified-hifi-control"
+
+[dependencies]
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git" }
+"#,
+            &manifest("unified-hifi-control/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (provider_nodes, _provider_edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+repository = "https://github.com/open-horizon-labs/rust-roon-api"
+"#,
+            &manifest("rust-roon-api/Cargo.toml"),
+            "hiphi-repos",
+        );
+        app_nodes.extend(provider_nodes);
+
+        add_explicit_package_host_edges(&app_nodes, &mut edges, &hosts);
+
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.from.name == "unified-hifi-control"
+                    && edge.to.name == "roon-api"
+                    && edge.to.file == manifest("rust-roon-api/Cargo.toml")
+                    && edge.confidence == Confidence::Confirmed)
+        );
+    }
+
+    #[test]
+    fn test_explicit_package_host_matches_nested_directory() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "libs/rust-roon-api".to_string(),
+        );
+
+        let (mut app_nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "unified-hifi-control"
+
+[dependencies]
+roon-api = "1"
+"#,
+            &manifest("unified-hifi-control/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+"#,
+            &manifest("libs/rust-roon-api/Cargo.toml"),
+            "hiphi-repos",
+        );
+        app_nodes.extend(provider_nodes);
+
+        add_explicit_package_host_edges(&app_nodes, &mut edges, &hosts);
+
+        assert!(
+            edges.iter().any(|edge| edge.to.name == "roon-api"
+                && edge.to.file == manifest("libs/rust-roon-api/Cargo.toml")
+                && edge.confidence == Confidence::Confirmed),
+            "nested package host directories should match provider manifest paths"
+        );
+    }
+
+    #[test]
+    fn test_explicit_package_hosts_are_scoped_to_declaring_root() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert(
+            ("app-a".to_string(), "shared-lib".to_string()),
+            "providers/a".to_string(),
+        );
+        hosts.insert(
+            ("app-b".to_string(), "shared-lib".to_string()),
+            "providers/b".to_string(),
+        );
+
+        let (mut nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "app-a"
+
+[dependencies]
+shared-lib = "1"
+"#,
+            &manifest("app-a/Cargo.toml"),
+            "app-a",
+        );
+        let (app_b_nodes, app_b_edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "app-b"
+
+[dependencies]
+shared-lib = "1"
+"#,
+            &manifest("app-b/Cargo.toml"),
+            "app-b",
+        );
+        let (provider_a_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "shared-lib"
+"#,
+            &manifest("providers/a/Cargo.toml"),
+            "repo-family",
+        );
+        let (provider_b_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "shared-lib"
+"#,
+            &manifest("providers/b/Cargo.toml"),
+            "repo-family",
+        );
+        nodes.extend(app_b_nodes);
+        nodes.extend(provider_a_nodes);
+        nodes.extend(provider_b_nodes);
+        edges.extend(app_b_edges);
+
+        add_explicit_package_host_edges(&nodes, &mut edges, &hosts);
+
+        assert!(edges.iter().any(|edge| edge.from.root == "app-a"
+            && edge.to.file == manifest("providers/a/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+        assert!(edges.iter().any(|edge| edge.from.root == "app-b"
+            && edge.to.file == manifest("providers/b/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+        assert!(!edges.iter().any(|edge| edge.from.root == "app-a"
+            && edge.to.file == manifest("providers/b/Cargo.toml")
+            && edge.confidence == Confidence::Confirmed));
+    }
+
+    #[test]
+    fn test_explicit_package_host_prefers_declared_root_over_primary_directory_copy() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert(
+            ("hiphi-repos".to_string(), "roon-api".to_string()),
+            "rust-roon-api".to_string(),
+        );
+
+        let (_app_nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "unified-hifi-control"
+
+[dependencies]
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git" }
+"#,
+            &manifest("unified-hifi-control/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (primary_provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+"#,
+            &manifest("rust-roon-api/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (declared_provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+"#,
+            &manifest("Cargo.toml"),
+            "rust-roon-api",
+        );
+        let mut nodes = _app_nodes;
+        nodes.extend(primary_provider_nodes);
+        nodes.extend(declared_provider_nodes);
+
+        add_explicit_package_host_edges(&nodes, &mut edges, &hosts);
+
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.from.name == "unified-hifi-control"
+                    && edge.to.root == "rust-roon-api"
+                    && edge.to.name == "roon-api"
+                    && edge.confidence == Confidence::Confirmed)
+        );
+    }
+
+    #[test]
+    fn test_package_host_is_explicit_not_unique_name_guess() {
+        let (_app_nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "app"
+
+[dependencies]
+local-lib = "1"
+"#,
+            &manifest("app/Cargo.toml"),
+            "root",
+        );
+        let (mut nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "app"
+
+[dependencies]
+local-lib = "1"
+"#,
+            &manifest("app/Cargo.toml"),
+            "root",
+        );
+        let (provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "local-lib"
+"#,
+            &manifest("local-lib/Cargo.toml"),
+            "root",
+        );
+        nodes.extend(provider_nodes);
+
+        add_explicit_package_host_edges(&nodes, &mut edges, &PackageHosts::new());
+
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.to.file == manifest("local-lib/Cargo.toml"))
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -906,7 +906,8 @@ impl RnaHandler {
 
         // Run incremental update on the local cached_state, then store atomically.
         // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
-        self.update_graph_with_scan(&mut cached_state, Some(scan), false)
+        let _persist_succeeded = self
+            .update_graph_with_scan(&mut cached_state, Some(scan), false)
             .await?;
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 

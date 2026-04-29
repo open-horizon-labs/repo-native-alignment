@@ -64,6 +64,72 @@ fn dedup_nodes_merge_metadata(nodes: &mut Vec<Node>) {
         .filter_map(|sid| merged.remove(&sid))
         .collect();
 }
+fn is_manifest_package_node(node: &Node) -> bool {
+    node.source == crate::graph::ExtractionSource::Schema
+        && matches!(&node.id.kind, NodeKind::Other(kind) if kind == "package")
+}
+
+fn is_manifest_package_edge(edge: &Edge) -> bool {
+    edge.source == crate::graph::ExtractionSource::Schema
+        && (matches!(&edge.from.kind, NodeKind::Other(kind) if kind == "package")
+            || matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "package"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(kind: NodeKind, name: &str) -> Node {
+        Node {
+            id: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("x.yaml"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "yaml".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: name.to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::Schema,
+        }
+    }
+
+    #[test]
+    fn manifest_refresh_filter_preserves_non_package_schema_depends_on_edges() {
+        let openapi_dep = Edge {
+            from: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("openapi.yaml"),
+                name: "POST /users".to_string(),
+                kind: NodeKind::ApiEndpoint,
+            },
+            to: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("openapi.yaml"),
+                name: "User".to_string(),
+                kind: NodeKind::Struct,
+            },
+            kind: crate::graph::EdgeKind::DependsOn,
+            source: crate::graph::ExtractionSource::Schema,
+            confidence: crate::graph::Confidence::Detected,
+        };
+
+        let package_dep = Edge {
+            from: node(NodeKind::Other("package".to_string()), "app").id,
+            to: node(NodeKind::Other("package".to_string()), "lib").id,
+            kind: crate::graph::EdgeKind::DependsOn,
+            source: crate::graph::ExtractionSource::Schema,
+            confidence: crate::graph::Confidence::Detected,
+        };
+
+        assert!(!is_manifest_package_edge(&openapi_dep));
+        assert!(is_manifest_package_edge(&package_dep));
+    }
+}
+
 fn collect_post_pass_node_upserts(
     nodes: &[Node],
     node_ids_before: &std::collections::HashSet<String>,
@@ -79,7 +145,6 @@ fn collect_post_pass_node_upserts(
         }
     }
 }
-
 
 impl RnaHandler {
     /// Maximum time to wait for pre-warm to finish before falling back to
@@ -718,7 +783,7 @@ impl RnaHandler {
         self.build_full_graph_inner(true).await
     }
 
-    pub(crate) async fn build_full_graph_inner(
+    pub async fn build_full_graph_inner(
         &self,
         spawn_background: bool,
     ) -> anyhow::Result<GraphState> {
@@ -1640,6 +1705,74 @@ impl RnaHandler {
         ))
     }
 
+    /// Refresh cheap manifest-derived package nodes and dependency edges without
+    /// running extraction, embeddings, or LSP. This catches `.oh/config.toml`
+    /// package host changes and manifest dependency metadata on otherwise idle scans.
+    pub async fn refresh_manifest_graph(&self, graph: &mut GraphState) -> anyhow::Result<bool> {
+        fn manifest_fingerprint(nodes: &[Node], edges: &[Edge]) -> Vec<String> {
+            let mut entries = Vec::new();
+            for node in nodes.iter().filter(|node| is_manifest_package_node(node)) {
+                entries.push(format!(
+                    "node:{}:{:?}:{}:{}",
+                    node.stable_id(),
+                    node.metadata,
+                    node.signature,
+                    node.body
+                ));
+            }
+            for edge in edges.iter().filter(|edge| is_manifest_package_edge(edge)) {
+                entries.push(format!(
+                    "edge:{}:{:?}:{:?}",
+                    edge.stable_id(),
+                    edge.source,
+                    edge.confidence
+                ));
+            }
+            entries.sort();
+            entries
+        }
+
+        let root_pairs: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root)
+            .with_declared_roots(&self.repo_root)
+            .resolved_roots()
+            .iter()
+            .map(|root| (root.slug.clone(), root.path.clone()))
+            .collect();
+
+        let before = manifest_fingerprint(&graph.nodes, &graph.edges);
+        let manifest = crate::extract::manifest::manifest_pass(&root_pairs);
+
+        graph.nodes.retain(|node| !is_manifest_package_node(node));
+        graph.edges.retain(|edge| !is_manifest_package_edge(edge));
+        graph.nodes.extend(manifest.nodes);
+        graph.edges.extend(manifest.edges);
+
+        dedup_nodes_merge_metadata(&mut graph.nodes);
+        let mut seen_edges = std::collections::HashSet::new();
+        graph
+            .edges
+            .retain(|edge| seen_edges.insert(edge.stable_id()));
+
+        graph.index = GraphIndex::new();
+        graph.index.rebuild_from_edges(&graph.edges);
+        for node in &graph.nodes {
+            graph
+                .index
+                .ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        let after = manifest_fingerprint(&graph.nodes, &graph.edges);
+        if before == after {
+            return Ok(false);
+        }
+
+        let _lance_guard = self.lance_write_lock.lock().await;
+        persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await?;
+        Ok(true)
+    }
+
     /// Incrementally update the graph, accepting an optional pre-computed scan.
     ///
     /// When `pending_scan` is `Some`, the caller already ran the scanner and
@@ -1650,12 +1783,12 @@ impl RnaHandler {
     ///
     /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`.
     /// The `_spawn_lsp` parameter is kept for API compatibility but is no longer acted on.
-    pub(crate) async fn update_graph_with_scan(
+    pub async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
         _spawn_lsp: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
         let mut fallback_scanner: Option<Scanner> = None;
@@ -1674,7 +1807,7 @@ impl RnaHandler {
             && scan.new_files.is_empty()
             && scan.deleted_files.is_empty()
         {
-            return Ok(());
+            return Ok(true);
         }
 
         tracing::info!(
@@ -1849,11 +1982,7 @@ impl RnaHandler {
         // Auto-collect delta: everything added by post-extraction passes since
         // the snapshot above. Include duplicate stable IDs so metadata-only
         // updates are persisted on incremental scans.
-        collect_post_pass_node_upserts(
-            &graph.nodes,
-            &node_ids_before_passes,
-            &mut upsert_node_ids,
-        );
+        collect_post_pass_node_upserts(&graph.nodes, &node_ids_before_passes, &mut upsert_node_ids);
         for e in &graph.edges {
             let sid = e.stable_id();
             if !edge_ids_before_passes.contains(&sid) {
@@ -2148,6 +2277,6 @@ impl RnaHandler {
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
 
-        Ok(())
+        Ok(persist_succeeded)
     }
 }

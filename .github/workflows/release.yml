@@ -32,9 +32,7 @@ jobs:
           fi
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/install-protoc.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -90,9 +88,7 @@ jobs:
             sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
           fi
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/install-protoc.sh
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -135,9 +131,7 @@ jobs:
           sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
           sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/install-protoc.sh
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
