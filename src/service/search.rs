@@ -11,8 +11,8 @@ use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
-    format_freshness_full, format_neighbors_grouped_with_root, format_node_entry_with_root,
-    strip_root_prefix,
+    format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
+    format_node_entry_with_root, strip_root_prefix,
 };
 use crate::server::state::GraphState;
 use crate::server::store::parse_edge_kind;
@@ -31,6 +31,30 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 /// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
 
+fn format_verbose_readiness(
+    gs: &GraphState,
+    ctx: &SearchContext<'_>,
+    semantic_index_attached: bool,
+    semantic_index_available: bool,
+) -> String {
+    format!(
+        "{}{}",
+        format_freshness_full(
+            gs.nodes.len(),
+            gs.last_scan_completed_at,
+            ctx.lsp_status,
+            ctx.embed_status,
+        ),
+        format_capability_readiness(
+            gs.nodes.len(),
+            ctx.lsp_status,
+            ctx.embed_status,
+            semantic_index_attached,
+            semantic_index_available,
+        ),
+    )
+}
+
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     let query = params
@@ -43,6 +67,16 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+
+    let semantic_index_attached = ctx.embed_index.is_some();
+    let semantic_index_available = if params.verbose {
+        match ctx.embed_index {
+            Some(index) => index.has_table().await.unwrap_or(false),
+            None => false,
+        }
+    } else {
+        false
+    };
 
     if let Some(ref node_ids) = params.nodes {
         let node_ids: Vec<&str> = node_ids
@@ -58,16 +92,43 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         if params.depth.unwrap_or(1) > 1 && params.mode.as_deref() == Some("neighbors") {
             return "depth > 1 is not supported with nodes=[...] batched traversal. Use node= for a single entry point with depth traversal.".to_string();
         }
-        return search_batch(&node_ids, params, ctx);
+        return search_batch(
+            &node_ids,
+            params,
+            ctx,
+            semantic_index_attached,
+            semantic_index_available,
+        );
     }
 
     if params.mode.is_some() {
-        search_traversal(params, query, node, ctx).await
+        search_traversal(
+            params,
+            query,
+            node,
+            ctx,
+            semantic_index_attached,
+            semantic_index_available,
+        )
+        .await
     } else if query.is_none() && node.is_some() {
         let node_ids = vec![node.unwrap()];
-        search_batch(&node_ids, params, ctx)
+        search_batch(
+            &node_ids,
+            params,
+            ctx,
+            semantic_index_attached,
+            semantic_index_available,
+        )
     } else {
-        search_flat(params, query, ctx).await
+        search_flat(
+            params,
+            query,
+            ctx,
+            semantic_index_attached,
+            semantic_index_available,
+        )
+        .await
     }
 }
 
@@ -75,6 +136,8 @@ async fn search_flat(
     params: &SearchParams,
     query: Option<&str>,
     ctx: &SearchContext<'_>,
+    semantic_index_attached: bool,
+    semantic_index_available: bool,
 ) -> String {
     let sort_by_complexity = params.sort_by.as_deref() == Some("complexity");
     let sort_by_importance = params.sort_by.as_deref() == Some("importance");
@@ -217,11 +280,11 @@ async fn search_flat(
     }
 
     let freshness = if params.verbose {
-        format_freshness_full(
-            graph_state.nodes.len(),
-            graph_state.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
+        format_verbose_readiness(
+            graph_state,
+            ctx,
+            semantic_index_attached,
+            semantic_index_available,
         )
     } else {
         String::new()
@@ -604,6 +667,8 @@ async fn search_traversal(
     query: Option<&str>,
     node: Option<&str>,
     ctx: &SearchContext<'_>,
+    semantic_index_attached: bool,
+    semantic_index_available: bool,
 ) -> String {
     let mode = params.mode.as_deref().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
@@ -622,12 +687,7 @@ async fn search_traversal(
         });
         let edge_filter_slice = edge_filter.as_deref();
         let freshness = if params.verbose {
-            format_freshness_full(
-                gs.nodes.len(),
-                gs.last_scan_completed_at,
-                ctx.lsp_status,
-                ctx.embed_status,
-            )
+            format_verbose_readiness(gs, ctx, semantic_index_attached, semantic_index_available)
         } else {
             String::new()
         };
@@ -716,12 +776,7 @@ async fn search_traversal(
         });
         let edge_filter_slice = edge_filter.as_deref();
         let freshness = if params.verbose {
-            format_freshness_full(
-                gs.nodes.len(),
-                gs.last_scan_completed_at,
-                ctx.lsp_status,
-                ctx.embed_status,
-            )
+            format_verbose_readiness(gs, ctx, semantic_index_attached, semantic_index_available)
         } else {
             String::new()
         };
@@ -1048,12 +1103,7 @@ async fn search_traversal(
     };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
     let freshness = if params.verbose {
-        format_freshness_full(
-            gs.nodes.len(),
-            gs.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
-        )
+        format_verbose_readiness(gs, ctx, semantic_index_attached, semantic_index_available)
     } else {
         String::new()
     };
@@ -1276,16 +1326,17 @@ fn count_affected_subsystems(
     subsystems.len()
 }
 
-fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+fn search_batch(
+    node_ids: &[&str],
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+    semantic_index_attached: bool,
+    semantic_index_available: bool,
+) -> String {
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
     let freshness = if params.verbose {
-        format_freshness_full(
-            gs.nodes.len(),
-            gs.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
-        )
+        format_verbose_readiness(gs, ctx, semantic_index_attached, semantic_index_available)
     } else {
         String::new()
     };

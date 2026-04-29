@@ -280,6 +280,70 @@ impl GraphBuildStatus {
     }
 }
 
+// ── Capability readiness ─────────────────────────────────────────────
+
+/// Agent-facing readiness state for a workflow capability.
+///
+/// These states are intentionally capability-scoped. A repo can be ready for
+/// extracted-graph navigation while embeddings are still running and global
+/// dead-code detection is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityReadinessState {
+    Ready,
+    Partial,
+    Running,
+    Failed,
+    Unavailable,
+    Stale,
+    NotNeeded,
+}
+
+impl CapabilityReadinessState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Partial => "partial/degraded",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+            Self::Stale => "stale",
+            Self::NotNeeded => "not needed",
+        }
+    }
+}
+
+/// Agent-facing readiness for one graph capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityReadiness {
+    pub name: &'static str,
+    pub state: CapabilityReadinessState,
+    pub detail: String,
+}
+
+impl CapabilityReadiness {
+    pub fn new(
+        name: &'static str,
+        state: CapabilityReadinessState,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name,
+            state,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn markdown_line(&self) -> String {
+        let normalized_detail = self.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        format!(
+            "- **{}**: {} — {}",
+            self.name,
+            self.state.label(),
+            normalized_detail
+        )
+    }
+}
+
 // ── Embedding build status ───────────────────────────────────────────
 
 /// Tracks embedding build progress so the search footer can show
@@ -334,6 +398,95 @@ impl EmbeddingStatus {
     pub fn set_failed(&self, error: String) {
         *self.last_error.lock().unwrap() = Some(error);
         self.state.store(3, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn capability_readiness(
+        &self,
+        semantic_index_attached: bool,
+        semantic_index_available: bool,
+    ) -> CapabilityReadiness {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            0 if semantic_index_available => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Ready,
+                "semantic index is loaded",
+            ),
+            0 if semantic_index_attached => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Running,
+                "semantic index is attached but not queryable yet",
+            ),
+            0 => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::NotNeeded,
+                "not required for exact symbol, graph, or file queries; semantic ranking is unavailable until embeddings build",
+            ),
+            1 => {
+                let cur = self.current.load(std::sync::atomic::Ordering::Acquire);
+                let tot = self.total.load(std::sync::atomic::Ordering::Acquire);
+                let state = if semantic_index_available {
+                    CapabilityReadinessState::Partial
+                } else {
+                    CapabilityReadinessState::Running
+                };
+                let detail = if semantic_index_available {
+                    format!(
+                        "existing semantic index is usable but may be stale while update runs ({}/{})",
+                        cur, tot
+                    )
+                } else {
+                    format!("semantic index is building ({}/{})", cur, tot)
+                };
+                CapabilityReadiness::new("embeddings / semantic search", state, detail)
+            }
+            2 => {
+                let count = self
+                    .completed_count
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if semantic_index_available {
+                    CapabilityReadiness::new(
+                        "embeddings / semantic search",
+                        CapabilityReadinessState::Ready,
+                        format!("{} embedded items available", count),
+                    )
+                } else {
+                    CapabilityReadiness::new(
+                        "embeddings / semantic search",
+                        CapabilityReadinessState::Failed,
+                        format!(
+                            "embedding status says {} items are complete, but the semantic index table is not queryable",
+                            count
+                        ),
+                    )
+                }
+            }
+            3 => {
+                let err = self.last_error.lock().unwrap();
+                let detail = match (semantic_index_available, err.as_deref()) {
+                    (true, Some(msg)) => format!(
+                        "last embedding update failed; existing semantic index may be stale: {}",
+                        msg
+                    ),
+                    (true, None) => {
+                        "last embedding update failed; existing semantic index may be stale"
+                            .to_string()
+                    }
+                    (false, Some(msg)) => format!("semantic index unavailable: {}", msg),
+                    (false, None) => "semantic index unavailable".to_string(),
+                };
+                let state = if semantic_index_available {
+                    CapabilityReadinessState::Stale
+                } else {
+                    CapabilityReadinessState::Failed
+                };
+                CapabilityReadiness::new("embeddings / semantic search", state, detail)
+            }
+            _ => CapabilityReadiness::new(
+                "embeddings / semantic search",
+                CapabilityReadinessState::Unavailable,
+                "embedding status is unknown",
+            ),
+        }
     }
 
     pub fn footer_segment(&self) -> Option<String> {
@@ -418,6 +571,13 @@ pub struct LspEnrichmentStatus {
     state: std::sync::atomic::AtomicU8,
     /// Number of edges added by the most recent enrichment pass.
     edge_count: std::sync::atomic::AtomicUsize,
+    /// Best known persisted call/reference coverage across enrichment passes.
+    ///
+    /// `edge_count` is the latest pass delta/status value for footers. This
+    /// coverage count is monotonic within a process so a no-op incremental pass
+    /// does not incorrectly downgrade workflow readiness after earlier persisted
+    /// coverage was observed.
+    coverage_edge_count: std::sync::atomic::AtomicUsize,
     /// Whether the most recent persist to LanceDB failed.
     /// When true, the footer shows "persist failed" to indicate edges are
     /// in-memory but may not have been written to disk.
@@ -442,6 +602,7 @@ impl Default for LspEnrichmentStatus {
         Self {
             state: std::sync::atomic::AtomicU8::new(0),
             edge_count: std::sync::atomic::AtomicUsize::new(0),
+            coverage_edge_count: std::sync::atomic::AtomicUsize::new(0),
             persist_failed: std::sync::atomic::AtomicBool::new(false),
             completed_at: std::sync::Mutex::new(None),
             created_at: now,
@@ -513,8 +674,14 @@ impl LspEnrichmentStatus {
     }
 
     pub fn set_complete(&self, edge_count: usize) {
+        self.set_complete_with_coverage(edge_count, edge_count);
+    }
+
+    pub fn set_complete_with_coverage(&self, latest_edge_count: usize, coverage_edge_count: usize) {
         self.edge_count
-            .store(edge_count, std::sync::atomic::Ordering::Release);
+            .store(latest_edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count
+            .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
@@ -522,7 +689,11 @@ impl LspEnrichmentStatus {
             self.state
                 .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
         );
-        self.log_transition(prev, LspState::Complete, &format!("{} edges", edge_count));
+        self.log_transition(
+            prev,
+            LspState::Complete,
+            &format!("{} edges", latest_edge_count),
+        );
     }
 
     /// Mark enrichment as complete but with a persist failure.
@@ -550,6 +721,8 @@ impl LspEnrichmentStatus {
     /// Mark that no LSP server was available for any of the detected languages.
     pub fn set_unavailable(&self) {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.coverage_edge_count
+            .store(0, std::sync::atomic::Ordering::Release);
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel),
@@ -559,6 +732,8 @@ impl LspEnrichmentStatus {
 
     pub fn set_failed(&self, error: &str) {
         *self.last_error.lock().unwrap() = Some(error.to_string());
+        self.coverage_edge_count
+            .store(0, std::sync::atomic::Ordering::Release);
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel),
@@ -594,6 +769,102 @@ impl LspEnrichmentStatus {
     /// Get the number of edges added by the most recent enrichment pass.
     pub fn edge_count(&self) -> usize {
         self.edge_count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn coverage_edge_count(&self) -> usize {
+        self.coverage_edge_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn call_reference_readiness(&self) -> CapabilityReadiness {
+        self.check_server_found_timeout();
+        match self.current_state() {
+            LspState::Complete => {
+                let latest_edge_count = self.edge_count();
+                let coverage_edge_count = self.coverage_edge_count();
+                let persist_failed = self
+                    .persist_failed
+                    .load(std::sync::atomic::Ordering::Acquire);
+                match (coverage_edge_count, persist_failed) {
+                    (_, true) => CapabilityReadiness::new(
+                        "LSP call/reference coverage",
+                        CapabilityReadinessState::Partial,
+                        format!(
+                            "{} persisted call/reference edges available, but latest pass persistence failed after {} edges; data may be stale after restart",
+                            coverage_edge_count, latest_edge_count
+                        ),
+                    ),
+                    (0, false) => CapabilityReadiness::new(
+                        "LSP call/reference coverage",
+                        CapabilityReadinessState::Partial,
+                        "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone",
+                    ),
+                    (_, false) => CapabilityReadiness::new(
+                        "LSP call/reference coverage",
+                        CapabilityReadinessState::Ready,
+                        format!(
+                            "{} persisted call/reference edges available",
+                            coverage_edge_count
+                        ),
+                    ),
+                }
+            }
+            LspState::Running => CapabilityReadiness::new(
+                "LSP call/reference coverage",
+                CapabilityReadinessState::Running,
+                format!(
+                    "enrichment is running ({}s since last state transition)",
+                    self.elapsed_since_last_transition().as_secs()
+                ),
+            ),
+            LspState::ServerFound => CapabilityReadiness::new(
+                "LSP call/reference coverage",
+                CapabilityReadinessState::Running,
+                format!(
+                    "{} found, waiting for enrichment to start",
+                    self.server_name()
+                        .unwrap_or_else(|| "LSP server".to_string())
+                ),
+            ),
+            LspState::NotStarted => CapabilityReadiness::new(
+                "LSP call/reference coverage",
+                CapabilityReadinessState::Running,
+                "enrichment has not started",
+            ),
+            LspState::Unavailable => CapabilityReadiness::new(
+                "LSP call/reference coverage",
+                CapabilityReadinessState::Unavailable,
+                "no supported language server detected",
+            ),
+            LspState::Failed => {
+                let err = self.last_error.lock().unwrap();
+                CapabilityReadiness::new(
+                    "LSP call/reference coverage",
+                    CapabilityReadinessState::Failed,
+                    err.as_deref().unwrap_or("enrichment failed"),
+                )
+            }
+        }
+    }
+
+    pub fn dead_code_readiness(&self) -> CapabilityReadiness {
+        let lsp = self.call_reference_readiness();
+        if lsp.state == CapabilityReadinessState::Ready {
+            CapabilityReadiness::new(
+                "global dead-code prerequisites",
+                CapabilityReadinessState::Ready,
+                "non-zero LSP call/reference coverage is available",
+            )
+        } else {
+            CapabilityReadiness::new(
+                "global dead-code prerequisites",
+                lsp.state,
+                format!(
+                    "blocked: requires complete, persisted, non-zero LSP call/reference coverage; {}",
+                    lsp.detail
+                ),
+            )
+        }
     }
 
     /// Get LSP server binaries that were not found on PATH during probe.
@@ -893,6 +1164,163 @@ mod tests {
         status.set_complete(3);
         let footer = status.footer_segment().unwrap();
         assert!(footer.contains("3 edges"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_capability_readiness_labels_cover_required_states() {
+        assert_eq!(CapabilityReadinessState::Ready.label(), "ready");
+        assert_eq!(
+            CapabilityReadinessState::Partial.label(),
+            "partial/degraded"
+        );
+        assert_eq!(CapabilityReadinessState::Running.label(), "running");
+        assert_eq!(CapabilityReadinessState::Failed.label(), "failed");
+        assert_eq!(CapabilityReadinessState::Unavailable.label(), "unavailable");
+        assert_eq!(CapabilityReadinessState::Stale.label(), "stale");
+        assert_eq!(CapabilityReadinessState::NotNeeded.label(), "not needed");
+    }
+
+    #[test]
+    fn test_capability_readiness_markdown_line_normalizes_detail_whitespace() {
+        let readiness = CapabilityReadiness::new(
+            "demo",
+            CapabilityReadinessState::Ready,
+            "first line\n\tsecond   line\r\nthird",
+        );
+        assert_eq!(
+            readiness.markdown_line(),
+            "- **demo**: ready — first line second line third"
+        );
+    }
+
+    #[test]
+    fn test_embedding_readiness_is_partial_when_existing_index_updates() {
+        let status = EmbeddingStatus::default();
+        status.set_building(10);
+        status.set_progress(4);
+        let readiness = status.capability_readiness(true, true);
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness.detail.contains("may be stale"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_embedding_readiness_complete_requires_queryable_index() {
+        let status = EmbeddingStatus::default();
+        status.set_complete(10);
+        let readiness = status.capability_readiness(true, false);
+        assert_eq!(readiness.state, CapabilityReadinessState::Failed);
+        assert!(
+            readiness.detail.contains("not queryable"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_embedding_readiness_is_stale_when_update_fails_but_index_exists() {
+        let status = EmbeddingStatus::default();
+        status.set_failed("network down".to_string());
+        let readiness = status.capability_readiness(true, true);
+        assert_eq!(readiness.state, CapabilityReadinessState::Stale);
+        assert!(
+            readiness.detail.contains("may be stale"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_dead_code_readiness_fails_closed_until_lsp_has_edges() {
+        let status = LspEnrichmentStatus::default();
+        let not_started = status.dead_code_readiness();
+        assert_eq!(not_started.state, CapabilityReadinessState::Running);
+        assert!(
+            not_started.detail.starts_with("blocked:"),
+            "got: {}",
+            not_started.detail
+        );
+
+        status.set_running();
+        status.set_complete(0);
+        let zero_edges = status.dead_code_readiness();
+        assert_eq!(zero_edges.state, CapabilityReadinessState::Partial);
+        assert!(
+            zero_edges.detail.starts_with("blocked:"),
+            "got: {}",
+            zero_edges.detail
+        );
+
+        status.set_running();
+        status.set_complete(12);
+        let ready = status.dead_code_readiness();
+        assert_eq!(ready.state, CapabilityReadinessState::Ready);
+        assert!(
+            ready.detail.contains("non-zero LSP"),
+            "got: {}",
+            ready.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_remains_ready_after_incremental_zero_edge_pass() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(12);
+        assert_eq!(
+            status.call_reference_readiness().state,
+            CapabilityReadinessState::Ready
+        );
+
+        status.set_running();
+        status.set_complete_with_coverage(0, 12);
+
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Ready);
+        assert!(
+            readiness.detail.contains("12 persisted"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_blocks_when_current_coverage_drops_to_zero() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(12);
+        assert_eq!(
+            status.dead_code_readiness().state,
+            CapabilityReadinessState::Ready
+        );
+
+        status.set_running();
+        status.set_complete(0);
+
+        let readiness = status.dead_code_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness.detail.starts_with("blocked:"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_lsp_readiness_preserves_persist_failed_reason_with_no_prior_coverage() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(7);
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness.detail.contains("persistence failed"),
+            "got: {}",
+            readiness.detail
+        );
     }
 
     #[test]

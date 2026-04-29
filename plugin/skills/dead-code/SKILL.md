@@ -23,31 +23,32 @@ Examples:
 
 ## Procedure
 
-### Step 0: Verify LSP enrichment completed (precondition)
+### Step 0: Verify capability readiness (precondition)
 
-This skill assumes the repo has been scanned with `--full` and that LSP enrichment produced `Calls` / `ReferencedBy` edges. Without those edges every function looks dead and every result is a false positive. Verify before doing anything else.
+This skill requires complete enough LSP call/reference coverage. Without those edges, every function can look dead and every result is a false positive. Verify readiness through RNA's MCP-visible output before doing anything else; do **not** rely on log scraping.
 
 **Self-check (run this first):**
 
-```bash
-repo-native-alignment scan --repo <path> --full 2>&1 | tee /tmp/rna-deadcode-scan.log
-grep -E 'LSP enrichment complete: ([1-9][0-9]*) LSP call edges' /tmp/rna-deadcode-scan.log
-```
-
-If the `grep` matches a non-zero call-edge count, proceed. Examples of acceptable output:
-
 ```text
-LSP enrichment complete for python: 1234 edges
-[background-lsp] LSP enrichment complete: 2870 LSP call edges, 173056 total LSP edges
+search(query="capability", verbose=true, limit=1)
 ```
 
-If the `grep` returns nothing, or the matched count is `0`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
+`verbose=true` includes the `Capability readiness` section for any query; the query just gives the search tool a harmless term to return alongside the readiness footer.
 
-- The repo's language server is not on `PATH` (e.g., `pyright`, `tsserver`, `gopls`, `rust-analyzer`).
-- The scan was run without `--full` (incremental scans skip LSP).
-- LSP enrichment aborted mid-run; check the scan log for `LspConsumer(...) enrichment failed`.
+Read the `Capability readiness` section:
 
-Tell the user the dead-code analysis cannot run reliably without LSP enrichment and stop. Do not fall back to a structural-edges-only scan.
+- `extracted graph / exact search` must be `ready` for basic symbol listing.
+- `LSP call/reference coverage` must be `ready` with a non-zero edge count.
+- `global dead-code prerequisites` must be `ready` (this is the workflow gate that aggregates the LSP coverage requirement for dead-code analysis).
+
+If `global dead-code prerequisites` is `running`, `partial/degraded`, `failed`, `unavailable`, or `stale`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
+
+- The repo's language server is not on `PATH` (e.g., `pyright-langserver`, `typescript-language-server`, `gopls`, `rust-analyzer`).
+- Enrichment is still running or has not started.
+- Enrichment completed with zero call/reference edges.
+- Enrichment computed edges but persistence failed, so data may not survive restart.
+
+Tell the user the dead-code analysis cannot run reliably until RNA reports `global dead-code prerequisites: ready`. Do not fall back to a structural-edges-only scan.
 
 ### Step 1: Gather functions
 
