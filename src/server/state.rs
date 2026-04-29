@@ -442,11 +442,22 @@ impl EmbeddingStatus {
                 let count = self
                     .completed_count
                     .load(std::sync::atomic::Ordering::Acquire);
-                CapabilityReadiness::new(
-                    "embeddings / semantic search",
-                    CapabilityReadinessState::Ready,
-                    format!("{} embedded items available", count),
-                )
+                if semantic_index_available {
+                    CapabilityReadiness::new(
+                        "embeddings / semantic search",
+                        CapabilityReadinessState::Ready,
+                        format!("{} embedded items available", count),
+                    )
+                } else {
+                    CapabilityReadiness::new(
+                        "embeddings / semantic search",
+                        CapabilityReadinessState::Failed,
+                        format!(
+                            "embedding status says {} items are complete, but the semantic index table is not queryable",
+                            count
+                        ),
+                    )
+                }
             }
             3 => {
                 let err = self.last_error.lock().unwrap();
@@ -1177,6 +1188,19 @@ mod tests {
         assert_eq!(readiness.state, CapabilityReadinessState::Partial);
         assert!(
             readiness.detail.contains("may be stale"),
+            "got: {}",
+            readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_embedding_readiness_complete_requires_queryable_index() {
+        let status = EmbeddingStatus::default();
+        status.set_complete(10);
+        let readiness = status.capability_readiness(true, false);
+        assert_eq!(readiness.state, CapabilityReadinessState::Failed);
+        assert!(
+            readiness.detail.contains("not queryable"),
             "got: {}",
             readiness.detail
         );
