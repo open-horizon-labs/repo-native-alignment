@@ -315,6 +315,26 @@ async fn try_load_cached_graph(
     }
 }
 
+async fn load_existing_embedding_index(
+    repo_root: &std::path::Path,
+    warn: impl FnOnce(String),
+) -> Option<repo_native_alignment::embed::EmbeddingIndex> {
+    match repo_native_alignment::embed::EmbeddingIndex::new(repo_root).await {
+        Ok(idx) => match idx.has_table().await {
+            Ok(true) => Some(idx),
+            Ok(false) => None,
+            Err(e) => {
+                warn(format!("Embedding index check failed: {}", e));
+                None
+            }
+        },
+        Err(e) => {
+            warn(format!("EmbeddingIndex init failed: {}", e));
+            None
+        }
+    }
+}
+
 fn print_scan_summary(
     graph: &server::state::GraphState,
     embeddings_loaded: bool,
@@ -422,6 +442,13 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
+            })
+            .await
+            {
+                handler.embed_index.store(Arc::new(Some(embed_idx)));
+            }
 
             let mut scanner = repo_native_alignment::scanner::Scanner::new(repo_root.clone())?;
             let scan = scanner.scan()?;
@@ -429,15 +456,20 @@ async fn async_main() -> anyhow::Result<()> {
                 && scan.new_files.is_empty()
                 && scan.deleted_files.is_empty()
             {
-                scanner.commit_state()?;
                 let graph = match try_load_cached_graph(&repo_root).await? {
                     Some(mut graph) => {
                         if handler.refresh_manifest_graph(&mut graph).await? {
                             eprintln!("Refreshed manifest dependency graph.");
                         }
+                        scanner.commit_state()?;
                         graph
                     }
-                    None => handler.build_full_graph_inner(true).await?,
+                    None => {
+                        let graph = handler.build_full_graph_inner(true).await?;
+                        scanner.commit_state()?;
+                        handler.await_background_embed().await;
+                        graph
+                    }
                 };
                 let elapsed = t0.elapsed();
                 print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
@@ -450,6 +482,7 @@ async fn async_main() -> anyhow::Result<()> {
                     eprintln!("No cached index found; building initial extracted graph.");
                     let graph = handler.build_full_graph_inner(true).await?;
                     scanner.commit_state()?;
+                    handler.await_background_embed().await;
                     let elapsed = t0.elapsed();
                     print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
                     return Ok(());

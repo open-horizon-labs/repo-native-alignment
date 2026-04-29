@@ -1,23 +1,22 @@
+---
+updated: 2026-04-27
+parent_issue: https://github.com/open-horizon-labs/repo-native-alignment/issues/659
+symptom_issues:
+  - 645
+  - 646
+  - 657
+primary_outcome: context-assembly
+secondary_outcomes:
+  - agent-alignment
+  - codebase-to-warehouse-pipeline
+  - domain-context-compiler
+  - subsystem-detection
+---
 # Capability-Scoped Enrichment Readiness
-
-## Session Metadata
-
-**Updated:** 2026-04-27
-**Parent issue:** #659 — https://github.com/open-horizon-labs/repo-native-alignment/issues/659
-**Symptom issues:** #645, #646, #657
 
 ## Outcome Alignment
 
-**Primary outcome:** `context-assembly`
-
 RNA exists so agents can discover and navigate local codebase context without guessing. Capability-scoped enrichment readiness is directly in scope: if agents cannot tell whether callers, references, diagnostics, embeddings, or dead-code coverage are trustworthy, RNA is assembling plausible context rather than true context.
-
-**Secondary outcomes:**
-
-- `agent-alignment` — agents need MCP-visible readiness to decide what claims they can safely make and when to fail closed.
-- `codebase-to-warehouse-pipeline` — diff/change workflows need structured, scoped metadata about what changed; this problem space clarifies that full-repo enrichment is not always the right source of truth.
-- `domain-context-compiler` — capability readiness generalizes beyond code: domain extractors, embeddings, and graph relationships also need truthful readiness/degradation semantics.
-- `subsystem-detection` — agents should reason about systems/capabilities/subsystems, not undifferentiated global enrichment state.
 
 ## Problem Statement
 
@@ -119,7 +118,7 @@ The decision should explicitly split what is required for v0.2.7 from what belon
 - Broad subagent edits were discarded locally; PR #658 remains a draft remote artifact but should not be treated as the accepted implementation direction.
 
 
-## Execute
+## Execute — Diff Overlay Spike
 **Updated:** 2026-04-27
 **Status:** pre-flight
 
@@ -189,7 +188,7 @@ Purpose: validate the job-shaped skill path before core API work. The issue keep
 
 This child issue is intentionally not a generic readiness API issue. It is the concrete PR/diff review use case that should force any later model/API design.
 
-## Execute
+## Execute — Review-Readiness Implementation
 **Updated:** 2026-04-27
 **Status:** implementation-revised
 

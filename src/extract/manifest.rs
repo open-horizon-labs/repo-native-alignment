@@ -264,29 +264,34 @@ fn add_explicit_package_host_edges(
         .collect();
     let mut added = std::collections::HashSet::new();
 
-    for edge in edges.clone() {
-        if edge.kind != EdgeKind::DependsOn {
-            continue;
-        }
-        let Some(host) = package_hosts.get(&edge.to.name) else {
+    let candidate_edges: Vec<(NodeId, String, NodeId)> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::DependsOn)
+        .map(|edge| (edge.from.clone(), edge.to.name.clone(), edge.to.clone()))
+        .collect();
+
+    for (from, dependency_name, dependency_node) in candidate_edges {
+        let Some(host) = package_hosts.get(&dependency_name) else {
             continue;
         };
-        let Some(provider) = find_explicit_provider(nodes, &edge.to.name, host, &edge.to) else {
+        let Some(provider) =
+            find_explicit_provider(nodes, &dependency_name, host, &dependency_node)
+        else {
             tracing::debug!(
                 "manifest_pass: explicit package host '{}' for '{}' did not match an indexed package",
                 host,
-                edge.to.name
+                dependency_name
             );
             continue;
         };
 
-        let key = (edge.from.clone(), provider.id.clone(), EdgeKind::DependsOn);
+        let key = (from.clone(), provider.id.clone(), EdgeKind::DependsOn);
         if existing.contains(&key) || !added.insert(key.clone()) {
             continue;
         }
 
         edges.push(Edge {
-            from: edge.from,
+            from,
             to: provider.id.clone(),
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::Schema,
@@ -537,17 +542,16 @@ pub fn parse_cargo_toml(
         return (Vec::new(), Vec::new());
     };
 
-    let package_name = value
-        .get("package")
-        .and_then(|package| package.get("name"))
+    let Some(package) = value.get("package") else {
+        tracing::debug!(
+            "manifest_pass: skipping workspace-only Cargo.toml at {}",
+            manifest_file.display()
+        );
+        return (Vec::new(), Vec::new());
+    };
+    let package_name = package
+        .get("name")
         .and_then(|name| name.as_str())
-        .or_else(|| {
-            value
-                .get("workspace")
-                .and_then(|workspace| workspace.get("package"))
-                .and_then(|package| package.get("name"))
-                .and_then(|name| name.as_str())
-        })
         .unwrap_or_else(|| {
             manifest_file
                 .parent()
@@ -1126,6 +1130,28 @@ libc = "0.2"
         assert!(nodes.iter().any(|node| node.id.name == "serde"));
         assert!(nodes.iter().any(|node| node.id.name == "libc"));
         assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn test_workspace_only_cargo_toml_emits_no_package_or_edges() {
+        let content = r#"
+[workspace]
+members = ["crates/app"]
+
+[workspace.dependencies]
+serde = "1"
+tokio = "1"
+"#;
+        let (nodes, edges) = parse_cargo_toml(content, &manifest("Cargo.toml"), "root");
+
+        assert!(
+            nodes.is_empty(),
+            "workspace-only manifests are not packages"
+        );
+        assert!(
+            edges.is_empty(),
+            "workspace.dependencies must not become package dependency edges"
+        );
     }
 
     #[test]
