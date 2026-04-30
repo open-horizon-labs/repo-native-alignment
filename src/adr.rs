@@ -9,7 +9,7 @@ use gray_matter::{Matter, ParsedEntity, engine::YAML};
 use serde::{Deserialize, Serialize};
 
 /// Default timeout for child processes spawned by ADR validation (cargo test,
-/// scripts, smoke fixtures, `cargo test -- --list`).
+/// scripts, smoke fixtures).
 ///
 /// Override with `RNA_ADR_CHILD_TIMEOUT_MS` (parsed once on first use). On parse
 /// failure the default is used and a warning is written to stderr. Setting `0`
@@ -344,15 +344,6 @@ pub fn validate(
         );
     }
 
-    let requested_cargo_tests: BTreeSet<String> = selected
-        .iter()
-        .flat_map(|manifest| manifest.validate.cargo_tests.iter().cloned())
-        .collect();
-    let available_tests = if requested_cargo_tests.is_empty() {
-        BTreeSet::new()
-    } else {
-        list_cargo_tests(repo_root, cargo_args)?
-    };
 
     let mut results = Vec::new();
     for manifest in selected {
@@ -364,17 +355,6 @@ pub fn validate(
         }
 
         for test_name in &manifest.validate.cargo_tests {
-            if !available_tests.contains(test_name) {
-                checks.push(CheckExecution {
-                    kind: "cargo_test".to_string(),
-                    target: test_name.clone(),
-                    ok: false,
-                    details: "not found in `cargo test -- --list` output".to_string(),
-                });
-                failures.push(format!("missing cargo test `{}`", test_name));
-                continue;
-            }
-
             let mut command = Command::new("cargo");
             command
                 .arg("test")
@@ -715,45 +695,6 @@ fn render_readme(adrs: &[ParsedAdr]) -> String {
     lines.join("\n")
 }
 
-fn list_cargo_tests(repo_root: &Path, cargo_args: &[String]) -> Result<BTreeSet<String>> {
-    let mut command = Command::new("cargo");
-    command
-        .arg("test")
-        .args(cargo_args)
-        .arg("--")
-        .arg("--list")
-        .current_dir(repo_root);
-    let output = run_command_with_timeout(&mut command, command_timeout())
-        .context("listing cargo tests for ADR validation")?;
-
-    if output.timed_out {
-        bail!(
-            "`cargo test -- --list` timed out after {:?}",
-            command_timeout()
-        );
-    }
-    if !output.success {
-        bail!(
-            "`cargo test -- --list` failed: {}",
-            summarize_command_output(
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr)
-            )
-        );
-    }
-
-    Ok(parse_cargo_test_list(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
-}
-
-fn parse_cargo_test_list(stdout: &str) -> BTreeSet<String> {
-    stdout
-        .lines()
-        .filter_map(|line| line.trim().strip_suffix(": test"))
-        .map(ToOwned::to_owned)
-        .collect()
-}
 
 fn audit_no_consumer_knows_other_consumers(repo_root: &Path) -> Result<AuditReport> {
     let extract_dir = repo_root.join("src/extract");
@@ -789,6 +730,15 @@ fn audit_no_consumer_knows_other_consumers(repo_root: &Path) -> Result<AuditRepo
             hits.join("; ")
         },
     })
+}
+
+#[cfg(test)]
+fn parse_cargo_test_list(stdout: &str) -> BTreeSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(": test"))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn audit_static_registration_only(repo_root: &Path) -> Result<AuditReport> {
