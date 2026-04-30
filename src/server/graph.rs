@@ -2289,6 +2289,10 @@ impl RnaHandler {
             Ok(false) => true,
         };
 
+        if persist_succeeded && !enrichment.runs_lsp() {
+            super::sentinel::clear_lsp_sentinel(&self.repo_root);
+        }
+
         // Commit fallback scanner state only after successful persist.
         // If persist failed, scanner state is left uncommitted so the next scan
         // re-detects the same changes and retries the LanceDB write.
