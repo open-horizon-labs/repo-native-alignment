@@ -2,6 +2,7 @@
 
 mod bg_scanner;
 mod enrichment;
+mod enrichment_jobs;
 mod graph;
 pub mod handlers;
 pub mod helpers;
@@ -14,6 +15,10 @@ pub mod tools;
 pub(crate) use graph::SUBSYSTEM_KEY;
 
 // Re-export public API so external `use crate::server::X` still works.
+pub use enrichment_jobs::{
+    EmbeddingEnrichmentMode, EnrichmentCapability, EnrichmentJobLedger, EnrichmentJobRecord,
+    EnrichmentScope, EnrichmentTrigger, JobStart, LspEnrichmentMode, ScanEnrichmentOptions,
+};
 pub use helpers::format_freshness;
 pub use state::{
     EmbeddingStatus, GraphBuildState, GraphBuildStatus, GraphState, LspEnrichmentStatus, LspState,
@@ -106,6 +111,8 @@ pub struct RnaHandler {
     pub lsp_status: Arc<LspEnrichmentStatus>,
     /// Embedding build status — shared with background embedding tasks.
     pub embed_status: Arc<EmbeddingStatus>,
+    /// Durable enrichment job ledger used by foreground/background enrichment tasks.
+    pub enrichment_jobs: Arc<EnrichmentJobLedger>,
     /// Cached non-code root slugs (computed once, cleared on root changes).
     pub non_code_root_slugs_cache: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
     /// Serializes all LanceDB writes to prevent concurrent merge_insert conflicts.
@@ -156,6 +163,7 @@ impl Default for RnaHandler {
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
             lsp_status: Arc::new(LspEnrichmentStatus::probe_for_servers()),
             embed_status: Arc::new(EmbeddingStatus::default()),
+            enrichment_jobs: Arc::new(EnrichmentJobLedger::default()),
             non_code_root_slugs_cache: std::sync::Mutex::new(None),
             lance_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             lsp_only_roots: Arc::new(Vec::new()),
@@ -191,6 +199,7 @@ impl RnaHandler {
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
             lsp_status: Arc::clone(&self.lsp_status),
             embed_status: Arc::clone(&self.embed_status),
+            enrichment_jobs: Arc::clone(&self.enrichment_jobs),
             non_code_root_slugs_cache: std::sync::Mutex::new(None),
             lance_write_lock: Arc::clone(&self.lance_write_lock),
             lsp_only_roots: Arc::clone(&self.lsp_only_roots),
@@ -691,9 +700,12 @@ mod tests {
         let progress: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let p = progress.clone();
         let result = handler
-            .run_pipeline_foreground(move |msg| {
-                p.lock().unwrap().push(msg.to_string());
-            })
+            .run_pipeline_foreground(
+                move |msg| {
+                    p.lock().unwrap().push(msg.to_string());
+                },
+                ScanEnrichmentOptions::all(),
+            )
             .await
             .expect("first foreground pipeline should succeed");
 
@@ -734,9 +746,12 @@ mod tests {
         let progress2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let p2 = progress2.clone();
         let result2 = handler2
-            .run_pipeline_foreground(move |msg| {
-                p2.lock().unwrap().push(msg.to_string());
-            })
+            .run_pipeline_foreground(
+                move |msg| {
+                    p2.lock().unwrap().push(msg.to_string());
+                },
+                ScanEnrichmentOptions::all(),
+            )
             .await
             .expect("second foreground pipeline should succeed");
 
@@ -799,7 +814,7 @@ mod tests {
 
         // First run: full rebuild, writes SCHEMA_VERSION to the version file.
         let result1 = handler
-            .run_pipeline_foreground(|_| {})
+            .run_pipeline_foreground(|_| {}, ScanEnrichmentOptions::all())
             .await
             .expect("first run should succeed");
         assert!(
@@ -833,9 +848,12 @@ mod tests {
         let progress2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let p2 = progress2.clone();
         let result2 = handler2
-            .run_pipeline_foreground(move |msg| {
-                p2.lock().unwrap().push(msg.to_string());
-            })
+            .run_pipeline_foreground(
+                move |msg| {
+                    p2.lock().unwrap().push(msg.to_string());
+                },
+                ScanEnrichmentOptions::all(),
+            )
             .await
             .expect("second run should succeed after schema version migration");
 

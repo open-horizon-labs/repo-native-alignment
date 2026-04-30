@@ -1924,6 +1924,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         embed_status: None,
         root_filter: None,
         non_code_slugs: std::collections::HashSet::new(),
+        enrichment_jobs: Vec::new(),
     };
 
     let params = crate::service::SearchParams {

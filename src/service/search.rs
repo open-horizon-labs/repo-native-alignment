@@ -38,7 +38,7 @@ fn format_verbose_readiness(
     semantic_index_available: bool,
 ) -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         format_freshness_full(
             gs.nodes.len(),
             gs.last_scan_completed_at,
@@ -52,7 +52,36 @@ fn format_verbose_readiness(
             semantic_index_attached,
             semantic_index_available,
         ),
+        format_enrichment_jobs(ctx),
     )
+}
+
+fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
+    if ctx.enrichment_jobs.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec!["\n\nEnrichment jobs:".to_string()];
+    for job in &ctx.enrichment_jobs {
+        let state = format!("{:?}", job.state).to_lowercase();
+        let phase = job.phase.as_deref().unwrap_or("unknown");
+        let failure = job
+            .failure
+            .as_ref()
+            .map(|msg| format!("; failure: {}", msg))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- `{}` {} {} scope={} phase={} updated={}{}",
+            job.job_id,
+            job.capability.as_str(),
+            state,
+            job.scope.stable_key(),
+            phase,
+            job.updated_at,
+            failure
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Unified search entry point. Returns formatted markdown.
@@ -1690,6 +1719,7 @@ mod tests {
             embed_status: None,
             root_filter: None,
             non_code_slugs: HashSet::new(),
+            enrichment_jobs: Vec::new(),
         }
     }
 
@@ -2155,6 +2185,7 @@ mod tests {
             embed_status: None,
             root_filter: Some("my-project".into()),
             non_code_slugs: HashSet::new(),
+            enrichment_jobs: Vec::new(),
         };
         let params = SearchParams {
             query: Some("handler".into()),

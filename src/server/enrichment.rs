@@ -14,6 +14,9 @@ use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
+use super::enrichment_jobs::{
+    EnrichmentCapability, EnrichmentScope, EnrichmentTrigger, JobStart, ScanEnrichmentOptions,
+};
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
 use super::{PipelineResult, RnaHandler};
@@ -179,9 +182,27 @@ impl RnaHandler {
         let lsp_status = Arc::clone(&self.lsp_status);
         let scan_stats = Arc::clone(&self.scan_stats);
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::CallReferences,
+            EnrichmentScope::ChangedFiles,
+            EnrichmentTrigger::BackgroundScan,
+            None,
+        ) {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => {
+                tracing::info!(
+                    "[background-lsp] joining active LSP job {}",
+                    existing_job_id
+                );
+                return tokio::spawn(async {});
+            }
+        };
+        let jobs = Arc::clone(&self.enrichment_jobs);
 
         tokio::spawn(async move {
             let t0 = std::time::Instant::now();
+            jobs.mark_running(&repo_root, &job_id, "lsp");
             tracing::info!(
                 "[background-lsp] Starting LSP enrichment: {} nodes, {} edges",
                 nodes.len(),
@@ -231,8 +252,15 @@ impl RnaHandler {
                                 && matches!(e.kind, crate::graph::EdgeKind::Calls)
                         })
                         .count();
+                    jobs.mark_progress(
+                        &repo_root,
+                        &job_id,
+                        "lsp_edges",
+                        lsp_call_edge_count,
+                        Some(lsp_edge_count),
+                    );
+                    lsp_status.set_complete(lsp_call_edge_count);
                     if lsp_edge_count > 0 {
-                        lsp_status.set_complete(lsp_call_edge_count);
                         tracing::info!(
                             "[background-lsp] LSP enrichment complete: {} LSP call edges, {} total LSP edges in {:.2}s",
                             lsp_call_edge_count,
@@ -240,9 +268,8 @@ impl RnaHandler {
                             t0.elapsed().as_secs_f64()
                         );
                     } else {
-                        lsp_status.set_unavailable();
                         tracing::info!(
-                            "[background-lsp] LSP enrichment produced no edges in {:.2}s",
+                            "[background-lsp] LSP enrichment completed with no edges in {:.2}s",
                             t0.elapsed().as_secs_f64()
                         );
                     }
@@ -374,6 +401,12 @@ impl RnaHandler {
                         enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                     }
 
+                    jobs.mark_persisting(
+                        &repo_root,
+                        &job_id,
+                        enriched_nodes.len(),
+                        enriched_edges.len(),
+                    );
                     // Persist to LanceDB with LSP edges
                     {
                         let _lance_guard = lance_write_lock.lock().await;
@@ -385,6 +418,7 @@ impl RnaHandler {
                         .await
                         {
                             tracing::error!("[background-lsp] LanceDB persist failed: {}", e);
+                            jobs.mark_failed(&repo_root, &job_id, format!("{}", e));
                         } else {
                             super::sentinel::write_extract_sentinel(
                                 &repo_root,
@@ -405,6 +439,12 @@ impl RnaHandler {
                                 "[background-lsp] LanceDB re-persisted with LSP edges: {} nodes, {} edges",
                                 enriched_nodes.len(),
                                 enriched_edges.len()
+                            );
+                            jobs.mark_completed(
+                                &repo_root,
+                                &job_id,
+                                enriched_nodes.len(),
+                                enriched_edges.len(),
                             );
                         }
                     }
@@ -430,6 +470,7 @@ impl RnaHandler {
                 Err(e) => {
                     tracing::error!("[background-lsp] LSP enrichment pipeline failed: {:#}", e);
                     lsp_status.set_unavailable();
+                    jobs.mark_failed(&repo_root, &job_id, format!("{}", e));
                 }
             }
         })
@@ -449,8 +490,26 @@ impl RnaHandler {
         let bg_embed_index = self.embed_index.clone();
         let bg_embed_status = self.embed_status.clone();
         let bg_nodes = all_nodes.to_vec();
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::Embeddings,
+            EnrichmentScope::Repo,
+            EnrichmentTrigger::BackgroundScan,
+            None,
+        ) {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => {
+                tracing::info!(
+                    "[background] joining active embedding job {}",
+                    existing_job_id
+                );
+                return tokio::spawn(async {});
+            }
+        };
+        let bg_jobs = Arc::clone(&self.enrichment_jobs);
 
         tokio::spawn(async move {
+            bg_jobs.mark_running(&bg_repo_root, &job_id, "embedding");
             let embeddable_nodes: Vec<Node> = bg_nodes
                 .iter()
                 .filter(|n| n.id.root != "external")
@@ -465,6 +524,13 @@ impl RnaHandler {
                 .filter(|n| n.id.kind.is_embeddable())
                 .count();
             embed_status.set_building(embeddable_count);
+            bg_jobs.mark_progress(
+                &bg_repo_root,
+                &job_id,
+                "embedding",
+                0,
+                Some(embeddable_count),
+            );
 
             let embed_fut = async move {
                 // Use BLAKE3 incremental reindex: hash-skip unchanged items
@@ -494,16 +560,19 @@ impl RnaHandler {
                                 embed_status.set_complete(count);
                                 // Atomic store -- no mutex needed
                                 embed_index_ref.store(Arc::new(Some(idx)));
+                                bg_jobs.mark_completed(&bg_repo_root, &job_id, count, count);
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding failed: {}", e);
                                 embed_status.set_failed(format!("{}", e));
+                                bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!("[background] EmbeddingIndex init failed: {}", e);
                         embed_status.set_failed(format!("{}", e));
+                        bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
                     }
                 }
             };
@@ -534,10 +603,25 @@ impl RnaHandler {
         let bg_scan_stats = Arc::clone(&self.scan_stats);
         let bg_nodes: Vec<Node> = nodes.to_vec();
         let bg_edges: Vec<Edge> = edges.to_vec();
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::CallReferences,
+            EnrichmentScope::Repo,
+            EnrichmentTrigger::Startup,
+            None,
+        ) {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => {
+                tracing::info!("[cache-hit bus] joining active LSP job {}", existing_job_id);
+                return;
+            }
+        };
+        let bg_jobs = Arc::clone(&self.enrichment_jobs);
 
         bg_lsp_status.set_running();
 
         tokio::spawn(async move {
+            bg_jobs.mark_running(&bg_repo_root, &job_id, "lsp");
             tracing::info!(
                 "[cache-hit bus] LSP enrichment via bus starting with {} nodes, {} edges",
                 bg_nodes.len(),
@@ -589,6 +673,7 @@ impl RnaHandler {
                 Err(e) => {
                     tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
                     bg_lsp_status.set_failed(&format!("{}", e));
+                    bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
                     return;
                 }
             };
@@ -618,6 +703,13 @@ impl RnaHandler {
                 .iter()
                 .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                 .count();
+            bg_jobs.mark_progress(
+                &bg_repo_root,
+                &job_id,
+                "lsp_edges",
+                lsp_call_edge_count,
+                Some(lsp_edge_count),
+            );
 
             tracing::info!(
                 "[cache-hit bus] LSP enrichment complete: {} LSP call edges, {} total LSP edges, {} total nodes",
@@ -647,6 +739,12 @@ impl RnaHandler {
                 }
             }
 
+            bg_jobs.mark_persisting(
+                &bg_repo_root,
+                &job_id,
+                enriched_nodes.len(),
+                enriched_edges.len(),
+            );
             // Persist enriched graph to LanceDB and write sentinel under the write lock
             // so no concurrent writer can interleave between persist and sentinel write.
             let persist_result = {
@@ -674,10 +772,17 @@ impl RnaHandler {
                     // nothing), not set_unavailable(). The sentinel is written to prevent repeated
                     // re-enrichment on repos that legitimately produce zero LSP edges.
                     bg_lsp_status.set_complete(lsp_call_edge_count);
+                    bg_jobs.mark_completed(
+                        &bg_repo_root,
+                        &job_id,
+                        enriched_nodes.len(),
+                        enriched_edges.len(),
+                    );
                 }
                 Err(e) => {
                     tracing::error!("[cache-hit bus] LSP persist failed: {:#}", e);
                     bg_lsp_status.set_complete_persist_failed(lsp_call_edge_count);
+                    bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
                 }
             }
         });
@@ -711,7 +816,11 @@ impl RnaHandler {
     /// full rebuild when no cache exists.
     ///
     /// The `on_progress` callback receives structured status messages.
-    pub async fn run_pipeline_foreground<F>(&self, on_progress: F) -> anyhow::Result<PipelineResult>
+    pub async fn run_pipeline_foreground<F>(
+        &self,
+        on_progress: F,
+        enrichment: ScanEnrichmentOptions,
+    ) -> anyhow::Result<PipelineResult>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -743,12 +852,17 @@ impl RnaHandler {
 
         if let Some(cached_state) = cached {
             return self
-                .run_pipeline_foreground_incremental(cached_state, on_progress, pipeline_start)
+                .run_pipeline_foreground_incremental(
+                    cached_state,
+                    on_progress,
+                    pipeline_start,
+                    enrichment,
+                )
                 .await;
         }
 
         // No cache -- full rebuild path.
-        self.run_pipeline_foreground_full(on_progress, pipeline_start)
+        self.run_pipeline_foreground_full(on_progress, pipeline_start, enrichment)
             .await
     }
 
@@ -759,6 +873,7 @@ impl RnaHandler {
         mut cached_state: GraphState,
         on_progress: F,
         pipeline_start: std::time::Instant,
+        enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<PipelineResult>
     where
         F: Fn(&str) + Send + Sync,
@@ -775,7 +890,7 @@ impl RnaHandler {
             // Clear sentinels -- they reference the old schema version and are now stale.
             super::sentinel::clear_sentinels(&self.repo_root);
             return self
-                .run_pipeline_foreground_full(on_progress, pipeline_start)
+                .run_pipeline_foreground_full(on_progress, pipeline_start, enrichment)
                 .await;
         }
 
@@ -847,10 +962,13 @@ impl RnaHandler {
                     call_count
                 ));
                 call_count
-            } else {
+            } else if enrichment.runs_lsp() {
                 // LSP sentinel absent or stale enrichment -- run full enrichment.
                 on_progress("LSP: running full enrichment...");
                 self.run_foreground_lsp_and_persist(&on_progress).await?
+            } else {
+                on_progress("LSP: skipped by scan options");
+                0
             };
 
             scanner.commit_state()?;
@@ -904,10 +1022,8 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Run incremental update on the local cached_state, then store atomically.
-        // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
         let _persist_succeeded = self
-            .update_graph_with_scan(&mut cached_state, Some(scan), false)
+            .update_graph_with_scan(&mut cached_state, Some(scan), enrichment)
             .await?;
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
@@ -969,7 +1085,7 @@ impl RnaHandler {
                 scan_stats: Some(Arc::clone(&self.scan_stats)),
                 embed_idx: None,
                 lance_repo_root: None,
-                skip_lsp: false,
+                skip_lsp: !enrichment.runs_lsp(),
             },
             dirty_slugs,
         )
@@ -1022,7 +1138,9 @@ impl RnaHandler {
                         self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-                self.lsp_status.set_complete(lsp_edge_count);
+                if enrichment.runs_lsp() {
+                    self.lsp_status.set_complete(lsp_edge_count);
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -1059,10 +1177,15 @@ impl RnaHandler {
                         e.context("Full persist failed during incremental foreground pipeline")
                     );
                 }
-                // Persist succeeded -- write both sentinels. Incremental path rewrites
-                // the full graph, so extraction is also complete after this persist.
+                // Persist succeeded -- write extraction sentinel. Write the LSP sentinel
+                // only when this invocation actually ran LSP; extract-only/no-lsp scans
+                // must leave call/reference readiness degraded and resumable.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
+                if enrichment.runs_lsp() {
+                    super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
+                } else {
+                    super::sentinel::clear_lsp_sentinel(&self.repo_root);
+                }
             }
         }
 
@@ -1109,13 +1232,14 @@ impl RnaHandler {
         &self,
         on_progress: F,
         pipeline_start: std::time::Instant,
+        enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<PipelineResult>
     where
         F: Fn(&str) + Send + Sync,
     {
         // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
         let t0 = std::time::Instant::now();
-        let graph_state = self.build_full_graph_inner(false).await?;
+        let graph_state = self.build_full_graph_inner(false, enrichment).await?;
         let scan_extract_time = t0.elapsed();
 
         let file_count = graph_state
@@ -1156,16 +1280,43 @@ impl RnaHandler {
             .cloned()
             .collect();
 
-        let server_name = self.lsp_status.server_name();
-        if let Some(ref name) = server_name {
-            on_progress(&format!("LSP: {} found on PATH", name));
-        }
-        self.lsp_status.set_running();
+        let (lsp_job_id, run_lsp_in_bus) = if enrichment.runs_lsp() {
+            let server_name = self.lsp_status.server_name();
+            if let Some(ref name) = server_name {
+                on_progress(&format!("LSP: {} found on PATH", name));
+            }
+            match self.enrichment_jobs.begin_job(
+                &self.repo_root,
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            ) {
+                JobStart::Started(job) => {
+                    self.lsp_status.set_running();
+                    self.enrichment_jobs
+                        .mark_running(&self.repo_root, &job.job_id, "lsp");
+                    (Some(job.job_id), true)
+                }
+                JobStart::Joined { existing_job_id } => {
+                    on_progress(&format!(
+                        "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
+                        existing_job_id
+                    ));
+                    (None, false)
+                }
+            }
+        } else {
+            (None, false)
+        };
 
         let embed_repo_root = self.repo_root.clone();
         let embed_index_ref = self.embed_index.clone();
         let embed_fut = async {
             let t1 = std::time::Instant::now();
+            if !enrichment.runs_embeddings() {
+                return (0, t1.elapsed());
+            }
             let count = match EmbeddingIndex::new(&embed_repo_root).await {
                 Ok(idx) => {
                     match idx
@@ -1210,7 +1361,7 @@ impl RnaHandler {
                     scan_stats: Some(Arc::clone(&self.scan_stats)),
                     embed_idx: None,
                     lance_repo_root: None,
-                    skip_lsp: false,
+                    skip_lsp: !run_lsp_in_bus,
                 },
                 None, // full rebuild: all roots dirty
             )
@@ -1249,6 +1400,15 @@ impl RnaHandler {
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
                     })
                     .count();
+                if let Some(job_id) = lsp_job_id.as_deref() {
+                    self.enrichment_jobs.mark_progress(
+                        &self.repo_root,
+                        job_id,
+                        "lsp_edges",
+                        lsp_edge_count,
+                        None,
+                    );
+                }
 
                 on_progress(&format!(
                     "Enrichment: {} LSP call edges via bus in {:.1}s",
@@ -1274,7 +1434,9 @@ impl RnaHandler {
                         self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-                self.lsp_status.set_complete(lsp_edge_count);
+                if run_lsp_in_bus {
+                    self.lsp_status.set_complete(lsp_edge_count);
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -1285,8 +1447,14 @@ impl RnaHandler {
                     "Enrichment: pipeline failed in {:.1}s -- graph has tree-sitter data only",
                     bus_time.as_secs_f64(),
                 ));
-                self.lsp_status.set_unavailable();
+                if run_lsp_in_bus {
+                    self.lsp_status.set_unavailable();
+                }
                 lsp_edge_count = 0;
+                if let Some(job_id) = lsp_job_id.as_deref() {
+                    self.enrichment_jobs
+                        .mark_failed(&self.repo_root, job_id, format!("{}", e));
+                }
             }
         }
 
@@ -1307,14 +1475,34 @@ impl RnaHandler {
                     edges.len(),
                     lsp_edge_count,
                 );
+                if let Some(job_id) = lsp_job_id.as_deref() {
+                    self.enrichment_jobs.mark_persisting(
+                        &self.repo_root,
+                        job_id,
+                        nodes.len(),
+                        edges.len(),
+                    );
+                }
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground full persist failed: {}", e);
                     return Err(e.context("Full persist failed during foreground pipeline"));
                 }
-                // Full persist succeeded (tree-sitter + LSP in one write) -- write
-                // both sentinels since the single persist covers both phases (#477).
+                // Full persist succeeded -- write extraction sentinel. The LSP sentinel
+                // is valid only when this invocation actually ran LSP.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
+                if run_lsp_in_bus {
+                    super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
+                } else if !enrichment.runs_lsp() {
+                    super::sentinel::clear_lsp_sentinel(&self.repo_root);
+                }
+                if let Some(job_id) = lsp_job_id.as_deref() {
+                    self.enrichment_jobs.mark_completed(
+                        &self.repo_root,
+                        job_id,
+                        nodes.len(),
+                        edges.len(),
+                    );
+                }
             }
         }
 
@@ -1367,7 +1555,27 @@ impl RnaHandler {
         if let Some(ref name) = server_name {
             on_progress(&format!("LSP: {} found on PATH", name));
         }
-        self.lsp_status.set_running();
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::CallReferences,
+            EnrichmentScope::Repo,
+            EnrichmentTrigger::ForegroundScan,
+            None,
+        ) {
+            JobStart::Started(job) => {
+                self.lsp_status.set_running();
+                self.enrichment_jobs
+                    .mark_running(&self.repo_root, &job.job_id, "lsp");
+                job.job_id
+            }
+            JobStart::Joined { existing_job_id } => {
+                on_progress(&format!(
+                    "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
+                    existing_job_id
+                ));
+                return Ok(0);
+            }
+        };
 
         on_progress("Enrichment: running pipeline via event bus (no sentinel)...");
 
@@ -1434,17 +1642,38 @@ impl RnaHandler {
                 }
                 self.lsp_status.set_complete(lsp_edge_count);
 
+                self.enrichment_jobs.mark_progress(
+                    &self.repo_root,
+                    &job_id,
+                    "lsp_edges",
+                    lsp_edge_count,
+                    None,
+                );
                 // Persist with enriched edges.
+                self.enrichment_jobs.mark_persisting(
+                    &self.repo_root,
+                    &job_id,
+                    enriched_nodes.len(),
+                    enriched_edges.len(),
+                );
                 if let Err(e) =
                     persist_graph_to_lance(&self.repo_root, &enriched_nodes, &enriched_edges).await
                 {
                     tracing::error!("Foreground LSP persist failed: {}", e);
+                    self.enrichment_jobs
+                        .mark_failed(&self.repo_root, &job_id, format!("{}", e));
                     return Err(e.context("LSP persist failed during foreground pipeline"));
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
                 // LSP enrichment is durable and can skip re-enrichment (#477).
                 super::sentinel::write_lsp_sentinel(
                     &self.repo_root,
+                    enriched_nodes.len(),
+                    enriched_edges.len(),
+                );
+                self.enrichment_jobs.mark_completed(
+                    &self.repo_root,
+                    &job_id,
                     enriched_nodes.len(),
                     enriched_edges.len(),
                 );
@@ -1458,6 +1687,8 @@ impl RnaHandler {
                 );
                 on_progress("Enrichment: pipeline failed -- no LSP edges available");
                 self.lsp_status.set_unavailable();
+                self.enrichment_jobs
+                    .mark_failed(&self.repo_root, &job_id, format!("{}", e));
                 Ok(0)
             }
         }
