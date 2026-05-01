@@ -7,11 +7,14 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::store::SCHEMA_VERSION;
@@ -226,14 +229,13 @@ impl EnrichmentJobLedger {
         scope: EnrichmentScope,
         trigger: EnrichmentTrigger,
         root: Option<String>,
-    ) -> JobStart {
+    ) -> Result<JobStart> {
         let repo = normalize_repo(repo_root);
         let key = JobKey {
             repo: repo.clone(),
             capability,
             scope: scope.stable_key(),
         };
-
 
         let now = unix_now();
         let job = EnrichmentJobRecord {
@@ -257,7 +259,7 @@ impl EnrichmentJobLedger {
         {
             let _guard = self.io_lock.lock().unwrap();
             let _file_lock = JobFileLock::acquire(repo_root);
-            let mut store = read_store(repo_root);
+            let mut store = read_store(repo_root)?;
             let mut active = self.active.lock().unwrap();
 
             if let Some(existing_job_id) = active.get(&key).cloned() {
@@ -270,8 +272,8 @@ impl EnrichmentJobLedger {
                         message: Some("overlapping request joined existing active job".to_string()),
                         counters: EnrichmentCounters::empty(),
                     });
-                    write_store(repo_root, &store);
-                    return JobStart::Joined { existing_job_id };
+                    write_store(repo_root, &store)?;
+                    return Ok(JobStart::Joined { existing_job_id });
                 }
                 active.remove(&key);
             }
@@ -308,10 +310,10 @@ impl EnrichmentJobLedger {
                 message: Some("job created".to_string()),
                 counters: job.counters.clone(),
             });
+            write_store(repo_root, &store)?;
             active.insert(key, job.job_id.clone());
-            write_store(repo_root, &store);
         }
-        JobStart::Started(Box::new(job))
+        Ok(JobStart::Started(Box::new(job)))
     }
 
     pub fn mark_running(&self, repo_root: &Path, job_id: &str, phase: impl Into<String>) {
@@ -438,7 +440,13 @@ impl EnrichmentJobLedger {
     }
 
     pub fn recent_jobs(&self, repo_root: &Path, limit: usize) -> Vec<EnrichmentJobRecord> {
-        let mut jobs = read_store(repo_root).jobs;
+        let mut jobs = match read_store(repo_root) {
+            Ok(store) => store.jobs,
+            Err(e) => {
+                tracing::warn!("Failed to read enrichment job ledger: {}", e);
+                Vec::new()
+            }
+        };
         jobs.retain(|job| job.schema_version == SCHEMA_VERSION);
         jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
         jobs.truncate(limit);
@@ -446,18 +454,29 @@ impl EnrichmentJobLedger {
     }
 
     pub fn events_for_job(&self, repo_root: &Path, job_id: &str) -> Vec<EnrichmentJobEvent> {
-        read_store(repo_root)
-            .events
-            .into_iter()
-            .filter(|event| event.job_id == job_id)
-            .collect()
+        match read_store(repo_root) {
+            Ok(store) => store
+                .events
+                .into_iter()
+                .filter(|event| event.job_id == job_id)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Failed to read enrichment job ledger events: {}", e);
+                Vec::new()
+            }
+        }
     }
-
 
     fn update_job(&self, repo_root: &Path, job_id: &str, update: JobUpdate) {
         let _guard = self.io_lock.lock().unwrap();
         let _file_lock = JobFileLock::acquire(repo_root);
-        let mut store = read_store(repo_root);
+        let mut store = match read_store(repo_root) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!("Failed to read enrichment job ledger for update: {}", e);
+                return;
+            }
+        };
         let now = unix_now();
         let mut event_counters = EnrichmentCounters::empty();
         let mut key_to_clear = None;
@@ -494,7 +513,14 @@ impl EnrichmentJobLedger {
             message: update.failure.or(update.superseded_by),
             counters: event_counters,
         });
-        write_store(repo_root, &store);
+        if let Err(e) = write_store(repo_root, &store) {
+            tracing::warn!(
+                "Failed to persist enrichment job update for {}: {}",
+                job_id,
+                e
+            );
+            return;
+        }
 
         if let Some(key) = key_to_clear {
             let mut active = self.active.lock().unwrap();
@@ -533,12 +559,14 @@ fn ledger_path(repo_root: &Path) -> PathBuf {
 
 struct JobFileLock {
     path: PathBuf,
+    owner: String,
     acquired: bool,
 }
 
 impl JobFileLock {
     fn acquire(repo_root: &Path) -> Self {
         let path = ledger_path(repo_root).with_extension("lock");
+        let owner = std::process::id().to_string();
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
@@ -547,18 +575,32 @@ impl JobFileLock {
 
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => {
+                Ok(mut file) => {
+                    if let Err(e) = writeln!(file, "{}", owner) {
+                        tracing::warn!(
+                            "Failed to write enrichment job lock owner {}; continuing with process-local lock only: {}",
+                            path.display(),
+                            e
+                        );
+                        let _ = fs::remove_file(&path);
+                        return Self {
+                            path,
+                            owner,
+                            acquired: false,
+                        };
+                    }
                     return Self {
                         path,
+                        owner,
                         acquired: true,
                     };
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
+                    if lock_owner_is_dead(&path) {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    thread::sleep(Duration::from_millis(25));
+                    thread::sleep(std::time::Duration::from_millis(25));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -568,6 +610,7 @@ impl JobFileLock {
                     );
                     return Self {
                         path,
+                        owner,
                         acquired: false,
                     };
                 }
@@ -578,18 +621,34 @@ impl JobFileLock {
 
 impl Drop for JobFileLock {
     fn drop(&mut self) {
-        if self.acquired {
+        if self.acquired && lock_is_owned_by(&self.path, &self.owner) {
             let _ = fs::remove_file(&self.path);
         }
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|elapsed| elapsed > Duration::from_secs(300))
+fn lock_is_owned_by(path: &Path, owner: &str) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.trim() == owner)
+        .unwrap_or(false)
+}
+
+fn lock_owner_is_dead(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(false)
 }
 
 fn unix_now() -> u64 {
@@ -599,41 +658,49 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn read_store(repo_root: &Path) -> EnrichmentJobStore {
+fn read_store(repo_root: &Path) -> Result<EnrichmentJobStore> {
     let path = ledger_path(repo_root);
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return EnrichmentJobStore::default();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    if !path.exists() {
+        return Ok(EnrichmentJobStore::default());
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read enrichment job ledger {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse enrichment job ledger {}", path.display()))
 }
 
-fn write_store(repo_root: &Path, store: &EnrichmentJobStore) {
+fn write_store(repo_root: &Path, store: &EnrichmentJobStore) -> Result<()> {
     let path = ledger_path(repo_root);
-    let Some(parent) = path.parent() else {
-        tracing::warn!(
-            "Enrichment job ledger path has no parent: {}",
+    let parent = path.parent().with_context(|| {
+        format!(
+            "enrichment job ledger path has no parent: {}",
             path.display()
-        );
-        return;
-    };
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        tracing::warn!("Failed to create enrichment job ledger directory: {}", e);
-        return;
-    }
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create enrichment job ledger directory {}",
+            parent.display()
+        )
+    })?;
     let tmp_path = path.with_extension("tmp");
-    match serde_json::to_string_pretty(store) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&tmp_path, json) {
-                tracing::warn!("Failed to write enrichment job ledger temp file: {}", e);
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                tracing::warn!("Failed to rename enrichment job ledger into place: {}", e);
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        }
-        Err(e) => tracing::warn!("Failed to serialize enrichment job ledger: {}", e),
-    }
+    let json =
+        serde_json::to_string_pretty(store).context("failed to serialize enrichment job ledger")?;
+    fs::write(&tmp_path, json).with_context(|| {
+        format!(
+            "failed to write enrichment job ledger temp file {}",
+            tmp_path.display()
+        )
+    })?;
+    fs::rename(&tmp_path, &path).with_context(|| {
+        let _ = fs::remove_file(&tmp_path);
+        format!(
+            "failed to rename enrichment job ledger temp file {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -645,13 +712,16 @@ mod tests {
     fn job_transitions_are_persisted() {
         let tmp = TempDir::new().unwrap();
         let ledger = EnrichmentJobLedger::default();
-        let job = match ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::CallReferences,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
-            None,
-        ) {
+        let job = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap()
+        {
             JobStart::Started(job) => job,
             JobStart::Joined { .. } => panic!("first job should start"),
         };
@@ -676,25 +746,30 @@ mod tests {
     fn overlapping_same_key_joins_active_job() {
         let tmp = TempDir::new().unwrap();
         let ledger = EnrichmentJobLedger::default();
-        let first = match ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::Embeddings,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::BackgroundScan,
-            None,
-        ) {
+        let first = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::BackgroundScan,
+                None,
+            )
+            .unwrap()
+        {
             JobStart::Started(job) => job,
             JobStart::Joined { .. } => panic!("first job should start"),
         };
         ledger.mark_running(tmp.path(), &first.job_id, "embedding");
 
-        let second = ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::Embeddings,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
-            None,
-        );
+        let second = ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap();
 
         assert_eq!(
             second,
@@ -709,25 +784,30 @@ mod tests {
     fn terminal_job_releases_active_key() {
         let tmp = TempDir::new().unwrap();
         let ledger = EnrichmentJobLedger::default();
-        let first = match ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::Embeddings,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::BackgroundScan,
-            None,
-        ) {
+        let first = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::BackgroundScan,
+                None,
+            )
+            .unwrap()
+        {
             JobStart::Started(job) => job,
             JobStart::Joined { .. } => panic!("first job should start"),
         };
         ledger.mark_failed(tmp.path(), &first.job_id, "boom");
 
-        let second = ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::Embeddings,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
-            None,
-        );
+        let second = ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap();
 
         assert!(matches!(second, JobStart::Started(_)));
         assert_eq!(ledger.recent_jobs(tmp.path(), 10).len(), 2);
@@ -756,26 +836,32 @@ mod tests {
     fn new_job_supersedes_stale_non_terminal_job_from_store() {
         let tmp = TempDir::new().unwrap();
         let ledger = EnrichmentJobLedger::default();
-        let first = match ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::CallReferences,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
-            None,
-        ) {
+        let first = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap()
+        {
             JobStart::Started(job) => job,
             JobStart::Joined { .. } => panic!("first job should start"),
         };
         ledger.mark_running(tmp.path(), &first.job_id, "lsp");
 
         let restarted_ledger = EnrichmentJobLedger::default();
-        let second = match restarted_ledger.begin_job(
-            tmp.path(),
-            EnrichmentCapability::CallReferences,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
-            None,
-        ) {
+        let second = match restarted_ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap()
+        {
             JobStart::Started(job) => job,
             JobStart::Joined { .. } => panic!("stale persisted job should be superseded"),
         };

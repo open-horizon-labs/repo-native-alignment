@@ -189,12 +189,16 @@ impl RnaHandler {
             EnrichmentTrigger::BackgroundScan,
             None,
         ) {
-            JobStart::Started(job) => job.job_id,
-            JobStart::Joined { existing_job_id } => {
+            Ok(JobStart::Started(job)) => job.job_id,
+            Ok(JobStart::Joined { existing_job_id }) => {
                 tracing::info!(
                     "[background-lsp] joining active LSP job {}",
                     existing_job_id
                 );
+                return tokio::spawn(async {});
+            }
+            Err(e) => {
+                tracing::warn!("[background-lsp] failed to begin LSP job: {}", e);
                 return tokio::spawn(async {});
             }
         };
@@ -497,12 +501,16 @@ impl RnaHandler {
             EnrichmentTrigger::BackgroundScan,
             None,
         ) {
-            JobStart::Started(job) => job.job_id,
-            JobStart::Joined { existing_job_id } => {
+            Ok(JobStart::Started(job)) => job.job_id,
+            Ok(JobStart::Joined { existing_job_id }) => {
                 tracing::info!(
                     "[background] joining active embedding job {}",
                     existing_job_id
                 );
+                return tokio::spawn(async {});
+            }
+            Err(e) => {
+                tracing::warn!("[background] failed to begin embedding job: {}", e);
                 return tokio::spawn(async {});
             }
         };
@@ -610,9 +618,13 @@ impl RnaHandler {
             EnrichmentTrigger::Startup,
             None,
         ) {
-            JobStart::Started(job) => job.job_id,
-            JobStart::Joined { existing_job_id } => {
+            Ok(JobStart::Started(job)) => job.job_id,
+            Ok(JobStart::Joined { existing_job_id }) => {
                 tracing::info!("[cache-hit bus] joining active LSP job {}", existing_job_id);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("[cache-hit bus] failed to begin LSP job: {}", e);
                 return;
             }
         };
@@ -1295,7 +1307,7 @@ impl RnaHandler {
                 EnrichmentScope::Repo,
                 EnrichmentTrigger::ForegroundScan,
                 None,
-            ) {
+            )? {
                 JobStart::Started(job) => {
                     self.lsp_status.set_running();
                     self.enrichment_jobs
@@ -1323,7 +1335,7 @@ impl RnaHandler {
                 EnrichmentScope::Repo,
                 EnrichmentTrigger::ForegroundScan,
                 None,
-            ) {
+            )? {
                 JobStart::Started(job) => {
                     self.enrichment_jobs
                         .mark_running(&self.repo_root, &job.job_id, "embedding");
@@ -1609,7 +1621,7 @@ impl RnaHandler {
             EnrichmentScope::Repo,
             EnrichmentTrigger::ForegroundScan,
             None,
-        ) {
+        )? {
             JobStart::Started(job) => {
                 self.lsp_status.set_running();
                 self.enrichment_jobs
