@@ -1208,7 +1208,8 @@ impl RnaHandler {
             // are produced by the background enricher and would otherwise be lost on
             // every incremental rebuild.
             let mut lsp_carry_count = 0usize;
-            if *root_changed
+            if enrichment.runs_lsp()
+                && *root_changed
                 && has_cached_graph
                 && let Some(cached_edges) = cached_edges_by_root.remove(root_slug)
             {
@@ -1404,6 +1405,18 @@ impl RnaHandler {
                 } else {
                     self.lsp_status.set_unavailable();
                 }
+            }
+        }
+
+        if !enrichment.runs_lsp() {
+            let before_lsp_strip = all_edges.len();
+            all_edges.retain(|edge| edge.source != crate::graph::ExtractionSource::Lsp);
+            let stripped = before_lsp_strip.saturating_sub(all_edges.len());
+            if stripped > 0 {
+                tracing::info!(
+                    "Skipped LSP enrichment -- stripped {} cached LSP edges before persist",
+                    stripped
+                );
             }
         }
 

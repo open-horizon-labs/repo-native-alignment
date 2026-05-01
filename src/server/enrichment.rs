@@ -1058,11 +1058,13 @@ impl RnaHandler {
             (gs.nodes.clone(), gs.edges.clone())
         };
 
-        let server_name = self.lsp_status.server_name();
-        if let Some(ref name) = server_name {
-            on_progress(&format!("LSP: {} found on PATH", name));
+        if enrichment.runs_lsp() {
+            let server_name = self.lsp_status.server_name();
+            if let Some(ref name) = server_name {
+                on_progress(&format!("LSP: {} found on PATH", name));
+            }
+            self.lsp_status.set_running();
         }
-        self.lsp_status.set_running();
 
         on_progress(&format!(
             "Enrichment: running pipeline via event bus ({} changed files)...",
@@ -1151,7 +1153,9 @@ impl RnaHandler {
                     "Enrichment: pipeline failed in {:.1}s -- graph has tree-sitter data only",
                     bus_time.as_secs_f64(),
                 ));
-                self.lsp_status.set_unavailable();
+                if enrichment.runs_lsp() {
+                    self.lsp_status.set_unavailable();
+                }
                 lsp_edge_count = 0;
             }
         }
@@ -1312,9 +1316,34 @@ impl RnaHandler {
 
         let embed_repo_root = self.repo_root.clone();
         let embed_index_ref = self.embed_index.clone();
+        let (embed_job_id, run_embed_job) = if enrichment.runs_embeddings() {
+            match self.enrichment_jobs.begin_job(
+                &self.repo_root,
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            ) {
+                JobStart::Started(job) => {
+                    self.enrichment_jobs
+                        .mark_running(&self.repo_root, &job.job_id, "embedding");
+                    (Some(job.job_id), true)
+                }
+                JobStart::Joined { existing_job_id } => {
+                    on_progress(&format!(
+                        "Embed: joined active enrichment job {}; skipping duplicate foreground embedding",
+                        existing_job_id
+                    ));
+                    (None, false)
+                }
+            }
+        } else {
+            (None, false)
+        };
+        let embed_jobs = Arc::clone(&self.enrichment_jobs);
         let embed_fut = async {
             let t1 = std::time::Instant::now();
-            if !enrichment.runs_embeddings() {
+            if !run_embed_job {
                 return (0, t1.elapsed());
             }
             let count = match EmbeddingIndex::new(&embed_repo_root).await {
@@ -1324,17 +1353,29 @@ impl RnaHandler {
                         .await
                     {
                         Ok(count) => {
+                            if let Some(job_id) = embed_job_id.as_deref() {
+                                embed_jobs.mark_persisting(&embed_repo_root, job_id, count, count);
+                            }
                             embed_index_ref.store(Arc::new(Some(idx)));
+                            if let Some(job_id) = embed_job_id.as_deref() {
+                                embed_jobs.mark_completed(&embed_repo_root, job_id, count, count);
+                            }
                             count
                         }
                         Err(e) => {
                             tracing::warn!("Embed: failed -- {}", e);
+                            if let Some(job_id) = embed_job_id.as_deref() {
+                                embed_jobs.mark_failed(&embed_repo_root, job_id, format!("{}", e));
+                            }
                             0
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Embed: init failed -- {}", e);
+                    if let Some(job_id) = embed_job_id.as_deref() {
+                        embed_jobs.mark_failed(&embed_repo_root, job_id, format!("{}", e));
+                    }
                     0
                 }
             };
@@ -1485,6 +1526,13 @@ impl RnaHandler {
                 }
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground full persist failed: {}", e);
+                    if let Some(job_id) = lsp_job_id.as_deref() {
+                        self.enrichment_jobs.mark_failed(
+                            &self.repo_root,
+                            job_id,
+                            format!("Full persist failed during foreground pipeline: {}", e),
+                        );
+                    }
                     return Err(e.context("Full persist failed during foreground pipeline"));
                 }
                 // Full persist succeeded -- write extraction sentinel. The LSP sentinel

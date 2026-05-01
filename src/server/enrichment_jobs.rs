@@ -6,9 +6,11 @@
 //! cannot emit indistinguishable progress for the same capability.
 
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -232,19 +234,6 @@ impl EnrichmentJobLedger {
             scope: scope.stable_key(),
         };
 
-        if let Some(existing_job_id) = self.active.lock().unwrap().get(&key).cloned()
-            && self.job_is_active(repo_root, &existing_job_id)
-        {
-            self.append_event(
-                repo_root,
-                &existing_job_id,
-                EnrichmentJobState::Running,
-                Some("joined".to_string()),
-                Some("overlapping request joined existing active job".to_string()),
-                EnrichmentCounters::empty(),
-            );
-            return JobStart::Joined { existing_job_id };
-        }
 
         let now = unix_now();
         let job = EnrichmentJobRecord {
@@ -267,7 +256,26 @@ impl EnrichmentJobLedger {
 
         {
             let _guard = self.io_lock.lock().unwrap();
+            let _file_lock = JobFileLock::acquire(repo_root);
             let mut store = read_store(repo_root);
+            let mut active = self.active.lock().unwrap();
+
+            if let Some(existing_job_id) = active.get(&key).cloned() {
+                if store_job_is_active(&store, &existing_job_id) {
+                    store.events.push(EnrichmentJobEvent {
+                        job_id: existing_job_id.clone(),
+                        timestamp: now,
+                        state: EnrichmentJobState::Running,
+                        phase: Some("joined".to_string()),
+                        message: Some("overlapping request joined existing active job".to_string()),
+                        counters: EnrichmentCounters::empty(),
+                    });
+                    write_store(repo_root, &store);
+                    return JobStart::Joined { existing_job_id };
+                }
+                active.remove(&key);
+            }
+
             let mut superseded_events = Vec::new();
             for existing in store.jobs.iter_mut().filter(|existing| {
                 existing.schema_version == SCHEMA_VERSION
@@ -300,9 +308,9 @@ impl EnrichmentJobLedger {
                 message: Some("job created".to_string()),
                 counters: job.counters.clone(),
             });
+            active.insert(key, job.job_id.clone());
             write_store(repo_root, &store);
         }
-        self.active.lock().unwrap().insert(key, job.job_id.clone());
         JobStart::Started(Box::new(job))
     }
 
@@ -445,38 +453,10 @@ impl EnrichmentJobLedger {
             .collect()
     }
 
-    fn job_is_active(&self, repo_root: &Path, job_id: &str) -> bool {
-        read_store(repo_root)
-            .jobs
-            .into_iter()
-            .find(|job| job.job_id == job_id)
-            .is_some_and(|job| job.schema_version == SCHEMA_VERSION && !job.state.is_terminal())
-    }
-
-    fn append_event(
-        &self,
-        repo_root: &Path,
-        job_id: &str,
-        state: EnrichmentJobState,
-        phase: Option<String>,
-        message: Option<String>,
-        counters: EnrichmentCounters,
-    ) {
-        let _guard = self.io_lock.lock().unwrap();
-        let mut store = read_store(repo_root);
-        store.events.push(EnrichmentJobEvent {
-            job_id: job_id.to_string(),
-            timestamp: unix_now(),
-            state,
-            phase,
-            message,
-            counters,
-        });
-        write_store(repo_root, &store);
-    }
 
     fn update_job(&self, repo_root: &Path, job_id: &str, update: JobUpdate) {
         let _guard = self.io_lock.lock().unwrap();
+        let _file_lock = JobFileLock::acquire(repo_root);
         let mut store = read_store(repo_root);
         let now = unix_now();
         let mut event_counters = EnrichmentCounters::empty();
@@ -528,6 +508,14 @@ impl EnrichmentJobLedger {
     }
 }
 
+fn store_job_is_active(store: &EnrichmentJobStore, job_id: &str) -> bool {
+    store
+        .jobs
+        .iter()
+        .find(|job| job.job_id == job_id)
+        .is_some_and(|job| job.schema_version == SCHEMA_VERSION && !job.state.is_terminal())
+}
+
 fn normalize_repo(repo_root: &Path) -> String {
     repo_root
         .canonicalize()
@@ -541,6 +529,67 @@ fn ledger_path(repo_root: &Path) -> PathBuf {
         .join(".oh")
         .join(".cache")
         .join("enrichment_jobs.json")
+}
+
+struct JobFileLock {
+    path: PathBuf,
+    acquired: bool,
+}
+
+impl JobFileLock {
+    fn acquire(repo_root: &Path) -> Self {
+        let path = ledger_path(repo_root).with_extension("lock");
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            tracing::warn!("Failed to create enrichment job lock directory: {}", e);
+        }
+
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => {
+                    return Self {
+                        path,
+                        acquired: true,
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to acquire enrichment job file lock {}; continuing with process-local lock only: {}",
+                        path.display(),
+                        e
+                    );
+                    return Self {
+                        path,
+                        acquired: false,
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for JobFileLock {
+    fn drop(&mut self) {
+        if self.acquired {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed > Duration::from_secs(300))
 }
 
 fn unix_now() -> u64 {
