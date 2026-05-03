@@ -159,6 +159,8 @@ impl EnrichmentCounters {
     }
 }
 
+const JOB_LEASE_SECONDS: u64 = 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnrichmentJobRecord {
     pub job_id: String,
@@ -175,6 +177,8 @@ pub struct EnrichmentJobRecord {
     pub completed_at: Option<u64>,
     pub failure: Option<String>,
     pub superseded_by: Option<String>,
+    pub owner_id: Option<String>,
+    pub lease_expires_at: Option<u64>,
     pub schema_version: u32,
 }
 
@@ -238,6 +242,7 @@ impl EnrichmentJobLedger {
         };
 
         let now = unix_now();
+        let owner_id = process_owner_id();
         let job = EnrichmentJobRecord {
             job_id: format!("{}-{}", capability.as_str(), uuid::Uuid::new_v4()),
             repo,
@@ -253,6 +258,8 @@ impl EnrichmentJobLedger {
             completed_at: None,
             failure: None,
             superseded_by: None,
+            owner_id: Some(owner_id.clone()),
+            lease_expires_at: Some(now + JOB_LEASE_SECONDS),
             schema_version: SCHEMA_VERSION,
         };
 
@@ -263,7 +270,7 @@ impl EnrichmentJobLedger {
             let mut active = self.active.lock().unwrap();
 
             if let Some(existing_job_id) = active.get(&key).cloned() {
-                if store_job_is_active(&store, &existing_job_id) {
+                if store_job_is_active(&store, &existing_job_id, now) {
                     store.events.push(EnrichmentJobEvent {
                         job_id: existing_job_id.clone(),
                         timestamp: now,
@@ -278,19 +285,39 @@ impl EnrichmentJobLedger {
                 active.remove(&key);
             }
 
+            if let Some(existing_job_id) = store
+                .jobs
+                .iter()
+                .find(|existing| {
+                    matching_job_key(existing, &job, &key) && persisted_job_is_live(existing, now)
+                })
+                .map(|existing| existing.job_id.clone())
+            {
+                store.events.push(EnrichmentJobEvent {
+                    job_id: existing_job_id.clone(),
+                    timestamp: now,
+                    state: EnrichmentJobState::Running,
+                    phase: Some("joined".to_string()),
+                    message: Some("overlapping request joined live persisted job".to_string()),
+                    counters: EnrichmentCounters::empty(),
+                });
+                write_store(repo_root, &store)?;
+                return Ok(JobStart::Joined { existing_job_id });
+            }
+
             let mut superseded_events = Vec::new();
-            for existing in store.jobs.iter_mut().filter(|existing| {
-                existing.schema_version == SCHEMA_VERSION
-                    && !existing.state.is_terminal()
-                    && existing.repo == job.repo
-                    && existing.capability == job.capability
-                    && existing.scope.stable_key() == key.scope
-            }) {
+            for existing in store
+                .jobs
+                .iter_mut()
+                .filter(|existing| matching_job_key(existing, &job, &key))
+            {
                 existing.state = EnrichmentJobState::Superseded;
                 existing.phase = Some("superseded".to_string());
                 existing.updated_at = now;
                 existing.completed_at = Some(now);
                 existing.superseded_by = Some(job.job_id.clone());
+                existing.owner_id = None;
+                existing.lease_expires_at = None;
                 superseded_events.push(EnrichmentJobEvent {
                     job_id: existing.job_id.clone(),
                     timestamp: now,
@@ -496,6 +523,13 @@ impl EnrichmentJobLedger {
             }
             job.updated_at = now;
             if update.state.is_terminal() {
+                job.lease_expires_at = None;
+                job.owner_id = None;
+            } else {
+                job.owner_id = Some(process_owner_id());
+                job.lease_expires_at = Some(now + JOB_LEASE_SECONDS);
+            }
+            if update.state.is_terminal() {
                 job.completed_at = Some(now);
                 key_to_clear = Some(JobKey {
                     repo: job.repo.clone(),
@@ -534,12 +568,44 @@ impl EnrichmentJobLedger {
     }
 }
 
-fn store_job_is_active(store: &EnrichmentJobStore, job_id: &str) -> bool {
+fn matching_job_key(
+    job: &EnrichmentJobRecord,
+    new_job: &EnrichmentJobRecord,
+    key: &JobKey,
+) -> bool {
+    job.schema_version == SCHEMA_VERSION
+        && !job.state.is_terminal()
+        && job.repo == new_job.repo
+        && job.capability == new_job.capability
+        && job.scope.stable_key() == key.scope
+}
+
+fn store_job_is_active(store: &EnrichmentJobStore, job_id: &str, now: u64) -> bool {
     store
         .jobs
         .iter()
         .find(|job| job.job_id == job_id)
-        .is_some_and(|job| job.schema_version == SCHEMA_VERSION && !job.state.is_terminal())
+        .is_some_and(|job| persisted_job_is_live(job, now))
+}
+
+fn persisted_job_is_live(job: &EnrichmentJobRecord, now: u64) -> bool {
+    job.schema_version == SCHEMA_VERSION
+        && !job.state.is_terminal()
+        && job
+            .lease_expires_at
+            .is_some_and(|expires_at| expires_at >= now)
+        && job.owner_id.as_deref().is_some_and(process_owner_is_alive)
+}
+
+fn process_owner_id() -> String {
+    std::process::id().to_string()
+}
+
+fn process_owner_is_alive(owner: &str) -> bool {
+    let Ok(pid) = owner.parse::<u32>() else {
+        return false;
+    };
+    process_is_alive(pid)
 }
 
 fn normalize_repo(repo_root: &Path) -> String {
@@ -637,17 +703,18 @@ fn lock_owner_is_dead(path: &Path) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return true;
     };
-    let Ok(pid) = content.trim().parse::<u32>() else {
-        return true;
-    };
+    !process_owner_is_alive(content.trim())
+}
+
+fn process_is_alive(pid: u32) -> bool {
     if pid == std::process::id() {
-        return false;
+        return true;
     }
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .status()
-        .map(|status| !status.success())
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -833,6 +900,48 @@ mod tests {
     }
 
     #[test]
+    fn new_ledger_joins_live_persisted_job() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let first = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("first job should start"),
+        };
+        ledger.mark_running(tmp.path(), &first.job_id, "lsp");
+
+        let restarted_ledger = EnrichmentJobLedger::default();
+        let second = restarted_ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            second,
+            JobStart::Joined {
+                existing_job_id: first.job_id.clone()
+            }
+        );
+        let jobs = restarted_ledger.recent_jobs(tmp.path(), 10);
+        let first_after = jobs.iter().find(|job| job.job_id == first.job_id).unwrap();
+        assert_eq!(first_after.state, EnrichmentJobState::Running);
+        assert!(first_after.lease_expires_at.is_some());
+    }
+
+    #[test]
     fn new_job_supersedes_stale_non_terminal_job_from_store() {
         let tmp = TempDir::new().unwrap();
         let ledger = EnrichmentJobLedger::default();
@@ -850,6 +959,15 @@ mod tests {
             JobStart::Joined { .. } => panic!("first job should start"),
         };
         ledger.mark_running(tmp.path(), &first.job_id, "lsp");
+        let mut store = read_store(tmp.path()).unwrap();
+        let stale = store
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == first.job_id)
+            .unwrap();
+        stale.owner_id = None;
+        stale.lease_expires_at = Some(unix_now().saturating_sub(1));
+        write_store(tmp.path(), &store).unwrap();
 
         let restarted_ledger = EnrichmentJobLedger::default();
         let second = match restarted_ledger

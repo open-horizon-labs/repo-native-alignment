@@ -1088,6 +1088,7 @@ impl RnaHandler {
         let dirty_slugs: Option<std::collections::HashSet<String>> =
             Some(std::iter::once(primary_slug.clone()).collect());
 
+        let mut lsp_stage_completed = false;
         let t2 = std::time::Instant::now();
         let bus_result = crate::extract::consumers::emit_enrichment_pipeline(
             all_nodes,
@@ -1154,6 +1155,7 @@ impl RnaHandler {
                 }
                 if enrichment.runs_lsp() {
                     self.lsp_status.set_complete(lsp_edge_count);
+                    lsp_stage_completed = true;
                 }
             }
             Err(e) => {
@@ -1189,15 +1191,16 @@ impl RnaHandler {
                 );
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground incremental persist failed: {}", e);
+                    super::sentinel::clear_lsp_sentinel(&self.repo_root);
                     return Err(
                         e.context("Full persist failed during incremental foreground pipeline")
                     );
                 }
-                // Persist succeeded -- write extraction sentinel. Write the LSP sentinel
-                // only when this invocation actually ran LSP; extract-only/no-lsp scans
-                // must leave call/reference readiness degraded and resumable.
+                // Persist succeeded -- write extraction sentinel. The LSP sentinel
+                // is valid only when this invocation completed LSP and persisted
+                // the resulting graph in this block.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                if enrichment.runs_lsp() {
+                if lsp_stage_completed {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
@@ -1423,6 +1426,7 @@ impl RnaHandler {
             (result, elapsed)
         };
 
+        let mut lsp_stage_completed = false;
         let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
@@ -1489,6 +1493,7 @@ impl RnaHandler {
                 }
                 if run_lsp_in_bus {
                     self.lsp_status.set_complete(lsp_edge_count);
+                    lsp_stage_completed = true;
                 }
             }
             Err(e) => {
@@ -1545,14 +1550,16 @@ impl RnaHandler {
                             format!("Full persist failed during foreground pipeline: {}", e),
                         );
                     }
+                    super::sentinel::clear_lsp_sentinel(&self.repo_root);
                     return Err(e.context("Full persist failed during foreground pipeline"));
                 }
                 // Full persist succeeded -- write extraction sentinel. The LSP sentinel
-                // is valid only when this invocation actually ran LSP.
+                // is valid only when this invocation completed LSP and persisted
+                // the resulting graph in this block.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                if run_lsp_in_bus {
+                if lsp_stage_completed {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
-                } else if !enrichment.runs_lsp() {
+                } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
                 if let Some(job_id) = lsp_job_id.as_deref() {
