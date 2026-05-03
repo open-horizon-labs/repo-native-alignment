@@ -1,14 +1,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::ToMcpServerHandler;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
-use repo_native_alignment::server::{self, EnrichmentJobLedger, RnaHandler, ScanEnrichmentOptions};
+use repo_native_alignment::server::{
+    self, EnrichmentCapability, EnrichmentJobLedger, EnrichmentScope, RnaHandler,
+    ScanEnrichmentOptions,
+};
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
     RepoMapParams, SearchContext, SearchParams,
@@ -39,6 +42,7 @@ enum Commands {
     Setup(SetupArgs),
     Test(TestArgs),
     Scan(ScanArgs),
+    Enrich(EnrichArgs),
     Search(SearchArgs),
     Graph(GraphArgs),
     Stats(StatsArgs),
@@ -83,6 +87,35 @@ struct ScanArgs {
     no_embed: bool,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct EnrichArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, value_enum)]
+    capability: EnrichCapabilityArg,
+    #[arg(long, value_enum, default_value_t = EnrichScopeArg::Repo)]
+    scope: EnrichScopeArg,
+    /// Workspace root slug to enrich when `--scope root` is selected.
+    #[arg(long)]
+    root: Option<String>,
+    /// Do not continue repo-wide enrichment in the background after the requested scope completes.
+    #[arg(long)]
+    no_background_continuation: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EnrichCapabilityArg {
+    Embeddings,
+    CallReferences,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EnrichScopeArg {
+    Repo,
+    Root,
+    Changed,
 }
 #[derive(clap::Args, Debug)]
 struct SearchArgs {
@@ -524,6 +557,63 @@ async fn async_main() -> anyhow::Result<()> {
             }
             let elapsed = t0.elapsed();
             print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
+            return Ok(());
+        }
+        Some(Commands::Enrich(args)) => {
+            init_tracing("info", log_path.as_deref());
+            let repo_root = args.repo.canonicalize()?;
+            let capability = match args.capability {
+                EnrichCapabilityArg::Embeddings => EnrichmentCapability::Embeddings,
+                EnrichCapabilityArg::CallReferences => EnrichmentCapability::CallReferences,
+            };
+            let scope = match args.scope {
+                EnrichScopeArg::Repo => EnrichmentScope::Repo,
+                EnrichScopeArg::Changed => EnrichmentScope::ChangedFiles,
+                EnrichScopeArg::Root => {
+                    EnrichmentScope::Root(args.root.clone().ok_or_else(|| {
+                        anyhow::anyhow!("--root <slug> is required when --scope root is selected")
+                    })?)
+                }
+            };
+            let lsp_only_roots = WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_declared_roots(&repo_root)
+                .lsp_only_roots();
+            let handler = RnaHandler {
+                repo_root: repo_root.clone(),
+                lsp_only_roots: Arc::new(lsp_only_roots),
+                ..Default::default()
+            };
+            let graph = match try_load_cached_graph(&repo_root).await? {
+                Some(graph) => graph,
+                None => anyhow::bail!(
+                    "no cached graph found for {}; run `repo-native-alignment scan --extract-only --repo {}` first",
+                    repo_root.display(),
+                    repo_root.display()
+                ),
+            };
+            handler.graph.store(Arc::new(Some(Arc::new(graph))));
+            if capability == EnrichmentCapability::Embeddings
+                && let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                    tracing::warn!(
+                        "{}; explicit embedding enrichment may need a repo-scope run",
+                        msg
+                    );
+                })
+                .await
+            {
+                handler.embed_index.store(Arc::new(Some(embed_idx)));
+            }
+            handler
+                .run_explicit_enrichment(
+                    capability,
+                    scope,
+                    !args.no_background_continuation,
+                    |msg| {
+                        eprintln!("{}", msg);
+                    },
+                )
+                .await?;
             return Ok(());
         }
         Some(Commands::Search(args)) => {

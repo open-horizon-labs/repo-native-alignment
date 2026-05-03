@@ -174,6 +174,8 @@ pub struct EnrichmentJobRecord {
     pub counters: EnrichmentCounters,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub failure: Option<String>,
     pub superseded_by: Option<String>,
@@ -255,6 +257,7 @@ impl EnrichmentJobLedger {
             counters: EnrichmentCounters::empty(),
             created_at: now,
             updated_at: now,
+            last_progress_at: Some(now),
             completed_at: None,
             failure: None,
             superseded_by: None,
@@ -314,6 +317,7 @@ impl EnrichmentJobLedger {
                 existing.state = EnrichmentJobState::Superseded;
                 existing.phase = Some("superseded".to_string());
                 existing.updated_at = now;
+                existing.last_progress_at = Some(now);
                 existing.completed_at = Some(now);
                 existing.superseded_by = Some(job.job_id.clone());
                 existing.owner_id = None;
@@ -447,6 +451,20 @@ impl EnrichmentJobLedger {
         );
     }
 
+    pub fn mark_timed_out(&self, repo_root: &Path, job_id: &str, detail: impl Into<String>) {
+        self.update_job(
+            repo_root,
+            job_id,
+            JobUpdate {
+                state: EnrichmentJobState::Failed,
+                phase: Some("timed_out".to_string()),
+                counters: None,
+                failure: Some(detail.into()),
+                superseded_by: None,
+            },
+        );
+    }
+
     pub fn mark_superseded(
         &self,
         repo_root: &Path,
@@ -522,6 +540,7 @@ impl EnrichmentJobLedger {
                 job.superseded_by = Some(superseded_by);
             }
             job.updated_at = now;
+            job.last_progress_at = Some(now);
             if update.state.is_terminal() {
                 job.lease_expires_at = None;
                 job.owner_id = None;
@@ -878,6 +897,40 @@ mod tests {
 
         assert!(matches!(second, JobStart::Started(_)));
         assert_eq!(ledger.recent_jobs(tmp.path(), 10).len(), 2);
+    }
+
+    #[test]
+    fn timed_out_job_records_terminal_failure_and_progress_time() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let job = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("first job should start"),
+        };
+
+        ledger.mark_running(tmp.path(), &job.job_id, "lsp");
+        ledger.mark_progress(tmp.path(), &job.job_id, "lsp_edges", 3, Some(10));
+        ledger.mark_timed_out(tmp.path(), &job.job_id, "budget exceeded");
+
+        let jobs = ledger.recent_jobs(tmp.path(), 10);
+        assert_eq!(jobs.len(), 1);
+        let persisted = &jobs[0];
+        assert_eq!(persisted.state, EnrichmentJobState::Failed);
+        assert_eq!(persisted.phase.as_deref(), Some("timed_out"));
+        assert_eq!(persisted.failure.as_deref(), Some("budget exceeded"));
+        assert!(persisted.completed_at.is_some());
+        assert!(persisted.last_progress_at.is_some());
+        assert!(persisted.owner_id.is_none());
+        assert!(persisted.lease_expires_at.is_none());
     }
 
     #[test]
