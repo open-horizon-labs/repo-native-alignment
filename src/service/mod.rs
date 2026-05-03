@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::embed::EmbeddingIndex;
-use crate::server::state::{EmbeddingStatus, GraphState, LspEnrichmentStatus};
+use crate::server::{EmbeddingStatus, EnrichmentJobRecord, GraphState, LspEnrichmentStatus};
 
 pub mod graph;
 pub mod progress;
@@ -139,6 +139,7 @@ pub struct SearchContext<'a> {
     pub embed_status: Option<&'a EmbeddingStatus>,
     pub root_filter: Option<String>,
     pub non_code_slugs: HashSet<String>,
+    pub enrichment_jobs: Vec<EnrichmentJobRecord>,
 }
 
 /// Returns true when a graph node's root passes the active root filter.

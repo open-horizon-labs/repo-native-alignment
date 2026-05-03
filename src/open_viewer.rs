@@ -212,6 +212,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 embed_status: None,
                 root_filter,
                 non_code_slugs,
+                enrichment_jobs: Vec::new(),
             };
             Ok(search(&params, &ctx).await)
         }
@@ -413,6 +414,9 @@ mod tests {
     #[test]
     fn tolerant_large_whole_float_accepted() {
         // 5 billion: valid u64, representable exactly in f64
-        assert_eq!(value_as_u64_tolerant(&json!(5_000_000_000.0)), Some(5_000_000_000));
+        assert_eq!(
+            value_as_u64_tolerant(&json!(5_000_000_000.0)),
+            Some(5_000_000_000)
+        );
     }
 }

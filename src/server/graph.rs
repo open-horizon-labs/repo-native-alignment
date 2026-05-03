@@ -16,6 +16,7 @@ use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
 use super::RnaHandler;
+use super::enrichment_jobs::ScanEnrichmentOptions;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
@@ -780,12 +781,14 @@ impl RnaHandler {
     /// When false (used by `run_pipeline_foreground`), LSP runs inline via the
     /// event bus and no background tasks are spawned -- the caller handles embed.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
-        self.build_full_graph_inner(true).await
+        self.build_full_graph_inner(true, ScanEnrichmentOptions::all())
+            .await
     }
 
     pub async fn build_full_graph_inner(
         &self,
         spawn_background: bool,
+        enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<GraphState> {
         // Invalidate cached root slugs since workspace/worktree config may have changed.
         self.invalidate_non_code_root_slugs_cache();
@@ -996,35 +999,44 @@ impl RnaHandler {
                         );
                         // No changes detected -- reuse existing embedding table if present.
                         // Only rebuild if the table is missing (first run or cache cleared).
-                        if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                            match idx.has_table().await {
-                                Ok(true) => {
-                                    // Ensure FTS indexes exist -- table may predate hybrid search.
-                                    idx.ensure_fts_index().await;
-                                    tracing::info!(
-                                        "Reusing existing embedding index (no changes detected)"
-                                    );
-                                    self.embed_index.store(Arc::new(Some(idx)));
-                                }
-                                Ok(false) => {
-                                    match idx
-                                        .index_all_with_symbols(&self.repo_root, &state.nodes)
-                                        .await
-                                    {
-                                        Ok(count) => {
-                                            tracing::info!(
-                                                "Built embedding index: {} items (table was missing)",
-                                                count
-                                            );
-                                            self.embed_index.store(Arc::new(Some(idx)));
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to embed cached graph: {}", e)
+                        if enrichment.runs_embeddings() {
+                            if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
+                                match idx.has_table().await {
+                                    Ok(true) => {
+                                        // Ensure FTS indexes exist -- table may predate hybrid search.
+                                        idx.ensure_fts_index().await;
+                                        tracing::info!(
+                                            "Reusing existing embedding index (no changes detected)"
+                                        );
+                                        self.embed_index.store(Arc::new(Some(idx)));
+                                    }
+                                    Ok(false) => {
+                                        match idx
+                                            .index_all_with_symbols(&self.repo_root, &state.nodes)
+                                            .await
+                                        {
+                                            Ok(count) => {
+                                                tracing::info!(
+                                                    "Built embedding index: {} items (table was missing)",
+                                                    count
+                                                );
+                                                self.embed_index.store(Arc::new(Some(idx)));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to embed cached graph: {}",
+                                                    e
+                                                )
+                                            }
                                         }
                                     }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to check embedding table: {}", e)
+                                    }
                                 }
-                                Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
                             }
+                        } else {
+                            tracing::info!("Embedding enrichment skipped by scan options");
                         }
 
                         // FIX(#215): The early return here previously skipped LSP
@@ -1039,7 +1051,7 @@ impl RnaHandler {
                         // (LspConsumer → EnrichmentComplete → AllEnrichmentsGate → AllEnrichmentsDone
                         // → EnrichmentFinalizer → PassesComplete) so ScanStatsConsumer correctly
                         // tracks LSP completion. The old spawn_lsp_enrichment bypassed all of these.
-                        if spawn_background {
+                        if spawn_background && enrichment.runs_lsp() {
                             let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
                             if lsp_sentinel.is_none() {
                                 tracing::info!(
@@ -1058,6 +1070,8 @@ impl RnaHandler {
                                     .count();
                                 self.lsp_status.set_complete(call_count);
                             }
+                        } else if spawn_background {
+                            tracing::info!("LSP enrichment skipped by scan options");
                         }
 
                         for (_slug, scanner, _scan, _path, _changed) in &scanners {
@@ -1194,7 +1208,8 @@ impl RnaHandler {
             // are produced by the background enricher and would otherwise be lost on
             // every incremental rebuild.
             let mut lsp_carry_count = 0usize;
-            if *root_changed
+            if enrichment.runs_lsp()
+                && *root_changed
                 && has_cached_graph
                 && let Some(cached_edges) = cached_edges_by_root.remove(root_slug)
             {
@@ -1323,8 +1338,8 @@ impl RnaHandler {
         // Clone dirty slugs for the background LSP task before they're consumed by the bus.
         let dirty_slugs_for_lsp = freshly_extracted_slugs.clone();
         {
-            // Mark LSP as running before the bus call so status is visible immediately.
-            if spawn_background {
+            // Mark LSP as running only when a background LSP job will actually run.
+            if spawn_background && enrichment.runs_lsp() {
                 self.lsp_status.set_running();
             }
             let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
@@ -1357,7 +1372,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
-                        skip_lsp: spawn_background, // #574: MCP server path skips LSP here, spawns it in background
+                        skip_lsp: spawn_background || !enrichment.runs_lsp(),
                     },
                     dirty_slugs,
                 )
@@ -1366,10 +1381,9 @@ impl RnaHandler {
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
 
-            // When skip_lsp=true (spawn_background path), LSP didn't run yet.
-            // LSP status stays "running" — the background LSP task will update it.
-            // When skip_lsp=false (CLI path), check LSP edges now.
-            if !spawn_background {
+            // When skip_lsp=true, LSP did not run in this bus invocation.
+            // A background task will update status only if enrichment.runs_lsp().
+            if !spawn_background && enrichment.runs_lsp() {
                 let lsp_edge_count = all_edges
                     .iter()
                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
@@ -1391,6 +1405,18 @@ impl RnaHandler {
                 } else {
                     self.lsp_status.set_unavailable();
                 }
+            }
+        }
+
+        if !enrichment.runs_lsp() {
+            let before_lsp_strip = all_edges.len();
+            all_edges.retain(|edge| edge.source != crate::graph::ExtractionSource::Lsp);
+            let stripped = before_lsp_strip.saturating_sub(all_edges.len());
+            if stripped > 0 {
+                tracing::info!(
+                    "Skipped LSP enrichment -- stripped {} cached LSP edges before persist",
+                    stripped
+                );
             }
         }
 
@@ -1668,32 +1694,37 @@ impl RnaHandler {
         // The background task below will re-index (including .oh/
         // artifacts) via index_all_inner which uses merge_insert to upsert
         // changed rows and skip unchanged ones (BLAKE3 hash check).
-        match EmbeddingIndex::new(&self.repo_root).await {
-            Ok(idx) => {
-                tracing::info!("Embedding index created -- background task will re-index");
-                self.embed_index.store(Arc::new(Some(idx)));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create embed index: {}", e);
-            }
-        };
+        if enrichment.runs_embeddings() {
+            match EmbeddingIndex::new(&self.repo_root).await {
+                Ok(idx) => {
+                    tracing::info!("Embedding index created -- background task will re-index");
+                    self.embed_index.store(Arc::new(Some(idx)));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create embed index: {}", e);
+                }
+            };
+        }
 
         if spawn_background {
             // #574: spawn background LSP enrichment (restores v0.1.14 pattern).
             // The graph returned below has tree-sitter + non-LSP passes only.
             // This task runs LSP, re-computes PageRank/subsystems, and ArcSwaps.
-            let lsp_handle = self.spawn_background_lsp_enrichment(
-                all_nodes.clone(),
-                all_edges.clone(),
-                dirty_slugs_for_lsp,
-                all_detected_frameworks.clone(),
-            );
-            *self.lsp_handle.lock().await = Some(lsp_handle);
-
-            let handle = self.spawn_background_enrichment(&all_nodes);
-            // Store the handle so CLI callers can await it before the runtime
-            // shuts down, preventing JoinError::Cancelled panics (#560).
-            *self.embed_handle.lock().await = Some(handle);
+            if enrichment.runs_lsp() {
+                let lsp_handle = self.spawn_background_lsp_enrichment(
+                    all_nodes.clone(),
+                    all_edges.clone(),
+                    dirty_slugs_for_lsp,
+                    all_detected_frameworks.clone(),
+                );
+                *self.lsp_handle.lock().await = Some(lsp_handle);
+            }
+            if enrichment.runs_embeddings() {
+                let handle = self.spawn_background_enrichment(&all_nodes);
+                // Store the handle so CLI callers can await it before the runtime
+                // shuts down, preventing JoinError::Cancelled panics (#560).
+                *self.embed_handle.lock().await = Some(handle);
+            }
         }
 
         Ok(GraphState::new(
@@ -1781,13 +1812,14 @@ impl RnaHandler {
     /// When `pending_scan` is `None`, this method creates its own scanner and
     /// commits state only after the graph update succeeds.
     ///
-    /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`.
-    /// The `_spawn_lsp` parameter is kept for API compatibility but is no longer acted on.
+    /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`
+    /// unless `enrichment.lsp` skips it. Embeddings are reindexed only when
+    /// `enrichment.embeddings` runs.
     pub async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
-        _spawn_lsp: bool,
+        enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<bool> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
@@ -1963,7 +1995,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
-                        skip_lsp: false, // update_graph_with_scan: LSP runs inline (already incremental)
+                        skip_lsp: !enrichment.runs_lsp(),
                     },
                     dirty_slugs,
                 )
@@ -2174,33 +2206,35 @@ impl RnaHandler {
 
         // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
         // metadata is included in the embedding text.
-        let embed_guard2 = self.embed_index.load();
-        if let Some(ref embed_idx) = **embed_guard2 {
-            let changed_file_nodes: Vec<_> = graph
-                .nodes
-                .iter()
-                .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
-                .cloned()
-                .collect();
-            match embed_idx.reindex_nodes(&changed_file_nodes).await {
-                Ok(count) => {
-                    tracing::info!(
-                        "Re-embedded {} changed-file nodes after incremental update",
-                        count
-                    )
-                }
-                Err(e) => {
-                    // reindex_nodes falls back to no-op if the table doesn't exist;
-                    // do a full rebuild instead.
-                    tracing::warn!(
-                        "Targeted re-embed failed ({}), falling back to full rebuild",
-                        e
-                    );
-                    if let Err(e2) = embed_idx
-                        .index_all_with_symbols(&self.repo_root, &graph.nodes)
-                        .await
-                    {
-                        tracing::warn!("Full embed rebuild also failed: {}", e2);
+        if enrichment.runs_embeddings() {
+            let embed_guard2 = self.embed_index.load();
+            if let Some(ref embed_idx) = **embed_guard2 {
+                let changed_file_nodes: Vec<_> = graph
+                    .nodes
+                    .iter()
+                    .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+                    .cloned()
+                    .collect();
+                match embed_idx.reindex_nodes(&changed_file_nodes).await {
+                    Ok(count) => {
+                        tracing::info!(
+                            "Re-embedded {} changed-file nodes after incremental update",
+                            count
+                        )
+                    }
+                    Err(e) => {
+                        // reindex_nodes falls back to no-op if the table doesn't exist;
+                        // do a full rebuild instead.
+                        tracing::warn!(
+                            "Targeted re-embed failed ({}), falling back to full rebuild",
+                            e
+                        );
+                        if let Err(e2) = embed_idx
+                            .index_all_with_symbols(&self.repo_root, &graph.nodes)
+                            .await
+                        {
+                            tracing::warn!("Full embed rebuild also failed: {}", e2);
+                        }
                     }
                 }
             }
@@ -2267,6 +2301,10 @@ impl RnaHandler {
             }
             Ok(false) => true,
         };
+
+        if persist_succeeded && !enrichment.runs_lsp() {
+            super::sentinel::clear_lsp_sentinel(&self.repo_root);
+        }
 
         // Commit fallback scanner state only after successful persist.
         // If persist failed, scanner state is left uncommitted so the next scan

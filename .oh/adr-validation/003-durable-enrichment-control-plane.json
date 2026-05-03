@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "003-durable-enrichment-control-plane",
+  "title": "Durable Enrichment Control Plane",
+  "status": "implementing",
+  "source": "docs/ADRs/003-durable-enrichment-control-plane.md",
+  "validate": {
+    "cargo_tests": [
+      "server::enrichment_jobs::tests::job_transitions_are_persisted",
+      "server::enrichment_jobs::tests::overlapping_same_key_joins_active_job",
+      "server::enrichment_jobs::tests::new_job_supersedes_stale_non_terminal_job_from_store",
+      "server::enrichment_jobs::tests::scan_enrichment_options_preserve_structured_modes",
+      "server::tests::test_foreground_pipeline_incremental_on_second_run",
+      "server::tests::test_schema_version_bump_forces_full_rebuild_on_incremental_path"
+    ],
+    "audits": [],
+    "scripts": [],
+    "smoke": []
+  }
+}

@@ -107,6 +107,7 @@ impl RnaHandler {
                 embed_status: None,
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
+                enrichment_jobs: Vec::new(),
             };
             let markdown = crate::service::search(&params, &ctx).await;
             return Ok(text_result(markdown));
@@ -132,6 +133,7 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
+            enrichment_jobs: self.enrichment_jobs.recent_jobs(&self.repo_root, 5),
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
         if self.graph_build_status.is_building() {
@@ -901,9 +903,15 @@ mod tests {
     fn test_building_indicator_note_is_italic_markdown() {
         // The note appended in handlers — verify format matches spec.
         let note = "\n\n_Index updating in background — results reflect last complete scan._";
-        assert!(note.starts_with("\n\n"), "Should start with paragraph separator");
+        assert!(
+            note.starts_with("\n\n"),
+            "Should start with paragraph separator"
+        );
         assert!(note.contains("_Index updating"), "Should be in italics");
-        assert!(note.contains("last complete scan"), "Should mention last complete scan");
+        assert!(
+            note.contains("last complete scan"),
+            "Should mention last complete scan"
+        );
         assert!(note.ends_with("._"), "Should end with italic marker");
     }
 

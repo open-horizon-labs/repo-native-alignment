@@ -8,7 +8,7 @@ use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities}
 
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
-use repo_native_alignment::server::{self, RnaHandler};
+use repo_native_alignment::server::{self, EnrichmentJobLedger, RnaHandler, ScanEnrichmentOptions};
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
     RepoMapParams, SearchContext, SearchParams,
@@ -72,6 +72,15 @@ struct ScanArgs {
     path: Option<PathBuf>,
     #[arg(long)]
     full: bool,
+    /// Run extraction only; skip LSP and embedding enrichment.
+    #[arg(long)]
+    extract_only: bool,
+    /// Skip LSP call/reference enrichment for this scan.
+    #[arg(long)]
+    no_lsp: bool,
+    /// Skip embedding/semantic-index enrichment for this scan.
+    #[arg(long)]
+    no_embed: bool,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 }
@@ -421,6 +430,17 @@ async fn async_main() -> anyhow::Result<()> {
                 .with_primary_root(repo_root.clone())
                 .with_declared_roots(&repo_root)
                 .lsp_only_roots();
+            let mut enrichment = if args.extract_only {
+                ScanEnrichmentOptions::extract_only()
+            } else {
+                ScanEnrichmentOptions::all()
+            };
+            if args.no_lsp {
+                enrichment = enrichment.without_lsp();
+            }
+            if args.no_embed {
+                enrichment = enrichment.without_embeddings();
+            }
             if args.full {
                 eprintln!("Full pipeline scan: {}", repo_root.display());
                 let handler = RnaHandler {
@@ -429,9 +449,12 @@ async fn async_main() -> anyhow::Result<()> {
                     ..Default::default()
                 };
                 handler
-                    .run_pipeline_foreground(|msg| {
-                        eprintln!("{}", msg);
-                    })
+                    .run_pipeline_foreground(
+                        |msg| {
+                            eprintln!("{}", msg);
+                        },
+                        enrichment,
+                    )
                     .await?;
                 return Ok(());
             }
@@ -442,10 +465,11 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
-            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
-                tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
-            })
-            .await
+            if enrichment.runs_embeddings()
+                && let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                    tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
+                })
+                .await
             {
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
@@ -465,9 +489,11 @@ async fn async_main() -> anyhow::Result<()> {
                         graph
                     }
                     None => {
-                        let graph = handler.build_full_graph_inner(true).await?;
+                        let graph = handler.build_full_graph_inner(true, enrichment).await?;
                         scanner.commit_state()?;
-                        handler.await_background_embed().await;
+                        if enrichment.runs_embeddings() {
+                            handler.await_background_embed().await;
+                        }
                         graph
                     }
                 };
@@ -480,16 +506,18 @@ async fn async_main() -> anyhow::Result<()> {
                 Some(graph) => graph,
                 None => {
                     eprintln!("No cached index found; building initial extracted graph.");
-                    let graph = handler.build_full_graph_inner(true).await?;
+                    let graph = handler.build_full_graph_inner(true, enrichment).await?;
                     scanner.commit_state()?;
-                    handler.await_background_embed().await;
+                    if enrichment.runs_embeddings() {
+                        handler.await_background_embed().await;
+                    }
                     let elapsed = t0.elapsed();
                     print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
                     return Ok(());
                 }
             };
             let persist_succeeded = handler
-                .update_graph_with_scan(&mut graph, Some(scan), false)
+                .update_graph_with_scan(&mut graph, Some(scan), enrichment)
                 .await?;
             if persist_succeeded {
                 scanner.commit_state()?;
@@ -604,6 +632,7 @@ async fn async_main() -> anyhow::Result<()> {
                 embed_status: None,
                 root_filter,
                 non_code_slugs,
+                enrichment_jobs: EnrichmentJobLedger::default().recent_jobs(&repo_root, 5),
             };
             println!("{}", service::search(&params, &ctx).await);
             return Ok(());

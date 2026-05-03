@@ -2281,7 +2281,7 @@ pub fn build_builtin_bus(
             }));
         }
     } else {
-        tracing::info!("skip_lsp=true: LspConsumers omitted from bus — LSP will run in background");
+        tracing::info!("skip_lsp=true: LspConsumers omitted from this bus invocation");
     }
 
     // --- AllEnrichmentsDone consumers ---
