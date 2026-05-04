@@ -1915,7 +1915,7 @@ impl RnaHandler {
     where
         F: Fn(&str) + Send + Sync,
     {
-        let (all_nodes, all_edges) = {
+        let (all_nodes, _all_edges) = {
             let snap = self.graph.load_full();
             let Some(gs) = snap.as_ref().as_ref() else {
                 anyhow::bail!(
@@ -1960,7 +1960,16 @@ impl RnaHandler {
                     match continuation {
                         EnrichmentContinuation::Disabled => {}
                         EnrichmentContinuation::SpawnBackground => {
-                            self.spawn_lsp_enrichment_via_bus(&all_nodes, &all_edges);
+                            let (current_nodes, current_edges) = {
+                                let snap = self.graph.load_full();
+                                let Some(gs) = snap.as_ref().as_ref() else {
+                                    anyhow::bail!(
+                                        "graph cache disappeared before LSP background continuation"
+                                    );
+                                };
+                                (gs.nodes.clone(), gs.edges.clone())
+                            };
+                            self.spawn_lsp_enrichment_via_bus(&current_nodes, &current_edges);
                             on_progress(
                                 "LSP background continuation scheduled for remaining cached graph coverage",
                             );
