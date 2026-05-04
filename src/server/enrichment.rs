@@ -6,8 +6,10 @@
 //! - `scan_roots()` -- resolve workspace roots, detect file changes
 //! - `update_graph()` -- apply changes, run enrichment pipeline
 //! - `persist_deltas()` -- write to LanceDB, commit scanner state
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::embed::EmbeddingIndex;
 use crate::graph::{Edge, Node};
@@ -15,7 +17,8 @@ use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
 use super::enrichment_jobs::{
-    EnrichmentCapability, EnrichmentScope, EnrichmentTrigger, JobStart, ScanEnrichmentOptions,
+    EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
+    ScanEnrichmentOptions,
 };
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
@@ -48,6 +51,104 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     // Quick check: do any imports match known framework patterns?
     let result = crate::extract::framework_detection::framework_detection_pass(nodes, "check");
     !result.detected_frameworks.is_empty()
+}
+
+type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentContinuation {
+    Disabled,
+    SpawnBackground,
+    RunToCompletion,
+}
+
+impl EnrichmentContinuation {
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LspBudget {
+    pub max_duration: Duration,
+}
+
+impl LspBudget {
+    pub(crate) fn from_env() -> Self {
+        let millis = std::env::var("RNA_LSP_JOB_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .unwrap_or(30 * 60 * 1000);
+        Self {
+            max_duration: Duration::from_millis(millis),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LspPipelineFailure {
+    TimedOut(Duration),
+    Failed(anyhow::Error),
+}
+
+impl LspPipelineFailure {
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimedOut(_))
+    }
+}
+
+impl std::fmt::Display for LspPipelineFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(duration) => {
+                write!(f, "LSP enrichment timed out after {}s", duration.as_secs())
+            }
+            Self::Failed(err) => write!(f, "{:#}", err),
+        }
+    }
+}
+
+impl std::error::Error for LspPipelineFailure {}
+
+struct LspPipelineInput {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+    repo_root: PathBuf,
+    scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
+    skip_lsp: bool,
+    dirty_slugs: Option<HashSet<String>>,
+}
+
+async fn emit_lsp_pipeline_with_budget(
+    input: LspPipelineInput,
+) -> Result<LspBusOutput, LspPipelineFailure> {
+    let fut = crate::extract::consumers::emit_enrichment_pipeline(
+        input.nodes,
+        input.edges,
+        input.root_pairs,
+        input.primary_slug,
+        input.repo_root,
+        crate::extract::consumers::BusOptions {
+            scan_stats: Some(input.scan_stats),
+            embed_idx: None,
+            lance_repo_root: None,
+            skip_lsp: input.skip_lsp,
+        },
+        input.dirty_slugs,
+    );
+
+    if input.skip_lsp {
+        return fut.await.map_err(LspPipelineFailure::Failed);
+    }
+
+    let budget = LspBudget::from_env();
+    match tokio::time::timeout(budget.max_duration, fut).await {
+        Ok(result) => result.map_err(LspPipelineFailure::Failed),
+        Err(_) => Err(LspPipelineFailure::TimedOut(budget.max_duration)),
+    }
 }
 
 impl RnaHandler {
@@ -225,21 +326,17 @@ impl RnaHandler {
                 .collect();
             let primary_slug = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
 
-            // Run enrichment pipeline WITH LSP (skip_lsp=false)
-            let result = crate::extract::consumers::emit_enrichment_pipeline(
+            // Run enrichment pipeline WITH LSP (skip_lsp=false).
+            let result = emit_lsp_pipeline_with_budget(LspPipelineInput {
                 nodes,
                 edges,
                 root_pairs,
-                primary_slug.clone(),
-                repo_root.clone(),
-                crate::extract::consumers::BusOptions {
-                    scan_stats: Some(Arc::clone(&scan_stats)),
-                    embed_idx: None,
-                    lance_repo_root: None,
-                    skip_lsp: false, // this time LSP runs
-                },
-                Some(dirty_slugs),
-            )
+                primary_slug: primary_slug.clone(),
+                repo_root: repo_root.clone(),
+                scan_stats: Arc::clone(&scan_stats),
+                skip_lsp: false,
+                dirty_slugs: Some(dirty_slugs),
+            })
             .await;
 
             match result {
@@ -473,8 +570,13 @@ impl RnaHandler {
                 }
                 Err(e) => {
                     tracing::error!("[background-lsp] LSP enrichment pipeline failed: {:#}", e);
-                    lsp_status.set_unavailable();
-                    jobs.mark_failed(&repo_root, &job_id, format!("{}", e));
+                    if e.is_timeout() {
+                        lsp_status.set_timed_out(&format!("{}", e));
+                        jobs.mark_timed_out(&repo_root, &job_id, format!("{}", e));
+                    } else {
+                        lsp_status.set_unavailable();
+                        jobs.mark_failed(&repo_root, &job_id, format!("{}", e));
+                    }
                 }
             }
         })
@@ -664,28 +766,29 @@ impl RnaHandler {
             // Cache-hit LSP enrichment: all roots are "dirty" because this is
             // the first time LSP runs on a cached graph (no prior LSP edges).
             // `None` = all roots dirty on first LSP run.
-            let result = crate::extract::consumers::emit_enrichment_pipeline(
-                bg_nodes,
-                bg_edges,
+            let result = emit_lsp_pipeline_with_budget(LspPipelineInput {
+                nodes: bg_nodes,
+                edges: bg_edges,
                 root_pairs,
                 primary_slug,
-                bus_repo_root,
-                crate::extract::consumers::BusOptions {
-                    scan_stats: Some(bg_scan_stats),
-                    embed_idx: None,
-                    lance_repo_root: None,
-                    skip_lsp: false,
-                },
-                None,
-            )
+                repo_root: bus_repo_root,
+                scan_stats: bg_scan_stats,
+                skip_lsp: false,
+                dirty_slugs: None,
+            })
             .await;
 
             let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
-                    bg_lsp_status.set_failed(&format!("{}", e));
-                    bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
+                    if e.is_timeout() {
+                        bg_lsp_status.set_timed_out(&format!("{}", e));
+                        bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
+                    } else {
+                        bg_lsp_status.set_failed(&format!("{}", e));
+                        bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
+                    }
                     return;
                 }
             };
@@ -977,7 +1080,14 @@ impl RnaHandler {
             } else if enrichment.runs_lsp() {
                 // LSP sentinel absent or stale enrichment -- run full enrichment.
                 on_progress("LSP: running full enrichment...");
-                self.run_foreground_lsp_and_persist(&on_progress).await?
+                self.run_foreground_lsp_and_persist(
+                    &on_progress,
+                    EnrichmentScope::Repo,
+                    EnrichmentTrigger::ForegroundScan,
+                    None,
+                    false,
+                )
+                .await?
             } else {
                 on_progress("LSP: skipped by scan options");
                 0
@@ -1090,20 +1200,16 @@ impl RnaHandler {
 
         let mut lsp_stage_completed = false;
         let t2 = std::time::Instant::now();
-        let bus_result = crate::extract::consumers::emit_enrichment_pipeline(
-            all_nodes,
-            all_edges,
+        let bus_result = emit_lsp_pipeline_with_budget(LspPipelineInput {
+            nodes: all_nodes,
+            edges: all_edges,
             root_pairs,
             primary_slug,
-            self.repo_root.clone(),
-            crate::extract::consumers::BusOptions {
-                scan_stats: Some(Arc::clone(&self.scan_stats)),
-                embed_idx: None,
-                lance_repo_root: None,
-                skip_lsp: !enrichment.runs_lsp(),
-            },
+            repo_root: self.repo_root.clone(),
+            scan_stats: Arc::clone(&self.scan_stats),
+            skip_lsp: !enrichment.runs_lsp(),
             dirty_slugs,
-        )
+        })
         .await;
         let bus_time = t2.elapsed();
 
@@ -1168,7 +1274,11 @@ impl RnaHandler {
                     bus_time.as_secs_f64(),
                 ));
                 if enrichment.runs_lsp() {
-                    self.lsp_status.set_unavailable();
+                    if e.is_timeout() {
+                        self.lsp_status.set_timed_out(&format!("{}", e));
+                    } else {
+                        self.lsp_status.set_unavailable();
+                    }
                 }
                 lsp_edge_count = 0;
             }
@@ -1407,20 +1517,16 @@ impl RnaHandler {
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
         let bus_fut = async {
             let t2 = std::time::Instant::now();
-            let result = crate::extract::consumers::emit_enrichment_pipeline(
-                graph_state.nodes.clone(),
-                graph_state.edges.clone(),
+            let result = emit_lsp_pipeline_with_budget(LspPipelineInput {
+                nodes: graph_state.nodes.clone(),
+                edges: graph_state.edges.clone(),
                 root_pairs,
                 primary_slug,
-                self.repo_root.clone(),
-                crate::extract::consumers::BusOptions {
-                    scan_stats: Some(Arc::clone(&self.scan_stats)),
-                    embed_idx: None,
-                    lance_repo_root: None,
-                    skip_lsp: !run_lsp_in_bus,
-                },
-                None, // full rebuild: all roots dirty
-            )
+                repo_root: self.repo_root.clone(),
+                scan_stats: Arc::clone(&self.scan_stats),
+                skip_lsp: !run_lsp_in_bus,
+                dirty_slugs: None,
+            })
             .await;
             let elapsed = t2.elapsed();
             (result, elapsed)
@@ -1506,12 +1612,24 @@ impl RnaHandler {
                     bus_time.as_secs_f64(),
                 ));
                 if run_lsp_in_bus {
-                    self.lsp_status.set_unavailable();
+                    if e.is_timeout() {
+                        self.lsp_status.set_timed_out(&format!("{}", e));
+                    } else {
+                        self.lsp_status.set_unavailable();
+                    }
                 }
                 lsp_edge_count = 0;
                 if let Some(job_id) = lsp_job_id.as_deref() {
-                    self.enrichment_jobs
-                        .mark_failed(&self.repo_root, job_id, format!("{}", e));
+                    if e.is_timeout() {
+                        self.enrichment_jobs.mark_timed_out(
+                            &self.repo_root,
+                            job_id,
+                            format!("{}", e),
+                        );
+                    } else {
+                        self.enrichment_jobs
+                            .mark_failed(&self.repo_root, job_id, format!("{}", e));
+                    }
                 }
             }
         }
@@ -1533,7 +1651,7 @@ impl RnaHandler {
                     edges.len(),
                     lsp_edge_count,
                 );
-                if let Some(job_id) = lsp_job_id.as_deref() {
+                if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_persisting(
                         &self.repo_root,
                         job_id,
@@ -1543,7 +1661,7 @@ impl RnaHandler {
                 }
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground full persist failed: {}", e);
-                    if let Some(job_id) = lsp_job_id.as_deref() {
+                    if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                         self.enrichment_jobs.mark_failed(
                             &self.repo_root,
                             job_id,
@@ -1562,7 +1680,7 @@ impl RnaHandler {
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
-                if let Some(job_id) = lsp_job_id.as_deref() {
+                if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_completed(
                         &self.repo_root,
                         job_id,
@@ -1608,7 +1726,14 @@ impl RnaHandler {
     /// Used when the cached graph has no LSP sentinel and needs enrichment.
     /// Routes through `emit_enrichment_pipeline` per ADR-001 (#583).
     /// Returns the number of LSP call edges added.
-    async fn run_foreground_lsp_and_persist<F>(&self, on_progress: &F) -> anyhow::Result<usize>
+    async fn run_foreground_lsp_and_persist<F>(
+        &self,
+        on_progress: &F,
+        scope: EnrichmentScope,
+        trigger: EnrichmentTrigger,
+        dirty_slugs: Option<HashSet<String>>,
+        fail_on_lsp_error: bool,
+    ) -> anyhow::Result<usize>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -1617,6 +1742,7 @@ impl RnaHandler {
             let gs = snap.as_ref().as_ref().unwrap();
             (gs.nodes.clone(), gs.edges.clone())
         };
+        let repo_wide_lsp = dirty_slugs.is_none();
 
         let server_name = self.lsp_status.server_name();
         if let Some(ref name) = server_name {
@@ -1625,8 +1751,8 @@ impl RnaHandler {
         let job_id = match self.enrichment_jobs.begin_job(
             &self.repo_root,
             EnrichmentCapability::CallReferences,
-            EnrichmentScope::Repo,
-            EnrichmentTrigger::ForegroundScan,
+            scope,
+            trigger,
             None,
         )? {
             JobStart::Started(job) => {
@@ -1637,30 +1763,31 @@ impl RnaHandler {
             }
             JobStart::Joined { existing_job_id } => {
                 on_progress(&format!(
-                    "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
+                    "LSP: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                return Ok(0);
+                return self
+                    .wait_for_joined_enrichment_job(
+                        &existing_job_id,
+                        EnrichmentCapability::CallReferences,
+                    )
+                    .await;
             }
         };
 
         on_progress("Enrichment: running pipeline via event bus (no sentinel)...");
 
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
-        let bus_result = crate::extract::consumers::emit_enrichment_pipeline(
-            all_nodes,
-            all_edges,
+        let bus_result = emit_lsp_pipeline_with_budget(LspPipelineInput {
+            nodes: all_nodes,
+            edges: all_edges,
             root_pairs,
             primary_slug,
-            self.repo_root.clone(),
-            crate::extract::consumers::BusOptions {
-                scan_stats: Some(Arc::clone(&self.scan_stats)),
-                embed_idx: None,
-                lance_repo_root: None,
-                skip_lsp: false,
-            },
-            None, // no sentinel means all roots need enrichment
-        )
+            repo_root: self.repo_root.clone(),
+            scan_stats: Arc::clone(&self.scan_stats),
+            skip_lsp: false,
+            dirty_slugs,
+        })
         .await;
 
         match bus_result {
@@ -1707,7 +1834,13 @@ impl RnaHandler {
                         self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-                self.lsp_status.set_complete(lsp_edge_count);
+                if repo_wide_lsp {
+                    self.lsp_status.set_complete(lsp_edge_count);
+                } else {
+                    let existing_coverage = self.lsp_status.coverage_edge_count();
+                    self.lsp_status
+                        .set_complete_with_coverage(lsp_edge_count, existing_coverage);
+                }
 
                 self.enrichment_jobs.mark_progress(
                     &self.repo_root,
@@ -1733,11 +1866,13 @@ impl RnaHandler {
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
                 // LSP enrichment is durable and can skip re-enrichment (#477).
-                super::sentinel::write_lsp_sentinel(
-                    &self.repo_root,
-                    enriched_nodes.len(),
-                    enriched_edges.len(),
-                );
+                if repo_wide_lsp {
+                    super::sentinel::write_lsp_sentinel(
+                        &self.repo_root,
+                        enriched_nodes.len(),
+                        enriched_edges.len(),
+                    );
+                }
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
                     &job_id,
@@ -1753,11 +1888,353 @@ impl RnaHandler {
                     e
                 );
                 on_progress("Enrichment: pipeline failed -- no LSP edges available");
-                self.lsp_status.set_unavailable();
-                self.enrichment_jobs
-                    .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                if e.is_timeout() {
+                    self.lsp_status.set_timed_out(&format!("{}", e));
+                    self.enrichment_jobs
+                        .mark_timed_out(&self.repo_root, &job_id, format!("{}", e));
+                } else {
+                    self.lsp_status.set_unavailable();
+                    self.enrichment_jobs
+                        .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                }
+                if fail_on_lsp_error {
+                    return Err(anyhow::anyhow!("LSP enrichment failed: {}", e));
+                }
                 Ok(0)
             }
+        }
+    }
+
+    pub async fn run_explicit_enrichment<F>(
+        &self,
+        capability: EnrichmentCapability,
+        scope: EnrichmentScope,
+        continuation: EnrichmentContinuation,
+        on_progress: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        let (all_nodes, _all_edges) = {
+            let snap = self.graph.load_full();
+            let Some(gs) = snap.as_ref().as_ref() else {
+                anyhow::bail!(
+                    "no cached graph loaded; run `repo-native-alignment scan --extract-only --repo {}` first",
+                    self.repo_root.display()
+                );
+            };
+            (gs.nodes.clone(), gs.edges.clone())
+        };
+
+        match capability {
+            EnrichmentCapability::Embeddings => {
+                self.run_explicit_embedding_enrichment(
+                    &all_nodes,
+                    scope.clone(),
+                    continuation,
+                    &on_progress,
+                )
+                .await?;
+            }
+            EnrichmentCapability::CallReferences => {
+                if matches!(scope, EnrichmentScope::ChangedFiles) {
+                    anyhow::bail!(
+                        "changed-file call-reference enrichment is not supported by the LSP executor yet; use `--scope root --root <slug>` or `--scope repo`"
+                    );
+                }
+                let dirty_slugs = self.dirty_slugs_for_scope(&scope);
+                let count = self
+                    .run_foreground_lsp_and_persist(
+                        &on_progress,
+                        scope.clone(),
+                        EnrichmentTrigger::Explicit,
+                        dirty_slugs,
+                        true,
+                    )
+                    .await?;
+                on_progress(&format!(
+                    "LSP explicit enrichment complete: {} call/reference edges",
+                    count
+                ));
+                if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+                    match continuation {
+                        EnrichmentContinuation::Disabled => {}
+                        EnrichmentContinuation::SpawnBackground => {
+                            let (current_nodes, current_edges) = {
+                                let snap = self.graph.load_full();
+                                let Some(gs) = snap.as_ref().as_ref() else {
+                                    anyhow::bail!(
+                                        "graph cache disappeared before LSP background continuation"
+                                    );
+                                };
+                                (gs.nodes.clone(), gs.edges.clone())
+                            };
+                            self.spawn_lsp_enrichment_via_bus(&current_nodes, &current_edges);
+                            on_progress(
+                                "LSP background continuation scheduled for remaining cached graph coverage",
+                            );
+                        }
+                        EnrichmentContinuation::RunToCompletion => {
+                            on_progress(
+                                "LSP continuation: enriching remaining cached graph coverage",
+                            );
+                            let continuation_count = self
+                                .run_foreground_lsp_and_persist(
+                                    &on_progress,
+                                    EnrichmentScope::Repo,
+                                    EnrichmentTrigger::Explicit,
+                                    None,
+                                    true,
+                                )
+                                .await?;
+                            on_progress(&format!(
+                                "LSP continuation complete: {} call/reference edges",
+                                continuation_count
+                            ));
+                        }
+                    }
+                }
+            }
+            EnrichmentCapability::ExtractedGraph => {
+                anyhow::bail!(
+                    "explicit enrich does not extract source; run `repo-native-alignment scan --extract-only --repo {}`",
+                    self.repo_root.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_explicit_embedding_enrichment<F>(
+        &self,
+        all_nodes: &[Node],
+        scope: EnrichmentScope,
+        continuation: EnrichmentContinuation,
+        on_progress: &F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        self.run_embedding_enrichment_once(all_nodes, scope.clone(), on_progress)
+            .await?;
+
+        if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+            match continuation {
+                EnrichmentContinuation::Disabled => {}
+                EnrichmentContinuation::SpawnBackground => {
+                    let handle = self.spawn_background_enrichment(all_nodes);
+                    *self.embed_handle.lock().await = Some(handle);
+                    on_progress(
+                        "Embedding background continuation scheduled for remaining cached graph coverage",
+                    );
+                }
+                EnrichmentContinuation::RunToCompletion => {
+                    on_progress(
+                        "Embedding continuation: enriching remaining cached graph coverage",
+                    );
+                    self.run_embedding_enrichment_once(
+                        all_nodes,
+                        EnrichmentScope::Repo,
+                        on_progress,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_embedding_enrichment_once<F>(
+        &self,
+        all_nodes: &[Node],
+        scope: EnrichmentScope,
+        on_progress: &F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        let selected_nodes = self.cached_nodes_for_scope(all_nodes, &scope)?;
+        let embeddable_count = selected_nodes
+            .iter()
+            .filter(|n| n.id.kind.is_embeddable())
+            .count();
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::Embeddings,
+            scope.clone(),
+            EnrichmentTrigger::Explicit,
+            None,
+        )? {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => {
+                on_progress(&format!(
+                    "Embed: joined active enrichment job {}; waiting for completion",
+                    existing_job_id
+                ));
+                self.wait_for_joined_enrichment_job(
+                    &existing_job_id,
+                    EnrichmentCapability::Embeddings,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        self.enrichment_jobs
+            .mark_running(&self.repo_root, &job_id, "embedding");
+        self.embed_status.set_building(embeddable_count);
+        self.enrichment_jobs.mark_progress(
+            &self.repo_root,
+            &job_id,
+            "embedding",
+            0,
+            Some(embeddable_count),
+        );
+
+        let result = async {
+            let idx = EmbeddingIndex::new(&self.repo_root).await?;
+            if !matches!(scope, EnrichmentScope::Repo) && !idx.has_table().await? {
+                anyhow::bail!(
+                    "embedding table is missing; run `repo-native-alignment enrich --capability embeddings --scope repo --repo {}` before scoped embedding enrichment",
+                    self.repo_root.display()
+                );
+            }
+            let count = if matches!(scope, EnrichmentScope::Repo) {
+                idx.index_all_with_symbols(&self.repo_root, &selected_nodes).await?
+            } else {
+                idx.reindex_nodes(&selected_nodes).await?
+            };
+            anyhow::Ok((idx, count))
+        }
+        .await;
+
+        match result {
+            Ok((idx, count)) => {
+                self.enrichment_jobs
+                    .mark_persisting(&self.repo_root, &job_id, count, count);
+                self.embed_index.store(Arc::new(Some(idx)));
+                self.embed_status.set_complete(count);
+                self.enrichment_jobs
+                    .mark_completed(&self.repo_root, &job_id, count, count);
+                on_progress(&format!(
+                    "Embed explicit enrichment complete: {} embedded items",
+                    count
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                self.embed_status.set_failed(format!("{}", e));
+                self.enrichment_jobs
+                    .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                Err(e)
+            }
+        }
+    }
+
+    async fn wait_for_joined_enrichment_job(
+        &self,
+        job_id: &str,
+        capability: EnrichmentCapability,
+    ) -> anyhow::Result<usize> {
+        let budget = LspBudget::from_env().max_duration;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(job) = self
+                .enrichment_jobs
+                .recent_jobs(&self.repo_root, 100)
+                .into_iter()
+                .find(|job| job.job_id == job_id)
+            {
+                match job.state {
+                    EnrichmentJobState::Completed => {
+                        if capability == EnrichmentCapability::CallReferences
+                            && let Some(progress) = self
+                                .enrichment_jobs
+                                .events_for_job(&self.repo_root, job_id)
+                                .into_iter()
+                                .rev()
+                                .find(|event| event.phase.as_deref() == Some("lsp_edges"))
+                        {
+                            return Ok(progress.counters.current);
+                        }
+                        return Ok(job.counters.current);
+                    }
+                    EnrichmentJobState::Failed => {
+                        let detail = job.failure.unwrap_or_else(|| "unknown failure".to_string());
+                        anyhow::bail!("joined enrichment job {} failed: {}", job_id, detail);
+                    }
+                    EnrichmentJobState::Superseded => {
+                        anyhow::bail!("joined enrichment job {} was superseded", job_id);
+                    }
+                    EnrichmentJobState::Cancelled => {
+                        anyhow::bail!("joined enrichment job {} was cancelled", job_id);
+                    }
+                    EnrichmentJobState::Queued
+                    | EnrichmentJobState::Running
+                    | EnrichmentJobState::Persisting => {}
+                }
+            }
+
+            if started.elapsed() > budget {
+                anyhow::bail!(
+                    "timed out waiting for joined enrichment job {} after {}s",
+                    job_id,
+                    budget.as_secs()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn cached_nodes_for_scope(
+        &self,
+        all_nodes: &[Node],
+        scope: &EnrichmentScope,
+    ) -> anyhow::Result<Vec<Node>> {
+        let nodes: Vec<Node> = match scope {
+            EnrichmentScope::Repo => all_nodes
+                .iter()
+                .filter(|n| n.id.root != "external")
+                .cloned()
+                .collect(),
+            EnrichmentScope::Root(root) => all_nodes
+                .iter()
+                .filter(|n| n.id.root == *root && n.id.root != "external")
+                .cloned()
+                .collect(),
+            EnrichmentScope::ChangedFiles => {
+                let scan = Scanner::new(self.repo_root.clone())?.scan()?;
+                let changed: HashSet<String> = scan
+                    .changed_files
+                    .iter()
+                    .chain(scan.new_files.iter())
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
+                all_nodes
+                    .iter()
+                    .filter(|node| changed.contains(&node.id.file.to_string_lossy().to_string()))
+                    .cloned()
+                    .collect()
+            }
+            EnrichmentScope::Explicit(value) => {
+                anyhow::bail!("unsupported explicit enrichment scope: {}", value);
+            }
+        };
+        Ok(nodes)
+    }
+
+    fn dirty_slugs_for_scope(&self, scope: &EnrichmentScope) -> Option<HashSet<String>> {
+        match scope {
+            EnrichmentScope::Repo => None,
+            EnrichmentScope::Root(root) => Some(std::iter::once(root.clone()).collect()),
+            EnrichmentScope::ChangedFiles => {
+                let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+                Some(std::iter::once(primary_slug).collect())
+            }
+            EnrichmentScope::Explicit(value) => Some(std::iter::once(value.clone()).collect()),
         }
     }
 }

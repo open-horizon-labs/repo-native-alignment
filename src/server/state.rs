@@ -741,6 +741,10 @@ impl LspEnrichmentStatus {
         self.log_transition(prev, LspState::Failed, error);
     }
 
+    pub fn set_timed_out(&self, detail: &str) {
+        self.set_failed(&format!("timed out: {}", detail));
+    }
+
     /// Mark that at least one LSP server binary was found on PATH.
     /// Called synchronously at startup before async enrichment begins.
     pub fn set_server_found(&self) {
@@ -777,6 +781,7 @@ impl LspEnrichmentStatus {
     }
 
     pub fn call_reference_readiness(&self) -> CapabilityReadiness {
+        self.check_running_timeout();
         self.check_server_found_timeout();
         match self.current_state() {
             LspState::Complete => {
@@ -905,6 +910,40 @@ impl LspEnrichmentStatus {
         false
     }
 
+    pub fn check_running_timeout(&self) -> bool {
+        self.check_running_timeout_after(default_lsp_running_timeout())
+    }
+
+    fn check_running_timeout_after(&self, max_elapsed: std::time::Duration) -> bool {
+        let current = self.current_state();
+        if current != LspState::Running {
+            return false;
+        }
+        let elapsed = self.elapsed_since_last_transition();
+        if elapsed <= max_elapsed {
+            return false;
+        }
+        let message = format!(
+            "RUNNING timed out after {}s without a terminal state",
+            max_elapsed.as_secs()
+        );
+        let result = self.state.compare_exchange(
+            Self::RUNNING,
+            Self::FAILED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        if result.is_ok() {
+            *self.last_error.lock().unwrap() = Some(message.clone());
+            *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+            self.coverage_edge_count
+                .store(0, std::sync::atomic::Ordering::Release);
+            self.log_transition(LspState::Running, LspState::Failed, &message);
+            return true;
+        }
+        false
+    }
+
     /// Synchronously probe for known LSP server binaries on PATH.
     /// Fast (just `which` calls, no process spawning). Call at handler construction
     /// to distinguish "server exists but pending" from "no server available."
@@ -969,6 +1008,7 @@ impl LspEnrichmentStatus {
     pub fn footer_segment(&self) -> Option<String> {
         // Check for SERVER_FOUND timeout before rendering
         self.check_server_found_timeout();
+        self.check_running_timeout();
 
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
             Self::NOT_STARTED => None,
@@ -1029,6 +1069,15 @@ impl LspEnrichmentStatus {
     }
 }
 
+fn default_lsp_running_timeout() -> std::time::Duration {
+    let millis = std::env::var("RNA_LSP_RUNNING_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(30 * 60 * 1000);
+    std::time::Duration::from_millis(millis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,6 +1130,24 @@ mod tests {
         status.set_running();
         let footer = status.footer_segment().unwrap();
         assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_lsp_running_timeout_projects_failed_readiness() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        *status.last_transition_at.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+
+        assert!(status.check_running_timeout_after(std::time::Duration::from_secs(1)));
+        assert_eq!(status.current_state(), LspState::Failed);
+
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Failed);
+        assert!(readiness.detail.contains("RUNNING timed out"));
+
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("RUNNING timed out"), "got: {}", footer);
     }
 
     #[test]
