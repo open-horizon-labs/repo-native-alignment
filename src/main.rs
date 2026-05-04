@@ -9,8 +9,8 @@ use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities}
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
-    self, EnrichmentCapability, EnrichmentJobLedger, EnrichmentScope, RnaHandler,
-    ScanEnrichmentOptions,
+    self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentScope,
+    RnaHandler, ScanEnrichmentOptions,
 };
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
@@ -100,7 +100,7 @@ struct EnrichArgs {
     /// Workspace root slug to enrich when `--scope root` is selected.
     #[arg(long)]
     root: Option<String>,
-    /// Do not continue repo-wide enrichment in the background after the requested scope completes.
+    /// Do not continue repo-wide enrichment after the requested scope completes.
     #[arg(long)]
     no_background_continuation: bool,
 }
@@ -562,6 +562,12 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Enrich(args)) => {
             init_tracing("info", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
+            let workspace_config = WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_worktrees(&repo_root)
+                .with_claude_memory(&repo_root)
+                .with_agent_memories(&repo_root)
+                .with_declared_roots(&repo_root);
             let capability = match args.capability {
                 EnrichCapabilityArg::Embeddings => EnrichmentCapability::Embeddings,
                 EnrichCapabilityArg::CallReferences => EnrichmentCapability::CallReferences,
@@ -570,15 +576,25 @@ async fn async_main() -> anyhow::Result<()> {
                 EnrichScopeArg::Repo => EnrichmentScope::Repo,
                 EnrichScopeArg::Changed => EnrichmentScope::ChangedFiles,
                 EnrichScopeArg::Root => {
-                    EnrichmentScope::Root(args.root.clone().ok_or_else(|| {
+                    let root = args.root.clone().ok_or_else(|| {
                         anyhow::anyhow!("--root <slug> is required when --scope root is selected")
-                    })?)
+                    })?;
+                    let known_roots: Vec<String> = workspace_config
+                        .resolved_roots()
+                        .into_iter()
+                        .map(|root| root.slug)
+                        .collect();
+                    if !known_roots.iter().any(|known| known == &root) {
+                        anyhow::bail!(
+                            "unknown root slug `{}`; known roots: {}",
+                            root,
+                            known_roots.join(", ")
+                        );
+                    }
+                    EnrichmentScope::Root(root)
                 }
             };
-            let lsp_only_roots = WorkspaceConfig::load()
-                .with_primary_root(repo_root.clone())
-                .with_declared_roots(&repo_root)
-                .lsp_only_roots();
+            let lsp_only_roots = workspace_config.lsp_only_roots();
             let handler = RnaHandler {
                 repo_root: repo_root.clone(),
                 lsp_only_roots: Arc::new(lsp_only_roots),
@@ -608,7 +624,11 @@ async fn async_main() -> anyhow::Result<()> {
                 .run_explicit_enrichment(
                     capability,
                     scope,
-                    !args.no_background_continuation,
+                    if args.no_background_continuation {
+                        EnrichmentContinuation::Disabled
+                    } else {
+                        EnrichmentContinuation::RunToCompletion
+                    },
                     |msg| {
                         eprintln!("{}", msg);
                     },

@@ -17,7 +17,8 @@ use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
 use super::enrichment_jobs::{
-    EnrichmentCapability, EnrichmentScope, EnrichmentTrigger, JobStart, ScanEnrichmentOptions,
+    EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
+    ScanEnrichmentOptions,
 };
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
@@ -53,6 +54,19 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
 }
 
 type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentContinuation {
+    Disabled,
+    SpawnBackground,
+    RunToCompletion,
+}
+
+impl EnrichmentContinuation {
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LspBudget {
@@ -1749,10 +1763,10 @@ impl RnaHandler {
             }
             JobStart::Joined { existing_job_id } => {
                 on_progress(&format!(
-                    "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
+                    "LSP: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                return Ok(0);
+                return self.wait_for_joined_enrichment_job(&existing_job_id).await;
             }
         };
 
@@ -1815,7 +1829,13 @@ impl RnaHandler {
                         self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-                self.lsp_status.set_complete(lsp_edge_count);
+                if repo_wide_lsp {
+                    self.lsp_status.set_complete(lsp_edge_count);
+                } else {
+                    let existing_coverage = self.lsp_status.coverage_edge_count();
+                    self.lsp_status
+                        .set_complete_with_coverage(lsp_edge_count, existing_coverage);
+                }
 
                 self.enrichment_jobs.mark_progress(
                     &self.repo_root,
@@ -1884,7 +1904,7 @@ impl RnaHandler {
         &self,
         capability: EnrichmentCapability,
         scope: EnrichmentScope,
-        continue_background: bool,
+        continuation: EnrichmentContinuation,
         on_progress: F,
     ) -> anyhow::Result<()>
     where
@@ -1906,12 +1926,17 @@ impl RnaHandler {
                 self.run_explicit_embedding_enrichment(
                     &all_nodes,
                     scope.clone(),
-                    continue_background,
+                    continuation,
                     &on_progress,
                 )
                 .await?;
             }
             EnrichmentCapability::CallReferences => {
+                if matches!(scope, EnrichmentScope::ChangedFiles) {
+                    anyhow::bail!(
+                        "changed-file call-reference enrichment is not supported by the LSP executor yet; use `--scope root --root <slug>` or `--scope repo`"
+                    );
+                }
                 let dirty_slugs = self.dirty_slugs_for_scope(&scope);
                 let count = self
                     .run_foreground_lsp_and_persist(
@@ -1926,11 +1951,34 @@ impl RnaHandler {
                     "LSP explicit enrichment complete: {} call/reference edges",
                     count
                 ));
-                if continue_background && !matches!(scope, EnrichmentScope::Repo) {
-                    self.spawn_lsp_enrichment_via_bus(&all_nodes, &all_edges);
-                    on_progress(
-                        "LSP background continuation scheduled for remaining cached graph coverage",
-                    );
+                if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+                    match continuation {
+                        EnrichmentContinuation::Disabled => {}
+                        EnrichmentContinuation::SpawnBackground => {
+                            self.spawn_lsp_enrichment_via_bus(&all_nodes, &all_edges);
+                            on_progress(
+                                "LSP background continuation scheduled for remaining cached graph coverage",
+                            );
+                        }
+                        EnrichmentContinuation::RunToCompletion => {
+                            on_progress(
+                                "LSP continuation: enriching remaining cached graph coverage",
+                            );
+                            let continuation_count = self
+                                .run_foreground_lsp_and_persist(
+                                    &on_progress,
+                                    EnrichmentScope::Repo,
+                                    EnrichmentTrigger::Explicit,
+                                    None,
+                                    true,
+                                )
+                                .await?;
+                            on_progress(&format!(
+                                "LSP continuation complete: {} call/reference edges",
+                                continuation_count
+                            ));
+                        }
+                    }
                 }
             }
             EnrichmentCapability::ExtractedGraph => {
@@ -1948,7 +1996,46 @@ impl RnaHandler {
         &self,
         all_nodes: &[Node],
         scope: EnrichmentScope,
-        continue_background: bool,
+        continuation: EnrichmentContinuation,
+        on_progress: &F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        self.run_embedding_enrichment_once(all_nodes, scope.clone(), on_progress)
+            .await?;
+
+        if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+            match continuation {
+                EnrichmentContinuation::Disabled => {}
+                EnrichmentContinuation::SpawnBackground => {
+                    let handle = self.spawn_background_enrichment(all_nodes);
+                    *self.embed_handle.lock().await = Some(handle);
+                    on_progress(
+                        "Embedding background continuation scheduled for remaining cached graph coverage",
+                    );
+                }
+                EnrichmentContinuation::RunToCompletion => {
+                    on_progress(
+                        "Embedding continuation: enriching remaining cached graph coverage",
+                    );
+                    self.run_embedding_enrichment_once(
+                        all_nodes,
+                        EnrichmentScope::Repo,
+                        on_progress,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_embedding_enrichment_once<F>(
+        &self,
+        all_nodes: &[Node],
+        scope: EnrichmentScope,
         on_progress: &F,
     ) -> anyhow::Result<()>
     where
@@ -1969,9 +2056,11 @@ impl RnaHandler {
             JobStart::Started(job) => job.job_id,
             JobStart::Joined { existing_job_id } => {
                 on_progress(&format!(
-                    "Embed: joined active enrichment job {}; skipping duplicate explicit embedding",
+                    "Embed: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
+                self.wait_for_joined_enrichment_job(&existing_job_id)
+                    .await?;
                 return Ok(());
             }
         };
@@ -2016,13 +2105,6 @@ impl RnaHandler {
                     "Embed explicit enrichment complete: {} embedded items",
                     count
                 ));
-                if continue_background && !matches!(scope, EnrichmentScope::Repo) {
-                    let handle = self.spawn_background_enrichment(all_nodes);
-                    *self.embed_handle.lock().await = Some(handle);
-                    on_progress(
-                        "Embedding background continuation scheduled for remaining cached graph coverage",
-                    );
-                }
                 Ok(())
             }
             Err(e) => {
@@ -2031,6 +2113,46 @@ impl RnaHandler {
                     .mark_failed(&self.repo_root, &job_id, format!("{}", e));
                 Err(e)
             }
+        }
+    }
+
+    async fn wait_for_joined_enrichment_job(&self, job_id: &str) -> anyhow::Result<usize> {
+        let budget = LspBudget::from_env().max_duration;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(job) = self
+                .enrichment_jobs
+                .recent_jobs(&self.repo_root, 100)
+                .into_iter()
+                .find(|job| job.job_id == job_id)
+            {
+                match job.state {
+                    EnrichmentJobState::Completed => return Ok(job.counters.current),
+                    EnrichmentJobState::Failed => {
+                        let detail = job.failure.unwrap_or_else(|| "unknown failure".to_string());
+                        anyhow::bail!("joined enrichment job {} failed: {}", job_id, detail);
+                    }
+                    EnrichmentJobState::Superseded => {
+                        anyhow::bail!("joined enrichment job {} was superseded", job_id);
+                    }
+                    EnrichmentJobState::Cancelled => {
+                        anyhow::bail!("joined enrichment job {} was cancelled", job_id);
+                    }
+                    EnrichmentJobState::Queued
+                    | EnrichmentJobState::Running
+                    | EnrichmentJobState::Persisting => {}
+                }
+            }
+
+            if started.elapsed() > budget {
+                anyhow::bail!(
+                    "timed out waiting for joined enrichment job {} after {}s",
+                    job_id,
+                    budget.as_secs()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 

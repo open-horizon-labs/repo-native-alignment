@@ -15,6 +15,7 @@ pub mod tools;
 pub(crate) use graph::SUBSYSTEM_KEY;
 
 // Re-export public API so external `use crate::server::X` still works.
+pub use enrichment::EnrichmentContinuation;
 pub use enrichment_jobs::{
     EmbeddingEnrichmentMode, EnrichmentCapability, EnrichmentJobLedger, EnrichmentJobRecord,
     EnrichmentScope, EnrichmentTrigger, JobStart, LspEnrichmentMode, ScanEnrichmentOptions,
