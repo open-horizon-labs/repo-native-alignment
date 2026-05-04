@@ -1766,7 +1766,12 @@ impl RnaHandler {
                     "LSP: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                return self.wait_for_joined_enrichment_job(&existing_job_id).await;
+                return self
+                    .wait_for_joined_enrichment_job(
+                        &existing_job_id,
+                        EnrichmentCapability::CallReferences,
+                    )
+                    .await;
             }
         };
 
@@ -2059,8 +2064,11 @@ impl RnaHandler {
                     "Embed: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                self.wait_for_joined_enrichment_job(&existing_job_id)
-                    .await?;
+                self.wait_for_joined_enrichment_job(
+                    &existing_job_id,
+                    EnrichmentCapability::Embeddings,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2116,7 +2124,11 @@ impl RnaHandler {
         }
     }
 
-    async fn wait_for_joined_enrichment_job(&self, job_id: &str) -> anyhow::Result<usize> {
+    async fn wait_for_joined_enrichment_job(
+        &self,
+        job_id: &str,
+        capability: EnrichmentCapability,
+    ) -> anyhow::Result<usize> {
         let budget = LspBudget::from_env().max_duration;
         let started = std::time::Instant::now();
         loop {
@@ -2127,7 +2139,19 @@ impl RnaHandler {
                 .find(|job| job.job_id == job_id)
             {
                 match job.state {
-                    EnrichmentJobState::Completed => return Ok(job.counters.current),
+                    EnrichmentJobState::Completed => {
+                        if capability == EnrichmentCapability::CallReferences
+                            && let Some(progress) = self
+                                .enrichment_jobs
+                                .events_for_job(&self.repo_root, job_id)
+                                .into_iter()
+                                .rev()
+                                .find(|event| event.phase.as_deref() == Some("lsp_edges"))
+                        {
+                            return Ok(progress.counters.current);
+                        }
+                        return Ok(job.counters.current);
+                    }
                     EnrichmentJobState::Failed => {
                         let detail = job.failure.unwrap_or_else(|| "unknown failure".to_string());
                         anyhow::bail!("joined enrichment job {} failed: {}", job_id, detail);

@@ -609,16 +609,23 @@ async fn async_main() -> anyhow::Result<()> {
                 ),
             };
             handler.graph.store(Arc::new(Some(Arc::new(graph))));
-            if capability == EnrichmentCapability::Embeddings
-                && let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+            if capability == EnrichmentCapability::Embeddings {
+                if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
                     tracing::warn!(
                         "{}; explicit embedding enrichment may need a repo-scope run",
                         msg
                     );
                 })
                 .await
-            {
-                handler.embed_index.store(Arc::new(Some(embed_idx)));
+                {
+                    handler.embed_index.store(Arc::new(Some(embed_idx)));
+                } else if !matches!(scope, EnrichmentScope::Repo) {
+                    anyhow::bail!(
+                        "no embedding index found for {}; run `repo-native-alignment enrich --capability embeddings --scope repo --repo {}` before scoped embedding enrichment",
+                        repo_root.display(),
+                        repo_root.display()
+                    );
+                }
             }
             handler
                 .run_explicit_enrichment(
