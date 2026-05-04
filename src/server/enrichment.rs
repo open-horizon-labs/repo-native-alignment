@@ -1071,6 +1071,7 @@ impl RnaHandler {
                     EnrichmentScope::Repo,
                     EnrichmentTrigger::ForegroundScan,
                     None,
+                    false,
                 )
                 .await?
             } else {
@@ -1636,7 +1637,7 @@ impl RnaHandler {
                     edges.len(),
                     lsp_edge_count,
                 );
-                if let Some(job_id) = lsp_job_id.as_deref() {
+                if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_persisting(
                         &self.repo_root,
                         job_id,
@@ -1646,7 +1647,7 @@ impl RnaHandler {
                 }
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground full persist failed: {}", e);
-                    if let Some(job_id) = lsp_job_id.as_deref() {
+                    if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                         self.enrichment_jobs.mark_failed(
                             &self.repo_root,
                             job_id,
@@ -1665,7 +1666,7 @@ impl RnaHandler {
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
-                if let Some(job_id) = lsp_job_id.as_deref() {
+                if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_completed(
                         &self.repo_root,
                         job_id,
@@ -1717,6 +1718,7 @@ impl RnaHandler {
         scope: EnrichmentScope,
         trigger: EnrichmentTrigger,
         dirty_slugs: Option<HashSet<String>>,
+        fail_on_lsp_error: bool,
     ) -> anyhow::Result<usize>
     where
         F: Fn(&str) + Send + Sync,
@@ -1726,6 +1728,7 @@ impl RnaHandler {
             let gs = snap.as_ref().as_ref().unwrap();
             (gs.nodes.clone(), gs.edges.clone())
         };
+        let repo_wide_lsp = dirty_slugs.is_none();
 
         let server_name = self.lsp_status.server_name();
         if let Some(ref name) = server_name {
@@ -1838,11 +1841,13 @@ impl RnaHandler {
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
                 // LSP enrichment is durable and can skip re-enrichment (#477).
-                super::sentinel::write_lsp_sentinel(
-                    &self.repo_root,
-                    enriched_nodes.len(),
-                    enriched_edges.len(),
-                );
+                if repo_wide_lsp {
+                    super::sentinel::write_lsp_sentinel(
+                        &self.repo_root,
+                        enriched_nodes.len(),
+                        enriched_edges.len(),
+                    );
+                }
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
                     &job_id,
@@ -1866,6 +1871,9 @@ impl RnaHandler {
                     self.lsp_status.set_unavailable();
                     self.enrichment_jobs
                         .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                }
+                if fail_on_lsp_error {
+                    return Err(anyhow::anyhow!("LSP enrichment failed: {}", e));
                 }
                 Ok(0)
             }
@@ -1911,6 +1919,7 @@ impl RnaHandler {
                         scope.clone(),
                         EnrichmentTrigger::Explicit,
                         dirty_slugs,
+                        true,
                     )
                     .await?;
                 on_progress(&format!(
