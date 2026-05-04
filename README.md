@@ -178,6 +178,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `search "auth"` | `search(query="auth")` | Find symbols by name |
 | `graph --node <id> --mode neighbors` | `search(node="<id>", mode="neighbors")` | Graph traversal |
 | `scan --full` | *(runs automatically on first query)* | Full pipeline: scan → extract → embed → LSP → graph |
+| `enrich --capability embeddings --scope repo` | — | Run one enrichment capability against an existing cache without re-extracting source |
 | `test` | — | 29 pipeline checks end-to-end |
 
 ### CLI Subcommands
@@ -188,6 +189,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --repo <dir>` | Scan + extract + embed + persist |
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. |
+| `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed` | Run selected enrichment against an existing graph cache without source extraction. Use `--root <slug>` with `--scope root`; use `--no-background-continuation` to skip remaining repo-wide coverage. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 29 pipeline checks end-to-end |
 | `adr compile --repo <dir>` | Compile ADR frontmatter into `.oh/adr-validation/*.json` and refresh `docs/ADRs/README.md` when present |
