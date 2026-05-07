@@ -118,7 +118,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         }
         // depth > 1 is not supported for batched traversal (nodes=[...]).
         // Use node= (single node) instead, or call search separately for each node.
-        if params.depth.unwrap_or(1) > 1 && params.mode.as_deref() == Some("neighbors") {
+        if params.depth.unwrap_or(1) > 1 && params.normalized_mode() == Some("neighbors") {
             return "depth > 1 is not supported with nodes=[...] batched traversal. Use node= for a single entry point with depth traversal.".to_string();
         }
         return search_batch(
@@ -130,7 +130,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         );
     }
 
-    if params.mode.is_some() {
+    if params.normalized_mode().is_some() {
         search_traversal(
             params,
             query,
@@ -699,7 +699,7 @@ async fn search_traversal(
     semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
-    let mode = params.mode.as_deref().unwrap_or("neighbors");
+    let mode = params.normalized_mode().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
 
     // ── cycles mode ─────────────────────────────────────────────────────────
@@ -1372,8 +1372,7 @@ fn search_batch(
     // Build O(1) lookup map and root slugs once for the entire batch.
     let node_index_map = gs.node_index_map();
     let roots = GraphState::root_slugs_from_index_map(node_index_map);
-    if params.mode.is_some() {
-        let mode = params.mode.as_deref().unwrap_or("neighbors");
+    if let Some(mode) = params.normalized_mode() {
         let edge_filter = params.edge_types.as_ref().map(|types| {
             types
                 .iter()

@@ -108,6 +108,13 @@ fn non_blank_optional(value: &Option<String>) -> Option<String> {
 }
 
 impl SearchParams {
+    pub fn normalized_mode(&self) -> Option<&str> {
+        self.mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// Convert from MCP `Search` tool struct.
     pub fn from_mcp_search(args: &crate::server::tools::Search) -> Self {
         Self {

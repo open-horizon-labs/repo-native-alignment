@@ -15,11 +15,12 @@
 - Updated `Search.mode` tool docs to describe whitespace normalization.
 
 ### Step 3: Fix
-**Status:** completed in follow-up commit.
-**Verification:** `cargo test --lib from_mcp_search`, `cargo check --lib`, `git diff --check`.
+**Status:** completed in follow-up commits.
+**Additional manual catch:** CLI `search --mode ""` still failed when only MCP conversion normalized mode. Fixed by normalizing `SearchParams::normalized_mode()` at the service search dispatch boundary, so MCP and CLI search share behavior.
+**Verification:** `cargo test --lib from_mcp_search`, `cargo check --lib`, `cargo build --bin repo-native-alignment`, CLI empty/whitespace/padded/invalid mode smoke, `git diff --check`.
 
 ### Step 3b: Mark Ready / CodeRabbit
-Pending.
+**Status:** ready for review; CodeRabbit review in progress.
 
 ### Step 4+: Verification
 Pending.
