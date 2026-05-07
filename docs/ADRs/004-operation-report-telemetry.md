@@ -1,3 +1,13 @@
+---
+id: 004-operation-report-telemetry
+status: implemented
+validate:
+  cargo_tests:
+    - server::operation_report::tests::store_marks_non_terminal_reports_stale_on_read
+    - server::operation_report::tests::running_lsp_is_reported_as_degraded_not_completed
+    - service::roots::tests::test_list_roots_from_slugs_includes_recent_operation_reports
+---
+
 # ADR-004: OperationReport telemetry control plane
 
 ## Status
