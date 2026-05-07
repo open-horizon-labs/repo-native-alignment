@@ -9,7 +9,7 @@ verdict: pending
 
 # Ship Pipeline — PR #672
 
-### Pre-flight
+## Pre-flight
 - PR: #672 `OperationReport telemetry control plane`
 - Branch: `execute/operation-report-669-671`
 - Issues: #669, #670, #671
@@ -17,7 +17,7 @@ verdict: pending
 - Required project ship docs read: `skill://ship/SKILL.md`, `.claude/agents/ship.md`, `AGENTS.md` from injected context, `.oh/guardrails/computed-but-not-delivered.md`.
 - Initial CodeRabbit state: skipped while draft; no inline review comments before ready.
 
-### RNA Tool Friction Log
+## RNA Tool Friction Log
 
 | Step | Tool | Friction | Workaround | Severity |
 |---|---|---|---|---|
@@ -26,7 +26,7 @@ verdict: pending
 | Pre-flight | `repo-native-alignment scan --repo . --full` | Mandatory scan gate using installed binary timed out after 600s while background enrichment was active. | Refreshed code graph with bounded extract-only/no-LSP/no-embed scan for review navigation; reserve full scan/perf gate for manual verification if needed. | medium |
 
 
-### Step 1: RNA-Grounded Review
+## Step 1: RNA-Grounded Review
 **Verdict:** ADJUST
 **Metis checked:** 3 entries
 **Guardrails checked:** 4 entries
@@ -35,7 +35,7 @@ verdict: pending
 - Two tooling/coverage caveats logged as N/A in friction log.
 **PR comment:** https://github.com/open-horizon-labs/repo-native-alignment/pull/672#issuecomment-4393807988
 
-### Step 2: Independent Code Review
+## Step 2: Independent Code Review
 **Verdict:** REQUEST CHANGES
 **PR comment:** https://github.com/open-horizon-labs/repo-native-alignment/pull/672#issuecomment-4393888046
 **Findings addressed in Step 3:**
@@ -46,10 +46,10 @@ verdict: pending
 - Scope explicit enrich `related_job_ids`/embedding counts to matching Explicit jobs, capability, and scope.
 - Added regression test for running LSP degraded state.
 
-### Step 3: Fix
+## Step 3: Fix
 **Status:** implemented locally; verification pending before commit.
 
-### Step 3 Verification/Commit
+## Step 3 Verification/Commit
 **Commit:** `9030156 Fix OperationReport LSP state truthfulness [outcome:context-assembly]`
 **Pushed:** yes
 **Verification:**
