@@ -162,6 +162,20 @@ mod tests {
     }
 
     #[test]
+    fn from_mcp_search_treats_whitespace_only_mode_as_absent() {
+        let search: Search = serde_json::from_value(json!({
+            "query": "parse_search",
+            "mode": "   "
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.query.as_deref(), Some("parse_search"));
+        assert!(params.mode.is_none());
+    }
+
+    #[test]
     fn from_mcp_search_trims_mode() {
         let search: Search = serde_json::from_value(json!({
             "node": "repo:src/lib.rs:thing:function",
@@ -172,6 +186,19 @@ mod tests {
         let params = SearchParams::from_mcp_search(&search);
 
         assert_eq!(params.mode.as_deref(), Some("neighbors"));
+    }
+
+    #[test]
+    fn from_mcp_search_preserves_invalid_non_blank_mode() {
+        let search: Search = serde_json::from_value(json!({
+            "node": "repo:src/lib.rs:thing:function",
+            "mode": " bogus "
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.mode.as_deref(), Some("bogus"));
     }
 }
 
