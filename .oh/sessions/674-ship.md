@@ -30,8 +30,11 @@ pr: 674
 ### Step 4: Regression Oracle
 **Status:** added service-boundary regression tests for blank mode flat search, padded traversal mode, and invalid non-blank mode failure, plus conversion tests for MCP argument normalization.
 
+### Step 7b: Delivery Verification
+**Status:** MCP stdio smoke script now asserts `search` with `mode: ""` behaves as flat search; local run against `./target/debug/repo-native-alignment` passed.
+
 ### Step 3b / CodeRabbit
-**Status:** ready for review; CodeRabbit review in progress after latest push.
+**Status:** ready for review; CodeRabbit findings addressed once; waiting for latest review pass after MCP smoke addition.
 
 ### Step 5+: Verification
 Pending.
