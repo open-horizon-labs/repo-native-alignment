@@ -665,7 +665,13 @@ impl OperationReportStore {
             if !report.state.is_terminal() {
                 changed = true;
                 report.state = OperationState::Stale;
-                report.completed_at = Some(unix_now());
+                let completed_at = unix_now();
+                report.completed_at = Some(completed_at);
+                report.duration_ms = Some(
+                    completed_at
+                        .saturating_sub(report.started_at)
+                        .saturating_mul(1000),
+                );
                 report.failure.get_or_insert_with(|| {
                     "operation was non-terminal when read from disk; previous process likely exited"
                         .to_string()
