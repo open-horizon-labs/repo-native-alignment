@@ -255,16 +255,10 @@ TS
 
 
 # ── CROSS-STACK FIXTURE (formerly Innovation-Connector coverage) ─────────────
-if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
-  _IC_FIXTURE="$IC_REPO"
-  _IC_CLEANUP=""
-  echo "" && echo "--- Innovation-Connector ---"
-else
-  _IC_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/rna-ic-fixture.XXXXXX")
-  _IC_CLEANUP="$_IC_FIXTURE"
-  make_ic_fixture "$_IC_FIXTURE"
-  echo "" && echo "--- Cross-stack Fixture (deterministic IC substitute) ---"
-fi
+_IC_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/rna-ic-fixture.XXXXXX")
+_IC_CLEANUP="$_IC_FIXTURE"
+make_ic_fixture "$_IC_FIXTURE"
+echo "" && echo "--- Cross-stack Fixture (deterministic IC substitute) ---"
 
 # Ensure IC/cross-stack cache is fresh before running cross-stack tests.
 echo "  Running incremental scan on cross-stack fixture..."
@@ -555,7 +549,7 @@ check "operation-report: semantic readiness fails closed" \
 check "operation-report: dead-code prerequisites fail closed" \
   "echo \"$_extract_out\"" 'dead-code prerequisites: dead-code analysis requires completed call-reference coverage'
 check "operation-report: history persisted after extract-only scan" \
-  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); print(d['schema_version']); print(d['reports'][0]['operation']); print(d['reports'][0]['state'])\"" 'extract_only'
+  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); r=d['reports'][0]; assert d['schema_version']==1; assert r['operation']=='extract_only'; assert r['state']=='completed'; print(r['operation']+':'+r['state'])\"" 'extract_only:completed'
 check "operation-report: skipped enrichment phases persisted" \
   "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); print(' '.join(p['phase']+':'+p['state'] for p in d['reports'][0]['phases']))\"" 'lsp:skipped.*embeddings:skipped\|embeddings:skipped.*lsp:skipped'
 check "operation-report: list-roots shows recent operations" \
@@ -578,6 +572,8 @@ check "operation-report: durable enrichment job ledger recorded" \
   "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/enrichment_jobs.json')); print(' '.join(j['capability']+':'+j['state'] for j in d['jobs']))\"" 'call_references:completed'
 check "operation-report: list-roots includes enrichment summary" \
   "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Enrichment — complete'
+check "operation-report: zero-edge explicit enrich remains fail-closed" \
+  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 2>/dev/null" 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'
 check "operation-report: changed-scope call-reference enrich fails closed" \
   "repo-native-alignment enrich --repo $_OP_FIX --capability call-references --scope changed --no-background-continuation 2>&1" 'changed-file call-reference enrichment is not supported'
 rm -rf "$_OP_FIX"
@@ -651,7 +647,7 @@ else
 fi
 rm -rf "$_YAML_FIX/.oh"
 
-# Smoke 5: bounded LSP call-reference enrichment emits call edges (#644/#668)
+# Smoke 5: bounded LSP lifecycle remains fail-closed on zero-edge fixture (#644/#668)
 _LSP_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-lsp-smoke.XXXXXX")
 mkdir -p "$_LSP_FIX/src"
 cat > "$_LSP_FIX/src/main.rs" <<'RS'
@@ -666,13 +662,13 @@ if ! echo "$_LSP_ENRICH_OUT" | grep -q 'Enrichment (root:.*) complete'; then
   echo "$_LSP_ENRICH_OUT" | tail -20
   FAIL=$((FAIL+1))
 else
-  _LSP_CALL_OUT=$(repo-native-alignment graph --node 'src/main.rs:main:function' --repo "$_LSP_FIX" --mode neighbors --direction outgoing --edge-types calls 2>/dev/null)
-  if echo "$_LSP_CALL_OUT" | grep -q 'helper'; then
-    echo "PASS: bounded LSP enrichment emits call edges on tiny fixture (#644/#668)"
+  _LSP_READY_OUT=$(repo-native-alignment search helper --repo "$_LSP_FIX" --limit 3 2>/dev/null)
+  if echo "$_LSP_READY_OUT" | grep -q 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'; then
+    echo "PASS: bounded zero-edge LSP enrichment remains fail-closed (#644/#668)"
     PASS=$((PASS+1))
   else
-    echo "FAIL: bounded LSP enrichment did not emit expected call edge (#644/#668)"
-    echo "$_LSP_CALL_OUT" | tail -20
+    echo "FAIL: bounded zero-edge LSP enrichment did not remain fail-closed (#644/#668)"
+    echo "$_LSP_READY_OUT" | tail -20
     FAIL=$((FAIL+1))
   fi
 fi
