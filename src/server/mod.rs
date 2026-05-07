@@ -6,6 +6,7 @@ mod enrichment_jobs;
 mod graph;
 pub mod handlers;
 pub mod helpers;
+pub mod operation_report;
 pub mod sentinel;
 pub mod state;
 pub mod store;
@@ -21,6 +22,7 @@ pub use enrichment_jobs::{
     EnrichmentScope, EnrichmentTrigger, JobStart, LspEnrichmentMode, ScanEnrichmentOptions,
 };
 pub use helpers::format_freshness;
+pub use operation_report::{OperationReport, OperationReportStore, render_recent_reports_markdown};
 pub use state::{
     EmbeddingStatus, GraphBuildState, GraphBuildStatus, GraphState, LspEnrichmentStatus, LspState,
 };
@@ -61,34 +63,13 @@ pub struct PipelineResult {
     pub total_time: std::time::Duration,
     pub lsp_entries: Vec<crate::extract::scan_stats::LspEnrichmentEntry>,
     pub encoding_stats: crate::extract::EncodingStats,
+    pub report: OperationReport,
 }
 
 impl PipelineResult {
     /// Format a structured scan summary for display.
     pub fn format_summary(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "Scan complete: {} symbols, {} edges, {} files in {:.1}s",
-            self.node_count,
-            self.edge_count,
-            self.file_count,
-            self.total_time.as_secs_f64()
-        ));
-        if !self.lsp_entries.is_empty() {
-            lines.push(String::new());
-            lines.push("LSP enrichment:".to_string());
-            for entry in &self.lsp_entries {
-                lines.push(entry.summary_line());
-            }
-        }
-        if !self.encoding_stats.is_empty() {
-            lines.push(String::new());
-            lines.push(format!(
-                "Encoding: {} lossy-decoded, {} binary-skipped",
-                self.encoding_stats.lossy_decoded, self.encoding_stats.binary_skipped
-            ));
-        }
-        lines.join("\n")
+        self.report.render_cli(false)
     }
 }
 

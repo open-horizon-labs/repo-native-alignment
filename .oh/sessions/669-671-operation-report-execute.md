@@ -22,3 +22,23 @@ updated: 2026-05-05
 
 ## Drift guard
 If persistence or MCP exposure requires a new scheduler/tool protocol redesign, pause and narrow to OperationReport + CLI/list_roots exposure rather than expanding beyond Option D.
+
+
+## Execute
+**Updated:** 2026-05-05
+**Status:** complete
+
+Implemented Option D in one PR branch:
+- #669: Added `OperationReport` model, structured capability/phase/degradation/next-step/diagnostic reports, CLI and markdown renderers, bounded store, ADR-004, and tests.
+- #670: Added `scan --timings`; scan/full/incremental/cache/extract-only/explicit enrich paths now create/persist/render operation reports with degraded query classes and next enrichment commands.
+- #671: Persisted bounded recent operation history at `.oh/.cache/operation_reports.json`; `list_roots`/MCP-visible root output appends recent operation reports; stale non-terminal records are marked stale on read.
+
+Verification completed:
+- `cargo check --lib --bins --no-default-features`
+- `cargo clippy --lib --bins --no-default-features -- -D warnings`
+- `cargo test --lib --no-default-features operation_report -- --nocapture`
+- `cargo test --lib --no-default-features test_list_roots_from_slugs_includes_recent_operation_reports -- --nocapture`
+- `cargo test --lib --no-default-features -- --test-threads=1`
+- Manual smoke with built binary: `scan --extract-only --no-embed --no-lsp --timings`, persisted report JSON assertion, and `list-roots` recent operation output.
+
+Observed test-suite note: default parallel `cargo test --lib --no-default-features` repeatedly exposed an existing order/concurrency-sensitive failure in `server::tests::test_declared_root_persists_across_fresh_handler_scans`; the test passes in isolation and the full suite passes with `--test-threads=1`.

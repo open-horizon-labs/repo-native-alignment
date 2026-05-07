@@ -20,6 +20,10 @@ use super::enrichment_jobs::{
     EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
     ScanEnrichmentOptions,
 };
+use super::operation_report::{
+    OperationKind, OperationReport, OperationTrigger, OutputReport, PhaseKind, PhaseReport,
+    add_scan_degradation_and_next_steps, scan_capability_reports,
+};
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
 use super::{PipelineResult, RnaHandler};
@@ -51,6 +55,56 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     // Quick check: do any imports match known framework patterns?
     let result = crate::extract::framework_detection::framework_detection_pass(nodes, "check");
     !result.detected_frameworks.is_empty()
+}
+
+#[derive(Debug, Clone)]
+struct PipelineReportInput {
+    operation: OperationKind,
+    enrichment: ScanEnrichmentOptions,
+    duration: Duration,
+    symbol_count: usize,
+    edge_count: usize,
+    file_count: usize,
+    lsp_edge_count: usize,
+    embedding_count: usize,
+    embeddings_attached: bool,
+    phases: Vec<PhaseReport>,
+}
+
+fn build_pipeline_operation_report(
+    repo_root: &std::path::Path,
+    input: PipelineReportInput,
+) -> OperationReport {
+    let mut report =
+        OperationReport::new(input.operation, OperationTrigger::ForegroundScan, repo_root)
+            .with_scope("repo")
+            .complete(input.duration);
+    report.outputs = OutputReport {
+        symbol_count: Some(input.symbol_count),
+        edge_count: Some(input.edge_count),
+        file_count: (input.file_count > 0).then_some(input.file_count),
+        embedding_count: Some(input.embedding_count),
+        lsp_edge_count: Some(input.lsp_edge_count),
+    };
+    for phase in input.phases {
+        report.add_phase(phase);
+    }
+    for capability in scan_capability_reports(
+        input.enrichment,
+        input.embeddings_attached,
+        input.lsp_edge_count,
+        Some("repo".to_string()),
+    ) {
+        report.add_capability(capability);
+    }
+    add_scan_degradation_and_next_steps(
+        &mut report,
+        repo_root,
+        input.enrichment,
+        input.embeddings_attached,
+        input.lsp_edge_count,
+    );
+    report
 }
 
 type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>);
@@ -1112,6 +1166,38 @@ impl RnaHandler {
                 total_time.as_secs_f64()
             ));
 
+            let mut phases = vec![
+                PhaseReport::ran(PhaseKind::DiscoverFiles, scan_time),
+                PhaseReport::ran(PhaseKind::Total, total_time),
+            ];
+            if !enrichment.runs_lsp() {
+                phases.push(PhaseReport::skipped(
+                    PhaseKind::Lsp,
+                    "skipped by scan options",
+                ));
+            }
+            if !enrichment.runs_embeddings() {
+                phases.push(PhaseReport::skipped(
+                    PhaseKind::Embeddings,
+                    "skipped by scan options",
+                ));
+            }
+            let report = build_pipeline_operation_report(
+                &self.repo_root,
+                PipelineReportInput {
+                    operation: OperationKind::CacheLoad,
+                    enrichment,
+                    duration: total_time,
+                    symbol_count: total_node_count,
+                    edge_count: total_edge_count,
+                    file_count: 0,
+                    lsp_edge_count,
+                    embedding_count: 0,
+                    embeddings_attached: self.embed_index.load().is_some(),
+                    phases,
+                },
+            );
+
             return Ok(PipelineResult {
                 node_count: total_node_count,
                 edge_count: total_edge_count,
@@ -1121,6 +1207,7 @@ impl RnaHandler {
                 total_time,
                 lsp_entries: vec![],
                 encoding_stats: crate::extract::EncodingStats::default(),
+                report,
             });
         }
 
@@ -1342,6 +1429,43 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
+        let mut phases = vec![
+            PhaseReport::ran(PhaseKind::Extract, extract_time),
+            PhaseReport::ran(PhaseKind::PostPasses, bus_time),
+            PhaseReport::ran(
+                PhaseKind::PersistGraph,
+                total_time.saturating_sub(extract_time + bus_time),
+            ),
+            PhaseReport::ran(PhaseKind::Total, total_time),
+        ];
+        if !enrichment.runs_lsp() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Lsp,
+                "skipped by scan options",
+            ));
+        }
+        if !enrichment.runs_embeddings() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Embeddings,
+                "skipped by scan options",
+            ));
+        }
+        let report = build_pipeline_operation_report(
+            &self.repo_root,
+            PipelineReportInput {
+                operation: OperationKind::IncrementalRefresh,
+                enrichment,
+                duration: total_time,
+                symbol_count: total_node_count,
+                edge_count: total_edge_count,
+                file_count,
+                lsp_edge_count,
+                embedding_count: 0,
+                embeddings_attached: self.embed_index.load().is_some(),
+                phases,
+            },
+        );
+
         let result = PipelineResult {
             node_count: total_node_count,
             edge_count: total_edge_count,
@@ -1351,6 +1475,7 @@ impl RnaHandler {
             total_time,
             lsp_entries: vec![],
             encoding_stats,
+            report,
         };
         on_progress(&result.format_summary());
         Ok(result)
@@ -1708,6 +1833,41 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
+        let mut phases = vec![
+            PhaseReport::ran(PhaseKind::Extract, scan_extract_time),
+            PhaseReport::ran(PhaseKind::PostPasses, bus_time),
+            PhaseReport::ran(PhaseKind::Total, total_time),
+        ];
+        if enrichment.runs_embeddings() {
+            phases.push(PhaseReport::ran(PhaseKind::Embeddings, embed_time));
+        } else {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Embeddings,
+                "skipped by scan options",
+            ));
+        }
+        if !enrichment.runs_lsp() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Lsp,
+                "skipped by scan options",
+            ));
+        }
+        let report = build_pipeline_operation_report(
+            &self.repo_root,
+            PipelineReportInput {
+                operation: OperationKind::FullRebuild,
+                enrichment,
+                duration: total_time,
+                symbol_count: total_node_count,
+                edge_count: total_edge_count,
+                file_count,
+                lsp_edge_count,
+                embedding_count: embed_count,
+                embeddings_attached: self.embed_index.load().is_some(),
+                phases,
+            },
+        );
+
         let result = PipelineResult {
             node_count: total_node_count,
             edge_count: total_edge_count,
@@ -1717,6 +1877,7 @@ impl RnaHandler {
             total_time,
             lsp_entries: vec![],
             encoding_stats,
+            report,
         };
         on_progress(&result.format_summary());
         Ok(result)
