@@ -1729,6 +1729,67 @@ mod tests {
         assert!(!p.compact);
         assert!(!p.rerank);
     }
+
+    #[tokio::test]
+    async fn test_search_blank_mode_is_flat_search() {
+        let nodes = vec![make_node("auth_handler", NodeKind::Function, "src/auth.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            mode: Some("   ".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("## Search: \"auth\""));
+        assert!(result.contains("auth_handler"));
+        assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_search_trims_traversal_mode_at_service_boundary() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        let gs = make_graph_state_with_edges(vec![caller.clone(), callee], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            node: Some(caller.stable_id()),
+            mode: Some(" neighbors ".into()),
+            compact: true,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("## Graph neighbors"));
+        assert!(result.contains("callee"));
+        assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_search_preserves_invalid_non_blank_mode_failure() {
+        let node = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state_with_edges(vec![node.clone()], vec![]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            node: Some(node.stable_id()),
+            mode: Some(" bogus ".into()),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("Unknown mode: \"bogus\""));
+    }
+
     #[test]
     fn test_node_passes_root_filter_all() {
         assert!(node_passes_root_filter("any", &None, &HashSet::new()));

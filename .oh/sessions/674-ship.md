@@ -17,10 +17,13 @@
 ### Step 3: Fix
 **Status:** completed in follow-up commits.
 **Additional manual catch:** CLI `search --mode ""` still failed when only MCP conversion normalized mode. Fixed by normalizing `SearchParams::normalized_mode()` at the service search dispatch boundary, so MCP and CLI search share behavior.
-**Verification:** `cargo test --lib from_mcp_search`, `cargo check --lib`, `cargo build --bin repo-native-alignment`, CLI empty/whitespace/padded/invalid mode smoke, `git diff --check`.
+**Verification:** `cargo test --lib from_mcp_search`, `cargo test --lib test_search_`, `cargo check --lib`, `cargo build --bin repo-native-alignment`, CLI empty/whitespace/padded/invalid mode smoke, `git diff --check`.
 
-### Step 3b: Mark Ready / CodeRabbit
-**Status:** ready for review; CodeRabbit review in progress.
+### Step 4: Regression Oracle
+**Status:** added service-boundary regression tests for blank mode flat search, padded traversal mode, and invalid non-blank mode failure, plus conversion tests for MCP argument normalization.
 
-### Step 4+: Verification
+### Step 3b / CodeRabbit
+**Status:** ready for review; CodeRabbit review in progress after latest push.
+
+### Step 5+: Verification
 Pending.
