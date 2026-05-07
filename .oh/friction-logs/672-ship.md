@@ -1,6 +1,11 @@
+---
+date: "2026-05-07"
+pipeline_issue: "/ship PR #672"
+pr: 672
+phase: ship
+---
+
 # Friction Log: PR #672 Ship
-**Date:** 2026-05-07
-**Pipeline/Issue:** /ship PR #672
 
 | Phase/Step | Tool | What happened | Workaround | Severity |
 |------------|------|---------------|------------|----------|

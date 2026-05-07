@@ -1,5 +1,13 @@
-## Ship Pipeline — PR #672
-**Started:** 2026-05-07
+---
+title: "Ship Pipeline — PR #672"
+pr: 672
+phase: ship
+started: "2026-05-07"
+status: in-progress
+verdict: pending
+---
+
+# Ship Pipeline — PR #672
 
 ### Pre-flight
 - PR: #672 `OperationReport telemetry control plane`
@@ -10,6 +18,7 @@
 - Initial CodeRabbit state: skipped while draft; no inline review comments before ready.
 
 ### RNA Tool Friction Log
+
 | Step | Tool | Friction | Workaround | Severity |
 |---|---|---|---|---|
 | Pre-flight | `mcp_rna_server_search` | Flat search calls failed with `Empty nodes list. Provide at least one stable node ID.` and dummy node calls treated as batch lookups instead of query searches. | Used RNA CLI `repo-native-alignment search --repo .` for worktree-aware search and recorded this friction. | high |
