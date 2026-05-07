@@ -159,6 +159,21 @@ try {
     pass("search('main') returned results");
   }
 
+  // ── 4b. search blank mode normalization ───────────────────────────────────
+  console.log("\n── search (blank mode normalization) ──");
+  const blankModeText = await callSearchWithRetry({
+    query: "main",
+    mode: "",
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 3,
+  });
+  if (blankModeText.includes('Unknown mode: ""')) {
+    fail('search mode="" behaves like omitted mode', blankModeText);
+  } else {
+    assertContains('search mode="" behaves like flat search', blankModeText, 'main');
+  }
+
   // ── 5. outcome_progress ─────────────────────────────────────────────────
   console.log("\n── outcome_progress ──");
   const progResult = await client.callTool({

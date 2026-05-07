@@ -118,7 +118,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         }
         // depth > 1 is not supported for batched traversal (nodes=[...]).
         // Use node= (single node) instead, or call search separately for each node.
-        if params.depth.unwrap_or(1) > 1 && params.mode.as_deref() == Some("neighbors") {
+        if params.depth.unwrap_or(1) > 1 && params.normalized_mode() == Some("neighbors") {
             return "depth > 1 is not supported with nodes=[...] batched traversal. Use node= for a single entry point with depth traversal.".to_string();
         }
         return search_batch(
@@ -130,7 +130,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         );
     }
 
-    if params.mode.is_some() {
+    if params.normalized_mode().is_some() {
         search_traversal(
             params,
             query,
@@ -699,7 +699,7 @@ async fn search_traversal(
     semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
-    let mode = params.mode.as_deref().unwrap_or("neighbors");
+    let mode = params.normalized_mode().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
 
     // ── cycles mode ─────────────────────────────────────────────────────────
@@ -1372,8 +1372,7 @@ fn search_batch(
     // Build O(1) lookup map and root slugs once for the entire batch.
     let node_index_map = gs.node_index_map();
     let roots = GraphState::root_slugs_from_index_map(node_index_map);
-    if params.mode.is_some() {
-        let mode = params.mode.as_deref().unwrap_or("neighbors");
+    if let Some(mode) = params.normalized_mode() {
         let edge_filter = params.edge_types.as_ref().map(|types| {
             types
                 .iter()
@@ -1730,6 +1729,67 @@ mod tests {
         assert!(!p.compact);
         assert!(!p.rerank);
     }
+
+    #[tokio::test]
+    async fn test_search_blank_mode_is_flat_search() {
+        let nodes = vec![make_node("auth_handler", NodeKind::Function, "src/auth.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            mode: Some("   ".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("## Search: \"auth\""));
+        assert!(result.contains("auth_handler"));
+        assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_search_trims_traversal_mode_at_service_boundary() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        let gs = make_graph_state_with_edges(vec![caller.clone(), callee], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            node: Some(caller.stable_id()),
+            mode: Some(" neighbors ".into()),
+            compact: true,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("## Graph neighbors"));
+        assert!(result.contains("callee"));
+        assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_search_preserves_invalid_non_blank_mode_failure() {
+        let node = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state_with_edges(vec![node.clone()], vec![]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            node: Some(node.stable_id()),
+            mode: Some(" bogus ".into()),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("Unknown mode: \"bogus\""));
+    }
+
     #[test]
     fn test_node_passes_root_filter_all() {
         assert!(node_passes_root_filter("any", &None, &HashSet::new()));

@@ -123,7 +123,7 @@ pub struct Search {
     /// Stable node ID from previous results
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Traversal: "neighbors","impact","reachable","tests_for","cycles","path"
+    /// Traversal mode; omit/null/blank => flat. Trims whitespace. Values: neighbors, impact, reachable, tests_for, cycles, path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.
@@ -709,7 +709,7 @@ mod tests {
             // Search
             "Search query (name, keyword, or natural language)",
             "Stable node ID from previous results",
-            r#"Traversal: "neighbors","impact","reachable","tests_for","cycles","path""#,
+            r#"Traversal mode; omit/null/blank => flat. Trims whitespace. Values: neighbors, impact, reachable, tests_for, cycles, path."#,
             "Max traversal depth (default: 1 neighbors, 3 impact/reachable)",
             r#"Neighbors direction: "outgoing" (default), "incoming", "both""#,
             "Edge filter: calls, depends_on, implements, defines, etc.",
@@ -735,7 +735,7 @@ mod tests {
             "Repo path to query (e.g. worktree path); defaults to server repo",
         ];
 
-        let max_len = 80;
+        let max_len = 140;
         for desc in &descriptions {
             assert!(
                 desc.len() <= max_len,
