@@ -20,6 +20,11 @@ use super::enrichment_jobs::{
     EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
     ScanEnrichmentOptions,
 };
+use super::operation_report::{
+    CapabilityState, OperationKind, OperationReport, OperationTrigger, OutputReport, PhaseKind,
+    PhaseReport, add_scan_degradation_and_next_steps, embedding_capability_from_availability,
+    lsp_capability_from_status, scan_capability_reports,
+};
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
 use super::{PipelineResult, RnaHandler};
@@ -53,6 +58,64 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     !result.detected_frameworks.is_empty()
 }
 
+#[derive(Debug, Clone)]
+struct PipelineReportInput {
+    operation: OperationKind,
+    enrichment: ScanEnrichmentOptions,
+    duration: Duration,
+    symbol_count: usize,
+    edge_count: usize,
+    file_count: usize,
+    lsp_edge_count: usize,
+    lsp_state: CapabilityState,
+    lsp_detail: Option<String>,
+    embedding_count: usize,
+    embeddings_attached: bool,
+    phases: Vec<PhaseReport>,
+    related_job_ids: Vec<String>,
+}
+
+fn build_pipeline_operation_report(
+    repo_root: &std::path::Path,
+    input: PipelineReportInput,
+) -> OperationReport {
+    let mut report =
+        OperationReport::new(input.operation, OperationTrigger::ForegroundScan, repo_root)
+            .with_scope("repo")
+            .complete(input.duration);
+    report.outputs = OutputReport {
+        symbol_count: Some(input.symbol_count),
+        edge_count: Some(input.edge_count),
+        file_count: (input.file_count > 0).then_some(input.file_count),
+        embedding_count: Some(input.embedding_count),
+        lsp_edge_count: Some(input.lsp_edge_count),
+    };
+    for phase in input.phases {
+        report.add_phase(phase);
+    }
+    let (embedding_state, embedding_detail) =
+        embedding_capability_from_availability(input.enrichment, input.embeddings_attached);
+    for capability in scan_capability_reports(
+        input.enrichment,
+        embedding_state,
+        embedding_detail,
+        input.lsp_state,
+        input.lsp_detail,
+        Some("repo".to_string()),
+    ) {
+        report.add_capability(capability);
+    }
+    add_scan_degradation_and_next_steps(
+        &mut report,
+        repo_root,
+        input.enrichment,
+        embedding_state,
+        input.lsp_state,
+    );
+    report.related_job_ids = input.related_job_ids;
+    report
+}
+
 type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +147,11 @@ impl LspBudget {
             max_duration: Duration::from_millis(millis),
         }
     }
+}
+
+struct LspEnrichmentRun {
+    edge_count: usize,
+    job_id: String,
 }
 
 #[derive(Debug)]
@@ -1060,7 +1128,7 @@ impl RnaHandler {
             // correctly re-runs LSP enrichment (#477).
             let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
 
-            let lsp_edge_count = if lsp_sentinel.is_some() && !stale_enrichment {
+            let (lsp_edge_count, lsp_job_id) = if lsp_sentinel.is_some() && !stale_enrichment {
                 let call_count = {
                     let snap = self.graph.load_full();
                     snap.as_ref()
@@ -1076,21 +1144,23 @@ impl RnaHandler {
                     "LSP: {} cached call edges (sentinel present)",
                     call_count
                 ));
-                call_count
+                (call_count, None)
             } else if enrichment.runs_lsp() {
                 // LSP sentinel absent or stale enrichment -- run full enrichment.
                 on_progress("LSP: running full enrichment...");
-                self.run_foreground_lsp_and_persist(
-                    &on_progress,
-                    EnrichmentScope::Repo,
-                    EnrichmentTrigger::ForegroundScan,
-                    None,
-                    false,
-                )
-                .await?
+                let run = self
+                    .run_foreground_lsp_and_persist(
+                        &on_progress,
+                        EnrichmentScope::Repo,
+                        EnrichmentTrigger::ForegroundScan,
+                        None,
+                        false,
+                    )
+                    .await?;
+                (run.edge_count, Some(run.job_id))
             } else {
                 on_progress("LSP: skipped by scan options");
-                0
+                (0, None)
             };
 
             scanner.commit_state()?;
@@ -1112,6 +1182,64 @@ impl RnaHandler {
                 total_time.as_secs_f64()
             ));
 
+            let mut phases = vec![
+                PhaseReport::ran(PhaseKind::DiscoverFiles, scan_time),
+                PhaseReport::ran(PhaseKind::Total, total_time),
+            ];
+            if !enrichment.runs_lsp() {
+                phases.push(PhaseReport::skipped(
+                    PhaseKind::Lsp,
+                    "skipped by scan options",
+                ));
+            }
+            if !enrichment.runs_embeddings() {
+                phases.push(PhaseReport::skipped(
+                    PhaseKind::Embeddings,
+                    "skipped by scan options",
+                ));
+            }
+            let related_job_ids = lsp_job_id.into_iter().collect::<Vec<_>>();
+            let (lsp_state, lsp_detail) = lsp_capability_from_status(
+                enrichment,
+                self.lsp_status.current_state(),
+                lsp_edge_count,
+                !related_job_ids.is_empty(),
+            );
+            if matches!(lsp_state, CapabilityState::Failed) {
+                phases.push(PhaseReport::failed(
+                    PhaseKind::Lsp,
+                    total_time,
+                    lsp_detail
+                        .clone()
+                        .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+                ));
+            } else if matches!(lsp_state, CapabilityState::Unavailable) {
+                phases.push(PhaseReport::unavailable(
+                    PhaseKind::Lsp,
+                    lsp_detail
+                        .clone()
+                        .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
+                ));
+            }
+            let report = build_pipeline_operation_report(
+                &self.repo_root,
+                PipelineReportInput {
+                    operation: OperationKind::CacheLoad,
+                    enrichment,
+                    duration: total_time,
+                    symbol_count: total_node_count,
+                    edge_count: total_edge_count,
+                    file_count: 0,
+                    lsp_edge_count,
+                    lsp_state,
+                    lsp_detail,
+                    embedding_count: 0,
+                    embeddings_attached: self.embed_index.load().is_some(),
+                    phases,
+                    related_job_ids,
+                },
+            );
+
             return Ok(PipelineResult {
                 node_count: total_node_count,
                 edge_count: total_edge_count,
@@ -1121,6 +1249,7 @@ impl RnaHandler {
                 total_time,
                 lsp_entries: vec![],
                 encoding_stats: crate::extract::EncodingStats::default(),
+                report,
             });
         }
 
@@ -1342,6 +1471,69 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
+        let mut phases = vec![
+            PhaseReport::ran(PhaseKind::Extract, extract_time),
+            PhaseReport::ran(PhaseKind::PostPasses, bus_time),
+            PhaseReport::ran(
+                PhaseKind::PersistGraph,
+                total_time.saturating_sub(extract_time + bus_time),
+            ),
+            PhaseReport::ran(PhaseKind::Total, total_time),
+        ];
+        if !enrichment.runs_lsp() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Lsp,
+                "skipped by scan options",
+            ));
+        }
+        if !enrichment.runs_embeddings() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Embeddings,
+                "skipped by scan options",
+            ));
+        }
+        let related_job_ids = Vec::new();
+        let (lsp_state, lsp_detail) = lsp_capability_from_status(
+            enrichment,
+            self.lsp_status.current_state(),
+            lsp_edge_count,
+            !related_job_ids.is_empty(),
+        );
+        if matches!(lsp_state, CapabilityState::Failed) {
+            phases.push(PhaseReport::failed(
+                PhaseKind::Lsp,
+                bus_time,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+            ));
+        } else if matches!(lsp_state, CapabilityState::Unavailable) {
+            phases.push(PhaseReport::unavailable(
+                PhaseKind::Lsp,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
+            ));
+        }
+        let report = build_pipeline_operation_report(
+            &self.repo_root,
+            PipelineReportInput {
+                operation: OperationKind::IncrementalRefresh,
+                enrichment,
+                duration: total_time,
+                symbol_count: total_node_count,
+                edge_count: total_edge_count,
+                file_count,
+                lsp_edge_count,
+                lsp_state,
+                lsp_detail,
+                embedding_count: 0,
+                embeddings_attached: self.embed_index.load().is_some(),
+                phases,
+                related_job_ids,
+            },
+        );
+
         let result = PipelineResult {
             node_count: total_node_count,
             edge_count: total_edge_count,
@@ -1351,6 +1543,7 @@ impl RnaHandler {
             total_time,
             lsp_entries: vec![],
             encoding_stats,
+            report,
         };
         on_progress(&result.format_summary());
         Ok(result)
@@ -1432,7 +1625,7 @@ impl RnaHandler {
                         "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
                         existing_job_id
                     ));
-                    (None, false)
+                    (Some(existing_job_id), false)
                 }
             }
         } else {
@@ -1459,7 +1652,7 @@ impl RnaHandler {
                         "Embed: joined active enrichment job {}; skipping duplicate foreground embedding",
                         existing_job_id
                     ));
-                    (None, false)
+                    (Some(existing_job_id), false)
                 }
             }
         } else {
@@ -1708,6 +1901,70 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
+        let related_job_ids = [lsp_job_id.clone(), embed_job_id.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let (lsp_state, lsp_detail) = lsp_capability_from_status(
+            enrichment,
+            self.lsp_status.current_state(),
+            lsp_edge_count,
+            !related_job_ids.is_empty(),
+        );
+        let mut phases = vec![
+            PhaseReport::ran(PhaseKind::Extract, scan_extract_time),
+            PhaseReport::ran(PhaseKind::PostPasses, bus_time),
+            PhaseReport::ran(PhaseKind::Total, total_time),
+        ];
+        if enrichment.runs_embeddings() {
+            phases.push(PhaseReport::ran(PhaseKind::Embeddings, embed_time));
+        } else {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Embeddings,
+                "skipped by scan options",
+            ));
+        }
+        if matches!(lsp_state, CapabilityState::Failed) {
+            phases.push(PhaseReport::failed(
+                PhaseKind::Lsp,
+                bus_time,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+            ));
+        } else if matches!(lsp_state, CapabilityState::Unavailable) {
+            phases.push(PhaseReport::unavailable(
+                PhaseKind::Lsp,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
+            ));
+        }
+        if !enrichment.runs_lsp() {
+            phases.push(PhaseReport::skipped(
+                PhaseKind::Lsp,
+                "skipped by scan options",
+            ));
+        }
+        let report = build_pipeline_operation_report(
+            &self.repo_root,
+            PipelineReportInput {
+                operation: OperationKind::FullRebuild,
+                enrichment,
+                duration: total_time,
+                symbol_count: total_node_count,
+                edge_count: total_edge_count,
+                file_count,
+                lsp_edge_count,
+                lsp_state,
+                lsp_detail,
+                embedding_count: embed_count,
+                embeddings_attached: self.embed_index.load().is_some(),
+                phases,
+                related_job_ids,
+            },
+        );
+
         let result = PipelineResult {
             node_count: total_node_count,
             edge_count: total_edge_count,
@@ -1717,6 +1974,7 @@ impl RnaHandler {
             total_time,
             lsp_entries: vec![],
             encoding_stats,
+            report,
         };
         on_progress(&result.format_summary());
         Ok(result)
@@ -1733,7 +1991,7 @@ impl RnaHandler {
         trigger: EnrichmentTrigger,
         dirty_slugs: Option<HashSet<String>>,
         fail_on_lsp_error: bool,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<LspEnrichmentRun>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -1766,12 +2024,16 @@ impl RnaHandler {
                     "LSP: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                return self
+                let edge_count = self
                     .wait_for_joined_enrichment_job(
                         &existing_job_id,
                         EnrichmentCapability::CallReferences,
                     )
-                    .await;
+                    .await?;
+                return Ok(LspEnrichmentRun {
+                    edge_count,
+                    job_id: existing_job_id,
+                });
             }
         };
 
@@ -1880,7 +2142,10 @@ impl RnaHandler {
                     enriched_edges.len(),
                 );
 
-                Ok(lsp_edge_count)
+                Ok(LspEnrichmentRun {
+                    edge_count: lsp_edge_count,
+                    job_id,
+                })
             }
             Err(e) => {
                 tracing::error!(
@@ -1900,7 +2165,10 @@ impl RnaHandler {
                 if fail_on_lsp_error {
                     return Err(anyhow::anyhow!("LSP enrichment failed: {}", e));
                 }
-                Ok(0)
+                Ok(LspEnrichmentRun {
+                    edge_count: 0,
+                    job_id,
+                })
             }
         }
     }
@@ -1911,7 +2179,7 @@ impl RnaHandler {
         scope: EnrichmentScope,
         continuation: EnrichmentContinuation,
         on_progress: F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<Vec<String>>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -1925,16 +2193,19 @@ impl RnaHandler {
             };
             (gs.nodes.clone(), gs.edges.clone())
         };
+        let mut related_job_ids = Vec::new();
 
         match capability {
             EnrichmentCapability::Embeddings => {
-                self.run_explicit_embedding_enrichment(
-                    &all_nodes,
-                    scope.clone(),
-                    continuation,
-                    &on_progress,
-                )
-                .await?;
+                related_job_ids.extend(
+                    self.run_explicit_embedding_enrichment(
+                        &all_nodes,
+                        scope.clone(),
+                        continuation,
+                        &on_progress,
+                    )
+                    .await?,
+                );
             }
             EnrichmentCapability::CallReferences => {
                 if matches!(scope, EnrichmentScope::ChangedFiles) {
@@ -1943,7 +2214,7 @@ impl RnaHandler {
                     );
                 }
                 let dirty_slugs = self.dirty_slugs_for_scope(&scope);
-                let count = self
+                let run = self
                     .run_foreground_lsp_and_persist(
                         &on_progress,
                         scope.clone(),
@@ -1952,9 +2223,10 @@ impl RnaHandler {
                         true,
                     )
                     .await?;
+                related_job_ids.push(run.job_id);
                 on_progress(&format!(
                     "LSP explicit enrichment complete: {} call/reference edges",
-                    count
+                    run.edge_count
                 ));
                 if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
                     match continuation {
@@ -1978,7 +2250,7 @@ impl RnaHandler {
                             on_progress(
                                 "LSP continuation: enriching remaining cached graph coverage",
                             );
-                            let continuation_count = self
+                            let continuation_run = self
                                 .run_foreground_lsp_and_persist(
                                     &on_progress,
                                     EnrichmentScope::Repo,
@@ -1987,9 +2259,10 @@ impl RnaHandler {
                                     true,
                                 )
                                 .await?;
+                            related_job_ids.push(continuation_run.job_id);
                             on_progress(&format!(
                                 "LSP continuation complete: {} call/reference edges",
-                                continuation_count
+                                continuation_run.edge_count
                             ));
                         }
                     }
@@ -2003,7 +2276,7 @@ impl RnaHandler {
             }
         }
 
-        Ok(())
+        Ok(related_job_ids)
     }
 
     async fn run_explicit_embedding_enrichment<F>(
@@ -2012,12 +2285,14 @@ impl RnaHandler {
         scope: EnrichmentScope,
         continuation: EnrichmentContinuation,
         on_progress: &F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<Vec<String>>
     where
         F: Fn(&str) + Send + Sync,
     {
-        self.run_embedding_enrichment_once(all_nodes, scope.clone(), on_progress)
-            .await?;
+        let mut related_job_ids = vec![
+            self.run_embedding_enrichment_once(all_nodes, scope.clone(), on_progress)
+                .await?,
+        ];
 
         if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
             match continuation {
@@ -2033,17 +2308,19 @@ impl RnaHandler {
                     on_progress(
                         "Embedding continuation: enriching remaining cached graph coverage",
                     );
-                    self.run_embedding_enrichment_once(
-                        all_nodes,
-                        EnrichmentScope::Repo,
-                        on_progress,
-                    )
-                    .await?;
+                    related_job_ids.push(
+                        self.run_embedding_enrichment_once(
+                            all_nodes,
+                            EnrichmentScope::Repo,
+                            on_progress,
+                        )
+                        .await?,
+                    );
                 }
             }
         }
 
-        Ok(())
+        Ok(related_job_ids)
     }
 
     async fn run_embedding_enrichment_once<F>(
@@ -2051,7 +2328,7 @@ impl RnaHandler {
         all_nodes: &[Node],
         scope: EnrichmentScope,
         on_progress: &F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<String>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -2078,7 +2355,7 @@ impl RnaHandler {
                     EnrichmentCapability::Embeddings,
                 )
                 .await?;
-                return Ok(());
+                return Ok(existing_job_id);
             }
         };
 
@@ -2122,7 +2399,7 @@ impl RnaHandler {
                     "Embed explicit enrichment complete: {} embedded items",
                     count
                 ));
-                Ok(())
+                Ok(job_id)
             }
             Err(e) => {
                 self.embed_status.set_failed(format!("{}", e));

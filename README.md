@@ -161,7 +161,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 | `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` (default for MCP) for cross-encoder precision. Use `include_body: true` (requires `node` or `nodes`) to return function bodies; add `minify_body: true` to strip comments and shorten locals with a legend (tree-sitter AST for TS/JS, Rust, Python, Go; text fallback for others). |
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
-| `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase). Includes LSP servers available to install for each root's detected languages. |
+| `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase) plus recent OperationReport history from `.oh/.cache/operation_reports.json`. Includes LSP servers available to install for each root's detected languages. |
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root.
 
@@ -187,9 +187,10 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 |---------|-------------|
 | `search <query>` | Search symbols by name, keyword, or meaning — filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
-| `scan --repo <dir>` | Scan + extract + embed + persist |
-| `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. |
-| `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed` | Run selected enrichment against an existing graph cache without source extraction. Use `--root <slug>` with `--scope root`; use `--no-background-continuation` to skip remaining repo-wide coverage. |
+| `scan --repo <dir>` | Scan + extract + embed + persist. Prints an OperationReport summary with ready capabilities, degraded query classes, and next enrichment commands. |
+| `scan --repo <dir> --timings` | Include measured operation phase timings in the scan summary. Unmeasured subphases are omitted rather than inferred. |
+| `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. Persists a recent OperationReport for `list_roots`. |
+| `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed` | Run selected enrichment against an existing graph cache without source extraction. Persists an OperationReport linked to relevant enrichment jobs. Use `--root <slug>` with `--scope root`; use `--no-background-continuation` to skip remaining repo-wide coverage. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 29 pipeline checks end-to-end |
 | `adr compile --repo <dir>` | Compile ADR frontmatter into `.oh/adr-validation/*.json` and refresh `docs/ADRs/README.md` when present |
@@ -198,6 +199,8 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `open --repo <dir>` | Launch an interactive graph visualizer in the browser |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
+
+Recent scan/enrich operation history is bounded diagnostic state under `.oh/.cache/operation_reports.json`. It is repo-native control-plane state for CLI/MCP visibility, not source truth; non-terminal records from a previous process are marked stale on read.
 
 ### ADR validation primitive
 

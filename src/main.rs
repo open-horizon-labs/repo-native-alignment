@@ -85,6 +85,9 @@ struct ScanArgs {
     /// Skip embedding/semantic-index enrichment for this scan.
     #[arg(long)]
     no_embed: bool,
+    /// Print measured operation phase timings after the scan summary.
+    #[arg(long)]
+    timings: bool,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 }
@@ -377,19 +380,106 @@ async fn load_existing_embedding_index(
     }
 }
 
-fn print_scan_summary(
-    graph: &server::state::GraphState,
+struct ScanSummaryInput<'a> {
+    repo_root: &'a std::path::Path,
+    graph: &'a server::state::GraphState,
     embeddings_loaded: bool,
     elapsed: std::time::Duration,
-) {
-    eprintln!();
-    eprintln!(
-        "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
-        graph.nodes.len(),
-        graph.edges.len(),
-        if embeddings_loaded { "yes" } else { "no" },
-        elapsed.as_secs_f64()
+    enrichment: ScanEnrichmentOptions,
+    timings: bool,
+    operation: server::operation_report::OperationKind,
+    extra_phases: Vec<server::operation_report::PhaseReport>,
+    lsp_state: server::operation_report::CapabilityState,
+    lsp_detail: Option<String>,
+    related_job_ids: Vec<String>,
+}
+
+fn lsp_call_edge_count(graph: &server::state::GraphState) -> usize {
+    graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.source == repo_native_alignment::graph::ExtractionSource::Lsp
+                && matches!(edge.kind, repo_native_alignment::graph::EdgeKind::Calls)
+        })
+        .count()
+}
+
+fn print_scan_summary(input: ScanSummaryInput<'_>) {
+    let ScanSummaryInput {
+        repo_root,
+        graph,
+        embeddings_loaded,
+        elapsed,
+        enrichment,
+        timings,
+        operation,
+        extra_phases,
+        lsp_state,
+        lsp_detail,
+        related_job_ids,
+    } = input;
+    let mut report = server::operation_report::OperationReport::new(
+        operation,
+        server::operation_report::OperationTrigger::Cli,
+        repo_root,
+    )
+    .with_scope("repo")
+    .complete(elapsed);
+    report.outputs = server::operation_report::OutputReport {
+        symbol_count: Some(graph.nodes.len()),
+        edge_count: Some(graph.edges.len()),
+        file_count: None,
+        embedding_count: None,
+        lsp_edge_count: Some(lsp_call_edge_count(graph)),
+    };
+    report.related_job_ids = related_job_ids;
+    for phase in extra_phases {
+        report.add_phase(phase);
+    }
+    report.add_phase(server::operation_report::PhaseReport::ran(
+        server::operation_report::PhaseKind::Total,
+        elapsed,
+    ));
+    let (embedding_state, embedding_detail) =
+        server::operation_report::embedding_capability_from_availability(
+            enrichment,
+            embeddings_loaded,
+        );
+    for capability in server::operation_report::scan_capability_reports(
+        enrichment,
+        embedding_state,
+        embedding_detail,
+        lsp_state,
+        lsp_detail,
+        Some("repo".to_string()),
+    ) {
+        report.add_capability(capability);
+    }
+    server::operation_report::add_scan_degradation_and_next_steps(
+        &mut report,
+        repo_root,
+        enrichment,
+        embedding_state,
+        lsp_state,
     );
+    if !enrichment.runs_lsp() {
+        report.add_phase(server::operation_report::PhaseReport::skipped(
+            server::operation_report::PhaseKind::Lsp,
+            "skipped by scan options",
+        ));
+    }
+    if !enrichment.runs_embeddings() {
+        report.add_phase(server::operation_report::PhaseReport::skipped(
+            server::operation_report::PhaseKind::Embeddings,
+            "skipped by scan options",
+        ));
+    }
+    if let Err(err) = server::OperationReportStore::record(repo_root, report.clone()) {
+        tracing::warn!("failed to persist operation report: {err:#}");
+    }
+    eprintln!();
+    eprintln!("{}", report.render_cli(timings));
 }
 
 /// Load graph from LanceDB cache or exit with instructions to scan first.
@@ -481,7 +571,7 @@ async fn async_main() -> anyhow::Result<()> {
                     lsp_only_roots: Arc::new(lsp_only_roots_scan),
                     ..Default::default()
                 };
-                handler
+                let result = handler
                     .run_pipeline_foreground(
                         |msg| {
                             eprintln!("{}", msg);
@@ -489,6 +579,15 @@ async fn async_main() -> anyhow::Result<()> {
                         enrichment,
                     )
                     .await?;
+                if let Err(err) =
+                    server::OperationReportStore::record(&repo_root, result.report.clone())
+                {
+                    tracing::warn!("failed to persist operation report: {err:#}");
+                }
+                if args.timings {
+                    eprintln!();
+                    eprintln!("{}", result.report.render_cli(true));
+                }
                 return Ok(());
             }
             eprintln!("Scanning: {}", repo_root.display());
@@ -498,28 +597,32 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
-            if enrichment.runs_embeddings()
-                && let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                if enrichment.runs_embeddings() {
                     tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
-                })
-                .await
+                } else {
+                    tracing::debug!("{}; no embedding enrichment requested", msg);
+                }
+            })
+            .await
             {
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
 
             let mut scanner = repo_native_alignment::scanner::Scanner::new(repo_root.clone())?;
             let scan = scanner.scan()?;
+            let scan_duration = scan.scan_duration;
             if scan.changed_files.is_empty()
                 && scan.new_files.is_empty()
                 && scan.deleted_files.is_empty()
             {
-                let graph = match try_load_cached_graph(&repo_root).await? {
+                let (graph, operation) = match try_load_cached_graph(&repo_root).await? {
                     Some(mut graph) => {
                         if handler.refresh_manifest_graph(&mut graph).await? {
                             eprintln!("Refreshed manifest dependency graph.");
                         }
                         scanner.commit_state()?;
-                        graph
+                        (graph, server::operation_report::OperationKind::CacheLoad)
                     }
                     None => {
                         let graph = handler.build_full_graph_inner(true, enrichment).await?;
@@ -527,11 +630,41 @@ async fn async_main() -> anyhow::Result<()> {
                         if enrichment.runs_embeddings() {
                             handler.await_background_embed().await;
                         }
-                        graph
+                        (
+                            graph,
+                            if args.extract_only {
+                                server::operation_report::OperationKind::ExtractOnly
+                            } else {
+                                server::operation_report::OperationKind::Scan
+                            },
+                        )
                     }
                 };
                 let elapsed = t0.elapsed();
-                print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
+                let lsp_edge_count = lsp_call_edge_count(&graph);
+                let related_job_ids = Vec::new();
+                let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
+                    enrichment,
+                    handler.lsp_status.current_state(),
+                    lsp_edge_count,
+                    !related_job_ids.is_empty(),
+                );
+                print_scan_summary(ScanSummaryInput {
+                    repo_root: &repo_root,
+                    graph: &graph,
+                    embeddings_loaded: handler.embed_index.load().is_some(),
+                    elapsed,
+                    enrichment,
+                    timings: args.timings,
+                    operation,
+                    extra_phases: vec![server::operation_report::PhaseReport::ran(
+                        server::operation_report::PhaseKind::DiscoverFiles,
+                        scan_duration,
+                    )],
+                    lsp_state,
+                    lsp_detail,
+                    related_job_ids,
+                });
                 return Ok(());
             }
 
@@ -545,7 +678,35 @@ async fn async_main() -> anyhow::Result<()> {
                         handler.await_background_embed().await;
                     }
                     let elapsed = t0.elapsed();
-                    print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
+                    let lsp_edge_count = lsp_call_edge_count(&graph);
+                    let related_job_ids = Vec::new();
+                    let (lsp_state, lsp_detail) =
+                        server::operation_report::lsp_capability_from_status(
+                            enrichment,
+                            handler.lsp_status.current_state(),
+                            lsp_edge_count,
+                            !related_job_ids.is_empty(),
+                        );
+                    print_scan_summary(ScanSummaryInput {
+                        repo_root: &repo_root,
+                        graph: &graph,
+                        embeddings_loaded: handler.embed_index.load().is_some(),
+                        elapsed,
+                        enrichment,
+                        timings: args.timings,
+                        operation: if args.extract_only {
+                            server::operation_report::OperationKind::ExtractOnly
+                        } else {
+                            server::operation_report::OperationKind::Scan
+                        },
+                        extra_phases: vec![server::operation_report::PhaseReport::ran(
+                            server::operation_report::PhaseKind::DiscoverFiles,
+                            scan_duration,
+                        )],
+                        lsp_state,
+                        lsp_detail,
+                        related_job_ids,
+                    });
                     return Ok(());
                 }
             };
@@ -556,7 +717,30 @@ async fn async_main() -> anyhow::Result<()> {
                 scanner.commit_state()?;
             }
             let elapsed = t0.elapsed();
-            print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
+            let lsp_edge_count = lsp_call_edge_count(&graph);
+            let related_job_ids = Vec::new();
+            let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
+                enrichment,
+                handler.lsp_status.current_state(),
+                lsp_edge_count,
+                !related_job_ids.is_empty(),
+            );
+            print_scan_summary(ScanSummaryInput {
+                repo_root: &repo_root,
+                graph: &graph,
+                embeddings_loaded: handler.embed_index.load().is_some(),
+                elapsed,
+                enrichment,
+                timings: args.timings,
+                operation: server::operation_report::OperationKind::IncrementalRefresh,
+                extra_phases: vec![server::operation_report::PhaseReport::ran(
+                    server::operation_report::PhaseKind::DiscoverFiles,
+                    scan_duration,
+                )],
+                lsp_state,
+                lsp_detail,
+                related_job_ids,
+            });
             return Ok(());
         }
         Some(Commands::Enrich(args)) => {
@@ -627,10 +811,11 @@ async fn async_main() -> anyhow::Result<()> {
                     );
                 }
             }
-            handler
+            let enrich_start = std::time::Instant::now();
+            let related_job_ids = handler
                 .run_explicit_enrichment(
                     capability,
-                    scope,
+                    scope.clone(),
                     if args.no_background_continuation {
                         EnrichmentContinuation::Disabled
                     } else {
@@ -641,6 +826,77 @@ async fn async_main() -> anyhow::Result<()> {
                     },
                 )
                 .await?;
+            let elapsed = enrich_start.elapsed();
+            let (symbol_count, edge_count, lsp_edge_count) = {
+                let snap = handler.graph.load_full();
+                match snap.as_ref().as_ref() {
+                    Some(gs) => (
+                        gs.nodes.len(),
+                        gs.edges.len(),
+                        gs.edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.source == repo_native_alignment::graph::ExtractionSource::Lsp
+                                    && matches!(
+                                        edge.kind,
+                                        repo_native_alignment::graph::EdgeKind::Calls
+                                    )
+                            })
+                            .count(),
+                    ),
+                    None => (0, 0, 0),
+                }
+            };
+            let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
+            let embedding_count = if capability == EnrichmentCapability::Embeddings {
+                recent_jobs
+                    .iter()
+                    .find(|job| related_job_ids.iter().any(|id| id == &job.job_id))
+                    .map(|job| job.counters.current)
+            } else {
+                None
+            };
+            let mut report = server::operation_report::OperationReport::new(
+                server::operation_report::OperationKind::Enrich,
+                server::operation_report::OperationTrigger::Cli,
+                &repo_root,
+            )
+            .with_scope(server::operation_report::scope_key(&scope))
+            .complete(elapsed);
+            report.outputs = server::operation_report::OutputReport {
+                symbol_count: Some(symbol_count),
+                edge_count: Some(edge_count),
+                file_count: None,
+                embedding_count,
+                lsp_edge_count: Some(lsp_edge_count),
+            };
+            report.related_job_ids = related_job_ids;
+            report.add_phase(server::operation_report::PhaseReport::ran(
+                match capability {
+                    EnrichmentCapability::Embeddings => {
+                        server::operation_report::PhaseKind::Embeddings
+                    }
+                    EnrichmentCapability::CallReferences => {
+                        server::operation_report::PhaseKind::Lsp
+                    }
+                    EnrichmentCapability::ExtractedGraph => {
+                        server::operation_report::PhaseKind::Extract
+                    }
+                },
+                elapsed,
+            ));
+            report.add_capability(server::operation_report::CapabilityReport::new(
+                capability,
+                server::operation_report::CapabilityState::Completed,
+                true,
+                Some(server::operation_report::scope_key(&scope)),
+                Some("explicit enrichment completed".to_string()),
+            ));
+            if let Err(err) = server::OperationReportStore::record(&repo_root, report.clone()) {
+                tracing::warn!("failed to persist operation report: {err:#}");
+            }
+            eprintln!();
+            eprintln!("{}", report.render_cli(true));
             return Ok(());
         }
         Some(Commands::Search(args)) => {

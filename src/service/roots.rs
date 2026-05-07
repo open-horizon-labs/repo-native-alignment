@@ -339,11 +339,13 @@ pub fn list_roots_from_slugs(
     }
 
     let total = lines.len();
-    format!(
+    let mut out = format!(
         "## Workspace Roots\n\n{} root(s)\n\n{}",
         total,
         lines.join("\n")
-    )
+    );
+    out.push_str(&crate::server::operation_report::render_recent_reports_markdown(repo_root, 3));
+    out
 }
 
 /// Returns true if the given LSP server binary is relevant for any of the languages present in a root.
@@ -429,6 +431,25 @@ mod tests {
             "should produce a roots header"
         );
         assert!(result.contains("root(s)"), "should report root count");
+    }
+
+    #[test]
+    fn test_list_roots_from_slugs_includes_recent_operation_reports() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let report = crate::server::operation_report::OperationReport::new(
+            crate::server::operation_report::OperationKind::ExtractOnly,
+            crate::server::operation_report::OperationTrigger::Test,
+            repo,
+        )
+        .complete(std::time::Duration::from_millis(42));
+        crate::server::operation_report::OperationReportStore::record(repo, report).unwrap();
+
+        let result =
+            list_roots_from_slugs(repo, &std::collections::HashSet::new(), None, None, None);
+
+        assert!(result.contains("## Recent Operations"), "got: {}", result);
+        assert!(result.contains("Extract-only scan"), "got: {}", result);
     }
 
     /// When active_slugs contains the primary slug, only that root is shown
