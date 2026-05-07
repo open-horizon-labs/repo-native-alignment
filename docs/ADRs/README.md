@@ -5,4 +5,4 @@
 | [001](001-event-bus-extraction-pipeline.md) | RNA Event Bus Architecture | Implemented |
 | [002](002-arcswap-graph-concurrency.md) | ArcSwap for Graph Concurrency | Implementing |
 | [003](003-durable-enrichment-control-plane.md) | Durable Enrichment Control Plane | Implementing |
-| [004](004-operation-report-telemetry.md) | OperationReport Telemetry Control Plane | Implementing |
+| [004](004-operation-report-telemetry.md) | ADR-004: OperationReport telemetry control plane | Implemented |

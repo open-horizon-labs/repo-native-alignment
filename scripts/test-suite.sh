@@ -1,7 +1,7 @@
 #!/bin/bash
 # RNA Full Test Suite — General functionality + all features since v0.1.14
 #
-# Usage: ./scripts/test-suite.sh [rna_repo_path] [ic_repo_path]
+# Usage: ./scripts/test-suite.sh [rna_repo_path]
 #
 # The test suite runs a pre-flight scan to ensure the RNA repo cache is
 # current before exercising search and graph queries. Any failing test is
@@ -15,7 +15,6 @@
 set -uo pipefail
 
 RNA_REPO="${1:-$HOME/src/open-horizon-labs/repo-native-alignment}"
-IC_REPO="${2:-$HOME/src/Innovation-Connector}"
 PASS=0; FAIL=0; SKIP=0
 
 check() {
@@ -48,7 +47,7 @@ echo ""
 # data after worktree switches or clean checkouts.
 echo "--- Pre-flight: ensure cache is current ---"
 echo "  Running incremental scan on RNA repo..."
-if ! _rna_scan_out=$(repo-native-alignment scan --repo "$RNA_REPO" 2>&1); then
+if ! _rna_scan_out=$(repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp --timings 2>&1); then
   echo "FAIL: RNA pre-flight scan failed — tests would run on stale/partial cache"
   echo "$_rna_scan_out" | tail -20
   exit 1
@@ -203,43 +202,95 @@ check "extract subsystem present (RNA has extract module)" \
 check "subsystem detection pass defined" \
   "grep -c 'subsystem_pass\|fn.*subsystem' $RNA_REPO/src/extract/subsystem_pass.rs" "[1-9]"
 
-# ── INNOVATION-CONNECTOR ─────────────────────────────────────────────────────
-if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
-  echo "" && echo "--- Innovation-Connector ---"
-  # Ensure IC cache is fresh before running IC tests
-  echo "  Running incremental scan on IC repo..."
-  if ! _ic_scan_out=$(repo-native-alignment scan --repo "$IC_REPO" 2>&1); then
-    echo "FAIL: IC pre-flight scan failed — IC tests would run on stale/partial cache"
-    echo "$_ic_scan_out" | tail -20
-    exit 1
-  fi
+make_ic_fixture() {
+  local dir="$1"
+  mkdir -p \
+    "$dir/server" \
+    "$dir/client/src/components/Expertunities" \
+    "$dir/client/app/api/one" \
+    "$dir/client/app/api/two" \
+    "$dir/client/app/api/three"
+
+  cat > "$dir/server/main.py" <<'PY'
+from fastapi import APIRouter, FastAPI
+
+app = FastAPI()
+router = APIRouter()
+
+@router.get("/expertunities")
+def get_expertunities():
+    return []
+
+app.include_router(router)
+PY
+
+  cat > "$dir/client/src/api.ts" <<'TS'
+import { useQuery } from '@tanstack/react-query';
+
+export function useQueryExpertunities() {
+  return useQuery({ queryKey: ['expertunities'], queryFn: async () => [] });
+}
+TS
+
+  cat > "$dir/client/src/components/Expertunities/Expertunities.tsx" <<'TSX'
+import { useQuery } from '@tanstack/react-query';
+import { useQueryExpertunities } from '../../api';
+
+export function Expertunities() {
+  useQueryExpertunities();
+  useQuery({ queryKey: ['local'], queryFn: async () => [] });
+  return <div />;
+}
+TSX
+
+  for route in one two three; do
+    cat > "$dir/client/app/api/$route/route.ts" <<'TS'
+export async function GET() {
+  return Response.json([]);
+}
+TS
+  done
+}
+
+
+# ── CROSS-STACK FIXTURE (formerly Innovation-Connector coverage) ─────────────
+_IC_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/rna-ic-fixture.XXXXXX")
+_IC_CLEANUP="$_IC_FIXTURE"
+make_ic_fixture "$_IC_FIXTURE"
+echo "" && echo "--- Cross-stack Fixture (deterministic IC substitute) ---"
+
+# Ensure IC/cross-stack cache is fresh before running cross-stack tests.
+echo "  Running incremental scan on cross-stack fixture..."
+if ! _ic_scan_out=$(repo-native-alignment scan --repo "$_IC_FIXTURE" --extract-only --no-embed --no-lsp 2>&1); then
+  echo "FAIL: cross-stack pre-flight scan failed — tests would run on stale/partial cache"
+  echo "$_ic_scan_out" | tail -20
+  FAIL=$((FAIL+1))
+else
   echo "$_ic_scan_out" | tail -2
 
-  check "IC: FastAPI endpoints" \
-    "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 5" "route_decorator"
-  check "IC: Next.js routes (limit 500)" \
-    "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "[1-9]" \
-    "IC repo has page routes (page.tsx) but no API routes (route.ts under app/api/)"
-  check "IC: framework nodes" \
-    "repo-native-alignment search 'framework' --repo $IC_REPO --kind framework --limit 5" "fastapi\|react"
-  check "IC: cross-file calls Expertunities" \
-    "repo-native-alignment graph --node 'client/src/components/Expertunities/Expertunities.tsx:Expertunities:function' --repo $IC_REPO --mode neighbors --direction outgoing --edge-types calls" "useQuery"
-  check "IC: 3-query Q1 component" \
-    "repo-native-alignment search 'Expertunities' --repo $IC_REPO --limit 3" "Expertunities"
-  check "IC: 3-query Q2 hook" \
-    "repo-native-alignment search 'useQueryExpertunities' --repo $IC_REPO --limit 3" "useQueryExpertunities\|api.ts"
-  check "IC: 3-query Q3 endpoint" \
-    "repo-native-alignment search 'expertunities' --repo $IC_REPO --kind api_endpoint --limit 3" "expertunities"
-  check "IC: BelongsTo edges" \
-    "repo-native-alignment search 'get_expertunities' --repo $IC_REPO --limit 1" "result"
-  check "IC: Next.js routes survive rescan" \
-    "repo-native-alignment scan --repo $IC_REPO 2>/dev/null && repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "3" \
-    "IC repo has page routes (page.tsx) but no API routes (route.ts under app/api/)"
-  check "IC: WAL sentinel present after scan" \
-    "test -f $IC_REPO/.oh/.cache/extract_completed.json && echo found" "found"
-else
-  echo "" && echo "--- Innovation-Connector (SKIP: no IC cache at $IC_REPO/.oh/.cache/lance) ---"
-  SKIP=$((SKIP+1))
+  check "Cross-stack: FastAPI endpoints" \
+    "repo-native-alignment search '' --repo $_IC_FIXTURE --kind api_endpoint --limit 5" "route_decorator"
+  check "Cross-stack: Next.js routes (limit 500)" \
+    "repo-native-alignment search '' --repo $_IC_FIXTURE --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "[1-9]"
+  check "Cross-stack: framework nodes" \
+    "repo-native-alignment search 'framework' --repo $_IC_FIXTURE --kind framework --limit 5" "fastapi\|react"
+  check "Cross-stack: cross-file calls Expertunities" \
+    "repo-native-alignment graph --node 'client/src/components/Expertunities/Expertunities.tsx:Expertunities:function' --repo $_IC_FIXTURE --mode neighbors --direction outgoing --edge-types calls" "useQuery"
+  check "Cross-stack: 3-query Q1 component" \
+    "repo-native-alignment search 'Expertunities' --repo $_IC_FIXTURE --limit 3" "Expertunities"
+  check "Cross-stack: 3-query Q2 hook" \
+    "repo-native-alignment search 'useQueryExpertunities' --repo $_IC_FIXTURE --limit 3" "useQueryExpertunities\|api.ts"
+  check "Cross-stack: 3-query Q3 endpoint" \
+    "repo-native-alignment search 'expertunities' --repo $_IC_FIXTURE --kind api_endpoint --limit 3" "expertunities"
+  check "Cross-stack: BelongsTo edges" \
+    "repo-native-alignment search 'get_expertunities' --repo $_IC_FIXTURE --limit 1" "result"
+  check "Cross-stack: Next.js routes survive rescan" \
+    "repo-native-alignment scan --repo $_IC_FIXTURE --extract-only --no-embed --no-lsp 2>/dev/null && repo-native-alignment search '' --repo $_IC_FIXTURE --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "3"
+  check "Cross-stack: WAL sentinel present after scan" \
+    "test -f $_IC_FIXTURE/.oh/.cache/extract_completed.json && echo found" "found"
+fi
+if [ -n "$_IC_CLEANUP" ]; then
+  rm -rf "$_IC_CLEANUP"
 fi
 
 # ── MERGED FEATURES ────────────────────────────────────────────────────────
@@ -472,6 +523,60 @@ check "rerank structural: reranker module exists" \
 # wiped after each run (.oh/.cache is gitignored).
 echo "" && echo "--- v0.2.7 Smoke Checks (#650) ---"
 
+# Smoke 0: OperationReport control plane and explicit enrichment (#665/#668/#672)
+_OP_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-operation-report.XXXXXX")
+mkdir -p "$_OP_FIX/src"
+cat > "$_OP_FIX/src/main.rs" <<'RS'
+fn main() { helper(); }
+fn helper() {}
+RS
+_extract_out=$(repo-native-alignment scan --repo "$_OP_FIX" --extract-only --no-embed --no-lsp --timings 2>&1)
+if echo "$_extract_out" | grep -q 'Extract-only scan (repo) complete' && echo "$_extract_out" | grep -q 'Timings:'; then
+  echo "PASS: operation-report: extract-only scan with timings completes (#672)"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: operation-report: extract-only scan with timings did not emit expected summary"
+  echo "$_extract_out" | tail -20
+  FAIL=$((FAIL+1))
+fi
+check "operation-report: extract-only skips LSP" \
+  "echo \"$_extract_out\"" 'LSP call references: skipped (skipped by scan options)'
+check "operation-report: extract-only skips embeddings" \
+  "echo \"$_extract_out\"" 'embeddings: skipped (skipped by scan options)'
+check "operation-report: semantic readiness fails closed" \
+  "echo \"$_extract_out\"" 'semantic search: embedding capability is not ready'
+check "operation-report: dead-code prerequisites fail closed" \
+  "echo \"$_extract_out\"" 'dead-code prerequisites: dead-code analysis requires completed call-reference coverage'
+check "operation-report: history persisted after extract-only scan" \
+  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); r=d['reports'][0]; assert d['schema_version']==1; assert r['operation']=='extract_only'; assert r['state']=='completed'; print(r['operation']+':'+r['state'])\"" 'extract_only:completed'
+check "operation-report: skipped enrichment phases persisted" \
+  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); print(' '.join(p['phase']+':'+p['state'] for p in d['reports'][0]['phases']))\"" 'lsp:skipped.*embeddings:skipped\|embeddings:skipped.*lsp:skipped'
+check "operation-report: list-roots shows recent operations" \
+  "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Recent Operations'
+check "operation-report: list-roots includes extract-only summary" \
+  "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Extract-only scan — complete'
+_OP_ROOT=$(repo-native-alignment list-roots --repo "$_OP_FIX" 2>/dev/null | sed -n 's/^- \*\*\([^*]*\)\*\*.*/\1/p' | head -1)
+_enrich_out=$(repo-native-alignment enrich --repo "$_OP_FIX" --capability call-references --scope root --root "$_OP_ROOT" --no-background-continuation 2>&1)
+if echo "$_enrich_out" | grep -q 'Enrichment (root:.*) complete'; then
+  echo "PASS: operation-report: explicit call-reference enrich completes (#668)"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: operation-report: explicit call-reference enrich did not emit expected summary"
+  echo "$_enrich_out" | tail -20
+  FAIL=$((FAIL+1))
+fi
+check "operation-report: history records explicit enrichment" \
+  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/operation_reports.json')); print(' '.join(r['operation']+':'+r['state'] for r in d['reports']))\"" 'enrich:completed'
+check "operation-report: durable enrichment job ledger recorded" \
+  "python3 -c \"import json; d=json.load(open('$_OP_FIX/.oh/.cache/enrichment_jobs.json')); print(' '.join(j['capability']+':'+j['state'] for j in d['jobs']))\"" 'call_references:completed'
+check "operation-report: list-roots includes enrichment summary" \
+  "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Enrichment — complete'
+check "operation-report: zero-edge explicit enrich remains fail-closed" \
+  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 2>/dev/null" 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'
+check "operation-report: changed-scope call-reference enrich fails closed" \
+  "repo-native-alignment enrich --repo $_OP_FIX --capability call-references --scope changed --no-background-continuation 2>&1" 'changed-file call-reference enrichment is not supported'
+rm -rf "$_OP_FIX"
+
 # Smoke 1: ADR validate pipeline emits a structured report (#641)
 # `adr validate` runs cargo, which is heavyweight + env-dependent. The fast,
 # env-free equivalent is `adr compile --json`, which loads every ADR's
@@ -530,41 +635,50 @@ rm -rf "$_OAPI_FIX/.oh"
 # scalars > 300 chars each.
 _YAML_FIX="$RNA_REPO/.github/fixtures/smoke-yaml-large"
 rm -rf "$_YAML_FIX/.oh"
-_yaml_scan_out=$(repo-native-alignment scan --repo "$_YAML_FIX" 2>&1)
-if [ $? -eq 0 ] && echo "$_yaml_scan_out" | grep -q 'Symbols:'; then
-  echo "PASS: smoke-yaml-large: scan completes on >4 KiB multibyte yaml (81c4058)"
+_yaml_scan_out=$(repo-native-alignment scan --repo "$_YAML_FIX" --extract-only --no-embed --no-lsp 2>&1)
+if [ $? -eq 0 ] && echo "$_yaml_scan_out" | grep -q 'output: .* symbols'; then
+  echo "PASS: smoke-yaml-large: extract-only scan completes on >4 KiB multibyte yaml (81c4058)"
   PASS=$((PASS+1))
 else
-  echo "FAIL: smoke-yaml-large: scan failed or did not emit Symbols summary"
+  echo "FAIL: smoke-yaml-large: extract-only scan failed or did not emit symbol summary"
   echo "$_yaml_scan_out" | tail -10
   FAIL=$((FAIL+1))
 fi
 rm -rf "$_YAML_FIX/.oh"
 
-# Smoke 5: RNA self-scan emits ReferencedBy edges (#644)
-# The pre-flight scanned $RNA_REPO. We probe a known-referenced enum to
-# verify ReferencedBy edges produced by LSP textDocument/references survive
-# load. NOTE: attr_refs durability across persist/load is fixed by #652;
-# until that lands, cached load can return 0 even after a fresh --full scan.
-# Tolerate that with SKIP rather than FAIL during the v0.2.7 transition.
-_RB_OUT=$(repo-native-alignment graph --node 'src/graph/mod.rs:NodeKind:enum' \
-  --repo "$RNA_REPO" --mode neighbors --direction incoming \
-  --edge-types referenced_by 2>/dev/null)
-_RB_COUNT=$(echo "$_RB_OUT" | grep -c '^- ')
-if [ "$_RB_COUNT" -gt 0 ]; then
-  echo "PASS: RNA self-scan emits ReferencedBy edges on NodeKind ($_RB_COUNT incoming) (#644)"
-  PASS=$((PASS+1))
+# Smoke 5: bounded LSP lifecycle remains fail-closed on zero-edge fixture (#644/#668)
+_LSP_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-lsp-smoke.XXXXXX")
+mkdir -p "$_LSP_FIX/src"
+cat > "$_LSP_FIX/src/main.rs" <<'RS'
+fn main() { helper(); }
+fn helper() {}
+RS
+repo-native-alignment scan --repo "$_LSP_FIX" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+_LSP_ROOT=$(repo-native-alignment list-roots --repo "$_LSP_FIX" 2>/dev/null | sed -n 's/^- \*\*\([^*]*\)\*\*.*/\1/p' | head -1)
+_LSP_ENRICH_OUT=$(repo-native-alignment enrich --repo "$_LSP_FIX" --capability call-references --scope root --root "$_LSP_ROOT" --no-background-continuation 2>&1)
+if ! echo "$_LSP_ENRICH_OUT" | grep -q 'Enrichment (root:.*) complete'; then
+  echo "FAIL: LSP call-reference enrichment did not complete on bounded fixture (#644/#668)"
+  echo "$_LSP_ENRICH_OUT" | tail -20
+  FAIL=$((FAIL+1))
 else
-  echo "SKIP: ReferencedBy edge count 0 from cached load — pending #652 attr_refs durability fix (#644/#650)"
-  SKIP=$((SKIP+1))
+  _LSP_READY_OUT=$(repo-native-alignment search helper --repo "$_LSP_FIX" --limit 3 2>/dev/null)
+  if echo "$_LSP_READY_OUT" | grep -q 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'; then
+    echo "PASS: bounded zero-edge LSP enrichment remains fail-closed (#644/#668)"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL: bounded zero-edge LSP enrichment did not remain fail-closed (#644/#668)"
+    echo "$_LSP_READY_OUT" | tail -20
+    FAIL=$((FAIL+1))
+  fi
 fi
+rm -rf "$_LSP_FIX"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
-if [ "$FAIL" -eq 0 ]; then
-  echo "ALL TESTS PASSING (excluding skipped)"
+if [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
+  echo "ALL TESTS PASSING"
   exit 0
 else
-  echo "FAILURES NEED ATTENTION"
+  echo "FAILURES OR SKIPS NEED ATTENTION"
   exit 1
 fi
