@@ -1,7 +1,7 @@
 #!/bin/bash
 # RNA Full Test Suite — General functionality + all features since v0.1.14
 #
-# Usage: ./scripts/test-suite.sh [rna_repo_path] [ic_repo_path]
+# Usage: ./scripts/test-suite.sh [rna_repo_path]
 #
 # The test suite runs a pre-flight scan to ensure the RNA repo cache is
 # current before exercising search and graph queries. Any failing test is
@@ -15,7 +15,6 @@
 set -uo pipefail
 
 RNA_REPO="${1:-$HOME/src/open-horizon-labs/repo-native-alignment}"
-IC_REPO="${2:-$HOME/src/Innovation-Connector}"
 PASS=0; FAIL=0; SKIP=0
 
 check() {
