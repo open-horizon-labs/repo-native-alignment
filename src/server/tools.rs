@@ -123,7 +123,7 @@ pub struct Search {
     /// Stable node ID from previous results
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Traversal: "neighbors","impact","reachable","tests_for","cycles","path"
+    /// Traversal: omit or set null for flat search; use "neighbors", "impact", "reachable", "tests_for", "cycles", or "path" for graph traversal. Empty string is treated as omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.

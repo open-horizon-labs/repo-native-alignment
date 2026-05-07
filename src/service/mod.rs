@@ -96,13 +96,24 @@ impl Default for SearchParams {
     }
 }
 
+fn non_blank_optional(value: &Option<String>) -> Option<String> {
+    value.as_deref().and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 impl SearchParams {
     /// Convert from MCP `Search` tool struct.
     pub fn from_mcp_search(args: &crate::server::tools::Search) -> Self {
         Self {
             query: args.query.clone(),
             node: args.node.clone(),
-            mode: args.mode.clone(),
+            mode: non_blank_optional(&args.mode),
             hops: args.hops,
             depth: args.depth,
             direction: args.direction.clone(),
@@ -127,6 +138,40 @@ impl SearchParams {
             minify_body: args.minify_body.unwrap_or(false),
             verbose: args.verbose.unwrap_or(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::tools::Search;
+    use serde_json::json;
+
+    #[test]
+    fn from_mcp_search_treats_blank_mode_as_absent() {
+        let search: Search = serde_json::from_value(json!({
+            "query": "parse_search",
+            "mode": ""
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.query.as_deref(), Some("parse_search"));
+        assert!(params.mode.is_none());
+    }
+
+    #[test]
+    fn from_mcp_search_trims_mode() {
+        let search: Search = serde_json::from_value(json!({
+            "node": "repo:src/lib.rs:thing:function",
+            "mode": " neighbors "
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.mode.as_deref(), Some("neighbors"));
     }
 }
 
