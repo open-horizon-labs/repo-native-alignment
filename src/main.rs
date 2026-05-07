@@ -10,7 +10,7 @@ use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
     self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentScope,
-    RnaHandler, ScanEnrichmentOptions,
+    EnrichmentTrigger, RnaHandler, ScanEnrichmentOptions,
 };
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
@@ -389,6 +389,30 @@ struct ScanSummaryInput<'a> {
     timings: bool,
     operation: server::operation_report::OperationKind,
     extra_phases: Vec<server::operation_report::PhaseReport>,
+    lsp_state: server::operation_report::CapabilityState,
+    lsp_detail: Option<String>,
+    related_job_ids: Vec<String>,
+}
+
+fn recent_job_ids_for_capability(
+    jobs: &[server::EnrichmentJobRecord],
+    capability: EnrichmentCapability,
+) -> Vec<String> {
+    jobs.iter()
+        .filter(|job| job.capability == capability)
+        .map(|job| job.job_id.clone())
+        .collect()
+}
+
+fn lsp_call_edge_count(graph: &server::state::GraphState) -> usize {
+    graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.source == repo_native_alignment::graph::ExtractionSource::Lsp
+                && matches!(edge.kind, repo_native_alignment::graph::EdgeKind::Calls)
+        })
+        .count()
 }
 
 fn print_scan_summary(input: ScanSummaryInput<'_>) {
@@ -401,6 +425,9 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         timings,
         operation,
         extra_phases,
+        lsp_state,
+        lsp_detail,
+        related_job_ids,
     } = input;
     let mut report = server::operation_report::OperationReport::new(
         operation,
@@ -414,17 +441,9 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         edge_count: Some(graph.edges.len()),
         file_count: None,
         embedding_count: None,
-        lsp_edge_count: Some(
-            graph
-                .edges
-                .iter()
-                .filter(|e| {
-                    e.source == repo_native_alignment::graph::ExtractionSource::Lsp
-                        && matches!(e.kind, repo_native_alignment::graph::EdgeKind::Calls)
-                })
-                .count(),
-        ),
+        lsp_edge_count: Some(lsp_call_edge_count(graph)),
     };
+    report.related_job_ids = related_job_ids;
     for phase in extra_phases {
         report.add_phase(phase);
     }
@@ -432,11 +451,11 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         server::operation_report::PhaseKind::Total,
         elapsed,
     ));
-    let lsp_edge_count = report.outputs.lsp_edge_count.unwrap_or(0);
     for capability in server::operation_report::scan_capability_reports(
         enrichment,
         embeddings_loaded,
-        lsp_edge_count,
+        lsp_state,
+        lsp_detail,
         Some("repo".to_string()),
     ) {
         report.add_capability(capability);
@@ -446,7 +465,7 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         repo_root,
         enrichment,
         embeddings_loaded,
-        lsp_edge_count,
+        lsp_state,
     );
     if !enrichment.runs_lsp() {
         report.add_phase(server::operation_report::PhaseReport::skipped(
@@ -623,6 +642,18 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 };
                 let elapsed = t0.elapsed();
+                let lsp_edge_count = lsp_call_edge_count(&graph);
+                let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
+                let related_job_ids = recent_job_ids_for_capability(
+                    &recent_jobs,
+                    EnrichmentCapability::CallReferences,
+                );
+                let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
+                    enrichment,
+                    handler.lsp_status.current_state(),
+                    lsp_edge_count,
+                    !related_job_ids.is_empty(),
+                );
                 print_scan_summary(ScanSummaryInput {
                     repo_root: &repo_root,
                     graph: &graph,
@@ -635,6 +666,9 @@ async fn async_main() -> anyhow::Result<()> {
                         server::operation_report::PhaseKind::DiscoverFiles,
                         scan_duration,
                     )],
+                    lsp_state,
+                    lsp_detail,
+                    related_job_ids,
                 });
                 return Ok(());
             }
@@ -649,6 +683,19 @@ async fn async_main() -> anyhow::Result<()> {
                         handler.await_background_embed().await;
                     }
                     let elapsed = t0.elapsed();
+                    let lsp_edge_count = lsp_call_edge_count(&graph);
+                    let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
+                    let related_job_ids = recent_job_ids_for_capability(
+                        &recent_jobs,
+                        EnrichmentCapability::CallReferences,
+                    );
+                    let (lsp_state, lsp_detail) =
+                        server::operation_report::lsp_capability_from_status(
+                            enrichment,
+                            handler.lsp_status.current_state(),
+                            lsp_edge_count,
+                            !related_job_ids.is_empty(),
+                        );
                     print_scan_summary(ScanSummaryInput {
                         repo_root: &repo_root,
                         graph: &graph,
@@ -665,6 +712,9 @@ async fn async_main() -> anyhow::Result<()> {
                             server::operation_report::PhaseKind::DiscoverFiles,
                             scan_duration,
                         )],
+                        lsp_state,
+                        lsp_detail,
+                        related_job_ids,
                     });
                     return Ok(());
                 }
@@ -676,6 +726,16 @@ async fn async_main() -> anyhow::Result<()> {
                 scanner.commit_state()?;
             }
             let elapsed = t0.elapsed();
+            let lsp_edge_count = lsp_call_edge_count(&graph);
+            let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
+            let related_job_ids =
+                recent_job_ids_for_capability(&recent_jobs, EnrichmentCapability::CallReferences);
+            let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
+                enrichment,
+                handler.lsp_status.current_state(),
+                lsp_edge_count,
+                !related_job_ids.is_empty(),
+            );
             print_scan_summary(ScanSummaryInput {
                 repo_root: &repo_root,
                 graph: &graph,
@@ -688,6 +748,9 @@ async fn async_main() -> anyhow::Result<()> {
                     server::operation_report::PhaseKind::DiscoverFiles,
                     scan_duration,
                 )],
+                lsp_state,
+                lsp_detail,
+                related_job_ids,
             });
             return Ok(());
         }
@@ -798,13 +861,21 @@ async fn async_main() -> anyhow::Result<()> {
             let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
             let related_job_ids: Vec<String> = recent_jobs
                 .iter()
-                .filter(|job| job.capability == capability)
+                .filter(|job| {
+                    job.capability == capability
+                        && job.scope == scope
+                        && job.trigger == EnrichmentTrigger::Explicit
+                })
                 .map(|job| job.job_id.clone())
                 .collect();
             let embedding_count = if capability == EnrichmentCapability::Embeddings {
                 recent_jobs
                     .iter()
-                    .find(|job| job.capability == EnrichmentCapability::Embeddings)
+                    .find(|job| {
+                        job.capability == EnrichmentCapability::Embeddings
+                            && job.scope == scope
+                            && job.trigger == EnrichmentTrigger::Explicit
+                    })
                     .map(|job| job.counters.current)
             } else {
                 None

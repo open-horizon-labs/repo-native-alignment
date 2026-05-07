@@ -591,7 +591,12 @@ impl OperationReportStore {
         if store.schema_version == 0 {
             store.schema_version = SCHEMA_VERSION;
         }
-        store.mark_non_terminal_stale();
+        if store.mark_non_terminal_stale() {
+            let raw = serde_json::to_string_pretty(&store)?;
+            std::fs::write(&path, raw).with_context(|| {
+                format!("write recovered operation report store {}", path.display())
+            })?;
+        }
         Ok(store)
     }
 
@@ -654,9 +659,11 @@ impl OperationReportStore {
             .with_context(|| format!("write operation report store {}", path.display()))
     }
 
-    fn mark_non_terminal_stale(&mut self) {
+    fn mark_non_terminal_stale(&mut self) -> bool {
+        let mut changed = false;
         for report in &mut self.reports {
             if !report.state.is_terminal() {
+                changed = true;
                 report.state = OperationState::Stale;
                 report.completed_at = Some(unix_now());
                 report.failure.get_or_insert_with(|| {
@@ -669,6 +676,7 @@ impl OperationReportStore {
                 );
             }
         }
+        changed
     }
 }
 
@@ -692,10 +700,58 @@ pub fn render_recent_reports_markdown(repo_root: &Path, limit: usize) -> String 
     out
 }
 
+pub fn lsp_capability_from_status(
+    enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
+    state: super::state::LspState,
+    lsp_edge_count: usize,
+    has_related_job: bool,
+) -> (CapabilityState, Option<String>) {
+    if !enrichment.runs_lsp() {
+        return (CapabilityState::Skipped, None);
+    }
+    match state {
+        super::state::LspState::Complete => (
+            CapabilityState::Completed,
+            Some(format!(
+                "{} persisted call/reference edges available",
+                lsp_edge_count
+            )),
+        ),
+        super::state::LspState::Running | super::state::LspState::ServerFound => (
+            CapabilityState::Running,
+            Some("call-reference enrichment is running or queued".to_string()),
+        ),
+        super::state::LspState::Failed => (
+            CapabilityState::Failed,
+            Some("call-reference enrichment failed; inspect enrichment job history".to_string()),
+        ),
+        super::state::LspState::Unavailable => (
+            CapabilityState::Unavailable,
+            Some("no call-reference LSP server was available".to_string()),
+        ),
+        super::state::LspState::NotStarted if has_related_job => (
+            CapabilityState::Running,
+            Some("call-reference enrichment job exists but has not completed".to_string()),
+        ),
+        super::state::LspState::NotStarted if lsp_edge_count > 0 => (
+            CapabilityState::Completed,
+            Some(format!(
+                "{} persisted call/reference edges available",
+                lsp_edge_count
+            )),
+        ),
+        super::state::LspState::NotStarted => (
+            CapabilityState::Requested,
+            Some("call-reference enrichment was requested but has not completed".to_string()),
+        ),
+    }
+}
+
 pub fn scan_capability_reports(
     enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
     embeddings_attached: bool,
-    _lsp_edge_count: usize,
+    lsp_state: CapabilityState,
+    lsp_detail: Option<String>,
     scope: Option<String>,
 ) -> Vec<CapabilityReport> {
     let mut capabilities = vec![CapabilityReport::new(
@@ -721,14 +777,14 @@ pub fn scan_capability_reports(
     capabilities.push(CapabilityReport::new(
         EnrichmentCapability::CallReferences,
         if enrichment.runs_lsp() {
-            CapabilityState::Completed
+            lsp_state
         } else {
             CapabilityState::Skipped
         },
         enrichment.runs_lsp(),
         scope,
         if enrichment.runs_lsp() {
-            Some("call-reference enrichment was requested; zero edges can be a valid completed result".to_string())
+            lsp_detail
         } else {
             None
         },
@@ -741,7 +797,7 @@ pub fn add_scan_degradation_and_next_steps(
     repo_root: &Path,
     enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
     embeddings_attached: bool,
-    _lsp_edge_count: usize,
+    lsp_state: CapabilityState,
 ) {
     if !enrichment.runs_embeddings() || !embeddings_attached {
         report.add_degradation(
@@ -757,14 +813,32 @@ pub fn add_scan_degradation_and_next_steps(
             "enable semantic search and rerank",
         );
     }
-    if !enrichment.runs_lsp() {
-        report.add_degradation(
-            QueryClass::GlobalImpact,
-            "complete cross-file call/reference coverage requires call-reference enrichment",
+    let lsp_degraded = !enrichment.runs_lsp()
+        || matches!(
+            lsp_state,
+            CapabilityState::Requested
+                | CapabilityState::Running
+                | CapabilityState::Failed
+                | CapabilityState::Unavailable
+                | CapabilityState::Stale
+                | CapabilityState::Superseded
         );
+    if lsp_degraded {
+        let reason = match lsp_state {
+            CapabilityState::Running => "call-reference enrichment is still running",
+            CapabilityState::Failed => "call-reference enrichment failed",
+            CapabilityState::Unavailable => "call-reference enrichment is unavailable",
+            CapabilityState::Requested => "call-reference enrichment has not completed yet",
+            CapabilityState::Stale => "call-reference enrichment is stale",
+            CapabilityState::Superseded => "call-reference enrichment was superseded",
+            CapabilityState::Skipped | CapabilityState::Completed => {
+                "complete cross-file call/reference coverage requires call-reference enrichment"
+            }
+        };
+        report.add_degradation(QueryClass::GlobalImpact, reason);
         report.add_degradation(
             QueryClass::DeadCodePrerequisites,
-            "dead-code analysis requires call-reference enrichment to run",
+            "dead-code analysis requires completed call-reference coverage",
         );
         report.add_next_step(
             format!(
@@ -921,7 +995,8 @@ mod tests {
         for capability in scan_capability_reports(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
             true,
-            0,
+            CapabilityState::Completed,
+            Some("zero edges can be valid".to_string()),
             Some("repo".to_string()),
         ) {
             report.add_capability(capability);
@@ -931,7 +1006,7 @@ mod tests {
             repo,
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
             true,
-            0,
+            CapabilityState::Completed,
         );
 
         let call_refs = report
@@ -940,10 +1015,48 @@ mod tests {
             .find(|capability| capability.capability == EnrichmentCapability::CallReferences)
             .unwrap();
         assert_eq!(call_refs.state, CapabilityState::Completed);
-        assert!(!report
-            .degradation
+        assert!(
+            !report
+                .degradation
+                .iter()
+                .any(|notice| notice.query_class == QueryClass::GlobalImpact)
+        );
+    }
+
+    #[test]
+    fn running_lsp_is_reported_as_degraded_not_completed() {
+        let repo = Path::new("/tmp/repo");
+        let mut report = OperationReport::new(OperationKind::Scan, OperationTrigger::Test, repo)
+            .complete(Duration::from_millis(10));
+        for capability in scan_capability_reports(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            true,
+            CapabilityState::Running,
+            Some("call-reference enrichment is running".to_string()),
+            Some("repo".to_string()),
+        ) {
+            report.add_capability(capability);
+        }
+        add_scan_degradation_and_next_steps(
+            &mut report,
+            repo,
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            true,
+            CapabilityState::Running,
+        );
+
+        let call_refs = report
+            .capabilities
             .iter()
-            .any(|notice| notice.query_class == QueryClass::GlobalImpact));
+            .find(|capability| capability.capability == EnrichmentCapability::CallReferences)
+            .unwrap();
+        assert_eq!(call_refs.state, CapabilityState::Running);
+        assert!(
+            report
+                .degradation
+                .iter()
+                .any(|notice| notice.query_class == QueryClass::GlobalImpact)
+        );
     }
 
     #[test]
@@ -966,6 +1079,8 @@ mod tests {
                 .unwrap()
                 .contains("non-terminal")
         );
+        let persisted = OperationReportStore::read(repo).unwrap();
+        assert_eq!(persisted.reports[0].state, OperationState::Stale);
     }
 
     #[test]

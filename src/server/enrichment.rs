@@ -21,8 +21,9 @@ use super::enrichment_jobs::{
     ScanEnrichmentOptions,
 };
 use super::operation_report::{
-    OperationKind, OperationReport, OperationTrigger, OutputReport, PhaseKind, PhaseReport,
-    add_scan_degradation_and_next_steps, scan_capability_reports,
+    CapabilityState, OperationKind, OperationReport, OperationTrigger, OutputReport, PhaseKind,
+    PhaseReport, add_scan_degradation_and_next_steps, lsp_capability_from_status,
+    scan_capability_reports,
 };
 use super::state::GraphState;
 use super::store::persist_graph_to_lance;
@@ -57,6 +58,19 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     !result.detected_frameworks.is_empty()
 }
 
+fn recent_job_ids_for_capability(
+    ledger: &super::enrichment_jobs::EnrichmentJobLedger,
+    repo_root: &std::path::Path,
+    capability: EnrichmentCapability,
+) -> Vec<String> {
+    ledger
+        .recent_jobs(repo_root, 10)
+        .into_iter()
+        .filter(|job| job.capability == capability)
+        .map(|job| job.job_id)
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct PipelineReportInput {
     operation: OperationKind,
@@ -66,9 +80,12 @@ struct PipelineReportInput {
     edge_count: usize,
     file_count: usize,
     lsp_edge_count: usize,
+    lsp_state: CapabilityState,
+    lsp_detail: Option<String>,
     embedding_count: usize,
     embeddings_attached: bool,
     phases: Vec<PhaseReport>,
+    related_job_ids: Vec<String>,
 }
 
 fn build_pipeline_operation_report(
@@ -92,7 +109,8 @@ fn build_pipeline_operation_report(
     for capability in scan_capability_reports(
         input.enrichment,
         input.embeddings_attached,
-        input.lsp_edge_count,
+        input.lsp_state,
+        input.lsp_detail,
         Some("repo".to_string()),
     ) {
         report.add_capability(capability);
@@ -102,8 +120,9 @@ fn build_pipeline_operation_report(
         repo_root,
         input.enrichment,
         input.embeddings_attached,
-        input.lsp_edge_count,
+        input.lsp_state,
     );
+    report.related_job_ids = input.related_job_ids;
     report
 }
 
@@ -1182,6 +1201,33 @@ impl RnaHandler {
                     "skipped by scan options",
                 ));
             }
+            let related_job_ids = recent_job_ids_for_capability(
+                &self.enrichment_jobs,
+                &self.repo_root,
+                EnrichmentCapability::CallReferences,
+            );
+            let (lsp_state, lsp_detail) = lsp_capability_from_status(
+                enrichment,
+                self.lsp_status.current_state(),
+                lsp_edge_count,
+                !related_job_ids.is_empty(),
+            );
+            if matches!(lsp_state, CapabilityState::Failed) {
+                phases.push(PhaseReport::failed(
+                    PhaseKind::Lsp,
+                    total_time,
+                    lsp_detail
+                        .clone()
+                        .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+                ));
+            } else if matches!(lsp_state, CapabilityState::Unavailable) {
+                phases.push(PhaseReport::unavailable(
+                    PhaseKind::Lsp,
+                    lsp_detail
+                        .clone()
+                        .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
+                ));
+            }
             let report = build_pipeline_operation_report(
                 &self.repo_root,
                 PipelineReportInput {
@@ -1192,9 +1238,12 @@ impl RnaHandler {
                     edge_count: total_edge_count,
                     file_count: 0,
                     lsp_edge_count,
+                    lsp_state,
+                    lsp_detail,
                     embedding_count: 0,
                     embeddings_attached: self.embed_index.load().is_some(),
                     phases,
+                    related_job_ids,
                 },
             );
 
@@ -1450,6 +1499,33 @@ impl RnaHandler {
                 "skipped by scan options",
             ));
         }
+        let related_job_ids = recent_job_ids_for_capability(
+            &self.enrichment_jobs,
+            &self.repo_root,
+            EnrichmentCapability::CallReferences,
+        );
+        let (lsp_state, lsp_detail) = lsp_capability_from_status(
+            enrichment,
+            self.lsp_status.current_state(),
+            lsp_edge_count,
+            !related_job_ids.is_empty(),
+        );
+        if matches!(lsp_state, CapabilityState::Failed) {
+            phases.push(PhaseReport::failed(
+                PhaseKind::Lsp,
+                bus_time,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+            ));
+        } else if matches!(lsp_state, CapabilityState::Unavailable) {
+            phases.push(PhaseReport::unavailable(
+                PhaseKind::Lsp,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
+            ));
+        }
         let report = build_pipeline_operation_report(
             &self.repo_root,
             PipelineReportInput {
@@ -1460,9 +1536,12 @@ impl RnaHandler {
                 edge_count: total_edge_count,
                 file_count,
                 lsp_edge_count,
+                lsp_state,
+                lsp_detail,
                 embedding_count: 0,
                 embeddings_attached: self.embed_index.load().is_some(),
                 phases,
+                related_job_ids,
             },
         );
 
@@ -1557,7 +1636,7 @@ impl RnaHandler {
                         "LSP: joined active enrichment job {}; skipping duplicate foreground LSP",
                         existing_job_id
                     ));
-                    (None, false)
+                    (Some(existing_job_id), false)
                 }
             }
         } else {
@@ -1584,7 +1663,7 @@ impl RnaHandler {
                         "Embed: joined active enrichment job {}; skipping duplicate foreground embedding",
                         existing_job_id
                     ));
-                    (None, false)
+                    (Some(existing_job_id), false)
                 }
             }
         } else {
@@ -1833,6 +1912,16 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
+        let related_job_ids = [lsp_job_id.clone(), embed_job_id.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let (lsp_state, lsp_detail) = lsp_capability_from_status(
+            enrichment,
+            self.lsp_status.current_state(),
+            lsp_edge_count,
+            !related_job_ids.is_empty(),
+        );
         let mut phases = vec![
             PhaseReport::ran(PhaseKind::Extract, scan_extract_time),
             PhaseReport::ran(PhaseKind::PostPasses, bus_time),
@@ -1844,6 +1933,22 @@ impl RnaHandler {
             phases.push(PhaseReport::skipped(
                 PhaseKind::Embeddings,
                 "skipped by scan options",
+            ));
+        }
+        if matches!(lsp_state, CapabilityState::Failed) {
+            phases.push(PhaseReport::failed(
+                PhaseKind::Lsp,
+                bus_time,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment failed".to_string()),
+            ));
+        } else if matches!(lsp_state, CapabilityState::Unavailable) {
+            phases.push(PhaseReport::unavailable(
+                PhaseKind::Lsp,
+                lsp_detail
+                    .clone()
+                    .unwrap_or_else(|| "call-reference enrichment unavailable".to_string()),
             ));
         }
         if !enrichment.runs_lsp() {
@@ -1862,9 +1967,12 @@ impl RnaHandler {
                 edge_count: total_edge_count,
                 file_count,
                 lsp_edge_count,
+                lsp_state,
+                lsp_detail,
                 embedding_count: embed_count,
                 embeddings_attached: self.embed_index.load().is_some(),
                 phases,
+                related_job_ids,
             },
         );
 
