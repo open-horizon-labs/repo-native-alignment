@@ -747,9 +747,35 @@ pub fn lsp_capability_from_status(
     }
 }
 
-pub fn scan_capability_reports(
+pub fn embedding_capability_from_availability(
     enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
     embeddings_attached: bool,
+) -> (CapabilityState, Option<String>) {
+    if embeddings_attached {
+        return (
+            CapabilityState::Completed,
+            Some("semantic embedding index is loaded".to_string()),
+        );
+    }
+    if enrichment.runs_embeddings() {
+        (
+            CapabilityState::Unavailable,
+            Some(
+                "embedding enrichment was requested but no queryable index is attached".to_string(),
+            ),
+        )
+    } else {
+        (
+            CapabilityState::Skipped,
+            Some("embedding enrichment was not requested and no index is attached".to_string()),
+        )
+    }
+}
+
+pub fn scan_capability_reports(
+    enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
+    embedding_state: CapabilityState,
+    embedding_detail: Option<String>,
     lsp_state: CapabilityState,
     lsp_detail: Option<String>,
     scope: Option<String>,
@@ -763,16 +789,10 @@ pub fn scan_capability_reports(
     )];
     capabilities.push(CapabilityReport::new(
         EnrichmentCapability::Embeddings,
-        if enrichment.runs_embeddings() && embeddings_attached {
-            CapabilityState::Completed
-        } else if enrichment.runs_embeddings() {
-            CapabilityState::Unavailable
-        } else {
-            CapabilityState::Skipped
-        },
+        embedding_state,
         enrichment.runs_embeddings(),
         scope.clone(),
-        None,
+        embedding_detail,
     ));
     capabilities.push(CapabilityReport::new(
         EnrichmentCapability::CallReferences,
@@ -796,14 +816,33 @@ pub fn add_scan_degradation_and_next_steps(
     report: &mut OperationReport,
     repo_root: &Path,
     enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
-    embeddings_attached: bool,
+    embedding_state: CapabilityState,
     lsp_state: CapabilityState,
 ) {
-    if !enrichment.runs_embeddings() || !embeddings_attached {
-        report.add_degradation(
-            QueryClass::SemanticSearch,
-            "embedding capability is not ready; keyword/structural search still works",
-        );
+    let embedding_degraded = matches!(
+        embedding_state,
+        CapabilityState::Requested
+            | CapabilityState::Running
+            | CapabilityState::Failed
+            | CapabilityState::Unavailable
+            | CapabilityState::Stale
+            | CapabilityState::Superseded
+            | CapabilityState::Skipped
+    );
+    if embedding_degraded {
+        let reason = match embedding_state {
+            CapabilityState::Completed => "embedding capability is ready",
+            CapabilityState::Running => "embedding enrichment is still running",
+            CapabilityState::Failed => "embedding enrichment failed",
+            CapabilityState::Unavailable => "embedding capability is unavailable",
+            CapabilityState::Requested => "embedding enrichment has not completed yet",
+            CapabilityState::Stale => "embedding index is stale",
+            CapabilityState::Superseded => "embedding enrichment was superseded",
+            CapabilityState::Skipped => {
+                "embedding capability is not ready; keyword/structural search still works"
+            }
+        };
+        report.add_degradation(QueryClass::SemanticSearch, reason);
         report.add_degradation(QueryClass::Rerank, "rerank requires embeddings");
         report.add_next_step(
             format!(
@@ -994,7 +1033,8 @@ mod tests {
             .complete(Duration::from_millis(10));
         for capability in scan_capability_reports(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
-            true,
+            CapabilityState::Completed,
+            Some("semantic index loaded".to_string()),
             CapabilityState::Completed,
             Some("zero edges can be valid".to_string()),
             Some("repo".to_string()),
@@ -1005,7 +1045,7 @@ mod tests {
             &mut report,
             repo,
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
-            true,
+            CapabilityState::Completed,
             CapabilityState::Completed,
         );
 
@@ -1030,7 +1070,8 @@ mod tests {
             .complete(Duration::from_millis(10));
         for capability in scan_capability_reports(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
-            true,
+            CapabilityState::Completed,
+            Some("semantic index loaded".to_string()),
             CapabilityState::Running,
             Some("call-reference enrichment is running".to_string()),
             Some("repo".to_string()),
@@ -1041,7 +1082,7 @@ mod tests {
             &mut report,
             repo,
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
-            true,
+            CapabilityState::Completed,
             CapabilityState::Running,
         );
 

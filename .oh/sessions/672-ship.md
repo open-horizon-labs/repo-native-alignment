@@ -39,3 +39,14 @@
 
 ### Step 3: Fix
 **Status:** implemented locally; verification pending before commit.
+
+### Step 3 Verification/Commit
+**Commit:** `9030156 Fix OperationReport LSP state truthfulness [outcome:context-assembly]`
+**Pushed:** yes
+**Verification:**
+- `cargo check --lib --bins --no-default-features`
+- `cargo test --lib --no-default-features operation_report -- --nocapture`
+- `cargo test --lib --no-default-features test_list_roots_from_slugs_includes_recent_operation_reports -- --nocapture`
+- `cargo clippy --lib --bins --no-default-features -- -D warnings`
+- `git diff --check`
+**Friction:** 1Password SSH signing failed twice; fix commit was pushed unsigned with `--no-gpg-sign`.

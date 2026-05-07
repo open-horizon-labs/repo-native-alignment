@@ -10,7 +10,7 @@ use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
     self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentScope,
-    EnrichmentTrigger, RnaHandler, ScanEnrichmentOptions,
+    RnaHandler, ScanEnrichmentOptions,
 };
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
@@ -394,16 +394,6 @@ struct ScanSummaryInput<'a> {
     related_job_ids: Vec<String>,
 }
 
-fn recent_job_ids_for_capability(
-    jobs: &[server::EnrichmentJobRecord],
-    capability: EnrichmentCapability,
-) -> Vec<String> {
-    jobs.iter()
-        .filter(|job| job.capability == capability)
-        .map(|job| job.job_id.clone())
-        .collect()
-}
-
 fn lsp_call_edge_count(graph: &server::state::GraphState) -> usize {
     graph
         .edges
@@ -451,9 +441,15 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         server::operation_report::PhaseKind::Total,
         elapsed,
     ));
+    let (embedding_state, embedding_detail) =
+        server::operation_report::embedding_capability_from_availability(
+            enrichment,
+            embeddings_loaded,
+        );
     for capability in server::operation_report::scan_capability_reports(
         enrichment,
-        embeddings_loaded,
+        embedding_state,
+        embedding_detail,
         lsp_state,
         lsp_detail,
         Some("repo".to_string()),
@@ -464,7 +460,7 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         &mut report,
         repo_root,
         enrichment,
-        embeddings_loaded,
+        embedding_state,
         lsp_state,
     );
     if !enrichment.runs_lsp() {
@@ -601,11 +597,14 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
-            if enrichment.runs_embeddings()
-                && let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                if enrichment.runs_embeddings() {
                     tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
-                })
-                .await
+                } else {
+                    tracing::debug!("{}; no embedding enrichment requested", msg);
+                }
+            })
+            .await
             {
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
@@ -643,11 +642,7 @@ async fn async_main() -> anyhow::Result<()> {
                 };
                 let elapsed = t0.elapsed();
                 let lsp_edge_count = lsp_call_edge_count(&graph);
-                let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
-                let related_job_ids = recent_job_ids_for_capability(
-                    &recent_jobs,
-                    EnrichmentCapability::CallReferences,
-                );
+                let related_job_ids = Vec::new();
                 let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                     enrichment,
                     handler.lsp_status.current_state(),
@@ -684,11 +679,7 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                     let elapsed = t0.elapsed();
                     let lsp_edge_count = lsp_call_edge_count(&graph);
-                    let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
-                    let related_job_ids = recent_job_ids_for_capability(
-                        &recent_jobs,
-                        EnrichmentCapability::CallReferences,
-                    );
+                    let related_job_ids = Vec::new();
                     let (lsp_state, lsp_detail) =
                         server::operation_report::lsp_capability_from_status(
                             enrichment,
@@ -727,9 +718,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
             let elapsed = t0.elapsed();
             let lsp_edge_count = lsp_call_edge_count(&graph);
-            let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
-            let related_job_ids =
-                recent_job_ids_for_capability(&recent_jobs, EnrichmentCapability::CallReferences);
+            let related_job_ids = Vec::new();
             let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                 enrichment,
                 handler.lsp_status.current_state(),
@@ -823,7 +812,7 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
             let enrich_start = std::time::Instant::now();
-            handler
+            let related_job_ids = handler
                 .run_explicit_enrichment(
                     capability,
                     scope.clone(),
@@ -859,23 +848,10 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             };
             let recent_jobs = handler.enrichment_jobs.recent_jobs(&repo_root, 10);
-            let related_job_ids: Vec<String> = recent_jobs
-                .iter()
-                .filter(|job| {
-                    job.capability == capability
-                        && job.scope == scope
-                        && job.trigger == EnrichmentTrigger::Explicit
-                })
-                .map(|job| job.job_id.clone())
-                .collect();
             let embedding_count = if capability == EnrichmentCapability::Embeddings {
                 recent_jobs
                     .iter()
-                    .find(|job| {
-                        job.capability == EnrichmentCapability::Embeddings
-                            && job.scope == scope
-                            && job.trigger == EnrichmentTrigger::Explicit
-                    })
+                    .find(|job| related_job_ids.iter().any(|id| id == &job.job_id))
                     .map(|job| job.counters.current)
             } else {
                 None
