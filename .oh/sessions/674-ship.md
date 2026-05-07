@@ -1,3 +1,11 @@
+---
+id: 674-ship
+artifact: ship-session
+started: 2026-05-07
+status: in-progress
+pr: 674
+---
+
 ## Ship Pipeline — PR #674
 **Started:** 2026-05-07
 
