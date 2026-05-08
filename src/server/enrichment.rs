@@ -58,6 +58,29 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     !result.detected_frameworks.is_empty()
 }
 
+fn lsp_abort_failures_for_slugs(
+    stats: &crate::extract::scan_stats::ScanStats,
+    participating_slugs: &HashSet<String>,
+) -> Vec<String> {
+    stats
+        .lsp_stats
+        .iter()
+        .filter(|(slug, _)| participating_slugs.contains(*slug))
+        .flat_map(|(slug, by_language)| {
+            by_language.iter().filter_map(move |(language, stat)| {
+                if stat.aborted {
+                    Some(format!(
+                        "{slug}/{language} via {}: {} error(s), aborted={}",
+                        stat.server_name, stat.error_count, stat.aborted
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct PipelineReportInput {
     operation: OperationKind,
@@ -1154,7 +1177,7 @@ impl RnaHandler {
                         EnrichmentScope::Repo,
                         EnrichmentTrigger::ForegroundScan,
                         None,
-                        false,
+                        true,
                     )
                     .await?;
                 (run.edge_count, Some(run.job_id))
@@ -1708,6 +1731,10 @@ impl RnaHandler {
         // post-extraction passes (LSP, subsystem detection, framework detection,
         // import calls, tested_by, etc.) and returns the fully enriched graph.
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let participating_lsp_slugs = root_pairs
+            .iter()
+            .map(|(slug, _)| slug.clone())
+            .collect::<HashSet<_>>();
         let bus_fut = async {
             let t2 = std::time::Instant::now();
             let result = emit_lsp_pipeline_with_budget(LspPipelineInput {
@@ -1769,24 +1796,7 @@ impl RnaHandler {
                     let lsp_failures = self
                         .scan_stats
                         .read()
-                        .map(|stats| {
-                            stats
-                                .lsp_stats
-                                .iter()
-                                .flat_map(|(slug, by_language)| {
-                                    by_language.iter().filter_map(move |(language, stat)| {
-                                        if stat.aborted {
-                                            Some(format!(
-                                                "{slug}/{language} via {}: {} error(s), aborted={}",
-                                                stat.server_name, stat.error_count, stat.aborted
-                                            ))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
+                        .map(|stats| lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs))
                         .unwrap_or_else(|_| {
                             vec!["scan stats unavailable: lock poisoned".to_string()]
                         });
@@ -2081,6 +2091,12 @@ impl RnaHandler {
         on_progress("Enrichment: running pipeline via event bus (no sentinel)...");
 
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let participating_lsp_slugs = dirty_slugs.clone().unwrap_or_else(|| {
+            root_pairs
+                .iter()
+                .map(|(slug, _)| slug.clone())
+                .collect::<HashSet<_>>()
+        });
         let bus_result = emit_lsp_pipeline_with_budget(LspPipelineInput {
             nodes: all_nodes,
             edges: all_edges,
@@ -2116,16 +2132,10 @@ impl RnaHandler {
 
                 let lsp_abort_detail = {
                     let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
-                    stats.lsp_stats.iter().find_map(|(root, languages)| {
-                        languages.iter().find_map(|(language, lsp)| {
-                            lsp.aborted.then(|| {
-                                format!(
-                                    "LSP enrichment aborted for root={} language={} server={} errors={} edges={}",
-                                    root, language, lsp.server_name, lsp.error_count, lsp.edge_count
-                                )
-                            })
-                        })
-                    })
+                    lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                        .into_iter()
+                        .next()
+                        .map(|failure| format!("LSP enrichment aborted for {failure}"))
                 };
                 if let Some(detail) = lsp_abort_detail {
                     on_progress(&format!("Enrichment: {detail}"));
@@ -2647,5 +2657,49 @@ mod tests {
         let import_node = make_node("use my_unknown_crate::Foo", NodeKind::Import);
         let nodes = vec![import_node];
         assert!(!cache_needs_enrichment(&nodes));
+    }
+
+    #[test]
+    fn test_lsp_abort_failures_are_scoped_to_participating_slugs() {
+        let mut stats = crate::extract::scan_stats::ScanStats::default();
+        stats.lsp_stats.insert(
+            "current".to_string(),
+            [(
+                "rust".to_string(),
+                crate::extract::scan_stats::LspLanguageStats {
+                    server_name: "rust-analyzer".to_string(),
+                    edge_count: 0,
+                    node_count: 0,
+                    duration: Duration::from_secs(1),
+                    error_count: 2,
+                    aborted: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        stats.lsp_stats.insert(
+            "stale".to_string(),
+            [(
+                "rust".to_string(),
+                crate::extract::scan_stats::LspLanguageStats {
+                    server_name: "rust-analyzer".to_string(),
+                    edge_count: 0,
+                    node_count: 0,
+                    duration: Duration::from_secs(1),
+                    error_count: 9,
+                    aborted: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let participating_slugs = HashSet::from(["current".to_string()]);
+        let failures = lsp_abort_failures_for_slugs(&stats, &participating_slugs);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("current/rust"));
+        assert!(!failures[0].contains("stale/rust"));
     }
 }

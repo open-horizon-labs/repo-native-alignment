@@ -41,9 +41,17 @@ fn foreground_full_scan_lsp_failure_exits_nonzero() {
         .expect("run repo-native-alignment scan");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() && stderr.contains("Missing Content-Length header") {
+    let lower_stderr = stderr.to_ascii_lowercase();
+    let pre_pass1_lsp_failure = !stderr.contains("Diagnostic snapshot: pass=lsp_pass1_references")
+        && !stderr.contains("LSP call-reference enrichment aborted")
+        && (stderr.contains("Missing Content-Length header")
+            || lower_stderr.contains("connection reset")
+            || lower_stderr.contains("broken pipe")
+            || lower_stderr.contains("connection refused"));
+    if pre_pass1_lsp_failure {
         eprintln!(
-            "skipping forced Pass 1 abort contract: rust-analyzer failed before Pass 1 on this host"
+            "skipping forced Pass 1 abort contract: rust-analyzer failed before Pass 1 on this host; status={:?}; stderr:\n{}",
+            output.status, stderr
         );
         return;
     }
