@@ -4,10 +4,13 @@
 //! appends results to the `EnrichmentResult`. The top-level `enrich()` orchestrates
 //! them in sequence: Pass 0 -> Pass 1 -> Pass 2 -> Pass 4 -> Pass 5 -> Pass 3.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
@@ -20,6 +23,364 @@ use super::{
     ZERO_EDGE_TIMEOUT,
 };
 use crate::scanner::LspConfig;
+
+const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
+const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
+const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DidOpenStatus {
+    Unopened,
+    Opening,
+    Opened,
+    Failed,
+}
+
+struct DidOpenEntry {
+    state: Mutex<DidOpenStatus>,
+    notify: tokio::sync::Notify,
+}
+
+impl DidOpenEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DidOpenStatus::Unopened),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct DidOpenCoordinator {
+    server: String,
+    files: Mutex<HashMap<PathBuf, Arc<DidOpenEntry>>>,
+}
+
+impl DidOpenCoordinator {
+    fn new(server: String) -> Self {
+        Self {
+            server,
+            files: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn ensure_open(
+        &self,
+        transport: &PipelinedTransport,
+        root: &Path,
+        rel_path: &Path,
+        file_uri: &lsp_types::Uri,
+    ) -> Result<bool> {
+        self.ensure_open_with(rel_path, || async {
+            self.send_did_open_once(transport, root, rel_path, file_uri)
+                .await
+        })
+        .await
+    }
+
+    async fn ensure_open_with<F, Fut>(&self, rel_path: &Path, open: F) -> Result<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let entry = {
+            let mut files = self.files.lock().await;
+            files
+                .entry(rel_path.to_path_buf())
+                .or_insert_with(|| Arc::new(DidOpenEntry::new()))
+                .clone()
+        };
+        let mut open = Some(open);
+
+        loop {
+            {
+                let mut state = entry.state.lock().await;
+                match *state {
+                    DidOpenStatus::Opened => return Ok(false),
+                    DidOpenStatus::Opening => {}
+                    DidOpenStatus::Unopened | DidOpenStatus::Failed => {
+                        *state = DidOpenStatus::Opening;
+                        drop(state);
+                        let open_once = open
+                            .take()
+                            .expect("didOpen operation consumed exactly once");
+                        let result = open_once().await;
+                        let mut state = entry.state.lock().await;
+                        *state = if result.is_ok() {
+                            DidOpenStatus::Opened
+                        } else {
+                            DidOpenStatus::Failed
+                        };
+                        entry.notify.notify_waiters();
+                        return result.map(|()| true);
+                    }
+                }
+            }
+            entry.notify.notified().await;
+        }
+    }
+
+    async fn send_did_open_once(
+        &self,
+        transport: &PipelinedTransport,
+        root: &Path,
+        rel_path: &Path,
+        file_uri: &lsp_types::Uri,
+    ) -> Result<()> {
+        let abs_path = root.join(rel_path);
+        let content = std::fs::read_to_string(&abs_path).with_context(|| {
+            format!(
+                "LSP didOpen failed: server={} file={} phase=read_file",
+                self.server,
+                rel_path.display()
+            )
+        })?;
+        let lang_id = language_id_for_path(&abs_path);
+        let notify = transport.notify(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": file_uri.to_string(),
+                    "languageId": lang_id,
+                    "version": 1,
+                    "text": content
+                }
+            }),
+        );
+
+        match tokio::time::timeout(did_open_timeout(), notify).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e).with_context(|| {
+                format!(
+                    "LSP didOpen failed: server={} file={} phase=notify_write",
+                    self.server,
+                    rel_path.display()
+                )
+            }),
+            Err(_) => anyhow::bail!(
+                "LSP didOpen timed out: server={} file={} phase=notify_write timeout_ms={}",
+                self.server,
+                rel_path.display(),
+                did_open_timeout().as_millis()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LspPass1WorkItem {
+    id: usize,
+    node: Node,
+    requested_operations: Vec<&'static str>,
+    attempt_count: u32,
+}
+
+#[derive(Debug)]
+struct Pass1TaskResult {
+    edges: Vec<Edge>,
+    new_nodes: Vec<Node>,
+    had_error: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightTaskDiagnostic {
+    file: PathBuf,
+    node: String,
+    phase: &'static str,
+    attempt_count: u32,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct LspPass1DiagnosticSnapshot {
+    total: usize,
+    completed: u64,
+    failed: u64,
+    pending: u64,
+    in_flight: usize,
+    phase_counts: BTreeMap<&'static str, usize>,
+    oldest: Vec<String>,
+    last_success: Option<String>,
+}
+
+impl LspPass1DiagnosticSnapshot {
+    fn render(&self) -> String {
+        let phases = if self.phase_counts.is_empty() {
+            "none".to_string()
+        } else {
+            self.phase_counts
+                .iter()
+                .map(|(phase, count)| format!("{phase}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let oldest = if self.oldest.is_empty() {
+            "none".to_string()
+        } else {
+            self.oldest.join("; ")
+        };
+        let last_success = self.last_success.as_deref().unwrap_or("none");
+        format!(
+            "pass=lsp_pass1_references completed={}/{} pending={} in_flight={} failed={} phases=[{}] oldest=[{}] last_success={}",
+            self.completed,
+            self.total,
+            self.pending,
+            self.in_flight,
+            self.failed,
+            phases,
+            oldest,
+            last_success
+        )
+    }
+}
+
+struct LspPass1Diagnostics {
+    total: usize,
+    in_flight: Mutex<HashMap<usize, InFlightTaskDiagnostic>>,
+    completed: AtomicI64,
+    failed: AtomicI64,
+    last_success: Mutex<Option<String>>,
+}
+
+impl LspPass1Diagnostics {
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            in_flight: Mutex::new(HashMap::new()),
+            completed: AtomicI64::new(0),
+            failed: AtomicI64::new(0),
+            last_success: Mutex::new(None),
+        }
+    }
+
+    async fn set_phase(&self, item: &LspPass1WorkItem, phase: &'static str) {
+        let mut in_flight = self.in_flight.lock().await;
+        in_flight.insert(
+            item.id,
+            InFlightTaskDiagnostic {
+                file: item.node.id.file.clone(),
+                node: item.node.id.name.clone(),
+                phase,
+                attempt_count: item.attempt_count,
+                started_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn finish(&self, item: &LspPass1WorkItem, success: bool) {
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.remove(&item.id);
+        }
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        if success {
+            let mut last_success = self.last_success.lock().await;
+            *last_success = Some(format!(
+                "{}:{}",
+                item.node.id.file.display(),
+                item.node.id.name
+            ));
+        } else {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn snapshot(&self) -> LspPass1DiagnosticSnapshot {
+        let completed = self.completed.load(Ordering::Relaxed).max(0) as u64;
+        let failed = self.failed.load(Ordering::Relaxed).max(0) as u64;
+        let in_flight = self.in_flight.lock().await;
+        let in_flight_count = in_flight.len();
+        let mut phase_counts = BTreeMap::new();
+        for task in in_flight.values() {
+            *phase_counts.entry(task.phase).or_insert(0) += 1;
+        }
+        let mut oldest_tasks = in_flight.values().cloned().collect::<Vec<_>>();
+        oldest_tasks.sort_by_key(|task| std::cmp::Reverse(task.started_at.elapsed()));
+        let oldest = oldest_tasks
+            .into_iter()
+            .take(PASS1_DIAGNOSTIC_SAMPLE_LIMIT)
+            .map(|task| {
+                format!(
+                    "file={} node={} phase={} attempt={} age_ms={}",
+                    task.file.display(),
+                    task.node,
+                    task.phase,
+                    task.attempt_count,
+                    task.started_at.elapsed().as_millis()
+                )
+            })
+            .collect();
+        drop(in_flight);
+        let last_success = self.last_success.lock().await.clone();
+        let accounted = completed.saturating_add(in_flight_count as u64);
+        let pending = (self.total as u64).saturating_sub(accounted);
+        LspPass1DiagnosticSnapshot {
+            total: self.total,
+            completed,
+            failed,
+            pending,
+            in_flight: in_flight_count,
+            phase_counts,
+            oldest,
+            last_success,
+        }
+    }
+}
+
+fn language_id_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("py") => "python",
+        Some("ts") => "typescript",
+        Some("tsx") => "typescriptreact",
+        Some("js") => "javascript",
+        Some("jsx") => "javascriptreact",
+        Some("rs") => "rust",
+        Some("go") => "go",
+        _ => "plaintext",
+    }
+}
+
+fn requested_operations_for_node(
+    kind: &NodeKind,
+    has_references: bool,
+    has_call_hierarchy: bool,
+) -> Vec<&'static str> {
+    match kind {
+        NodeKind::Function if has_call_hierarchy => vec![
+            "requesting_call_hierarchy_prepare",
+            "requesting_call_hierarchy_incoming",
+            "requesting_call_hierarchy_outgoing",
+        ],
+        NodeKind::Function if has_references => vec!["requesting_references"],
+        NodeKind::Trait => vec!["requesting_implementations"],
+        NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
+            if has_references =>
+        {
+            vec!["requesting_references"]
+        }
+        NodeKind::Other(_) => vec!["requesting_document_links"],
+        _ => vec!["skipped_no_supported_operation"],
+    }
+}
+
+fn did_open_timeout() -> Duration {
+    duration_from_env("RNA_LSP_DID_OPEN_TIMEOUT_MS", DID_OPEN_DEFAULT_TIMEOUT)
+}
+
+fn pass1_no_progress_timeout() -> Duration {
+    duration_from_env(
+        "RNA_LSP_PASS1_NO_PROGRESS_TIMEOUT_MS",
+        PASS1_DEFAULT_NO_PROGRESS_TIMEOUT,
+    )
+}
+
+fn duration_from_env(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
 
 impl LspEnricher {
     // ------------------------------------------------------------------
@@ -69,7 +430,7 @@ impl LspEnricher {
     // Pass 1: call hierarchy, find_implementations, references, and document links.
     // Pipelined with adaptive concurrency (TCP slow-start).
     //
-    // Returns (attempted, errors, aborted).
+    // Returns (attempted, errors, aborted, abort diagnostic).
     // ------------------------------------------------------------------
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_pass1_references(
@@ -82,7 +443,7 @@ impl LspEnricher {
         has_references: bool,
         has_call_hierarchy: bool,
         result: &mut EnrichmentResult,
-    ) -> (u32, u32, bool) {
+    ) -> (u32, u32, bool, Option<String>) {
         let pass1_start = std::time::Instant::now();
         let language = self.language.clone();
 
@@ -166,195 +527,144 @@ impl LspEnricher {
             has_call_hierarchy,
         );
 
-        // Concurrency control: TCP slow-start from 4 to 64.
+        // Bounded queue substrate: materialize inspectable work items, then let a
+        // fixed worker pool drain them. This avoids spawning one opaque task per
+        // symbol and gives diagnostics a stable queue/in-flight model.
         const PIPELINE_MAX_CONCURRENCY: usize = 64;
-        let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(4));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        let completed = Arc::new(AtomicI64::new(0));
+        let work_items: Vec<LspPass1WorkItem> = enrichable_nodes
+            .iter()
+            .enumerate()
+            .map(|(id, node)| LspPass1WorkItem {
+                id,
+                node: (*node).clone(),
+                requested_operations: requested_operations_for_node(
+                    &node.id.kind,
+                    has_references,
+                    has_call_hierarchy,
+                ),
+                attempt_count: 1,
+            })
+            .collect();
+        let total_nodes = work_items.len();
+        let worker_count = total_nodes.clamp(1, PIPELINE_MAX_CONCURRENCY);
+        let diagnostics = Arc::new(LspPass1Diagnostics::new(total_nodes));
+        let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
-        let ramped_up = Arc::new(AtomicBool::new(false));
-        // Track files we've sent didOpen for — pyright only resolves
-        // callHierarchy for files it has analyzed.
-        let opened_files: Arc<Mutex<std::collections::HashSet<PathBuf>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let mut join_set = tokio::task::JoinSet::new();
+        let (work_tx, work_rx) =
+            tokio::sync::mpsc::channel::<LspPass1WorkItem>(PIPELINE_MAX_CONCURRENCY);
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (result_tx, mut result_rx) =
+            tokio::sync::mpsc::channel::<Pass1TaskResult>(PIPELINE_MAX_CONCURRENCY);
 
-        for node in &enrichable_nodes {
-            let node = (*node).clone();
+        for _ in 0..worker_count {
             let transport = Arc::clone(transport);
             let root = root.to_path_buf();
             let matching_owned = Arc::clone(matching_nodes_owned);
             let refs_by_file = Arc::clone(refs_by_file_shared);
             let language = language.clone();
-            let sem = Arc::clone(&concurrency_limit);
-            let completed = Arc::clone(&completed);
             let error_count = Arc::clone(&error_count);
-            let ramped_up = Arc::clone(&ramped_up);
-            let opened = Arc::clone(&opened_files);
+            let did_open = Arc::clone(&did_open);
+            let diagnostics = Arc::clone(&diagnostics);
+            let work_rx = Arc::clone(&work_rx);
+            let result_tx = result_tx.clone();
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-
-                let abs_path = root.join(&node.id.file);
-                let file_uri = match path_to_uri(&abs_path) {
-                    Ok(u) => u,
-                    Err(_) => {
-                        completed.fetch_add(1, Ordering::Relaxed);
-                        return (Vec::new(), Vec::new(), false);
-                    }
-                };
-
-                // Send didOpen for this file if not already opened.
-                // Only mark the file as opened after the file read and notify succeed,
-                // so a transient failure doesn't permanently suppress future attempts.
-                {
-                    let already_open = {
-                        let set = opened.lock().await;
-                        set.contains(&node.id.file)
+                loop {
+                    let item = {
+                        let mut rx = work_rx.lock().await;
+                        rx.recv().await
                     };
-                    if !already_open {
-                        let lang_id = match abs_path.extension().and_then(|e| e.to_str()) {
-                            Some("py") => "python",
-                            Some("ts") => "typescript",
-                            Some("tsx") => "typescriptreact",
-                            Some("js") => "javascript",
-                            Some("jsx") => "javascriptreact",
-                            Some("rs") => "rust",
-                            Some("go") => "go",
-                            _ => "plaintext",
-                        };
-                        if let Ok(content) = std::fs::read_to_string(&abs_path)
-                            && transport.notify(
-                                "textDocument/didOpen",
-                                serde_json::json!({
-                                    "textDocument": {
-                                        "uri": file_uri.to_string(),
-                                        "languageId": lang_id,
-                                        "version": 1,
-                                        "text": content
-                                    }
-                                }),
-                            ).await.is_ok()
-                        {
-                            let mut set = opened.lock().await;
-                            set.insert(node.id.file.clone());
-                        }
+                    let Some(item) = item else {
+                        break;
+                    };
+                    let result = Self::run_pass1_work_item(
+                        item,
+                        &transport,
+                        &root,
+                        &matching_owned,
+                        &refs_by_file,
+                        &language,
+                        has_references,
+                        has_call_hierarchy,
+                        &did_open,
+                        &diagnostics,
+                        &error_count,
+                    )
+                    .await;
+                    if result_tx.send(result).await.is_err() {
+                        break;
                     }
                 }
-
-                let (line, col) = Self::node_lsp_position(&node);
-                let mut edges = Vec::new();
-                let mut new_nodes = Vec::new();
-                let mut had_error = false;
-
-                match node.id.kind {
-                    NodeKind::Function => {
-                        Self::enrich_function_node(
-                            &transport,
-                            &file_uri,
-                            line,
-                            col,
-                            &node,
-                            &matching_owned,
-                            &refs_by_file,
-                            &root,
-                            &language,
-                            has_references,
-                            has_call_hierarchy,
-                            &mut edges,
-                            &mut new_nodes,
-                            &mut had_error,
-                            &error_count,
-                        )
-                        .await;
-                    }
-                    NodeKind::Trait => {
-                        Self::enrich_trait_node(
-                            &transport,
-                            &file_uri,
-                            line,
-                            col,
-                            &node,
-                            &matching_owned,
-                            &root,
-                            &mut edges,
-                        )
-                        .await;
-                    }
-                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                        if has_references {
-                            Self::enrich_type_references(
-                                &transport,
-                                &file_uri,
-                                line,
-                                col,
-                                &node,
-                                &matching_owned,
-                                &root,
-                                &mut edges,
-                                &mut had_error,
-                                &error_count,
-                            )
-                            .await;
-                        }
-                    }
-                    _ => {
-                        if matches!(node.id.kind, NodeKind::Other(_)) {
-                            Self::enrich_document_links(
-                                &transport, &file_uri, &node, &root, &mut edges,
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                // Ramp up after 4 successful completions (TCP slow-start exit)
-                if done >= 4 && !had_error && !ramped_up.swap(true, Ordering::Relaxed) {
-                    let added = PIPELINE_MAX_CONCURRENCY - 4;
-                    sem.add_permits(added);
-                    tracing::info!(
-                        "LSP pipeline: ramp-up to {} concurrent",
-                        PIPELINE_MAX_CONCURRENCY
-                    );
-                }
-                (edges, new_nodes, had_error)
             });
         }
+        drop(result_tx);
 
-        // Collect results from all concurrent tasks
+        for item in work_items {
+            if work_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+        drop(work_tx);
+
+        // Collect results from all queued work items. A no-progress watchdog emits
+        // a bounded diagnostic snapshot before aborting workers, so stalls surface
+        // by phase/file instead of waiting for the outer 30-minute job watchdog.
         let mut attempted = 0u32;
         let mut errors = 0u32;
         let mut aborted = false;
+        let mut abort_diagnostic = None;
         let mut seen_virtual_ids = std::collections::HashSet::new();
-        let total_nodes = enrichable_nodes.len();
         let mut last_progress_log = std::time::Instant::now();
         let mut last_logged_count = 0u64;
+        let mut no_progress_deadline = Box::pin(tokio::time::sleep(pass1_no_progress_timeout()));
         const PROGRESS_LOG_INTERVAL_SECS: u64 = 30;
         const PROGRESS_LOG_INTERVAL_NODES: u64 = 1_000;
 
-        while let Some(task_result) = join_set.join_next().await {
-            match task_result {
-                Ok((edges, new_nodes, had_error)) => {
+        while attempted < total_nodes as u32 {
+            tokio::select! {
+                maybe_result = result_rx.recv() => {
+                    let Some(task_result) = maybe_result else {
+                        break;
+                    };
                     attempted += 1;
-                    if had_error {
+                    if task_result.had_error {
                         errors += 1;
                     }
-                    result.added_edges.extend(edges);
-                    for vnode in new_nodes {
+                    result.added_edges.extend(task_result.edges);
+                    for vnode in task_result.new_nodes {
                         if seen_virtual_ids.insert(vnode.id.clone()) {
                             result.new_nodes.push(vnode);
                         }
                     }
+
+                    no_progress_deadline.as_mut().reset(
+                        tokio::time::Instant::now() + pass1_no_progress_timeout(),
+                    );
                 }
-                Err(e) => {
+                _ = &mut no_progress_deadline => {
+                    let snapshot = diagnostics.snapshot().await;
+                    let rendered_snapshot = snapshot.render();
+                    tracing::warn!(
+                        "LSP: {} no progress for {}s; aborting Pass 1. Diagnostic snapshot: {}. Recommended next action: retry with a narrower scope or inspect the listed phase/file for language-server stalls.",
+                        self.server_command,
+                        pass1_no_progress_timeout().as_secs(),
+                        rendered_snapshot,
+                    );
                     errors += 1;
-                    tracing::debug!("LSP enrichment task panicked: {}", e);
+                    aborted = true;
+                    abort_diagnostic = Some(format!(
+                        "no progress for {}s; {}; recommended next action: retry with a narrower scope or inspect the listed phase/file for language-server stalls",
+                        pass1_no_progress_timeout().as_secs(),
+                        rendered_snapshot
+                    ));
+                    join_set.abort_all();
+                    break;
                 }
             }
 
             // Log progress every 1,000 nodes or every 30 seconds (whichever comes first)
-            let done = completed.load(Ordering::Relaxed) as u64;
+            let done = diagnostics.completed.load(Ordering::Relaxed).max(0) as u64;
             let elapsed_since_log = last_progress_log.elapsed().as_secs();
             let nodes_since_log = done.saturating_sub(last_logged_count);
             if done > 0
@@ -394,16 +704,31 @@ impl LspEnricher {
                     && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                     || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
             {
+                let snapshot = diagnostics.snapshot().await;
+                let rendered_snapshot = snapshot.render();
                 tracing::warn!(
-                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) -- aborting (likely misconfigured)",
+                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) -- aborting. Diagnostic snapshot: {}",
                     self.server_command,
                     attempted,
                     total_nodes,
                     pass1_start.elapsed().as_secs_f64(),
+                    rendered_snapshot,
                 );
                 aborted = true;
+                abort_diagnostic = Some(format!(
+                    "zero LSP edges after {attempted}/{total_nodes} nodes; {rendered_snapshot}"
+                ));
                 join_set.abort_all();
                 break;
+            }
+        }
+
+        while let Some(worker_result) = join_set.join_next().await {
+            if let Err(e) = worker_result
+                && !aborted
+            {
+                errors += 1;
+                tracing::debug!("LSP enrichment worker panicked: {}", e);
             }
         }
 
@@ -415,12 +740,139 @@ impl LspEnricher {
             errors,
         );
 
-        (attempted, errors, aborted)
+        (attempted, errors, aborted, abort_diagnostic)
     }
 
     // ------------------------------------------------------------------
     // Pass 1 helpers: per-node-kind enrichment functions
     // ------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_pass1_work_item(
+        item: LspPass1WorkItem,
+        transport: &PipelinedTransport,
+        root: &Path,
+        matching_owned: &Arc<Vec<Node>>,
+        refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        language: &str,
+        has_references: bool,
+        has_call_hierarchy: bool,
+        did_open: &DidOpenCoordinator,
+        diagnostics: &LspPass1Diagnostics,
+        error_count: &AtomicI64,
+    ) -> Pass1TaskResult {
+        diagnostics.set_phase(&item, "resolving_file_uri").await;
+        let node = &item.node;
+        let abs_path = root.join(&node.id.file);
+        let file_uri = match path_to_uri(&abs_path) {
+            Ok(uri) => uri,
+            Err(e) => {
+                tracing::debug!(
+                    "LSP Pass 1 skipped {} after URI failure: {}",
+                    node.id.file.display(),
+                    e
+                );
+                diagnostics.finish(&item, false).await;
+                return Pass1TaskResult {
+                    edges: Vec::new(),
+                    new_nodes: Vec::new(),
+                    had_error: true,
+                };
+            }
+        };
+
+        diagnostics.set_phase(&item, "sending_did_open").await;
+        if let Err(e) = did_open
+            .ensure_open(transport, root, &node.id.file, &file_uri)
+            .await
+        {
+            error_count.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("{}", e);
+            diagnostics.finish(&item, false).await;
+            return Pass1TaskResult {
+                edges: Vec::new(),
+                new_nodes: Vec::new(),
+                had_error: true,
+            };
+        }
+
+        let phase = item
+            .requested_operations
+            .first()
+            .copied()
+            .unwrap_or("requesting_lsp_operation");
+        diagnostics.set_phase(&item, phase).await;
+
+        let (line, col) = Self::node_lsp_position(node);
+        let mut edges = Vec::new();
+        let mut new_nodes = Vec::new();
+        let mut had_error = false;
+
+        match node.id.kind {
+            NodeKind::Function => {
+                Self::enrich_function_node(
+                    transport,
+                    &file_uri,
+                    line,
+                    col,
+                    node,
+                    matching_owned,
+                    refs_by_file,
+                    root,
+                    language,
+                    has_references,
+                    has_call_hierarchy,
+                    &mut edges,
+                    &mut new_nodes,
+                    &mut had_error,
+                    error_count,
+                )
+                .await;
+            }
+            NodeKind::Trait => {
+                Self::enrich_trait_node(
+                    transport,
+                    &file_uri,
+                    line,
+                    col,
+                    node,
+                    matching_owned,
+                    root,
+                    &mut edges,
+                )
+                .await;
+            }
+            NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                if has_references {
+                    Self::enrich_type_references(
+                        transport,
+                        &file_uri,
+                        line,
+                        col,
+                        node,
+                        matching_owned,
+                        root,
+                        &mut edges,
+                        &mut had_error,
+                        error_count,
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                if matches!(node.id.kind, NodeKind::Other(_)) {
+                    Self::enrich_document_links(transport, &file_uri, node, root, &mut edges).await;
+                }
+            }
+        }
+
+        diagnostics.finish(&item, !had_error).await;
+        Pass1TaskResult {
+            edges,
+            new_nodes,
+            had_error,
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn enrich_function_node(
@@ -958,8 +1410,15 @@ impl LspEnricher {
             .unwrap_or(false);
 
         for (rel_file, file_nodes) in &nodes_by_file {
-            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, has_parent_module, result)
-                .await;
+            Self::emit_belongs_to_edges(
+                transport,
+                file_nodes,
+                rel_file,
+                root,
+                has_parent_module,
+                result,
+            )
+            .await;
         }
 
         // Remove duplicate module nodes (same stable_id emitted for multiple files in same dir)
@@ -1198,5 +1657,128 @@ impl LspEnricher {
                 result.new_nodes.extend(nodes);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn did_open_coordinator_dedupes_concurrent_same_file() {
+        let coordinator = Arc::new(DidOpenCoordinator::new("test-lsp".to_string()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..8 {
+            let coordinator = Arc::clone(&coordinator);
+            let attempts = Arc::clone(&attempts);
+            let release = Arc::clone(&release);
+            tasks.spawn(async move {
+                coordinator
+                    .ensure_open_with(Path::new("src/lib.rs"), || async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            });
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one didOpen attempt should start");
+        release.notify_waiters();
+
+        let mut opened = 0;
+        let mut reused = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap().unwrap() {
+                true => opened += 1,
+                false => reused += 1,
+            }
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(opened, 1);
+        assert_eq!(reused, 7);
+    }
+
+    #[tokio::test]
+    async fn did_open_failure_does_not_suppress_retry() {
+        let coordinator = DidOpenCoordinator::new("test-lsp".to_string());
+        let attempts = AtomicUsize::new(0);
+
+        let first = coordinator
+            .ensure_open_with(Path::new("src/lib.rs"), || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("write failed")
+            })
+            .await;
+        assert!(first.is_err());
+
+        let second = coordinator
+            .ensure_open_with(Path::new("src/lib.rs"), || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let third = coordinator
+            .ensure_open_with(Path::new("src/lib.rs"), || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(second);
+        assert!(!third);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pass1_diagnostic_snapshot_is_bounded_and_phase_counted() {
+        let diagnostics = LspPass1Diagnostics::new(10);
+        for id in 0..8 {
+            let item = LspPass1WorkItem {
+                id,
+                node: Node {
+                    id: NodeId {
+                        root: "repo".to_string(),
+                        file: PathBuf::from(format!("src/file{id}.rs")),
+                        kind: NodeKind::Function,
+                        name: format!("func{id}"),
+                    },
+                    language: "rust".to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    signature: format!("fn func{id}()"),
+                    body: String::new(),
+                    metadata: BTreeMap::new(),
+                    source: ExtractionSource::Lsp,
+                },
+                requested_operations: vec!["requesting_references"],
+                attempt_count: 1,
+            };
+            diagnostics.set_phase(&item, "requesting_references").await;
+        }
+
+        let snapshot = diagnostics.snapshot().await;
+        let rendered = snapshot.render();
+        assert_eq!(snapshot.in_flight, 8);
+        assert_eq!(snapshot.oldest.len(), PASS1_DIAGNOSTIC_SAMPLE_LIMIT);
+        assert!(rendered.contains("requesting_references=8"), "{rendered}");
+        assert!(rendered.contains("attempt=1"), "{rendered}");
     }
 }

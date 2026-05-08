@@ -2073,6 +2073,32 @@ impl RnaHandler {
                     })
                     .count();
 
+                let lsp_abort_detail = {
+                    let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+                    stats.lsp_stats.iter().find_map(|(root, languages)| {
+                        languages.iter().find_map(|(language, lsp)| {
+                            lsp.aborted.then(|| {
+                                format!(
+                                    "LSP enrichment aborted for root={} language={} server={} errors={} edges={}",
+                                    root, language, lsp.server_name, lsp.error_count, lsp.edge_count
+                                )
+                            })
+                        })
+                    })
+                };
+                if let Some(detail) = lsp_abort_detail {
+                    on_progress(&format!("Enrichment: {detail}"));
+                    self.lsp_status.set_failed(&detail);
+                    self.enrichment_jobs.mark_failed(&self.repo_root, &job_id, detail.clone());
+                    if fail_on_lsp_error {
+                        return Err(anyhow::anyhow!("LSP enrichment failed: {detail}"));
+                    }
+                    return Ok(LspEnrichmentRun {
+                        edge_count: 0,
+                        job_id,
+                    });
+                }
+
                 on_progress(&format!(
                     "Enrichment: {} LSP call edges via bus",
                     lsp_edge_count

@@ -1480,6 +1480,20 @@ impl ExtractionConsumer for LspConsumer {
                     slug,
                     e,
                 );
+                let err_text = e.to_string();
+                let aborted = err_text.contains("aborted")
+                    || err_text.contains("no progress")
+                    || err_text.contains("timed out")
+                    || err_text.contains("zero LSP edges");
+                let error_count = usize::from(!err_text.contains("not found"));
+                if aborted {
+                    anyhow::bail!(
+                        "LSP enrichment aborted for {} root {}: {}",
+                        self.language,
+                        slug,
+                        err_text
+                    );
+                }
                 Ok(vec![ExtractionEvent::EnrichmentComplete {
                     slug: slug.clone(),
                     language: language.clone(),
@@ -1487,8 +1501,8 @@ impl ExtractionConsumer for LspConsumer {
                     new_nodes: Arc::from([]),
                     updated_nodes: Arc::from([]),
                     server_name: Some(self.enricher.name().to_string()),
-                    error_count: 0,
-                    aborted: false,
+                    error_count,
+                    aborted,
                 }])
             }
         }
