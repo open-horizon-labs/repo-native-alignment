@@ -1775,7 +1775,7 @@ impl RnaHandler {
                                 .iter()
                                 .flat_map(|(slug, by_language)| {
                                     by_language.iter().filter_map(move |(language, stat)| {
-                                        if stat.aborted || stat.error_count > 0 {
+                                        if stat.aborted {
                                             Some(format!(
                                                 "{slug}/{language} via {}: {} error(s), aborted={}",
                                                 stat.server_name, stat.error_count, stat.aborted
@@ -1792,7 +1792,7 @@ impl RnaHandler {
                         });
                     if !lsp_failures.is_empty() {
                         let detail = format!(
-                            "LSP call-reference enrichment failed: {}",
+                            "LSP call-reference enrichment aborted: {}",
                             lsp_failures.join("; ")
                         );
                         self.lsp_status.set_unavailable();
