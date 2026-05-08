@@ -740,9 +740,9 @@ pub fn lsp_capability_from_status(
             Some("call-reference enrichment job exists but has not completed".to_string()),
         ),
         super::state::LspState::NotStarted if lsp_edge_count > 0 => (
-            CapabilityState::Completed,
+            CapabilityState::Stale,
             Some(format!(
-                "{} persisted call/reference edges available",
+                "{} persisted call/reference edges exist, but no completed call-reference job or live LSP status proves complete coverage",
                 lsp_edge_count
             )),
         ),
@@ -1103,6 +1103,43 @@ mod tests {
                 .degradation
                 .iter()
                 .any(|notice| notice.query_class == QueryClass::GlobalImpact)
+        );
+    }
+
+    #[test]
+    fn lsp_capability_does_not_complete_from_edge_count_alone() {
+        let (state, detail) = lsp_capability_from_status(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            super::super::state::LspState::NotStarted,
+            12,
+            false,
+        );
+
+        assert_eq!(state, CapabilityState::Stale);
+        assert!(
+            detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no completed call-reference job"),
+            "got: {:?}",
+            detail
+        );
+    }
+
+    #[test]
+    fn lsp_capability_reports_running_when_related_job_exists() {
+        let (state, detail) = lsp_capability_from_status(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            super::super::state::LspState::NotStarted,
+            12,
+            true,
+        );
+
+        assert_eq!(state, CapabilityState::Running);
+        assert!(
+            detail.as_deref().unwrap_or_default().contains("job exists"),
+            "got: {:?}",
+            detail
         );
     }
 
