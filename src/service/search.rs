@@ -14,7 +14,7 @@ use crate::server::helpers::{
     format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
     format_node_entry_with_root, strip_root_prefix,
 };
-use crate::server::state::{GraphState, LspEnrichmentStatus};
+use crate::server::state::{CapabilityReadinessState, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 use crate::server::{EnrichmentCapability, EnrichmentJobState, EnrichmentScope};
 
@@ -38,7 +38,11 @@ fn format_verbose_readiness(
     semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
-    let inferred_lsp_status = if ctx.lsp_status.is_none() {
+    let should_infer_lsp_status = ctx
+        .lsp_status
+        .map(|status| status.call_reference_readiness().state != CapabilityReadinessState::Ready)
+        .unwrap_or(true);
+    let inferred_lsp_status = if should_infer_lsp_status {
         let persisted_lsp_edges = gs
             .edges
             .iter()
@@ -65,7 +69,7 @@ fn format_verbose_readiness(
     } else {
         None
     };
-    let lsp_status = ctx.lsp_status.or(inferred_lsp_status.as_ref());
+    let lsp_status = inferred_lsp_status.as_ref().or(ctx.lsp_status);
 
     format!(
         "{}{}{}",
@@ -1877,6 +1881,59 @@ mod tests {
         );
         assert!(
             result.contains("global dead-code prerequisites**: unavailable"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_uses_persisted_lsp_edges_when_live_status_is_only_server_found()
+    {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        let live_status = LspEnrichmentStatus::default();
+        live_status.set_server_found();
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.lsp_status = Some(&live_status);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
             "got: {}",
             result
         );
