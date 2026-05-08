@@ -1765,6 +1765,47 @@ impl RnaHandler {
                         None,
                     );
                 }
+                if run_lsp_in_bus {
+                    let lsp_failures = self
+                        .scan_stats
+                        .read()
+                        .map(|stats| {
+                            stats
+                                .lsp_stats
+                                .iter()
+                                .flat_map(|(slug, by_language)| {
+                                    by_language.iter().filter_map(move |(language, stat)| {
+                                        if stat.aborted || stat.error_count > 0 {
+                                            Some(format!(
+                                                "{slug}/{language} via {}: {} error(s), aborted={}",
+                                                stat.server_name, stat.error_count, stat.aborted
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|_| {
+                            vec!["scan stats unavailable: lock poisoned".to_string()]
+                        });
+                    if !lsp_failures.is_empty() {
+                        let detail = format!(
+                            "LSP call-reference enrichment failed: {}",
+                            lsp_failures.join("; ")
+                        );
+                        self.lsp_status.set_unavailable();
+                        if let Some(job_id) = lsp_job_id.as_deref() {
+                            self.enrichment_jobs.mark_failed(
+                                &self.repo_root,
+                                job_id,
+                                detail.clone(),
+                            );
+                        }
+                        return Err(anyhow::anyhow!(detail));
+                    }
+                }
 
                 on_progress(&format!(
                     "Enrichment: {} LSP call edges via bus in {:.1}s",
@@ -2089,7 +2130,8 @@ impl RnaHandler {
                 if let Some(detail) = lsp_abort_detail {
                     on_progress(&format!("Enrichment: {detail}"));
                     self.lsp_status.set_failed(&detail);
-                    self.enrichment_jobs.mark_failed(&self.repo_root, &job_id, detail.clone());
+                    self.enrichment_jobs
+                        .mark_failed(&self.repo_root, &job_id, detail.clone());
                     if fail_on_lsp_error {
                         return Err(anyhow::anyhow!("LSP enrichment failed: {detail}"));
                     }
