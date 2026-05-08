@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -551,9 +551,8 @@ impl LspEnricher {
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let mut join_set = tokio::task::JoinSet::new();
-        let (work_tx, work_rx) =
-            tokio::sync::mpsc::channel::<LspPass1WorkItem>(PIPELINE_MAX_CONCURRENCY);
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        let work_items = Arc::new(work_items);
+        let next_work_index = Arc::new(AtomicUsize::new(0));
         let (result_tx, mut result_rx) =
             tokio::sync::mpsc::channel::<Pass1TaskResult>(PIPELINE_MAX_CONCURRENCY);
 
@@ -566,16 +565,14 @@ impl LspEnricher {
             let error_count = Arc::clone(&error_count);
             let did_open = Arc::clone(&did_open);
             let diagnostics = Arc::clone(&diagnostics);
-            let work_rx = Arc::clone(&work_rx);
+            let work_items = Arc::clone(&work_items);
+            let next_work_index = Arc::clone(&next_work_index);
             let result_tx = result_tx.clone();
 
             join_set.spawn(async move {
                 loop {
-                    let item = {
-                        let mut rx = work_rx.lock().await;
-                        rx.recv().await
-                    };
-                    let Some(item) = item else {
+                    let index = next_work_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = work_items.get(index).cloned() else {
                         break;
                     };
                     let result = Self::run_pass1_work_item(
@@ -599,13 +596,6 @@ impl LspEnricher {
             });
         }
         drop(result_tx);
-
-        for item in work_items {
-            if work_tx.send(item).await.is_err() {
-                break;
-            }
-        }
-        drop(work_tx);
 
         // Collect results from all queued work items. A no-progress watchdog emits
         // a bounded diagnostic snapshot before aborting workers, so stalls surface

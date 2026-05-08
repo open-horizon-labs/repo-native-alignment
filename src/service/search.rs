@@ -7,14 +7,14 @@
 use std::collections::HashSet;
 
 use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
-use crate::graph::{Node, NodeKind};
+use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
     format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
     format_node_entry_with_root, strip_root_prefix,
 };
-use crate::server::state::GraphState;
+use crate::server::state::{GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 
 use super::{
@@ -37,17 +37,38 @@ fn format_verbose_readiness(
     semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
+    let inferred_lsp_status = if ctx.lsp_status.is_none() {
+        let persisted_lsp_edges = gs
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == ExtractionSource::Lsp
+                    && matches!(edge.kind, EdgeKind::Calls | EdgeKind::ReferencedBy)
+            })
+            .count();
+        if persisted_lsp_edges > 0 {
+            let status = LspEnrichmentStatus::default();
+            status.set_complete(persisted_lsp_edges);
+            Some(status)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let lsp_status = ctx.lsp_status.or(inferred_lsp_status.as_ref());
+
     format!(
         "{}{}{}",
         format_freshness_full(
             gs.nodes.len(),
             gs.last_scan_completed_at,
-            ctx.lsp_status,
+            lsp_status,
             ctx.embed_status,
         ),
         format_capability_readiness(
             gs.nodes.len(),
-            ctx.lsp_status,
+            lsp_status,
             ctx.embed_status,
             semantic_index_attached,
             semantic_index_available,
@@ -1771,6 +1792,37 @@ mod tests {
         assert!(result.contains("## Graph neighbors"));
         assert!(result.contains("callee"));
         assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_uses_persisted_lsp_edges_without_live_status() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
     }
 
     #[tokio::test]
