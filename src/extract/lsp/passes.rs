@@ -572,7 +572,7 @@ impl LspEnricher {
             join_set.spawn(async move {
                 loop {
                     let index = next_work_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = work_items.get(index).cloned() else {
+                    let Some(item) = work_items.get(index) else {
                         break;
                     };
                     let result = Self::run_pass1_work_item(
@@ -739,7 +739,7 @@ impl LspEnricher {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_pass1_work_item(
-        item: LspPass1WorkItem,
+        item: &LspPass1WorkItem,
         transport: &PipelinedTransport,
         root: &Path,
         matching_owned: &Arc<Vec<Node>>,

@@ -716,12 +716,18 @@ pub fn lsp_capability_from_status(
         return (CapabilityState::Skipped, None);
     }
     match state {
-        super::state::LspState::Complete => (
+        super::state::LspState::Complete if lsp_edge_count > 0 => (
             CapabilityState::Completed,
             Some(format!(
                 "{} persisted call/reference edges available",
                 lsp_edge_count
             )),
+        ),
+        super::state::LspState::Complete => (
+            CapabilityState::Stale,
+            Some(
+                "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone".to_string(),
+            ),
         ),
         super::state::LspState::Running | super::state::LspState::ServerFound => (
             CapabilityState::Running,
@@ -1103,6 +1109,26 @@ mod tests {
                 .degradation
                 .iter()
                 .any(|notice| notice.query_class == QueryClass::GlobalImpact)
+        );
+    }
+
+    #[test]
+    fn lsp_capability_complete_with_zero_edges_is_stale() {
+        let (state, detail) = lsp_capability_from_status(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            super::super::state::LspState::Complete,
+            0,
+            false,
+        );
+
+        assert_eq!(state, CapabilityState::Stale);
+        assert!(
+            detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("0 persisted call/reference edges"),
+            "got: {:?}",
+            detail
         );
     }
 

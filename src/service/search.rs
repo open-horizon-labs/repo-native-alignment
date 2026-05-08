@@ -16,7 +16,7 @@ use crate::server::helpers::{
 };
 use crate::server::state::{GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
-use crate::server::{EnrichmentCapability, EnrichmentScope};
+use crate::server::{EnrichmentCapability, EnrichmentJobState, EnrichmentScope};
 
 use super::{
     SearchContext, SearchParams, node_passes_root_filter, search_result_passes_root_filter,
@@ -50,6 +50,7 @@ fn format_verbose_readiness(
         let completed_repo_job = ctx.enrichment_jobs.iter().any(|job| {
             job.capability == EnrichmentCapability::CallReferences
                 && matches!(job.scope, EnrichmentScope::Repo)
+                && job.state == EnrichmentJobState::Completed
                 && job.completed_at.is_some()
                 && job.failure.is_none()
                 && job.counters.edge_count.unwrap_or(0) > 0
@@ -1859,6 +1860,56 @@ mod tests {
         let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: unavailable"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: unavailable"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_does_not_promote_superseded_completed_job() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+        ctx.enrichment_jobs[0].state = EnrichmentJobState::Superseded;
+
         let params = SearchParams {
             query: Some("caller".into()),
             verbose: true,
