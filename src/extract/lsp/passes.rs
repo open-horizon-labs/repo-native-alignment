@@ -751,7 +751,7 @@ impl LspEnricher {
         diagnostics: &LspPass1Diagnostics,
         error_count: &AtomicI64,
     ) -> Pass1TaskResult {
-        diagnostics.set_phase(&item, "resolving_file_uri").await;
+        diagnostics.set_phase(item, "resolving_file_uri").await;
         let node = &item.node;
         let abs_path = root.join(&node.id.file);
         let file_uri = match path_to_uri(&abs_path) {
@@ -762,7 +762,7 @@ impl LspEnricher {
                     node.id.file.display(),
                     e
                 );
-                diagnostics.finish(&item, false).await;
+                diagnostics.finish(item, false).await;
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -771,14 +771,14 @@ impl LspEnricher {
             }
         };
 
-        diagnostics.set_phase(&item, "sending_did_open").await;
+        diagnostics.set_phase(item, "sending_did_open").await;
         if let Err(e) = did_open
             .ensure_open(transport, root, &node.id.file, &file_uri)
             .await
         {
             error_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("{}", e);
-            diagnostics.finish(&item, false).await;
+            diagnostics.finish(item, false).await;
             return Pass1TaskResult {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
@@ -791,7 +791,7 @@ impl LspEnricher {
             .first()
             .copied()
             .unwrap_or("requesting_lsp_operation");
-        diagnostics.set_phase(&item, phase).await;
+        diagnostics.set_phase(item, phase).await;
 
         let (line, col) = Self::node_lsp_position(node);
         let mut edges = Vec::new();
@@ -856,7 +856,7 @@ impl LspEnricher {
             }
         }
 
-        diagnostics.finish(&item, !had_error).await;
+        diagnostics.finish(item, !had_error).await;
         Pass1TaskResult {
             edges,
             new_nodes,
