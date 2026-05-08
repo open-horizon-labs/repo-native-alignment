@@ -1811,7 +1811,6 @@ impl RnaHandler {
                         self.lsp_status.set_unavailable();
                     }
                 }
-                lsp_edge_count = 0;
                 if let Some(job_id) = lsp_job_id.as_deref() {
                     if e.is_timeout() {
                         self.enrichment_jobs.mark_timed_out(
@@ -1824,6 +1823,7 @@ impl RnaHandler {
                             .mark_failed(&self.repo_root, job_id, format!("{}", e));
                     }
                 }
+                return Err(e.into());
             }
         }
 
