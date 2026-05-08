@@ -14,18 +14,22 @@ EventBus.emit_all(RootDiscovered)
          |
          v
 ManifestConsumer               <- package.json/Cargo.toml dependency edges
-TreeSitterConsumer             <- 30 extractors (22 code + 4 config + 4 schema)
+TreeSitterConsumer             <- built-in code/config/schema/doc extractors
   ├── rayon parallel per-file extraction
   ├── topology detector        <- subprocess/network/async boundaries
   └── fires: RootExtracted { nodes, edges, dirty_slugs }
+         |
+         +--> OpenApiConsumer  <- bidirectional endpoint / SDK operation linking
+         +--> GrpcConsumer     <- proto RPC -> caller stub matching
+         +--> EmbeddingIndexerConsumer <- streams embed tasks in parallel with LSP
          |
          v
 LanguageAccumulatorConsumer    <- groups nodes by language
   └── fires: LanguageDetected (once per language)
          |
          v
-LspConsumer × N                <- 38 servers auto-detected, one consumer per language
-  └── fires: EnrichmentComplete { added_edges, new_nodes }
+LspConsumer × N                <- auto-detected servers, one consumer per language
+  └── fires: EnrichmentComplete { added_edges, new_nodes, updated_nodes }
          |
 AllEnrichmentsGate             <- counts expected vs received, fires AllEnrichmentsDone
          |
@@ -42,8 +46,8 @@ EnrichmentFinalizer            <- runs post-extraction passes over full graph
          v
 SubsystemConsumer              <- Louvain community detection, PageRank
 LanceDBConsumer                <- background persist (full or incremental)
-EmbeddingIndexerConsumer       <- streams embed tasks in parallel with LSP
 ScanStatsConsumer              <- live stats for list_roots (no file I/O)
+OperationReportStore           <- durable operation telemetry for scans/enrichment
          |
          v
 Graph (LanceDB + petgraph)
@@ -52,13 +56,14 @@ Graph (LanceDB + petgraph)
   └── content-addressed cache  <- per-consumer cache keys, dirty-slugs filtering
          |
          v
-MCP Server (rust-mcp-sdk)      <- stdio + HTTP transport, 4 tools
+MCP Server (rust-mcp-sdk)      <- stdio + HTTP transport
 ```
 
 ## Nodes and Edges
 
 - **Nodes:** symbols, schemas, artifacts, PR merges, framework nodes, channel nodes, subsystem metadata
-- **Edges:** calls, implements, depends-on, modified, serves, produces, consumes, uses-framework (with provenance + confidence)
+- **Edges:** calls, implements, depends-on, modified, serves, produces, consumes, uses-framework, referenced-by (with provenance + confidence)
 - **Traversal:** in-memory via petgraph (microseconds)
+- **Readiness:** MCP responses surface exact-search, embedding, LSP call/reference, and dead-code prerequisite readiness separately from index freshness.
 
 No cloud dependency. Everything local, git-versioned, disposable.

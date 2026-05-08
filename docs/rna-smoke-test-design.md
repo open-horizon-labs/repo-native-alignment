@@ -185,7 +185,7 @@ Both run without a Claude API key. Neither requires additional CI dependencies b
 | Check | Assertion |
 |---|---|
 | Binary starts and connects | `client.connect()` succeeds |
-| `listTools` | Returns 4 tools: search, repo_map, outcome_progress, list_roots |
+| `listTools` | Returns expected tools: search, repo_map, outcome_progress, list_roots |
 | `search("agent-alignment", include_artifacts: true)` | ≥1 result with non-empty name field |
 | `search("main", include_artifacts: false)` | ≥1 symbol with file path |
 | `outcome_progress("agent-alignment")` | Non-empty response, no RPC error |

@@ -43,7 +43,7 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64.tar.gz | tar xz -C ~/.cargo/bin
 ```
 
-**If none of the above match:** Tell the user their platform is not yet supported. They can build from source:
+**If none of the above match:** Tell the user their platform is not yet supported by the published release artifacts. They may build from source for development/testing, but source builds are not a substitute for release verification from successful CI/release artifacts:
 ```bash
 cargo install --locked --git https://github.com/open-horizon-labs/repo-native-alignment
 ```

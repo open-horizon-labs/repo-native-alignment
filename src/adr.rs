@@ -671,6 +671,13 @@ fn render_readme(adrs: &[ParsedAdr]) -> String {
     let mut lines = vec![
         "# Architecture Decision Records".to_string(),
         String::new(),
+        "This index lists architecture decisions and their declared implementation status. ADRs may also include `validate.*` frontmatter; compile and run those executable references with:".to_string(),
+        String::new(),
+        "```bash".to_string(),
+        "repo-native-alignment adr compile --repo .".to_string(),
+        "repo-native-alignment adr validate --repo .".to_string(),
+        "```".to_string(),
+        String::new(),
         "| ADR | Title | Status |".to_string(),
         "|-----|-------|--------|".to_string(),
     ];
@@ -1093,6 +1100,7 @@ mod tests {
         );
         let readme = fs::read_to_string(tmp.path().join("docs/ADRs/README.md")).unwrap();
         assert!(readme.contains("| [001](001-event-bus-extraction-pipeline.md) | Event bus extraction pipeline | Implemented |"));
+        assert!(readme.contains("repo-native-alignment adr validate --repo ."));
     }
 
     #[test]

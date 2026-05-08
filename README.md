@@ -43,7 +43,7 @@ RNA runs LSP servers internally. It fuses their data with tree-sitter, embedded 
 
 ## What Changes After Installing
 
-Four jobs agents can do after RNA is running that they could not do reliably before:
+Six jobs agents can do after RNA is running that they could not do reliably before:
 
 **Find code by meaning, not just by name**
 `search("payment processing")` returns ranked results across symbols, docs, commits, and artifacts in one call. Path scoping works too: `search("auth/handlers/validate")` returns only symbols named `validate` in files matching `auth/handlers`.
@@ -51,11 +51,17 @@ Four jobs agents can do after RNA is running that they could not do reliably bef
 **Trace call paths and blast radius**
 `search(node="AuthHandler", mode="impact")` returns transitive dependents grouped by subsystem. `search(node="X", mode="path", query="Y")` returns the directed call chain between two nodes.
 
+**Know which capabilities are ready**
+`scan`, `enrich`, and `list_roots` surface OperationReport summaries: ready capabilities, degraded query classes, recent enrichment jobs, and the exact follow-up command when embeddings or call/reference enrichment is missing.
+
 **Connect code to business outcomes**
 `outcome_progress("agent-alignment")` follows tagged commits to changed files to affected symbols. Outcomes, signals, and guardrails in `.oh/` are full graph nodes — searchable, linkable, tracked.
 
 **Orient instantly in an unfamiliar repo**
 `repo_map()` returns detected subsystems (from actual call relationships), top symbols by PageRank, hotspot files, and active outcomes. One call instead of an exploratory loop.
+
+**Inspect schemas and service contracts**
+Built-in extractors cover SQL, OpenAPI/JSON Schema, and `.proto` files, so agents can find database objects, API operations, protobuf messages/services/RPCs, and gRPC call links in the same graph as application code.
 
 ## Quick Start
 
@@ -74,7 +80,7 @@ claude plugin install rna-mcp
 /rna-mcp:setup
 ```
 
-Setup detects your platform (optimized binary for M2+ chips with bf16/i8mm), downloads the binary to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
+Setup detects your platform (optimized binary for M2+ chips with bf16/i8mm), installs a release artifact to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
 
 **Download a prebuilt binary** (manual):
 
@@ -89,7 +95,9 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64.tar.gz | tar xz -C ~/.cargo/bin
 ```
 
-**Build from source** (requires [Rust toolchain](https://rustup.rs)):
+Release and user-facing verification should use successful GitHub Actions/release artifacts, not a local source build.
+
+**Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/open-horizon-labs/repo-native-alignment.git
@@ -123,7 +131,8 @@ For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382
 repo-native-alignment scan --repo . --full
 ```
 
-Runs the complete pipeline: scan → extract → embed → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries won't work. Subsequent scans are incremental (~0.1s on no-change runs).
+Runs the complete pipeline: scan → extract → embed → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries are degraded until call/reference enrichment completes. Subsequent scans are incremental (~0.1s on no-change runs).
+OperationReport output tells you which capabilities are ready, which query classes are degraded, and which `enrich` command can close any remaining gap.
 
 **Why run this before starting the MCP server?** The MCP server pre-warms the graph automatically at startup, but building from scratch can take 10-30s on large repos. Running `scan` first populates `.oh/.cache/lance/` so the server loads the cached graph in seconds.
 
@@ -178,7 +187,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `search "auth"` | `search(query="auth")` | Find symbols by name |
 | `graph --node <id> --mode neighbors` | `search(node="<id>", mode="neighbors")` | Graph traversal |
 | `scan --full` | *(runs automatically on first query)* | Full pipeline: scan → extract → embed → LSP → graph |
-| `enrich --capability embeddings --scope repo` | — | Run one enrichment capability against an existing cache without re-extracting source |
+| `enrich --capability embeddings\|call-references --scope repo` | — | Run one enrichment capability against an existing cache without re-extracting source; use OperationReport output to see readiness/degradation. |
 | `test` | — | 29 pipeline checks end-to-end |
 
 ### CLI Subcommands
@@ -192,6 +201,9 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. Persists a recent OperationReport for `list_roots`. |
 | `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed` | Run selected enrichment against an existing graph cache without source extraction. Persists an OperationReport linked to relevant enrichment jobs. Use `--root <slug>` with `--scope root`; use `--no-background-continuation` to skip remaining repo-wide coverage. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
+| `outcome-progress <id> --repo <dir>` | Join outcome artifacts, tagged commits, and impacted symbols |
+| `list-roots` | Show configured roots, scan state, readiness, and recent OperationReports |
+| `repo-map --repo <dir>` | Show subsystems, top symbols, hotspots, and active outcomes |
 | `test --repo <dir>` | Run 29 pipeline checks end-to-end |
 | `adr compile --repo <dir>` | Compile ADR frontmatter into `.oh/adr-validation/*.json` and refresh `docs/ADRs/README.md` when present |
 | `adr validate --repo <dir>` | Execute compiled ADR validations (cargo tests, audits, smoke, scripts) and fail if an implemented ADR is not honestly backed by passing checks |
@@ -307,7 +319,7 @@ See the [full comparison](docs/compared-to.md) for details.
 |---|---|---|---|---|
 | **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB | `pip install mcp-server-serena` |
 | **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) | None (language servers auto-downloaded) |
-| **Languages** | 30 extractors + 38 LSP servers | Tree-sitter only | Tree-sitter only | 30+ via LSP |
+| **Language coverage** | Broad tree-sitter extraction plus LSP enrichment | Tree-sitter only | Tree-sitter only | LSP-backed |
 | **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
 | **Business context** | Outcomes, signals, guardrails, metis | None | None | Agent memories (auto-accumulated, not curated outcomes) |
 
@@ -320,9 +332,9 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-4 MCP tools, 11 CLI subcommands. 30 tree-sitter extractors (22 code languages + 4 config + 4 schema), 38 auto-detected LSP servers, event-driven pipeline, automatic subsystem and framework detection.
+RNA ships a compact MCP surface, CLI parity through the shared service layer, broad tree-sitter extraction, auto-detected LSP enrichment, event-driven indexing, and automatic subsystem/framework detection.
 
-**v0.1.15 (current):** EventBus/consumer architecture, async bus, dirty-slugs incremental enrichment, monorepo-aware extraction (Next.js routing), content-addressed per-consumer cache, framework detection consumers, subsystem consumers, adaptive LSP wait, 8 new language extractors (C, PHP, HTML, Scala, Dart, Elixir, GraphQL, Dockerfile), config-driven extractors (`.oh/extractors/*.toml`), live scan stats in `list_roots`, worktree own-cache detection, FastAPI router prefix resolution, SDK path inference, OpenAPI SDK link pass.
+Current release-line capabilities include durable enrichment jobs, OperationReport readiness telemetry, explicit `enrich` control, ADR validation commands, proto/schema extraction, dead-code detection, and diff-scoped review-readiness skills.
 
 ### Platform Support
 
@@ -339,8 +351,9 @@ MIT — see [LICENSE](LICENSE).
 ## Detailed Documentation
 
 - [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext
-- [Extractors](docs/extractors.md) — tree-sitter language extractors, constants, synthetic literals
+- [Extractors](docs/extractors.md) — tree-sitter language/schema extractors, constants, synthetic literals, SQL/OpenAPI/proto support
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning, dirty-slugs optimization
 - [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
+- [ADR Index](docs/ADRs/README.md) — architecture decisions and executable validation references
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration

@@ -72,9 +72,9 @@ Minimize time-to-first-value: "found on GitHub" → "useful output from my repo.
 1. `npx -y @scope/server` — zero install (JS golden path)
 2. `uvx mcp-server-x` — zero install (Python)
 3. Docker image — one prereq
-4. `cargo install` from crates.io — needs Rust toolchain
-5. GitHub Releases binary download — needs curl/browser
-6. Clone + `cargo build --release` — 3+ min compile, needs Rust
+4. GitHub Releases binary download — needs curl/browser
+5. `cargo install` from crates.io — needs Rust toolchain (developer path, not release verification)
+6. Clone + `cargo build --release` — 3+ min compile, needs Rust (development only)
 
 **Where RNA sits today:** Level 6. **Target:** Level 5 (GitHub Releases) primary, plus Claude Code marketplace entry for MCP users.
 
@@ -118,7 +118,7 @@ For Rust MCP servers, the pattern is: **GitHub Releases for binaries, crates.io 
 
 Current flow: install binary → run `setup` → run `/teach-oh`
 
-Better flow: user opens Claude Code in their project → runs `/teach-oh` → teach-oh detects RNA not installed → offers install (download from latest release or `cargo install`) → configures .mcp.json → continues with strategic setup.
+Better flow: user opens Claude Code in their project → runs `/teach-oh` → teach-oh detects RNA not installed → offers install from the latest CI/release artifact (or a clearly marked development source install) → configures .mcp.json → continues with strategic setup.
 
 This makes teach-oh the single entry point for adopters. The `setup` subcommand remains for CI/scripted use.
 

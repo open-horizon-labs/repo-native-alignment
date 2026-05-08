@@ -105,6 +105,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - **no-parallel-cargo-agents**: One cargo build per target directory; use worktrees for parallel builds. [Details](.oh/guardrails/no-parallel-cargo-agents.md)
 - **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
 - **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
+- **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use the successful GitHub Actions artifact for the target commit, not a local cargo install from source. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
 
 ### Soft guardrails
 - **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)
@@ -125,7 +126,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - YAML frontmatter + markdown body for all `.oh/` artifacts
 - Scanner excludes configurable via `.oh/config.toml`
 - Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
-- `cargo install --path .` before `/mcp` reconnect (or restart Claude Code)
+- **Release installs use CI artifacts only**: download/install the successful GitHub Actions release artifact for the target commit before `/mcp` reconnect (or restart Claude Code). Do not use `cargo install --path .` for anything representing a shipped/user build.
 - Parallel worktree builds: `scripts/prep-worktree.sh <path> <branch>` creates a worktree with warm build cache (hardlinks `target/`). Set `CARGO_TARGET_DIR=$WORKTREE/target` before cargo commands. Enables genuinely parallel builds on M4 Max without cache thrashing.
 - **Cargo: use `cargo check --lib` for fast error checking** (seconds, not minutes). Only run `cargo test` once code compiles. Never `cargo run` for testing — use the installed binary. Save output to file, then grep/tail. **Use `run_in_background: true` for long cargo commands** — never `sleep` then poll.
 

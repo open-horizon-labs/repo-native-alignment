@@ -1,8 +1,8 @@
 # RNA Data Model
 
-This document describes the actual data model in RNA as of schema version 18. It covers the LanceDB column store, the in-memory graph structure, and how data flows from extraction through to MCP tool rendering.
+This document describes the actual data model in RNA as of schema version 21. It covers the LanceDB column store, the in-memory graph structure, operation reports, and how data flows from extraction through to MCP tool rendering.
 
-Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/graph/index.rs`, `src/extract/event_bus.rs`, `src/extract/consumers.rs`, `src/extract/scan_stats.rs`, `src/extract/cache.rs`.
+Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/server/operation_report.rs`, `src/server/enrichment_jobs.rs`, `src/graph/index.rs`, `src/extract/event_bus.rs`, `src/extract/consumers.rs`, `src/extract/scan_stats.rs`, `src/extract/cache.rs`.
 
 **Keeping this doc in sync:** When you bump `SCHEMA_VERSION` in `src/graph/store.rs`, update the tables in section 1 of this file to match. The schema version number appears in the first paragraph of section 1.
 
@@ -10,9 +10,9 @@ Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/sto
 
 ## 1. LanceDB Column Store
 
-RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `18`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
+RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `21`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
 
-The `extraction_version` file that used to live alongside `schema_version` has been removed as of v0.2.x (#620). Per-consumer content-addressed cache keys (see [Section 6](#6-content-addressed-consumer-cache)) replaced the single global sentinel in v0.1.15 (#526). Legacy `extraction_version` files on disk are no longer read or written and will be cleaned up by the next schema migration.
+The `extraction_version` file that used to live alongside `schema_version` has been removed as of v0.2.x (#620). Per-consumer content-addressed cache keys (see [Section 7](#7-content-addressed-consumer-cache)) replaced the single global sentinel in v0.1.15 (#526). Legacy `extraction_version` files on disk are no longer read or written and will be cleaned up by the next schema migration.
 
 ### `symbols` table
 
@@ -39,6 +39,9 @@ Stores code symbols (functions, structs, traits, enums, etc.) and other node typ
 | `storage` | UTF8 | yes | `"static"` (Rust) or `"var"` (Go) |
 | `mutable` | Boolean | yes | `true` for `static mut` declarations |
 | `decorators` | UTF8 | yes | Comma-separated decorator/attribute text |
+| `parent_scope` | UTF8 | yes | Enclosing class/interface/function name |
+| `parent_scope_kind` | UTF8 | yes | Enclosing scope kind |
+| `framework_hook` | UTF8 | yes | Extractor-config hook match |
 | `type_params` | UTF8 | yes | Generic type parameters (e.g., `<T: Clone + Send>`) |
 | `pattern_hint` | UTF8 | yes | Design pattern from naming conventions (e.g., `"factory"`, `"observer"`) |
 | `is_static` | Boolean | yes | `true` for static/associated methods; `false` for instance methods; `null` for top-level functions |
@@ -53,8 +56,14 @@ Stores code symbols (functions, structs, traits, enums, etc.) and other node typ
 | `diagnostic_timestamp` | UTF8 | yes | Unix timestamp (seconds) when diagnostic was captured |
 | `http_method` | UTF8 | yes | HTTP verb — only for `NodeKind::ApiEndpoint` nodes (e.g., `"GET"`, `"POST"`) |
 | `http_path` | UTF8 | yes | HTTP path pattern — only for `ApiEndpoint` nodes (e.g., `"/users/{id}"`) |
+| `doc_comment` | UTF8 | yes | Documentation comment preserved across LanceDB round-trips |
+| `attr_refs` | UTF8 | yes | Comma-separated dot-access identifiers used by `import_calls_pass` to emit attribute `ReferencedBy` edges |
+| `parent_service` | UTF8 | yes | Owning proto service for proto RPC function nodes |
+| `rpc_request_type` | UTF8 | yes | Proto RPC request message type |
+| `rpc_response_type` | UTF8 | yes | Proto RPC response message type |
 | `vector` | FixedSizeList(Float32, dim) | yes | Semantic embedding vector. Dimension depends on the model (384 for MiniLM-L6-v2). Present only after embeddings are computed; absent in the base schema. Added by `symbols_schema_with_vector(dim)`. |
 | `updated_at` | Int64 | no | Unix timestamp (seconds) of last write |
+| `scan_version` | UInt64 | no | Append-only graph write version. Queries filter to the latest committed version; stale rows are compacted separately. |
 
 **FTS index:** An FTS (BM25) index is created on `name` after each full persist. This enables keyword search over symbol names.
 
@@ -80,6 +89,7 @@ Stores directed relationships between nodes. This is the source of truth for the
 | `edge_confidence` | UTF8 | no | `"detected"` or `"confirmed"` |
 | `root_id` | UTF8 | no | Root slug (from the source node's root) |
 | `updated_at` | Int64 | no | Unix timestamp (seconds) of last write |
+| `scan_version` | UInt64 | no | Append-only graph write version. Queries filter to the latest committed version; stale rows are compacted separately. |
 
 ### `pr_merges` table
 
@@ -265,7 +275,7 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | `Defines` | `defines` | container → member | Module defines function |
 | `HasField` | `has_field` | struct → field | Struct has a field |
 | `Evolves` | `evolves` | PR → schema/component | PR evolved this entity |
-| `ReferencedBy` | `referenced_by` | symbol → referencing site | Symbol referenced at a location |
+| `ReferencedBy` | `referenced_by` | referencing site → referenced symbol | LSP-confirmed references plus tree-sitter-detected import and attribute references |
 | `References` | `references` | source → target | Markdown link or code reference |
 | `TopologyBoundary` | `topology_boundary` | service A → service B | Architectural boundary crossing |
 | `Modified` | `modified` | PR merge → symbol | PR modified this symbol |
@@ -357,8 +367,8 @@ LanguageAccumulatorConsumer (subscribes: RootExtracted)
   -- fires: LanguageDetected { slug, language, nodes } (once per language)
 
 AllEnrichmentsGate (subscribes: RootExtracted + EnrichmentComplete)
-  -- counts expected vs received enrichments --
-  -- registered before LspConsumers so it captures language count first
+  -- tracks expected vs received enrichments --
+  -- registered before LspConsumers so it observes detected languages first
 
 OpenApiConsumer (subscribes: RootExtracted)
   -- bidirectional endpoint → handler linking
@@ -372,7 +382,7 @@ EmbeddingIndexerConsumer (subscribes: RootExtracted)
         |
         v
 LspConsumer × N (subscribes: LanguageDetected)
-  -- one consumer per language, 38 servers auto-detected --
+  -- one consumer per language, servers auto-detected --
   -- adaptive wait (serverStatus/quiescent or probe, 10-min circuit breaker) --
   -- fires: EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes }
 
@@ -472,7 +482,15 @@ Subsystems are detected automatically via community detection on the in-memory g
 
 ---
 
-## 6. Content-Addressed Consumer Cache
+## 6. Operation Reports and Enrichment Control Plane
+
+Scan and enrichment operations produce durable `OperationReport` records through `src/server/operation_report.rs`. Reports include phases, outputs, capability readiness (`extracted_graph`, `embeddings`, `call_references`), degraded query notices, next steps, diagnostics, and related enrichment job IDs. CLI scan summaries render from the report; `list_roots` includes recent reports from the on-disk store.
+
+`src/server/enrichment_jobs.rs` supplies the scoped enrichment control-plane primitives: LSP and embedding run/skip options, capabilities, scopes (`repo`, `root`, `changed_files`, `explicit`), triggers, job states, and a restart-visible job ledger. It is intentionally a ledger/control plane, not a worker scheduler.
+
+---
+
+## 7. Content-Addressed Consumer Cache
 
 As of v0.1.15 (#526, #533), per-consumer cache keys replace the single global `EXTRACTION_VERSION` integer for incremental extraction invalidation.
 
@@ -522,7 +540,7 @@ Override to `false` for consumers that:
 
 ---
 
-## 7. EventBus Pipeline Types
+## 8. EventBus Pipeline Types
 
 Defined in `src/extract/event_bus.rs` and `src/extract/consumers.rs`.
 

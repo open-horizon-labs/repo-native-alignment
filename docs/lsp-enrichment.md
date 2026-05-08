@@ -33,7 +33,11 @@ When the EventBus content-addressed cache has a hit for an LSP consumer (same in
 
 The `RootExtracted` event carries `dirty_slugs: Option<HashSet<String>>`. The `LanguageAccumulatorConsumer` uses this to emit `LanguageDetected` events only for languages with nodes in dirty roots. LSP consumers for unchanged roots are never invoked.
 
-## 38 Auto-detected Language Servers
+### Per-file didOpen Warmup (#644)
+
+Before requesting call hierarchy or references for a symbol, RNA sends `textDocument/didOpen` for that file once per enrichment pass. Files are marked opened only after the source read and notification succeed, so transient failures can be retried. This keeps language servers that require open documents from returning empty or stale reference results during warmup.
+
+## Auto-detected Language Servers
 
 ### Common Servers (install for richer graphs)
 
@@ -47,6 +51,10 @@ The `RootExtracted` event carries `dirty_slugs: Option<HashSet<String>>`. The `L
 | Markdown | marksman | `brew install marksman` |
 
 Plus 32 more: Ruby (solargraph), Java (jdtls), C# (omnisharp), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, R, Julia, CSS, HTML, JSON, Nix, Terraform, TOML, YAML, Vue, Svelte, Erlang, Gleam, Nim, Clojure, Deno, Protobuf (buf), LaTeX (texlab), Typst (tinymist). Full list in `src/extract/consumers.rs`.
+
+## Capability Readiness
+
+MCP output distinguishes freshness from readiness. Freshness says when the index last changed; readiness says which workflow metadata is currently trustworthy: exact extracted graph search, embeddings/semantic search, LSP call/reference coverage, and dead-code prerequisites. Dead-code workflows require complete, persisted, non-zero LSP call/reference coverage; if LSP is still running, failed, or unavailable, the readiness block reports that instead of implying the graph is complete.
 
 ## Type Hierarchy Enrichment
 
@@ -68,6 +76,10 @@ When a language server advertises `typeHierarchyProvider`, RNA queries supertype
 **Concurrency:**
 
 - LSP requests within a single language server use pipelined transport with adaptive concurrency (TCP slow-start from 4 to 64 concurrent requests). Different language servers run in parallel via separate `LspConsumer` instances in the EventBus.
+
+### Reference Edge Coverage
+
+LSP reference queries emit confirmed `ReferencedBy` edges from the referring symbol/location to the referenced node. Post-extraction import-call analysis also emits detected `ReferencedBy` edges for unambiguous imports and attribute-access references captured in `metadata["attr_refs"]`; those tree-sitter-derived edges complement LSP rather than replacing confirmed LSP coverage.
 
 **Limitations:**
 

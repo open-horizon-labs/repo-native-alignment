@@ -188,6 +188,6 @@ The custom RNA-specific benchmark (above) tests capabilities the external benchm
 - [ETH AGENTS.md Study](https://arxiv.org/html/2602.11988v1) — Static context files hurt performance
 - [RANGER](https://arxiv.org/abs/2509.25257) — Graph+embed retrieval for repo-level code
 - [MCP Tool Description Smells](https://arxiv.org/html/2602.14878) — 97.1% of tools have quality defects
-- [Multi-SWE-bench](https://arxiv.org/abs/2504.02605) — 7 languages, 1,632 instances
+- [Multi-SWE-bench](https://arxiv.org/abs/2504.02605) — multi-language SWE benchmark
 - [DependEval](https://aclanthology.org/2025.findings-acl.373/) — Dependency understanding benchmark
 - [Advanced Context Engineering](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents) — Frequent Intentional Compaction

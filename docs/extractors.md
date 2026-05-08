@@ -1,6 +1,6 @@
 # Extractor Contribution Guide
 
-RNA extracts symbols, imports, and topology edges from 30 file types (22 code languages + 4 config formats + 4 schema/doc formats) via tree-sitter, then runs a set of event-driven consumers to enrich the graph with framework-aware edges (pub/sub boundaries, gRPC call chains, API links, etc.).
+RNA extracts symbols, imports, and topology edges from supported code, config, schema, and documentation formats via tree-sitter, then runs a set of event-driven consumers to enrich the graph with framework-aware edges (pub/sub boundaries, gRPC call chains, API links, etc.).
 
 This document covers how to add new extraction capability — whether that is a framework-specific enrichment pass built into RNA, a repo-specific config file, or a new framework detection rule.
 
@@ -160,6 +160,8 @@ pub mod your_framework;
 - The pass builds an index of proto RPC method `Function` nodes (those with `parent_service` metadata), then scans caller function bodies for `stub.MethodName(` patterns.
 - Emits `Calls` edges from callers to proto method nodes.
 - Zero cost for repos without gRPC (framework gate + early-out on empty proto index).
+
+`src/extract/proto.rs` is a tree-sitter-proto extractor. It emits proto messages, fields (including `oneof` fields), services, RPC functions, imports, enum values, and option constants. RPC function metadata (`parent_service`, request/response types) is persisted so gRPC client-call linking still works after LanceDB round-trips and incremental scans.
 
 ### Real example: openapi_sdk_link.rs
 
@@ -445,6 +447,8 @@ Built-in passes should have unit tests in the same file. The pattern is:
 
 See `src/extract/extractor_config.rs` tests for the full pattern including adversarial cases (variable topics, wrong language, deduplication, template literal interpolation).
 
+Schema extractors also carry iceberg/regression suites in their own modules. `src/extract/proto.rs` covers tree-sitter-proto edge cases such as single-line empty declarations, nested messages, `oneof` fields, imports, and options. `src/extract/sql.rs` covers empty/comment-only inputs, single-line tables, `IF NOT EXISTS`, unsupported drops, and foreign keys. `src/extract/openapi.rs` covers empty paths, multi-method paths, `{param}` paths, shared `parameters` blocks, local `$ref` dependencies, JSON Schema inputs, invalid YAML, and empty files.
+
 ### Integration test a config extractor
 
 The test suite has filesystem-based tests in `src/extract/extractor_config.rs` that write real `.oh/extractors/` files to `TempDir` and run the config extractor. These verify:
@@ -516,18 +520,18 @@ Config extractors (`ExtractorConfigPass`) always run regardless of `detected_fra
 
 ## Language extractor reference
 
-RNA includes 30 extractors that run via tree-sitter to produce symbols, import graphs, and topology edges.
+RNA's built-in extractors run via tree-sitter to produce symbols, import graphs, and topology edges.
 
-### Supported languages
+### Supported languages/formats
 
-- **Code** — Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C, C#, Kotlin, Zig, Lua, Swift, Elixir, Scala, Dart, PHP, HTML, GraphQL, Dockerfile
-- **Config & infra** — HCL/Terraform, JSON, TOML, YAML (Kubernetes manifests detected automatically)
-- **Docs & schema** — Markdown (heading-aware), .proto, SQL, OpenAPI
+- **Code & web** — Rust, Python, GDScript, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C, C#, Kotlin, Zig, Lua, Swift, PHP, HTML, Scala, Dart, Elixir
+- **Config & infra** — Dockerfile, HCL/Terraform, JSON, TOML, YAML (Kubernetes manifests detected automatically)
+- **Docs & schema/API** — Markdown (heading-aware), .proto, SQL, OpenAPI/JSON Schema, GraphQL
 - **Architecture** — subprocess, network, async boundaries detected as topology edges (Rust extractor)
 
 ### Constants and literals (cross-language)
 
-All 30 extractors index constants and literal values. `search` returns the value inline:
+Built-in extractors index constants and literal values where the parser exposes them. `search` returns the value inline:
 
 ```
 - const MAX_RETRIES (rust) src/config.rs:12  Value: `5`
@@ -557,7 +561,7 @@ Synthetic constants are inferred from structure — YAML/TOML/JSON top-level sca
 | C/C++ | `constexpr` and `static const` declarations |
 | Lua/Ruby/Bash | ALL_CAPS module-level assignments |
 | HCL | `variable` block default values |
-| Proto | Enum values and `option` fields |
+| Proto | Enum values and `option` fields; services/RPCs carry `parent_service`, request, and response metadata |
 | SQL | `CREATE TYPE ... AS ENUM` values |
 | YAML/TOML/JSON/OpenAPI | Top-level scalar values (synthetic) |
 

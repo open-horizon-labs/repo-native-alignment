@@ -130,11 +130,11 @@ In each domain, listing the objects tells you almost nothing about the system. D
 RNA (Repo-Native Alignment) is a local context discovery tool for coding agents. It provides:
 
 - **Incremental scanning** — mtime-based file change detection with git diff acceleration
-- **Multi-language extraction** — tree-sitter parsing across 22 languages producing typed graph nodes (functions, structs, traits, enums, imports, etc.)
+- **Multi-language extraction** — tree-sitter parsing across supported languages producing typed graph nodes (functions, structs, traits, enums, imports, etc.)
 - **LSP enrichment** — call hierarchy and reference queries from language servers (rust-analyzer, pyright, tsserver, gopls) adding Calls and ReferencedBy edges
 - **Semantic embedding** — MiniLM-L6-v2 embeddings with optional Jina cross-encoder reranking
 - **Unified storage** — LanceDB for both graph persistence and vector search
-- **4 MCP tools** — `search` (code symbols, artifacts, markdown, graph traversal in one call), `outcome_progress`, `repo_map`, `list_roots`
+- **MCP surface** — `search` (code symbols, artifacts, markdown, graph traversal in one call), `outcome_progress`, `repo_map`, `list_roots`
 
 ### 2.2 Graph Model
 
@@ -234,7 +234,7 @@ Each solution scored independently (not head-to-head) by a scorer agent using a 
 
 **Tool nudging**: The RNA agent's prompt includes explicit CLI commands to use. The vanilla agent receives no equivalent "use grep like this" guidance. This creates an asymmetry — the RNA agent is told HOW to use its tools, while the vanilla agent must figure it out. We chose this design because: (a) without explicit commands, agents default to Grep/Read even when RNA is available (observed in pilot runs), and (b) in practice, RNA users would have AGENTS.md guidance suggesting tool usage patterns.
 
-**Harness limitations**: RNA is accessed via native MCP integration (`claude --print` from the target repo directory with RNA configured in `.mcp.json`). The MCP tool schemas add ~22K tokens to the system prompt (4 tools with full JSON parameter schemas). This is a one-time cache_creation cost per session, but the cached prefix is re-read on every turn. RNA MCP agents also tend to use more turns (38 vs 6 in pilot runs) because graph traversal queries are separate tool calls, further amplifying cache_read totals. This overhead is reducible — the current parameter descriptions are verbose and could be slimmed significantly (#295).
+**Harness limitations**: RNA is accessed via native MCP integration (`claude --print` from the target repo directory with RNA configured in `.mcp.json`). MCP tool schemas add prompt overhead that is paid through cache creation and cache reads. RNA MCP agents also tend to use more turns because graph traversal queries are separate tool calls, further amplifying cache-read totals. This overhead is reducible — the current parameter descriptions are verbose and could be slimmed significantly (#295).
 
 **Single codebase**: Results are from one Rust project. Generalization to other languages, project sizes, and architectures is not established.
 
@@ -313,11 +313,11 @@ Implications for the field: building better code understanding tools is necessar
 
 Current coding agent harnesses make assumptions that work against graph-augmented context:
 
-**Context-per-interaction vs. persistent queryable state.** MCP tools return text that enters the context window. A graph traversal returning 50 nodes occupies context — and gets compacted away 3 turns later. The agent then re-queries the same information. The graph IS persistent state, but the protocol forces it through an ephemeral text channel. A better design: tools that maintain queryable state the agent can re-access without re-paying the context cost.
+**Context-per-interaction vs. persistent queryable state.** MCP responses return text that enters the context window. A graph traversal occupies context — and gets compacted away later. The agent then re-queries the same information. The graph IS persistent state, but the protocol forces it through an ephemeral text channel. A better design: queryable state the agent can re-access without re-paying the context cost.
 
-**KV-prefix cache invalidation.** LLM inference optimizes for stable context prefixes via KV caching. Every MCP tool response is unique content that invalidates the prefix cache. A system prompt with 4 MCP tool schemas (~2K tokens) is cached on the first turn, but the tool results that follow are never cacheable. This means graph-augmented agents pay a higher per-turn inference cost than agents using built-in tools whose outputs are more predictable.
+**KV-prefix cache invalidation.** LLM inference optimizes for stable context prefixes via KV caching. Every MCP tool response is unique content that invalidates the prefix cache. Schema-heavy MCP prompts are cached initially, but the tool results that follow are never cacheable. This means graph-augmented agents pay a higher per-turn inference cost than agents using built-in tools whose outputs are more predictable.
 
-**Context compaction discards tool results.** As the context window fills, harnesses auto-compress older messages. The first thing discarded is typically tool results — exactly the context the agent paid tokens to acquire. An agent that used RNA to discover 20 relevant functions loses that discovery after compaction and must re-discover it. Text search agents suffer the same problem, but because their per-query results are smaller (one grep result vs. a graph traversal), the waste is proportionally less visible.
+**Context compaction discards tool results.** As the context window fills, harnesses auto-compress older messages. The first thing discarded is typically tool results — exactly the context the agent paid tokens to acquire. An agent that used RNA to discover relevant functions loses that discovery after compaction and must re-discover it. Text search agents suffer the same problem, but because their per-query results are smaller, the waste is proportionally less visible.
 
 **Implication:** The question is not "what harness design lets graph tools deliver their full value?" but rather "what harness design gets more value out of LLM models?" The context window is the LLM's working memory. Every token spent on irrelevant grep results, re-discovered facts, or compacted-then-re-fetched tool outputs is a token not spent on reasoning. Graph-augmented context is one approach to this problem — deliver precisely the relevant structural information instead of raw text the model must assemble into structure itself. But the harness must also stop undoing that work through compaction, cache invalidation, and ephemeral tool results. Current harnesses treat context as disposable. The alternative: context as a managed resource, with persistence, incremental updates, and compaction-aware prioritization. Our benchmark measures what's achievable within current harness constraints, not the theoretical ceiling.
 
@@ -341,14 +341,14 @@ Current coding agent harnesses make assumptions that work against graph-augmente
 
 - **Code-Graph-RAG** — Neo4j + tree-sitter + UniXcoder embeddings. Similar graph-first approach but requires Docker/Memgraph, no LSP enrichment.
 - **CodeGraphContext** — SCIP-based indexing with KuzuDB/Neo4j. Compiler-grade edges but requires build-time indexers.
-- **codeTree** — SQLite-based AST analysis with 23 MCP tools. Breadth over depth, no embeddings or LSP.
+- **codeTree** — SQLite-based AST analysis. Breadth over depth, no embeddings or LSP.
 - **Aider repo-map** — Tag-based code summarization for context window management. Complementary approach (summarization vs. queryable graph).
 
 ### 6.3 Agent Architecture
 
 - **12-Factor Agents / Context Engineering** (Dex Horthy; [talk](https://www.youtube.com/watch?v=IS_y40zY-hc), [post](https://github.com/humanlayer/12-factor-agents)) — Framework for systematic context management. Distinguishes harness engineering (tool configuration) from context engineering (what information reaches the model). RNA implements the "give agents the right context" principle via queryable pre-indexed artifacts.
 - **Harness Engineering** (Viv Trivedy; [post 1](https://www.vtrivedy.com/posts/claude-code-sdk-haas-harness-as-a-service), [post 2](https://blog.langchain.com/the-anatomy-of-an-agent-harness/)) — Identifies four customization levers: system prompt, tools/MCPs, context, sub-agents. Our benchmark measures the tools/MCPs lever specifically — does a better code exploration tool improve outcomes?
-- **Skill Issue: Harness Engineering for Coding Agents** (HumanLayer; [post](https://www.humanlayer.dev/blog/skill-issue-harness-engineering-for-coding-agents)) — Practical guide to harness configuration. Notes that sub-agents function as "context firewalls" and that tool count matters for context budget. RNA's consolidation from 20+ tools to 4 aligns with their finding that fewer, focused tools outperform broad tool suites.
+- **Skill Issue: Harness Engineering for Coding Agents** (HumanLayer; [post](https://www.humanlayer.dev/blog/skill-issue-harness-engineering-for-coding-agents)) — Practical guide to harness configuration. Notes that sub-agents function as "context firewalls" and that sprawling tool surfaces hurt context budget. RNA's consolidated tool surface aligns with their finding that focused tools outperform broad tool suites.
 
 ## 7. Conclusion
 

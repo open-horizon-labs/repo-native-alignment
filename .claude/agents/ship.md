@@ -264,7 +264,7 @@ gh pr comment <PR> --body "$(cat <<'EOF'
 - [x/blank] Read path: Arrow → Node.metadata during load
 - [x/blank] Render: `search` code results formatting
 - [x/blank] Render: `search` graph traversal (neighbors/impact) formatting
-- [x/blank] End-to-end: value visible in tool output after `cargo install --path .` + restart + rescan
+- [x/blank] End-to-end: value visible in tool output after installing the successful CI artifact + restart + rescan
 - [x/blank] MCP server path: verified via `mcp-smoke.mjs` or `@modelcontextprotocol/inspector` (not just CLI)
 EOF
 )"

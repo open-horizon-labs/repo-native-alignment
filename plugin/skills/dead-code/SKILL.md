@@ -170,7 +170,7 @@ Present results as a table:
 
 ## Limitations
 
-- **LSP enrichment required** — `Calls` and `ReferencedBy` edges come from LSP. If the repo hasn't been LSP-enriched, the graph only has structural edges (defines, contains), and every function will look "dead." Check: if no function has `Calls` edges, warn the user that LSP enrichment hasn't run.
+- **LSP enrichment required** — `Calls` and `ReferencedBy` edges come from LSP. If RNA does not report `global dead-code prerequisites: ready`, abort instead of emitting candidates; a structural-edges-only graph makes every function look "dead."
 - **Dynamic dispatch** — trait objects, function pointers, and reflection-based calls won't have graph edges.
 - **Macros** — macro-generated call sites may not be captured by tree-sitter or LSP.
 - **Re-exports** — a function re-exported from a library crate may have zero in-repo callers but be the public API.

@@ -61,8 +61,8 @@
 
 | Option | Level | Approach | Trade-off |
 |--------|-------|----------|-----------|
-| A | Band-Aid | Improve docs only (explicit `protoc`, `cargo install --path .`, `.mcp.json` examples, troubleshooting) | Fastest, but failure still user-driven and late-discovered |
-| B | Local Optimum | Distribute installable binaries (`cargo install`/release artifacts) and standardize paths | Easier install, but still no deterministic init/config/verification |
+| A | Band-Aid | Improve docs only (explicit `protoc`, CI/release artifact install steps, `.mcp.json` examples, troubleshooting) | Fastest, but failure still user-driven and late-discovered |
+| B | Local Optimum | Distribute installable binaries from CI/release artifacts and standardize paths | Easier install, but still no deterministic init/config/verification |
 | C | Reframe | Add one idempotent bootstrap command (`install + init + verify`) that preflights deps, installs tools, merges MCP config, and smoke-tests via real client path | Moderate implementation effort; needs careful cross-platform behavior |
 | D | Redesign | Build a first-class setup workflow in the RNA CLI (`repo-native-alignment setup`) with pluggable installers for RNA, OH MCP, and skills | Best long-term UX, highest upfront complexity and maintenance |
 
@@ -130,8 +130,8 @@ repo-native-alignment setup --project <PATH>  # default: .
 ```
 
 **Execution flow (in order):**
-1. Preflight: checks only the tools required for selected actions (`cargo`/`protoc` when source reinstall is possible, `npx` unless `--skip-skills`); emits remediation and aborts on missing required deps.
-2. RNA install: runs `cargo install --locked --path <rna repo root>` when source path exists; if source is missing but an installed binary exists, setup continues using the existing binary.
+1. Preflight: checks only the tools required for selected actions (`protoc`, `npx` unless `--skip-skills`, and Rust tooling only when an explicitly development-scoped source reinstall is requested); emits remediation and aborts on missing required deps.
+2. RNA install: supported release/user-facing installs come from CI/release artifacts. Development source reinstalls may run `cargo install --locked --path <rna repo root>` when the source path exists; if source is missing but an installed binary exists, setup continues using the existing binary.
 3. Skills install: `npx skills add open-horizon-labs/skills -g -a claude-code -y` — skipped on `--skip-skills` or `--dry-run`.
 4. MCP config merge: reads `<project>/.mcp.json` if present, sets `mcpServers.rna-server` to:
    - `type: "stdio"`

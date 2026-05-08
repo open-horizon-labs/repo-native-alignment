@@ -11,6 +11,8 @@ The RNA scanner is incremental, event-driven, and worktree-aware.
 - Self-healing cache -- schema changes trigger automatic rebuild; no manual cache deletion needed
 - Dirty-slugs filtering -- incremental scans track which root slugs have changed files, skipping LSP enrichment for unchanged roots
 - Content-addressed consumer cache -- per-consumer cache keys (blake3 hash of event payload + consumer version) mean only consumers whose input changed re-run
+- Scoped enrichment controls -- scans can run all enrichment, extract-only, without LSP, or without embeddings while preserving capability state in the operation report
+- Durable operation telemetry -- scan/enrichment runs record phases, outputs, capability readiness, degraded query notices, next steps, and related enrichment job IDs for `list_roots`/CLI rendering
 
 ## Configuration
 
