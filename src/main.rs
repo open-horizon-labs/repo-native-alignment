@@ -511,7 +511,7 @@ fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> O
         .unwrap_or_else(|| Some(root_slug))
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     // Set fastembed model cache to ~/.cache/rna/models/ instead of .fastembed_cache/
     // in the current directory. Must be set before Tokio runtime and any fastembed
     // initialization (reranker model, or any future fastembed embedding model).
@@ -529,7 +529,10 @@ fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir) };
     }
 
-    async_main()
+    if let Err(err) = async_main() {
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
+    }
 }
 
 #[tokio::main]

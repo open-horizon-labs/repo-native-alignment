@@ -485,17 +485,31 @@ impl EnrichmentJobLedger {
     }
 
     pub fn recent_jobs(&self, repo_root: &Path, limit: usize) -> Vec<EnrichmentJobRecord> {
-        let mut jobs = match read_store(repo_root) {
-            Ok(store) => store.jobs,
-            Err(e) => {
-                tracing::warn!("Failed to read enrichment job ledger: {}", e);
-                Vec::new()
+        let mut store = {
+            let _guard = self.io_lock.lock().unwrap();
+            let _file_lock = JobFileLock::acquire(repo_root);
+            let mut store = match read_store(repo_root) {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::warn!("Failed to read enrichment job ledger: {}", e);
+                    return Vec::new();
+                }
+            };
+            if recover_stale_jobs(&mut store, unix_now())
+                && let Err(e) = write_store(repo_root, &store)
+            {
+                tracing::warn!("Failed to persist stale enrichment job recovery: {}", e);
             }
+            store
         };
-        jobs.retain(|job| job.schema_version == SCHEMA_VERSION);
-        jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
-        jobs.truncate(limit);
-        jobs
+        store
+            .jobs
+            .retain(|job| job.schema_version == SCHEMA_VERSION);
+        store
+            .jobs
+            .sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+        store.jobs.truncate(limit);
+        store.jobs
     }
 
     pub fn events_for_job(&self, repo_root: &Path, job_id: &str) -> Vec<EnrichmentJobEvent> {
@@ -614,6 +628,40 @@ fn persisted_job_is_live(job: &EnrichmentJobRecord, now: u64) -> bool {
             .lease_expires_at
             .is_some_and(|expires_at| expires_at >= now)
         && job.owner_id.as_deref().is_some_and(process_owner_is_alive)
+}
+
+fn recover_stale_jobs(store: &mut EnrichmentJobStore, now: u64) -> bool {
+    let mut changed = false;
+    let mut events = Vec::new();
+    for job in store.jobs.iter_mut() {
+        if job.schema_version != SCHEMA_VERSION || job.state.is_terminal() {
+            continue;
+        }
+        if persisted_job_is_live(job, now) {
+            continue;
+        }
+        job.state = EnrichmentJobState::Cancelled;
+        job.phase = Some("stale_recovered".to_string());
+        job.updated_at = now;
+        job.last_progress_at = Some(now);
+        job.completed_at = Some(now);
+        job.failure = Some(
+            "previous enrichment process exited or its lease expired before completion".to_string(),
+        );
+        job.owner_id = None;
+        job.lease_expires_at = None;
+        events.push(EnrichmentJobEvent {
+            job_id: job.job_id.clone(),
+            timestamp: now,
+            state: EnrichmentJobState::Cancelled,
+            phase: job.phase.clone(),
+            message: job.failure.clone(),
+            counters: job.counters.clone(),
+        });
+        changed = true;
+    }
+    store.events.extend(events);
+    changed
 }
 
 fn process_owner_id() -> String {
@@ -1045,5 +1093,49 @@ mod tests {
             Some(second.job_id.as_str())
         );
         assert!(jobs.iter().any(|job| job.job_id == second.job_id));
+    }
+
+    #[test]
+    fn recent_jobs_recovers_dead_running_job_as_cancelled() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let first = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("first job should start"),
+        };
+        ledger.mark_running(tmp.path(), &first.job_id, "lsp");
+        let mut store = read_store(tmp.path()).unwrap();
+        let stale = store
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == first.job_id)
+            .unwrap();
+        stale.owner_id = None;
+        stale.lease_expires_at = Some(unix_now().saturating_sub(1));
+        write_store(tmp.path(), &store).unwrap();
+
+        let jobs = ledger.recent_jobs(tmp.path(), 10);
+        let recovered = jobs.iter().find(|job| job.job_id == first.job_id).unwrap();
+        assert_eq!(recovered.state, EnrichmentJobState::Cancelled);
+        assert_eq!(recovered.phase.as_deref(), Some("stale_recovered"));
+        assert!(
+            recovered
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("lease expired")
+        );
+        assert!(recovered.completed_at.is_some());
+        assert!(recovered.owner_id.is_none());
+        assert!(recovered.lease_expires_at.is_none());
     }
 }

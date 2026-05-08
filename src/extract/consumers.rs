@@ -1357,6 +1357,10 @@ impl ExtractionConsumer for CustomExtractorConsumer {
     }
 }
 
+fn is_lsp_server_not_found_error(err_text: &str) -> bool {
+    err_text.starts_with("LSP server '") && err_text.ends_with("' not found on PATH")
+}
+
 // ---------------------------------------------------------------------------
 // LspConsumer
 // ---------------------------------------------------------------------------
@@ -1480,6 +1484,20 @@ impl ExtractionConsumer for LspConsumer {
                     slug,
                     e,
                 );
+                let err_text = e.to_string();
+                let aborted = err_text.contains("aborted")
+                    || err_text.contains("no progress")
+                    || err_text.contains("timed out")
+                    || err_text.contains("zero LSP edges");
+                let error_count = usize::from(!is_lsp_server_not_found_error(&err_text));
+                if aborted {
+                    anyhow::bail!(
+                        "LSP enrichment aborted for {} root {}: {}",
+                        self.language,
+                        slug,
+                        err_text
+                    );
+                }
                 Ok(vec![ExtractionEvent::EnrichmentComplete {
                     slug: slug.clone(),
                     language: language.clone(),
@@ -1487,8 +1505,8 @@ impl ExtractionConsumer for LspConsumer {
                     new_nodes: Arc::from([]),
                     updated_nodes: Arc::from([]),
                     server_name: Some(self.enricher.name().to_string()),
-                    error_count: 0,
-                    aborted: false,
+                    error_count,
+                    aborted,
                 }])
             }
         }
@@ -3206,6 +3224,16 @@ mod tests {
             has_passes_complete,
             "EnrichmentFinalizer must produce PassesComplete"
         );
+    }
+
+    #[test]
+    fn test_lsp_server_not_found_detection_is_targeted() {
+        assert!(is_lsp_server_not_found_error(
+            "LSP server 'rust-analyzer' not found on PATH"
+        ));
+        assert!(!is_lsp_server_not_found_error(
+            "workspace config file not found while resolving references"
+        ));
     }
 
     /// Verify LspConsumer fires only for its declared language.

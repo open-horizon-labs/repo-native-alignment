@@ -2340,7 +2340,7 @@ impl Enricher for LspEnricher {
         };
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
-        let (attempted, errors, aborted) = self
+        let (attempted, errors, aborted, abort_diagnostic) = self
             .run_pass1_references(
                 &transport,
                 &root,
@@ -2352,6 +2352,20 @@ impl Enricher for LspEnricher {
                 &mut result,
             )
             .await;
+        if aborted {
+            result.error_count = errors as usize;
+            result.aborted = true;
+            let detail = abort_diagnostic
+                .unwrap_or_else(|| "Pass 1 aborted without a diagnostic snapshot".to_string());
+            anyhow::bail!(
+                "LSP Pass 1 aborted for {} after {} attempted nodes and {} errors: {}",
+                self.server_command,
+                attempted,
+                errors,
+                detail
+            );
+        }
+
 
         // Pass 2: type hierarchy (sequential -- strike counting needs order)
         let (has_type_hierarchy, type_hierarchy_strikes) = self
