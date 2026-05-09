@@ -1940,6 +1940,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verbose_readiness_uses_completed_job_beyond_recent_display_limit() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let completed_call_refs = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &completed_call_refs, 2, 1);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for index in 0..5 {
+            let job_id = match ledger
+                .begin_job(
+                    &repo_root,
+                    crate::server::EnrichmentCapability::Embeddings,
+                    crate::server::EnrichmentScope::Root(format!("root-{index}")),
+                    crate::server::EnrichmentTrigger::Explicit,
+                    None,
+                )
+                .expect("begin unrelated job")
+            {
+                crate::server::JobStart::Started(job) => job.job_id,
+                crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+            };
+            ledger.mark_completed(&repo_root, &job_id, 1, 1);
+        }
+        assert!(
+            !ledger
+                .recent_jobs(&repo_root, 5)
+                .iter()
+                .any(|job| job.job_id == completed_call_refs),
+            "test setup should push call-reference proof outside the recent display window"
+        );
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.all_jobs(&repo_root);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
     async fn test_verbose_readiness_does_not_promote_superseded_completed_job() {
         let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
         let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
