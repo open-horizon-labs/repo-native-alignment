@@ -133,7 +133,7 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
-            enrichment_jobs: self.enrichment_jobs.recent_jobs(&self.repo_root, 5),
+            enrichment_jobs: self.enrichment_jobs.all_jobs(&self.repo_root),
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
         if self.graph_build_status.is_building() {

@@ -512,6 +512,10 @@ impl EnrichmentJobLedger {
         store.jobs
     }
 
+    pub fn all_jobs(&self, repo_root: &Path) -> Vec<EnrichmentJobRecord> {
+        self.recent_jobs(repo_root, usize::MAX)
+    }
+
     pub fn events_for_job(&self, repo_root: &Path, job_id: &str) -> Vec<EnrichmentJobEvent> {
         match read_store(repo_root) {
             Ok(store) => store

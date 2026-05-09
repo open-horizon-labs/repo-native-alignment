@@ -19,7 +19,8 @@ pub(crate) use graph::SUBSYSTEM_KEY;
 pub use enrichment::EnrichmentContinuation;
 pub use enrichment_jobs::{
     EmbeddingEnrichmentMode, EnrichmentCapability, EnrichmentJobLedger, EnrichmentJobRecord,
-    EnrichmentScope, EnrichmentTrigger, JobStart, LspEnrichmentMode, ScanEnrichmentOptions,
+    EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart, LspEnrichmentMode,
+    ScanEnrichmentOptions,
 };
 pub use helpers::format_freshness;
 pub use operation_report::{OperationReport, OperationReportStore, render_recent_reports_markdown};

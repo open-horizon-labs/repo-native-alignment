@@ -1008,7 +1008,7 @@ async fn async_main() -> anyhow::Result<()> {
                 embed_status: None,
                 root_filter,
                 non_code_slugs,
-                enrichment_jobs: EnrichmentJobLedger::default().recent_jobs(&repo_root, 5),
+                enrichment_jobs: EnrichmentJobLedger::default().all_jobs(&repo_root),
             };
             println!("{}", service::search(&params, &ctx).await);
             return Ok(());

@@ -7,15 +7,16 @@
 use std::collections::HashSet;
 
 use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
-use crate::graph::{Node, NodeKind};
+use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
     format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
     format_node_entry_with_root, strip_root_prefix,
 };
-use crate::server::state::GraphState;
+use crate::server::state::{CapabilityReadinessState, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
+use crate::server::{EnrichmentCapability, EnrichmentJobState, EnrichmentScope};
 
 use super::{
     SearchContext, SearchParams, node_passes_root_filter, search_result_passes_root_filter,
@@ -37,17 +38,50 @@ fn format_verbose_readiness(
     semantic_index_attached: bool,
     semantic_index_available: bool,
 ) -> String {
+    let should_infer_lsp_status = ctx
+        .lsp_status
+        .map(|status| status.call_reference_readiness().state != CapabilityReadinessState::Ready)
+        .unwrap_or(true);
+    let inferred_lsp_status = if should_infer_lsp_status {
+        let persisted_lsp_edges = gs
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == ExtractionSource::Lsp
+                    && matches!(edge.kind, EdgeKind::Calls | EdgeKind::ReferencedBy)
+            })
+            .count();
+        let completed_repo_job = ctx.enrichment_jobs.iter().any(|job| {
+            job.capability == EnrichmentCapability::CallReferences
+                && matches!(job.scope, EnrichmentScope::Repo)
+                && job.state == EnrichmentJobState::Completed
+                && job.completed_at.is_some()
+                && job.failure.is_none()
+                && job.counters.edge_count.unwrap_or(0) > 0
+        });
+        if completed_repo_job && persisted_lsp_edges > 0 {
+            let status = LspEnrichmentStatus::default();
+            status.set_complete(persisted_lsp_edges);
+            Some(status)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let lsp_status = inferred_lsp_status.as_ref().or(ctx.lsp_status);
+
     format!(
         "{}{}{}",
         format_freshness_full(
             gs.nodes.len(),
             gs.last_scan_completed_at,
-            ctx.lsp_status,
+            lsp_status,
             ctx.embed_status,
         ),
         format_capability_readiness(
             gs.nodes.len(),
-            ctx.lsp_status,
+            lsp_status,
             ctx.embed_status,
             semantic_index_attached,
             semantic_index_available,
@@ -1771,6 +1805,324 @@ mod tests {
         assert!(result.contains("## Graph neighbors"));
         assert!(result.contains("callee"));
         assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_uses_persisted_lsp_edges_without_live_status() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_does_not_promote_lsp_edges_without_completed_job() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: unavailable"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: unavailable"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_uses_persisted_lsp_edges_when_live_status_is_only_server_found()
+    {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        let live_status = LspEnrichmentStatus::default();
+        live_status.set_server_found();
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.lsp_status = Some(&live_status);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_uses_completed_job_beyond_recent_display_limit() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let completed_call_refs = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &completed_call_refs, 2, 1);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for index in 0..5 {
+            let job_id = match ledger
+                .begin_job(
+                    &repo_root,
+                    crate::server::EnrichmentCapability::Embeddings,
+                    crate::server::EnrichmentScope::Root(format!("root-{index}")),
+                    crate::server::EnrichmentTrigger::Explicit,
+                    None,
+                )
+                .expect("begin unrelated job")
+            {
+                crate::server::JobStart::Started(job) => job.job_id,
+                crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+            };
+            ledger.mark_completed(&repo_root, &job_id, 1, 1);
+        }
+        assert!(
+            !ledger
+                .recent_jobs(&repo_root, 5)
+                .iter()
+                .any(|job| job.job_id == completed_call_refs),
+            "test setup should push call-reference proof outside the recent display window"
+        );
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.all_jobs(&repo_root);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_does_not_promote_superseded_completed_job() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+        ctx.enrichment_jobs[0].state = EnrichmentJobState::Superseded;
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: unavailable"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: unavailable"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_prefers_live_ready_status_over_stale_job_metadata() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let completed_job = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin completed call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &completed_job, 2, 7);
+        let _replacement_job = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin replacement call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        let live_status = LspEnrichmentStatus::default();
+        live_status.set_complete(7);
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.lsp_status = Some(&live_status);
+        ctx.enrichment_jobs = ledger.all_jobs(&repo_root);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
     }
 
     #[tokio::test]

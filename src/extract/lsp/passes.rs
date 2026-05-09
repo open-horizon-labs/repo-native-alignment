@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -551,9 +551,8 @@ impl LspEnricher {
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let mut join_set = tokio::task::JoinSet::new();
-        let (work_tx, work_rx) =
-            tokio::sync::mpsc::channel::<LspPass1WorkItem>(PIPELINE_MAX_CONCURRENCY);
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        let work_items = Arc::new(work_items);
+        let next_work_index = Arc::new(AtomicUsize::new(0));
         let (result_tx, mut result_rx) =
             tokio::sync::mpsc::channel::<Pass1TaskResult>(PIPELINE_MAX_CONCURRENCY);
 
@@ -566,16 +565,14 @@ impl LspEnricher {
             let error_count = Arc::clone(&error_count);
             let did_open = Arc::clone(&did_open);
             let diagnostics = Arc::clone(&diagnostics);
-            let work_rx = Arc::clone(&work_rx);
+            let work_items = Arc::clone(&work_items);
+            let next_work_index = Arc::clone(&next_work_index);
             let result_tx = result_tx.clone();
 
             join_set.spawn(async move {
                 loop {
-                    let item = {
-                        let mut rx = work_rx.lock().await;
-                        rx.recv().await
-                    };
-                    let Some(item) = item else {
+                    let index = next_work_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = work_items.get(index) else {
                         break;
                     };
                     let result = Self::run_pass1_work_item(
@@ -599,13 +596,6 @@ impl LspEnricher {
             });
         }
         drop(result_tx);
-
-        for item in work_items {
-            if work_tx.send(item).await.is_err() {
-                break;
-            }
-        }
-        drop(work_tx);
 
         // Collect results from all queued work items. A no-progress watchdog emits
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
@@ -749,7 +739,7 @@ impl LspEnricher {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_pass1_work_item(
-        item: LspPass1WorkItem,
+        item: &LspPass1WorkItem,
         transport: &PipelinedTransport,
         root: &Path,
         matching_owned: &Arc<Vec<Node>>,
@@ -761,7 +751,7 @@ impl LspEnricher {
         diagnostics: &LspPass1Diagnostics,
         error_count: &AtomicI64,
     ) -> Pass1TaskResult {
-        diagnostics.set_phase(&item, "resolving_file_uri").await;
+        diagnostics.set_phase(item, "resolving_file_uri").await;
         let node = &item.node;
         let abs_path = root.join(&node.id.file);
         let file_uri = match path_to_uri(&abs_path) {
@@ -772,7 +762,7 @@ impl LspEnricher {
                     node.id.file.display(),
                     e
                 );
-                diagnostics.finish(&item, false).await;
+                diagnostics.finish(item, false).await;
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -781,14 +771,14 @@ impl LspEnricher {
             }
         };
 
-        diagnostics.set_phase(&item, "sending_did_open").await;
+        diagnostics.set_phase(item, "sending_did_open").await;
         if let Err(e) = did_open
             .ensure_open(transport, root, &node.id.file, &file_uri)
             .await
         {
             error_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("{}", e);
-            diagnostics.finish(&item, false).await;
+            diagnostics.finish(item, false).await;
             return Pass1TaskResult {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
@@ -801,7 +791,7 @@ impl LspEnricher {
             .first()
             .copied()
             .unwrap_or("requesting_lsp_operation");
-        diagnostics.set_phase(&item, phase).await;
+        diagnostics.set_phase(item, phase).await;
 
         let (line, col) = Self::node_lsp_position(node);
         let mut edges = Vec::new();
@@ -866,7 +856,7 @@ impl LspEnricher {
             }
         }
 
-        diagnostics.finish(&item, !had_error).await;
+        diagnostics.finish(item, !had_error).await;
         Pass1TaskResult {
             edges,
             new_nodes,
