@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
+use crate::graph::index::GraphIndex;
 use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
@@ -539,16 +540,13 @@ async fn flat_code_symbol_search<'a>(
         Vec::new()
     };
 
-    // Supplement or fallback: name/signature matching.
+    // Supplement or fallback: text matching over name/signature/body/metadata.
     //
-    // When embed search was used, exact name matches that the embedding missed
-    // are appended after the embed-ranked results. This ensures functions are
-    // always findable by name regardless of embedding quality or index freshness.
-    // (#275: without this, `search("embed_texts")` returned zero code results
-    // because the embedding didn't surface the function and no fallback fired.)
-    //
-    // When embed search was NOT used (unavailable, not ready, or empty query),
-    // name/signature matching is the sole source of results.
+    // The wide-net stage must retrieve known facts before ranking can help.
+    // Exact name/signature matches still dominate, but compound capability-style
+    // queries also match individual high-signal terms against the node body and
+    // metadata so constants such as `tree_sitter_python::LANGUAGE` are searchable.
+    let text_terms = query_terms(query_str);
     if !used_embed {
         matches = graph_state
             .nodes
@@ -558,11 +556,9 @@ async fn flat_code_symbol_search<'a>(
                     return false;
                 }
                 if !query_lower.is_empty() && path_name.is_none() {
-                    // Plain query: check name/signature directly here for early exit.
+                    // Plain query: cast a wider lexical net over name, signature, body, and metadata.
                     // Path/name queries are handled inside node_passes_filters.
-                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                        || n.signature.to_lowercase().contains(&query_lower);
-                    if !name_match {
+                    if !node_matches_text_query(n, &query_lower, &text_terms) {
                         return false;
                     }
                 }
@@ -587,11 +583,9 @@ async fn flat_code_symbol_search<'a>(
                     return false;
                 }
                 if path_name.is_none() {
-                    // Plain query: check name/signature for early exit.
-                    // Path/name queries are handled inside node_passes_filters.
-                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                        || n.signature.to_lowercase().contains(&query_lower);
-                    if !name_match {
+                    // Plain query: cast the same lexical net for supplements so exact/code-expression
+                    // matches survive embedding misses.
+                    if !node_matches_text_query(n, &query_lower, &text_terms) {
                         return false;
                     }
                 }
@@ -599,11 +593,16 @@ async fn flat_code_symbol_search<'a>(
             })
             .collect();
         if !name_supplements.is_empty() {
-            // Sort supplements by name-match quality, then cap to budget.
+            // Sort supplements by text-match quality, then cap to budget.
             // For path/name queries use only the name part for ranking.
             let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
             let mut sorted_supplements = name_supplements;
-            ranking::sort_symbol_matches(&mut sorted_supplements, sort_key, &graph_state.index);
+            sort_symbol_text_matches(
+                &mut sorted_supplements,
+                sort_key,
+                &text_terms,
+                &graph_state.index,
+            );
             sorted_supplements.truncate(supplement_budget);
             // Evict tail embed results to make room so supplements survive
             // the final truncate(limit).
@@ -654,11 +653,11 @@ async fn flat_code_symbol_search<'a>(
             }
         });
     } else if !used_embed {
-        // Only apply name-match ranking for fallback results; embed results
+        // Only apply text-match ranking for fallback results; embed results
         // are already ranked by the embedding index.
         // For path/name queries use only the name part for ranking.
         let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
-        ranking::sort_symbol_matches(&mut matches, sort_key, &graph_state.index);
+        sort_symbol_text_matches(&mut matches, sort_key, &text_terms, &graph_state.index);
     }
 
     // Cross-encoder reranking: re-score the top candidates using a cross-encoder
@@ -1690,6 +1689,141 @@ fn subsystem_matches(node_subsystem: &str, filter: &str) -> bool {
     false
 }
 
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter_map(|raw| {
+            let term = raw.trim().to_lowercase();
+            if term.len() < 3 {
+                return None;
+            }
+            if matches!(
+                term.as_str(),
+                "add"
+                    | "and"
+                    | "are"
+                    | "but"
+                    | "can"
+                    | "does"
+                    | "for"
+                    | "from"
+                    | "have"
+                    | "how"
+                    | "need"
+                    | "registered"
+                    | "the"
+                    | "this"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "why"
+                    | "with"
+            ) {
+                return None;
+            }
+            Some(term)
+        })
+        .collect()
+}
+
+fn node_search_text_lower(n: &Node) -> String {
+    let mut text = format!(
+        "{} {} {} {} {}",
+        n.id.name,
+        n.signature,
+        n.body,
+        n.id.file.display(),
+        n.language
+    )
+    .to_lowercase();
+    for (key, value) in &n.metadata {
+        text.push(' ');
+        text.push_str(&key.to_lowercase());
+        text.push(' ');
+        text.push_str(&value.to_lowercase());
+    }
+    text
+}
+
+fn symbol_text_match_score(n: &Node, query_lower: &str, terms: &[String]) -> usize {
+    let name = n.id.name.to_lowercase();
+    let signature = n.signature.to_lowercase();
+    if !query_lower.is_empty() {
+        if name == query_lower {
+            return 10_000;
+        }
+        if name.contains(query_lower) {
+            return 8_000;
+        }
+        if signature.contains(query_lower) {
+            return 6_000;
+        }
+        let search_text = node_search_text_lower(n);
+        if search_text.contains(query_lower) {
+            return 7_000;
+        }
+    }
+
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let search_text = node_search_text_lower(n);
+    let matched_term_score: usize = terms
+        .iter()
+        .filter(|term| search_text.contains(term.as_str()))
+        .map(|term| {
+            if term.contains('_') || term.len() >= 12 {
+                2_000
+            } else {
+                100
+            }
+        })
+        .sum();
+    if matched_term_score == 0 {
+        return 0;
+    }
+
+    let name_hits = terms
+        .iter()
+        .filter(|term| name.contains(term.as_str()))
+        .count();
+    let signature_hits = terms
+        .iter()
+        .filter(|term| signature.contains(term.as_str()))
+        .count();
+
+    matched_term_score + name_hits * 250 + signature_hits * 10
+}
+
+fn node_matches_text_query(n: &Node, query_lower: &str, terms: &[String]) -> bool {
+    symbol_text_match_score(n, query_lower, terms) > 0
+}
+
+fn sort_symbol_text_matches(
+    matches: &mut [&Node],
+    query_lower: &str,
+    terms: &[String],
+    index: &GraphIndex,
+) {
+    matches.sort_by(|a, b| {
+        let score_cmp = symbol_text_match_score(b, query_lower, terms)
+            .cmp(&symbol_text_match_score(a, query_lower, terms));
+        if score_cmp != std::cmp::Ordering::Equal {
+            return score_cmp;
+        }
+
+        let mut pair = [*a, *b];
+        ranking::sort_symbol_matches(&mut pair, query_lower, index);
+        if std::ptr::eq(pair[0], *a) {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2231,6 +2365,71 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "process");
+    }
+
+    #[tokio::test]
+    async fn test_flat_search_fallback_body_matching_for_parser_registration() {
+        let mut node = make_node("PYTHON_CONFIG", NodeKind::Const, "src/extract/configs.rs");
+        node.body = r#"pub static PYTHON_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_python::LANGUAGE.into(),
+    language_name: "python",
+};"#
+        .to_string();
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("where is tree_sitter_python::LANGUAGE registered".into()),
+            file: Some("src/extract".into()),
+            language: Some("rust".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "where is tree_sitter_python::LANGUAGE registered",
+            SearchMode::Keyword,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "PYTHON_CONFIG");
+    }
+
+    #[tokio::test]
+    async fn test_flat_search_fallback_compound_query_matches_config_symbol() {
+        let mut lang_config = make_node("LangConfig", NodeKind::Struct, "src/extract/generic.rs");
+        lang_config.body = "pub struct LangConfig { pub language_fn: fn() -> tree_sitter::Language, pub extensions: &'static [&'static str] }".to_string();
+        let unrelated = make_node("ExtractorRegistry", NodeKind::Struct, "src/extract/mod.rs");
+        let gs = make_graph_state(vec![unrelated, lang_config]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("LangConfig language parser tree_sitter extractor suffixes".into()),
+            file: Some("src/extract".into()),
+            language: Some("rust".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "LangConfig language parser tree_sitter extractor suffixes",
+            SearchMode::Keyword,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id.name, "LangConfig");
     }
 
     /// Kind filter works with fallback path.
