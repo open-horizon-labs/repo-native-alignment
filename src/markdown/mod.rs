@@ -387,11 +387,71 @@ pub struct ScoredMarkdownChunk<'a> {
 /// that merely contains the term in a deep subsection.
 ///
 /// Returns results sorted by descending score.
+fn markdown_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter_map(|raw| {
+            let mut term = raw.trim().to_lowercase();
+            if term.len() < 3 {
+                return None;
+            }
+            if matches!(
+                term.as_str(),
+                "add"
+                    | "and"
+                    | "are"
+                    | "but"
+                    | "can"
+                    | "does"
+                    | "for"
+                    | "from"
+                    | "have"
+                    | "how"
+                    | "need"
+                    | "the"
+                    | "this"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "why"
+                    | "with"
+            ) {
+                return None;
+            }
+            if term.ends_with('s') && term.len() > 4 {
+                term.pop();
+            }
+            if term.ends_with("ed") && term.len() > 5 {
+                term.truncate(term.len() - 2);
+            }
+            Some(term)
+        })
+        .collect()
+}
+
+fn text_matches_markdown_term(text: &str, term: &str) -> bool {
+    if text.contains(term) {
+        return true;
+    }
+    let plural = format!("{}s", term);
+    text.contains(&plural)
+}
+
+fn markdown_term_match_count(text: &str, terms: &[String]) -> usize {
+    terms
+        .iter()
+        .filter(|term| text_matches_markdown_term(text, term))
+        .count()
+}
+
 pub fn search_chunks_ranked<'a>(
     chunks: &'a [MarkdownChunk],
     query: &str,
 ) -> Vec<ScoredMarkdownChunk<'a>> {
     let query_lower = query.to_lowercase();
+    let terms = markdown_query_terms(query);
+    let allow_term_fallback = !query.is_empty() && terms.len() >= 3;
 
     let mut scored: Vec<ScoredMarkdownChunk<'a>> = chunks
         .iter()
@@ -402,8 +462,12 @@ pub fn search_chunks_ranked<'a>(
             let heading_match = chunk.heading_hierarchy.iter().any(|h| {
                 let text = h.trim_start_matches('#').trim().to_lowercase();
                 text.contains(&query_lower)
+                    || (allow_term_fallback
+                        && markdown_term_match_count(&text, &terms) == terms.len())
             });
-            let content_match = content_lower.contains(&query_lower);
+            let content_match = content_lower.contains(&query_lower)
+                || (allow_term_fallback
+                    && markdown_term_match_count(&content_lower, &terms) == terms.len());
 
             if !heading_match && !content_match {
                 return None;
@@ -436,16 +500,24 @@ pub fn search_chunks_ranked<'a>(
             }
 
             // Tier 3: Code span match -- cross-reference to a code symbol
-            if chunk
-                .code_spans
-                .iter()
-                .any(|s| s.to_lowercase().contains(&query_lower))
-            {
+            if chunk.code_spans.iter().any(|s| {
+                let s = s.to_lowercase();
+                s.contains(&query_lower)
+                    || (allow_term_fallback && markdown_term_match_count(&s, &terms) == terms.len())
+            }) {
                 score += 0.15; // strong signal for developer queries
             }
 
             // Tier 4: Match density -- capped so long docs don't dominate
-            let occurrence_count = content_lower.matches(&query_lower).count();
+            let occurrence_count = if query_lower.is_empty() {
+                0
+            } else if content_lower.contains(&query_lower) {
+                content_lower.matches(&query_lower).count()
+            } else if allow_term_fallback {
+                markdown_term_match_count(&content_lower, &terms)
+            } else {
+                0
+            };
             let density_bonus = (occurrence_count as f32 * 0.02).min(0.10);
             score += density_bonus;
 
@@ -1415,6 +1487,31 @@ mod tests {
             "Multi-word query should be exact substring match"
         );
         assert_eq!(results[0].chunk.file_path, PathBuf::from("b.md"));
+    }
+
+    #[test]
+    fn test_ranked_stopword_and_inflection_query_matches_heading_terms() {
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("docs/lsp-enrichment.md"),
+            heading_hierarchy: vec!["# What LSP Adds Beyond tree-sitter".to_string()],
+            heading_level: 1,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "LSP adds call hierarchy and cross-file references.".to_string(),
+            byte_offset: 0,
+            byte_len: 55,
+            code_spans: vec![],
+            links: vec![],
+        }];
+
+        let results = search_chunks_ranked(&chunks, "what does LSP add beyond tree-sitter");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].chunk.file_path,
+            PathBuf::from("docs/lsp-enrichment.md")
+        );
     }
 
     /// Heading-contains vs exact: "Config" heading should score higher than

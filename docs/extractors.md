@@ -529,6 +529,12 @@ RNA's built-in extractors run via tree-sitter to produce symbols, import graphs,
 - **Docs & schema/API** — Markdown (heading-aware), .proto, SQL, OpenAPI/JSON Schema, GraphQL
 - **Architecture** — subprocess, network, async boundaries detected as topology edges (Rust extractor)
 
+### Tree-sitter parser support policy
+
+Do we need to manually add parsers? Yes. The upstream tree-sitter parser list is a candidate catalog, not automatic RNA support. A language is supported only after its parser crate is packaged, the extractor is registered and configured, the behavior is tested with expected symbols/edges, and search/MCP delivery exposes the facts.
+
+Packaged parser dependencies live in `Cargo.toml`. Parser registration and language configuration live in the language extractor modules and `src/extract/configs.rs`; for example, Python support uses `tree_sitter_python::LANGUAGE` in `src/extract/python.rs`. Registry coverage is exposed through `ExtractorRegistry` and the `languages()` methods.
+
 ### Constants and literals (cross-language)
 
 Built-in extractors index constants and literal values where the parser exposes them. `search` returns the value inline:
