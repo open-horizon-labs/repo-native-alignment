@@ -520,7 +520,15 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
         deleted_files: Vec::new(),
         scan_duration: std::time::Duration::ZERO,
     };
-    let initial_extraction = registry.extract_scan_result(&temp_dir, &initial_scan);
+    let primary_slug = crate::roots::RootConfig::code_project(temp_dir.clone()).slug();
+    let mut initial_extraction = registry.extract_scan_result(&temp_dir, &initial_scan);
+    for node in &mut initial_extraction.nodes {
+        node.id.root = primary_slug.clone();
+    }
+    for edge in &mut initial_extraction.edges {
+        edge.from.root = primary_slug.clone();
+        edge.to.root = primary_slug.clone();
+    }
     let initial_nodes = initial_extraction.nodes;
     let initial_edges = initial_extraction.edges;
 
@@ -558,17 +566,24 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
     }
 
     // Step 4: Simulate what update_graph_incrementally does:
-    //   files_to_remove = [fixture_path] (it's a "changed" file)
+    //   files_to_remove = [(primary_slug, fixture_path)] (it's a "changed" file)
     //   deleted_edge_ids = [] (no edges in this test)
     //   upsert = extraction of updated file
-    let files_to_remove = vec![fixture_path.clone()];
+    let files_to_remove = vec![(primary_slug.clone(), fixture_path.clone())];
     let update_scan = crate::scanner::ScanResult {
         changed_files: vec![fixture_path.clone()],
         new_files: Vec::new(),
         deleted_files: Vec::new(),
         scan_duration: std::time::Duration::ZERO,
     };
-    let update_extraction = registry.extract_scan_result(&temp_dir, &update_scan);
+    let mut update_extraction = registry.extract_scan_result(&temp_dir, &update_scan);
+    for node in &mut update_extraction.nodes {
+        node.id.root = primary_slug.clone();
+    }
+    for edge in &mut update_extraction.edges {
+        edge.from.root = primary_slug.clone();
+        edge.to.root = primary_slug.clone();
+    }
     let upsert_nodes = update_extraction.nodes;
     let upsert_edges = update_extraction.edges;
 

@@ -158,24 +158,64 @@ impl RnaHandler {
     /// Tool calls never block on a write lock — they always see the last
     /// complete graph snapshot (#574).
     pub(crate) async fn get_graph(&self) -> anyhow::Result<Arc<GraphState>> {
-        // Fast path: graph exists and scan cooldown hasn't expired.
+        // Fast path: if a graph exists, scan for changes. The scanner is cheap
+        // relative to MCP timeout budgets, and skipping it for a cooldown window
+        // makes rapid add/change/delete edits invisible to agents.
         // ArcSwap load is an atomic pointer read — zero blocking.
         let current = self.graph.load_full();
-        if let Some(ref gs) = *current {
-            let skip_scan = {
-                let last = self.last_scan.lock().unwrap();
-                last.elapsed() < std::time::Duration::from_secs(2)
+        if current.is_some() {
+            // Serialize only foreground tree-sitter refreshes so two MCP requests
+            // cannot publish fast snapshots out of order. This lock is separate from
+            // graph_build_lock; background enrichment must not block foreground search.
+            let _incremental_guard = self.incremental_update_lock.lock().await;
+            let current = self.graph.load_full();
+            let Some(ref gs) = *current else {
+                anyhow::bail!("graph snapshot disappeared during incremental refresh");
             };
-            if skip_scan {
-                return Ok(Arc::clone(gs));
-            }
 
             // Check for changes via scanner
             let mut scanner = Scanner::new(self.repo_root.clone())?;
             let scan = scanner.scan()?;
+            let missing_graph_files: Vec<(String, PathBuf)> = {
+                let root_paths: std::collections::HashMap<String, PathBuf> =
+                    WorkspaceConfig::load()
+                        .with_primary_root(self.repo_root.clone())
+                        .with_worktrees(&self.repo_root)
+                        .with_declared_roots(&self.repo_root)
+                        .resolved_roots()
+                        .into_iter()
+                        .map(|root| (root.slug, root.path))
+                        .collect();
+                let graph_files: std::collections::HashSet<(String, PathBuf)> = gs
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        !matches!(n.id.kind, NodeKind::PrMerge)
+                            && !matches!(&n.id.kind, NodeKind::Other(kind) if matches!(
+                                kind.as_str(),
+                                "subsystem" | "framework" | "channel" | "event"
+                            ))
+                    })
+                    .map(|n| (n.id.root.clone(), n.id.file.clone()))
+                    .filter(|(_, f)| !f.as_os_str().is_empty())
+                    .collect();
+                graph_files
+                    .into_iter()
+                    .filter_map(|(root, file)| {
+                        let root_path = root_paths.get(&root)?;
+                        let absolute = if file.is_absolute() {
+                            file.clone()
+                        } else {
+                            root_path.join(&file)
+                        };
+                        (!absolute.exists()).then_some((root, file))
+                    })
+                    .collect()
+            };
             if scan.changed_files.is_empty()
                 && scan.new_files.is_empty()
                 && scan.deleted_files.is_empty()
+                && missing_graph_files.is_empty()
             {
                 // No changes -- safe to commit state (records current mtimes)
                 scanner.commit_state()?;
@@ -190,15 +230,18 @@ impl RnaHandler {
             // 2. Apply to cloned graph, ArcSwap immediately
             // 3. Spawn full pipeline (LSP, passes, PageRank, embed, persist) as background task
             // 4. Return immediately with tree-sitter results
-            let _build_guard = self.graph_build_lock.lock().await;
-            // Re-check after acquiring lock — another call may have already updated.
+            //
+            // Do not await graph_build_lock here. A background enrichment pipeline may
+            // legitimately hold it for minutes; foreground incremental refresh must
+            // still publish a tree-sitter snapshot immediately so MCP tools do not time out.
+            let build_guard = self.graph_build_lock.try_lock().ok();
+            // Re-check after opportunistically taking the build lock. A background
+            // full pipeline may have published a newer graph while this foreground
+            // refresh was scanning; if so, do not publish stale scan results.
             let current2 = self.graph.load_full();
             if let Some(ref gs2) = *current2
                 && !Arc::ptr_eq(gs, gs2)
             {
-                // Graph was updated while we waited for the lock.
-                scanner.commit_state()?;
-                *self.last_scan.lock().unwrap() = std::time::Instant::now();
                 return Ok(Arc::clone(gs2));
             }
 
@@ -207,20 +250,28 @@ impl RnaHandler {
             let registry = ExtractorRegistry::with_builtins();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
 
-            // Remove nodes/edges for deleted + changed files
-            let files_to_remove: Vec<PathBuf> = scan
+            // Remove nodes/edges for any touched file before re-extracting. Include
+            // `new_files`: if a file was added and then modified before scanner state
+            // was committed, it is still classified as new but may already exist in
+            // the foreground fast graph. Include missing graph files for the matching
+            // delete-before-commit case, where the scanner never saw the transient file.
+            let primary_touched_files = scan
                 .deleted_files
                 .iter()
                 .chain(scan.changed_files.iter())
+                .chain(scan.new_files.iter())
                 .cloned()
-                .collect();
+                .map(|file| (primary_slug.clone(), file));
+            let files_to_remove: std::collections::HashSet<(String, PathBuf)> =
+                primary_touched_files
+                    .chain(missing_graph_files.iter().cloned())
+                    .collect();
             fast_state
                 .nodes
-                .retain(|n| !files_to_remove.contains(&n.id.file));
+                .retain(|n| !files_to_remove.contains(&(n.id.root.clone(), n.id.file.clone())));
             fast_state.edges.retain(|e| {
-                !files_to_remove
-                    .iter()
-                    .any(|f| e.from.file == *f || e.to.file == *f)
+                !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                    && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
             });
 
             // Extract new + changed files via tree-sitter
@@ -252,6 +303,13 @@ impl RnaHandler {
                     .ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
 
+            let current_before_fast_store = self.graph.load_full();
+            if let Some(ref current_gs) = *current_before_fast_store
+                && !Arc::ptr_eq(current_gs, gs)
+            {
+                return Ok(Arc::clone(current_gs));
+            }
+
             // Atomic swap: tool calls see tree-sitter results immediately
             let fast_arc = Arc::new(fast_state);
             self.graph.store(Arc::new(Some(Arc::clone(&fast_arc))));
@@ -265,17 +323,21 @@ impl RnaHandler {
                 let handler_graph = Arc::clone(&self.graph);
                 let repo_root = self.repo_root.clone();
                 let fast_arc_for_check = Arc::clone(&fast_arc);
+                let missing_graph_files = missing_graph_files.clone();
                 let scan_stats = Arc::clone(&self.scan_stats);
                 let lance_write_lock = Arc::clone(&self.lance_write_lock);
                 let embed_index = Arc::clone(&self.embed_index);
                 let lsp_status = Arc::clone(&self.lsp_status);
                 let graph_build_lock = Arc::clone(&self.graph_build_lock);
+                let incremental_update_lock = Arc::clone(&self.incremental_update_lock);
                 // Clone the pre-fast-path graph so the full pipeline starts from
                 // the same base state (with all existing LSP edges, PageRank, etc.)
                 let base_state = (**gs).clone();
-                // Release the build lock before spawning so the background task
-                // can re-acquire it. The fast graph is already swapped in.
-                drop(_build_guard);
+                // Release the opportunistic fast-path guard before spawning so the
+                // background task can serialize full enrichment work. If no guard was
+                // available, the fast snapshot has still been published and this task
+                // will wait in the background instead of blocking the tool call.
+                drop(build_guard);
                 tokio::spawn(async move {
                     tracing::info!(
                         "Spawned background incremental pipeline: {} changed, {} new, {} deleted",
@@ -292,13 +354,12 @@ impl RnaHandler {
                     if let Some(ref current_gs) = *current_snap
                         && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
                     {
-                        // Another update happened; skip this pipeline run.
+                        // A newer fast snapshot was published while this background task
+                        // was waiting. Do not commit this older scanner state; the latest
+                        // background task must persist the final observed filesystem state.
                         tracing::info!(
-                            "Background incremental pipeline: graph already updated, skipping"
+                            "Background incremental pipeline: graph already superseded before enrichment; skipping"
                         );
-                        if let Err(e) = scanner.commit_state() {
-                            tracing::error!("Failed to commit scanner state: {}", e);
-                        }
                         return;
                     }
 
@@ -306,30 +367,33 @@ impl RnaHandler {
                     let mut full_state = base_state;
                     let primary_slug = RootConfig::code_project(repo_root.clone()).slug();
 
-                    // Remove nodes/edges for deleted + changed files (same as fast path)
-                    let files_to_remove: Vec<PathBuf> = scan
+                    // Remove nodes/edges for any touched file before re-extracting (same as fast path).
+                    let primary_touched_files = scan
                         .deleted_files
                         .iter()
                         .chain(scan.changed_files.iter())
+                        .chain(scan.new_files.iter())
                         .cloned()
-                        .collect();
+                        .map(|file| (primary_slug.clone(), file));
+                    let files_to_remove: std::collections::HashSet<(String, PathBuf)> =
+                        primary_touched_files
+                            .chain(missing_graph_files.iter().cloned())
+                            .collect();
                     let deleted_edge_ids: Vec<String> = full_state
                         .edges
                         .iter()
                         .filter(|e| {
-                            files_to_remove
-                                .iter()
-                                .any(|f| e.from.file == *f || e.to.file == *f)
+                            files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                                || files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
                         })
                         .map(|e| e.stable_id())
                         .collect();
-                    full_state
-                        .nodes
-                        .retain(|n| !files_to_remove.contains(&n.id.file));
+                    full_state.nodes.retain(|n| {
+                        !files_to_remove.contains(&(n.id.root.clone(), n.id.file.clone()))
+                    });
                     full_state.edges.retain(|e| {
-                        !files_to_remove
-                            .iter()
-                            .any(|f| e.from.file == *f || e.to.file == *f)
+                        !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                            && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
                     });
 
                     // Extract new + changed files
@@ -367,10 +431,11 @@ impl RnaHandler {
                         full_state.edges.iter().map(|e| e.stable_id()).collect();
 
                     // Pre-clean: remove stale virtual nodes before passes
-                    let stale_virtual_files: Vec<std::path::PathBuf> = full_state.nodes
+                    let stale_virtual_files: Vec<(String, PathBuf)> = full_state
+                        .nodes
                         .iter()
                         .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")))
-                        .map(|n| n.id.file.clone())
+                        .map(|n| (n.id.root.clone(), n.id.file.clone()))
                         .collect();
                     full_state.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
                     full_state.edges.retain(|e| {
@@ -379,8 +444,19 @@ impl RnaHandler {
                             && e.kind != crate::graph::EdgeKind::Produces
                             && e.kind != crate::graph::EdgeKind::Consumes
                     });
-                    let mut files_to_remove_all: Vec<PathBuf> = files_to_remove;
+                    let mut files_to_remove_all: Vec<(String, PathBuf)> =
+                        files_to_remove.into_iter().collect();
                     files_to_remove_all.extend(stale_virtual_files);
+
+                    let current_before_enrichment = handler_graph.load_full();
+                    if let Some(ref current_gs) = *current_before_enrichment
+                        && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                    {
+                        tracing::info!(
+                            "Background incremental pipeline: newer graph published before enrichment; skipping"
+                        );
+                        return;
+                    }
 
                     // Run enrichment pipeline via EventBus (LSP, passes, framework detection)
                     let root_pairs: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
@@ -441,9 +517,6 @@ impl RnaHandler {
                                     "Background incremental pipeline: enrichment failed: {:#}",
                                     e
                                 );
-                                if let Err(e) = scanner.commit_state() {
-                                    tracing::error!("Failed to commit scanner state: {}", e);
-                                }
                                 return;
                             }
                         }
@@ -626,6 +699,20 @@ impl RnaHandler {
                         }
                     }
 
+                    // A newer foreground refresh may have published another fast snapshot
+                    // while this full pipeline was running. If so, discard this stale result
+                    // before persisting or swapping so older file contents cannot overwrite
+                    // newer incremental updates.
+                    let current_snap = handler_graph.load_full();
+                    if let Some(ref current_gs) = *current_snap
+                        && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                    {
+                        tracing::info!(
+                            "Background incremental pipeline: newer graph published; discarding stale result"
+                        );
+                        return;
+                    }
+
                     // Build upsert data with post-PageRank importance scores
                     let upsert_nodes: Vec<Node> = full_state
                         .nodes
@@ -634,9 +721,21 @@ impl RnaHandler {
                         .cloned()
                         .collect();
 
-                    // Persist to LanceDB
+                    // Persist to LanceDB. Re-check while holding the write lock so a
+                    // stale background task cannot write after a newer fast snapshot
+                    // has already been published and is waiting to persist.
+                    let _foreground_guard = incremental_update_lock.lock().await;
                     let persist_result = {
                         let _lance_guard = lance_write_lock.lock().await;
+                        let current_before_persist = handler_graph.load_full();
+                        if let Some(ref current_gs) = *current_before_persist
+                            && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                        {
+                            tracing::info!(
+                                "Background incremental pipeline: newer graph published before persist; discarding stale result"
+                            );
+                            return;
+                        }
                         persist_graph_incremental(
                             &repo_root,
                             &upsert_nodes,
@@ -649,6 +748,15 @@ impl RnaHandler {
                     let persist_ok = match persist_result {
                         Ok(true) => {
                             let _lance_guard = lance_write_lock.lock().await;
+                            let current_before_full_persist = handler_graph.load_full();
+                            if let Some(ref current_gs) = *current_before_full_persist
+                                && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                            {
+                                tracing::info!(
+                                    "Background incremental pipeline: newer graph published before full persist; discarding stale result"
+                                );
+                                return;
+                            }
                             match persist_graph_to_lance(
                                 &repo_root,
                                 &full_state.nodes,
@@ -669,6 +777,16 @@ impl RnaHandler {
                             false
                         }
                     };
+
+                    let current_before_commit = handler_graph.load_full();
+                    if let Some(ref current_gs) = *current_before_commit
+                        && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                    {
+                        tracing::info!(
+                            "Background incremental pipeline: newer graph published after persist; skipping stale commit/swap"
+                        );
+                        return;
+                    }
 
                     if persist_ok && let Err(e) = scanner.commit_state() {
                         tracing::error!("Failed to commit scanner state: {}", e);
@@ -1851,13 +1969,16 @@ impl RnaHandler {
 
         let registry = ExtractorRegistry::with_builtins();
 
+        let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
         // Remove nodes/edges for deleted + changed files.
         // HashSet for O(1) lookup instead of O(F) Vec scan per edge (#586).
-        let mut files_to_remove: std::collections::HashSet<PathBuf> = scan
+        let mut files_to_remove: std::collections::HashSet<(String, PathBuf)> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
+            .chain(scan.new_files.iter())
             .cloned()
+            .map(|file| (primary_slug.clone(), file))
             .collect();
 
         // Collect edge stable IDs for removed/changed files BEFORE retain, so we can
@@ -1866,16 +1987,18 @@ impl RnaHandler {
             .edges
             .iter()
             .filter(|e| {
-                files_to_remove.contains(&e.from.file) || files_to_remove.contains(&e.to.file)
+                files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                    || files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
             })
             .map(|e| e.stable_id())
             .collect();
 
         graph
             .nodes
-            .retain(|n| !files_to_remove.contains(&n.id.file));
+            .retain(|n| !files_to_remove.contains(&(n.id.root.clone(), n.id.file.clone())));
         graph.edges.retain(|e| {
-            !files_to_remove.contains(&e.from.file) && !files_to_remove.contains(&e.to.file)
+            !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
         });
 
         // Extract new + changed files
@@ -1885,7 +2008,6 @@ impl RnaHandler {
         // Set root slug on extracted nodes and edges.
         // Extractors don't set root -- the caller must assign it, matching the
         // pattern in build_full_graph and the background scanner.
-        let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
 
         // Merge encoding stats (incremental scan: add to existing totals).
         if let Ok(mut stats) = self.scan_stats.write() {
@@ -1946,13 +2068,13 @@ impl RnaHandler {
         // re-emits fresh framework nodes with correct state.
         // Collect virtual file paths for LanceDB deletion — these will be added to
         // files_to_remove so the old rows are removed from LanceDB on persist.
-        let stale_virtual_files: Vec<std::path::PathBuf> = graph
+        let stale_virtual_files: Vec<(String, PathBuf)> = graph
             .nodes
             .iter()
             .filter(|n| {
                 matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
             })
-            .map(|n| n.id.file.clone())
+            .map(|n| (n.id.root.clone(), n.id.file.clone()))
             .collect();
         graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
         graph.edges.retain(|e| {
@@ -2265,7 +2387,7 @@ impl RnaHandler {
         // failure, so the next scan re-detects and retries the persist.
         let persist_result = {
             let _lance_guard = self.lance_write_lock.lock().await;
-            let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
+            let files_to_remove_vec: Vec<(String, PathBuf)> = files_to_remove.into_iter().collect();
             persist_graph_incremental(
                 &self.repo_root,
                 &upsert_nodes,

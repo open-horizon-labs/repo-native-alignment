@@ -125,6 +125,12 @@ pub struct RnaHandler {
     pub prewarm_notify: Arc<tokio::sync::Notify>,
     /// Whether a pre-warm task has been started.
     pub prewarm_started: std::sync::atomic::AtomicBool,
+    /// Serializes fast foreground snapshots with background finalization.
+    ///
+    /// This deliberately does not serialize foreground refresh behind long LSP
+    /// enrichment. Background work takes it only for the short persist/commit/swap
+    /// finalization window so stale pipeline results cannot overwrite newer snapshots.
+    pub incremental_update_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes graph build/update operations in `get_graph()`.
     /// With ArcSwap, reads are lock-free but concurrent builds must be serialized
     /// to avoid duplicate work (two tool calls both detecting "no graph" and both
@@ -157,6 +163,7 @@ impl Default for RnaHandler {
             lsp_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::new(tokio::sync::Notify::new()),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            incremental_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             graph_build_lock: Arc::new(tokio::sync::Mutex::new(())),
             graph_build_status: Arc::new(GraphBuildStatus::default()),
         }
@@ -191,6 +198,7 @@ impl RnaHandler {
             lsp_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::clone(&self.prewarm_notify),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            incremental_update_lock: Arc::clone(&self.incremental_update_lock),
             graph_build_lock: Arc::clone(&self.graph_build_lock),
             graph_build_status: Arc::clone(&self.graph_build_status),
         }
@@ -597,6 +605,243 @@ mod tests {
             let age = gs.last_scan_completed_at.unwrap().elapsed();
             assert!(age < std::time::Duration::from_secs(5));
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_graph_incremental_update_does_not_wait_for_background_lock() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn original_function() {}\n").unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        let initial = handler.get_graph().await.unwrap();
+        assert!(
+            initial
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "original_function")
+        );
+        drop(initial);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn nonblocking_replacement_function() {}\n",
+        )
+        .unwrap();
+
+        {
+            let mut last = handler.last_scan.lock().unwrap();
+            *last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        }
+
+        let background_guard = handler.graph_build_lock.lock().await;
+        let updated =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect(
+                    "incremental tree-sitter refresh must not wait for background enrichment lock",
+                )
+                .expect("get_graph should succeed while background lock is held");
+        drop(background_guard);
+
+        assert!(
+            updated
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "nonblocking_replacement_function"),
+            "foreground fast graph should include the updated symbol"
+        );
+        assert!(
+            !updated
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "original_function"),
+            "foreground fast graph should remove the stale symbol"
+        );
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn immediate_second_replacement_function() {}\n",
+        )
+        .unwrap();
+        let second_update =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect("rapid follow-up edit must not be hidden by a scan cooldown")
+                .expect("get_graph should succeed for rapid follow-up edit");
+        assert!(
+            second_update
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "immediate_second_replacement_function"),
+            "foreground fast graph should include the rapid follow-up symbol"
+        );
+        assert!(
+            !second_update
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "nonblocking_replacement_function"),
+            "foreground fast graph should remove the previous rapid symbol"
+        );
+
+        std::fs::write(
+            root.join("src/new_file.rs"),
+            "pub fn rapid_new_file_alpha() {}\n",
+        )
+        .unwrap();
+        let new_file_add =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect("new file add should be visible without waiting for background persistence")
+                .expect("get_graph should succeed for new file add");
+        assert!(
+            new_file_add
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "rapid_new_file_alpha"),
+            "foreground fast graph should include the new-file symbol"
+        );
+
+        std::fs::write(
+            root.join("src/new_file.rs"),
+            "pub fn rapid_new_file_beta() {}\n",
+        )
+        .unwrap();
+        let new_file_modify =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect("new file modify should replace the previous fast snapshot immediately")
+                .expect("get_graph should succeed for new file modify");
+        assert!(
+            new_file_modify
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "rapid_new_file_beta"),
+            "foreground fast graph should include the modified new-file symbol"
+        );
+        assert!(
+            !new_file_modify
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "rapid_new_file_alpha"),
+            "foreground fast graph should remove the stale new-file symbol"
+        );
+
+        std::fs::remove_file(root.join("src/new_file.rs")).unwrap();
+        let new_file_delete =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect("new file delete should remove the fast snapshot immediately")
+                .expect("get_graph should succeed for new file delete");
+        assert!(
+            !new_file_delete
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "rapid_new_file_beta"),
+            "foreground fast graph should remove the deleted new-file symbol"
+        );
+
+        let mut graph_with_other = (*new_file_delete).clone();
+        graph_with_other.nodes.push(crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: crate::roots::RootConfig::code_project(root.to_path_buf()).slug(),
+                file: std::path::PathBuf::from("src/other_only.graphql"),
+                name: "TransientGraphqlType".to_string(),
+                kind: crate::graph::NodeKind::Other("graphql_type".to_string()),
+            },
+            language: "graphql".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "type TransientGraphqlType".to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        });
+        handler
+            .graph
+            .store(std::sync::Arc::new(Some(std::sync::Arc::new(
+                graph_with_other,
+            ))));
+        let other_cleanup =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect("missing real file-backed Other nodes should be cleaned immediately")
+                .expect("get_graph should succeed for Other-node cleanup");
+        assert!(
+            !other_cleanup
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "TransientGraphqlType"),
+            "foreground fast graph should remove stale real file-backed Other nodes"
+        );
+
+        let mut graph_with_exclusions = (*other_cleanup).clone();
+        graph_with_exclusions.nodes.push(crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: "unknown-declared-root".to_string(),
+                file: std::path::PathBuf::from("src/other_only.graphql"),
+                name: "UnknownRootGraphqlType".to_string(),
+                kind: crate::graph::NodeKind::Other("graphql_type".to_string()),
+            },
+            language: "graphql".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "type UnknownRootGraphqlType".to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        });
+        graph_with_exclusions.nodes.push(crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: crate::roots::RootConfig::code_project(root.to_path_buf()).slug(),
+                file: std::path::PathBuf::from("subsystems/transient-subsystem"),
+                name: "transient-subsystem".to_string(),
+                kind: crate::graph::NodeKind::Other("subsystem".to_string()),
+            },
+            language: String::new(),
+            line_start: 0,
+            line_end: 0,
+            signature: String::new(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        });
+        handler
+            .graph
+            .store(std::sync::Arc::new(Some(std::sync::Arc::new(
+                graph_with_exclusions,
+            ))));
+        let exclusion_cleanup =
+            tokio::time::timeout(std::time::Duration::from_millis(250), handler.get_graph())
+                .await
+                .expect(
+                    "virtual Other and unknown-root nodes should not trigger missing-file cleanup",
+                )
+                .expect("get_graph should succeed for exclusion cleanup");
+        assert!(
+            exclusion_cleanup
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "UnknownRootGraphqlType"),
+            "unknown-root nodes should not be resolved against the primary root"
+        );
+        assert!(
+            exclusion_cleanup
+                .nodes
+                .iter()
+                .any(|n| n.id.name == "transient-subsystem"),
+            "virtual Other subsystem nodes should be excluded from missing-file cleanup"
+        );
     }
 
     #[tokio::test]

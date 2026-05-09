@@ -266,13 +266,13 @@ pub(crate) async fn compact_stale_versions(
 /// - `upsert_edges`: only the changed or newly added edges (not the full graph)
 /// - `deleted_edge_ids`: stable IDs of edges that reference removed/changed files -- collected
 ///   before the in-memory retain step in `update_graph_incrementally`
-/// - `deleted_files`: file paths whose symbols should be deleted from LanceDB
+/// - `deleted_files`: `(root_id, file_path)` pairs whose symbols should be deleted from LanceDB
 pub(crate) async fn persist_graph_incremental(
     repo_root: &Path,
     upsert_nodes: &[Node],
     upsert_edges: &[Edge],
     deleted_edge_ids: &[String],
-    deleted_files: &[PathBuf],
+    deleted_files: &[(String, PathBuf)],
 ) -> anyhow::Result<bool> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
@@ -308,11 +308,17 @@ pub(crate) async fn persist_graph_incremental(
         if !deleted_files.is_empty()
             && let Ok(tbl) = db.open_table("symbols").execute().await
         {
-            let quoted: Vec<String> = deleted_files
+            let predicates: Vec<String> = deleted_files
                 .iter()
-                .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+                .map(|(root, path)| {
+                    format!(
+                        "(root_id = '{}' AND file_path = '{}')",
+                        root.replace('\'', "''"),
+                        path.display().to_string().replace('\'', "''")
+                    )
+                })
                 .collect();
-            let predicate = format!("file_path IN ({})", quoted.join(", "));
+            let predicate = predicates.join(" OR ");
             if let Err(e) = tbl.delete(&predicate).await {
                 tracing::warn!("Failed to delete symbols for removed files: {}", e);
             }
