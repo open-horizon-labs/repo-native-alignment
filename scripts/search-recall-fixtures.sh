@@ -41,12 +41,24 @@ PY
 run_search() {
   local query="$1" mode="$2" limit="$3" outfile="$4"
   shift 4
-  "$RNA_BIN" search "$query" \
+  local status=0
+  if "$RNA_BIN" search "$query" \
     --repo "$RNA_REPO" \
     --search-mode "$mode" \
     --limit "$limit" \
     --compact \
-    "$@" >"$outfile" 2>&1
+    "$@" >"$outfile" 2>&1; then
+    return 0
+  else
+    status=$?
+    {
+      printf '\nERROR: search probe failed with exit code %s\n' "$status"
+      printf 'query=%s mode=%s limit=%s\n' "$query" "$mode" "$limit"
+    } >>"$outfile"
+    printf 'Search probe failed: query=%s mode=%s exit=%s\n' "$query" "$mode" "$status" >&2
+    fail_count=$((fail_count + 1))
+    return 0
+  fi
 }
 
 contains_in_section() {

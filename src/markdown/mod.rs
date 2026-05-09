@@ -480,8 +480,6 @@ pub fn search_chunks_ranked<'a>(
                 let exact_heading = chunk.heading_hierarchy.iter().any(|h| {
                     let text = h.trim_start_matches('#').trim().to_lowercase();
                     text == query_lower
-                        || (allow_term_fallback
-                            && markdown_term_match_count(&text, &terms) == terms.len())
                 });
                 if exact_heading {
                     score += 1.0; // Section is *about* this term

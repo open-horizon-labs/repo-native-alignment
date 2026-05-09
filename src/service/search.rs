@@ -4,7 +4,7 @@
 //! `search_flat`, `search_traversal`, or `search_batch` depending on the
 //! parameters supplied by the caller.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
 use crate::graph::index::GraphIndex;
@@ -540,12 +540,12 @@ async fn flat_code_symbol_search<'a>(
         Vec::new()
     };
 
-    // Supplement or fallback: text matching over name/signature/body/metadata.
+    // Supplement or fallback: structured text matching over symbol declarations.
     //
     // The wide-net stage must retrieve known facts before ranking can help.
     // Exact name/signature matches still dominate, but compound capability-style
-    // queries also match individual high-signal terms against the node body and
-    // metadata so constants such as `tree_sitter_python::LANGUAGE` are searchable.
+    // queries also match high-signal terms against non-function declaration text
+    // and extraction metadata. Function bodies stay out of generic symbol search.
     let text_terms = query_terms(query_str);
     if !used_embed {
         matches = graph_state
@@ -1729,14 +1729,32 @@ fn query_terms(query: &str) -> Vec<String> {
 
 fn node_search_text_lower(n: &Node) -> String {
     let mut text = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {}",
         n.id.name,
         n.signature,
-        n.body,
         n.id.file.display(),
         n.language
     )
     .to_lowercase();
+    if matches!(
+        n.id.kind,
+        NodeKind::Struct
+            | NodeKind::Trait
+            | NodeKind::Enum
+            | NodeKind::TypeAlias
+            | NodeKind::Const
+            | NodeKind::ProtoMessage
+            | NodeKind::SqlTable
+            | NodeKind::ApiEndpoint
+            | NodeKind::Macro
+            | NodeKind::Field
+            | NodeKind::EnumVariant
+            | NodeKind::Other(_)
+    ) && !n.body.is_empty()
+    {
+        text.push(' ');
+        text.push_str(&n.body.to_lowercase());
+    }
     for (key, value) in &n.metadata {
         text.push(' ');
         text.push_str(&key.to_lowercase());
@@ -1807,9 +1825,27 @@ fn sort_symbol_text_matches(
     terms: &[String],
     index: &GraphIndex,
 ) {
+    let scores: HashMap<*const Node, usize> = matches
+        .iter()
+        .map(|node| {
+            (
+                *node as *const Node,
+                symbol_text_match_score(node, query_lower, terms),
+            )
+        })
+        .collect();
+
     matches.sort_by(|a, b| {
-        let score_cmp = symbol_text_match_score(b, query_lower, terms)
-            .cmp(&symbol_text_match_score(a, query_lower, terms));
+        let score_cmp = scores
+            .get(&(*b as *const Node))
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &scores
+                    .get(&(*a as *const Node))
+                    .copied()
+                    .unwrap_or_default(),
+            );
         if score_cmp != std::cmp::Ordering::Equal {
             return score_cmp;
         }

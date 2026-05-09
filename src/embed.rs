@@ -539,8 +539,8 @@ pub struct SearchResult {
 
 impl SearchResult {
     pub fn to_markdown(&self) -> String {
-        let snippet = if self.body.len() > 200 {
-            format!("{}...", &self.body[..200])
+        let snippet = if self.body.chars().count() > 200 {
+            format!("{}...", truncate_chars(&self.body, 200))
         } else {
             self.body.clone()
         };
@@ -1753,11 +1753,27 @@ impl EmbeddingIndex {
 mod tests {
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
-        EmbeddingIndex, SearchFilters, build_artifact_embedding_text, build_code_embedding_text,
-        node_embedding_kind, node_embedding_text, node_embedding_title, node_scalar_filters,
-        truncate_chars,
+        EmbeddingIndex, SearchFilters, SearchResult, build_artifact_embedding_text,
+        build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
+        node_scalar_filters, truncate_chars,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn search_result_markdown_truncates_on_char_boundary() {
+        let result = SearchResult {
+            id: "abc123".into(),
+            kind: "commit".into(),
+            title: "unicode body".into(),
+            body: format!("{}—tail", "a".repeat(199)),
+            score: 1.0,
+        };
+
+        let markdown = result.to_markdown();
+
+        assert!(markdown.contains("..."));
+        assert!(markdown.contains("Hash: `abc123`"));
+    }
 
     // ── Adversarial: has_table ──────────────────────────────────────
 
