@@ -26,7 +26,7 @@ pub(super) type LanceDelta = (
     Vec<Node>,
     Vec<Edge>,
     Vec<String>,
-    HashSet<PathBuf>,
+    HashSet<(String, PathBuf)>,
 );
 
 /// Result of scanning all workspace roots for file changes.
@@ -151,11 +151,13 @@ pub(super) async fn update_graph(
             scan.new_files.len(),
             scan.deleted_files.len()
         );
-        let files_to_remove: HashSet<PathBuf> = scan
+        let files_to_remove: HashSet<(String, PathBuf)> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
+            .chain(scan.new_files.iter())
             .cloned()
+            .map(|file| (root_slug.clone(), file))
             .collect();
 
         // Collect edge IDs to delete BEFORE retain.
@@ -163,20 +165,18 @@ pub(super) async fn update_graph(
             .edges
             .iter()
             .filter(|e| {
-                e.from.root == *root_slug
-                    && (files_to_remove.contains(&e.from.file)
-                        || files_to_remove.contains(&e.to.file))
+                files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                    || files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
             })
             .map(|e| e.stable_id())
             .collect();
 
         graph_state
             .nodes
-            .retain(|n| n.id.root != *root_slug || !files_to_remove.contains(&n.id.file));
+            .retain(|n| !files_to_remove.contains(&(n.id.root.clone(), n.id.file.clone())));
         graph_state.edges.retain(|e| {
-            e.from.root != *root_slug
-                || (!files_to_remove.contains(&e.from.file)
-                    && !files_to_remove.contains(&e.to.file))
+            !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
+                && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
         });
         let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
 
@@ -370,7 +370,7 @@ pub(super) async fn persist_deltas(
     {
         let persist_result = {
             let _lance_guard = lance_write_lock.lock().await;
-            let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
+            let files_to_remove_vec: Vec<(String, PathBuf)> = files_to_remove.into_iter().collect();
             persist_graph_incremental(
                 &root_path,
                 &upsert_nodes,
