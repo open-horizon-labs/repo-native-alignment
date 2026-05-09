@@ -12,7 +12,33 @@ pub mod oh;
 pub mod process;
 pub mod query;
 pub mod ranking;
+#[cfg(feature = "embeddings")]
 pub mod rerank;
+#[cfg(not(feature = "embeddings"))]
+pub mod rerank {
+    use anyhow::{Result, anyhow};
+
+    #[derive(Debug)]
+    pub struct RerankCandidate {
+        pub text: String,
+        pub original_index: usize,
+    }
+
+    #[derive(Debug)]
+    pub struct RerankedResult {
+        pub original_index: usize,
+        pub score: f32,
+    }
+
+    pub fn rerank_results(
+        _query: &str,
+        _candidates: &[RerankCandidate],
+    ) -> Result<Vec<RerankedResult>> {
+        Err(anyhow!(
+            "rerank support is not compiled in; rebuild with --features embeddings"
+        ))
+    }
+}
 pub mod roots;
 pub mod scanner;
 pub mod server;

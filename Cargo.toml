@@ -65,12 +65,12 @@ lancedb = "0.26"
 arrow-array = "57"
 arrow-schema = "57"
 
-# Local embeddings — Metal GPU on Apple Silicon, CPU fallback
-metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", default-features = false, features = ["embeddings"] }
-candle-core = { version = "0.9" }
+# Optional local embeddings — Metal GPU on Apple Silicon, CPU fallback
+metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", default-features = false, features = ["embeddings"], optional = true }
+candle-core = { version = "0.9", optional = true }
 
-# Cross-encoder reranking (ONNX runtime, CPU inference)
-fastembed = "5"
+# Optional cross-encoder reranking (ONNX runtime, CPU inference)
+fastembed = { version = "5", optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -87,8 +87,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
 
-# FTS types for hybrid search (FullTextSearchQuery)
-lance-index = "2.0"
+# Optional FTS types for embedding-backed hybrid search (FullTextSearchQuery)
+lance-index = { version = "2.0", optional = true }
 
 # Async streams (for LanceDB query results)
 futures = "0.3"
@@ -118,8 +118,9 @@ aho-corasick = "1"
 tree-sitter-gdscript = "6.1"
 
 [features]
-default = ["metal"]
-metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
+default = []
+embeddings = ["dep:metal-candle", "dep:candle-core", "dep:fastembed", "dep:lance-index"]
+metal = ["embeddings", "candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
 
 # Dev: fastest possible compile, no optimization on own code
 [profile.dev]
