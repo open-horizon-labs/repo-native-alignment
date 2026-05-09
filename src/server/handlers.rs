@@ -6,9 +6,10 @@
 //! ## `repo` parameter
 //!
 //! `search`, `repo_map`, and `outcome_progress` accept an optional `repo` path.
-//! When provided, the handler loads a fresh [`GraphState`] from that path's
-//! `.oh/.cache/lance/` LanceDB instead of the server's in-memory graph. This
-//! lets agents in git worktrees query their own repo:
+//! Blank strings and paths resolving to the server's own repo use the live in-memory
+//! graph (including foreground incremental updates). Other paths load a fresh
+//! [`GraphState`] from that path's `.oh/.cache/lance/`, which lets agents in git
+//! worktrees query their own repo:
 //!
 //! ```text
 //! search(query="build_code_embedding_text", repo="/path/to/worktree")
@@ -19,7 +20,7 @@
 //!
 //! Embedding (semantic) search is not available for external repos.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult};
@@ -80,12 +81,37 @@ impl RnaHandler {
         Ok((graph, repo_path))
     }
 
+    fn non_blank_arg(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    fn external_repo_arg<'a>(value: Option<&'a str>, server_root: &Path) -> Option<&'a str> {
+        let repo = Self::non_blank_arg(value)?;
+        let requested = PathBuf::from(repo);
+        if !requested.is_absolute() {
+            return Some(repo);
+        }
+        let requested_canonical = requested.canonicalize().unwrap_or(requested);
+        let server_canonical = server_root
+            .canonicalize()
+            .unwrap_or_else(|_| server_root.to_path_buf());
+
+        (requested_canonical != server_canonical).then_some(repo)
+    }
+
     pub(crate) async fn handle_search(
         &self,
         args: Search,
     ) -> Result<CallToolResult, CallToolError> {
         let params = SearchParams::from_mcp_search(&args);
-        if params.include_body && args.node.is_none() && args.nodes.is_none() {
+        if params.include_body
+            && params.node.is_none()
+            && params
+                .nodes
+                .as_ref()
+                .map(|nodes| nodes.is_empty())
+                .unwrap_or(true)
+        {
             return Ok(text_result(
                 "include_body requires `node` or `nodes` parameter".into(),
             ));
@@ -93,7 +119,7 @@ impl RnaHandler {
 
         // When `repo` is provided, load an external graph from that path.
         // Semantic search is skipped (no embed_index for external repos).
-        if let Some(ref repo) = args.repo {
+        if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -113,7 +139,7 @@ impl RnaHandler {
             return Ok(text_result(markdown));
         }
 
-        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let root_filter = self.effective_root_filter(Self::non_blank_arg(args.root.as_deref()));
         let non_code_slugs = if root_filter.is_some() {
             self.non_code_root_slugs()
         } else {
@@ -149,7 +175,7 @@ impl RnaHandler {
         args: OutcomeProgress,
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
-        if let Some(ref repo) = args.repo {
+        if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -168,7 +194,7 @@ impl RnaHandler {
             return Ok(text_result(markdown));
         }
 
-        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let root_filter = self.effective_root_filter(Self::non_blank_arg(args.root.as_deref()));
         let non_code_slugs = if root_filter.is_some() {
             self.non_code_root_slugs()
         } else {
@@ -234,7 +260,7 @@ impl RnaHandler {
         args: RepoMap,
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
-        if let Some(ref repo) = args.repo {
+        if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -254,7 +280,7 @@ impl RnaHandler {
             return Ok(text_result(markdown));
         }
 
-        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let root_filter = self.effective_root_filter(Self::non_blank_arg(args.root.as_deref()));
         let non_code_slugs = if root_filter.is_some() {
             self.non_code_root_slugs()
         } else {
@@ -1015,6 +1041,114 @@ mod tests {
             err.contains("absolute path"),
             "error should mention absolute path: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_external_repo_arg_ignores_blank_repo() {
+        let root = PathBuf::from("/srv/main-repo");
+        assert!(RnaHandler::external_repo_arg(None, &root).is_none());
+        assert!(RnaHandler::external_repo_arg(Some(""), &root).is_none());
+        assert!(RnaHandler::external_repo_arg(Some("   "), &root).is_none());
+    }
+
+    #[test]
+    fn test_external_repo_arg_ignores_current_repo_path() {
+        let root = std::env::current_dir().unwrap();
+        let root_string = root.to_string_lossy().to_string();
+
+        assert!(RnaHandler::external_repo_arg(Some(&root_string), &root).is_none());
+    }
+
+    #[test]
+    fn test_external_repo_arg_keeps_different_absolute_repo() {
+        let root = PathBuf::from("/srv/main-repo");
+
+        assert_eq!(
+            RnaHandler::external_repo_arg(Some("/srv/worktree"), &root),
+            Some("/srv/worktree")
+        );
+    }
+
+    #[test]
+    fn test_external_repo_arg_keeps_relative_repo_for_validation_error() {
+        let root = std::env::current_dir().unwrap();
+
+        assert_eq!(RnaHandler::external_repo_arg(Some("."), &root), Some("."));
+        assert_eq!(
+            RnaHandler::external_repo_arg(Some(" worktrees/feature "), &root),
+            Some("worktrees/feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_search_generated_defaults_current_repo_use_live_graph() {
+        let repo_root = std::env::current_dir().unwrap();
+        let handler = make_handler(&repo_root);
+        let symbol = "rna_generated_default_live_graph_probe";
+        let root_slug = handler.primary_root_slug();
+
+        let node = Node {
+            id: NodeId {
+                root: root_slug,
+                file: PathBuf::from("src/generated_default_live.rs"),
+                name: symbol.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 3,
+            signature: format!("pub fn {}() -> &'static str", symbol),
+            body: "\"live\"".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&node.stable_id(), "function");
+        let graph = GraphState::new(
+            vec![node],
+            Vec::new(),
+            index,
+            Some(std::time::Instant::now()),
+            std::collections::HashSet::new(),
+        );
+        handler
+            .graph
+            .store(std::sync::Arc::new(Some(std::sync::Arc::new(graph))));
+
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": symbol,
+            "nodes": [],
+            "edge_types": [],
+            "artifact_types": [],
+            "repo": repo_root.to_string_lossy(),
+            "root": " ",
+            "file": "generated_default_live.rs",
+            "kind": "function",
+            "language": "rust",
+            "include_markdown": false,
+            "include_artifacts": false,
+            "search_mode": "keyword",
+            "compact": true,
+            "verbose": false
+        }))
+        .unwrap();
+
+        let result = handler.handle_search(args).await.unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+
+        assert!(
+            rendered.contains(symbol),
+            "generated-default current-repo search should return live graph symbol: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Empty nodes list"),
+            "empty generated nodes must not force batch mode: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Failed to load graph"),
+            "current repo should not be treated as external LanceDB: {rendered}"
         );
     }
 
