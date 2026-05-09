@@ -2063,6 +2063,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verbose_readiness_prefers_live_ready_status_over_stale_job_metadata() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let completed_job = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin completed call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &completed_job, 2, 7);
+        let _replacement_job = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin replacement call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        let live_status = LspEnrichmentStatus::default();
+        live_status.set_complete(7);
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.lsp_status = Some(&live_status);
+        ctx.enrichment_jobs = ledger.all_jobs(&repo_root);
+
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites**: ready"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_preserves_invalid_non_blank_mode_failure() {
         let node = make_node("caller", NodeKind::Function, "src/caller.rs");
         let gs = make_graph_state_with_edges(vec![node.clone()], vec![]);
