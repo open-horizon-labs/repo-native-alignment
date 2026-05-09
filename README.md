@@ -350,6 +350,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Detailed Documentation
 
+- [RNA Familiar Archetype](docs/rna-familiar-archetype.md) — hosted GitHub App product/runtime archetype: familiar as app, RNA as repo cognition layer
 - [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext
 - [Extractors](docs/extractors.md) — tree-sitter language/schema extractors, constants, synthetic literals, SQL/OpenAPI/proto support
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
