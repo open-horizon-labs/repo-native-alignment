@@ -1772,6 +1772,7 @@ mod tests {
         let markdown = result.to_markdown();
 
         assert!(markdown.contains("..."));
+        assert!(markdown.contains(&format!("{}—...", "a".repeat(199))));
         assert!(markdown.contains("Hash: `abc123`"));
     }
 

@@ -74,7 +74,7 @@ if start == -1:
     sys.exit(1)
 next_section = text.find("\n### ", start + 1)
 chunk = text[start:] if next_section == -1 else text[start:next_section]
-sys.exit(0 if re.search(pattern, chunk, re.MULTILINE | re.IGNORECASE) else 1)
+sys.exit(0 if re.search(pattern, chunk, re.MULTILINE | re.IGNORECASE | re.DOTALL) else 1)
 PY
 }
 
