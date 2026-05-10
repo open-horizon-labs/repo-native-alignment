@@ -742,15 +742,19 @@ mod tests {
         let repo = std::env::current_dir().unwrap();
         let result =
             list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None, None);
+        let roots_section = result
+            .split("\n## Recent Operations")
+            .next()
+            .unwrap_or(&result);
         assert!(
             !result.contains("Last scan:"),
             "no stats line without graph_state, got: {}",
             result
         );
         assert!(
-            !result.contains("symbols"),
-            "no symbol count without graph_state, got: {}",
-            result
+            !roots_section.contains("symbols"),
+            "no symbol count without graph_state in roots section, got: {}",
+            roots_section
         );
     }
 

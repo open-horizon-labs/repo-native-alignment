@@ -1405,6 +1405,14 @@ mod tests {
         // subsequent scan sees 0 file changes for it — this simulates the exact
         // scenario from #364 where the state was committed on a previous run.
         let state_path = crate::roots::cache_state_path("secondary");
+        // Ensure cleanup runs even if the test panics.
+        struct CleanupFile(std::path::PathBuf);
+        impl Drop for CleanupFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = CleanupFile(state_path.clone());
         if let Some(parent) = state_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -1451,6 +1459,12 @@ mod tests {
             Nodes: {:?}",
             gs2.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
+        // Await background LSP enrichment before reading LanceDB directly.
+        // The same handler can re-persist after the foreground tree-sitter snapshot;
+        // reading while that task is still running makes this regression test flaky.
+        if let Some(h) = handler.lsp_handle.lock().await.take() {
+            let _ = h.await;
+        }
 
         // Step 5: Verify LanceDB was updated: load fresh from lance and check
         let persisted = crate::server::load_graph_from_lance(primary.path())
@@ -1467,8 +1481,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // Cleanup: remove scanner state we wrote so other tests aren't affected
-        let _ = std::fs::remove_file(&state_path);
+        // Cleanup runs automatically when _cleanup is dropped (end of test scope).
     }
 
     /// Regression test for #364 (round 3): newly-declared workspace root must persist
