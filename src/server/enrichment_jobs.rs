@@ -41,7 +41,11 @@ impl ScanEnrichmentOptions {
     pub const fn all() -> Self {
         Self {
             lsp: LspEnrichmentMode::Run,
-            embeddings: EmbeddingEnrichmentMode::Run,
+            embeddings: if cfg!(feature = "embeddings") {
+                EmbeddingEnrichmentMode::Run
+            } else {
+                EmbeddingEnrichmentMode::Skip
+            },
         }
     }
 
@@ -67,7 +71,7 @@ impl ScanEnrichmentOptions {
     }
 
     pub const fn runs_embeddings(self) -> bool {
-        matches!(self.embeddings, EmbeddingEnrichmentMode::Run)
+        cfg!(feature = "embeddings") && matches!(self.embeddings, EmbeddingEnrichmentMode::Run)
     }
 }
 
@@ -987,9 +991,11 @@ mod tests {
 
     #[test]
     fn scan_enrichment_options_preserve_structured_modes() {
+        let embeddings_compiled = cfg!(feature = "embeddings");
+
         let all = ScanEnrichmentOptions::all();
         assert!(all.runs_lsp());
-        assert!(all.runs_embeddings());
+        assert_eq!(all.runs_embeddings(), embeddings_compiled);
 
         let extract_only = ScanEnrichmentOptions::extract_only();
         assert!(!extract_only.runs_lsp());
@@ -997,7 +1003,7 @@ mod tests {
 
         let no_lsp = ScanEnrichmentOptions::all().without_lsp();
         assert!(!no_lsp.runs_lsp());
-        assert!(no_lsp.runs_embeddings());
+        assert_eq!(no_lsp.runs_embeddings(), embeddings_compiled);
 
         let no_embed = ScanEnrichmentOptions::all().without_embeddings();
         assert!(no_embed.runs_lsp());

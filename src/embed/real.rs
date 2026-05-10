@@ -1,0 +1,3394 @@
+use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use anyhow::{Context, Result};
+use arrow_array::{
+    Array as ArrowArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema};
+use lance_index::scalar::FullTextSearchQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
+
+use crate::git;
+use crate::ranking;
+
+/// Scalar pre-filters for embedding search (#400).
+///
+/// These filters are pushed into LanceDB as `.only_if()` predicates
+/// before vector scoring, so only matching rows participate in ranking.
+/// This ensures "top-K within subsystem" rather than "globally top-3K,
+/// then discard non-matching" — a great match ranked 4001st globally
+/// is now visible when filtering to a subsystem or file path.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    /// Filter to symbols in this subsystem (exact match on `subsystem` column).
+    pub subsystem: Option<String>,
+    /// Filter to symbols in files whose path contains this substring
+    /// (LIKE '%...%' on `file_path` column).
+    pub file: Option<String>,
+    /// Filter to symbols in this language (exact match on `language` column).
+    pub language: Option<String>,
+    /// Filter to symbols with cyclomatic complexity >= this value.
+    pub min_complexity: Option<u32>,
+}
+
+impl SearchFilters {
+    /// Build a LanceDB SQL filter expression from the active filters.
+    /// Returns `None` if no filters are set.
+    pub fn to_sql(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(ref sub) = self.subsystem {
+            // Escape single quotes in subsystem name
+            let escaped = sub.replace('\'', "''");
+            parts.push(format!("subsystem = '{}'", escaped));
+        }
+
+        if let Some(ref file) = self.file {
+            // LIKE-based path substring matching. The file_path column stores
+            // the full path string, so '%pattern%' finds any containing path.
+            //
+            // Use '!' as the ESCAPE character (DataFusion requires an explicit
+            // ESCAPE clause — without it, backslash is not treated as an escape
+            // character). '!' is safe since it does not appear in typical file paths.
+            // Escape order matters: escape '!' first to avoid double-escaping.
+            let escaped = file
+                .replace('\'', "''") // SQL single-quote escaping
+                .replace('!', "!!") // Escape the ESCAPE character itself
+                .replace('%', "!%") // Escape LIKE wildcard %
+                .replace('_', "!_"); // Escape LIKE single-char wildcard _
+            parts.push(format!("file_path LIKE '%{}%' ESCAPE '!'", escaped));
+        }
+
+        if let Some(ref lang) = self.language {
+            let escaped = lang.replace('\'', "''");
+            parts.push(format!("language = '{}'", escaped));
+        }
+
+        if let Some(min_cc) = self.min_complexity {
+            parts.push(format!("cyclomatic >= {}", min_cc));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" AND "))
+        }
+    }
+}
+
+/// Search mode for the embedding index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// Combine keyword (BM25) + vector scoring via LanceDB hybrid search with RRF.
+    #[default]
+    Hybrid,
+    /// Pure keyword (BM25 full-text) search only.
+    Keyword,
+    /// Pure vector (semantic embedding) search only.
+    Semantic,
+}
+
+/// Adaptive batch sizing constants (TCP slow-start style).
+/// Instead of a fixed batch size that may saturate unified memory bandwidth
+/// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
+/// we start small and grow/shrink based on observed per-item latency.
+const BATCH_FLOOR: usize = 4;
+/// Benchmarked on M4 Pro: batch=32 gives best throughput (~880 t/s).
+/// Don't overshoot — larger batches don't help and can hurt.
+const BATCH_CEILING: usize = 32;
+/// Yield duration between batches to let other system tasks breathe.
+const BATCH_YIELD_MS: u64 = 50;
+/// If per-item time exceeds this multiple of the rolling average, halve batch size.
+const BACKOFF_THRESHOLD: f64 = 2.0;
+
+/// Number of recent commits to embed for temporal context.
+const RECENT_COMMIT_LIMIT: usize = 100;
+/// Number of PR merge commits to embed for structural context.
+const PR_MERGE_LIMIT: usize = 50;
+
+/// Maximum character budget for code embedding text.
+///
+/// MiniLM-L6-v2 has a 256-token effective max sequence length.  Code
+/// tokenizes poorly with WordPiece (~3.5 subword tokens per identifier),
+/// so we budget ~650 chars to target ~180 tokens, safely within 256.
+/// The name is always included; the body (which already contains the
+/// signature) gets at least 50% of the budget; metadata fills remaining space.
+const CODE_EMBED_CHAR_BUDGET: usize = 650;
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
+/// valid UTF-8 slice. Safe even when a multibyte character straddles the
+/// byte boundary (the original panic trigger).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+/// Build the Arrow schema for the embedding table, including the `text_hash` column
+/// and scalar filter columns for pre-filtering before vector ranking (#400).
+fn embedding_schema(dim: usize) -> Schema {
+    Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new("text_hash", DataType::Utf8, true),
+        // Scalar filter columns — enable .only_if() pre-filtering before vector ranking.
+        // Eliminates the 3x over-fetch hack: search(file='src/embed.rs') now filters
+        // within LanceDB before scoring rather than post-filtering Rust results.
+        Field::new("file_path", DataType::Utf8, true), // file path for path-based filtering
+        Field::new("language", DataType::Utf8, true),  // programming language
+        Field::new("subsystem", DataType::Utf8, true), // detected subsystem cluster
+        Field::new("cyclomatic", DataType::Int32, true), // cyclomatic complexity (functions only)
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        ),
+    ])
+}
+
+/// Build embedding text for a code node within the MiniLM-L6-v2 token budget.
+///
+/// Layout: `name [doc_comment] body_excerpt [metadata]`
+///
+/// `body` already includes the signature (it's the full AST node text),
+/// so we don't push the signature separately.  The body is truncated so
+/// the total stays within [`CODE_EMBED_CHAR_BUDGET`].
+///
+/// When `metadata["doc_comment"]` is present, it is prepended before the
+/// body to improve semantic search quality: doc comments describe *intent*
+/// (e.g. "Charges the card, records the transaction") while code describes
+/// implementation. This makes queries like "what handles charging?" surface
+/// the right function even when the function body uses different terminology.
+fn build_code_embedding_text(
+    name: &str,
+    body: &str,
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut t = String::with_capacity(CODE_EMBED_CHAR_BUDGET);
+    t.push_str(name);
+
+    let name_chars = name.chars().count();
+    // Body always gets at least 50% of the budget
+    let min_body_budget = CODE_EMBED_CHAR_BUDGET / 2;
+    let after_name = CODE_EMBED_CHAR_BUDGET.saturating_sub(name_chars + 1);
+
+    // Estimate metadata cost in chars (not bytes) and cap to leave room for body
+    // Skip doc_comment and inferred_types here — both are handled separately below as body prefixes.
+    let meta_estimate: usize = metadata
+        .iter()
+        .filter(|(k, _)| k.as_str() != "doc_comment" && k.as_str() != "inferred_types")
+        .map(|(k, v)| k.chars().count() + v.chars().count() + 3) // " key: value"
+        .sum();
+    let meta_budget = after_name
+        .saturating_sub(min_body_budget)
+        .min(meta_estimate);
+
+    // Truncate metadata entries to fit within meta_budget (exclude doc_comment and inferred_types)
+    let mut meta_parts: Vec<String> = Vec::new();
+    let mut meta_used = 0usize;
+    for (key, value) in metadata {
+        if key == "doc_comment" || key == "inferred_types" {
+            continue; // handled as body prefix below
+        }
+        let entry = format!(" {}: {}", key, value);
+        let entry_chars = entry.chars().count();
+        if meta_used + entry_chars > meta_budget {
+            break;
+        }
+        meta_used += entry_chars;
+        meta_parts.push(entry);
+    }
+
+    // Body gets everything remaining after name and actual metadata used.
+    // Prepend doc_comment (truncated) before the code body: intent before implementation.
+    // Also append inferred_types after the body to enrich semantic vocabulary.
+    let body_budget = after_name.saturating_sub(meta_used);
+
+    if body_budget > 0 {
+        // Build combined doc + body + inferred_types text.
+        // Budget allocation: doc_comment up to 1/3, body up to 1/2, inferred_types up to 1/6.
+        let doc_comment = metadata
+            .get("doc_comment")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let inferred_types = metadata
+            .get("inferred_types")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let types_budget = if !inferred_types.is_empty() {
+            (body_budget / 6).min(inferred_types.chars().count())
+        } else {
+            0
+        };
+        let remaining_for_doc_and_body = body_budget.saturating_sub(types_budget);
+
+        if !doc_comment.is_empty() {
+            let doc_budget = remaining_for_doc_and_body / 2;
+            let remaining_body_budget = remaining_for_doc_and_body
+                .saturating_sub(doc_budget.min(doc_comment.chars().count()) + 1);
+            let doc_truncated = truncate_chars(doc_comment, doc_budget);
+            t.push(' ');
+            t.push_str(doc_truncated);
+            if !body.is_empty() && remaining_body_budget > 0 {
+                t.push(' ');
+                t.push_str(truncate_chars(body, remaining_body_budget));
+            }
+        } else if !body.is_empty() {
+            t.push(' ');
+            t.push_str(truncate_chars(body, remaining_for_doc_and_body));
+        }
+
+        // Append inferred types after body — compiler vocabulary for semantic search
+        if !inferred_types.is_empty() && types_budget > 0 {
+            t.push(' ');
+            t.push_str(truncate_chars(inferred_types, types_budget));
+        }
+    }
+
+    for part in &meta_parts {
+        t.push_str(part);
+    }
+
+    // Final safety truncation to hard budget
+    truncate_chars(&t, CODE_EMBED_CHAR_BUDGET).to_string()
+}
+
+/// Build embedding text for .oh/ artifacts.
+fn build_artifact_embedding_text(
+    name: &str,
+    body: &str,
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut text = String::with_capacity(500);
+    let id = metadata
+        .get("frontmatter.id")
+        .map(|s| s.as_str())
+        .unwrap_or(name);
+    text.push_str(id);
+    text.push(' ');
+    for (key, value) in metadata {
+        if let Some(fm_key) = key.strip_prefix("frontmatter.") {
+            text.push_str(fm_key);
+            text.push_str(": ");
+            text.push_str(value);
+            text.push(' ');
+        }
+    }
+    text.push_str(body);
+    truncate_chars(&text, 500).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Unified node → embedding helpers
+// ---------------------------------------------------------------------------
+// These functions consolidate the artifact-vs-code branching that was
+// previously scattered across reindex_nodes() and index_all_inner().
+// embed.rs still owns the text-building logic (budget, truncation) but
+// the indexing loops no longer test `oh_kind` directly.
+
+/// Build embedding text for any graph node, dispatching by node properties.
+fn node_embedding_text(node: &crate::graph::Node) -> String {
+    if node.metadata.contains_key("oh_kind") {
+        build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
+    } else {
+        match &node.id.kind {
+            crate::graph::NodeKind::MarkdownSection => truncate_chars(&node.body, 500).to_string(),
+            _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
+        }
+    }
+}
+
+/// Embedding index kind label for a graph node.
+fn node_embedding_kind(node: &crate::graph::Node) -> String {
+    if let Some(oh_kind) = node.metadata.get("oh_kind") {
+        oh_kind.clone()
+    } else {
+        let kind_str = match &node.id.kind {
+            crate::graph::NodeKind::Other(s) => s.clone(),
+            k => format!("{}", k),
+        };
+        format!("code:{}", kind_str)
+    }
+}
+
+/// Display title for a graph node in the embedding index.
+fn node_embedding_title(node: &crate::graph::Node) -> String {
+    let kind_str = match &node.id.kind {
+        crate::graph::NodeKind::Other(s) => s.clone(),
+        k => format!("{}", k),
+    };
+    if node.metadata.contains_key("oh_kind") {
+        node.metadata
+            .get("frontmatter.title")
+            .or(node.metadata.get("frontmatter.statement"))
+            .cloned()
+            .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
+    } else {
+        format!("{} {} ({})", kind_str, node.id.name, node.language)
+    }
+}
+
+/// Scalar filter columns for a graph node.
+///
+/// Returns `(file_path, language, subsystem, cyclomatic)`.
+/// Artifact nodes (those with `oh_kind` metadata) return `(None, None, None, None)`.
+/// Non-artifact nodes include `file_path` and `language`; `subsystem` and
+/// `cyclomatic` are populated when present in metadata.
+fn node_scalar_filters(
+    node: &crate::graph::Node,
+) -> (Option<String>, Option<String>, Option<String>, Option<i32>) {
+    if node.metadata.contains_key("oh_kind") {
+        (None, None, None, None)
+    } else {
+        let fp = Some(node.id.file.to_string_lossy().to_string());
+        let lang = if node.language.is_empty() {
+            None
+        } else {
+            Some(node.language.clone())
+        };
+        let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+        let cc = node
+            .metadata
+            .get("cyclomatic")
+            .and_then(|s| s.parse::<i32>().ok());
+        (fp, lang, sub, cc)
+    }
+}
+
+// Serialize embedding model initialization within this process to avoid
+// HuggingFace cache lock contention when tests call `new_model()` in parallel.
+static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
+    let start = std::time::Instant::now();
+
+    #[cfg(feature = "metal")]
+    let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
+        tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+        candle_core::Device::Cpu
+    });
+    #[cfg(not(feature = "metal"))]
+    let device = candle_core::Device::Cpu;
+
+    #[cfg(feature = "metal")]
+    let device_name = if matches!(device, candle_core::Device::Metal(_)) {
+        "Metal GPU"
+    } else {
+        "CPU"
+    };
+    #[cfg(not(feature = "metal"))]
+    let device_name = "CPU";
+    let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+
+    let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
+        metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,
+        device,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}", e));
+
+    match &model {
+        Ok(m) => tracing::info!(
+            "EmbeddingIndex: MiniLM-L6-v2 ready on {} (dim={}) in {:?}",
+            device_name,
+            m.dimension(),
+            start.elapsed()
+        ),
+        Err(err) => tracing::warn!(
+            "EmbeddingIndex: model load failed in {:?}: {}",
+            start.elapsed(),
+            err
+        ),
+    }
+    model
+}
+
+async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    let model = new_model()?;
+    embed_texts_with_model(&model, texts).await
+}
+
+/// Embed texts using a pre-loaded model. Avoids repeated model initialization
+/// when called in a loop (e.g., streaming batch writes in index_all_inner).
+async fn embed_texts_with_model(
+    model: &metal_candle::embeddings::EmbeddingModel,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>> {
+    let total = texts.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    let total_chars: usize = texts.iter().map(|t| t.len()).sum();
+    let overall_start = std::time::Instant::now();
+    tracing::info!(
+        "EmbeddingIndex: embedding {} text(s) ({} chars total, adaptive batch {}..{})",
+        total,
+        total_chars,
+        BATCH_FLOOR,
+        BATCH_CEILING
+    );
+
+    let mut remaining = texts;
+    let mut all_embeddings = Vec::with_capacity(total);
+    let mut processed = 0usize;
+    let mut batch_idx = 0usize;
+    let mut current_batch_size = BATCH_FLOOR;
+    let mut rolling_avg: Option<f64> = None;
+    const EMA_ALPHA: f64 = 0.3;
+
+    while !remaining.is_empty() {
+        let bs = remaining.len().min(current_batch_size);
+        let batch: Vec<String> = remaining.drain(..bs).collect();
+        let batch_start = std::time::Instant::now();
+
+        let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+        let tensor = model
+            .encode(&refs)
+            .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
+        let batch_embeddings: Vec<Vec<f32>> = tensor
+            .to_vec2::<f32>()
+            .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
+
+        let elapsed_secs = batch_start.elapsed().as_secs_f64();
+        let per_item = elapsed_secs / bs as f64;
+
+        // Adaptive batch sizing: TCP slow-start style
+        match rolling_avg {
+            None => {
+                // First batch: seed the rolling average
+                rolling_avg = Some(per_item);
+                // Grow for next batch
+                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            }
+            Some(avg) => {
+                if per_item > BACKOFF_THRESHOLD * avg {
+                    // Latency spike — halve batch size
+                    current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    tracing::debug!(
+                        "EmbeddingIndex: backoff batch_size -> {} (per_item {:.4}s > {:.4}s threshold)",
+                        current_batch_size,
+                        per_item,
+                        BACKOFF_THRESHOLD * avg
+                    );
+                } else {
+                    // Steady — grow batch size
+                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                }
+                // Update EMA
+                rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+            }
+        }
+
+        processed += batch_embeddings.len();
+        batch_idx += 1;
+        tracing::info!(
+            "EmbeddingIndex: batch {} done in {:?} (bs={}, {}/{})",
+            batch_idx,
+            batch_start.elapsed(),
+            bs,
+            processed,
+            total
+        );
+        all_embeddings.extend(batch_embeddings);
+
+        // Yield between batches to avoid saturating memory bandwidth
+        if !remaining.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(BATCH_YIELD_MS)).await;
+        }
+    }
+
+    tracing::info!(
+        "EmbeddingIndex: embedded {} text(s) in {:?}",
+        processed,
+        overall_start.elapsed()
+    );
+    Ok(all_embeddings)
+}
+
+/// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
+#[derive(Clone)]
+pub struct EmbeddingIndex {
+    db: lancedb::Connection,
+    table_name: String,
+}
+
+/// Result of a semantic search — either results or "not ready yet."
+pub enum SearchOutcome {
+    /// Index is ready; here are the results (may be empty).
+    Results(Vec<SearchResult>),
+    /// Embedding table hasn't been created yet — index is still building.
+    NotReady,
+}
+
+/// A search result with the artifact and its relevance score.
+pub struct SearchResult {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub score: f32,
+}
+
+impl SearchResult {
+    pub fn to_markdown(&self) -> String {
+        let snippet = if self.body.chars().count() > 200 {
+            format!("{}...", truncate_chars(&self.body, 200))
+        } else {
+            self.body.clone()
+        };
+        if self.kind.starts_with("code:") {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n  ID: `{}`\n",
+                self.title, self.kind, self.score, snippet, self.id
+            )
+        } else if self.kind == "commit" {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n  Hash: `{}` (use: `git show {}`)\n",
+                self.title, self.kind, self.score, snippet, self.id, self.id
+            )
+        } else {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n",
+                self.title, self.kind, self.score, snippet
+            )
+        }
+    }
+}
+
+impl EmbeddingIndex {
+    /// Create or open the embedding index. Stores data in memory.
+    pub async fn new(repo_root: &Path) -> Result<Self> {
+        let db_path = repo_root.join(".oh").join(".cache").join("lance");
+        std::fs::create_dir_all(&db_path)?;
+        tracing::debug!("EmbeddingIndex: opening LanceDB at {}", db_path.display());
+        let open_start = std::time::Instant::now();
+
+        let db = lancedb::connect(db_path.to_str().unwrap())
+            .execute()
+            .await
+            .context("Failed to connect to LanceDB")?;
+        tracing::debug!(
+            "EmbeddingIndex: opened LanceDB at {} in {:?}",
+            db_path.display(),
+            open_start.elapsed()
+        );
+
+        Ok(Self {
+            db,
+            table_name: "artifacts".to_string(),
+        })
+    }
+
+    /// Check if the embedding table exists.
+    ///
+    /// Returns `Ok(true)` if the table exists, `Ok(false)` if it does not,
+    /// and propagates unexpected errors instead of swallowing them.
+    pub async fn has_table(&self) -> Result<bool> {
+        match self.db.open_table(&self.table_name).execute().await {
+            Ok(_) => Ok(true),
+            Err(lancedb::Error::TableNotFound { .. }) => Ok(false),
+            Err(e) => Err(anyhow::anyhow!("Failed to check embedding table: {}", e)),
+        }
+    }
+
+    /// Create (or replace) tantivy full-text search indexes on the `title` and
+    /// `body` columns. LanceDB requires separate FTS indexes per column.
+    /// Called after bulk writes and reindex to enable hybrid search.
+    ///
+    /// Best-effort: FTS index failures are logged as warnings but do not fail
+    /// the embedding operation. The vector table is already usable without FTS;
+    /// hybrid search will fall back to vector-only if the index is missing.
+    async fn create_fts_index(&self, table: &lancedb::Table) {
+        let fts_start = std::time::Instant::now();
+        // Title index: symbol names, kind labels, language — best for exact keyword matches.
+        if let Err(e) = table
+            .create_index(&["title"], lancedb::index::Index::FTS(Default::default()))
+            .replace(true)
+            .execute()
+            .await
+        {
+            tracing::warn!("FTS index on title failed (hybrid search degraded): {e:#}");
+            return;
+        }
+        // Body index: signatures, file paths, commit messages — broader keyword coverage.
+        if let Err(e) = table
+            .create_index(&["body"], lancedb::index::Index::FTS(Default::default()))
+            .replace(true)
+            .execute()
+            .await
+        {
+            tracing::warn!("FTS index on body failed (hybrid search degraded): {e:#}");
+            return;
+        }
+        // file_path index: enables path-based pre-filtering before ranking.
+        // search(file='src/embed.rs') no longer over-fetches globally — it
+        // filters within the file path before vector scoring.
+        if let Err(e) = table
+            .create_index(
+                &["file_path"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+        {
+            tracing::warn!("FTS index on file_path failed (path-based filtering degraded): {e:#}");
+            return;
+        }
+        tracing::info!(
+            "EmbeddingIndex: FTS indexes on title+body+file_path created in {:?}",
+            fts_start.elapsed()
+        );
+    }
+
+    /// Ensure FTS indexes exist on an existing embedding table.
+    /// No-op if the indexes already exist (LanceDB replace=true is idempotent).
+    /// Called when reusing a cached table that may predate FTS support.
+    pub async fn ensure_fts_index(&self) {
+        match self.db.open_table(&self.table_name).execute().await {
+            Ok(table) => self.create_fts_index(&table).await,
+            Err(lancedb::Error::TableNotFound { .. }) => {
+                // No table to index yet.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "EmbeddingIndex: failed to open table '{}' for FTS ensure: {e:#}",
+                    self.table_name
+                );
+            }
+        }
+    }
+
+    /// Index all graph nodes (code, markdown, .oh/ artifacts), git commits, and PR merges.
+    /// Call with symbols from the graph.
+    pub async fn index_all_with_symbols(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+    ) -> Result<usize> {
+        self.index_all_inner(repo_root, symbols).await
+    }
+
+    /// Index recent git commits only (no graph nodes). Rebuilds the table from scratch.
+    pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
+        self.index_all_inner(repo_root, &[]).await
+    }
+
+    /// Re-embed a targeted subset of nodes and upsert them into the existing table.
+    ///
+    /// Use this after LSP enrichment to update embeddings for only the nodes whose
+    /// metadata was patched — avoiding a full table rebuild for every incremental update.
+    /// If the table does not yet exist, falls back to a no-op (caller must run
+    /// `index_all_with_symbols` first).
+    pub async fn reindex_nodes(&self, nodes: &[crate::graph::Node]) -> Result<usize> {
+        if nodes.is_empty() {
+            return Ok(0);
+        }
+
+        // Open table first — if it doesn't exist, nothing to update.
+        let table = match self.db.open_table(&self.table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                // Table not yet created — nothing to update.
+                return Ok(0);
+            }
+        };
+
+        // Build candidate data: id, kind, title, body, text, text_hash + scalar filter columns
+        struct Candidate {
+            id: String,
+            kind: String,
+            title: String,
+            body: String,
+            text: String,
+            text_hash: String,
+            // Scalar filter columns (#400)
+            file_path: Option<String>,
+            language: Option<String>,
+            subsystem: Option<String>,
+            cyclomatic: Option<i32>,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(nodes.len());
+
+        for node in nodes {
+            let embed_kind = node_embedding_kind(node);
+            let text = node_embedding_text(node);
+            let (fp, lang, sub, cc) = node_scalar_filters(node);
+
+            // Hash only the embedding text — scalar filter columns (file_path,
+            // language, subsystem, cyclomatic) are updated separately via LanceDB
+            // upsert. Including them in the hash invalidates the entire embedding
+            // cache on every subsystem reassignment, causing a 4x regression (#597).
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+
+            let title = node_embedding_title(node);
+            let body_display = format!(
+                "{}\n\n{}:{}",
+                node.signature,
+                node.id.file.display(),
+                node.line_start
+            );
+
+            candidates.push(Candidate {
+                id: node.stable_id(),
+                kind: embed_kind,
+                title,
+                body: body_display,
+                text,
+                text_hash,
+                file_path: fp,
+                language: lang,
+                subsystem: sub,
+                cyclomatic: cc,
+            });
+        }
+
+        // Query existing text_hash values to skip unchanged nodes.
+        // If the column doesn't exist (old schema), embed everything.
+        let existing_hashes = self
+            .query_text_hashes(
+                &table,
+                &candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            )
+            .await;
+
+        let (to_embed, skipped): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+            match &existing_hashes {
+                Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
+                None => true, // no text_hash column yet — embed all
+            }
+        });
+
+        if !skipped.is_empty() {
+            tracing::info!(
+                "reindex_nodes: BLAKE3 text hash skipped {} unchanged node(s), embedding {} node(s)",
+                skipped.len(),
+                to_embed.len(),
+            );
+        }
+
+        if to_embed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut text_hashes: Vec<String> = Vec::new();
+        let mut file_paths: Vec<Option<String>> = Vec::new();
+        let mut languages: Vec<Option<String>> = Vec::new();
+        let mut subsystems: Vec<Option<String>> = Vec::new();
+        let mut cyclomatics: Vec<Option<i32>> = Vec::new();
+
+        for c in to_embed {
+            ids.push(c.id);
+            kinds.push(c.kind);
+            titles.push(c.title);
+            bodies.push(c.body);
+            texts.push(c.text);
+            text_hashes.push(c.text_hash);
+            file_paths.push(c.file_path);
+            languages.push(c.language);
+            subsystems.push(c.subsystem);
+            cyclomatics.push(c.cyclomatic);
+        }
+
+        let count = texts.len();
+        // Save IDs before they're moved into Arrow arrays — needed for delete-before-add.
+        let ids_for_delete: Vec<String> = ids.clone();
+        let embeddings = embed_texts(texts).await?;
+        let dim = embeddings[0].len();
+        let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
+
+        let schema = Arc::new(embedding_schema(dim));
+
+        let id_array = Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>;
+        let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
+        let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
+        let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
+        let text_hash_array =
+            Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
+        let file_path_array =
+            Arc::new(StringArray::from(file_paths)) as Arc<dyn arrow_array::Array>;
+        let language_array = Arc::new(StringArray::from(languages)) as Arc<dyn arrow_array::Array>;
+        let subsystem_array =
+            Arc::new(StringArray::from(subsystems)) as Arc<dyn arrow_array::Array>;
+        let cyclomatic_array =
+            Arc::new(Int32Array::from(cyclomatics)) as Arc<dyn arrow_array::Array>;
+        let values = Arc::new(Float32Array::from(flat_embeddings));
+        let list_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
+            list_field, dim as i32, values, None,
+        )?) as Arc<dyn arrow_array::Array>;
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                id_array,
+                kind_array,
+                title_array,
+                body_array,
+                text_hash_array,
+                file_path_array,
+                language_array,
+                subsystem_array,
+                cyclomatic_array,
+                vector_array,
+            ],
+        )?;
+
+        // Delete existing rows for these IDs, then add() fresh.
+        // merge_insert fails on tables created by the same process (#332),
+        // so we use delete + add instead.
+        let id_refs: Vec<&str> = ids_for_delete.iter().map(|s| s.as_str()).collect();
+        self.delete_rows_by_ids(&table, &id_refs).await?;
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        table
+            .add(Box::new(batches))
+            .execute()
+            .await
+            .context("Failed to add enriched node embeddings")?;
+
+        // Skip FTS rebuild on incremental upsert — the full FTS index is rebuilt
+        // during index_all_inner(). Rebuilding on every small upsert defeats the
+        // purpose of targeted reindexing and hurts latency as the table grows.
+        // Hybrid search uses the last-built FTS index; new rows fall back to
+        // vector-only until the next full index run.
+
+        Ok(count)
+    }
+
+    // reindex_artifacts() removed: .oh/ artifacts are now graph nodes
+    // (markdown_section with oh_kind metadata) and flow through
+    // reindex_nodes() like everything else.
+
+    /// Delete rows by ID in batches of 500. Used before add() to avoid merge_insert (#332).
+    async fn delete_rows_by_ids(&self, table: &lancedb::Table, ids: &[&str]) -> Result<()> {
+        for chunk in ids.chunks(500) {
+            let quoted: Vec<String> = chunk
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect();
+            let filter = format!("id IN ({})", quoted.join(", "));
+            table
+                .delete(&filter)
+                .await
+                .context("Failed to delete rows by ID")?;
+        }
+        Ok(())
+    }
+
+    /// Query existing text_hash values for given node IDs from the embedding table.
+    /// Returns None if the text_hash column doesn't exist (old schema).
+    async fn query_text_hashes(
+        &self,
+        table: &lancedb::Table,
+        node_ids: &[&str],
+    ) -> Option<std::collections::HashMap<String, String>> {
+        use futures::TryStreamExt;
+
+        if node_ids.is_empty() {
+            return Some(std::collections::HashMap::new());
+        }
+
+        // Build filter: id IN ('id1', 'id2', ...)
+        let quoted: Vec<String> = node_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let filter = format!("id IN ({})", quoted.join(", "));
+
+        let result = table
+            .query()
+            .select(lancedb::query::Select::columns(&["id", "text_hash"]))
+            .only_if(filter)
+            .execute()
+            .await;
+
+        let stream = match result {
+            Ok(s) => s,
+            Err(e) => {
+                // Column doesn't exist yet (old schema) — this is expected on first run
+                tracing::debug!("query_text_hashes: could not query text_hash column: {}", e);
+                return None;
+            }
+        };
+
+        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("query_text_hashes: failed to collect batches: {}", e);
+                return None;
+            }
+        };
+
+        let mut map = std::collections::HashMap::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let hash_col = batch
+                .column_by_name("text_hash")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+            if let (Some(ids), Some(hashes)) = (id_col, hash_col) {
+                for i in 0..ids.len() {
+                    if !ids.is_null(i) && !hashes.is_null(i) {
+                        map.insert(ids.value(i).to_string(), hashes.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Some(map)
+    }
+
+    async fn index_all_inner(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+    ) -> Result<usize> {
+        let index_start = std::time::Instant::now();
+        tracing::info!(
+            "EmbeddingIndex: rebuilding full index for {}",
+            repo_root.display()
+        );
+
+        // Batch size for streaming writes to LanceDB (#110, #298).
+        const WRITE_BATCH_SIZE: usize = 2048;
+
+        // Build candidate structs: id, kind, title, body, text, text_hash + scalar filter columns.
+        // We collect metadata eagerly but defer embedding to streaming batches
+        // so we never hold all embedding vectors in memory simultaneously (#298).
+        struct Candidate {
+            id: String,
+            kind: String,
+            title: String,
+            body: String,
+            text: String,
+            text_hash: String,
+            // Scalar filter columns (#400): None for commits/merges, Some for code nodes
+            file_path: Option<String>,
+            language: Option<String>,
+            subsystem: Option<String>,
+            cyclomatic: Option<i32>,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+
+        // Index recent git commits (capped for performance)
+        let commit_count = match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
+            Ok(commits) => {
+                for c in &commits {
+                    let changed_files_str = c
+                        .changed_files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
+                    let title = c.message.lines().next().unwrap_or(&c.message).to_string();
+                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+
+                    candidates.push(Candidate {
+                        id: c.short_hash.clone(),
+                        kind: "commit".to_string(),
+                        title,
+                        body: body.clone(),
+                        text: body,
+                        text_hash,
+                        file_path: None,
+                        language: None,
+                        subsystem: None,
+                        cyclomatic: None,
+                    });
+                }
+                commits.len()
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "EmbeddingIndex: failed to load commits for {}: {}",
+                    repo_root.display(),
+                    err
+                );
+                0
+            }
+        };
+        // Index PR merge commits for structural context (what shipped)
+        let mut seen_merge_shas = std::collections::HashSet::new();
+        let merge_count = match git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
+            Ok((merge_nodes, _edges)) => {
+                for node in &merge_nodes {
+                    let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                    let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                    if seen_merge_shas.contains(&short) {
+                        continue;
+                    }
+                    seen_merge_shas.insert(short.clone());
+
+                    let branch = node
+                        .metadata
+                        .get("branch_name")
+                        .cloned()
+                        .unwrap_or_default();
+                    let files = node
+                        .metadata
+                        .get("files_changed")
+                        .cloned()
+                        .unwrap_or_default();
+                    let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
+                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+
+                    candidates.push(Candidate {
+                        id: format!("merge:{}", short),
+                        kind: "merge".to_string(),
+                        title: node.signature.clone(),
+                        body: body.clone(),
+                        text: body,
+                        text_hash,
+                        file_path: None,
+                        language: None,
+                        subsystem: None,
+                        cyclomatic: None,
+                    });
+                }
+                seen_merge_shas.len()
+            }
+            Err(_) => 0,
+        };
+
+        // Filter to embeddable node kinds before counting/indexing
+        let embeddable: Vec<&crate::graph::Node> = symbols
+            .iter()
+            .filter(|n| n.id.kind.is_embeddable())
+            .collect();
+        let skipped = symbols.len() - embeddable.len();
+        let oh_artifact_count = embeddable
+            .iter()
+            .filter(|n| n.metadata.contains_key("oh_kind"))
+            .count();
+        tracing::info!(
+            "EmbeddingIndex: collected {} commit(s), {} merge(s), {} symbol(s) ({} embeddable, {} .oh/ artifacts, {} skipped) for indexing",
+            commit_count,
+            merge_count,
+            symbols.len(),
+            embeddable.len(),
+            oh_artifact_count,
+            skipped,
+        );
+
+        // Index code symbols, markdown sections, and .oh/ artifacts from the graph
+        for node in &embeddable {
+            let embed_kind = node_embedding_kind(node);
+            let text = node_embedding_text(node);
+            let (fp, lang, sub, cc) = node_scalar_filters(node);
+
+            // Hash only the embedding text — scalar filter columns are updated
+            // separately via LanceDB upsert (#597).
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+
+            let title = node_embedding_title(node);
+            let body_display = format!(
+                "{}\n\n{}:{}",
+                node.signature,
+                node.id.file.display(),
+                node.line_start
+            );
+
+            candidates.push(Candidate {
+                id: node.stable_id(),
+                kind: embed_kind,
+                title,
+                body: body_display,
+                text,
+                text_hash,
+                file_path: fp,
+                language: lang,
+                subsystem: sub,
+                cyclomatic: cc,
+            });
+        }
+
+        if candidates.is_empty() {
+            tracing::info!(
+                "EmbeddingIndex: no texts collected for {}",
+                repo_root.display()
+            );
+            return Ok(0);
+        }
+
+        let total_candidates = candidates.len();
+
+        // Capture all current IDs before partitioning consumes candidates.
+        // Used later by delete_stale_rows_with_ids to avoid re-loading
+        // commits/merges from git (CodeRabbit review finding).
+        let current_ids: std::collections::HashSet<String> =
+            candidates.iter().map(|c| c.id.clone()).collect();
+
+        // --- BLAKE3 hash check: skip unchanged embeddings (#298) ---
+        // If the table exists, query existing hashes and partition candidates
+        // into changed vs unchanged. This avoids re-embedding the entire corpus
+        // on every full rebuild.
+        let table_exists = self
+            .has_table()
+            .await
+            .context("Failed to check embedding table before full reindex")?;
+
+        // If the table exists but has an old schema (missing text_hash or file_path columns),
+        // drop it and treat as fresh. LanceDB does not support adding nullable columns
+        // to existing tables via add() — a schema mismatch is a fatal error at write time.
+        let (table_exists, to_embed) = if table_exists {
+            let table = self
+                .db
+                .open_table(&self.table_name)
+                .execute()
+                .await
+                .context("Failed to open embedding table for hash check")?;
+
+            // Check for file_path column (added in #400/schema v2 of embedding table).
+            // If missing, force a full rebuild to pick up scalar filter columns.
+            let has_file_path_col = table
+                .schema()
+                .await
+                .map(|s| s.column_with_name("file_path").is_some())
+                .unwrap_or(false);
+
+            let all_ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+            let existing_hashes = self.query_text_hashes(&table, &all_ids).await;
+
+            if existing_hashes.is_none() || !has_file_path_col {
+                // Old schema: missing text_hash or scalar filter columns. Drop and rebuild.
+                tracing::info!(
+                    "EmbeddingIndex: dropping old-schema table (missing text_hash={}, file_path={})",
+                    existing_hashes.is_some(),
+                    has_file_path_col,
+                );
+                if let Err(e) = self.db.drop_table(&self.table_name, &[]).await {
+                    tracing::debug!(
+                        "EmbeddingIndex: drop_table failed (proceeding with create): {}",
+                        e
+                    );
+                }
+                (false, candidates)
+            } else {
+                let (to_embed, unchanged): (Vec<_>, Vec<_>) =
+                    candidates
+                        .into_iter()
+                        .partition(|c| match &existing_hashes {
+                            Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
+                            None => true,
+                        });
+                let unchanged_count = unchanged.len();
+
+                if unchanged_count > 0 {
+                    tracing::info!(
+                        "EmbeddingIndex: BLAKE3 hash skipped {} unchanged row(s), embedding {} row(s)",
+                        unchanged_count,
+                        to_embed.len(),
+                    );
+                }
+                (true, to_embed)
+            }
+        } else {
+            (false, candidates)
+        };
+
+        tracing::info!(
+            "EmbeddingIndex: preparing {} row(s) for embedding ({} total, {} skipped via BLAKE3)",
+            to_embed.len(),
+            total_candidates,
+            total_candidates - to_embed.len(),
+        );
+
+        // --- Stream embeddings in batches (#298) ---
+        // Embed WRITE_BATCH_SIZE texts at a time and persist each batch
+        // immediately, so we never hold all embedding vectors in memory.
+        let embed_start = std::time::Instant::now();
+        let mut embedded_count = 0usize;
+
+        if !to_embed.is_empty() {
+            // If the table already exists, delete the IDs we're about to re-embed
+            // so we can use simple add() instead of merge_insert.  merge_insert
+            // fails on tables created by the same process (#332) and is unnecessary
+            // here: the BLAKE3 hash check already partitioned candidates into
+            // changed (to_embed) vs unchanged (kept in-place).
+            if table_exists {
+                let table = self
+                    .db
+                    .open_table(&self.table_name)
+                    .execute()
+                    .await
+                    .context("Failed to open table to delete stale rows before re-embed")?;
+                let ids_to_delete: Vec<&str> = to_embed.iter().map(|c| c.id.as_str()).collect();
+                self.delete_rows_by_ids(&table, &ids_to_delete).await?;
+                tracing::info!(
+                    "EmbeddingIndex: deleted {} existing row(s) before re-embed",
+                    ids_to_delete.len(),
+                );
+            }
+
+            // Load model once and reuse across all write batches to avoid
+            // repeated heavyweight model initialization.
+            let model = new_model()?;
+            let mut remaining = to_embed;
+            let mut batch_idx = 0usize;
+
+            while !remaining.is_empty() {
+                let bs = remaining.len().min(WRITE_BATCH_SIZE);
+                let batch_candidates: Vec<Candidate> = remaining.drain(..bs).collect();
+
+                let batch_texts: Vec<String> =
+                    batch_candidates.iter().map(|c| c.text.clone()).collect();
+                let embeddings = embed_texts_with_model(&model, batch_texts).await?;
+
+                if embeddings.is_empty() {
+                    continue;
+                }
+
+                let dim = embeddings[0].len();
+                let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
+
+                let batch_ids: Vec<String> =
+                    batch_candidates.iter().map(|c| c.id.clone()).collect();
+                let batch_kinds: Vec<String> =
+                    batch_candidates.iter().map(|c| c.kind.clone()).collect();
+                let batch_titles: Vec<String> =
+                    batch_candidates.iter().map(|c| c.title.clone()).collect();
+                let batch_bodies: Vec<String> =
+                    batch_candidates.iter().map(|c| c.body.clone()).collect();
+                let batch_text_hashes: Vec<String> = batch_candidates
+                    .iter()
+                    .map(|c| c.text_hash.clone())
+                    .collect();
+                let batch_file_paths: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.file_path.clone())
+                    .collect();
+                let batch_languages: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.language.clone())
+                    .collect();
+                let batch_subsystems: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.subsystem.clone())
+                    .collect();
+                let batch_cyclomatics: Vec<Option<i32>> =
+                    batch_candidates.iter().map(|c| c.cyclomatic).collect();
+
+                let schema = Arc::new(embedding_schema(dim));
+
+                let id_array =
+                    Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
+                let kind_array =
+                    Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
+                let title_array =
+                    Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
+                let body_array =
+                    Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
+                let text_hash_array =
+                    Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
+                let file_path_array =
+                    Arc::new(StringArray::from(batch_file_paths)) as Arc<dyn arrow_array::Array>;
+                let language_array =
+                    Arc::new(StringArray::from(batch_languages)) as Arc<dyn arrow_array::Array>;
+                let subsystem_array =
+                    Arc::new(StringArray::from(batch_subsystems)) as Arc<dyn arrow_array::Array>;
+                let cyclomatic_array =
+                    Arc::new(Int32Array::from(batch_cyclomatics)) as Arc<dyn arrow_array::Array>;
+                let values = Arc::new(Float32Array::from(flat_embeddings));
+                let list_field = Arc::new(Field::new("item", DataType::Float32, true));
+                let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
+                    list_field, dim as i32, values, None,
+                )?) as Arc<dyn arrow_array::Array>;
+
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        id_array,
+                        kind_array,
+                        title_array,
+                        body_array,
+                        text_hash_array,
+                        file_path_array,
+                        language_array,
+                        subsystem_array,
+                        cyclomatic_array,
+                        vector_array,
+                    ],
+                )?;
+
+                if !table_exists && batch_idx == 0 {
+                    // First batch on a fresh table: create it
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                    self.db
+                        .create_table(&self.table_name, Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to create LanceDB table")?;
+                } else {
+                    // Subsequent batches (fresh or existing table): plain add().
+                    // For fresh tables, no duplicates are possible.
+                    // For existing tables, rows to re-embed were already deleted
+                    // above (#332).
+                    let table = self
+                        .db
+                        .open_table(&self.table_name)
+                        .execute()
+                        .await
+                        .context("Failed to open table for add")?;
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                    table
+                        .add(Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to add batch to LanceDB table")?;
+                }
+
+                embedded_count += bs;
+                batch_idx += 1;
+                tracing::info!(
+                    "EmbeddingIndex: embedded+persisted batch {} ({}/{} rows)",
+                    batch_idx,
+                    embedded_count,
+                    embedded_count + remaining.len()
+                );
+            }
+        }
+
+        tracing::info!(
+            "EmbeddingIndex: embedded {} row(s) in {:?} (total {:?})",
+            embedded_count,
+            embed_start.elapsed(),
+            index_start.elapsed()
+        );
+
+        // --- Delete stale rows (#298) ---
+        // If the table already existed, there may be rows for nodes that no
+        // longer exist in the graph. Delete them.
+        // Uses current_ids captured before partitioning to avoid re-loading
+        // commits/merges from git.
+        if table_exists && let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
+            tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
+        }
+
+        // --- Compact lance to reclaim space (#298) ---
+        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+            let compact_start = std::time::Instant::now();
+            match table.optimize(lancedb::table::OptimizeAction::All).await {
+                Ok(_stats) => {
+                    tracing::info!(
+                        "EmbeddingIndex: lance compaction completed in {:?}",
+                        compact_start.elapsed(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("EmbeddingIndex: lance compaction failed: {}", e);
+                }
+            }
+        }
+
+        // Build FTS index for hybrid search (BM25 on title + body).
+        // Best-effort: failure is logged but does not fail the indexing operation.
+        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+            self.create_fts_index(&table).await;
+        } else {
+            tracing::warn!(
+                "Could not open table for FTS index creation; hybrid search will use vector-only"
+            );
+        }
+
+        Ok(embedded_count)
+    }
+
+    /// Delete embedding rows for IDs that are no longer in the current graph.
+    /// Called after rebuild to clean up stale entries from previous builds.
+    async fn delete_stale_rows_with_ids(
+        &self,
+        current_ids: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        use futures::TryStreamExt;
+
+        let table = self
+            .db
+            .open_table(&self.table_name)
+            .execute()
+            .await
+            .context("Failed to open table for stale row deletion")?;
+
+        // Query all IDs currently in the table
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::columns(&["id"]))
+            .execute()
+            .await
+            .context("Failed to query IDs for stale detection")?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .context("Failed to collect ID batches")?;
+
+        let mut stale_ids: Vec<String> = Vec::new();
+        for batch in &batches {
+            if let Some(id_col) = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id = id_col.value(i);
+                        if !current_ids.contains(id) {
+                            stale_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if stale_ids.is_empty() {
+            tracing::info!("EmbeddingIndex: no stale rows to delete");
+            return Ok(());
+        }
+
+        tracing::info!("EmbeddingIndex: deleting {} stale row(s)", stale_ids.len());
+
+        // Delete in batches to avoid filter length limits
+        let stale_refs: Vec<&str> = stale_ids.iter().map(|s| s.as_str()).collect();
+        self.delete_rows_by_ids(&table, &stale_refs).await?;
+
+        tracing::info!("EmbeddingIndex: deleted {} stale row(s)", stale_ids.len());
+        Ok(())
+    }
+
+    /// Search over indexed artifacts using the specified mode.
+    ///
+    /// - `Hybrid` (default): combines BM25 keyword scoring + vector similarity
+    ///   via LanceDB's native RRF fusion. Falls back to pure vector if the FTS
+    ///   index isn't available.
+    /// - `Keyword`: BM25 full-text search only (no embeddings computed).
+    /// - `Semantic`: pure vector similarity search only.
+    ///
+    /// Returns `SearchOutcome::NotReady` if the table hasn't been created yet,
+    /// `SearchOutcome::Results(vec)` otherwise (may be empty).
+    pub async fn search(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+    ) -> Result<SearchOutcome> {
+        self.search_with_mode(query, artifact_types, limit, SearchMode::default())
+            .await
+    }
+
+    /// Search with an explicit [`SearchMode`].
+    pub async fn search_with_mode(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+    ) -> Result<SearchOutcome> {
+        self.search_with_filters(
+            query,
+            artifact_types,
+            limit,
+            mode,
+            &SearchFilters::default(),
+        )
+        .await
+    }
+
+    /// Search with an explicit [`SearchMode`] and scalar pre-filters (#400).
+    ///
+    /// Scalar filters (subsystem, file, language, min_complexity) are pushed
+    /// into LanceDB as `.only_if()` predicates before vector ranking, ensuring
+    /// "top-K within filter" semantics rather than "globally top-K, then discard."
+    pub async fn search_with_filters(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
+        let table = match self.db.open_table(&self.table_name).execute().await {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("was not found")
+                    || msg.contains("does not exist")
+                    || msg.contains("not found")
+                {
+                    return Ok(SearchOutcome::NotReady);
+                }
+                return Err(e).context("Failed to open embedding table");
+            }
+        };
+
+        // Determine over-fetch multiplier.
+        //
+        // When scalar pre-filters are active, only matching rows participate
+        // in vector ranking — no need to over-fetch for post-Rust filtering.
+        // However, two Rust-side steps still reduce result count after the DB query:
+        //   1. artifact_types post-filter (lines below): skips rows whose kind
+        //      does not match the requested types.
+        //   2. test-path demotion: does not reduce count but reorders results.
+        //
+        // Keep a 2x over-fetch when artifact_types filtering is also active,
+        // so the caller receives `limit` results after that Rust-side step.
+        // Without filters, keep the 3x over-fetch (baseline behavior).
+        let pre_filter_sql = filters.to_sql();
+        let has_scalar_filters = pre_filter_sql.is_some();
+        let has_post_filter = artifact_types.is_some_and(|t| !t.is_empty());
+        let over_fetch = match (has_scalar_filters, has_post_filter) {
+            (true, false) => limit,    // scalar-only: exact fetch
+            (true, true) => limit * 2, // scalar + artifact_type: 2x for post-filter loss
+            _ => limit * 3,            // no scalar filters: baseline 3x
+        };
+
+        use futures::TryStreamExt;
+
+        let batches: Vec<RecordBatch> = match mode {
+            SearchMode::Keyword => {
+                // Pure BM25 full-text search — no embedding needed.
+                let fts_query = FullTextSearchQuery::new(query.to_string());
+                let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    q = q.only_if(sql.clone());
+                }
+                let results = q.execute().await.context("FTS keyword search failed")?;
+                results.try_collect().await?
+            }
+            SearchMode::Semantic => {
+                // Pure vector search — original behavior.
+                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let mut search = table
+                    .vector_search(query_embedding[0].clone())
+                    .context("Failed to create vector search")?
+                    .distance_type(lancedb::DistanceType::Cosine)
+                    .limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    search = search.only_if(sql.clone());
+                }
+                let results = search.execute().await.context("Vector search failed")?;
+                results.try_collect().await?
+            }
+            SearchMode::Hybrid => {
+                // Hybrid: BM25 + vector with RRF fusion.
+                // LanceDB automatically detects both FTS and vector on VectorQuery
+                // and routes through execute_hybrid with RRF reranking.
+                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let fts_query = FullTextSearchQuery::new(query.to_string());
+
+                let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    q = q.only_if(sql.clone());
+                }
+                let hybrid_result = q
+                    .nearest_to(query_embedding[0].as_slice())
+                    .context("Failed to create hybrid search")?
+                    .distance_type(lancedb::DistanceType::Cosine)
+                    .execute()
+                    .await;
+
+                match hybrid_result {
+                    Ok(stream) => stream.try_collect().await?,
+                    Err(e) => {
+                        // FTS index may not exist yet (first run before index_all
+                        // completes, or old cache). Fall back to pure vector search.
+                        tracing::warn!("Hybrid search failed ({}), falling back to vector-only", e);
+                        let mut search = table
+                            .vector_search(query_embedding[0].clone())
+                            .context("Failed to create fallback vector search")?
+                            .distance_type(lancedb::DistanceType::Cosine)
+                            .limit(over_fetch);
+                        if let Some(ref sql) = pre_filter_sql {
+                            search = search.only_if(sql.clone());
+                        }
+                        let results = search
+                            .execute()
+                            .await
+                            .context("Fallback vector search failed")?;
+                        results.try_collect().await?
+                    }
+                }
+            }
+        };
+
+        let mut search_results = Vec::new();
+
+        // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
+        // Detect which column is present by checking ANY batch — not just the first.
+        // The first batch may be skipped (missing required columns) when hybrid search
+        // with a pre-filter returns a partial schema, so checking only the first batch
+        // could misdetect the score column. (#400)
+        let has_score_col = batches.iter().any(|b| b.column_by_name("_score").is_some());
+
+        for batch in &batches {
+            // LanceDB hybrid search with a pre-filter (.only_if()) can return
+            // RecordBatches that are missing table columns — only FTS-indexed
+            // columns may be present. Guard against this rather than panicking.
+            // Skip the batch with a warning so callers get partial results
+            // instead of a hard crash. (#400)
+            let required_cols = ["id", "kind", "title", "body"];
+            let missing: Vec<&str> = required_cols
+                .iter()
+                .copied()
+                .filter(|col| batch.column_by_name(col).is_none())
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    missing_columns = ?missing,
+                    schema = ?batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                    "Skipping RecordBatch with missing required columns — \
+                     hybrid search pre-filter may have excluded non-indexed columns"
+                );
+                continue;
+            }
+
+            let ids = batch
+                .column_by_name("id")
+                .expect("checked above")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("id column is StringArray");
+            let kinds = batch
+                .column_by_name("kind")
+                .expect("checked above")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("kind column is StringArray");
+            let titles = batch
+                .column_by_name("title")
+                .expect("checked above")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("title column is StringArray");
+            let bodies = batch
+                .column_by_name("body")
+                .expect("checked above")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("body column is StringArray");
+
+            for i in 0..batch.num_rows() {
+                let kind = kinds.value(i).to_string();
+
+                // Filter by artifact type if specified
+                if let Some(types) = artifact_types
+                    && !types.iter().any(|t| t == &kind)
+                {
+                    continue;
+                }
+
+                let raw_score = if has_score_col {
+                    // RRF / BM25 `_score` — higher is better.
+                    // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
+                    // BM25 scores can exceed 1.0 for highly relevant short docs.
+                    // Use monotonic s/(1+s) transform to map [0, inf) -> [0, 1)
+                    // while preserving ranking order. A hard clamp at 1.0 would
+                    // destroy differentiation among high-scoring results.
+                    //
+                    // _score column presence was checked on first batch; if a
+                    // subsequent batch is missing it, fall back to 0.5 (neutral).
+                    let s = batch
+                        .column_by_name("_score")
+                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                        .map(|arr| arr.value(i))
+                        .unwrap_or(0.5);
+                    let s = s.max(0.0);
+                    s / (1.0 + s)
+                } else {
+                    // Cosine distance [0, 2]: convert to similarity.
+                    // If _distance is absent (shouldn't happen in vector mode,
+                    // but guard defensively), treat as maximum distance → 0 score.
+                    let d = batch
+                        .column_by_name("_distance")
+                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                        .map(|arr| arr.value(i))
+                        .unwrap_or(2.0);
+                    (1.0 - d).max(0.0)
+                };
+
+                // Demote test files: reduce score so production code ranks above
+                // test code at similar distances.
+                let id_str = ids.value(i).to_string();
+                let is_test = ranking::is_test_path(&id_str);
+                let score = if is_test { raw_score * 0.7 } else { raw_score };
+
+                search_results.push(SearchResult {
+                    id: id_str,
+                    kind,
+                    title: titles.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    score,
+                });
+            }
+        }
+
+        // Re-sort by adjusted score (descending) and truncate.
+        search_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        search_results.truncate(limit);
+
+        Ok(SearchOutcome::Results(search_results))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
+        EmbeddingIndex, SearchFilters, SearchResult, build_artifact_embedding_text,
+        build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
+        node_scalar_filters, truncate_chars,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn search_result_markdown_truncates_on_char_boundary() {
+        let result = SearchResult {
+            id: "abc123".into(),
+            kind: "commit".into(),
+            title: "unicode body".into(),
+            body: format!("{}—tail", "a".repeat(199)),
+            score: 1.0,
+        };
+
+        let markdown = result.to_markdown();
+
+        assert!(markdown.contains("..."));
+        assert!(markdown.contains(&format!("{}—...", "a".repeat(199))));
+        assert!(markdown.contains("Hash: `abc123`"));
+    }
+
+    // ── Adversarial: has_table ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn has_table_returns_false_when_no_table_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        // Fresh DB with no table should return Ok(false)
+        assert!(
+            !idx.has_table().await.unwrap(),
+            "has_table should be false on fresh DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_table_returns_true_after_index_build() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        // Create .oh directory structure that index_all_with_symbols expects
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        assert!(
+            !idx.has_table().await.unwrap(),
+            "precondition: no table yet"
+        );
+
+        // Provide a real node so the table gets created (empty texts = no table)
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("test.rs"),
+                name: "test_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn test_fn()".into(),
+            body: "fn test_fn() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let count = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
+        assert!(count > 0, "should have indexed at least 1 item");
+        // Table should now exist
+        assert!(
+            idx.has_table().await.unwrap(),
+            "has_table should be true after build"
+        );
+    }
+
+    #[test]
+    fn test_truncate_chars_ascii() {
+        let s = "a".repeat(600);
+        let result = truncate_chars(&s, 500);
+        assert_eq!(result.len(), 500);
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte_boundary() {
+        let mut s = "a".repeat(498);
+        s.push('—');
+        s.push_str(&"b".repeat(100));
+        let result = truncate_chars(&s, 500);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert_eq!(result.chars().count(), 500);
+    }
+
+    #[test]
+    fn test_truncate_chars_short_string() {
+        let s = "hello";
+        assert_eq!(truncate_chars(s, 500), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_exact_boundary() {
+        let s = "a".repeat(500);
+        assert_eq!(truncate_chars(&s, 500), s.as_str());
+    }
+
+    #[test]
+    fn test_code_embedding_text_within_budget() {
+        // Simulate a realistic Rust function body (body includes signature)
+        let name = "handle_timeout_error";
+        let body = concat!(
+            "pub async fn handle_timeout_error(&self, req: Request) -> Result<Response> {\n",
+            "    let timeout = self.config.timeout_ms;\n",
+            "    let result = tokio::time::timeout(\n",
+            "        Duration::from_millis(timeout),\n",
+            "        self.inner.call(req),\n",
+            "    ).await;\n",
+            "    match result {\n",
+            "        Ok(Ok(resp)) => Ok(resp),\n",
+            "        Ok(Err(e)) => Err(e.into()),\n",
+            "        Err(_) => {\n",
+            "            tracing::warn!(\"Request timed out after {}ms\", timeout);\n",
+            "            Err(AppError::Timeout { duration_ms: timeout })\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+        // Name should be present
+        assert!(
+            text.starts_with(name),
+            "text should start with the function name"
+        );
+        // Body content (signature) should be present -- but NOT duplicated
+        assert!(
+            text.contains("handle_timeout_error"),
+            "text should contain function name"
+        );
+        let sig_occurrences = text.matches("handle_timeout_error").count();
+        // name appears once at start, once inside the body's signature line = 2 max
+        assert!(
+            sig_occurrences <= 2,
+            "function name appears {} times — possible duplication",
+            sig_occurrences,
+        );
+    }
+
+    #[test]
+    fn test_code_embedding_text_long_body_truncated() {
+        let name = "process";
+        // A body much larger than the budget
+        let body = format!(
+            "fn process(data: &[u8]) -> Result<()> {{\n{}\n}}",
+            "x".repeat(2000)
+        );
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+    }
+
+    #[test]
+    fn test_code_embedding_text_with_metadata() {
+        let name = "foo";
+        let body = "fn foo() -> i32 { 42 }";
+        let mut metadata = BTreeMap::new();
+        metadata.insert("return_type".to_string(), "i32".to_string());
+        metadata.insert("visibility".to_string(), "pub".to_string());
+        let text = build_code_embedding_text(name, body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+        // Should contain the metadata
+        assert!(
+            text.contains("return_type: i32"),
+            "metadata should be in text"
+        );
+    }
+
+    #[test]
+    fn test_code_embedding_no_signature_duplication() {
+        // The key review finding: body already contains the signature.
+        // We should NOT see name + signature + body (which would duplicate).
+        let name = "search";
+        let signature = "pub fn search(&self, query: &str) -> Vec<Result>";
+        let body = format!("{} {{\n    self.db.query(query).collect()\n}}", signature);
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // The signature text should appear exactly once in the embedding
+        // (inside the body excerpt), NOT separately prepended.
+        let sig_count = text.matches(signature).count();
+        assert_eq!(
+            sig_count, 1,
+            "signature should appear exactly once in embedding text, found {}",
+            sig_count,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADVERSARIAL TESTS: edge cases, budget attacks, consistency probes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_chars_empty_string() {
+        assert_eq!(truncate_chars("", 500), "");
+    }
+
+    #[test]
+    fn truncate_chars_zero_limit() {
+        assert_eq!(truncate_chars("hello", 0), "");
+    }
+
+    /// Empty body should degrade gracefully: just the name, no crash.
+    #[test]
+    fn empty_body_degrades_gracefully() {
+        let text = build_code_embedding_text("foo", "", &BTreeMap::new());
+        assert!(text.contains("foo"), "must contain name");
+        // Should not be just whitespace or have excessive padding
+        assert_eq!(
+            text.trim(),
+            "foo",
+            "empty body should produce just name (trimmed)"
+        );
+    }
+
+    /// Empty name: the function must not panic and body should still appear.
+    #[test]
+    fn empty_name_no_panic() {
+        let text = build_code_embedding_text("", "fn () { 42 }", &BTreeMap::new());
+        assert!(
+            text.contains("fn () { 42 }"),
+            "body must be present even with empty name"
+        );
+    }
+
+    /// Both name and body empty: should produce an empty or near-empty string.
+    #[test]
+    fn all_empty_inputs() {
+        let text = build_code_embedding_text("", "", &BTreeMap::new());
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+        // Should not crash
+    }
+
+    /// BUG PROBE: meta_estimate uses .len() (bytes) but body budget
+    /// subtracts from a char-counted budget. For metadata with multibyte
+    /// characters, the byte-based estimate overcounts, stealing more body
+    /// budget than necessary.
+    #[test]
+    fn multibyte_metadata_steals_body_budget() {
+        let name = "f";
+        // 100 chars of body content
+        let body = "x".repeat(100);
+
+        // Metadata with multibyte values: 10 chars but 30 bytes each
+        let mut metadata = BTreeMap::new();
+        // Each value is 10 chars of 3-byte emoji = 30 bytes
+        let emoji_val: String = std::iter::repeat('\u{1f600}').take(10).collect();
+        metadata.insert("key".into(), emoji_val.clone());
+
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // The metadata byte estimate will be: 3 + 30 + 3 = 36 bytes
+        // But the actual char cost is: 3 + 10 + 3 = 16 chars
+        // This means body_budget is reduced by 36 instead of 16,
+        // wasting 20 chars of body budget.
+        //
+        // Verify the body content is still present (it's short enough
+        // to fit even with the overcounting)
+        assert!(
+            text.contains(&"x".repeat(50)),
+            "body should contain at least 50 x's, but meta byte overcounting \
+             may have stolen body budget. Text: {}",
+            text
+        );
+    }
+
+    /// Attack: enormous name that exceeds CODE_EMBED_CHAR_BUDGET.
+    /// The safety truncation must catch this.
+    #[test]
+    fn enormous_name_exceeds_budget() {
+        let name = "a".repeat(2000);
+        let body = "fn big() { }";
+        let text = build_code_embedding_text(&name, body, &BTreeMap::new());
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "enormous name ({} chars) must be truncated to budget ({}), got {}",
+            name.len(),
+            CODE_EMBED_CHAR_BUDGET,
+            text.chars().count()
+        );
+    }
+
+    /// Attack: enormous metadata that floods past budget.
+    /// Even with final safety truncation, the metadata loop runs to
+    /// completion before truncating. This is wasteful but not incorrect.
+    #[test]
+    fn enormous_metadata_within_budget() {
+        let name = "f";
+        let body = "fn f() {}";
+        let mut metadata = BTreeMap::new();
+        for i in 0..50 {
+            metadata.insert(
+                format!("type_ref_{:03}", i),
+                format!(
+                    "some::deeply::nested::module::Type{}<Generic{}, Another{}>",
+                    i, i, i
+                ),
+            );
+        }
+
+        let text = build_code_embedding_text(name, body, &metadata);
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "50 metadata entries must stay within budget, got {} chars",
+            text.chars().count()
+        );
+    }
+
+    /// BUG PROBE: When metadata is very large, body_budget saturates to 0.
+    /// The body content (which includes the signature!) gets entirely
+    /// dropped. The embedding becomes: name + metadata -- losing the
+    /// function's actual code, which defeats the purpose of this PR.
+    #[test]
+    fn large_metadata_evicts_body_entirely() {
+        let name = "search";
+        let body = "pub fn search(&self, q: &str) -> Vec<R> { self.db.query(q) }";
+        let mut metadata = BTreeMap::new();
+        // ~600 bytes of metadata, which will consume most of the 800-char budget
+        for i in 0..15 {
+            metadata.insert(
+                format!("param_type_{}", i),
+                format!(
+                    "std::collections::HashMap<String, Vec<Arc<Mutex<Type{}>>>>",
+                    i
+                ),
+            );
+        }
+
+        let text = build_code_embedding_text(name, body, &metadata);
+        // The body should still be present, at least partially
+        // If meta_estimate > budget - name, body_budget = 0 and body is gone
+        let has_body = text.contains("search") && text.contains("query");
+        if !has_body {
+            // Document the failure mode -- body was evicted
+            panic!(
+                "BUG: large metadata evicted the function body entirely. \
+                 The embedding text is: name + metadata with no code content. \
+                 This defeats the purpose of embedding function bodies.\n\
+                 Text ({} chars): {}",
+                text.chars().count(),
+                &text[..text.len().min(300)]
+            );
+        }
+    }
+
+    /// Single-line function: body IS the signature. Embedding should
+    /// contain it exactly once (from body), plus the name.
+    #[test]
+    fn single_line_function_no_duplication() {
+        let sig_and_body = "fn default_port() -> u16 { 8080 }";
+        let text = build_code_embedding_text("default_port", sig_and_body, &BTreeMap::new());
+
+        let count = text.matches(sig_and_body).count();
+        assert_eq!(
+            count, 1,
+            "single-line function should appear once in text, found {}. Text: {}",
+            count, text
+        );
+    }
+
+    /// Unicode in name and body: must not panic on multibyte boundaries.
+    #[test]
+    fn unicode_identifiers_safe() {
+        let text = build_code_embedding_text(
+            "\u{1f600}_handler",
+            "fn \u{1f600}_handler() { let \u{03b1} = \u{03b2} + \u{03b3}; }",
+            &BTreeMap::new(),
+        );
+        assert!(
+            std::str::from_utf8(text.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+        assert!(text.contains("\u{1f600}"), "emoji must survive");
+    }
+
+    /// Whitespace-only body should not produce excessive padding.
+    #[test]
+    fn whitespace_only_body() {
+        let text = build_code_embedding_text("blank", "   \n\t\n   ", &BTreeMap::new());
+        assert!(text.starts_with("blank"), "name must be at start");
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+    }
+
+    /// Determinism: same inputs always produce same output.
+    #[test]
+    fn embedding_text_deterministic() {
+        let meta = BTreeMap::from([("k".into(), "v".into())]);
+        let t1 = build_code_embedding_text("f", "fn f() {}", &meta);
+        let t2 = build_code_embedding_text("f", "fn f() {}", &meta);
+        assert_eq!(t1, t2, "embedding text must be deterministic");
+    }
+
+    /// BUG PROBE: The budget is 800 chars, but MiniLM-L6-v2 only accepts
+    /// 256 tokens. At ~2.8 chars per code token (WordPiece), 800 chars =
+    /// ~286 tokens, which exceeds the model's limit.
+    ///
+    /// This test constructs a maximal embedding text and estimates whether
+    /// it could fit in 256 tokens.
+    #[test]
+    fn budget_800_chars_may_exceed_256_tokens() {
+        // Fill exactly to budget with code-like content
+        let name = "handle_complex_request";
+        let body_content = concat!(
+            "pub async fn handle_complex_request(&self, req: HttpRequest<Body>, ",
+            "ctx: &RequestContext, middleware: &[Box<dyn Middleware>]) ",
+            "-> Result<HttpResponse<Body>, AppError> {\n",
+            "    let session = self.session_store.get_or_create(req.headers());\n",
+            "    let auth_result = self.auth_service.validate_token(\n",
+            "        req.headers().get(\"Authorization\"),\n",
+            "        &session,\n",
+            "    ).await?;\n",
+            "    if !auth_result.has_permission(ctx.required_permission()) {\n",
+            "        return Err(AppError::Forbidden {\n",
+            "            user: auth_result.user_id().to_string(),\n",
+            "            resource: ctx.resource_path().to_string(),\n",
+            "        });\n",
+            "    }\n",
+            "    let mut response = self.inner_handler.handle(req, ctx).await?;\n",
+            "    for mw in middleware.iter().rev() {\n",
+            "        response = mw.after(response, ctx).await?;\n",
+            "    }\n",
+            "    self.metrics.record_request(ctx, &response);\n",
+            "    Ok(response)\n",
+            "}\n",
+        );
+        let text = build_code_embedding_text(name, body_content, &BTreeMap::new());
+        let char_count = text.chars().count();
+
+        // Conservative token estimate for code: ~2.8 chars per token
+        // (identifiers like handle_complex_request split into multiple
+        // subword tokens with WordPiece)
+        let estimated_tokens = char_count as f64 / 2.8;
+
+        // If this fails, the 800-char budget is too generous for 256 tokens.
+        // It's a documentation assertion, not necessarily a hard failure.
+        if estimated_tokens > 256.0 {
+            panic!(
+                "WARNING: embedding text of {} chars (~{:.0} estimated tokens) \
+                 likely exceeds MiniLM-L6-v2's 256-token limit. The model will \
+                 silently truncate, potentially discarding meaningful content.\n\
+                 Consider reducing CODE_EMBED_CHAR_BUDGET to ~700 chars.\n\
+                 Text (first 200 chars): {}",
+                char_count,
+                estimated_tokens,
+                &text[..text.len().min(200)]
+            );
+        }
+    }
+
+    /// Verify that body_budget calculation doesn't underflow when name is
+    /// close to CODE_EMBED_CHAR_BUDGET.
+    #[test]
+    fn body_budget_no_underflow() {
+        // Name that's exactly at budget
+        let name = "a".repeat(CODE_EMBED_CHAR_BUDGET);
+        let text = build_code_embedding_text(&name, "body content", &BTreeMap::new());
+        // Should not panic from underflow; body should be omitted
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+    }
+
+    /// When metadata byte-length equals char-length (ASCII only),
+    /// the body budget calculation should be accurate.
+    #[test]
+    fn ascii_metadata_budget_accurate() {
+        let name = "f";
+        // Fill body to exactly what should fit
+        let mut metadata = BTreeMap::new();
+        metadata.insert("key".into(), "val".into());
+        // meta entry " key: val" = 9 chars
+        // after_name = 650 - 2 = 648
+        // min_body_budget = 325
+        // meta_budget = min(648 - 325, 9) = 9
+        // body_budget = 648 - 9 = 639
+
+        let body = "x".repeat(639);
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // With ASCII metadata, byte == char, so budget should be exact
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET
+        );
+        // Body should be fully included (not truncated)
+        assert!(
+            text.contains(&"x".repeat(639)),
+            "full body should fit within budget when metadata is small"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADVERSARIAL TESTS: adaptive batch sizing (PR #129)
+    // -----------------------------------------------------------------------
+
+    /// Constants must form a valid configuration: floor < ceiling,
+    /// backoff threshold > 1.0 (otherwise every batch triggers backoff),
+    /// yield > 0 (otherwise no breathing room).
+    #[test]
+    fn adaptive_batch_constants_sane() {
+        assert!(
+            BATCH_FLOOR < BATCH_CEILING,
+            "BATCH_FLOOR ({}) must be less than BATCH_CEILING ({})",
+            BATCH_FLOOR,
+            BATCH_CEILING
+        );
+        assert!(
+            BATCH_FLOOR > 0,
+            "BATCH_FLOOR must be > 0 to avoid zero-size batches"
+        );
+        assert!(
+            BACKOFF_THRESHOLD > 1.0,
+            "BACKOFF_THRESHOLD ({}) must be > 1.0 or every batch triggers backoff",
+            BACKOFF_THRESHOLD
+        );
+        assert!(
+            BATCH_YIELD_MS > 0,
+            "BATCH_YIELD_MS must be > 0 to actually yield"
+        );
+    }
+
+    /// BATCH_FLOOR must be a power of two so that repeated halving
+    /// from BATCH_CEILING always lands exactly on BATCH_FLOOR.
+    #[test]
+    fn batch_floor_and_ceiling_are_powers_of_two() {
+        assert!(
+            BATCH_FLOOR.is_power_of_two(),
+            "BATCH_FLOOR ({}) should be a power of two for clean halving",
+            BATCH_FLOOR
+        );
+        assert!(
+            BATCH_CEILING.is_power_of_two(),
+            "BATCH_CEILING ({}) should be a power of two for clean doubling",
+            BATCH_CEILING
+        );
+    }
+
+    /// Simulate the ramp-up sequence: starting at BATCH_FLOOR, doubling
+    /// each step, we should reach BATCH_CEILING in a known number of steps.
+    #[test]
+    fn ramp_up_reaches_ceiling() {
+        let mut batch_size = BATCH_FLOOR;
+        let mut steps = 0;
+        while batch_size < BATCH_CEILING {
+            batch_size = (batch_size * 2).min(BATCH_CEILING);
+            steps += 1;
+            assert!(
+                steps <= 20,
+                "ramp-up did not converge after 20 doublings — constants are broken"
+            );
+        }
+        assert_eq!(batch_size, BATCH_CEILING);
+        // With floor=4 and ceiling=64: 4->8->16->32->64 = 4 steps
+        let expected = (BATCH_CEILING / BATCH_FLOOR).trailing_zeros() as usize;
+        assert_eq!(
+            steps, expected,
+            "ramp-up should take exactly {} doublings, took {}",
+            expected, steps
+        );
+    }
+
+    /// Simulate backoff: halving from BATCH_CEILING should reach BATCH_FLOOR.
+    #[test]
+    fn backoff_reaches_floor() {
+        let mut batch_size = BATCH_CEILING;
+        let mut steps = 0;
+        while batch_size > BATCH_FLOOR {
+            batch_size = (batch_size / 2).max(BATCH_FLOOR);
+            steps += 1;
+            assert!(steps <= 20, "backoff did not converge");
+        }
+        assert_eq!(batch_size, BATCH_FLOOR);
+    }
+
+    /// Simulate the full adaptive loop for 0 items.
+    /// The while loop should never execute; result should be empty.
+    #[test]
+    fn adaptive_loop_zero_items() {
+        let items: Vec<String> = vec![];
+        let total = items.len();
+        assert_eq!(total, 0);
+        // Mirrors the early return in embed_texts
+        // No panic, no infinite loop
+    }
+
+    /// Simulate the adaptive loop for exactly 1 item.
+    /// Should produce exactly one batch of size 1, no yield.
+    #[test]
+    fn adaptive_loop_single_item() {
+        let mut remaining = vec!["one".to_string()];
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batches_processed = 0;
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            // Simulate: first batch always doubles
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            batches_processed += 1;
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        assert_eq!(batches_processed, 1, "single item = single batch");
+        assert_eq!(yields, 0, "single item = no yield needed");
+    }
+
+    /// Simulate the adaptive loop for exactly BATCH_FLOOR items.
+    /// Should produce exactly one batch of size BATCH_FLOOR, no yield.
+    #[test]
+    fn adaptive_loop_exactly_floor_items() {
+        let mut remaining: Vec<String> = (0..BATCH_FLOOR).map(|i| format!("item_{}", i)).collect();
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batches_processed = 0;
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            batches_processed += 1;
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        assert_eq!(batches_processed, 1, "BATCH_FLOOR items = single batch");
+        assert_eq!(yields, 0, "BATCH_FLOOR items = no yield needed");
+    }
+
+    /// Simulate the adaptive loop for exactly BATCH_CEILING items.
+    /// Should ramp up: 4 + 8 + 16 + 32 + 4 = 64 items across 5 batches.
+    #[test]
+    fn adaptive_loop_exactly_ceiling_items() {
+        let mut remaining: Vec<String> =
+            (0..BATCH_CEILING).map(|i| format!("item_{}", i)).collect();
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batch_sizes = Vec::new();
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            batch_sizes.push(bs);
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        // With ramp-up and ceiling=64: batches are 4, 8, 16, 32, 4 (remainder)
+        let total_processed: usize = batch_sizes.iter().sum();
+        assert_eq!(total_processed, BATCH_CEILING);
+        assert!(
+            batch_sizes.len() >= 2,
+            "should need multiple batches for ramp-up"
+        );
+        // First batch is always BATCH_FLOOR
+        assert_eq!(batch_sizes[0], BATCH_FLOOR);
+        // Yields = batches - 1 (no yield after last batch)
+        assert_eq!(yields, batch_sizes.len() - 1);
+    }
+
+    /// Simulate the EMA calculation to verify it converges, not diverges.
+    /// Feed constant per-item times and verify rolling_avg converges to that value.
+    #[test]
+    fn ema_converges_on_steady_input() {
+        const EMA_ALPHA: f64 = 0.3;
+        let constant_time = 0.01; // 10ms per item
+        let mut rolling_avg: Option<f64> = None;
+
+        for _ in 0..20 {
+            match rolling_avg {
+                None => {
+                    rolling_avg = Some(constant_time);
+                }
+                Some(avg) => {
+                    rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + constant_time * EMA_ALPHA);
+                }
+            }
+        }
+
+        let avg = rolling_avg.unwrap();
+        assert!(
+            (avg - constant_time).abs() < 1e-10,
+            "EMA should converge to the constant input value, got {}",
+            avg
+        );
+    }
+
+    /// Simulate a latency spike: verify backoff triggers and then recovers.
+    #[test]
+    fn ema_backoff_and_recovery() {
+        const EMA_ALPHA: f64 = 0.3;
+        let normal_time = 0.01;
+        let spike_time = 0.05; // 5x normal
+
+        let mut rolling_avg: Option<f64> = None;
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batch_sizes = Vec::new();
+
+        // 5 normal batches to establish baseline
+        for _ in 0..5 {
+            let per_item = normal_time;
+            match rolling_avg {
+                None => {
+                    rolling_avg = Some(per_item);
+                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                }
+                Some(avg) => {
+                    if per_item > BACKOFF_THRESHOLD * avg {
+                        current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    } else {
+                        current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                    }
+                    rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+                }
+            }
+            batch_sizes.push(current_batch_size);
+        }
+
+        // Batch size should have ramped up
+        let pre_spike_size = current_batch_size;
+        assert!(
+            pre_spike_size > BATCH_FLOOR,
+            "should have ramped up before spike"
+        );
+
+        // Spike: per-item time jumps to 5x normal
+        let per_item = spike_time;
+        let avg = rolling_avg.unwrap();
+        assert!(
+            per_item > BACKOFF_THRESHOLD * avg,
+            "spike should exceed backoff threshold"
+        );
+        current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+        rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+
+        let post_spike_size = current_batch_size;
+        assert!(
+            post_spike_size < pre_spike_size,
+            "batch size should decrease after spike"
+        );
+
+        // Recovery: 10 more normal batches
+        for _ in 0..10 {
+            let per_item = normal_time;
+            let avg = rolling_avg.unwrap();
+            if per_item > BACKOFF_THRESHOLD * avg {
+                current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+            } else {
+                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            }
+            rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+        }
+
+        assert!(
+            current_batch_size >= pre_spike_size,
+            "should recover to at least pre-spike size after normal batches, got {}",
+            current_batch_size
+        );
+    }
+
+    /// Floor clamping: repeated halving should never go below BATCH_FLOOR.
+    #[test]
+    fn backoff_never_below_floor() {
+        let mut batch_size = BATCH_FLOOR;
+        // Try to halve 10 more times past the floor
+        for _ in 0..10 {
+            batch_size = (batch_size / 2).max(BATCH_FLOOR);
+        }
+        assert_eq!(batch_size, BATCH_FLOOR, "should clamp at BATCH_FLOOR");
+    }
+
+    /// Ceiling clamping: repeated doubling should never exceed BATCH_CEILING.
+    #[test]
+    fn ramp_up_never_above_ceiling() {
+        let mut batch_size = BATCH_CEILING;
+        // Try to double 10 more times past the ceiling
+        for _ in 0..10 {
+            batch_size = (batch_size * 2).min(BATCH_CEILING);
+        }
+        assert_eq!(batch_size, BATCH_CEILING, "should clamp at BATCH_CEILING");
+    }
+
+    // ── SearchMode tests ───────────────────────────────────────────────
+
+    use super::SearchMode;
+
+    #[test]
+    fn search_mode_default_is_hybrid() {
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn search_mode_equality() {
+        assert_ne!(SearchMode::Keyword, SearchMode::Semantic);
+        assert_ne!(SearchMode::Keyword, SearchMode::Hybrid);
+        assert_ne!(SearchMode::Semantic, SearchMode::Hybrid);
+    }
+
+    // ── Unified artifact embedding via graph nodes ──────────────────────
+
+    #[tokio::test]
+    async fn oh_artifact_node_gets_artifact_kind_in_embedding() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("oh_kind".to_string(), "outcome".to_string());
+        metadata.insert("frontmatter.id".to_string(), "test-outcome".to_string());
+        metadata.insert("frontmatter.title".to_string(), "Test Outcome".to_string());
+
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from(".oh/outcomes/test-outcome.md"),
+                name: "Test Outcome".into(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".into(),
+            signature: "Test Outcome".into(),
+            body: "This is a test outcome body.".into(),
+            line_start: 1,
+            line_end: 5,
+            metadata,
+            source: ExtractionSource::Markdown,
+        };
+
+        let count = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
+        assert!(count > 0, "should have indexed the .oh/ artifact node");
+    }
+
+    #[tokio::test]
+    async fn blake3_hash_skips_unchanged_on_second_rebuild() {
+        // Adversarial test: second index_all_with_symbols call should skip
+        // embedding for unchanged nodes (BLAKE3 hash hit).
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        // Initialize git repo so load_commits doesn't error
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo_root)
+            .output()
+            .ok();
+
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("test.rs"),
+                name: "blake3_test_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn blake3_test_fn()".into(),
+            body: "fn blake3_test_fn() { let x = 1; }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+
+        // First build: creates table
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node.clone()])
+            .await
+            .unwrap();
+        assert!(count1 > 0, "first build should index items");
+        assert!(
+            idx.has_table().await.unwrap(),
+            "table should exist after first build"
+        );
+
+        // Second build with same node: BLAKE3 hash skip means 0 newly embedded
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
+        assert_eq!(
+            count2, 0,
+            "second build should skip all unchanged nodes via BLAKE3 hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rows_deleted_when_node_removed() {
+        // Adversarial test: if a node is removed between rebuilds,
+        // its embedding row should be deleted.
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo_root)
+            .output()
+            .ok();
+
+        let node_a = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("a.rs"),
+                name: "fn_a".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn fn_a()".into(),
+            body: "fn fn_a() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let node_b = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("b.rs"),
+                name: "fn_b".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn fn_b()".into(),
+            body: "fn fn_b() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        let node_b_id = node_b.stable_id();
+
+        // Build with both nodes
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node_a.clone(), node_b])
+            .await
+            .unwrap();
+        assert!(count1 > 0);
+
+        // Rebuild with only node_a -- node_b should be cleaned up.
+        // count2 is 0 because node_a is unchanged (BLAKE3 hash hit).
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node_a])
+            .await
+            .unwrap();
+        assert_eq!(count2, 0, "node_a unchanged, should skip via BLAKE3 hash");
+
+        // Verify stale row is truly gone by querying text hashes for node_b
+        let table = idx.db.open_table(&idx.table_name).execute().await.unwrap();
+        let hashes = idx.query_text_hashes(&table, &[&node_b_id]).await;
+        match hashes {
+            Some(map) => {
+                assert!(
+                    !map.contains_key(&node_b_id),
+                    "stale row for removed node should be deleted, but found id: {}",
+                    node_b_id
+                );
+            }
+            None => {
+                // text_hash column missing = old schema, acceptable
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_re_embed_succeeds_on_existing_table() {
+        // Regression test for #332: second index_all_with_symbols call on an
+        // existing table (simulating post-enrichment re-embed) should succeed.
+        // The node body changes between calls, forcing a re-embed (BLAKE3 miss).
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo_root)
+            .output()
+            .ok();
+
+        let node_v1 = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("enrich.rs"),
+                name: "enriched_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn enriched_fn()".into(),
+            body: "fn enriched_fn() { original(); }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        // Enriched version: same ID, different body (simulates LSP metadata)
+        let mut node_v2 = node_v1.clone();
+        node_v2.body = "fn enriched_fn() { original(); /* LSP: calls foo, bar */ }".into();
+        node_v2.metadata.insert("callers".into(), "foo, bar".into());
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+
+        // First build: creates table
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node_v1])
+            .await
+            .unwrap();
+        assert!(count1 > 0, "first build should index items");
+        assert!(
+            idx.has_table().await.unwrap(),
+            "table should exist after first build"
+        );
+
+        // Second build with enriched node: body changed so BLAKE3 hash differs,
+        // must re-embed. Before fix #332 this failed with merge_insert error.
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node_v2])
+            .await
+            .unwrap();
+        assert!(
+            count2 > 0,
+            "enrichment re-embed should re-index changed node"
+        );
+    }
+
+    #[test]
+    fn artifact_embedding_text_includes_frontmatter() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("oh_kind".to_string(), "outcome".to_string());
+        metadata.insert("frontmatter.id".to_string(), "ctx-assembly".to_string());
+        metadata.insert("frontmatter.status".to_string(), "active".to_string());
+
+        let text = build_artifact_embedding_text("My Outcome", "Body text here.", &metadata);
+        assert!(
+            text.starts_with("ctx-assembly"),
+            "should start with frontmatter id, got: {}",
+            text
+        );
+        assert!(
+            text.contains("status: active"),
+            "should contain frontmatter fields"
+        );
+        assert!(text.contains("Body text here."), "should contain body text");
+    }
+
+    // ── #401: doc comment in embedding text ───────────────────────────────
+
+    #[test]
+    fn doc_comment_prepended_before_body_in_embedding() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "doc_comment".to_string(),
+            "Charges the card and records the transaction in the audit log.".to_string(),
+        );
+
+        let text =
+            build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+
+        // Doc comment should appear before the function body
+        let doc_pos = text
+            .find("Charges the card")
+            .expect("doc comment should be present");
+        let body_pos = text
+            .find("fn process_payment")
+            .expect("body should be present");
+        assert!(
+            doc_pos < body_pos,
+            "doc comment (pos {}) should appear before body (pos {}): {}",
+            doc_pos,
+            body_pos,
+            text,
+        );
+    }
+
+    #[test]
+    fn doc_comment_not_duplicated_in_metadata_section() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "doc_comment".to_string(),
+            "Returns the computed value.".to_string(),
+        );
+        metadata.insert("cyclomatic".to_string(), "3".to_string());
+
+        let text = build_code_embedding_text("compute_result", "fn compute_result() {}", &metadata);
+
+        // doc_comment should appear once (as body prefix), not twice (not in metadata section)
+        let count = text.matches("Returns the computed value").count();
+        assert_eq!(
+            count, 1,
+            "doc_comment should appear exactly once, found {} times in: {}",
+            count, text
+        );
+    }
+
+    #[test]
+    fn doc_comment_within_budget() {
+        let doc =
+            "This is a very long doc comment describing the function's purpose in great detail."
+                .repeat(10);
+        let mut metadata = BTreeMap::new();
+        metadata.insert("doc_comment".to_string(), doc);
+
+        let text = build_code_embedding_text("my_fn", "fn my_fn() {}", &metadata);
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding with doc comment exceeded budget: {} chars",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn embedding_without_doc_comment_unchanged() {
+        // When no doc_comment key, behavior should be identical to the original
+        let metadata = BTreeMap::new();
+        let text =
+            build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+        // Name should be first, body should follow
+        assert!(
+            text.starts_with("process_payment"),
+            "should start with name"
+        );
+        assert!(text.contains("fn process_payment"), "should contain body");
+    }
+
+    // ── #400: SearchFilters SQL generation ────────────────────────────────
+
+    #[test]
+    fn search_filters_empty_returns_none() {
+        let filters = SearchFilters::default();
+        assert!(
+            filters.to_sql().is_none(),
+            "empty filters should produce None"
+        );
+    }
+
+    #[test]
+    fn search_filters_subsystem_only() {
+        let filters = SearchFilters {
+            subsystem: Some("server".to_string()),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("subsystem filter should produce SQL");
+        assert_eq!(sql, "subsystem = 'server'");
+    }
+
+    #[test]
+    fn search_filters_file_only() {
+        let filters = SearchFilters {
+            file: Some("src/embed.rs".to_string()),
+            ..Default::default()
+        };
+        let sql = filters.to_sql().expect("file filter should produce SQL");
+        assert!(
+            sql.contains("file_path LIKE"),
+            "should use LIKE for file: {}",
+            sql
+        );
+        assert!(
+            sql.contains("src/embed.rs"),
+            "should contain file pattern: {}",
+            sql
+        );
+        assert!(
+            sql.contains("ESCAPE '!'"),
+            "should include explicit ESCAPE clause for DataFusion: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn search_filters_file_wildcards_escaped() {
+        // Verify LIKE special characters are escaped with the '!' escape character
+        let filters = SearchFilters {
+            file: Some("src%embed_rs".to_string()),
+            ..Default::default()
+        };
+        let sql = filters.to_sql().expect("should produce SQL");
+        // % should be escaped as !%
+        assert!(
+            sql.contains("!%"),
+            "% in file path should be escaped as !%: {}",
+            sql
+        );
+        // _ should be escaped as !_
+        assert!(
+            sql.contains("!_"),
+            "_ in file path should be escaped as !_: {}",
+            sql
+        );
+        // The escape character itself should be escaped as !!
+        let filters2 = SearchFilters {
+            file: Some("src!embed.rs".to_string()),
+            ..Default::default()
+        };
+        let sql2 = filters2.to_sql().expect("should produce SQL");
+        assert!(
+            sql2.contains("!!"),
+            "! in file path should be escaped as !!: {}",
+            sql2
+        );
+    }
+
+    #[test]
+    fn search_filters_language_only() {
+        let filters = SearchFilters {
+            language: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("language filter should produce SQL");
+        assert_eq!(sql, "language = 'rust'");
+    }
+
+    #[test]
+    fn search_filters_min_complexity_only() {
+        let filters = SearchFilters {
+            min_complexity: Some(5),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("min_complexity filter should produce SQL");
+        assert_eq!(sql, "cyclomatic >= 5");
+    }
+
+    #[test]
+    fn search_filters_combined() {
+        let filters = SearchFilters {
+            subsystem: Some("embed".to_string()),
+            file: Some("embed.rs".to_string()),
+            language: Some("rust".to_string()),
+            min_complexity: Some(3),
+        };
+        let sql = filters
+            .to_sql()
+            .expect("combined filters should produce SQL");
+        assert!(
+            sql.contains("subsystem = 'embed'"),
+            "missing subsystem: {}",
+            sql
+        );
+        assert!(sql.contains("file_path LIKE"), "missing file_path: {}", sql);
+        assert!(
+            sql.contains("language = 'rust'"),
+            "missing language: {}",
+            sql
+        );
+        assert!(
+            sql.contains("cyclomatic >= 3"),
+            "missing cyclomatic: {}",
+            sql
+        );
+        // Should be joined with AND
+        assert!(sql.contains(" AND "), "should use AND: {}", sql);
+    }
+
+    #[test]
+    fn search_filters_sql_injection_escaped() {
+        // Single quotes in subsystem name should be escaped
+        let filters = SearchFilters {
+            subsystem: Some("server's module".to_string()),
+            ..Default::default()
+        };
+        let sql = filters.to_sql().expect("should produce SQL");
+        assert!(
+            sql.contains("server''s module"),
+            "single quotes should be doubled: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("server's module"),
+            "raw single quote should not appear: {}",
+            sql
+        );
+    }
+
+    // ── #400: batch column guard (hybrid search panic regression) ─────────
+
+    /// Verify that a RecordBatch missing required columns is detected and
+    /// skipped gracefully rather than causing an unwrap panic.
+    ///
+    /// Regression test for the panic at embed.rs:1518 when LanceDB hybrid
+    /// search with a pre-filter returns RecordBatches without the `id` column.
+    #[test]
+    fn batch_missing_required_column_is_detected() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Build a batch that has `kind`, `title`, `body` but NOT `id` —
+        // simulating the hybrid-search-with-prefilter regression.
+        let schema = Schema::new(vec![
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["example_fn"])),
+                Arc::new(StringArray::from(vec!["fn example_fn() {}"])),
+            ],
+        )
+        .expect("should build RecordBatch without id column");
+
+        // Apply the same column guard used in search_with_filters.
+        // This must NOT panic — it should detect the missing column.
+        let required_cols = ["id", "kind", "title", "body"];
+        let missing: Vec<&str> = required_cols
+            .iter()
+            .copied()
+            .filter(|col| batch.column_by_name(col).is_none())
+            .collect();
+
+        assert_eq!(
+            missing,
+            vec!["id"],
+            "should detect exactly the missing 'id' column, got: {:?}",
+            missing
+        );
+    }
+
+    /// Verify that a complete RecordBatch (all required columns present)
+    /// passes the column guard with no missing columns.
+    #[test]
+    fn batch_with_all_required_columns_passes_guard() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["test::file.rs::fn_a::function"])),
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["fn_a"])),
+                Arc::new(StringArray::from(vec!["fn fn_a() {}"])),
+            ],
+        )
+        .expect("should build complete RecordBatch");
+
+        let required_cols = ["id", "kind", "title", "body"];
+        let missing: Vec<&str> = required_cols
+            .iter()
+            .copied()
+            .filter(|col| batch.column_by_name(col).is_none())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "complete batch should have no missing columns, but found: {:?}",
+            missing
+        );
+    }
+
+    /// Adversarial: has_score_col must be detected from ANY batch, not just the first.
+    ///
+    /// When the first batch is missing required columns (and gets skipped), later
+    /// batches may have _score. has_score_col must still be true so they use the
+    /// correct scoring branch.
+    #[test]
+    fn has_score_col_detected_from_any_batch() {
+        use arrow_array::{Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
+        // No _score column either.
+        let schema_incomplete = Schema::new(vec![Field::new("title", DataType::Utf8, false)]);
+        let batch_incomplete = RecordBatch::try_new(
+            Arc::new(schema_incomplete),
+            vec![Arc::new(StringArray::from(vec!["stub"]))],
+        )
+        .expect("should build incomplete batch");
+
+        // Batch 1: complete batch with _score (simulates valid hybrid search result).
+        let schema_complete = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+        ]);
+        let batch_complete = RecordBatch::try_new(
+            Arc::new(schema_complete),
+            vec![
+                Arc::new(StringArray::from(vec!["id1"])),
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["title1"])),
+                Arc::new(StringArray::from(vec!["body1"])),
+                Arc::new(Float32Array::from(vec![0.8f32])),
+            ],
+        )
+        .expect("should build complete batch");
+
+        let batches = vec![batch_incomplete, batch_complete];
+
+        // Simulate the has_score_col detection from the fix (any batch, not just first).
+        let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
+        let has_score_col_first = batches
+            .first()
+            .is_some_and(|b| b.column_by_name("_score").is_some());
+
+        assert!(
+            has_score_col_any,
+            "should detect _score from any batch, but iter().any() returned false"
+        );
+        assert!(
+            !has_score_col_first,
+            "first batch does not have _score — verifying that first-only detection is wrong"
+        );
+    }
+
+    // ── #599: unified node embedding helpers ──────────────────────────────
+
+    fn make_test_node(
+        name: &str,
+        kind: crate::graph::NodeKind,
+        body: &str,
+        metadata: BTreeMap<String, String>,
+    ) -> crate::graph::Node {
+        use crate::graph::{ExtractionSource, Node, NodeId};
+        use std::path::PathBuf;
+        Node {
+            id: NodeId {
+                root: "test".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: format!("fn {}()", name),
+            body: body.to_string(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn node_embedding_kind_uses_oh_kind_when_present() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        let node = make_test_node(
+            "my-outcome",
+            crate::graph::NodeKind::MarkdownSection,
+            "body",
+            meta,
+        );
+        assert_eq!(node_embedding_kind(&node), "outcome");
+    }
+
+    #[test]
+    fn node_embedding_kind_prefixes_code_for_regular_nodes() {
+        let node = make_test_node(
+            "foo",
+            crate::graph::NodeKind::Function,
+            "fn foo() {}",
+            BTreeMap::new(),
+        );
+        assert_eq!(node_embedding_kind(&node), "code:function");
+    }
+
+    #[test]
+    fn node_embedding_title_uses_frontmatter_for_artifacts() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        meta.insert(
+            "frontmatter.title".to_string(),
+            "Context Assembly".to_string(),
+        );
+        let node = make_test_node("ctx", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        assert_eq!(node_embedding_title(&node), "Context Assembly");
+    }
+
+    #[test]
+    fn node_embedding_title_falls_back_for_artifacts_without_frontmatter() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "metis".to_string());
+        let node = make_test_node(
+            "learning",
+            crate::graph::NodeKind::MarkdownSection,
+            "body",
+            meta,
+        );
+        let title = node_embedding_title(&node);
+        assert!(title.contains("learning"), "should contain name: {}", title);
+    }
+
+    #[test]
+    fn node_embedding_title_for_code_node() {
+        let node = make_test_node(
+            "process",
+            crate::graph::NodeKind::Function,
+            "fn process() {}",
+            BTreeMap::new(),
+        );
+        let title = node_embedding_title(&node);
+        assert_eq!(title, "function process (rust)");
+    }
+
+    #[test]
+    fn node_scalar_filters_none_for_artifacts() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "guardrail".to_string());
+        let node = make_test_node("gr", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        let (fp, lang, sub, cc) = node_scalar_filters(&node);
+        assert!(fp.is_none(), "artifact should have no file_path filter");
+        assert!(lang.is_none(), "artifact should have no language filter");
+        assert!(sub.is_none(), "artifact should have no subsystem filter");
+        assert!(cc.is_none(), "artifact should have no cyclomatic filter");
+    }
+
+    #[test]
+    fn node_scalar_filters_populated_for_code() {
+        let mut meta = BTreeMap::new();
+        meta.insert("cyclomatic".to_string(), "5".to_string());
+        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", meta);
+        let (fp, lang, sub, cc) = node_scalar_filters(&node);
+        assert!(fp.is_some(), "code node should have file_path");
+        assert_eq!(lang, Some("rust".to_string()));
+        assert_eq!(cc, Some(5));
+        assert!(sub.is_none(), "no subsystem set");
+    }
+
+    #[test]
+    fn node_embedding_text_artifact_matches_direct_call() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        meta.insert("frontmatter.id".to_string(), "ctx-assembly".to_string());
+        meta.insert("frontmatter.status".to_string(), "active".to_string());
+        let node = make_test_node(
+            "ctx",
+            crate::graph::NodeKind::MarkdownSection,
+            "Body text.",
+            meta.clone(),
+        );
+        let via_node = node_embedding_text(&node);
+        let via_direct = build_artifact_embedding_text("ctx", "Body text.", &meta);
+        assert_eq!(
+            via_node, via_direct,
+            "unified helper should match direct artifact builder"
+        );
+    }
+
+    #[test]
+    fn node_embedding_text_code_matches_direct_call() {
+        let meta = BTreeMap::new();
+        let node = make_test_node(
+            "foo",
+            crate::graph::NodeKind::Function,
+            "fn foo() {}",
+            meta.clone(),
+        );
+        let via_node = node_embedding_text(&node);
+        let via_direct = build_code_embedding_text("foo", "fn foo() {}", &meta);
+        assert_eq!(
+            via_node, via_direct,
+            "unified helper should match direct code builder"
+        );
+    }
+
+    #[test]
+    fn node_embedding_text_markdown_section_truncates() {
+        let long_body = "x".repeat(1000);
+        let node = make_test_node(
+            "section",
+            crate::graph::NodeKind::MarkdownSection,
+            &long_body,
+            BTreeMap::new(),
+        );
+        let text = node_embedding_text(&node);
+        assert!(
+            text.chars().count() <= 500,
+            "markdown section should be truncated to 500 chars"
+        );
+    }
+}
