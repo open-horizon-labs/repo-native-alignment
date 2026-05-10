@@ -1459,11 +1459,18 @@ mod tests {
             Nodes: {:?}",
             gs2.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
-        // Await background LSP enrichment before reading LanceDB directly.
+        // Drain background LSP enrichment before reading LanceDB directly.
         // The same handler can re-persist after the foreground tree-sitter snapshot;
-        // reading while that task is still running makes this regression test flaky.
-        if let Some(h) = handler.lsp_handle.lock().await.take() {
-            let _ = h.await;
+        // bound the wait so a stuck enrichment task fails this test quickly instead
+        // of hanging the suite.
+        if let Some(mut h) = handler.lsp_handle.lock().await.take() {
+            if tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
+                .await
+                .is_err()
+            {
+                h.abort();
+                let _ = h.await;
+            }
         }
 
         // Step 5: Verify LanceDB was updated: load fresh from lance and check
