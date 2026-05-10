@@ -77,9 +77,9 @@ check "cross-file calls symbol present" \
 # ── EDGE TRAVERSAL ───────────────────────────────────────────────────────────
 echo "" && echo "--- Edge Traversal ---"
 check "BelongsTo edges (#396)" \
-  "repo-native-alignment graph --node 'src/embed.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types belongs_to" "module\|subsystem"
+  "repo-native-alignment graph --node 'src/embed/real.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types belongs_to" "module\|subsystem"
 check "Calls edges" \
-  "repo-native-alignment graph --node 'src/embed.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types calls" "result"
+  "repo-native-alignment graph --node 'src/embed/real.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types calls" "result"
 check "Subsystem members present" \
   "repo-native-alignment search '' --repo $RNA_REPO --kind subsystem --limit 3" "subsystem"
 
@@ -177,8 +177,8 @@ check "import_calls_pass indexed by RNA" \
 # directory_module pass produces unconditional BelongsTo edges; verify by
 # querying a known function's outgoing belongs_to neighbors.
 echo "" && echo "--- BelongsTo Edges (#396 / #443) ---"
-check "BelongsTo: embed.rs function belongs to module" \
-  "repo-native-alignment graph --node 'src/embed.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types belongs_to" "module\|subsystem"
+check "BelongsTo: embed real function belongs to module" \
+  "repo-native-alignment graph --node 'src/embed/real.rs:build_code_embedding_text:function' --repo $RNA_REPO --mode neighbors --direction outgoing --edge-types belongs_to" "module\|subsystem"
 check "directory_module_pass defined" \
   "grep -c 'fn directory_module_pass\|pub fn directory' $RNA_REPO/src/extract/directory_module.rs" "[1-9]"
 
@@ -468,7 +468,7 @@ check "CLI list-roots loads from cache (#587)" \
 # Embedding hash fix (#597) — text-only hash, not metadata
 echo "" && echo "--- Embedding hash fix (#597) ---"
 check "embedding hash uses text-only content (#597)" \
-  "grep -c 'embedding_text_hash\|hash.*embedding_text\|text_hash' $RNA_REPO/src/embed.rs 2>/dev/null" "[1-9]"
+  "grep -c 'embedding_text_hash\|hash.*embedding_text\|text_hash' $RNA_REPO/src/embed/real.rs 2>/dev/null" "[1-9]"
 
 # LSP refactoring: lsp passes split (#595)
 echo "" && echo "--- LSP/store refactoring (#595) ---"
@@ -485,9 +485,9 @@ check "MCP search uses limit parameter (#594)" \
 # ── include_body + minify_body (#604) ─────────────────────────────────────────
 echo "" && echo "--- include_body + minify_body (#604) ---"
 check "include_body returns function body with --nodes (#604)" \
-  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed.rs:build_code_embedding_text:function' --include-body 2>/dev/null" '```rust'
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed/real.rs:build_code_embedding_text:function' --include-body 2>/dev/null" '```rust'
 check "minify_body shortens identifiers (#604)" \
-  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed.rs:build_code_embedding_text:function' --include-body --minify-body 2>/dev/null | grep -c '[a-z][0-9][a-z]'" "[1-9]"
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed/real.rs:build_code_embedding_text:function' --include-body --minify-body 2>/dev/null | grep -c '[a-z][0-9][a-z]'" "[1-9]"
 check "include_body rejected without --node/--nodes (#604)" \
   "repo-native-alignment search 'test' --repo $RNA_REPO --include-body 2>&1 | grep -ci 'requires'" "[1-9]"
 check "minify_body structural: minify_body fn in code/minify.rs (#604)" \
