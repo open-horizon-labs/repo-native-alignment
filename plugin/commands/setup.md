@@ -45,6 +45,8 @@ cargo install --locked --git https://github.com/open-horizon-labs/repo-native-al
 
 If `~/.cargo/bin` is not on PATH (no Rust toolchain installed), tell the user to add it: `export PATH="$HOME/.cargo/bin:$PATH"`
 
+Release artifacts are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (Apple Silicon Metal: `cargo install --locked --path . --features metal` from a checked-out repo); source builds are not a substitute for release verification from successful CI/release artifacts.
+
 ## Step 3: Add MCP server to Claude Code
 
 RNA is a per-project MCP server (it indexes the repo it's pointed at), so add it with project scope:
@@ -63,7 +65,7 @@ Run a one-time scan to build the code index before the MCP server starts. This a
 repo-native-alignment scan --repo . --full
 ```
 
-This builds the full pipeline (scan, extract, embed, LSP enrich, graph) and caches results in `.oh/.cache/lance/`. The MCP server reuses this cache on startup -- if no files changed, graph loads in seconds with zero re-extraction. Subsequent scans are incremental.
+This builds the release-binary pipeline (scan, extract, LSP enrich, graph) and caches results in `.oh/.cache/lance/`. Builds compiled with `--features embeddings` or `--features metal` also run embedding enrichment. The MCP server reuses this cache on startup -- if no files changed, graph loads in seconds with zero re-extraction. Subsequent scans are incremental.
 
 Without this step, the MCP server pre-warms the graph automatically at startup, but the first tool call may need to wait for that to complete. Pre-building ensures instant readiness.
 

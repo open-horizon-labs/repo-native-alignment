@@ -18,7 +18,7 @@ regex = "1"
 pulldown-cmark = "0.13"
 
 # Git integration (change detection, history)
-git2 = "0.20"
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 
 # Code parsing (symbol extraction)
 tree-sitter = "0.26"
