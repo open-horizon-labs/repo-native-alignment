@@ -80,7 +80,7 @@ claude plugin install rna-mcp
 /rna-mcp:setup
 ```
 
-Setup detects your platform (optimized binary for M2+ chips with bf16/i8mm), installs a release artifact to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
+Setup detects your platform (optimized binary for M2+ chips with bf16/i8mm CPU instructions), installs a release artifact to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
 
 **Download a prebuilt binary** (manual):
 
@@ -96,6 +96,8 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 ```
 
 Release and user-facing verification should use successful GitHub Actions/release artifacts, not a local source build.
+
+Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
 
 **Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 
@@ -131,7 +133,7 @@ For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382
 repo-native-alignment scan --repo . --full
 ```
 
-Runs the complete pipeline: scan → extract → embed → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries are degraded until call/reference enrichment completes. Subsequent scans are incremental (~0.1s on no-change runs).
+Runs the complete release-binary pipeline: scan → extract → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries are degraded until call/reference enrichment completes. Release binaries do not include embedding/reranking support; builds compiled with `--features embeddings` or `--features metal` also run embedding enrichment. Subsequent scans are incremental (~0.1s on no-change runs).
 OperationReport output tells you which capabilities are ready, which query classes are degraded, and which `enrich` command can close any remaining gap.
 
 **Why run this before starting the MCP server?** The MCP server pre-warms the graph automatically at startup, but building from scratch can take 10-30s on large repos. Running `scan` first populates `.oh/.cache/lance/` so the server loads the cached graph in seconds.

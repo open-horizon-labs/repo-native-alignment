@@ -660,11 +660,10 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     // Split named `{ … }` block from default import prefix.
     let (default_part, named_part) = if let Some(brace_start) = specifier.find('{') {
         let before = specifier[..brace_start].trim().trim_end_matches(',').trim();
-        let end = specifier
-            .rfind('}')
-            .map(|i| i + 1)
-            .unwrap_or(specifier.len());
-        let inner = &specifier[brace_start + 1..end - 1];
+        let Some(brace_end) = specifier[brace_start + 1..].find('}').map(|i| brace_start + 1 + i) else {
+            return Vec::new();
+        };
+        let inner = &specifier[brace_start + 1..brace_end];
         (before, Some(inner))
     } else {
         (specifier, None)
@@ -1083,6 +1082,24 @@ mod tests {
             names.is_empty(),
             "type-only import should return empty, got {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn test_parse_es6_malformed_named_import_does_not_panic() {
+        let names = parse_imported_names("import { from './fresh-module'");
+        assert!(
+            names.is_empty(),
+            "malformed import should be skipped, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_es6_malformed_mixed_import_does_not_emit_default() {
+        let names = parse_imported_names("import Client, { from './fresh-module'");
+        assert!(
+            names.is_empty(),
+            "partially extracted import should be skipped, got {names:?}"
         );
     }
 
