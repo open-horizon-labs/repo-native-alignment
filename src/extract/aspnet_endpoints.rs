@@ -155,7 +155,6 @@ fn extract_endpoints_from_source(
                     result,
                     root_slug,
                     file_path,
-                    "csharp",
                     attribute_line,
                     http_method,
                     &route,
@@ -199,7 +198,6 @@ fn extract_minimal_api_endpoints(
             result,
             root_slug,
             file_path,
-            "csharp",
             line_number,
             http_method,
             route,
@@ -212,7 +210,6 @@ fn push_endpoint(
     result: &mut ExtractionResult,
     root_slug: &str,
     file_path: &Path,
-    language: &str,
     line_number: usize,
     http_method: &str,
     route: &str,
@@ -237,7 +234,7 @@ fn push_endpoint(
 
     result.nodes.push(Node {
         id: node_id,
-        language: language.to_string(),
+        language: "csharp".to_string(),
         line_start: line_number,
         line_end: line_number,
         signature,
