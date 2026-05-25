@@ -122,11 +122,11 @@ impl LspEnrichmentEntry {
                 )
             }
         };
-        if let Some(remediation) = &self.remediation {
-            if self.status != LspStatus::Ok {
-                line.push_str(" -- ");
-                line.push_str(remediation);
-            }
+        if let Some(remediation) = &self.remediation
+            && self.status != LspStatus::Ok
+        {
+            line.push_str(" -- ");
+            line.push_str(remediation);
         }
         line
     }
