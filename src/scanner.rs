@@ -506,6 +506,11 @@ pub struct Scanner {
     custom_state_path: Option<PathBuf>,
 }
 
+struct GitIgnoreContext {
+    repo: git2::Repository,
+    workdir: PathBuf,
+}
+
 impl Scanner {
     /// Create a new scanner for the given root directory.
     /// Loads exclude config from `.oh/config.toml` if it exists,
@@ -568,6 +573,49 @@ impl Scanner {
         Ok(())
     }
 
+    fn git_ignore_context(&self) -> Option<GitIgnoreContext> {
+        let repo = match git2::Repository::discover(&self.repo_root) {
+            Ok(repo) => repo,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: git ignore context unavailable for {}: {}",
+                    self.repo_root.display(),
+                    err
+                );
+                return None;
+            }
+        };
+        let workdir = match repo.workdir() {
+            Some(workdir) => workdir
+                .canonicalize()
+                .unwrap_or_else(|_| workdir.to_path_buf()),
+            None => {
+                tracing::debug!(
+                    "Scanner: git ignore context unavailable for {}: bare repository",
+                    self.repo_root.display()
+                );
+                return None;
+            }
+        };
+        Some(GitIgnoreContext { repo, workdir })
+    }
+
+    fn is_git_ignored(git_ignore: Option<&GitIgnoreContext>, path: &Path) -> bool {
+        let Some(git_ignore) = git_ignore else {
+            return false;
+        };
+        if let Ok(rel) = path.strip_prefix(&git_ignore.workdir) {
+            return git_ignore.repo.is_path_ignored(rel).unwrap_or(false);
+        }
+        let Ok(canonical_path) = path.canonicalize() else {
+            return false;
+        };
+        let Ok(rel) = canonical_path.strip_prefix(&git_ignore.workdir) else {
+            return false;
+        };
+        git_ignore.repo.is_path_ignored(rel).unwrap_or(false)
+    }
+
     /// Perform an incremental scan. Returns changed/new/deleted file lists.
     ///
     /// The scan updates internal state (mtimes, hashes) in memory but does
@@ -594,6 +642,8 @@ impl Scanner {
             self.excludes.len(),
             self.excludes
         );
+
+        let git_ignore = self.git_ignore_context();
 
         let mut changed_files = Vec::new();
         let mut new_files = Vec::new();
@@ -625,6 +675,7 @@ impl Scanner {
 
         self.walk_dir_mtime(
             &self.repo_root.clone(),
+            git_ignore.as_ref(),
             &mut changed_files,
             &mut new_files,
             &mut new_dir_mtimes,
@@ -636,7 +687,10 @@ impl Scanner {
         if let Some(git_files) = git_changed {
             for rel_path in git_files {
                 let abs_path = self.repo_root.join(&rel_path);
-                if abs_path.is_file() && !self.is_excluded(&rel_path) {
+                if abs_path.is_file()
+                    && !self.is_excluded(&rel_path)
+                    && !Self::is_git_ignored(git_ignore.as_ref(), &abs_path)
+                {
                     // If not already captured by mtime walk
                     if !changed_files.contains(&rel_path) && !new_files.contains(&rel_path) {
                         if self.state.file_mtimes.contains_key(&rel_path) {
@@ -709,14 +763,14 @@ impl Scanner {
             }
         }
 
-        // ── Step 4: Detect deleted files ────────────────────────────
+        // ── Step 4: Detect deleted or newly-filtered files ───────────────
         let deleted_files: Vec<PathBuf> = self
             .state
             .file_mtimes
             .keys()
             .filter(|rel_path| {
                 let abs = self.repo_root.join(rel_path);
-                !abs.exists()
+                !abs.exists() || !new_file_mtimes.contains_key(*rel_path)
             })
             .cloned()
             .collect();
@@ -785,6 +839,7 @@ impl Scanner {
     fn walk_dir_mtime(
         &self,
         dir: &Path,
+        git_ignore: Option<&GitIgnoreContext>,
         changed: &mut Vec<PathBuf>,
         new: &mut Vec<PathBuf>,
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
@@ -804,6 +859,13 @@ impl Scanner {
         // Check exclude patterns for this directory
         if !rel_dir.as_os_str().is_empty() && self.is_excluded_dir(&rel_dir) {
             tracing::debug!("Scanner: skipping excluded directory {}", rel_dir_display);
+            return Ok(());
+        }
+        if dir != self.repo_root && Self::is_git_ignored(git_ignore, dir) {
+            tracing::debug!(
+                "Scanner: skipping git-ignored directory {}",
+                rel_dir_display
+            );
             return Ok(());
         }
 
@@ -833,7 +895,14 @@ impl Scanner {
             // Directory unchanged: no files added/removed in this dir. But file
             // contents may have been modified in place. Re-check file mtimes
             // while skipping subdirectories whose mtimes are also unchanged.
-            self.carry_forward_subtree(dir, changed, new, new_dir_mtimes, new_file_mtimes)?;
+            self.carry_forward_subtree(
+                dir,
+                git_ignore,
+                changed,
+                new,
+                new_dir_mtimes,
+                new_file_mtimes,
+            )?;
             tracing::debug!(
                 "Scanner: carried subtree {} in {:?}",
                 rel_dir_display,
@@ -857,7 +926,14 @@ impl Scanner {
                 if skip_if_independent_worktree(&path) {
                     continue;
                 }
-                self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
+                self.walk_dir_mtime(
+                    &path,
+                    git_ignore,
+                    changed,
+                    new,
+                    new_dir_mtimes,
+                    new_file_mtimes,
+                )?;
             } else if ft.is_file() {
                 let file_start = Instant::now();
                 let rel_file = path
@@ -865,8 +941,11 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded(&rel_file) {
-                    tracing::debug!("Scanner: skipping excluded file {}", rel_file.display());
+                if self.is_excluded(&rel_file) || Self::is_git_ignored(git_ignore, &path) {
+                    tracing::debug!(
+                        "Scanner: skipping excluded or git-ignored file {}",
+                        rel_file.display()
+                    );
                     continue;
                 }
 
@@ -914,6 +993,7 @@ impl Scanner {
     fn carry_forward_subtree(
         &self,
         dir: &Path,
+        git_ignore: Option<&GitIgnoreContext>,
         changed: &mut Vec<PathBuf>,
         new: &mut Vec<PathBuf>,
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
@@ -949,9 +1029,9 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded_dir(&rel_dir) {
+                if self.is_excluded_dir(&rel_dir) || Self::is_git_ignored(git_ignore, &path) {
                     tracing::debug!(
-                        "Scanner: skipping excluded directory {} during subtree carry",
+                        "Scanner: skipping excluded or git-ignored directory {} during subtree carry",
                         rel_dir.display()
                     );
                     continue;
@@ -974,11 +1054,19 @@ impl Scanner {
                     );
                     // Subdirectory changed: files may have been added/removed.
                     // Fall through to full enumeration via walk_dir_mtime.
-                    self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
+                    self.walk_dir_mtime(
+                        &path,
+                        git_ignore,
+                        changed,
+                        new,
+                        new_dir_mtimes,
+                        new_file_mtimes,
+                    )?;
                 } else {
                     // Subdirectory also unchanged: recurse with same logic
                     self.carry_forward_subtree(
                         &path,
+                        git_ignore,
                         changed,
                         new,
                         new_dir_mtimes,
@@ -992,9 +1080,9 @@ impl Scanner {
                     .unwrap_or(&path)
                     .to_path_buf();
 
-                if self.is_excluded(&rel_file) {
+                if self.is_excluded(&rel_file) || Self::is_git_ignored(git_ignore, &path) {
                     tracing::debug!(
-                        "Scanner: skipping excluded file {} during subtree carry",
+                        "Scanner: skipping excluded or git-ignored file {} during subtree carry",
                         rel_file.display()
                     );
                     continue;
@@ -1047,7 +1135,7 @@ impl Scanner {
                 return None;
             }
         };
-        let repo = match git2::Repository::open(&self.repo_root) {
+        let repo = match git2::Repository::discover(&self.repo_root) {
             Ok(repo) => repo,
             Err(err) => {
                 tracing::debug!(
@@ -1058,6 +1146,22 @@ impl Scanner {
                 return None;
             }
         };
+        let workdir = match repo.workdir() {
+            Some(workdir) => workdir
+                .canonicalize()
+                .unwrap_or_else(|_| workdir.to_path_buf()),
+            None => {
+                tracing::debug!(
+                    "Scanner: git diff unavailable for {}: bare repository",
+                    self.repo_root.display()
+                );
+                return None;
+            }
+        };
+        let scan_root = self
+            .repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_root.clone());
 
         let old_oid = match git2::Oid::from_str(last_sha) {
             Ok(oid) => oid,
@@ -1140,10 +1244,12 @@ impl Scanner {
         if diff
             .foreach(
                 &mut |delta, _| {
-                    if let Some(path) = delta.new_file().path() {
-                        paths.push(path.to_path_buf());
-                    } else if let Some(path) = delta.old_file().path() {
-                        paths.push(path.to_path_buf());
+                    let git_rel_path = delta.new_file().path().or_else(|| delta.old_file().path());
+                    if let Some(git_rel_path) = git_rel_path {
+                        let abs_path = workdir.join(git_rel_path);
+                        if let Ok(scan_rel_path) = abs_path.strip_prefix(&scan_root) {
+                            paths.push(scan_rel_path.to_path_buf());
+                        }
                     }
                     true
                 },
@@ -1173,8 +1279,12 @@ impl Scanner {
 
     /// Get the current HEAD commit SHA.
     fn current_head_sha(&self) -> Result<String> {
-        let repo =
-            git2::Repository::open(&self.repo_root).context("Failed to open git repository")?;
+        let repo = git2::Repository::discover(&self.repo_root).with_context(|| {
+            format!(
+                "Failed to discover git repository from {}",
+                self.repo_root.display()
+            )
+        })?;
         let head = repo.head().context("Failed to get HEAD")?;
         let commit = head
             .peel_to_commit()
@@ -1482,6 +1592,109 @@ mod tests {
         // State should be persisted after commit
         scanner.commit_state().unwrap();
         assert!(state_path(root).exists());
+    }
+
+    #[test]
+    fn test_scoped_scan_uses_parent_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git2::Repository::init(root).unwrap();
+        fs::write(root.join(".gitignore"), "bin/\nobj/\n.angular/\n").unwrap();
+
+        create_file(
+            root,
+            "app/src/index.ts",
+            "export function realCode() { return 1; }",
+        );
+        create_file(
+            root,
+            "app/bin/Debug/generated.ts",
+            "export function ignoredBin() { return 2; }",
+        );
+        create_file(
+            root,
+            "app/obj/generated.ts",
+            "export function ignoredObj() { return 3; }",
+        );
+        create_file(
+            root,
+            "app/.angular/cache/generated.ts",
+            "export function ignoredAngularCache() { return 4; }",
+        );
+
+        let mut scanner = Scanner::new(root.join("app")).unwrap();
+        let result = scanner.scan().unwrap();
+        let mut new_files = result.new_files.clone();
+        new_files.sort();
+
+        assert_eq!(new_files, vec![PathBuf::from("src/index.ts")]);
+        assert!(result.changed_files.is_empty());
+        assert!(result.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn test_scoped_scan_reports_previously_tracked_gitignored_files_as_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git2::Repository::init(root).unwrap();
+        create_file(
+            root,
+            "app/src/index.ts",
+            "export function realCode() { return 1; }",
+        );
+        create_file(
+            root,
+            "app/bin/Debug/generated.ts",
+            "export function previouslyTracked() { return 2; }",
+        );
+
+        let mut scanner = Scanner::new(root.join("app")).unwrap();
+        let first = scanner.scan().unwrap();
+        assert!(first
+            .new_files
+            .contains(&PathBuf::from("bin/Debug/generated.ts")));
+
+        fs::write(root.join(".gitignore"), "bin/\n").unwrap();
+        let second = scanner.scan().unwrap();
+
+        assert!(second.new_files.is_empty());
+        assert!(second.changed_files.is_empty());
+        assert_eq!(
+            second.deleted_files,
+            vec![PathBuf::from("bin/Debug/generated.ts")]
+        );
+    }
+
+    #[test]
+    fn test_scan_outside_git_uses_configured_excludes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        create_file(root, ".oh/config.toml", "[scanner]\nexclude = [\"bin/\"]\n");
+        create_file(
+            root,
+            "src/index.ts",
+            "export function realCode() { return 1; }",
+        );
+        create_file(
+            root,
+            "bin/generated.ts",
+            "export function configuredIgnore() { return 2; }",
+        );
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result = scanner.scan().unwrap();
+        let mut new_files = result.new_files.clone();
+        new_files.sort();
+
+        assert_eq!(
+            new_files,
+            vec![
+                PathBuf::from(".oh/config.toml"),
+                PathBuf::from("src/index.ts")
+            ]
+        );
+        assert!(result.changed_files.is_empty());
+        assert!(result.deleted_files.is_empty());
     }
 
     // ── Incremental scan: detect changes ────────────────────────────
