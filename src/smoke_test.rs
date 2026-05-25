@@ -368,14 +368,13 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         )),
         Ok(true) => match query::outcome_progress(&repo, SMOKE_OUTCOME_ID, &all_nodes) {
             Ok(result) => {
-                let outcome_count = result.outcomes.len();
-                if outcome_count > 0
-                    || !result.markdown_chunks.is_empty()
-                    || !result.code_symbols.is_empty()
-                {
+                if !result.markdown_chunks.is_empty() || !result.code_symbols.is_empty() {
                     checks.push(Check::pass(
                         "outcome_progress",
-                        format!("{} outcomes in progress result", outcome_count),
+                        format!(
+                            "{} outcomes with progress details",
+                            result.outcomes.len()
+                        ),
                     ));
                 } else {
                     checks.push(Check::skip(

@@ -763,14 +763,14 @@ impl Scanner {
             }
         }
 
-        // ── Step 4: Detect deleted files ────────────────────────────
+        // ── Step 4: Detect deleted or newly-filtered files ───────────────
         let deleted_files: Vec<PathBuf> = self
             .state
             .file_mtimes
             .keys()
             .filter(|rel_path| {
                 let abs = self.repo_root.join(rel_path);
-                !abs.exists()
+                !abs.exists() || !new_file_mtimes.contains_key(*rel_path)
             })
             .cloned()
             .collect();
@@ -1630,6 +1630,39 @@ mod tests {
         assert_eq!(new_files, vec![PathBuf::from("src/index.ts")]);
         assert!(result.changed_files.is_empty());
         assert!(result.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn test_scoped_scan_reports_previously_tracked_gitignored_files_as_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git2::Repository::init(root).unwrap();
+        create_file(
+            root,
+            "app/src/index.ts",
+            "export function realCode() { return 1; }",
+        );
+        create_file(
+            root,
+            "app/bin/Debug/generated.ts",
+            "export function previouslyTracked() { return 2; }",
+        );
+
+        let mut scanner = Scanner::new(root.join("app")).unwrap();
+        let first = scanner.scan().unwrap();
+        assert!(first
+            .new_files
+            .contains(&PathBuf::from("bin/Debug/generated.ts")));
+
+        fs::write(root.join(".gitignore"), "bin/\n").unwrap();
+        let second = scanner.scan().unwrap();
+
+        assert!(second.new_files.is_empty());
+        assert!(second.changed_files.is_empty());
+        assert_eq!(
+            second.deleted_files,
+            vec![PathBuf::from("bin/Debug/generated.ts")]
+        );
     }
 
     #[test]
