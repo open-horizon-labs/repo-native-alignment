@@ -356,6 +356,8 @@ fn common_dotnet_root_candidates() -> Vec<PathBuf> {
         candidates.push(home.join(".dotnet"));
         candidates.push(home.join(".local/share/mise/dotnet-root"));
         candidates.push(home.join(".local/share/mise/installs/dotnet"));
+        candidates.push(home.join(".asdf/installs/dotnet"));
+        candidates.push(home.join(".asdf/installs/dotnet-core"));
     }
     candidates
 }
@@ -1230,6 +1232,8 @@ mod tests {
         assert!(rendered.contains("/opt/homebrew/opt/dotnet/libexec"));
         assert!(rendered.contains(".dotnet"));
         assert!(rendered.contains(".local/share/mise"));
+        assert!(rendered.contains(".asdf/installs/dotnet"));
+        assert!(rendered.contains(".asdf/installs/dotnet-core"));
     }
 
     #[test]
