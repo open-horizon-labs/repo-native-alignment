@@ -129,7 +129,7 @@ pub fn format_capability_readiness(
         |status| status.capability_readiness(semantic_index_attached, semantic_index_available),
     );
 
-    let (lsp, dead_code) = lsp_status.map_or_else(
+    let (lsp, dead_code, review_readiness) = lsp_status.map_or_else(
         || {
             (
                 CapabilityReadiness::new(
@@ -140,7 +140,12 @@ pub fn format_capability_readiness(
                 CapabilityReadiness::new(
                     "global dead-code prerequisites",
                     CapabilityReadinessState::Unavailable,
-                    "blocked: requires complete, persisted, non-zero LSP call/reference coverage",
+                    "blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage",
+                ),
+                CapabilityReadiness::new(
+                    "review-readiness scoped context",
+                    CapabilityReadinessState::Partial,
+                    "review can proceed from the diff, but LSP caller/reference context is not attached",
                 ),
             )
         },
@@ -148,16 +153,18 @@ pub fn format_capability_readiness(
             (
                 status.call_reference_readiness(),
                 status.dead_code_readiness(),
+                status.review_readiness(),
             )
         },
     );
 
     format!(
-        "\n\n### Capability readiness\n\n{}\n{}\n{}\n{}",
+        "\n\n### Capability readiness\n\n{}\n{}\n{}\n{}\n{}",
         extracted.markdown_line(),
         embeddings.markdown_line(),
         lsp.markdown_line(),
         dead_code.markdown_line(),
+        review_readiness.markdown_line(),
     )
 }
 
@@ -1163,7 +1170,12 @@ mod tests {
             result
         );
         assert!(
-            result.contains("blocked: requires complete"),
+            result.contains("blocked: requires repo-wide"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("review-readiness scoped context"),
             "got: {}",
             result
         );
