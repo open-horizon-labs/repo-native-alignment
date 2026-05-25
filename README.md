@@ -109,7 +109,7 @@ cargo install --locked --path .
 
 ### 2. Connect to your MCP client
 
-The MCP server command is `repo-native-alignment` with `--repo` as an argument. `command` must be just the binary name — the `--repo` flag goes in `args`, not in `command` (MCP stdio transport doesn't do shell splitting).
+The MCP server command is `repo-native-alignment` with `--repo` as an argument. Use a direct binary path for `command` — the `--repo` flag goes in `args`, not in `command`, and MCP stdio launchers should not rely on shell splitting or shell-profile/tool-manager wrappers.
 
 Example `.mcp.json`:
 
@@ -118,12 +118,18 @@ Example `.mcp.json`:
   "mcpServers": {
     "rna": {
       "type": "stdio",
-      "command": "repo-native-alignment",
-      "args": ["--repo", "/path/to/your/project"]
+      "command": "/Users/me/.cargo/bin/repo-native-alignment",
+      "args": ["--repo", "/path/to/your/project"],
+      "env": {
+        "DOTNET_ROOT": "/opt/homebrew/opt/dotnet/libexec",
+        "PATH": "/Users/me/.dotnet/tools:/opt/homebrew/opt/dotnet/libexec:/Users/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+      }
     }
   }
 }
 ```
+
+For Homebrew, mise, asdf, or official .NET installs, keep `command` as the RNA binary and put `DOTNET_ROOT`/`DOTNET_ROOT_ARM64` plus `~/.dotnet/tools` PATH entries in `env`; do not launch RNA through `mise exec`, `asdf exec`, or wrapper scripts.
 
 For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382`
 

@@ -54,28 +54,36 @@ Release artifacts are intentionally built without local embedding/reranking supp
 
 ## Step 3: Configure the MCP server
 
-RNA is a per-project MCP server (it indexes the repo it's pointed at).
+RNA is a per-project MCP server (it indexes the repo it's pointed at). MCP stdio launchers often do **not** source shell profiles, and some harnesses crash or mis-handle wrapper commands. Keep `command` as the direct `repo-native-alignment` binary path and put tool-manager paths/env in the server `env` block instead of launching through `mise exec`, `asdf exec`, `brew shellenv`, or shell wrapper scripts.
 
-Check if `.mcp.json` exists in the project root and already contains an `rna-mcp` entry. If it does, skip this step.
+Check if `.mcp.json` exists in the project root and already contains an `rna-server` entry. If it does, verify it uses a direct RNA binary command; rewrite wrapper-based entries to the direct-binary pattern below.
 
-If the agent supports `claude mcp add` (Claude Code):
+If the agent supports `claude mcp add` (Claude Code), use a direct RNA command:
 ```bash
-claude mcp add rna-mcp --scope project -- repo-native-alignment --repo .
+claude mcp add rna-server --scope project -- repo-native-alignment --repo .
 ```
 
 Otherwise, create or update `.mcp.json` in the project root with:
 ```json
 {
   "mcpServers": {
-    "rna-mcp": {
-      "command": "repo-native-alignment",
-      "args": ["--repo", "."]
+    "rna-server": {
+      "type": "stdio",
+      "command": "/Users/me/.cargo/bin/repo-native-alignment",
+      "args": ["--repo", "/absolute/path/to/project"],
+      "env": {
+        "DOTNET_ROOT": "/opt/homebrew/opt/dotnet/libexec",
+        "DOTNET_ROOT_ARM64": "/opt/homebrew/opt/dotnet/libexec",
+        "PATH": "/Users/me/.dotnet/tools:/opt/homebrew/opt/dotnet/libexec:/Users/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+      }
     }
   }
 }
 ```
 
-If `.mcp.json` already exists with other servers, merge the `rna-mcp` entry into the existing `mcpServers` object -- do not overwrite the file.
+For mise-managed .NET, set `DOTNET_ROOT`/`DOTNET_ROOT_ARM64` to the mise .NET root and prepend the root plus `~/.dotnet/tools` to `PATH`; keep `command` as the RNA binary, not `/opt/homebrew/bin/mise`. For asdf/Homebrew/official .NET installs, use their resolved install root in `env` the same way.
+
+If `.mcp.json` already exists with other servers, merge the `rna-server` entry into the existing `mcpServers` object -- do not overwrite the file.
 
 ## Step 4: Pre-warm the code index
 

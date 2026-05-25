@@ -246,6 +246,9 @@ pub fn list_roots_from_slugs(
                 for (lang, ls) in &langs {
                     let duration_str = format_duration(ls.duration);
                     let mut detail_parts: Vec<String> = Vec::new();
+                    if ls.server_missing {
+                        detail_parts.push("not found".to_string());
+                    }
                     detail_parts.push(format!("{} edges", format_count(ls.edge_count)));
                     if ls.node_count > 0 {
                         detail_parts.push(format!("{} nodes", format_count(ls.node_count)));
@@ -256,6 +259,11 @@ pub fn list_roots_from_slugs(
                     }
                     if ls.aborted {
                         detail_parts.push("aborted".to_string());
+                    }
+                    if let Some(remediation) = &ls.remediation
+                        && (ls.server_missing || ls.aborted || ls.error_count > 0)
+                    {
+                        detail_parts.push(format!("next: {}", remediation));
                     }
                     line.push_str(&format!(
                         "\n  LSP: {} -> {} ({})",
@@ -1252,6 +1260,8 @@ mod tests {
                 duration: std::time::Duration::from_secs(45),
                 error_count: 0,
                 aborted: false,
+                server_missing: false,
+                remediation: None,
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1323,6 +1333,8 @@ mod tests {
                 duration: std::time::Duration::from_secs(120),
                 error_count: 13,
                 aborted: true,
+                server_missing: false,
+                remediation: Some("install pyright".to_string()),
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1390,6 +1402,8 @@ mod tests {
                 duration: std::time::Duration::from_secs(10),
                 error_count: 0,
                 aborted: false,
+                server_missing: false,
+                remediation: None,
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);

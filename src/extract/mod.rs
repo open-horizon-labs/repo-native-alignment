@@ -8,10 +8,10 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod api_link;
+pub mod aspnet_endpoints;
 pub mod bash;
 pub mod c;
 pub mod cache;
-pub mod aspnet_endpoints;
 pub mod configs;
 pub mod consumers;
 pub mod cpp;
@@ -24,8 +24,8 @@ pub mod event_bus;
 pub mod extractor_config;
 pub mod fastapi_router_prefix;
 pub mod framework_detection;
-pub mod generic;
 pub mod gdscript;
+pub mod generic;
 pub mod go;
 pub mod graphql;
 pub mod grpc;
@@ -264,6 +264,11 @@ pub trait Enricher: Send + Sync {
     ///
     /// Default: `None` (no preference).
     fn config_file_hint(&self) -> Option<&str> {
+        None
+    }
+
+    /// Optional actionable setup guidance when this enricher cannot start.
+    fn toolchain_remediation(&self) -> Option<&str> {
         None
     }
 }
@@ -716,13 +721,13 @@ impl EnricherRegistry {
 
         for &(lang, cmd, args, exts) in servers {
             let enricher = lsp::LspEnricher::new(lang, cmd, args, exts);
-            // Add pyright-specific settings
-            let enricher = if lang == "python" {
-                enricher.with_settings(serde_json::json!({
+            // Add language-specific startup settings and remediation at the LSP config boundary.
+            let enricher = match lang {
+                "python" => enricher.with_settings(serde_json::json!({
                     "python": { "analysis": { "autoSearchPaths": true } }
-                }))
-            } else {
-                enricher
+                })),
+                "csharp" => enricher.with_toolchain_remediation(lsp::CSHARP_TOOLCHAIN_REMEDIATION),
+                _ => enricher,
             };
             // Add config file hints for lsp_root selection in monorepos.
             // When a monorepo has multiple subdirectory roots, the enricher prefers
@@ -849,6 +854,7 @@ impl EnricherRegistry {
                         error_count,
                         duration: dur,
                         status,
+                        remediation: enricher.toolchain_remediation().map(str::to_string),
                     });
                 }
                 Err(e) => {
@@ -874,6 +880,7 @@ impl EnricherRegistry {
                         error_count: 1,
                         duration: dur,
                         status,
+                        remediation: enricher.toolchain_remediation().map(str::to_string),
                     });
                 }
             }

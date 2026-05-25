@@ -117,6 +117,10 @@ pub enum ExtractionEvent {
         server_name: Option<String>,
         /// Number of errors encountered during enrichment (e.g., LSP request failures).
         error_count: usize,
+        /// Whether the server binary was missing before enrichment could start.
+        server_missing: bool,
+        /// Optional actionable setup guidance for this language server.
+        remediation: Option<String>,
         /// Whether enrichment was aborted early (e.g., error threshold exceeded).
         aborted: bool,
     },
@@ -1344,6 +1348,8 @@ mod tests {
                 server_name: None,
                 error_count: 0,
                 aborted: false,
+                server_missing: false,
+                remediation: None,
             }
         };
 
