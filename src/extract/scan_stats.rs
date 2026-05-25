@@ -83,6 +83,7 @@ pub struct LspEnrichmentEntry {
     pub error_count: usize,
     pub duration: Duration,
     pub status: LspStatus,
+    pub remediation: Option<String>,
 }
 
 impl LspEnrichmentEntry {
@@ -94,7 +95,7 @@ impl LspEnrichmentEntry {
             String::new()
         };
         let label = format!("  {} ({}){}", self.language, self.server_name, root_part);
-        match self.status {
+        let mut line = match self.status {
             LspStatus::NotFound => format!("{:<50} {}", label, self.status),
             LspStatus::Ok => {
                 let mut line = format!(
@@ -120,7 +121,14 @@ impl LspEnrichmentEntry {
                     self.duration.as_secs_f64()
                 )
             }
+        };
+        if let Some(remediation) = &self.remediation
+            && self.status != LspStatus::Ok
+        {
+            line.push_str(" -- ");
+            line.push_str(remediation);
         }
+        line
     }
 }
 
@@ -146,6 +154,10 @@ pub struct LspLanguageStats {
     pub error_count: usize,
     /// Whether the enrichment was aborted (e.g., too many errors, timeout).
     pub aborted: bool,
+    /// Whether the server binary was missing before enrichment could start.
+    pub server_missing: bool,
+    /// Optional actionable setup guidance for this language server.
+    pub remediation: Option<String>,
 }
 
 /// Per-root stats populated after `RootExtracted`.
@@ -368,6 +380,8 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 server_name,
                 error_count,
                 aborted,
+                server_missing,
+                remediation,
                 ..
             } => {
                 // Remove from in-flight.
@@ -407,6 +421,8 @@ impl ExtractionConsumer for ScanStatsConsumer {
                             duration,
                             error_count: *error_count,
                             aborted: *aborted,
+                            server_missing: *server_missing,
+                            remediation: remediation.clone(),
                         },
                     );
                 }
@@ -598,6 +614,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         })
         .await
@@ -663,6 +681,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: Some("rust-analyzer".to_string()),
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         })
         .await
@@ -714,6 +734,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         })
         .await
@@ -791,6 +813,8 @@ mod tests {
                 updated_nodes: std::sync::Arc::from([]),
                 server_name: None,
                 error_count: 0,
+                server_missing: false,
+                remediation: None,
                 aborted: false,
             })
             .await;
@@ -853,6 +877,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: Some("rust-analyzer".to_string()),
             error_count: 5,
+            server_missing: false,
+            remediation: Some("fix rust".to_string()),
             aborted: true,
         })
         .await
@@ -887,6 +913,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         })
         .await
@@ -910,6 +938,7 @@ mod tests {
             error_count: 0,
             duration: Duration::from_secs_f64(3.5),
             status: LspStatus::Ok,
+            remediation: None,
         };
         let l = e.summary_line();
         assert!(l.contains("rust (rust-analyzer)"));
@@ -928,7 +957,10 @@ mod tests {
             error_count: 0,
             duration: Duration::from_millis(5),
             status: LspStatus::NotFound,
+            remediation: Some("install json ls".to_string()),
         };
-        assert!(e.summary_line().contains("not found"));
+        let line = e.summary_line();
+        assert!(line.contains("not found"));
+        assert!(line.contains("install json ls"));
     }
 }

@@ -99,6 +99,8 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         preflight(source_available, !args.skip_skills, needs_download)?;
     }
 
+    report_optional_csharp_toolchain(&project_path, args.dry_run);
+
     // ── Step 2: install RNA binary ─────────────────────────────────────────
     if args.dry_run {
         if source_available {
@@ -251,6 +253,151 @@ fn check_dep(cmd: &str, args: &[&str], remediation: &str) -> Result<()> {
         }
         Err(_) => bail!("Preflight failed: `{cmd}` not found in PATH.\n  Fix: {remediation}"),
     }
+}
+
+fn report_optional_csharp_toolchain(project_path: &Path, dry_run: bool) {
+    if !has_csharp_markers(project_path) {
+        return;
+    }
+
+    println!("Checking optional C#/.NET LSP toolchain...");
+    if dry_run {
+        println!("  [dry-run] Would check: dotnet on PATH");
+        println!("  [dry-run] Would check: csharp-ls on PATH");
+        println!("  [dry-run] Would check: DOTNET_ROOT / DOTNET_ROOT_ARM64 for MCP stdio env");
+        println!(
+            "  Guidance: keep .mcp.json command as the direct repo-native-alignment binary; put DOTNET_ROOT and PATH additions in the server env instead of launching through mise/asdf/brew wrappers.\n"
+        );
+        return;
+    }
+
+    let dotnet = command_on_path("dotnet");
+    let csharp_ls = command_on_path("csharp-ls");
+    let dotnet_root = detected_dotnet_root();
+
+    if dotnet {
+        println!("  [ok] dotnet found on PATH");
+    } else {
+        println!("  [warn] dotnet not found on PATH");
+    }
+
+    if csharp_ls {
+        println!("  [ok] csharp-ls found on PATH");
+    } else {
+        println!("  [warn] csharp-ls not found on PATH");
+    }
+
+    match &dotnet_root {
+        Some(root) => println!("  [ok] DOTNET_ROOT candidate: {}", root.display()),
+        None => {
+            println!("  [warn] DOTNET_ROOT/DOTNET_ROOT_ARM64 not set and no common .NET root found")
+        }
+    }
+
+    if !dotnet || !csharp_ls || dotnet_root.is_none() {
+        println!("  Next for C# call/reference enrichment:");
+        if !dotnet {
+            println!(
+                "    - Install .NET SDK: brew install --cask dotnet-sdk, mise use dotnet@latest, asdf install dotnet latest, or Microsoft installer."
+            );
+        }
+        if !csharp_ls {
+            println!("    - Install csharp-ls: dotnet tool install -g csharp-ls");
+            println!("    - Ensure global .NET tools are on PATH: $HOME/.dotnet/tools");
+        }
+        if dotnet_root.is_none() {
+            println!(
+                "    - Set DOTNET_ROOT (and DOTNET_ROOT_ARM64 on Apple Silicon) to the installed .NET root; common roots include /opt/homebrew/opt/dotnet/libexec, /usr/local/share/dotnet, $HOME/.dotnet, or a mise/asdf install root."
+            );
+        }
+        println!(
+            "    - For MCP stdio, do not make command a tool-manager wrapper. Keep command as the direct repo-native-alignment binary and put DOTNET_ROOT/PATH in the server env.\n"
+        );
+    } else {
+        println!(
+            "  C#/.NET LSP prerequisites look usable. Mirror DOTNET_ROOT and PATH in .mcp.json env if your MCP launcher does not inherit shell profile setup.\n"
+        );
+    }
+}
+
+fn command_on_path(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn detected_dotnet_root() -> Option<PathBuf> {
+    for key in ["DOTNET_ROOT_ARM64", "DOTNET_ROOT"] {
+        if let Ok(value) = std::env::var(key) {
+            let path = PathBuf::from(value);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    common_dotnet_root_candidates()
+        .into_iter()
+        .find(|path| path.is_dir())
+}
+
+fn common_dotnet_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/opt/dotnet/libexec"),
+        PathBuf::from("/usr/local/share/dotnet"),
+        PathBuf::from("/usr/share/dotnet"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".dotnet"));
+        candidates.push(home.join(".local/share/mise/dotnet-root"));
+        candidates.push(home.join(".local/share/mise/installs/dotnet"));
+        candidates.push(home.join(".asdf/installs/dotnet"));
+        candidates.push(home.join(".asdf/installs/dotnet-core"));
+    }
+    candidates
+}
+
+fn has_csharp_markers(project_path: &Path) -> bool {
+    fn walk(path: &Path, depth: u8) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.')
+                || matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | "bin" | "obj" | "packages"
+                )
+            {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if matches!(ext, "cs" | "csproj" | "sln") {
+                    return true;
+                }
+            } else if file_type.is_dir() && walk(&entry.path(), depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(project_path, 0)
 }
 
 // ─── Install steps ───────────────────────────────────────────────────────────
@@ -1054,6 +1201,39 @@ mod tests {
             err.contains("No pre-built binary"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_has_csharp_markers_detects_project_files() {
+        let (_dir, proj) = tmp();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("src/App.csproj"), "<Project />").unwrap();
+
+        assert!(has_csharp_markers(&proj));
+    }
+
+    #[test]
+    fn test_has_csharp_markers_ignores_non_csharp_project() {
+        let (_dir, proj) = tmp();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("src/main.rs"), "fn main() {}").unwrap();
+
+        assert!(!has_csharp_markers(&proj));
+    }
+
+    #[test]
+    fn test_common_dotnet_root_candidates_include_tool_manager_roots() {
+        let rendered = common_dotnet_root_candidates()
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("/opt/homebrew/opt/dotnet/libexec"));
+        assert!(rendered.contains(".dotnet"));
+        assert!(rendered.contains(".local/share/mise"));
+        assert!(rendered.contains(".asdf/installs/dotnet"));
+        assert!(rendered.contains(".asdf/installs/dotnet-core"));
     }
 
     #[test]

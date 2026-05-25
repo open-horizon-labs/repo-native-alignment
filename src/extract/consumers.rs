@@ -1358,7 +1358,7 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 }
 
 fn is_lsp_server_not_found_error(err_text: &str) -> bool {
-    err_text.starts_with("LSP server '") && err_text.ends_with("' not found on PATH")
+    err_text.contains("LSP server '") && err_text.contains("' not found on PATH")
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1455,7 @@ impl ExtractionConsumer for LspConsumer {
 
         match enrichment_result {
             Ok(enrichment) => {
+                let server_missing = !enrichment.any_enricher_ran;
                 tracing::info!(
                     "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes, {} patches",
                     self.language,
@@ -1471,6 +1472,8 @@ impl ExtractionConsumer for LspConsumer {
                     updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
                     server_name: Some(self.enricher.name().to_string()),
                     error_count: enrichment.error_count,
+                    server_missing,
+                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
                     aborted: enrichment.aborted,
                 }])
             }
@@ -1489,7 +1492,8 @@ impl ExtractionConsumer for LspConsumer {
                     || err_text.contains("no progress")
                     || err_text.contains("timed out")
                     || err_text.contains("zero LSP edges");
-                let error_count = usize::from(!is_lsp_server_not_found_error(&err_text));
+                let server_missing = is_lsp_server_not_found_error(&err_text);
+                let error_count = usize::from(!server_missing);
                 if aborted {
                     anyhow::bail!(
                         "LSP enrichment aborted for {} root {}: {}",
@@ -1506,6 +1510,8 @@ impl ExtractionConsumer for LspConsumer {
                     updated_nodes: Arc::from([]),
                     server_name: Some(self.enricher.name().to_string()),
                     error_count,
+                    server_missing,
+                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
                     aborted,
                 }])
             }
@@ -2436,12 +2442,13 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
     for &(lang, cmd, args, exts) in servers {
         if lang == language {
             let enricher = LspEnricher::new(lang, cmd, args, exts);
-            let enricher = if lang == "python" {
-                enricher.with_settings(serde_json::json!({
+            let enricher = match lang {
+                "python" => enricher.with_settings(serde_json::json!({
                     "python": { "analysis": { "autoSearchPaths": true } }
-                }))
-            } else {
-                enricher
+                })),
+                "csharp" => enricher
+                    .with_toolchain_remediation(crate::extract::lsp::CSHARP_TOOLCHAIN_REMEDIATION),
+                _ => enricher,
             };
             let enricher = match lang {
                 "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
@@ -3362,6 +3369,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
@@ -3442,6 +3451,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
@@ -3520,6 +3531,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
@@ -3537,6 +3550,8 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
             server_name: None,
             error_count: 0,
+            server_missing: false,
+            remediation: None,
             aborted: false,
         };
         let result = gate.on_event(&python_done).await.unwrap();
@@ -3987,7 +4002,8 @@ mod tests {
             line_start: 1,
             line_end: 4,
             signature: "[frontmatter]".to_string(),
-            body: "validate:\n  cargo_tests:\n    - module_0::tests::test_process_event_0\n".to_string(),
+            body: "validate:\n  cargo_tests:\n    - module_0::tests::test_process_event_0\n"
+                .to_string(),
             metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
             source: ExtractionSource::Markdown,
         });
@@ -4058,7 +4074,11 @@ mod tests {
             "forward pass should match the seeded cargo_test entry"
         );
         let edge = &edges_forward[0];
-        assert_eq!(edge.kind, EdgeKind::References, "edge kind must be References");
+        assert_eq!(
+            edge.kind,
+            EdgeKind::References,
+            "edge kind must be References"
+        );
         assert_eq!(edge.from.root, "app", "edge must originate in seeded root");
         assert_eq!(
             edge.from.file,
@@ -4094,5 +4114,4 @@ mod tests {
             "adr_passes_scan_time: tested_by={baseline_ms:.2}ms, adr={adr_ms:.2}ms, ratio={ratio:.2}x ({N} nodes)"
         );
     }
-
 }

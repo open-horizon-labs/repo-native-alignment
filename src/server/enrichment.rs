@@ -2673,6 +2673,8 @@ mod tests {
                     duration: Duration::from_secs(1),
                     error_count: 2,
                     aborted: true,
+                    server_missing: false,
+                    remediation: None,
                 },
             )]
             .into_iter()
@@ -2689,6 +2691,8 @@ mod tests {
                     duration: Duration::from_secs(1),
                     error_count: 9,
                     aborted: true,
+                    server_missing: false,
+                    remediation: None,
                 },
             )]
             .into_iter()

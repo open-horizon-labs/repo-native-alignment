@@ -39,6 +39,8 @@ use super::{Enricher, EnrichmentResult};
 use crate::graph::index::GraphIndex;
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
+pub const CSHARP_TOOLCHAIN_REMEDIATION: &str = "C# LSP needs dotnet, csharp-ls, and a visible .NET root. Install .NET (brew install --cask dotnet-sdk, mise use dotnet@latest, asdf install dotnet latest, or Microsoft installer), install csharp-ls with `dotnet tool install -g csharp-ls`, add `$HOME/.dotnet/tools` to PATH, and set DOTNET_ROOT/DOTNET_ROOT_ARM64 to the installed .NET root for MCP stdio env.";
+
 // ---------------------------------------------------------------------------
 // LspEnricher
 // ---------------------------------------------------------------------------
@@ -68,6 +70,8 @@ pub struct LspEnricher {
     /// Config file this enricher relies on (e.g., "tsconfig.json" for TypeScript).
     /// Used by pick_lsp_root to prefer lsp_roots that contain this file.
     config_file: Option<&'static str>,
+    /// Optional setup guidance shown when this server is unavailable or fails startup.
+    toolchain_remediation: Option<&'static str>,
     ready: AtomicBool,
     /// Protected by mutex because enrich takes &self but we need to mutate transport state.
     state: Mutex<LspState>,
@@ -170,6 +174,7 @@ impl LspEnricher {
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             init_settings: None,
             config_file: None,
+            toolchain_remediation: None,
             ready: AtomicBool::new(false),
             state: Mutex::new(LspState {
                 transport: None,
@@ -219,6 +224,12 @@ impl LspEnricher {
     /// prefer the root that contains this file (e.g., `tsconfig.json` for TypeScript).
     pub fn with_config_file(mut self, config_file: &'static str) -> Self {
         self.config_file = Some(config_file);
+        self
+    }
+
+    /// Attach actionable setup guidance for this language server.
+    pub fn with_toolchain_remediation(mut self, remediation: &'static str) -> Self {
+        self.toolchain_remediation = Some(remediation);
         self
     }
 
@@ -382,6 +393,13 @@ impl LspEnricher {
         Ok(())
     }
 
+    fn remediation_suffix(&self) -> String {
+        self.toolchain_remediation
+            .map(|hint| format!("\n  Fix: {hint}"))
+            .unwrap_or_default()
+    }
+
+
     /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
         let mut state = self.state.lock().await;
@@ -406,8 +424,9 @@ impl LspEnricher {
                 self.language
             );
             return Err(anyhow::anyhow!(
-                "LSP server '{}' not found on PATH",
-                self.server_command
+                "LSP server '{}' not found on PATH{}",
+                self.server_command,
+                self.remediation_suffix()
             ));
         }
 
@@ -454,7 +473,13 @@ impl LspEnricher {
                     self.language,
                     e
                 );
-                return Err(e);
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to start LSP server '{}'{}",
+                        self.server_command,
+                        self.remediation_suffix()
+                    )
+                });
             }
         };
 
@@ -2229,6 +2254,10 @@ impl Enricher for LspEnricher {
 
     fn config_file_hint(&self) -> Option<&str> {
         self.config_file
+    }
+
+    fn toolchain_remediation(&self) -> Option<&str> {
+        self.toolchain_remediation
     }
 
     async fn enrich(
