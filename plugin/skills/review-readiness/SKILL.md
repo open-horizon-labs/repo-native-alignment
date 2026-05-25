@@ -85,6 +85,7 @@ Classify what the reviewer can trust:
 - **Blocked** — a specific missing fact prevents an honest review
 
 Be precise about missing metadata. Avoid generic complaints like “LSP not ready.” Instead say what is missing: exact callers for `X`, base-side identity for a deleted symbol, graph coverage for Python skill files, stale scan for `src/extract`, etc.
+When RNA verbose output includes `review-readiness scoped context`, use that workflow-specific line instead of treating global `dead-code prerequisites` as the review gate. Scoped/root/changed-file LSP coverage is partial for global analysis but can still be enough for review when the missing facts are named.
 
 ### Step 5: Produce a review map
 

@@ -25,7 +25,7 @@ Examples:
 
 ### Step 0: Verify capability readiness (precondition)
 
-This skill requires complete enough LSP call/reference coverage. Without those edges, every function can look dead and every result is a false positive. Verify readiness through RNA's MCP-visible output before doing anything else; do **not** rely on log scraping.
+This skill requires repo-wide LSP call/reference coverage. Scoped coverage from changed-file/root enrichment is useful for review-readiness, but not enough for global dead-code: without repo-wide edges, every function can look dead and every result is a false positive. Verify readiness through RNA's MCP-visible output before doing anything else; do **not** rely on log scraping.
 
 **Self-check (run this first):**
 
@@ -38,17 +38,17 @@ search(query="capability", verbose=true, limit=1)
 Read the `Capability readiness` section:
 
 - `extracted graph / exact search` must be `ready` for basic symbol listing.
-- `LSP call/reference coverage` must be `ready` with a non-zero edge count.
-- `global dead-code prerequisites` must be `ready` (this is the workflow gate that aggregates the LSP coverage requirement for dead-code analysis).
+- `LSP call/reference coverage` must be `ready` with a non-zero edge count and repo-wide coverage.
+- `global dead-code prerequisites` must be `ready` (this is the workflow gate that aggregates the repo-wide LSP coverage requirement for dead-code analysis).
 
-If `global dead-code prerequisites` is `running`, `partial/degraded`, `failed`, `unavailable`, or `stale`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
+If `global dead-code prerequisites` is `running`, `partial/degraded`, `failed`, `unavailable`, or `stale`, **abort and report the precondition failure** rather than emitting candidates. If RNA reports scoped/root/changed-file LSP coverage, explain that the coverage may support review-readiness but not global dead-code. Common causes:
 
 - The repo's language server is not on `PATH` (e.g., `pyright-langserver`, `typescript-language-server`, `gopls`, `rust-analyzer`).
 - Enrichment is still running or has not started.
 - Enrichment completed with zero call/reference edges.
 - Enrichment computed edges but persistence failed, so data may not survive restart.
 
-Tell the user the dead-code analysis cannot run reliably until RNA reports `global dead-code prerequisites: ready`. Do not fall back to a structural-edges-only scan.
+Tell the user the dead-code analysis cannot run reliably until RNA reports `global dead-code prerequisites: ready`. Do not fall back to scoped LSP coverage or a structural-edges-only scan.
 
 ### Step 1: Gather functions
 
@@ -170,7 +170,7 @@ Present results as a table:
 
 ## Limitations
 
-- **LSP enrichment required** — `Calls` and `ReferencedBy` edges come from LSP. If RNA does not report `global dead-code prerequisites: ready`, abort instead of emitting candidates; a structural-edges-only graph makes every function look "dead."
+- **Repo-wide LSP enrichment required** — `Calls` and `ReferencedBy` edges come from LSP. If RNA does not report `global dead-code prerequisites: ready`, abort instead of emitting candidates; scoped changed-file/root coverage is partial by design and a structural-edges-only graph makes every function look "dead."
 - **Dynamic dispatch** — trait objects, function pointers, and reflection-based calls won't have graph edges.
 - **Macros** — macro-generated call sites may not be captured by tree-sitter or LSP.
 - **Re-exports** — a function re-exported from a library crate may have zero in-repo callers but be the public API.

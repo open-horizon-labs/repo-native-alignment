@@ -562,6 +562,12 @@ impl std::fmt::Display for LspState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LspCoverageScope {
+    Repo,
+    Scoped(String),
+}
+
 /// Tracks whether background LSP enrichment has run, so query footers
 /// can tell the agent "results may be incomplete" vs "enrichment done."
 ///
@@ -594,6 +600,12 @@ pub struct LspEnrichmentStatus {
     /// Used by list_roots to show "LSP available but not installed" for relevant languages.
     missing_servers: std::sync::Mutex<Vec<String>>,
     last_error: std::sync::Mutex<Option<String>>,
+    /// Scope proven by the persisted call/reference coverage.
+    ///
+    /// Repo-wide coverage is required for global workflows such as dead-code.
+    /// Scoped coverage is still useful for review-readiness, but must not be
+    /// promoted to repo-wide caller completeness.
+    coverage_scope: std::sync::Mutex<LspCoverageScope>,
 }
 
 impl Default for LspEnrichmentStatus {
@@ -610,6 +622,7 @@ impl Default for LspEnrichmentStatus {
             server_name: std::sync::Mutex::new(None),
             missing_servers: std::sync::Mutex::new(Vec::new()),
             last_error: std::sync::Mutex::new(None),
+            coverage_scope: std::sync::Mutex::new(LspCoverageScope::Repo),
         }
     }
 }
@@ -684,6 +697,7 @@ impl LspEnrichmentStatus {
             .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::Repo;
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
             self.state
@@ -693,6 +707,31 @@ impl LspEnrichmentStatus {
             prev,
             LspState::Complete,
             &format!("{} edges", latest_edge_count),
+        );
+    }
+
+    pub fn set_complete_scoped(
+        &self,
+        latest_edge_count: usize,
+        coverage_edge_count: usize,
+        scope_detail: impl Into<String>,
+    ) {
+        self.edge_count
+            .store(latest_edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count
+            .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::Scoped(scope_detail.into());
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        let prev = LspState::from_u8(
+            self.state
+                .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
+        );
+        self.log_transition(
+            prev,
+            LspState::Complete,
+            &format!("{} edges, scoped coverage", latest_edge_count),
         );
     }
 
@@ -706,6 +745,7 @@ impl LspEnrichmentStatus {
             .store(edge_count, std::sync::atomic::Ordering::Release);
         self.persist_failed
             .store(true, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::Repo;
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
             self.state
@@ -723,6 +763,7 @@ impl LspEnrichmentStatus {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         self.coverage_edge_count
             .store(0, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::Repo;
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel),
@@ -734,6 +775,7 @@ impl LspEnrichmentStatus {
         *self.last_error.lock().unwrap() = Some(error.to_string());
         self.coverage_edge_count
             .store(0, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::Repo;
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel),
@@ -790,8 +832,9 @@ impl LspEnrichmentStatus {
                 let persist_failed = self
                     .persist_failed
                     .load(std::sync::atomic::Ordering::Acquire);
-                match (coverage_edge_count, persist_failed) {
-                    (_, true) => CapabilityReadiness::new(
+                let coverage_scope = self.coverage_scope.lock().unwrap().clone();
+                match (coverage_edge_count, persist_failed, coverage_scope) {
+                    (_, true, _) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
                         format!(
@@ -799,12 +842,20 @@ impl LspEnrichmentStatus {
                             coverage_edge_count, latest_edge_count
                         ),
                     ),
-                    (0, false) => CapabilityReadiness::new(
+                    (0, false, _) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
                         "LSP completed with 0 persisted call/reference edges; enriched workflows may be false-negative prone",
                     ),
-                    (_, false) => CapabilityReadiness::new(
+                    (_, false, LspCoverageScope::Scoped(scope_detail)) => CapabilityReadiness::new(
+                        "LSP call/reference coverage",
+                        CapabilityReadinessState::Partial,
+                        format!(
+                            "{} persisted call/reference edges available for {}; repo-wide coverage is not proven",
+                            coverage_edge_count, scope_detail
+                        ),
+                    ),
+                    (_, false, LspCoverageScope::Repo) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Ready,
                         format!(
@@ -865,10 +916,51 @@ impl LspEnrichmentStatus {
                 "global dead-code prerequisites",
                 lsp.state,
                 format!(
-                    "blocked: requires complete, persisted, non-zero LSP call/reference coverage; {}",
+                    "blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage; {}",
                     lsp.detail
                 ),
             )
+        }
+    }
+
+    pub fn review_readiness(&self) -> CapabilityReadiness {
+        let lsp = self.call_reference_readiness();
+        match lsp.state {
+            CapabilityReadinessState::Ready => CapabilityReadiness::new(
+                "review-readiness scoped context",
+                CapabilityReadinessState::Ready,
+                "repo-wide LSP caller/reference coverage is available; diff-scoped review probes may use graph callers",
+            ),
+            CapabilityReadinessState::Partial if self.coverage_edge_count() > 0 => {
+                CapabilityReadiness::new(
+                    "review-readiness scoped context",
+                    CapabilityReadinessState::Partial,
+                    format!(
+                        "review can proceed with explicit scoped/degraded context; {}",
+                        lsp.detail
+                    ),
+                )
+            }
+            CapabilityReadinessState::Running => CapabilityReadiness::new(
+                "review-readiness scoped context",
+                CapabilityReadinessState::Running,
+                format!(
+                    "targeted review context is still being enriched; {}",
+                    lsp.detail
+                ),
+            ),
+            CapabilityReadinessState::Failed
+            | CapabilityReadinessState::Unavailable
+            | CapabilityReadinessState::Stale
+            | CapabilityReadinessState::Partial
+            | CapabilityReadinessState::NotNeeded => CapabilityReadiness::new(
+                "review-readiness scoped context",
+                CapabilityReadinessState::Partial,
+                format!(
+                    "review can proceed from the diff, but LSP caller/reference context is degraded; {}",
+                    lsp.detail
+                ),
+            ),
         }
     }
 
@@ -1329,6 +1421,37 @@ mod tests {
             ready.detail.contains("non-zero LSP"),
             "got: {}",
             ready.detail
+        );
+    }
+
+    #[test]
+    fn test_scoped_lsp_coverage_blocks_dead_code_but_allows_review_context() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_scoped(4, 4, "changed_files scope");
+
+        let lsp = status.call_reference_readiness();
+        assert_eq!(lsp.state, CapabilityReadinessState::Partial);
+        assert!(
+            lsp.detail.contains("repo-wide coverage is not proven"),
+            "got: {}",
+            lsp.detail
+        );
+
+        let dead_code = status.dead_code_readiness();
+        assert_eq!(dead_code.state, CapabilityReadinessState::Partial);
+        assert!(
+            dead_code.detail.contains("requires repo-wide"),
+            "got: {}",
+            dead_code.detail
+        );
+
+        let review = status.review_readiness();
+        assert_eq!(review.state, CapabilityReadinessState::Partial);
+        assert!(
+            review.detail.contains("scoped/degraded context"),
+            "got: {}",
+            review.detail
         );
     }
 

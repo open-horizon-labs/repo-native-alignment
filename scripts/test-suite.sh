@@ -572,7 +572,7 @@ check "operation-report: durable enrichment job ledger recorded" \
 check "operation-report: list-roots includes enrichment summary" \
   "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Enrichment — complete'
 check "operation-report: zero-edge explicit enrich remains fail-closed" \
-  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 2>/dev/null" 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'
+  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 2>/dev/null" 'blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage'
 check "operation-report: changed-scope call-reference enrich fails closed" \
   "repo-native-alignment enrich --repo $_OP_FIX --capability call-references --scope changed --no-background-continuation 2>&1" 'changed-file call-reference enrichment is not supported'
 rm -rf "$_OP_FIX"
@@ -662,7 +662,7 @@ if ! echo "$_LSP_ENRICH_OUT" | grep -q 'Enrichment (root:.*) complete'; then
   FAIL=$((FAIL+1))
 else
   _LSP_READY_OUT=$(repo-native-alignment search helper --repo "$_LSP_FIX" --limit 3 2>/dev/null)
-  if echo "$_LSP_READY_OUT" | grep -q 'blocked: requires complete, persisted, non-zero LSP call/reference coverage'; then
+  if echo "$_LSP_READY_OUT" | grep -q 'blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage'; then
     echo "PASS: bounded zero-edge LSP enrichment remains fail-closed (#644/#668)"
     PASS=$((PASS+1))
   else
