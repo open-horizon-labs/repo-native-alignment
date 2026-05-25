@@ -925,13 +925,17 @@ impl LspEnrichmentStatus {
 
     pub fn review_readiness(&self) -> CapabilityReadiness {
         let lsp = self.call_reference_readiness();
+        let has_scoped_coverage = matches!(
+            &*self.coverage_scope.lock().unwrap(),
+            LspCoverageScope::Scoped(_)
+        ) && self.coverage_edge_count() > 0;
         match lsp.state {
             CapabilityReadinessState::Ready => CapabilityReadiness::new(
                 "review-readiness scoped context",
                 CapabilityReadinessState::Ready,
                 "repo-wide LSP caller/reference coverage is available; diff-scoped review probes may use graph callers",
             ),
-            CapabilityReadinessState::Partial if self.coverage_edge_count() > 0 => {
+            CapabilityReadinessState::Partial if has_scoped_coverage => {
                 CapabilityReadiness::new(
                     "review-readiness scoped context",
                     CapabilityReadinessState::Partial,
@@ -1510,6 +1514,26 @@ mod tests {
             readiness.detail.contains("persistence failed"),
             "got: {}",
             readiness.detail
+        );
+    }
+
+    #[test]
+    fn test_review_readiness_does_not_label_repo_persist_failure_as_scoped() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(7);
+
+        let review = status.review_readiness();
+        assert_eq!(review.state, CapabilityReadinessState::Partial);
+        assert!(
+            review.detail.contains("context is degraded"),
+            "got: {}",
+            review.detail
+        );
+        assert!(
+            !review.detail.contains("scoped/degraded context"),
+            "got: {}",
+            review.detail
         );
     }
 

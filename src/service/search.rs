@@ -77,9 +77,10 @@ fn format_verbose_readiness(
             .max_by_key(|job| job.updated_at)
         {
             let status = LspEnrichmentStatus::default();
+            let scoped_edge_count = scoped_job.counters.edge_count.unwrap_or(0);
             status.set_complete_scoped(
-                persisted_lsp_edges,
-                persisted_lsp_edges,
+                scoped_edge_count,
+                scoped_edge_count,
                 format!("{} scope", scoped_job.scope.stable_key()),
             );
             Some(status)
