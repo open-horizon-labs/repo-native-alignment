@@ -40,9 +40,14 @@ pub fn is_worktree_with_own_cache(dir: &Path) -> bool {
 }
 
 fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
-    let repo = git2::Repository::open(repo_root)?;
+    let repo = git2::Repository::discover(repo_root)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("git walk requires a non-bare repository"))?
+        .canonicalize()
+        .unwrap_or_else(|_| repo.workdir().expect("checked workdir").to_path_buf());
     let mut files = Vec::new();
-    walk_dir_git2(&repo, repo_root, repo_root, extensions, &mut files)?;
+    walk_dir_git2(&repo, repo_root, &workdir, extensions, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -50,7 +55,7 @@ fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
 fn walk_dir_git2(
     repo: &git2::Repository,
     dir: &Path,
-    repo_root: &Path,
+    git_root: &Path,
     extensions: &[&str],
     files: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -67,8 +72,21 @@ fn walk_dir_git2(
         }
 
         // Check if git ignores this path
-        let rel = path.strip_prefix(repo_root).unwrap_or(&path);
-        if repo.is_path_ignored(rel).unwrap_or(false) {
+        let ignored = path
+            .strip_prefix(git_root)
+            .map(|rel| repo.is_path_ignored(rel).unwrap_or(false))
+            .unwrap_or_else(|_| {
+                path.canonicalize()
+                    .ok()
+                    .and_then(|canonical| {
+                        canonical
+                            .strip_prefix(git_root)
+                            .ok()
+                            .map(|rel| repo.is_path_ignored(rel).unwrap_or(false))
+                    })
+                    .unwrap_or(false)
+            });
+        if ignored {
             continue;
         }
 
@@ -78,7 +96,7 @@ fn walk_dir_git2(
                 tracing::info!("skipping worktree {}: has own RNA cache", path.display());
                 continue;
             }
-            walk_dir_git2(repo, &path, repo_root, extensions, files)?;
+            walk_dir_git2(repo, &path, git_root, extensions, files)?;
         } else if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
@@ -168,6 +186,46 @@ mod tests {
         let cache = path.join(".oh").join(".cache").join("lance");
         fs::create_dir_all(&cache).unwrap();
         assert!(!is_worktree_with_own_cache(path));
+    }
+
+    #[test]
+    fn test_walk_repo_files_uses_parent_gitignore_for_scoped_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        fs::write(root.join(".gitignore"), "bin/\nobj/\n.angular/\n").unwrap();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::create_dir_all(root.join("app/bin/Debug")).unwrap();
+        fs::create_dir_all(root.join("app/obj")).unwrap();
+        fs::create_dir_all(root.join("app/.angular/cache")).unwrap();
+        fs::write(
+            root.join("app/src/index.ts"),
+            "export function realCode() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/bin/Debug/generated.ts"),
+            "export function ignoredBin() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/obj/generated.ts"),
+            "export function ignoredObj() { return 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/.angular/cache/generated.ts"),
+            "export function ignoredAngularCache() { return 4; }\n",
+        )
+        .unwrap();
+
+        let files = walk_repo_files(&root.join("app"), &["ts"]).unwrap();
+        let rel_files: Vec<_> = files
+            .iter()
+            .map(|path| path.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(rel_files, vec![PathBuf::from("app/src/index.ts")]);
     }
 
     #[test]

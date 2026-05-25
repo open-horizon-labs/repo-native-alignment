@@ -26,6 +26,7 @@ use crate::server::{
     check_and_migrate_schema, graph_lance_path, load_graph_from_lance, persist_graph_incremental,
     persist_graph_to_lance,
 };
+use crate::types::OhArtifactKind;
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -86,6 +87,14 @@ impl Check {
             detail: Some(detail.into()),
         }
     }
+}
+
+const SMOKE_OUTCOME_ID: &str = "agent-alignment";
+
+fn outcome_artifact_exists(repo: &Path, outcome_id: &str) -> Result<bool> {
+    Ok(crate::oh::load_oh_artifacts(repo)?
+        .into_iter()
+        .any(|artifact| artifact.kind == OhArtifactKind::Outcome && artifact.id() == outcome_id))
 }
 
 // ── Runner ──────────────────────────────────────────────────────────
@@ -349,31 +358,43 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     }
 
     // 9. outcome_progress path
-    match query::outcome_progress(&repo, "agent-alignment", &all_nodes) {
-        Ok(result) => {
-            let outcome_count = result.outcomes.len();
-            if outcome_count > 0
-                || !result.markdown_chunks.is_empty()
-                || !result.code_symbols.is_empty()
-            {
-                checks.push(Check::pass(
+    match outcome_artifact_exists(&repo, SMOKE_OUTCOME_ID) {
+        Ok(false) => checks.push(Check::skip(
+            "outcome_progress",
+            format!(
+                "optional outcome '{}' is absent; skipping outcome_progress smoke check",
+                SMOKE_OUTCOME_ID
+            ),
+        )),
+        Ok(true) => match query::outcome_progress(&repo, SMOKE_OUTCOME_ID, &all_nodes) {
+            Ok(result) => {
+                let outcome_count = result.outcomes.len();
+                if outcome_count > 0
+                    || !result.markdown_chunks.is_empty()
+                    || !result.code_symbols.is_empty()
+                {
+                    checks.push(Check::pass(
+                        "outcome_progress",
+                        format!("{} outcomes in progress result", outcome_count),
+                    ));
+                } else {
+                    checks.push(Check::skip(
+                        "outcome_progress",
+                        "outcome_progress returned empty for existing outcome",
+                    ));
+                }
+            }
+            Err(e) => {
+                checks.push(Check::fail(
                     "outcome_progress",
-                    format!("{} outcomes in progress result", outcome_count),
-                ));
-            } else {
-                // No outcomes for "agent-alignment" is possible but worth noting
-                checks.push(Check::skip(
-                    "outcome_progress",
-                    "outcome_progress returned empty (outcome may not exist)",
+                    format!("outcome_progress error: {}", e),
                 ));
             }
-        }
-        Err(e) => {
-            checks.push(Check::fail(
-                "outcome_progress",
-                format!("outcome_progress error: {}", e),
-            ));
-        }
+        },
+        Err(e) => checks.push(Check::fail(
+            "outcome_progress",
+            format!("failed to inspect outcome artifacts: {}", e),
+        )),
     }
 
     // 10. list_roots path
@@ -2216,4 +2237,31 @@ fn print_and_return(args: &TestArgs, checks: Vec<Check>) -> bool {
     }
 
     result.pass
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_outcome_artifact_exists_false_when_optional_outcome_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!outcome_artifact_exists(dir.path(), SMOKE_OUTCOME_ID).unwrap());
+    }
+
+    #[test]
+    fn test_outcome_artifact_exists_true_for_matching_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcomes = dir.path().join(".oh").join("outcomes");
+        fs::create_dir_all(&outcomes).unwrap();
+        fs::write(
+            outcomes.join("agent-alignment.md"),
+            "---\nid: agent-alignment\n---\n\n# Agent Alignment\n",
+        )
+        .unwrap();
+
+        assert!(outcome_artifact_exists(dir.path(), SMOKE_OUTCOME_ID).unwrap());
+    }
 }
