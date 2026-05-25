@@ -151,20 +151,25 @@ static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
 
 /// JavaScript / Node.js Express route registration query.
 ///
-/// Matches method calls where the HTTP method is deterministic:
+/// Matches server-side Express-style route registrations where the receiver is
+/// a conventional route container (`app`, `router`, `routes`, or `server`) and
+/// the first argument is a URL path literal:
 /// - `app.get('/users', handler)`     (Express)    → GET
 /// - `router.post('/items', handler)` (Express)    → POST
 /// - `app.put('/items/:id', handler)` (Express)    → PUT
 /// - `app.delete('/items/:id', handler)` (Express) → DELETE
 /// - `app.patch('/items/:id', handler)` (Express)  → PATCH
 ///
+/// Client calls such as `axios.get('/api/users')`, `fetch('/api/users')`,
+/// `URLSearchParams.get('deviceId')`, and cache/map lookups are deliberately
+/// excluded. They are observations of outbound client behavior, not authoritative
+/// server API surface, so they must not become `api_endpoint` nodes.
+///
 /// NOT included (deferred to #390 or later):
 /// - `use`   — middleware mount; not a route endpoint
 /// - `all`   — matches all HTTP methods; not a single-method endpoint
 /// - `route` — creates a route group for chaining `.get().post()`; not a direct endpoint
-///
-/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
-/// incorrect metadata before multi-method and prefix expansion are implemented.
+/// - custom receiver names — lower recall is preferable to noisy client false positives
 ///
 /// Tree-sitter JavaScript uses `member_expression` (not `selector_expression`
 /// like Go), with `property: (property_identifier)` for the method name.
@@ -173,10 +178,13 @@ static JAVASCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     query: r#"
 (call_expression
   function: (member_expression
+    object: (identifier) @receiver
     property: (property_identifier) @name)
   arguments: (arguments
     (string) @path)
-  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
+  (#match? @receiver "^(app|router|routes|server)$")
+  (#match? @name "^(get|post|put|delete|patch|head|options)$")
+  (#match? @path "^[\"']/"))
 "#,
     default_method: "GET",
 };
@@ -1232,7 +1240,6 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     has_parent_module_request: false,
     attribute_access_node: None,
 };
-
 
 /// Look up the LangConfig for a language name. Returns None for languages
 /// not supported by the generic extractor (JSON, Markdown, TOML, etc.).

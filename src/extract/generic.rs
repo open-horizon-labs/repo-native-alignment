@@ -335,7 +335,6 @@ impl GenericExtractor {
         Self { config }
     }
 
-
     /// Run extraction and return the result. Used directly or as a base by
     /// per-language extractors that need custom post-processing.
     pub fn run(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
@@ -506,10 +505,7 @@ fn collect_nodes(
             // Parent scope.
             if let Some((scope_name, scope_kind)) = parent_scope {
                 metadata.insert("parent_scope".to_string(), scope_name.clone());
-                metadata.insert(
-                    "parent_scope_kind".to_string(),
-                    scope_kind.to_string(),
-                );
+                metadata.insert("parent_scope_kind".to_string(), scope_kind.to_string());
             }
 
             // Name column for LSP cursor positioning.
@@ -5314,6 +5310,41 @@ class UserController {
         );
     }
 
+    /// JavaScript client HTTP calls and lookup-style `.get()` calls are not
+    /// authoritative server route declarations and must not become ApiEndpoint nodes.
+    #[test]
+    fn test_javascript_client_calls_do_not_emit_api_endpoints() {
+        use crate::extract::configs::JAVASCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&JAVASCRIPT_CONFIG);
+        let code = r#"
+const params = new URLSearchParams(location.search);
+axios.get("/api/users");
+params.get("deviceId");
+cache.get("reset");
+fetch("/api/orders");
+app.get("/health", health);
+
+function health(req, res) {
+  res.send("ok");
+}
+"#;
+        let result = ext.run(Path::new("client.js"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+
+        assert_eq!(
+            api_nodes
+                .iter()
+                .map(|n| n.id.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GET /health"],
+            "only Express-style server route registrations should emit ApiEndpoint nodes"
+        );
+    }
+
     /// Verify that the existing function extraction still works alongside route queries.
     #[test]
     fn test_python_route_query_does_not_break_function_extraction() {
@@ -6139,7 +6170,6 @@ fn helper() {}
         assert_eq!(plain, with_md);
     }
 
-    
     #[test]
     fn test_parse_adr_refs_supports_path_and_id() {
         let refs = parse_adr_refs(
@@ -6831,7 +6861,11 @@ def process(self):
             .iter()
             .find(|n| n.id.name == "process")
             .unwrap();
-        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        let attr_refs = fn_node
+            .metadata
+            .get("attr_refs")
+            .map(String::as_str)
+            .unwrap_or("");
         assert!(
             attr_refs.split(',').any(|s| s.trim() == "transform"),
             "transform() call should appear in attr_refs, got: {:?}",
@@ -6864,7 +6898,11 @@ function process(handler: Handler): void {
             .iter()
             .find(|n| n.id.name == "process")
             .unwrap();
-        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        let attr_refs = fn_node
+            .metadata
+            .get("attr_refs")
+            .map(String::as_str)
+            .unwrap_or("");
         assert!(
             attr_refs.split(',').any(|s| s.trim() == "transform"),
             "transform() call should appear in attr_refs, got: {:?}",
