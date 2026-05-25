@@ -63,7 +63,15 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                 }
             })
             .collect();
-        swi.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        swi.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.to_stable_id().cmp(&b.0.id.to_stable_id()))
+                .then_with(|| a.0.line_start.cmp(&b.0.line_start))
+                .then_with(|| a.0.line_end.cmp(&b.0.line_end))
+        });
+        let mut seen_identities = HashSet::new();
+        swi.retain(|(node, _)| seen_identities.insert(node.id.to_stable_id()));
         swi.truncate(params.top_n);
         if !swi.is_empty() {
             let single_root = params.root_filter.is_some();
@@ -488,6 +496,55 @@ mod tests {
             result.contains("[project-a]"),
             "Multi-root mode should show root slug prefix: {}",
             result
+        );
+    }
+
+    #[test]
+    fn test_repo_map_deduplicates_top_symbols_by_stable_identity() {
+        let mut duplicate_a = make_node("NodeKind", NodeKind::Enum, "src/graph/mod.rs");
+        duplicate_a
+            .metadata
+            .insert("importance".into(), "0.9".into());
+        duplicate_a.line_start = 10;
+        duplicate_a.line_end = 20;
+
+        let mut duplicate_b = make_node("NodeKind", NodeKind::Enum, "src/graph/mod.rs");
+        duplicate_b
+            .metadata
+            .insert("importance".into(), "0.8".into());
+        duplicate_b.line_start = 10;
+        duplicate_b.line_end = 20;
+
+        let mut distinct_same_name = make_node("NodeKind", NodeKind::Enum, "src/extract/mod.rs");
+        distinct_same_name
+            .metadata
+            .insert("importance".into(), "0.7".into());
+        distinct_same_name.line_start = 30;
+        distinct_same_name.line_end = 40;
+
+        let gs = make_graph_state(vec![duplicate_a, duplicate_b, distinct_same_name]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = RepoMapContext {
+            graph_state: &gs,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some("local".to_string()),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert_eq!(
+            result.matches("`src/graph/mod.rs`:10-20").count(),
+            1,
+            "duplicate stable identities should be shown once: {result}"
+        );
+        assert!(
+            result.contains("`src/extract/mod.rs`:30-40"),
+            "same short name in a distinct file should remain visible: {result}"
         );
     }
 }

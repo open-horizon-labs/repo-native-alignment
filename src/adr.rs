@@ -607,7 +607,7 @@ fn parse_adr(repo_root: &Path, path: &Path, raw: &str) -> Result<ParsedAdr> {
         );
     }
 
-    let title = extract_title(&parsed.content)
+    let title = extract_title(&parsed.content, &frontmatter.id)
         .with_context(|| format!("extracting title from {}", path.display()))?;
 
     let validate = AdrValidationRefs {
@@ -932,17 +932,32 @@ fn collect_rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn extract_title(body: &str) -> Result<String> {
+fn extract_title(body: &str, adr_id: &str) -> Result<String> {
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            let title = rest.trim();
+            let title = normalize_adr_heading_title(rest.trim(), adr_id);
             if !title.is_empty() {
-                return Ok(title.to_string());
+                return Ok(title);
             }
         }
     }
     bail!("ADR body is missing a level-1 heading")
+}
+
+fn normalize_adr_heading_title(title: &str, adr_id: &str) -> String {
+    let number = adr_id.split('-').next().unwrap_or(adr_id);
+    let dashed = format!("ADR-{}:", number);
+    let spaced = format!("ADR {}:", number);
+    for prefix in [dashed.as_str(), spaced.as_str()] {
+        if let Some(rest) = title.strip_prefix(prefix) {
+            let normalized = rest.trim();
+            if !normalized.is_empty() {
+                return normalized.to_string();
+            }
+        }
+    }
+    title.to_string()
 }
 
 fn normalize_repo_paths(repo_root: &Path, raw_paths: &[String], kind: &str) -> Result<Vec<String>> {
@@ -1183,6 +1198,46 @@ mod tests {
         assert!(err.to_string().contains("must match file stem"));
     }
 
+    #[test]
+    fn test_compile_normalizes_redundant_adr_title_prefix_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        write_adr(
+            tmp.path(),
+            "004-operation-report-telemetry.md",
+            &sample_adr(
+                "004-operation-report-telemetry",
+                "implemented",
+                "ADR-004: OperationReport telemetry control plane",
+                "  cargo_tests: []\n",
+            ),
+        );
+        fs::write(
+            tmp.path().join("docs/ADRs/README.md"),
+            "# Architecture Decision Records\n\nThis index lists architecture decisions and their declared implementation status. ADRs may also include `validate.*` frontmatter; compile and run those executable references with:\n\n```bash\nrepo-native-alignment adr compile --repo .\nrepo-native-alignment adr validate --repo .\n```\n\n| ADR | Title | Status |\n|-----|-------|--------|\n| [004](004-operation-report-telemetry.md) | OperationReport telemetry control plane | Implemented |\n",
+        )
+        .unwrap();
+
+        let report = compile(tmp.path(), &tmp.path().join("docs/ADRs"), false).unwrap();
+        assert!(report.ok());
+        assert!(
+            !report.readme_updated,
+            "compile should not rewrite an already-normalized README"
+        );
+
+        let manifest = fs::read_to_string(
+            tmp.path()
+                .join(".oh/adr-validation/004-operation-report-telemetry.json"),
+        )
+        .unwrap();
+        assert!(manifest.contains("\"title\": \"OperationReport telemetry control plane\""));
+
+        let check_report = compile(tmp.path(), &tmp.path().join("docs/ADRs"), true).unwrap();
+        assert!(
+            check_report.ok(),
+            "second check should report no drift: {:?}",
+            check_report.drift
+        );
+    }
     #[test]
     fn test_normalize_repo_relative_path_rejects_escape() {
         let err = normalize_repo_relative_path("../outside.sh").unwrap_err();
