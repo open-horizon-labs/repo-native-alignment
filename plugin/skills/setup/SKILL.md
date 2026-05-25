@@ -60,7 +60,7 @@ Check if `.mcp.json` exists in the project root and already contains an `rna-ser
 
 If the agent supports `claude mcp add` (Claude Code), use a direct RNA command:
 ```bash
-claude mcp add rna-server --scope project -- repo-native-alignment --repo .
+claude mcp add rna-server --scope project -- repo-native-alignment --repo "$PWD"
 ```
 
 Otherwise, create or update `.mcp.json` in the project root with:

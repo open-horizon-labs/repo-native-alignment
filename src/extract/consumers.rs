@@ -1358,7 +1358,7 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 }
 
 fn is_lsp_server_not_found_error(err_text: &str) -> bool {
-    err_text.starts_with("LSP server '") && err_text.contains("' not found on PATH")
+    err_text.contains("LSP server '") && err_text.contains("' not found on PATH")
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1455,7 @@ impl ExtractionConsumer for LspConsumer {
 
         match enrichment_result {
             Ok(enrichment) => {
+                let server_missing = !enrichment.any_enricher_ran;
                 tracing::info!(
                     "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes, {} patches",
                     self.language,
@@ -1471,7 +1472,7 @@ impl ExtractionConsumer for LspConsumer {
                     updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
                     server_name: Some(self.enricher.name().to_string()),
                     error_count: enrichment.error_count,
-                    server_missing: false,
+                    server_missing,
                     remediation: self.enricher.toolchain_remediation().map(str::to_string),
                     aborted: enrichment.aborted,
                 }])

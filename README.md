@@ -122,6 +122,7 @@ Example `.mcp.json`:
       "args": ["--repo", "/path/to/your/project"],
       "env": {
         "DOTNET_ROOT": "/opt/homebrew/opt/dotnet/libexec",
+        "DOTNET_ROOT_ARM64": "/opt/homebrew/opt/dotnet/libexec",
         "PATH": "/Users/me/.dotnet/tools:/opt/homebrew/opt/dotnet/libexec:/Users/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
       }
     }

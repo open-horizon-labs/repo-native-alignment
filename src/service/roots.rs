@@ -1361,6 +1361,11 @@ mod tests {
             result
         );
         assert!(
+            result.contains("next: install pyright"),
+            "should show remediation guidance, got: {}",
+            result
+        );
+        assert!(
             result.contains("2m"),
             "should show duration, got: {}",
             result

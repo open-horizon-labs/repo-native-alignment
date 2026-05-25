@@ -959,6 +959,8 @@ mod tests {
             status: LspStatus::NotFound,
             remediation: Some("install json ls".to_string()),
         };
-        assert!(e.summary_line().contains("not found"));
+        let line = e.summary_line();
+        assert!(line.contains("not found"));
+        assert!(line.contains("install json ls"));
     }
 }
