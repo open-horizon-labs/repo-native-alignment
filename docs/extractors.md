@@ -9,12 +9,13 @@ This document covers how to add new extraction capability — whether that is a 
 ## Table of Contents
 
 1. [Decision tree](#decision-tree)
-2. [Approach 1: Built-in framework extractor (Rust)](#approach-1-built-in-framework-extractor-rust)
-3. [Approach 2: Custom config extractor (.oh/extractors/*.toml)](#approach-2-custom-config-extractor-ohextractorstoml)
-4. [Approach 3: Framework detection rules](#approach-3-framework-detection-rules)
-5. [How to test an extractor](#how-to-test-an-extractor)
-6. [Known limitations](#known-limitations)
-7. [Language extractor reference](#language-extractor-reference)
+2. [Repo-local knowledge declarations](#repo-local-knowledge-declarations)
+3. [Approach 1: Built-in framework extractor (Rust)](#approach-1-built-in-framework-extractor-rust)
+4. [Approach 2: Custom config extractor (.oh/extractors/*.toml)](#approach-2-custom-config-extractor-ohextractorstoml)
+5. [Approach 3: Framework detection rules](#approach-3-framework-detection-rules)
+6. [How to test an extractor](#how-to-test-an-extractor)
+7. [Known limitations](#known-limitations)
+8. [Language extractor reference](#language-extractor-reference)
 
 ---
 
@@ -34,6 +35,45 @@ Do you just want RNA to recognise a framework from imports (no edges yet)?
 ```
 
 **Rule of thumb:** start with Approach 2 (config file). Promote to Approach 1 (built-in Rust pass) only when the pattern is common enough to include in RNA itself and requires more logic than TOML can express (e.g., the KafkaJS `{topic: "..."}` object-literal extraction).
+
+## Repo-local knowledge declarations
+
+Markdown files can opt into repo-local knowledge graph extraction by adding an `rna` object to YAML frontmatter. This is intentionally source-first: the human-editable artifact remains the source of truth, and RNA compiles the declared node and relationships into the same graph as code, markdown sections, `.oh/` artifacts, and framework boundaries.
+
+Use this for local/domain knowledge such as quote/source ledgers, claims/facts, manuscript sections, review decisions, or other repo-specific primitives. Do **not** hardcode these domain concepts into RNA core enums; they are emitted as `NodeKind::Other(<kind>)` and `EdgeKind::Other(<relationship>)`.
+
+Example:
+
+```markdown
+---
+rna:
+  kind: quote
+  id: quote.goodhart
+  name: Goodhart quote
+  metadata:
+    public_use: verified
+  relationships:
+    - kind: supports
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Goodhart Source
+
+When a measure becomes a target, it ceases to be a good measure.
+```
+
+This emits:
+
+- one `NodeKind::Other("quote")` node for `quote.goodhart`;
+- one `EdgeKind::Other("supports")` edge from `quote.goodhart` to `claim.proxy-risk`;
+- metadata keys such as `local_knowledge=true`, `rna.kind`, `rna.id`, `rna.name`, and `rna.metadata.public_use`.
+
+The target node does not need to be in the same file, but its `kind`, `id`, and `file` should match the artifact that declares it so traversal/search can join the graph after all files are scanned. Relationship labels are true edge kinds after reload; do not collapse support/verification/review semantics into `References`, `DependsOn`, or metadata.
+
 
 ---
 

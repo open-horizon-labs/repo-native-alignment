@@ -183,6 +183,8 @@ pub enum EdgeKind {
     /// A symbol/handler consumes events from a channel/topic.
     /// Direction: consumer → channel
     Consumes,
+    /// A repo-local/domain-specific relationship kind declared outside RNA core.
+    Other(String),
 }
 
 impl fmt::Display for EdgeKind {
@@ -207,7 +209,45 @@ impl fmt::Display for EdgeKind {
             EdgeKind::UsesFramework => write!(f, "uses_framework"),
             EdgeKind::Produces => write!(f, "produces"),
             EdgeKind::Consumes => write!(f, "consumes"),
+            EdgeKind::Other(kind) => write!(f, "{}", kind),
         }
+    }
+}
+
+impl EdgeKind {
+    /// Parse a persisted or user-supplied edge label.
+    ///
+    /// Built-in labels preserve their typed variants. Any other non-empty label becomes
+    /// `Other(label)`, which lets repo-local relationship kinds survive persistence,
+    /// traversal, and search without hardcoding domain vocabulary in RNA core.
+    pub fn from_label(label: &str) -> Option<Self> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        Some(match trimmed {
+            "calls" => EdgeKind::Calls,
+            "implements" => EdgeKind::Implements,
+            "depends_on" => EdgeKind::DependsOn,
+            "connects_to" => EdgeKind::ConnectsTo,
+            "defines" => EdgeKind::Defines,
+            "has_field" => EdgeKind::HasField,
+            "evolves" => EdgeKind::Evolves,
+            "referenced_by" => EdgeKind::ReferencedBy,
+            "references" => EdgeKind::References,
+            "topology_boundary" => EdgeKind::TopologyBoundary,
+            "modified" => EdgeKind::Modified,
+            "affected" => EdgeKind::Affected,
+            "serves" => EdgeKind::Serves,
+            "tested_by" => EdgeKind::TestedBy,
+            "belongs_to" => EdgeKind::BelongsTo,
+            "re_exports" => EdgeKind::ReExports,
+            "uses_framework" => EdgeKind::UsesFramework,
+            "produces" | "Produces" => EdgeKind::Produces,
+            "consumes" | "Consumes" => EdgeKind::Consumes,
+            other => EdgeKind::Other(other.to_string()),
+        })
     }
 }
 

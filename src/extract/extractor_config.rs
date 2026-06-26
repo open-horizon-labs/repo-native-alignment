@@ -107,14 +107,8 @@ pub struct Boundary {
 
 impl Boundary {
     /// Resolve the declared `edge_kind` string to an `EdgeKind`.
-    ///
-    /// Returns `None` for unrecognized values.
     fn resolved_edge_kind(&self) -> Option<EdgeKind> {
-        match self.edge_kind.as_str() {
-            "Produces" => Some(EdgeKind::Produces),
-            "Consumes" => Some(EdgeKind::Consumes),
-            _ => None,
-        }
+        EdgeKind::from_label(&self.edge_kind)
     }
 }
 

@@ -217,6 +217,10 @@ Key metadata keys stored in `Node.metadata` (all optional):
 | `diagnostic_message` | Full diagnostic text |
 | `http_method` | For `NodeKind::ApiEndpoint` nodes |
 | `http_path` | HTTP path for API endpoint nodes (full path after router prefix resolution) |
+| `local_knowledge` | `"true"` for repo-local knowledge nodes emitted from markdown `rna` frontmatter |
+| `rna.kind` | Repo-local knowledge kind declared in markdown frontmatter (for example `quote`, `claim`, `manuscript_section`) |
+| `rna.id` | Repo-local stable knowledge ID |
+| `rna.name` | Human-readable local knowledge label |
 | `http_path_local` | Original local path fragment before router prefix concatenation (e.g., `"/list"` when a FastAPI `APIRouter(prefix="/orders")` is applied) — set once on first prefix application; subsequent applications read this value instead of re-prefixing |
 
 ### NodeKind
@@ -287,6 +291,7 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | `UsesFramework` | `uses_framework` | subsystem/symbol → framework node | A subsystem or symbol uses a detected framework |
 | `Produces` | `produces` | producer → channel | A symbol/handler produces events to a channel/topic |
 | `Consumes` | `consumes` | consumer → channel | A symbol/handler consumes events from a channel/topic |
+| `Other(String)` | custom label | repo-local | Repo-local/domain-specific relationship kind that is not hardcoded in RNA core |
 
 **PageRank weights by edge kind** (used for importance scoring):
 
@@ -297,6 +302,7 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | DependsOn, ReferencedBy, References | 0.5 |
 | TestedBy, BelongsTo, ReExports, ConnectsTo | 0.2–0.3 |
 | Produces, Consumes | 0.4 |
+| Other(_) | 0.3 default until a relationship registry supplies a more specific weight |
 | Defines, HasField, UsesFramework | 0.1 |
 | Evolves, TopologyBoundary, Modified, Affected, Serves | 0.05 |
 
