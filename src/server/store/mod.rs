@@ -183,3 +183,75 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         _ => "unknown".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+
+    use super::{load_graph_from_lance, parse_edge_kind, persist_graph_to_lance};
+
+    fn node(kind: &str, name: &str, file: &str) -> Node {
+        Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: NodeKind::Other(kind.to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: format!("{} {}", kind, name),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        }
+    }
+
+    #[test]
+    fn parse_edge_kind_preserves_unknown_labels_as_custom_edges() {
+        assert_eq!(parse_edge_kind("calls"), Some(EdgeKind::Calls));
+        assert_eq!(
+            parse_edge_kind("supports"),
+            Some(EdgeKind::Other("supports".to_string()))
+        );
+        assert_eq!(parse_edge_kind("  "), None);
+    }
+
+    #[tokio::test]
+    async fn custom_edge_kind_survives_persist_load_and_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = node("quote", "quote.goodhart", ".oh/sources/goodhart.md");
+        let claim = node("claim", "claim.proxy-risk", ".oh/knowledge/proxy-risk.md");
+        let edge = Edge {
+            from: source.id.clone(),
+            to: claim.id.clone(),
+            kind: EdgeKind::Other("supports".to_string()),
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Confirmed,
+        };
+
+        persist_graph_to_lance(dir.path(), &[source.clone(), claim.clone()], &[edge])
+            .await
+            .expect("persist graph");
+        let state = load_graph_from_lance(dir.path()).await.expect("load graph");
+
+        assert_eq!(
+            state.edges.len(),
+            1,
+            "custom edge must not be dropped on load"
+        );
+        assert_eq!(state.edges[0].kind, EdgeKind::Other("supports".to_string()));
+        assert_eq!(state.edges[0].confidence, Confidence::Confirmed);
+
+        let neighbors = state.index.neighbors(
+            &source.stable_id(),
+            Some(&[EdgeKind::Other("supports".to_string())]),
+            petgraph::Direction::Outgoing,
+        );
+        assert_eq!(neighbors, vec![claim.stable_id()]);
+    }
+}

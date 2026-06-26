@@ -217,6 +217,10 @@ Key metadata keys stored in `Node.metadata` (all optional):
 | `diagnostic_message` | Full diagnostic text |
 | `http_method` | For `NodeKind::ApiEndpoint` nodes |
 | `http_path` | HTTP path for API endpoint nodes (full path after router prefix resolution) |
+| `local_knowledge` | `"true"` for repo-local knowledge nodes emitted from markdown `rna` frontmatter |
+| `rna.kind` | Repo-local knowledge kind declared in markdown frontmatter (for example `quote`, `claim`, `manuscript_section`) |
+| `rna.id` | Repo-local stable knowledge ID |
+| `rna.name` | Human-readable local knowledge label |
 | `http_path_local` | Original local path fragment before router prefix concatenation (e.g., `"/list"` when a FastAPI `APIRouter(prefix="/orders")` is applied) — set once on first prefix application; subsequent applications read this value instead of re-prefixing |
 
 ### NodeKind

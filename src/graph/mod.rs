@@ -269,7 +269,6 @@ impl<'de> Deserialize<'de> for EdgeKind {
             .ok_or_else(|| serde::de::Error::custom("edge kind must not be empty"))
     }
 }
-
 // ---------------------------------------------------------------------------
 // Extraction metadata
 // ---------------------------------------------------------------------------

@@ -2027,6 +2027,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_neighbors_displays_custom_edge_label() {
+        let quote = make_node(
+            "quote.goodhart",
+            NodeKind::Other("quote".to_string()),
+            ".oh/sources/goodhart.md",
+        );
+        let claim = make_node(
+            "claim.proxy-risk",
+            NodeKind::Other("claim".to_string()),
+            ".oh/knowledge/proxy-risk.md",
+        );
+        let edge = make_edge(
+            &quote,
+            &claim,
+            crate::graph::EdgeKind::Other("supports".to_string()),
+        );
+        let gs = make_graph_state_with_edges(vec![quote.clone(), claim], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            node: Some(quote.stable_id()),
+            mode: Some("neighbors".into()),
+            edge_types: Some(vec!["supports".to_string()]),
+            compact: true,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("#### Supports (1)"),
+            "custom edge label should render: {}",
+            result
+        );
+        assert!(result.contains("claim.proxy-risk"));
+    }
+
+    #[tokio::test]
     async fn test_verbose_readiness_uses_persisted_lsp_edges_without_live_status() {
         let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
         let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
