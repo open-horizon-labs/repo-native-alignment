@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 21; // persist attr_refs for import_calls_pass Step 6 on incremental scans
+pub const SCHEMA_VERSION: u32 = 22; // persist generic metadata for repo-local knowledge nodes
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -90,6 +90,10 @@ pub fn symbols_schema() -> Schema {
         Field::new("parent_service", DataType::Utf8, true), // metadata["parent_service"] — owning service name
         Field::new("rpc_request_type", DataType::Utf8, true), // metadata["request_type"] — proto request message
         Field::new("rpc_response_type", DataType::Utf8, true), // metadata["response_type"] — proto response message
+        // Generic metadata JSON — persists repo-local/custom metadata keys that are
+        // not represented by typed Arrow columns. Typed metadata remains in dedicated
+        // columns for query/type stability; this column preserves extensibility.
+        Field::new("metadata_json", DataType::Utf8, true),
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -151,6 +155,9 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("parent_service", DataType::Utf8, true),
         Field::new("rpc_request_type", DataType::Utf8, true),
         Field::new("rpc_response_type", DataType::Utf8, true),
+        // Generic metadata JSON — persists repo-local/custom metadata keys not represented
+        // by typed Arrow columns.
+        Field::new("metadata_json", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),

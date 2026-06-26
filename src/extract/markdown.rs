@@ -834,7 +834,12 @@ fn parse_markdown_file_from_source(source: &str, path: &Path) -> Vec<crate::type
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::ExtractorRegistry;
     use crate::graph::{Confidence, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+    use crate::scanner::Scanner;
+    use crate::server::store::{load_graph_from_lance, persist_graph_to_lance};
+    use crate::service::{SearchContext, SearchParams, search};
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -939,6 +944,147 @@ When a measure becomes a target, it ceases to be a good measure.
         assert_eq!(edge.to.name, "claim.proxy-risk");
         assert!(matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "claim"));
         assert_eq!(edge.confidence, Confidence::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_local_knowledge_scan_persist_load_search_answers_claim_support_question() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join(".oh/sources")).expect("create sources dir");
+        std::fs::create_dir_all(root.join(".oh/knowledge")).expect("create knowledge dir");
+        std::fs::create_dir_all(root.join("manuscript")).expect("create manuscript dir");
+
+        std::fs::write(
+            root.join(".oh/sources/goodhart.md"),
+            r#"---
+rna:
+  kind: quote
+  id: quote.goodhart
+  name: Goodhart quote
+  metadata:
+    public_use: verified
+    source_url: https://example.test/goodhart
+  relationships:
+    - kind: supports
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Goodhart Source
+
+When a measure becomes a target, it ceases to be a good measure.
+"#,
+        )
+        .expect("write source artifact");
+        std::fs::write(
+            root.join(".oh/knowledge/proxy-risk.md"),
+            r#"---
+rna:
+  kind: claim
+  id: claim.proxy-risk
+  name: Proxy metrics become risky when treated as targets
+---
+
+# Proxy Risk Claim
+
+Proxy metrics become unreliable when the organization optimizes the proxy rather than the underlying outcome.
+"#,
+        )
+        .expect("write claim artifact");
+        std::fs::write(
+            root.join("manuscript/chapter-01.md"),
+            r#"---
+rna:
+  kind: manuscript_section
+  id: manuscript.chapter-01.proxy-risk
+  name: Chapter 1 proxy-risk section
+  relationships:
+    - kind: consumes
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Chapter 1
+
+The manuscript uses the proxy-risk claim in the opening argument.
+"#,
+        )
+        .expect("write manuscript artifact");
+
+        let mut scanner = Scanner::new(root.to_path_buf()).expect("create scanner");
+        let scan = scanner.scan().expect("scan local knowledge corpus");
+        let extraction = ExtractorRegistry::with_builtins().extract_scan_result(root, &scan);
+
+        persist_graph_to_lance(root, &extraction.nodes, &extraction.edges)
+            .await
+            .expect("persist graph");
+        let loaded = load_graph_from_lance(root).await.expect("load graph");
+
+        let claim = loaded
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "claim.proxy-risk")
+            .expect("claim node should survive scan/persist/load");
+        let quote = loaded
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "quote.goodhart")
+            .expect("quote node should survive scan/persist/load");
+        assert_eq!(
+            quote.metadata.get("rna.metadata.public_use"),
+            Some(&"verified".to_string()),
+            "quote public-use verification must remain queryable as source metadata"
+        );
+
+        let supports = loaded.index.neighbors(
+            &claim.stable_id(),
+            Some(&[EdgeKind::Other("supports".to_string())]),
+            petgraph::Direction::Incoming,
+        );
+        assert_eq!(
+            supports,
+            vec![quote.stable_id()],
+            "claim support must be a real incoming custom edge, not metadata or a generic reference"
+        );
+
+        let ctx = SearchContext {
+            graph_state: &loaded,
+            embed_index: None,
+            repo_root: root,
+            lsp_status: None,
+            embed_status: None,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+            enrichment_jobs: Vec::new(),
+        };
+        let answer = search(
+            &SearchParams {
+                node: Some(claim.stable_id()),
+                mode: Some("neighbors".to_string()),
+                direction: Some("incoming".to_string()),
+                edge_types: Some(vec!["supports".to_string(), "consumes".to_string()]),
+                compact: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            answer.contains("#### Supports (1)") && answer.contains("quote.goodhart"),
+            "search should answer what supports the claim: {answer}"
+        );
+        assert!(
+            answer.contains("#### Consumes (1)")
+                && answer.contains("manuscript.chapter-01.proxy-risk"),
+            "search should answer which manuscript node consumes the claim: {answer}"
+        );
     }
 
     #[test]

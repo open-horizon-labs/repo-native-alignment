@@ -118,6 +118,9 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let metadata_json_col = batch
+                .column_by_name("metadata_json")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             // Typed metadata columns -- Arrow type safety, no JSON blobs for known fields.
             let meta_virtual_col = batch
                 .column_by_name("meta_virtual")
@@ -229,6 +232,21 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
                 let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+                if let Some(col) = metadata_json_col
+                    && !col.is_null(i)
+                {
+                    let raw = col.value(i);
+                    if !raw.is_empty() {
+                        match serde_json::from_str::<BTreeMap<String, String>>(raw) {
+                            Ok(extra) => metadata.extend(extra),
+                            Err(err) => tracing::warn!(
+                                "load_graph_from_lance: ignoring invalid metadata_json for {}: {}",
+                                file_path.display(),
+                                err
+                            ),
+                        }
+                    }
+                }
                 if let Some(col) = meta_virtual_col
                     && !col.is_null(i)
                     && col.value(i)
