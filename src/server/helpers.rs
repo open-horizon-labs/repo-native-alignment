@@ -905,6 +905,32 @@ mod tests {
     }
 
     #[test]
+    fn test_format_neighbors_grouped_preserves_custom_edge_label() {
+        use crate::graph::EdgeKind;
+
+        let evidence = make_test_node("evidence");
+        let nodes = vec![evidence.clone()];
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&evidence.stable_id(), "function");
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(
+            EdgeKind::Other("requires_verification".to_string()),
+            vec![evidence.stable_id()],
+        );
+
+        let result = format_neighbors_grouped(&nodes, &groups, &index, true);
+
+        assert!(
+            result.contains("#### Requires verification (1)"),
+            "custom edge label should be exposed in traversal/search output, got: {}",
+            result
+        );
+        assert!(result.contains("evidence"));
+    }
+
+    #[test]
     fn test_format_neighbors_grouped_omits_empty() {
         use crate::graph::EdgeKind;
 

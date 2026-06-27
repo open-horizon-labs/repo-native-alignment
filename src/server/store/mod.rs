@@ -64,29 +64,12 @@ pub(crate) fn parse_node_kind(s: &str) -> NodeKind {
 }
 
 /// Parse an EdgeKind from its string representation.
+///
+/// Built-in labels map to their canonical variants. Any non-empty unknown
+/// label becomes `EdgeKind::Other(label)`, preserving repo-local relationship
+/// kinds loaded from LanceDB or accepted through MCP/search edge filters.
 pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
-    Some(match s {
-        "calls" => EdgeKind::Calls,
-        "implements" => EdgeKind::Implements,
-        "depends_on" => EdgeKind::DependsOn,
-        "connects_to" => EdgeKind::ConnectsTo,
-        "defines" => EdgeKind::Defines,
-        "has_field" => EdgeKind::HasField,
-        "evolves" => EdgeKind::Evolves,
-        "referenced_by" => EdgeKind::ReferencedBy,
-        "references" => EdgeKind::References,
-        "topology_boundary" => EdgeKind::TopologyBoundary,
-        "modified" => EdgeKind::Modified,
-        "affected" => EdgeKind::Affected,
-        "serves" => EdgeKind::Serves,
-        "tested_by" => EdgeKind::TestedBy,
-        "belongs_to" => EdgeKind::BelongsTo,
-        "re_exports" => EdgeKind::ReExports,
-        "uses_framework" => EdgeKind::UsesFramework,
-        "produces" => EdgeKind::Produces,
-        "consumes" => EdgeKind::Consumes,
-        _ => return None,
-    })
+    EdgeKind::from_label(s)
 }
 
 /// Parse an ExtractionSource from its string representation.
