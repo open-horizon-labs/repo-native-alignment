@@ -28,6 +28,7 @@ jobs:
               - 'src/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'build.rs'
               - '.github/workflows/**'
               - '.github/scripts/**'
@@ -44,6 +45,9 @@ jobs:
       - name: Checkout
         if: needs.changes.outputs.rust == 'true'
         uses: actions/checkout@v5
+      - name: Rust toolchain pins agree
+        if: needs.changes.outputs.rust == 'true'
+        run: bash .github/scripts/check-rust-toolchain-pins.sh
       - name: No language-specific conditionals in generic.rs
         if: needs.changes.outputs.rust == 'true'
         run: |
@@ -72,7 +76,7 @@ jobs:
         run: bash .github/scripts/install-protoc.sh
       - name: Install Rust toolchain
         if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - name: Setup sccache
@@ -97,9 +101,10 @@ jobs:
   test:
     needs: changes
     runs-on: namespace-profile-cached
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - name: Skip (no Rust changes)
         if: needs.changes.outputs.rust != 'true'
@@ -114,7 +119,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
         if: needs.changes.outputs.rust == 'true'
@@ -132,7 +137,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
 
-      - name: Run all tests (debug profile)
+      - name: Run all tests (test profile, no debuginfo)
         if: needs.changes.outputs.rust == 'true'
         env:
           RUSTC_WRAPPER: "sccache"
@@ -153,7 +158,7 @@ jobs:
         run: bash .github/scripts/install-protoc.sh
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -224,7 +229,7 @@ jobs:
         run: bash .github/scripts/install-protoc.sh
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: aarch64-apple-darwin
 

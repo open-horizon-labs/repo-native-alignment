@@ -46,7 +46,7 @@ pub fn extract_pr_merges(repo_root: &Path, limit: Option<usize>) -> Result<(Vec<
             continue;
         }
 
-        let title = commit.summary().unwrap_or("").to_string();
+        let title = commit.summary().ok().flatten().unwrap_or("").to_string();
         let description = commit.message().unwrap_or("").to_string();
         let author = commit.author().name().unwrap_or("").to_string();
         let merged_at = commit.time().seconds();

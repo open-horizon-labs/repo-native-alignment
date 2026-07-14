@@ -2340,10 +2340,8 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
     } else if bare.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
         // lowercase → capitalize first char (e.g. `@injectable` → `Injectable`)
         let mut c = bare.chars();
-        match c.next() {
-            None => return None,
-            Some(f) => f.to_uppercase().to_string() + c.as_str(),
-        }
+        let f = c.next()?;
+        f.to_uppercase().to_string() + c.as_str()
     } else {
         bare.to_string()
     };
