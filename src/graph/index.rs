@@ -49,6 +49,9 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         EdgeKind::UsesFramework => 0.1,
         // Pub/sub edges carry moderate signal (async coupling)
         EdgeKind::Produces | EdgeKind::Consumes => 0.4,
+        // Repo-local relationship semantics are unknown to RNA core; keep a conservative
+        // weak structural signal while preserving the custom label for traversal/search.
+        EdgeKind::Other(_) => 0.05,
     }
 }
 
@@ -2169,6 +2172,9 @@ mod tests {
         assert!((edge_weight(&EdgeKind::UsesFramework) - 0.1).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::Produces) - 0.4).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::Consumes) - 0.4).abs() < f64::EPSILON);
+        assert!(
+            (edge_weight(&EdgeKind::Other("supports".to_string())) - 0.05).abs() < f64::EPSILON
+        );
     }
 
     // ==================== neighbors_grouped tests ====================

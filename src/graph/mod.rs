@@ -145,8 +145,7 @@ impl NodeKind {
 // ---------------------------------------------------------------------------
 
 /// The kind of relationship between two nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EdgeKind {
     Calls,
     Implements,
@@ -183,6 +182,12 @@ pub enum EdgeKind {
     /// A symbol/handler consumes events from a channel/topic.
     /// Direction: consumer → channel
     Consumes,
+    /// Repo-local/domain-specific relationship kind.
+    ///
+    /// Custom edges use the persisted edge label directly (for example,
+    /// `supports` or `requires_verification`) and intentionally share the
+    /// conservative low default PageRank weight used by weak structural edges.
+    Other(String),
 }
 
 impl fmt::Display for EdgeKind {
@@ -207,7 +212,61 @@ impl fmt::Display for EdgeKind {
             EdgeKind::UsesFramework => write!(f, "uses_framework"),
             EdgeKind::Produces => write!(f, "produces"),
             EdgeKind::Consumes => write!(f, "consumes"),
+            EdgeKind::Other(s) => write!(f, "{}", s),
         }
+    }
+}
+
+impl EdgeKind {
+    /// Parse an edge label into a built-in or repo-local edge kind.
+    pub fn from_label(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        Some(match s {
+            "calls" => EdgeKind::Calls,
+            "implements" => EdgeKind::Implements,
+            "depends_on" => EdgeKind::DependsOn,
+            "connects_to" => EdgeKind::ConnectsTo,
+            "defines" => EdgeKind::Defines,
+            "has_field" => EdgeKind::HasField,
+            "evolves" => EdgeKind::Evolves,
+            "referenced_by" => EdgeKind::ReferencedBy,
+            "references" => EdgeKind::References,
+            "topology_boundary" => EdgeKind::TopologyBoundary,
+            "modified" => EdgeKind::Modified,
+            "affected" => EdgeKind::Affected,
+            "serves" => EdgeKind::Serves,
+            "tested_by" => EdgeKind::TestedBy,
+            "belongs_to" => EdgeKind::BelongsTo,
+            "re_exports" => EdgeKind::ReExports,
+            "uses_framework" => EdgeKind::UsesFramework,
+            "produces" => EdgeKind::Produces,
+            "consumes" => EdgeKind::Consumes,
+            other => EdgeKind::Other(other.to_string()),
+        })
+    }
+}
+
+impl Serialize for EdgeKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EdgeKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        EdgeKind::from_label(&s)
+            .ok_or_else(|| serde::de::Error::custom("edge kind must not be empty"))
     }
 }
 
@@ -624,6 +683,39 @@ mod tests {
             result.unwrap().name,
             "Status",
             "Should find Enum on enum declaration line"
+        );
+    }
+
+    // -- EdgeKind tests --
+
+    #[test]
+    fn test_builtin_edge_kind_json_serialization_stays_string_label() {
+        assert_eq!(
+            serde_json::to_string(&EdgeKind::DependsOn).expect("serialize built-in edge kind"),
+            "\"depends_on\""
+        );
+        assert_eq!(
+            serde_json::from_str::<EdgeKind>("\"depends_on\"")
+                .expect("deserialize built-in edge kind"),
+            EdgeKind::DependsOn
+        );
+    }
+
+    #[test]
+    fn test_custom_edge_kind_display_and_json_serialization_use_label() {
+        let edge_kind = EdgeKind::Other("requires_verification".to_string());
+
+        assert_eq!(edge_kind.to_string(), "requires_verification");
+        assert_eq!(
+            serde_json::to_string(&edge_kind).expect("serialize custom edge kind"),
+            "\"requires_verification\"",
+            "custom edge serialization must expose the relationship label, not an opaque Other wrapper"
+        );
+        assert_eq!(
+            serde_json::from_str::<EdgeKind>("\"requires_verification\"")
+                .expect("deserialize custom edge kind"),
+            edge_kind,
+            "custom edge deserialization must preserve the relationship label"
         );
     }
 

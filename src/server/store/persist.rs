@@ -855,13 +855,15 @@ mod tests {
             confidence: Confidence::Detected,
         };
 
-        persist_graph_to_lance(repo_root, &[caller.clone(), callee.clone()], &[edge.clone()])
-            .await
-            .expect("persist failed");
+        persist_graph_to_lance(
+            repo_root,
+            &[caller.clone(), callee.clone()],
+            &[edge.clone()],
+        )
+        .await
+        .expect("persist failed");
 
-        let state = load_graph_from_lance(repo_root)
-            .await
-            .expect("load failed");
+        let state = load_graph_from_lance(repo_root).await.expect("load failed");
 
         let reloaded_caller = state
             .nodes
@@ -884,9 +886,102 @@ mod tests {
             .filter(|e| e.kind == EdgeKind::ReferencedBy)
             .count();
         assert_eq!(
-            referenced_by_count, 1,
+            referenced_by_count,
+            1,
             "ReferencedBy edge dropped on round-trip; got edges {:?}",
-            state.edges.iter().map(|e| e.kind.to_string()).collect::<Vec<_>>(),
+            state
+                .edges
+                .iter()
+                .map(|e| e.kind.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_edge_kind_round_trips_as_graph_edge_not_metadata() {
+        use crate::graph::{Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let mut claimant = make_test_node("claimant");
+        claimant.id.file = PathBuf::from("docs/claim.md");
+        let mut evidence = make_test_node("evidence");
+        evidence.id.file = PathBuf::from("docs/evidence.md");
+
+        claimant
+            .metadata
+            .insert("relationship".to_string(), "supports".to_string());
+        let supports_kind = EdgeKind::Other("supports".to_string());
+        let wrong_workaround = Edge {
+            from: claimant.id.clone(),
+            to: evidence.id.clone(),
+            kind: EdgeKind::References,
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Detected,
+        };
+        let custom_edge = Edge {
+            from: claimant.id.clone(),
+            to: evidence.id.clone(),
+            kind: supports_kind.clone(),
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Detected,
+        };
+
+        persist_graph_to_lance(
+            repo_root,
+            &[claimant.clone(), evidence.clone()],
+            &[custom_edge.clone(), wrong_workaround],
+        )
+        .await
+        .expect("persist failed");
+
+        let state = load_graph_from_lance(repo_root).await.expect("load failed");
+
+        let supports_edges: Vec<_> = state
+            .edges
+            .iter()
+            .filter(|e| e.kind == supports_kind)
+            .collect();
+        assert_eq!(
+            supports_edges.len(),
+            1,
+            "custom relationship must reload as an actual supports edge; got {:?}",
+            state
+                .edges
+                .iter()
+                .map(|e| e.kind.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(supports_edges[0].from.name, "claimant");
+        assert_eq!(supports_edges[0].to.name, "evidence");
+
+        let unfiltered = state.index.neighbors_grouped(
+            &claimant.stable_id(),
+            None,
+            petgraph::Direction::Outgoing,
+        );
+        assert!(
+            unfiltered.contains_key(&EdgeKind::References),
+            "the same-source generic-edge workaround must be present for this regression to be adversarial"
+        );
+
+        let supports_filter = [supports_kind.clone()];
+        let groups = state.index.neighbors_grouped(
+            &claimant.stable_id(),
+            Some(&supports_filter),
+            petgraph::Direction::Outgoing,
+        );
+        let supports_group = groups
+            .get(&supports_kind)
+            .expect("custom supports edge missing from grouped traversal");
+        assert!(
+            supports_group.contains(&evidence.stable_id()),
+            "custom supports traversal should reach evidence; groups={groups:?}"
+        );
+        assert!(
+            !groups.contains_key(&EdgeKind::References),
+            "metadata-only workaround must not satisfy supports traversal"
         );
     }
 }
