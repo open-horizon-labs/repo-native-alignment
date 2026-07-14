@@ -37,3 +37,28 @@ awk -v expected="$toolchain" '
     printf "Rust toolchain pins agree at %s across %d workflow references\n", expected, count
   }
 ' "$repo_root"/.github/workflows/*.yml
+
+sccache_action="v0.0.10"
+
+awk -v expected="$sccache_action" '
+  /uses:[[:space:]]*mozilla-actions\/sccache-action@/ {
+    count++
+    actual = $0
+    sub(/^.*mozilla-actions\/sccache-action@/, "", actual)
+    sub(/[[:space:]#].*$/, "", actual)
+    if (actual != expected) {
+      printf "FAIL: %s:%d does not use sccache-action %s: %s\n", FILENAME, FNR, expected, $0 > "/dev/stderr"
+      mismatch = 1
+    }
+  }
+  END {
+    if (count == 0) {
+      print "FAIL: no mozilla-actions/sccache-action workflow references found" > "/dev/stderr"
+      exit 1
+    }
+    if (mismatch) {
+      exit 1
+    }
+    printf "sccache-action pins agree at %s across %d workflow references\n", expected, count
+  }
+' "$repo_root"/.github/workflows/*.yml
