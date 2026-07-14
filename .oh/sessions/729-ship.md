@@ -1,9 +1,12 @@
 ---
+type: session
 session: 729-ship
+issue: 728
 issues: [728]
 pr: 729
 branch: issue/728-release-blockers
 date: 2026-07-14
+status: executing
 tags: [context-assembly, local-knowledge, persistence, ship]
 ---
 

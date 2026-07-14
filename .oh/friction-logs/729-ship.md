@@ -1,8 +1,10 @@
 ---
+type: friction-log
 date: "2026-07-14"
 pipeline_issue: "/ship PR #729"
 pr: 729
 phase: ship
+status: active
 ---
 
 # PR #729 ship friction

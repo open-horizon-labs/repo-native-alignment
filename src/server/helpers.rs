@@ -1170,8 +1170,10 @@ mod tests {
         let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
         let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
 
+        assert!(compact.contains("src:markdown"), "got: {compact}");
+        assert!(full.contains("Extraction source: markdown"), "got: {full}");
+
         for rendered in [&compact, &full] {
-            assert!(rendered.contains("markdown"), "got: {rendered}");
             assert!(rendered.contains("public_use"), "got: {rendered}");
             assert!(rendered.contains("verified"), "got: {rendered}");
             assert!(rendered.contains("source_url"), "got: {rendered}");
