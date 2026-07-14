@@ -376,6 +376,10 @@ else
     "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "public_use.*verified\|verified.*public_use"
   check "Local knowledge: source URL reaches search output (#727)" \
     "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "https://example.test/goodhart"
+  check "Local knowledge: extraction provenance reaches search output (#728)" \
+    "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "Extraction source: markdown\|src:markdown"
+  check "Local knowledge: extraction provenance reaches traversal output (#728)" \
+    "repo-native-alignment graph --node '.oh/knowledge/proxy-risk.md:claim.proxy-risk:claim' --repo $_LK_FIXTURE --mode neighbors --direction incoming --edge-types supports" "Extraction source: markdown\|src:markdown"
 fi
 rm -rf "$_LK_FIXTURE"
 

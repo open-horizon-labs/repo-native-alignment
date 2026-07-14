@@ -54,8 +54,7 @@ pub(super) fn build_symbols_batch(
     let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
     let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
     let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
-    let extraction_sources: Vec<String> =
-        nodes.iter().map(|n| n.source.to_string()).collect();
+    let extraction_sources: Vec<String> = nodes.iter().map(|n| n.source.to_string()).collect();
     let meta_virtuals: Vec<Option<bool>> = nodes
         .iter()
         .map(|n| {

@@ -119,6 +119,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
+        Field::new("extraction_source", DataType::Utf8, true),
         Field::new("meta_virtual", DataType::Boolean, true),
         Field::new("meta_package", DataType::Utf8, true),
         Field::new("meta_name_col", DataType::Int32, true),
@@ -242,10 +243,15 @@ mod tests {
     #[test]
     fn test_symbols_schema_has_expected_fields() {
         let schema = symbols_schema();
+        let vector_schema = symbols_schema_with_vector(384);
         assert!(schema.field_with_name("id").is_ok());
         assert!(schema.field_with_name("signature").is_ok());
         assert!(schema.field_with_name("body").is_ok());
         assert!(schema.field_with_name("extraction_source").is_ok());
+        assert!(
+            vector_schema.field_with_name("extraction_source").is_ok(),
+            "base and vector symbols schemas must preserve the same node provenance"
+        );
         assert!(schema.field_with_name("value").is_ok());
         assert!(schema.field_with_name("synthetic").is_ok());
         assert!(schema.field_with_name("cyclomatic").is_ok());

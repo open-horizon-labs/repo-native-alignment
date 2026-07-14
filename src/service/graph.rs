@@ -90,6 +90,7 @@ pub fn graph_query(params: &GraphParams, graph_state: &GraphState) -> Result<Str
                 node.line_start,
                 node.line_end
             ));
+            lines.push(format!("  Extraction source: {}", node.source));
             if !node.signature.is_empty() {
                 lines.push(format!("  Sig: `{}`", node.signature));
             }

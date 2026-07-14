@@ -341,6 +341,7 @@ pub(crate) fn format_node_entry_with_root(
             n.line_start,
             n.line_end,
         );
+        entry.push_str(&format!(" src:{}", n.source));
         if !n.signature.is_empty() {
             // Truncate signature to first line for compact
             let sig_first_line = n.signature.lines().next().unwrap_or(&n.signature);
@@ -447,6 +448,7 @@ pub(crate) fn format_node_entry_with_root(
             n.line_end,
             display_id,
         );
+        entry.push_str(&format!("\n  Extraction source: {}", n.source));
         if !n.signature.is_empty() {
             entry.push_str(&format!("\n  Sig: {}", format_inline_code(&n.signature)));
         }
@@ -1154,6 +1156,7 @@ mod tests {
     #[test]
     fn test_format_node_entry_with_root_delivers_local_knowledge_metadata() {
         let mut node = make_test_node("quote.goodhart");
+        node.source = ExtractionSource::Markdown;
         node.metadata.insert(
             "rna.metadata.public_use".to_string(),
             "verified".to_string(),
@@ -1168,6 +1171,7 @@ mod tests {
         let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
 
         for rendered in [&compact, &full] {
+            assert!(rendered.contains("markdown"), "got: {rendered}");
             assert!(rendered.contains("public_use"), "got: {rendered}");
             assert!(rendered.contains("verified"), "got: {rendered}");
             assert!(rendered.contains("source_url"), "got: {rendered}");
