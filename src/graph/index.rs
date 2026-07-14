@@ -2172,6 +2172,9 @@ mod tests {
         assert!((edge_weight(&EdgeKind::UsesFramework) - 0.1).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::Produces) - 0.4).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::Consumes) - 0.4).abs() < f64::EPSILON);
+        assert!(
+            (edge_weight(&EdgeKind::Other("supports".to_string())) - 0.05).abs() < f64::EPSILON
+        );
     }
 
     // ==================== neighbors_grouped tests ====================

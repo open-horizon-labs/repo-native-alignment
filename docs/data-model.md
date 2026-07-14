@@ -287,6 +287,7 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | `UsesFramework` | `uses_framework` | subsystem/symbol → framework node | A subsystem or symbol uses a detected framework |
 | `Produces` | `produces` | producer → channel | A symbol/handler produces events to a channel/topic |
 | `Consumes` | `consumes` | consumer → channel | A symbol/handler consumes events from a channel/topic |
+| `Other(String)` | repo-local label (for example, `supports`) | repo-defined | Repo-local/domain-specific relationship preserved without adding a core enum variant |
 
 **PageRank weights by edge kind** (used for importance scoring):
 
@@ -299,6 +300,7 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | Produces, Consumes | 0.4 |
 | Defines, HasField, UsesFramework | 0.1 |
 | Evolves, TopologyBoundary, Modified, Affected, Serves | 0.05 |
+| Other (repo-local relationship) | 0.05 |
 
 ### Confidence
 
