@@ -909,12 +909,12 @@ mod tests {
         let mut evidence = make_test_node("evidence");
         evidence.id.file = PathBuf::from("docs/evidence.md");
 
-        let mut metadata_only = make_test_node("metadata_only");
-        metadata_only
+        claimant
             .metadata
             .insert("relationship".to_string(), "supports".to_string());
+        let supports_kind = EdgeKind::Other("supports".to_string());
         let wrong_workaround = Edge {
-            from: metadata_only.id.clone(),
+            from: claimant.id.clone(),
             to: evidence.id.clone(),
             kind: EdgeKind::References,
             source: ExtractionSource::Markdown,
@@ -923,14 +923,14 @@ mod tests {
         let custom_edge = Edge {
             from: claimant.id.clone(),
             to: evidence.id.clone(),
-            kind: EdgeKind::Other("supports".to_string()),
+            kind: supports_kind.clone(),
             source: ExtractionSource::Markdown,
             confidence: Confidence::Detected,
         };
 
         persist_graph_to_lance(
             repo_root,
-            &[claimant.clone(), evidence.clone(), metadata_only.clone()],
+            &[claimant.clone(), evidence.clone()],
             &[custom_edge.clone(), wrong_workaround],
         )
         .await
@@ -941,7 +941,7 @@ mod tests {
         let supports_edges: Vec<_> = state
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Other("supports".to_string()))
+            .filter(|e| e.kind == supports_kind)
             .collect();
         assert_eq!(
             supports_edges.len(),
@@ -956,13 +956,24 @@ mod tests {
         assert_eq!(supports_edges[0].from.name, "claimant");
         assert_eq!(supports_edges[0].to.name, "evidence");
 
-        let groups = state.index.neighbors_grouped(
+        let unfiltered = state.index.neighbors_grouped(
             &claimant.stable_id(),
             None,
             petgraph::Direction::Outgoing,
         );
+        assert!(
+            unfiltered.contains_key(&EdgeKind::References),
+            "the same-source generic-edge workaround must be present for this regression to be adversarial"
+        );
+
+        let supports_filter = [supports_kind.clone()];
+        let groups = state.index.neighbors_grouped(
+            &claimant.stable_id(),
+            Some(&supports_filter),
+            petgraph::Direction::Outgoing,
+        );
         let supports_group = groups
-            .get(&EdgeKind::Other("supports".to_string()))
+            .get(&supports_kind)
             .expect("custom supports edge missing from grouped traversal");
         assert!(
             supports_group.contains(&evidence.stable_id()),
