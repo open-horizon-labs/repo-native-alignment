@@ -104,6 +104,7 @@ jobs:
     timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - name: Skip (no Rust changes)
         if: needs.changes.outputs.rust != 'true'
@@ -136,7 +137,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
 
-      - name: Run all tests (debug profile)
+      - name: Run all tests (test profile, no debuginfo)
         if: needs.changes.outputs.rust == 'true'
         env:
           RUSTC_WRAPPER: "sccache"
