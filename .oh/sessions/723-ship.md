@@ -1,3 +1,12 @@
+---
+session: 723-ship
+issues: [722, 724]
+pr: 723
+branch: codex/issue-722-rust-197
+date: 2026-07-14
+tags: [context-assembly, dependency-refresh, rust-toolchain, ship]
+---
+
 # Ship Pipeline — PR #723
 
 ## Pre-flight
@@ -32,7 +41,11 @@
 - Rust 1.97 `cargo clippy --no-default-features -- -D warnings`: pass after the expanded refresh.
 - Rust 1.97 full test suite on a clean target: 1,906 executable tests passed, 2 ignored, 0 failed.
 - Rust 1.91 `cargo check --no-default-features`: pass after the expanded refresh.
+- Rust 1.97 `cargo check --features embeddings`: pass, covering refreshed fastembed 5.17.2, ORT rc.12, model formats, and their HTTP/download graph.
+- Rust 1.97 `cargo check --features metal`: pass, covering the Apple Silicon Candle/metal-candle source-build path.
+- Rust 1.97 ignored `test_rerank_integration` with `--features embeddings`: pass, exercising model loading, ORT session creation, inference, and ranking on the refreshed fastembed/ORT runtime.
 - Direct incompatible-version inventory is explicit rather than silently migrated: Arrow/Lance, Candle, rust-mcp-sdk, TOML, SQL parser, and two tree-sitter grammars require separate API migrations beyond `cargo update`.
+- Warning reachability was rechecked with feature-aware dependency trees: `number_prefix` is active only for embeddings/metal through metal-candle's older hf-hub/indicatif chain, while `lru` remains active through Tantivy/Lance. Issue #724 records both exact parent paths.
 
 ## Review evidence
 

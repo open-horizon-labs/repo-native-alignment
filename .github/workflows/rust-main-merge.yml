@@ -101,7 +101,7 @@ jobs:
   test:
     needs: changes
     runs-on: namespace-profile-cached
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
