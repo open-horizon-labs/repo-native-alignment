@@ -81,7 +81,10 @@ pub(crate) fn parse_extraction_source(s: &str) -> ExtractionSource {
         "git" => ExtractionSource::Git,
         "markdown" => ExtractionSource::Markdown,
         _ => {
-            tracing::warn!("Unknown edge_source value: {}, defaulting to TreeSitter", s);
+            tracing::warn!(
+                "Unknown extraction source value: {}, defaulting to TreeSitter",
+                s
+            );
             ExtractionSource::TreeSitter
         }
     }
@@ -253,5 +256,41 @@ mod tests {
             petgraph::Direction::Outgoing,
         );
         assert_eq!(neighbors, vec![claim.stable_id()]);
+    }
+
+    #[tokio::test]
+    async fn node_extraction_sources_survive_persist_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = [
+            ExtractionSource::TreeSitter,
+            ExtractionSource::Lsp,
+            ExtractionSource::Schema,
+            ExtractionSource::Git,
+            ExtractionSource::Markdown,
+        ];
+        let nodes: Vec<Node> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut node = node("fixture", &format!("node-{index}"), "fixture.md");
+                node.source = source.clone();
+                node
+            })
+            .collect();
+
+        persist_graph_to_lance(dir.path(), &nodes, &[])
+            .await
+            .expect("persist graph");
+        let state = load_graph_from_lance(dir.path()).await.expect("load graph");
+        let loaded_sources: BTreeMap<_, _> = state
+            .nodes
+            .iter()
+            .map(|node| (node.id.name.as_str(), &node.source))
+            .collect();
+
+        for (index, expected) in sources.iter().enumerate() {
+            let name = format!("node-{index}");
+            assert_eq!(loaded_sources.get(name.as_str()), Some(&expected));
+        }
     }
 }

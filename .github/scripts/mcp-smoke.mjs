@@ -159,6 +159,26 @@ try {
     pass("search('main') returned results");
   }
 
+  // ── 4a. persisted local-knowledge provenance ────────────────────────────
+  console.log("\n── search (local-knowledge provenance) ──");
+  const provenanceText = await callSearchWithRetry({
+    query: "quote.mcp-provenance",
+    compact: true,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 3,
+  });
+  assertContains(
+    "MCP search exposes persisted Markdown provenance",
+    provenanceText,
+    "src:markdown",
+  );
+  assertContains(
+    "MCP search exposes persisted local-knowledge metadata",
+    provenanceText,
+    "mcp_verified",
+  );
+
   // ── 4b. search blank mode normalization ───────────────────────────────────
   console.log("\n── search (blank mode normalization) ──");
   const blankModeText = await callSearchWithRetry({

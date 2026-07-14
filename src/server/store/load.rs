@@ -19,6 +19,16 @@ use super::{
     parse_extraction_source, parse_node_id_from_stable, parse_node_kind,
 };
 
+fn node_extraction_source_at(
+    extraction_source_col: Option<&StringArray>,
+    row: usize,
+) -> ExtractionSource {
+    extraction_source_col
+        .filter(|col| !col.is_null(row))
+        .map(|col| parse_extraction_source(col.value(row)))
+        .unwrap_or(ExtractionSource::TreeSitter)
+}
+
 /// Load graph nodes and edges from LanceDB tables.
 ///
 /// Reads only rows matching the currently committed `scan_version`.
@@ -118,6 +128,9 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let extraction_source_col = batch
+                .column_by_name("extraction_source")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let metadata_json_col = batch
                 .column_by_name("metadata_json")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -131,7 +144,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let meta_name_col_col = batch
                 .column_by_name("meta_name_col")
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
-            // We don't store language or source in the symbols schema, so we infer from file extension
+            // Language remains derived from the file extension. Legacy tables may not
+            // have extraction_source, so node_extraction_source_at falls back safely.
             let _ = ids; // ids column exists but we reconstruct from components
 
             // Read optional value and synthetic columns (present after schema migration)
@@ -489,7 +503,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     signature: signatures.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     metadata,
-                    source: ExtractionSource::TreeSitter, // default; not stored in schema
+                    source: node_extraction_source_at(extraction_source_col, i),
                 });
             }
         }
@@ -606,4 +620,51 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         Some(std::time::Instant::now()),
         std::collections::HashSet::new(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_extraction_source_supports_all_values_and_legacy_fallback() {
+        let sources = StringArray::from(vec![
+            Some("tree_sitter"),
+            Some("lsp"),
+            Some("schema"),
+            Some("git"),
+            Some("markdown"),
+            None,
+        ]);
+
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 0),
+            ExtractionSource::TreeSitter
+        );
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 1),
+            ExtractionSource::Lsp
+        );
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 2),
+            ExtractionSource::Schema
+        );
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 3),
+            ExtractionSource::Git
+        );
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 4),
+            ExtractionSource::Markdown
+        );
+        assert_eq!(
+            node_extraction_source_at(Some(&sources), 5),
+            ExtractionSource::TreeSitter
+        );
+        assert_eq!(
+            node_extraction_source_at(None, 0),
+            ExtractionSource::TreeSitter,
+            "legacy symbols tables without extraction_source must still load"
+        );
+    }
 }

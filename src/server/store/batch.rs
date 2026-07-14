@@ -10,12 +10,15 @@ use crate::graph::store::{edges_schema, symbols_schema};
 use crate::graph::{Edge, Node};
 use crate::server::store::metadata_keys as mk;
 
+static TYPED_KEYS_SET: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| mk::TYPED_KEYS.iter().copied().collect());
+
 fn generic_metadata_json(
     metadata: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<Option<String>> {
     let extra: std::collections::BTreeMap<_, _> = metadata
         .iter()
-        .filter(|(key, _)| !mk::TYPED_KEYS.contains(&key.as_str()))
+        .filter(|(key, _)| !TYPED_KEYS_SET.contains(key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     if extra.is_empty() {
@@ -51,6 +54,7 @@ pub(super) fn build_symbols_batch(
     let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
     let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
     let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+    let extraction_sources: Vec<String> = nodes.iter().map(|n| n.source.to_string()).collect();
     let meta_virtuals: Vec<Option<bool>> = nodes
         .iter()
         .map(|n| {
@@ -240,6 +244,7 @@ pub(super) fn build_symbols_batch(
             Arc::new(UInt32Array::from(line_ends)),
             Arc::new(StringArray::from(signatures)),
             Arc::new(StringArray::from(bodies)),
+            Arc::new(StringArray::from(extraction_sources)),
             Arc::new(BooleanArray::from(meta_virtuals)),
             Arc::new(StringArray::from(meta_packages)),
             Arc::new(Int32Array::from(meta_name_cols)),

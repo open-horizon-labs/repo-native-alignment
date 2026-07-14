@@ -252,6 +252,67 @@ TS
   done
 }
 
+make_local_knowledge_fixture() {
+  local dir="$1"
+  mkdir -p "$dir/.oh/sources" "$dir/.oh/knowledge" "$dir/manuscript"
+
+  cat > "$dir/.oh/sources/goodhart.md" <<'MD'
+---
+rna:
+  kind: quote
+  id: quote.goodhart
+  name: Goodhart quote
+  metadata:
+    public_use: verified
+    source_url: https://example.test/goodhart
+  relationships:
+    - kind: supports
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Goodhart Source
+
+When a measure becomes a target, it ceases to be a good measure.
+MD
+
+  cat > "$dir/.oh/knowledge/proxy-risk.md" <<'MD'
+---
+rna:
+  kind: claim
+  id: claim.proxy-risk
+  name: Proxy metrics become risky when treated as targets
+---
+
+# Proxy Risk Claim
+
+Proxy metrics become unreliable when an organization optimizes the proxy instead of the outcome.
+MD
+
+  cat > "$dir/manuscript/chapter-01.md" <<'MD'
+---
+rna:
+  kind: manuscript_section
+  id: manuscript.chapter-01.proxy-risk
+  name: Chapter 1 proxy-risk section
+  relationships:
+    - kind: consumes
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Chapter 1
+
+The manuscript uses the proxy-risk claim in its opening argument.
+MD
+}
+
 
 # ── CROSS-STACK FIXTURE (formerly Innovation-Connector coverage) ─────────────
 _IC_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/rna-ic-fixture.XXXXXX")
@@ -292,6 +353,35 @@ fi
 if [ -n "$_IC_CLEANUP" ]; then
   rm -rf "$_IC_CLEANUP"
 fi
+
+# ── LOCAL-KNOWLEDGE DELIVERY (#710 / #727 / #728) ─────────────────────────
+_LK_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/rna-local-knowledge.XXXXXX")
+make_local_knowledge_fixture "$_LK_FIXTURE"
+echo "" && echo "--- Local-knowledge delivery (#710 / #727 / #728) ---"
+
+if ! _lk_scan_out=$(repo-native-alignment scan --repo "$_LK_FIXTURE" --extract-only --no-embed --no-lsp 2>&1); then
+  echo "FAIL: local-knowledge fixture scan failed"
+  echo "$_lk_scan_out" | tail -20
+  FAIL=$((FAIL+1))
+elif ! _lk_rescan_out=$(repo-native-alignment scan --repo "$_LK_FIXTURE" --extract-only --no-embed --no-lsp 2>&1); then
+  echo "FAIL: local-knowledge fixture rescan failed — persisted delivery path was not exercised"
+  echo "$_lk_rescan_out" | tail -20
+  FAIL=$((FAIL+1))
+else
+  check "Local knowledge: custom supports edge survives reload (#710/#727)" \
+    "repo-native-alignment graph --node '.oh/knowledge/proxy-risk.md:claim.proxy-risk:claim' --repo $_LK_FIXTURE --mode neighbors --direction incoming --edge-types supports" "quote.goodhart"
+  check "Local knowledge: custom consumes edge survives reload (#710/#727)" \
+    "repo-native-alignment graph --node '.oh/knowledge/proxy-risk.md:claim.proxy-risk:claim' --repo $_LK_FIXTURE --mode neighbors --direction incoming --edge-types consumes" "manuscript.chapter-01.proxy-risk"
+  check "Local knowledge: source metadata reaches search output (#727)" \
+    "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "public_use.*verified\|verified.*public_use"
+  check "Local knowledge: source URL reaches search output (#727)" \
+    "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "https://example.test/goodhart"
+  check "Local knowledge: extraction provenance reaches search output (#728)" \
+    "repo-native-alignment search 'quote.goodhart' --repo $_LK_FIXTURE --limit 3" "Extraction source: markdown\|src:markdown"
+  check "Local knowledge: extraction provenance reaches traversal output (#728)" \
+    "repo-native-alignment graph --node '.oh/knowledge/proxy-risk.md:claim.proxy-risk:claim' --repo $_LK_FIXTURE --mode neighbors --direction incoming --edge-types supports" "Extraction source: markdown\|src:markdown"
+fi
+rm -rf "$_LK_FIXTURE"
 
 # ── MERGED FEATURES ────────────────────────────────────────────────────────
 echo "" && echo "--- Merged Features ---"
