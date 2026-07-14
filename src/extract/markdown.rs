@@ -643,12 +643,27 @@ fn emit_local_knowledge_graph(
             continue;
         }
 
-        let target_file = relationship
-            .target
-            .file
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf());
+        let target_file = match relationship.target.file.as_deref() {
+            Some(declared_file) => {
+                let declared_file = declared_file.trim();
+                if declared_file.is_empty() {
+                    continue;
+                }
+                let declared_file = Path::new(declared_file);
+                if declared_file.is_absolute() {
+                    continue;
+                }
+                let normalized = normalize_path(declared_file);
+                if matches!(
+                    normalized.components().next(),
+                    Some(std::path::Component::ParentDir)
+                ) {
+                    continue;
+                }
+                normalized
+            }
+            None => path.to_path_buf(),
+        };
         let target_node =
             local_knowledge_node_id(&target_file, relationship.target.kind.trim(), target_id);
         let confidence = parse_local_knowledge_confidence(relationship.confidence.as_deref());
@@ -909,7 +924,12 @@ rna:
       target:
         kind: claim
         id: claim.proxy-risk
-        file: .oh/knowledge/proxy-risk.md
+        file: ./.oh/knowledge/../knowledge/proxy-risk.md
+    - kind: escapes_repo
+      target:
+        kind: claim
+        id: claim.outside
+        file: ../outside.md
 ---
 
 # Goodhart Source
@@ -942,8 +962,18 @@ When a measure becomes a target, it ceases to be a good measure.
             .expect("custom supports edge should be emitted as a true edge kind");
         assert_eq!(edge.from.name, "quote.goodhart");
         assert_eq!(edge.to.name, "claim.proxy-risk");
+        assert_eq!(edge.to.file, PathBuf::from(".oh/knowledge/proxy-risk.md"));
         assert!(matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "claim"));
         assert_eq!(edge.confidence, Confidence::Confirmed);
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Other("escapes_repo".to_string()))
+                .count(),
+            0,
+            "repo-local relationship targets must not escape the repository"
+        );
     }
 
     #[tokio::test]

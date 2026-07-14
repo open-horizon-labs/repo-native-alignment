@@ -72,7 +72,7 @@ This emits:
 - one `EdgeKind::Other("supports")` edge from `quote.goodhart` to `claim.proxy-risk`;
 - metadata keys such as `local_knowledge=true`, `rna.kind`, `rna.id`, `rna.name`, and `rna.metadata.public_use`.
 
-The target node does not need to be in the same file, but its `kind`, `id`, and `file` should match the artifact that declares it so traversal/search can join the graph after all files are scanned. Relationship labels are true edge kinds after reload; do not collapse support/verification/review semantics into `References`, `DependsOn`, or metadata.
+The target node does not need to be in the same file, but its `kind`, `id`, and `file` should match the artifact that declares it so traversal/search can join the graph after all files are scanned. A declared `file` is repo-root-relative; RNA normalizes `.` and `..` components and ignores absolute paths or paths that escape the repository. Relationship labels are true edge kinds after reload; do not collapse support/verification/review semantics into `References`, `DependsOn`, or metadata.
 
 
 ---
