@@ -56,3 +56,38 @@ pub const HTTP_PATH: &str = "http_path";
 pub const PARENT_SERVICE: &str = "parent_service";
 pub const REQUEST_TYPE: &str = "request_type";
 pub const RESPONSE_TYPE: &str = "response_type";
+
+pub const TYPED_KEYS: &[&str] = &[
+    VIRTUAL,
+    PACKAGE,
+    NAME_COL,
+    VALUE,
+    SYNTHETIC,
+    CYCLOMATIC,
+    IMPORTANCE,
+    STORAGE,
+    MUTABLE,
+    DECORATORS,
+    PARENT_SCOPE,
+    PARENT_SCOPE_KIND,
+    FRAMEWORK_HOOK,
+    TYPE_PARAMS,
+    PATTERN_HINT,
+    IS_STATIC,
+    IS_ASYNC,
+    IS_TEST,
+    VISIBILITY,
+    EXPORTED,
+    DOC_COMMENT,
+    ATTR_REFS,
+    DIAG_SEVERITY,
+    DIAG_SOURCE,
+    DIAG_MESSAGE,
+    DIAG_RANGE,
+    DIAG_TIMESTAMP,
+    HTTP_METHOD,
+    HTTP_PATH,
+    PARENT_SERVICE,
+    REQUEST_TYPE,
+    RESPONSE_TYPE,
+];

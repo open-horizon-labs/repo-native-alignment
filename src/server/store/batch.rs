@@ -10,6 +10,23 @@ use crate::graph::store::{edges_schema, symbols_schema};
 use crate::graph::{Edge, Node};
 use crate::server::store::metadata_keys as mk;
 
+fn generic_metadata_json(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<Option<String>> {
+    let extra: std::collections::BTreeMap<_, _> = metadata
+        .iter()
+        .filter(|(key, _)| !mk::TYPED_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if extra.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(&extra)
+            .map(Some)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 /// Build a symbols `RecordBatch` for `nodes` tagged with `scan_version`.
 pub(super) fn build_symbols_batch(
     nodes: &[Node],
@@ -204,6 +221,10 @@ pub(super) fn build_symbols_batch(
         .iter()
         .map(|n| n.metadata.get(mk::RESPONSE_TYPE).cloned())
         .collect();
+    let metadata_jsons: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| generic_metadata_json(&n.metadata))
+        .collect::<anyhow::Result<_>>()?;
     let updated_ats: Vec<i64> = vec![now; nodes.len()];
     let scan_versions: Vec<u64> = vec![scan_version; nodes.len()];
 
@@ -251,6 +272,7 @@ pub(super) fn build_symbols_batch(
             Arc::new(StringArray::from(parent_services)),
             Arc::new(StringArray::from(rpc_request_types)),
             Arc::new(StringArray::from(rpc_response_types)),
+            Arc::new(StringArray::from(metadata_jsons)),
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),
         ],

@@ -3,16 +3,18 @@
 //! Reuses the existing `pulldown-cmark` parsing from `src/markdown/mod.rs`
 //! but produces graph `Node` types for the unified graph model.
 //!
-//! Emits four kinds of edges:
+//! Emits five kinds of edges:
 //! - **Hierarchy (Defines):** parent heading section -> child heading section
 //! - **Frontmatter refs (DependsOn):** .oh/ artifact -> referenced outcome/signal/guardrail
 //! - **Cross-file links (References):** section containing `[text](path)` -> target file
 //! - **ADR validation links (References):** ADR section -> exact test function declared in frontmatter
+//! - **Local knowledge relationships:** optional `rna` frontmatter nodes and custom relationship edges
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::Deserialize;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
@@ -171,6 +173,9 @@ impl Extractor for MarkdownExtractor {
 
         // 3. Cross-file link edges: section -> target file (References)
         emit_link_edges(&nodes, &chunks, path, &mut edges);
+
+        // 4. Local knowledge graph declarations: human-editable frontmatter -> custom nodes/edges.
+        emit_local_knowledge_graph(path, content, &mut nodes, &mut edges);
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -413,8 +418,7 @@ pub fn adr_validation_pass(all_nodes: &[Node]) -> Vec<Edge> {
             .unwrap_or(&node.id);
 
         for cargo_test in frontmatter.cargo_tests {
-            let Some(matches) =
-                rust_tests.get(&(source_id.root.as_str(), cargo_test.as_str()))
+            let Some(matches) = rust_tests.get(&(source_id.root.as_str(), cargo_test.as_str()))
             else {
                 continue;
             };
@@ -532,6 +536,198 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalKnowledgeFrontmatter {
+    rna: Option<LocalKnowledgeNodeSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalKnowledgeNodeSpec {
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    relationships: Vec<LocalKnowledgeRelationship>,
+    #[serde(default)]
+    metadata: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalKnowledgeRelationship {
+    kind: String,
+    target: LocalKnowledgeTarget,
+    #[serde(default)]
+    confidence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalKnowledgeTarget {
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+}
+
+fn emit_local_knowledge_graph(
+    path: &Path,
+    content: &str,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    let Some(yaml_block) = extract_frontmatter_yaml(content) else {
+        return;
+    };
+    let Ok(frontmatter) = serde_yaml::from_str::<LocalKnowledgeFrontmatter>(yaml_block) else {
+        return;
+    };
+    let Some(spec) = frontmatter.rna else {
+        return;
+    };
+
+    let Some(local_id) = spec.id.as_deref().or(spec.name.as_deref()).map(str::trim) else {
+        return;
+    };
+    if local_id.is_empty() || spec.kind.trim().is_empty() {
+        return;
+    }
+
+    let display_name = spec.name.as_deref().unwrap_or(local_id).trim();
+    let node_id = local_knowledge_node_id(path, spec.kind.trim(), local_id);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("local_knowledge".to_string(), "true".to_string());
+    metadata.insert("rna.kind".to_string(), spec.kind.trim().to_string());
+    metadata.insert("rna.id".to_string(), local_id.to_string());
+    metadata.insert("rna.name".to_string(), display_name.to_string());
+    metadata.insert("rna.source_file".to_string(), path.display().to_string());
+    for (key, value) in spec.metadata {
+        metadata.insert(
+            format!("rna.metadata.{}", key),
+            yaml_value_to_string(&value),
+        );
+    }
+
+    let line_end = content.lines().count().max(1);
+    nodes.push(Node {
+        id: node_id.clone(),
+        language: "markdown".to_string(),
+        line_start: 1,
+        line_end,
+        signature: format!("{} {}", spec.kind.trim(), display_name),
+        body: strip_frontmatter(content).trim().to_string(),
+        metadata,
+        source: ExtractionSource::Markdown,
+    });
+
+    for relationship in spec.relationships {
+        let Some(kind) = EdgeKind::from_label(&relationship.kind) else {
+            continue;
+        };
+        if relationship.target.kind.trim().is_empty() {
+            continue;
+        }
+        let Some(target_id) = relationship
+            .target
+            .id
+            .as_deref()
+            .or(relationship.target.name.as_deref())
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if target_id.is_empty() {
+            continue;
+        }
+
+        let target_file = match relationship.target.file.as_deref() {
+            Some(declared_file) => {
+                let declared_file = declared_file.trim();
+                if declared_file.is_empty() {
+                    continue;
+                }
+                let declared_file = Path::new(declared_file);
+                if declared_file.is_absolute() {
+                    continue;
+                }
+                let normalized = normalize_path(declared_file);
+                if matches!(
+                    normalized.components().next(),
+                    Some(std::path::Component::ParentDir)
+                ) {
+                    continue;
+                }
+                normalized
+            }
+            None => path.to_path_buf(),
+        };
+        let target_node =
+            local_knowledge_node_id(&target_file, relationship.target.kind.trim(), target_id);
+        let confidence = parse_local_knowledge_confidence(relationship.confidence.as_deref());
+        edges.push(Edge {
+            from: node_id.clone(),
+            to: target_node,
+            kind,
+            source: ExtractionSource::Markdown,
+            confidence,
+        });
+    }
+}
+
+fn local_knowledge_node_id(path: &Path, kind: &str, id: &str) -> NodeId {
+    NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: id.to_string(),
+        kind: NodeKind::Other(kind.to_string()),
+    }
+}
+
+fn parse_local_knowledge_confidence(value: Option<&str>) -> Confidence {
+    match value.map(str::trim) {
+        Some("confirmed") => Confidence::Confirmed,
+        _ => Confidence::Detected,
+    }
+}
+
+fn extract_frontmatter_yaml(content: &str) -> Option<&str> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after_first = trimmed[3..].trim_start_matches(['\r', '\n']);
+    let end_idx = after_first.find("\n---")?;
+    Some(&after_first[..end_idx])
+}
+
+fn strip_frontmatter(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content;
+    }
+    let after_first = trimmed[3..].trim_start_matches(['\r', '\n']);
+    let Some(end_idx) = after_first.find("\n---") else {
+        return content;
+    };
+    after_first[end_idx + 4..].trim_start_matches(['\r', '\n'])
+}
+
+fn yaml_value_to_string(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::Null => String::new(),
+        serde_yaml::Value::Bool(value) => value.to_string(),
+        serde_yaml::Value::Number(value) => value.to_string(),
+        serde_yaml::Value::String(value) => value.clone(),
+        _ => serde_yaml::to_string(value)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
 /// Detect the artifact kind for a markdown file based on its path.
 ///
 /// Handles two families of paths:
@@ -541,6 +737,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// - `signals` → `"signal"`
 /// - `guardrails` → `"guardrail"`
 /// - `metis` → `"metis"`
+/// - `knowledge` → `"knowledge"`
 ///
 /// **Agent memory files** — detects common AI agent rule/memory locations:
 /// - `.cursorrules` (file in repo root) → `"cursor-rule"`
@@ -567,6 +764,7 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
                 "signals" => Some("signal".to_string()),
                 "guardrails" => Some("guardrail".to_string()),
                 "metis" => Some("metis".to_string()),
+                "knowledge" => Some("knowledge".to_string()),
                 _ => None,
             };
         }
@@ -651,7 +849,12 @@ fn parse_markdown_file_from_source(source: &str, path: &Path) -> Vec<crate::type
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+    use crate::extract::ExtractorRegistry;
+    use crate::graph::{Confidence, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+    use crate::scanner::Scanner;
+    use crate::server::store::{load_graph_from_lance, persist_graph_to_lance};
+    use crate::service::{SearchContext, SearchParams, search};
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -702,6 +905,223 @@ mod tests {
         assert_eq!(
             first.metadata.get("frontmatter.title"),
             Some(&"Test Outcome".to_string())
+        );
+    }
+
+    #[test]
+    fn test_markdown_local_knowledge_frontmatter_emits_custom_node_and_edge() {
+        let extractor = MarkdownExtractor::new();
+        let content = r#"---
+rna:
+  kind: quote
+  id: quote.goodhart
+  name: Goodhart quote
+  metadata:
+    public_use: verified
+  relationships:
+    - kind: supports
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: ./.oh/knowledge/../knowledge/proxy-risk.md
+    - kind: escapes_repo
+      target:
+        kind: claim
+        id: claim.outside
+        file: ../outside.md
+---
+
+# Goodhart Source
+
+When a measure becomes a target, it ceases to be a good measure.
+"#;
+        let result = extractor
+            .extract(Path::new(".oh/sources/goodhart.md"), content)
+            .unwrap();
+
+        let quote = result
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "quote"))
+            .expect("quote local knowledge node should be emitted");
+        assert_eq!(quote.id.name, "quote.goodhart");
+        assert_eq!(
+            quote.metadata.get("local_knowledge"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            quote.metadata.get("rna.metadata.public_use"),
+            Some(&"verified".to_string())
+        );
+
+        let edge = result
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Other("supports".to_string()))
+            .expect("custom supports edge should be emitted as a true edge kind");
+        assert_eq!(edge.from.name, "quote.goodhart");
+        assert_eq!(edge.to.name, "claim.proxy-risk");
+        assert_eq!(edge.to.file, PathBuf::from(".oh/knowledge/proxy-risk.md"));
+        assert!(matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "claim"));
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Other("escapes_repo".to_string()))
+                .count(),
+            0,
+            "repo-local relationship targets must not escape the repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_knowledge_scan_persist_load_search_answers_claim_support_question() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join(".oh/sources")).expect("create sources dir");
+        std::fs::create_dir_all(root.join(".oh/knowledge")).expect("create knowledge dir");
+        std::fs::create_dir_all(root.join("manuscript")).expect("create manuscript dir");
+
+        std::fs::write(
+            root.join(".oh/sources/goodhart.md"),
+            r#"---
+rna:
+  kind: quote
+  id: quote.goodhart
+  name: Goodhart quote
+  metadata:
+    public_use: verified
+    source_url: https://example.test/goodhart
+  relationships:
+    - kind: supports
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Goodhart Source
+
+When a measure becomes a target, it ceases to be a good measure.
+"#,
+        )
+        .expect("write source artifact");
+        std::fs::write(
+            root.join(".oh/knowledge/proxy-risk.md"),
+            r#"---
+rna:
+  kind: claim
+  id: claim.proxy-risk
+  name: Proxy metrics become risky when treated as targets
+---
+
+# Proxy Risk Claim
+
+Proxy metrics become unreliable when the organization optimizes the proxy rather than the underlying outcome.
+"#,
+        )
+        .expect("write claim artifact");
+        std::fs::write(
+            root.join("manuscript/chapter-01.md"),
+            r#"---
+rna:
+  kind: manuscript_section
+  id: manuscript.chapter-01.proxy-risk
+  name: Chapter 1 proxy-risk section
+  relationships:
+    - kind: consumes
+      confidence: confirmed
+      target:
+        kind: claim
+        id: claim.proxy-risk
+        file: .oh/knowledge/proxy-risk.md
+---
+
+# Chapter 1
+
+The manuscript uses the proxy-risk claim in the opening argument.
+"#,
+        )
+        .expect("write manuscript artifact");
+
+        let mut scanner = Scanner::new(root.to_path_buf()).expect("create scanner");
+        let scan = scanner.scan().expect("scan local knowledge corpus");
+        let extraction = ExtractorRegistry::with_builtins().extract_scan_result(root, &scan);
+
+        persist_graph_to_lance(root, &extraction.nodes, &extraction.edges)
+            .await
+            .expect("persist graph");
+        let loaded = load_graph_from_lance(root).await.expect("load graph");
+
+        let claim = loaded
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "claim.proxy-risk")
+            .expect("claim node should survive scan/persist/load");
+        let quote = loaded
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "quote.goodhart")
+            .expect("quote node should survive scan/persist/load");
+        assert_eq!(
+            quote.metadata.get("rna.metadata.public_use"),
+            Some(&"verified".to_string()),
+            "quote public-use verification must remain queryable as source metadata"
+        );
+
+        let supports = loaded.index.neighbors(
+            &claim.stable_id(),
+            Some(&[EdgeKind::Other("supports".to_string())]),
+            petgraph::Direction::Incoming,
+        );
+        assert_eq!(
+            supports,
+            vec![quote.stable_id()],
+            "claim support must be a real incoming custom edge, not metadata or a generic reference"
+        );
+
+        let ctx = SearchContext {
+            graph_state: &loaded,
+            embed_index: None,
+            repo_root: root,
+            lsp_status: None,
+            embed_status: None,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+            enrichment_jobs: Vec::new(),
+        };
+        let answer = search(
+            &SearchParams {
+                node: Some(claim.stable_id()),
+                mode: Some("neighbors".to_string()),
+                direction: Some("incoming".to_string()),
+                edge_types: Some(vec!["supports".to_string(), "consumes".to_string()]),
+                compact: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            answer.contains("#### Supports (1)") && answer.contains("quote.goodhart"),
+            "search should answer what supports the claim: {answer}"
+        );
+        assert!(
+            answer.contains("#### Consumes (1)")
+                && answer.contains("manuscript.chapter-01.proxy-risk"),
+            "search should answer which manuscript node consumes the claim: {answer}"
+        );
+        assert!(
+            answer.contains("public_use") && answer.contains("verified"),
+            "search must deliver persisted local knowledge metadata to agents: {answer}"
+        );
+        assert!(
+            answer.contains("source_url") && answer.contains("https://example.test/goodhart"),
+            "search must deliver persisted source metadata to agents: {answer}"
         );
     }
 
@@ -1597,10 +2017,7 @@ mod tests {
                     line_end: 4,
                     signature: "[frontmatter]".to_string(),
                     body: "validate:\n  cargo_tests:\n    - mymod::tests::test_thing\n".to_string(),
-                    metadata: BTreeMap::from([(
-                        "is_frontmatter".to_string(),
-                        "true".to_string(),
-                    )]),
+                    metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
                     source: ExtractionSource::Markdown,
                 },
                 Node {
@@ -1722,7 +2139,6 @@ mod tests {
         }
     }
 
-    
     #[test]
     fn timing_smoke_adr_passes_100k_nodes() {
         use std::time::Instant;
@@ -1812,7 +2228,11 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(forward.len(), 1, "forward pass must produce exactly 1 edge");
-        assert_eq!(backward.len(), 1, "backward pass must produce exactly 1 edge");
+        assert_eq!(
+            backward.len(),
+            1,
+            "backward pass must produce exactly 1 edge"
+        );
         // Print elapsed for visibility but do not assert on it; wall-clock is
         // CI-flaky and the budget is enforced via the regression test in
         // `crate::extract::consumers::tests::adr_passes_timing_regression`.

@@ -286,6 +286,40 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
 /// displayed stable IDs. When `strip_root` is `Some(slug)`, the `slug:`
 /// prefix is removed from the ID display -- used in single-root mode
 /// where the prefix is noise.
+fn append_local_knowledge_metadata(entry: &mut String, node: &graph::Node, compact: bool) {
+    let declared: Vec<_> = node
+        .metadata
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("rna.metadata.")
+                .map(|name| (name, value.as_str()))
+        })
+        .collect();
+    if declared.is_empty() {
+        return;
+    }
+
+    if compact {
+        entry.push_str(" metadata:");
+        for (name, value) in declared {
+            entry.push_str(&format!(
+                " {}={}",
+                format_inline_code(name),
+                format_inline_code(value)
+            ));
+        }
+    } else {
+        entry.push_str("\n  Local metadata:");
+        for (name, value) in declared {
+            entry.push_str(&format!(
+                "\n    - {}: {}",
+                format_inline_code(name),
+                format_inline_code(value)
+            ));
+        }
+    }
+}
+
 pub(crate) fn format_node_entry_with_root(
     n: &graph::Node,
     index: &GraphIndex,
@@ -376,6 +410,7 @@ pub(crate) fn format_node_entry_with_root(
         {
             entry.push_str(&format!(" imp:{:.3}", score));
         }
+        append_local_knowledge_metadata(&mut entry, n, true);
         let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
             + index.neighbors(&stable_id, None, Direction::Incoming).len();
         if edge_count > 0 {
@@ -519,6 +554,7 @@ pub(crate) fn format_node_entry_with_root(
         if let Some(path) = n.metadata.get("http_path") {
             entry.push_str(&format!("\n  HTTP Path: {}", path));
         }
+        append_local_knowledge_metadata(&mut entry, n, false);
         if !outgoing.is_empty() {
             entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
         }
@@ -1113,6 +1149,33 @@ mod tests {
             "got: {}",
             full
         );
+    }
+
+    #[test]
+    fn test_format_node_entry_with_root_delivers_local_knowledge_metadata() {
+        let mut node = make_test_node("quote.goodhart");
+        node.metadata.insert(
+            "rna.metadata.public_use".to_string(),
+            "verified".to_string(),
+        );
+        node.metadata.insert(
+            "rna.metadata.source_url".to_string(),
+            "https://example.test/goodhart".to_string(),
+        );
+        let index = GraphIndex::new();
+
+        let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
+
+        for rendered in [&compact, &full] {
+            assert!(rendered.contains("public_use"), "got: {rendered}");
+            assert!(rendered.contains("verified"), "got: {rendered}");
+            assert!(rendered.contains("source_url"), "got: {rendered}");
+            assert!(
+                rendered.contains("https://example.test/goodhart"),
+                "got: {rendered}"
+            );
+        }
     }
 
     #[test]
