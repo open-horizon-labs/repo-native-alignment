@@ -51,24 +51,25 @@ tags: [context-assembly, dependency-refresh, rust-toolchain, ship]
 
 - RNA review concerns: duplicate workflow pins, the direct `git2` breaking-version update, broad lockfile movement, and residual advisory warnings.
 - Resolutions: a CI pin-consistency oracle; no RNA evidence of git2 remote/SSH operations; Rust 1.97 full tests plus Rust 1.91 MSRV check; remaining upstream warning debt isolated in #724.
-- Independent reviewer verdict: ready, with no actionable findings. The reviewer confirmed both source migrations preserve behavior and used RNA impact/caller evidence without running a parallel Cargo build.
+- Fresh expanded-scope review readiness: ready, with no actionable findings. Raw diff plus compiler/audit evidence was sufficient for the lockfile and config changes; RNA mapped the two Rust compatibility hunks to their callers and tests.
+- Fresh independent review found two verification blockers: the optional fastembed/ORT runtime seam and the 15-minute cold CI timeout. The reranker integration test passed, the test timeout was raised to 45 minutes without changing scope after a 30-minute trial showed insufficient margin, and the reviewer reported no remaining code, supply-chain, MSRV, or runtime findings.
 - Merit: the change restores the blocked build, makes compiler selection reproducible, removes five known vulnerabilities, and prevents silent workflow/toolchain drift. A lockfile-only ethnum bump would not meet that outcome.
 - TODO audit: no unresolved TODO appears in the change; #724 and the post-merge refresh of #710 are explicit follow-ups.
 - README: no change required. User installs consume CI/release artifacts, while source developers already enter through the checked-in toolchain file and the README links rustup.
 
 ## Ship status after scope expansion
 
-- [ ] Step 1: RNA review
-- [ ] Step 2: independent review
-- [ ] Step 3: fixes
+- [x] Step 1: RNA review
+- [x] Step 2: independent review
+- [x] Step 3: fixes
 - [ ] Step 3b: ready for review
-- [ ] Step 4: regression oracle
-- [ ] Step 5: merit assessment
-- [ ] Step 6: TODO resolution
-- [ ] Step 7a: manual verification
+- [x] Step 4: regression oracle
+- [x] Step 5: merit assessment
+- [x] Step 6: TODO resolution
+- [x] Step 7a: manual verification
 - [x] Step 7b: delivery verification (N/A: no agent-visible data)
 - [x] Step 8: README (no change required)
-- [ ] Step 9: full tests
+- [x] Step 9: full tests
 - [ ] Step 10: CI green
 - [ ] Step 10b: final comments
 - [ ] Step 11: merge
