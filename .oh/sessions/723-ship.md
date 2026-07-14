@@ -22,6 +22,18 @@
 - Regression oracle: `.github/scripts/check-rust-toolchain-pins.sh` makes workflow/toolchain drift fail in CI and passes locally across all seven references.
 - Formatting: changed Rust lines pass Clippy; repo-wide rustfmt 1.97 check is blocked by unrelated baseline drift logged in the friction table.
 
+## Expanded full compatible dependency refresh
+
+- User expanded scope after the first ready-for-review transition; PR returned to draft and the ship gate was reset.
+- `cargo update` refreshed the entire lockfile under declared semver and Rust 1.91 constraints: 211 packages moved.
+- Major runtime surfaces refreshed include Arrow, fastembed/ORT, Tokio, rustls, QUIC, tree-sitter grammars, OpenSSL, serde, regex, and the DataFusion support graph.
+- RustSec audit after the full refresh: zero vulnerabilities and three warning-class advisories. The yanked/unmaintained `core2` entry was removed; `lru`, `paste`, and `number_prefix` remain tracked in #724.
+- Rust 1.97 `cargo check --lib --no-default-features`: pass after the expanded refresh.
+- Rust 1.97 `cargo clippy --no-default-features -- -D warnings`: pass after the expanded refresh.
+- Rust 1.97 full test suite on a clean target: 1,906 executable tests passed, 2 ignored, 0 failed.
+- Rust 1.91 `cargo check --no-default-features`: pass after the expanded refresh.
+- Direct incompatible-version inventory is explicit rather than silently migrated: Arrow/Lance, Candle, rust-mcp-sdk, TOML, SQL parser, and two tree-sitter grammars require separate API migrations beyond `cargo update`.
+
 ## Review evidence
 
 - RNA review concerns: duplicate workflow pins, the direct `git2` breaking-version update, broad lockfile movement, and residual advisory warnings.
@@ -31,19 +43,19 @@
 - TODO audit: no unresolved TODO appears in the change; #724 and the post-merge refresh of #710 are explicit follow-ups.
 - README: no change required. User installs consume CI/release artifacts, while source developers already enter through the checked-in toolchain file and the README links rustup.
 
-## Ship status
+## Ship status after scope expansion
 
-- [x] Step 1: RNA review
-- [x] Step 2: independent review
-- [x] Step 3: fixes
+- [ ] Step 1: RNA review
+- [ ] Step 2: independent review
+- [ ] Step 3: fixes
 - [ ] Step 3b: ready for review
-- [x] Step 4: regression oracle
-- [x] Step 5: merit assessment
-- [x] Step 6: TODO resolution
-- [x] Step 7a: manual verification
+- [ ] Step 4: regression oracle
+- [ ] Step 5: merit assessment
+- [ ] Step 6: TODO resolution
+- [ ] Step 7a: manual verification
 - [x] Step 7b: delivery verification (N/A: no agent-visible data)
 - [x] Step 8: README (no change required)
-- [x] Step 9: full tests
+- [ ] Step 9: full tests
 - [ ] Step 10: CI green
 - [ ] Step 10b: final comments
 - [ ] Step 11: merge
