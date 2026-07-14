@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 22; // persist generic metadata for repo-local knowledge nodes
+pub const SCHEMA_VERSION: u32 = 23; // persist node extraction provenance
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -49,6 +49,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
+        Field::new("extraction_source", DataType::Utf8, true),
         // Typed metadata columns — Arrow type safety, no JSON blobs for known fields.
         Field::new("meta_virtual", DataType::Boolean, true),
         Field::new("meta_package", DataType::Utf8, true),
@@ -244,6 +245,7 @@ mod tests {
         assert!(schema.field_with_name("id").is_ok());
         assert!(schema.field_with_name("signature").is_ok());
         assert!(schema.field_with_name("body").is_ok());
+        assert!(schema.field_with_name("extraction_source").is_ok());
         assert!(schema.field_with_name("value").is_ok());
         assert!(schema.field_with_name("synthetic").is_ok());
         assert!(schema.field_with_name("cyclomatic").is_ok());

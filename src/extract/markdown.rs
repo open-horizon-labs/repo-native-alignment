@@ -854,7 +854,7 @@ mod tests {
     use crate::scanner::Scanner;
     use crate::server::store::{load_graph_from_lance, persist_graph_to_lance};
     use crate::service::{SearchContext, SearchParams, search};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     #[test]
@@ -940,10 +940,17 @@ When a measure becomes a target, it ceases to be a good measure.
             .extract(Path::new(".oh/sources/goodhart.md"), content)
             .unwrap();
 
-        let quote = result
+        let nodes_by_kind: HashMap<&str, &Node> = result
             .nodes
             .iter()
-            .find(|node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "quote"))
+            .filter_map(|node| match &node.id.kind {
+                NodeKind::Other(kind) => Some((kind.as_str(), node)),
+                _ => None,
+            })
+            .collect();
+        let quote = nodes_by_kind
+            .get("quote")
+            .copied()
             .expect("quote local knowledge node should be emitted");
         assert_eq!(quote.id.name, "quote.goodhart");
         assert_eq!(
@@ -955,23 +962,22 @@ When a measure becomes a target, it ceases to be a good measure.
             Some(&"verified".to_string())
         );
 
-        let edge = result
+        let edges_by_kind: HashMap<String, &Edge> = result
             .edges
             .iter()
-            .find(|edge| edge.kind == EdgeKind::Other("supports".to_string()))
+            .map(|edge| (edge.kind.to_string(), edge))
+            .collect();
+        let edge = edges_by_kind
+            .get("supports")
+            .copied()
             .expect("custom supports edge should be emitted as a true edge kind");
         assert_eq!(edge.from.name, "quote.goodhart");
         assert_eq!(edge.to.name, "claim.proxy-risk");
         assert_eq!(edge.to.file, PathBuf::from(".oh/knowledge/proxy-risk.md"));
         assert!(matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "claim"));
         assert_eq!(edge.confidence, Confidence::Confirmed);
-        assert_eq!(
-            result
-                .edges
-                .iter()
-                .filter(|edge| edge.kind == EdgeKind::Other("escapes_repo".to_string()))
-                .count(),
-            0,
+        assert!(
+            !edges_by_kind.contains_key("escapes_repo"),
             "repo-local relationship targets must not escape the repository"
         );
     }
@@ -1056,16 +1062,24 @@ The manuscript uses the proxy-risk claim in the opening argument.
             .expect("persist graph");
         let loaded = load_graph_from_lance(root).await.expect("load graph");
 
-        let claim = loaded
+        let nodes_by_name: HashMap<&str, &Node> = loaded
             .nodes
             .iter()
-            .find(|node| node.id.name == "claim.proxy-risk")
+            .map(|node| (node.id.name.as_str(), node))
+            .collect();
+        let claim = nodes_by_name
+            .get("claim.proxy-risk")
+            .copied()
             .expect("claim node should survive scan/persist/load");
-        let quote = loaded
-            .nodes
-            .iter()
-            .find(|node| node.id.name == "quote.goodhart")
+        let quote = nodes_by_name
+            .get("quote.goodhart")
+            .copied()
             .expect("quote node should survive scan/persist/load");
+        assert_eq!(
+            quote.source,
+            ExtractionSource::Markdown,
+            "Markdown provenance must survive scan/persist/load"
+        );
         assert_eq!(
             quote.metadata.get("rna.metadata.public_use"),
             Some(&"verified".to_string()),

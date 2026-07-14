@@ -1,3 +1,10 @@
+---
+type: session
+pr: 709
+status: superseded
+started: 2026-07-13
+---
+
 # Ship Pipeline — PR #709
 **Started:** 2026-07-13
 

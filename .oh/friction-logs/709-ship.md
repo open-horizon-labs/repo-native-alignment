@@ -1,3 +1,10 @@
+---
+type: friction-log
+pr: 709
+status: closed
+date: 2026-07-14
+---
+
 # PR #709 ship friction
 
 | Time | Tool path | Severity | Friction | Impact | Follow-up |
