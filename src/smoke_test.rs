@@ -2255,9 +2255,9 @@ mod tests {
     fn test_embedding_error_only_fails_when_embeddings_are_compiled() {
         let check = embedding_error_check("runtime failure");
         let expected = if cfg!(any(feature = "embeddings", feature = "metal")) {
-            CheckStatus::Failed
+            CheckStatus::Fail
         } else {
-            CheckStatus::Skipped
+            CheckStatus::Skip
         };
 
         assert_eq!(check.status, expected);
