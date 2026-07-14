@@ -40,7 +40,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
@@ -94,7 +94,7 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust
@@ -137,7 +137,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust

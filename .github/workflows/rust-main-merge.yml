@@ -45,7 +45,7 @@ jobs:
       - name: Checkout
         if: needs.changes.outputs.rust == 'true'
         uses: actions/checkout@v5
-      - name: Rust toolchain pins agree
+      - name: Rust workflow pins agree
         if: needs.changes.outputs.rust == 'true'
         run: bash .github/scripts/check-rust-toolchain-pins.sh
       - name: No language-specific conditionals in generic.rs
@@ -81,7 +81,7 @@ jobs:
           components: clippy
       - name: Setup sccache
         if: needs.changes.outputs.rust == 'true'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
         if: needs.changes.outputs.rust == 'true'
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
@@ -123,7 +123,7 @@ jobs:
 
       - name: Setup sccache
         if: needs.changes.outputs.rust == 'true'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
         if: needs.changes.outputs.rust == 'true'
@@ -161,7 +161,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
@@ -234,7 +234,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"

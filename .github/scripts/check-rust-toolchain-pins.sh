@@ -4,6 +4,17 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 toolchain_file="$repo_root/rust-toolchain.toml"
 
+shopt -s nullglob
+workflow_files=(
+  "$repo_root"/.github/workflows/*.yml
+  "$repo_root"/.github/workflows/*.yaml
+)
+
+if (( ${#workflow_files[@]} == 0 )); then
+  echo "FAIL: no GitHub Actions workflow files found" >&2
+  exit 1
+fi
+
 toolchain="$(
   awk -F'"' '
     $1 ~ /^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }
@@ -36,4 +47,29 @@ awk -v expected="$toolchain" '
     }
     printf "Rust toolchain pins agree at %s across %d workflow references\n", expected, count
   }
-' "$repo_root"/.github/workflows/*.yml
+' "${workflow_files[@]}"
+
+sccache_action="v0.0.10"
+
+awk -v expected="$sccache_action" '
+  /uses:[[:space:]]*mozilla-actions\/sccache-action@/ {
+    count++
+    actual = $0
+    sub(/^.*mozilla-actions\/sccache-action@/, "", actual)
+    sub(/[[:space:]#].*$/, "", actual)
+    if (actual != expected) {
+      printf "FAIL: %s:%d does not use sccache-action %s: %s\n", FILENAME, FNR, expected, $0 > "/dev/stderr"
+      mismatch = 1
+    }
+  }
+  END {
+    if (count == 0) {
+      print "FAIL: no mozilla-actions/sccache-action workflow references found" > "/dev/stderr"
+      exit 1
+    }
+    if (mismatch) {
+      exit 1
+    }
+    printf "sccache-action pins agree at %s across %d workflow references\n", expected, count
+  }
+' "${workflow_files[@]}"
