@@ -89,6 +89,14 @@ impl Check {
     }
 }
 
+fn embedding_error_check(detail: impl Into<String>) -> Check {
+    if cfg!(any(feature = "embeddings", feature = "metal")) {
+        Check::fail("embed_index", detail)
+    } else {
+        Check::skip("embed_index", "Embedding support is not compiled in")
+    }
+}
+
 const SMOKE_OUTCOME_ID: &str = "agent-alignment";
 
 fn outcome_artifact_exists(repo: &Path, outcome_id: &str) -> Result<bool> {
@@ -240,10 +248,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                             Some(idx)
                         }
                         Err(e) => {
-                            checks.push(Check::fail(
-                                "embed_index",
-                                format!("Embedding failed: {}", e),
-                            ));
+                            checks.push(embedding_error_check(format!(
+                                "Embedding failed: {}",
+                                e
+                            )));
                             None
                         }
                     }
@@ -251,10 +259,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
             }
         }
         Err(e) => {
-            checks.push(Check::fail(
-                "embed_index",
-                format!("EmbeddingIndex::new failed: {}", e),
-            ));
+            checks.push(embedding_error_check(format!(
+                "EmbeddingIndex::new failed: {}",
+                e
+            )));
             None
         }
     };
@@ -2242,6 +2250,18 @@ fn print_and_return(args: &TestArgs, checks: Vec<Check>) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_embedding_error_only_fails_when_embeddings_are_compiled() {
+        let check = embedding_error_check("runtime failure");
+        let expected = if cfg!(any(feature = "embeddings", feature = "metal")) {
+            CheckStatus::Fail
+        } else {
+            CheckStatus::Skip
+        };
+
+        assert_eq!(check.status, expected);
+    }
 
     #[test]
     fn test_outcome_artifact_exists_false_when_optional_outcome_absent() {
