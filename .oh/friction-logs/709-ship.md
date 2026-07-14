@@ -1,0 +1,6 @@
+# PR #709 ship friction
+
+| Time | Tool path | Severity | Friction | Impact | Follow-up |
+|---|---|---|---|---|---|
+| 2026-07-13 | `repo-native-alignment scan --repo . --extract-only --no-embed --no-lsp` | major | Incremental LanceDB persistence rejected duplicate source rows for the `extractor_config_pass_with_configs` subsystem, but the command still exited 0 and reported refresh complete. | The durable RNA index may not contain the staged review fixes, so graph queries can cover indexed branch symbols but the staged Git diff remains authoritative for the new formatter helper. | Fix incremental scan deduplication and propagate persistence failure as a non-zero exit status. |
+| 2026-07-13 | `outcome_progress(context-assembly, include_impact=true, repo=<checkout>)` | major | Worktree-scoped impact results were dominated by symbols under `.worktrees/issue-707` and `.worktrees/content-native-all` instead of the requested checkout. | Risk classification cannot reliably distinguish callers in the current branch; targeted main-checkout neighbor queries and the Git diff are used instead. | Enforce repo-root scoping for outcome impact and exclude nested worktrees from the parent root index. |

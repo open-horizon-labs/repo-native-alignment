@@ -1085,6 +1085,14 @@ The manuscript uses the proxy-risk claim in the opening argument.
                 && answer.contains("manuscript.chapter-01.proxy-risk"),
             "search should answer which manuscript node consumes the claim: {answer}"
         );
+        assert!(
+            answer.contains("public_use") && answer.contains("verified"),
+            "search must deliver persisted local knowledge metadata to agents: {answer}"
+        );
+        assert!(
+            answer.contains("source_url") && answer.contains("https://example.test/goodhart"),
+            "search must deliver persisted source metadata to agents: {answer}"
+        );
     }
 
     #[test]

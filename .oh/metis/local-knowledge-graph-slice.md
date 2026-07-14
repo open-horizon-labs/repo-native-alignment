@@ -19,3 +19,9 @@ Implementation learning:
 Guardrail reinforced:
 
 Do not add book-specific concepts such as `Quote`, `Claim`, `Chapter`, or `Supports` as RNA core enum variants. Keep vocabulary local; keep graph persistence/traversal/search mechanics generic.
+
+Review follow-up:
+
+- Persisting `rna.metadata.*` is not sufficient. MCP formatting must render those fields in both compact and full search results so agents can discover them.
+- A shared permissive edge-label parser must not weaken context-specific validation. Boundary configuration remains strict to `Produces` and `Consumes`; markdown frontmatter is the extension point for repo-local relationship labels.
+- Regression coverage should assert delivered search text and reject misspelled boundary kinds, not only inspect extracted or persisted graph records.

@@ -107,8 +107,16 @@ pub struct Boundary {
 
 impl Boundary {
     /// Resolve the declared `edge_kind` string to an `EdgeKind`.
+    ///
+    /// Boundary configs model pub/sub channels, so only the two documented
+    /// relationship kinds are valid here. Repo-local custom relationships use
+    /// markdown `rna` frontmatter instead.
     fn resolved_edge_kind(&self) -> Option<EdgeKind> {
-        EdgeKind::from_label(&self.edge_kind)
+        match self.edge_kind.as_str() {
+            "Produces" => Some(EdgeKind::Produces),
+            "Consumes" => Some(EdgeKind::Consumes),
+            _ => None,
+        }
     }
 }
 
@@ -1125,6 +1133,22 @@ decorator = true
         assert_eq!(result.edges[0].to.name, "projects/my-project/topics/orders");
         assert_eq!(result.nodes.len(), 1, "Should emit one channel node");
         assert!(matches!(&result.nodes[0].id.kind, NodeKind::Other(s) if s == "channel"));
+    }
+
+    #[test]
+    fn test_boundary_rejects_unknown_edge_kind() {
+        let boundary = Boundary {
+            function_pattern: "publisher.publish".to_string(),
+            topic_arg: Some(0),
+            edge_kind: "Produce".to_string(),
+            decorator: false,
+        };
+
+        assert_eq!(
+            boundary.resolved_edge_kind(),
+            None,
+            "a misspelled boundary edge kind must not become a custom graph relationship"
+        );
     }
 
     #[test]
