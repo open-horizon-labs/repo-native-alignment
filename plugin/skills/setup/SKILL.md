@@ -54,7 +54,7 @@ Release artifacts are intentionally built without local embedding/reranking supp
 
 ## Step 3: Configure the MCP server
 
-RNA is a per-project MCP server (it indexes the repo it's pointed at). MCP stdio launchers often do **not** source shell profiles, and some harnesses crash or mis-handle wrapper commands. Keep `command` as the direct `repo-native-alignment` binary path and put tool-manager paths/env in the server `env` block instead of launching through `mise exec`, `asdf exec`, `brew shellenv`, or shell wrapper scripts.
+RNA is a per-project MCP server (it indexes the repo it's pointed at). MCP stdio launchers often do **not** source shell profiles, and some harnesses crash or mis-handle wrapper commands. Keep `command` as the direct `repo-native-alignment` binary path. Never launch through `mise`, `asdf`, `brew`, another tool-manager command, or a shell wrapper script.
 
 Check if `.mcp.json` exists in the project root and already contains an `rna-server` entry. If it does, verify it uses a direct RNA binary command; rewrite wrapper-based entries to the direct-binary pattern below.
 
@@ -70,20 +70,32 @@ Otherwise, create or update `.mcp.json` in the project root with:
     "rna-server": {
       "type": "stdio",
       "command": "/Users/me/.cargo/bin/repo-native-alignment",
-      "args": ["--repo", "/absolute/path/to/project"],
-      "env": {
-        "DOTNET_ROOT": "/opt/homebrew/opt/dotnet/libexec",
-        "DOTNET_ROOT_ARM64": "/opt/homebrew/opt/dotnet/libexec",
-        "PATH": "/Users/me/.dotnet/tools:/opt/homebrew/opt/dotnet/libexec:/Users/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-      }
+      "args": ["--repo", "/absolute/path/to/project"]
     }
   }
 }
 ```
 
-For mise-managed .NET, set `DOTNET_ROOT`/`DOTNET_ROOT_ARM64` to the mise .NET root and prepend the root plus `~/.dotnet/tools` to `PATH`; keep `command` as the RNA binary, not `/opt/homebrew/bin/mise`. For asdf/Homebrew/official .NET installs, use their resolved install root in `env` the same way.
-
 If `.mcp.json` already exists with other servers, merge the `rna-server` entry into the existing `mcpServers` object -- do not overwrite the file.
+
+### Conditional C#/.NET LSP enrichment
+
+Do **not** probe for `dotnet`, `csharp-ls`, `DOTNET_ROOT`, or .NET
+tool-manager installs by default. Only do so when at least one of these is true:
+
+- the target repository contains C#/.NET markers such as `.cs`, `.csproj`, or
+  `.sln` files;
+- `repo-native-alignment setup` reports the optional C# toolchain need; or
+- the user explicitly requests C# call/reference enrichment.
+
+For those C#/.NET repositories, install `csharp-ls` with
+`dotnet tool install -g csharp-ls` and ensure `~/.dotnet/tools` is on `PATH`.
+If the MCP launcher does not inherit shell setup, add the resolved .NET root as
+`DOTNET_ROOT` (and `DOTNET_ROOT_ARM64` on Apple Silicon), and prepend that root
+plus `~/.dotnet/tools` to the server `env` `PATH`. Use the setup command's
+reported root for mise, asdf, Homebrew, or official .NET installs. Keep
+`command` as the direct RNA binary; never make it `mise`, `asdf`, `brew`, or a
+wrapper script.
 
 ## Step 4: Pre-warm the code index
 
