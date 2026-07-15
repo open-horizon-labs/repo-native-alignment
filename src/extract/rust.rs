@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::generic::{GenericExtractor, LangConfig};
 use super::query::RouteQueryConfig;
@@ -144,10 +144,112 @@ impl Extractor for RustExtractor {
             // Walks enclosing `mod_item` ancestors so tests inside
             // `#[cfg(test)] mod tests { ... }` get the correct `tests::` segment.
             enrich_test_paths(path, tree.root_node(), content.as_bytes(), &mut result.nodes);
+            extract_struct_constructions(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+            );
         }
 
         Ok(result)
     }
+}
+
+/// Capture Rust struct expressions while the AST is available.
+fn extract_struct_constructions(
+    node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+) {
+    if node.kind() == "struct_expression"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(type_path) = name_node.utf8_text(source)
+        && let Some(constructed_type) = rust_type_basename(type_path)
+    {
+        let line_start = node.start_position().row + 1;
+        let line_end = node.end_position().row + 1;
+        let column = node.start_position().column + 1;
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("constructed_type".into(), constructed_type.clone());
+        metadata.insert("type_path".into(), type_path.to_string());
+        metadata.insert(
+            "name_col".into(),
+            name_node.start_position().column.to_string(),
+        );
+        if let Some((owner_name, owner_kind)) = nearest_owning_symbol(node, source) {
+            metadata.insert("parent_scope".into(), owner_name);
+            metadata.insert("parent_scope_kind".into(), owner_kind);
+        }
+        let body = node.utf8_text(source).unwrap_or("").to_string();
+        let signature = body.lines().next().unwrap_or("").trim().to_string();
+        nodes.push(Node {
+            id: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: format!("{constructed_type}@{line_start}:{column}"),
+                kind: NodeKind::Other("struct_literal".into()),
+            },
+            language: "rust".into(),
+            line_start,
+            line_end,
+            signature,
+            body,
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        });
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            extract_struct_constructions(child, path, source, nodes);
+        }
+    }
+}
+
+fn rust_type_basename(type_path: &str) -> Option<String> {
+    let without_generics = type_path
+        .split("::<")
+        .next()
+        .unwrap_or(type_path)
+        .split('<')
+        .next()
+        .unwrap_or(type_path);
+    without_generics
+        .rsplit("::")
+        .find(|part| !part.is_empty())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn nearest_owning_symbol(node: tree_sitter::Node, source: &[u8]) -> Option<(String, String)> {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        let (field, kind) = match current.kind() {
+            "function_item" | "function_signature_item" => ("name", "function"),
+            "impl_item" => ("type", "impl"),
+            "struct_item" => ("name", "struct"),
+            "trait_item" => ("name", "trait"),
+            "enum_item" => ("name", "enum"),
+            "mod_item" => ("name", "module"),
+            "const_item" | "static_item" => ("name", "const"),
+            _ => {
+                ancestor = current.parent();
+                continue;
+            }
+        };
+        if let Some(name) = current
+            .child_by_field_name(field)
+            .and_then(|child| child.utf8_text(source).ok())
+            .filter(|name| !name.is_empty())
+        {
+            return Some((name.to_string(), kind.to_string()));
+        }
+        ancestor = current.parent();
+    }
+    None
 }
 
 /// Metadata key for the resolved `cargo test -- --list` style path.
@@ -1659,4 +1761,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_struct_literal_sites_include_paths_generics_location_and_owner() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct BusOptions { enabled: bool }
+struct LspPipelineInput<T> { value: T }
+struct LangConfig { name: &'static str }
+
+fn build() {
+    let _a = BusOptions { enabled: true };
+    let _b = crate::server::BusOptions { enabled: false };
+    let _c = LspPipelineInput::<String> { value: String::new() };
+    let _d = LangConfig { name: "rust" };
+    let _field = _a.enabled;
+    let BusOptions { enabled: _ } = _a;
+    fake_macro!(BusOptions { enabled: true });
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let sites: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "struct_literal"),
+            )
+            .collect();
+
+        // The macro token tree is opaque to tree-sitter and the destructuring pattern
+        // is a different AST kind, so only the four real expressions are captured.
+        assert_eq!(sites.len(), 4, "unexpected sites: {sites:#?}");
+        assert_eq!(
+            sites
+                .iter()
+                .filter_map(|node| node.metadata.get("constructed_type"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["BusOptions", "BusOptions", "LspPipelineInput", "LangConfig"]
+        );
+        assert!(sites.iter().all(|node| node.line_start > 0));
+        assert!(sites.iter().all(|node| {
+            node.metadata.get("parent_scope").map(String::as_str) == Some("build")
+                && node.metadata.get("parent_scope_kind").map(String::as_str) == Some("function")
+        }));
+        assert!(sites.iter().any(|node| {
+            node.metadata.get("type_path").map(String::as_str) == Some("crate::server::BusOptions")
+        }));
+        assert!(sites.iter().any(|node| {
+            node.metadata.get("type_path").map(String::as_str) == Some("LspPipelineInput::<String>")
+        }));
+    }
 }

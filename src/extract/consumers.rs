@@ -521,14 +521,15 @@ impl ExtractionConsumer for SdkPathInferenceConsumer {
 /// 4. `sdk_path_inference_pass` — infers full paths for FastAPI endpoints still unresolved
 ///    (chained routers without explicit `prefix=` args); uses SDK Const nodes (#517).
 ///    Gated on `detected_frameworks.contains("fastapi")` — zero invocations on non-FastAPI repos.
-/// 5. `api_link_pass` — links HTTP handlers to route definitions
-/// 6. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
-/// 7. `manifest_pass` — package.json / Cargo.toml dependency nodes
-/// 8. `tested_by_pass` — naming-convention test edges
-/// 9. `adr_validation_pass` — ADR frontmatter -> exact test function edges
-/// 10. `import_calls_pass` — resolves bare function calls via import nodes
-/// 11. `directory_module_pass` — directory-level module nodes
-/// 12. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
+/// 5. `struct_construction_pass` — links Rust struct literals to local declarations
+/// 6. `api_link_pass` — links HTTP handlers to route definitions
+/// 7. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
+/// 8. `manifest_pass` — package.json / Cargo.toml dependency nodes
+/// 9. `tested_by_pass` — naming-convention test edges
+/// 10. `adr_validation_pass` — ADR frontmatter -> exact test function edges
+/// 11. `import_calls_pass` — resolves bare function calls via import nodes
+/// 12. `directory_module_pass` — directory-level module nodes
+/// 13. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
 ///     `grpc_client_calls_pass`, `extractor_config_pass` — gate on detected_frameworks
 ///
 /// **Why passes run here, not in individual consumers:**
@@ -665,7 +666,17 @@ impl EnrichmentFinalizer {
             crate::extract::sdk_path_inference::sdk_path_inference_pass(&mut all_nodes);
         }
 
-        // Step 5: api_link — links HTTP handlers to route definitions.
+        // Step 5: struct constructions — link AST-derived Rust literal sites to
+        // unambiguous local declarations before persistence and graph rendering.
+        {
+            let new_edges =
+                crate::extract::struct_construction::struct_construction_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 6: api_link — links HTTP handlers to route definitions.
         {
             let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
             if !new_edges.is_empty() {

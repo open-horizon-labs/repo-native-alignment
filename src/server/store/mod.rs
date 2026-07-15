@@ -192,6 +192,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use crate::extract::{Extractor, rust::RustExtractor};
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
     use super::{load_graph_from_lance, parse_edge_kind, persist_graph_to_lance};
@@ -256,6 +257,72 @@ mod tests {
             petgraph::Direction::Outgoing,
         );
         assert_eq!(neighbors, vec![claim.stable_id()]);
+    }
+
+    #[tokio::test]
+    async fn rust_struct_construction_survives_persist_load_and_rendering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extractor = RustExtractor::new();
+        let mut declaration = extractor
+            .extract(
+                std::path::Path::new("src/options.rs"),
+                "pub struct BusOptions { pub enabled: bool }\n",
+            )
+            .expect("extract declaration");
+        let mut construction = extractor
+            .extract(
+                std::path::Path::new("src/server.rs"),
+                "fn build() { let _ = BusOptions { enabled: true }; }\n",
+            )
+            .expect("extract construction");
+        for node in declaration.nodes.iter_mut().chain(&mut construction.nodes) {
+            node.id.root = "repo".into();
+        }
+        let mut nodes = declaration.nodes;
+        nodes.extend(construction.nodes);
+        let edges = crate::extract::struct_construction::struct_construction_pass(&nodes);
+        assert_eq!(edges.len(), 1);
+
+        persist_graph_to_lance(dir.path(), &nodes, &edges)
+            .await
+            .expect("persist graph");
+        let state = load_graph_from_lance(dir.path()).await.expect("load graph");
+        let declaration = state
+            .nodes
+            .iter()
+            .find(|node| node.id.kind == NodeKind::Struct && node.id.name == "BusOptions")
+            .expect("loaded declaration");
+        let site = state
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "struct_literal"))
+            .expect("loaded construction");
+        assert_eq!(
+            site.metadata.get("constructed_type").map(String::as_str),
+            Some("BusOptions")
+        );
+        assert_eq!(
+            site.metadata.get("parent_scope").map(String::as_str),
+            Some("build")
+        );
+
+        let edge_kind = EdgeKind::Other("constructed_at".into());
+        let neighbors = state.index.neighbors(
+            &declaration.stable_id(),
+            Some(std::slice::from_ref(&edge_kind)),
+            petgraph::Direction::Outgoing,
+        );
+        assert_eq!(neighbors, vec![site.stable_id()]);
+
+        let groups = std::collections::BTreeMap::from([(edge_kind, neighbors)]);
+        let rendered = crate::server::helpers::format_neighbors_grouped(
+            &state.nodes,
+            &groups,
+            &state.index,
+            false,
+        );
+        assert!(rendered.contains("Constructed at (1)"));
+        assert!(rendered.contains("BusOptions@1:"));
     }
 
     #[tokio::test]
