@@ -4,6 +4,7 @@
 //! and use declarations from Rust source files. Also detects topology
 //! patterns (subprocess spawn, network listeners, async boundaries).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -133,6 +134,14 @@ impl Extractor for RustExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
+            let scope_imports = build_scope_import_index(tree.root_node(), content.as_bytes());
+            let struct_indices: HashMap<(String, usize), usize> = result
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.id.kind == NodeKind::Struct && node.id.file == path)
+                .map(|(index, node)| ((node.id.name.clone(), node.line_start), index))
+                .collect();
             detect_topology_patterns(
                 tree.root_node(),
                 path,
@@ -145,6 +154,7 @@ impl Extractor for RustExtractor {
                 tree.root_node(),
                 content.as_bytes(),
                 &mut result.nodes,
+                &struct_indices,
             );
             // Compute exact `cargo test -- --list` style paths from the AST.
             // Walks enclosing `mod_item` ancestors so tests inside
@@ -155,6 +165,7 @@ impl Extractor for RustExtractor {
                 path,
                 content.as_bytes(),
                 &mut result.nodes,
+                &scope_imports,
             );
         }
 
@@ -168,6 +179,7 @@ fn extract_struct_constructions(
     path: &Path,
     source: &[u8],
     nodes: &mut Vec<Node>,
+    scope_imports: &ScopeImportIndex,
 ) {
     if node.kind() == "struct_expression"
         && let Some(name_node) = node.child_by_field_name("name")
@@ -185,7 +197,9 @@ fn extract_struct_constructions(
             "module_path".into(),
             rust_lexical_module_path(node, path, source),
         );
-        if let Some(import_path) = imported_binding_path(node, constructed_type.as_str(), source) {
+        if let Some(import_path) =
+            imported_binding_path(node, constructed_type.as_str(), scope_imports)
+        {
             metadata.insert("imported_type_path".into(), import_path);
         }
         metadata.insert(
@@ -225,7 +239,7 @@ fn extract_struct_constructions(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            extract_struct_constructions(child, path, source, nodes);
+            extract_struct_constructions(child, path, source, nodes, scope_imports);
         }
     }
 }
@@ -250,12 +264,22 @@ fn rust_lexical_module_path(node: tree_sitter::Node, path: &Path, source: &[u8])
 
 /// Return an import path that binds `name` in this source file. Multiple bindings
 /// are marked ambiguous so the post-pass remains conservative.
-fn imported_binding_path(node: tree_sitter::Node, name: &str, source: &[u8]) -> Option<String> {
+type ScopeKey = (usize, usize);
+type ScopeImportIndex = HashMap<ScopeKey, HashMap<String, Vec<String>>>;
+
+fn imported_binding_path(
+    node: tree_sitter::Node,
+    name: &str,
+    scope_imports: &ScopeImportIndex,
+) -> Option<String> {
     let mut scope = node.parent();
     let mut matches = Vec::new();
     while let Some(current) = scope {
         if matches!(current.kind(), "block" | "declaration_list" | "source_file") {
-            collect_scope_import_bindings(current, name, source, &mut matches);
+            let key = (current.start_byte(), current.end_byte());
+            if let Some(paths) = scope_imports.get(&key).and_then(|bindings| bindings.get(name)) {
+                matches.extend(paths.iter().cloned());
+            }
         }
         scope = current.parent();
     }
@@ -268,23 +292,38 @@ fn imported_binding_path(node: tree_sitter::Node, name: &str, source: &[u8]) -> 
     }
 }
 
-fn collect_scope_import_bindings(
-    node: tree_sitter::Node,
-    name: &str,
-    source: &[u8],
-    matches: &mut Vec<String>,
-) {
-    for index in 0..node.child_count() {
-        if let Some(child) = node.child(index as u32)
-            && child.kind() == "use_declaration"
-            && let Ok(text) = child.utf8_text(source)
-        {
-            collect_import_text_binding(text, name, matches);
+fn build_scope_import_index(node: tree_sitter::Node, source: &[u8]) -> ScopeImportIndex {
+    fn walk(node: tree_sitter::Node, source: &[u8], index: &mut ScopeImportIndex) {
+        if matches!(node.kind(), "block" | "declaration_list" | "source_file") {
+            let mut bindings: HashMap<String, Vec<String>> = HashMap::new();
+            for child_index in 0..node.child_count() {
+                if let Some(child) = node.child(child_index as u32)
+                    && child.kind() == "use_declaration"
+                    && let Ok(text) = child.utf8_text(source)
+                {
+                    for (binding, path) in import_text_bindings(text) {
+                        bindings.entry(binding).or_default().push(path);
+                    }
+                }
+            }
+            if !bindings.is_empty() {
+                index.insert((node.start_byte(), node.end_byte()), bindings);
+            }
+        }
+        for child_index in 0..node.child_count() {
+            if let Some(child) = node.child(child_index as u32) {
+                walk(child, source, index);
+            }
         }
     }
+
+    let mut index = HashMap::new();
+    walk(node, source, &mut index);
+    index
 }
 
-fn collect_import_text_binding(text: &str, name: &str, matches: &mut Vec<String>) {
+fn import_text_bindings(text: &str) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
     let import = text
         .trim()
         .strip_prefix("pub ")
@@ -299,19 +338,16 @@ fn collect_import_text_binding(text: &str, name: &str, matches: &mut Vec<String>
                 .rsplit_once(" as ")
                 .map(|(target, alias)| (target.trim(), alias.trim()))
                 .unwrap_or_else(|| (member, member.rsplit("::").next().unwrap_or(member)));
-            if binding == name {
-                matches.push(format!("{prefix}::{target}"));
-            }
+            bindings.push((binding.to_string(), format!("{prefix}::{target}")));
         }
     } else {
         let (path, binding) = import
             .rsplit_once(" as ")
             .map(|(path, alias)| (path.trim(), alias.trim()))
             .unwrap_or_else(|| (import, import.rsplit("::").next().unwrap_or(import)));
-        if binding == name {
-            matches.push(path.to_string());
-        }
+        bindings.push((binding.to_string(), path.to_string()));
     }
+    bindings
 }
 
 fn enrich_struct_module_paths(
@@ -319,18 +355,16 @@ fn enrich_struct_module_paths(
     node: tree_sitter::Node,
     source: &[u8],
     nodes: &mut [Node],
+    struct_indices: &HashMap<(String, usize), usize>,
 ) {
     if node.kind() == "struct_item"
         && let Some(name_node) = node.child_by_field_name("name")
         && let Ok(name) = name_node.utf8_text(source)
     {
         let line = node.start_position().row + 1;
-        if let Some(extracted) = nodes.iter_mut().find(|candidate| {
-            candidate.id.file == path
-                && candidate.id.kind == NodeKind::Struct
-                && candidate.id.name == name
-                && candidate.line_start == line
-        }) {
+        if let Some(index) = struct_indices.get(&(name.to_string(), line))
+            && let Some(extracted) = nodes.get_mut(*index)
+        {
             extracted.metadata.insert(
                 "module_path".into(),
                 rust_lexical_module_path(node, path, source),
@@ -339,7 +373,7 @@ fn enrich_struct_module_paths(
     }
     for index in 0..node.child_count() {
         if let Some(child) = node.child(index as u32) {
-            enrich_struct_module_paths(path, child, source, nodes);
+            enrich_struct_module_paths(path, child, source, nodes, struct_indices);
         }
     }
 }
