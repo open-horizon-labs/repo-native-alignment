@@ -4,6 +4,8 @@
 
 **The sequence:** aim → problem-space → problem-statement → solution-space → **draft PR** → execute → ship
 
+**Repo-local skills:** The canonical workflow skills for this project live in `.agents/skills/`. Agents must prefer these repo-local versions over similarly named global skills so the workflow travels with the repository.
+
 **Where to start (triggers):**
 - Can't explain why you're building this → `/aim`
 - Keep hitting the same blockers → `/problem-space`
@@ -88,12 +90,19 @@ This project IS the RNA MCP server. When working here, use its own tools.
 # Project Context
 
 ## Purpose
-Local context discovery and alignment tool for coding agents. Makes the fractal, local knowledge in a codebase — the stuff not in training data — discoverable and queryable. If an agent can't find something through RNA, RNA is broken.
+
+Help coding agents understand a repository without wasting context and time on repeated grep, sed, and file-reading loops.
+
+RNA compiles the fractal, repo-local knowledge absent from model training data—including code structure, relationships, business artifacts, outcomes, and domain context—into a discoverable graph. If relevant repository knowledge exists but an agent cannot find or navigate it through RNA, RNA is broken.
 
 ## Current Aims
-- **context-assembly** (active): Agents discover and navigate code, business artifacts, and structural relationships through RNA — no grep fallback needed. If something exists and RNA can't find it, that's a bug.
+
+- **context-assembly** (active): Agents discover and navigate code, business artifacts, and structural relationships through RNA without grep/read fallback. Search, traversal, and enrichment must deliver enough context for agents to understand before acting.
+- **domain-context-compiler** (active): Repositories can declare domain-specific entities and relationships from structured files, allowing agents to understand system meaning beyond programming-language structure.
+- **codebase-to-warehouse-pipeline** (active): Repo-local knowledge is extracted, enriched, persisted, and delivered through a dependable pipeline rather than assembled repeatedly through ad hoc file reads.
+- **subsystem-detection** (active): Agents receive a useful architectural map of unfamiliar repositories, including coherent subsystems, interfaces, entry points, and hotspots.
 - **agent-alignment** (maintenance): Work stays connected to declared outcomes. Architecture settled, feedback loop exists. Remaining work: bug fixes, tool cleanup, adoption.
-- **human-led-curation** (proposed): LLM-assisted corpus curation. Deferred until manual /distill sessions prove insufficient.
+- **human-led-curation** (proposed): LLMs surface candidates for corpus improvement, while humans decide what to promote, compact, or dismiss. Deferred until manual `/distill` sessions prove insufficient.
 
 ## Key Constraints
 
