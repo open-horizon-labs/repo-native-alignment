@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rna-server": {
+      "args": [
+        "--repo",
+        "."
+      ],
+      "command": "repo-native-alignment",
+      "timeout": 30000,
+      "type": "stdio"
+    }
+  }
+}
