@@ -203,7 +203,29 @@ impl ExtractionConsumer for TreeSitterConsumer {
 ///
 /// Subscribes to: `RootExtracted`
 /// Emits: `LanguageDetected` (one per language found)
-pub struct LanguageAccumulatorConsumer;
+#[derive(Default)]
+pub struct LanguageAccumulatorConsumer {
+    planned_node_ids: Option<Arc<HashSet<String>>>,
+}
+
+impl LanguageAccumulatorConsumer {
+    pub fn with_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
+        Self { planned_node_ids }
+    }
+}
+
+fn node_is_in_lsp_scope(
+    node: &Node,
+    dirty_slugs: Option<&HashSet<String>>,
+    planned_node_ids: Option<&HashSet<String>>,
+) -> bool {
+    if let Some(dirty_slugs) = dirty_slugs
+        && !dirty_slugs.contains(&node.id.root)
+    {
+        return false;
+    }
+    planned_node_ids.is_none_or(|planned| planned.contains(&node.stable_id()))
+}
 
 #[async_trait]
 impl ExtractionConsumer for LanguageAccumulatorConsumer {
@@ -242,13 +264,17 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
         // to avoid O(N) copies when multiple consumers receive the same LanguageDetected.
         let mut by_lang: std::collections::BTreeMap<String, Vec<Node>> =
             std::collections::BTreeMap::new();
+        let mut emitted_planned_ids = HashSet::new();
         for node in nodes.iter() {
             if node.language.is_empty() {
                 continue;
             }
-            // Skip nodes from clean roots — they already have LSP edges from cache.
-            if let Some(set) = dirty_set
-                && !set.contains(&node.id.root)
+            // Skip nodes outside the dirty roots or the explicit changed-file plan.
+            if !node_is_in_lsp_scope(node, dirty_set, self.planned_node_ids.as_deref()) {
+                continue;
+            }
+            if self.planned_node_ids.is_some()
+                && !emitted_planned_ids.insert(node.stable_id())
             {
                 continue;
             }
@@ -1552,6 +1578,8 @@ pub struct AllEnrichmentsGate {
     /// When true, LSP consumers are skipped (#574) — force expected=0 so the gate
     /// emits AllEnrichmentsDone immediately on RootExtracted.
     skip_lsp: bool,
+    /// Optional stable-node-ID set for bounded changed-file LSP scheduling.
+    planned_node_ids: Option<Arc<HashSet<String>>>,
 }
 
 struct GateState {
@@ -1578,6 +1606,10 @@ struct GateState {
 
 impl AllEnrichmentsGate {
     pub fn new() -> Self {
+        Self::with_planned_nodes(None)
+    }
+
+    pub fn with_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
         Self {
             state: Mutex::new(GateState {
                 expected: 0,
@@ -1591,12 +1623,17 @@ impl AllEnrichmentsGate {
                 fired: false,
             }),
             skip_lsp: false,
+            planned_node_ids,
         }
     }
 
     /// Create a gate that skips LSP — forces expected=0 so AllEnrichmentsDone
     /// fires immediately. Used when LSP is deferred to background (#574).
     pub fn with_skip_lsp() -> Self {
+        Self::with_skip_lsp_and_planned_nodes(None)
+    }
+
+    pub fn with_skip_lsp_and_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
         Self {
             state: Mutex::new(GateState {
                 expected: 0,
@@ -1610,6 +1647,7 @@ impl AllEnrichmentsGate {
                 fired: false,
             }),
             skip_lsp: true,
+            planned_node_ids,
         }
     }
 }
@@ -1661,14 +1699,14 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 let language_count: usize = {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
-                        if !n.language.is_empty() {
-                            let is_dirty = match dirty_set {
-                                None => true,
-                                Some(set) => set.contains(&n.id.root),
-                            };
-                            if is_dirty {
-                                seen.insert(n.language.clone());
-                            }
+                        if !n.language.is_empty()
+                            && node_is_in_lsp_scope(
+                                n,
+                                dirty_set,
+                                self.planned_node_ids.as_deref(),
+                            )
+                        {
+                            seen.insert(n.language.clone());
                         }
                     }
                     seen.len()
@@ -1687,14 +1725,15 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 } else {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
-                        if !n.language.is_empty() && supported.contains(&n.language) {
-                            let is_dirty = match dirty_set {
-                                None => true,
-                                Some(set) => set.contains(&n.id.root),
-                            };
-                            if is_dirty {
-                                seen.insert(n.language.clone());
-                            }
+                        if !n.language.is_empty()
+                            && supported.contains(&n.language)
+                            && node_is_in_lsp_scope(
+                                n,
+                                dirty_set,
+                                self.planned_node_ids.as_deref(),
+                            )
+                        {
+                            seen.insert(n.language.clone());
                         }
                     }
                     seen.len()
@@ -2176,6 +2215,9 @@ pub struct BusOptions {
     /// This allows the enrichment pipeline to run non-LSP passes only (fast path),
     /// with LSP enrichment deferred to a background task (#574).
     pub skip_lsp: bool,
+    /// When present, only these stable node IDs may emit LSP work. The full graph
+    /// still flows through finalization and persistence.
+    pub lsp_node_filter: Option<Arc<HashSet<String>>>,
 }
 
 /// Build an `EventBus` pre-loaded with all built-in consumers.
@@ -2224,6 +2266,7 @@ pub fn build_builtin_bus(
         embed_idx,
         lance_repo_root,
         skip_lsp,
+        lsp_node_filter,
     } = opts;
     use crate::extract::event_bus::EventBus;
 
@@ -2245,7 +2288,9 @@ pub fn build_builtin_bus(
     // --- RootExtracted consumers ---
     // LanguageAccumulatorConsumer must run first (emits LanguageDetected which
     // triggers LspConsumers, then AllEnrichmentsGate counts up).
-    bus.register(Box::new(LanguageAccumulatorConsumer));
+    bus.register(Box::new(LanguageAccumulatorConsumer::with_planned_nodes(
+        lsp_node_filter.clone(),
+    )));
 
     // AllEnrichmentsGate: must subscribe to RootExtracted BEFORE LspConsumers
     // fire so it captures the language count before any EnrichmentComplete arrives.
@@ -2253,9 +2298,9 @@ pub fn build_builtin_bus(
     // When skip_lsp=true (#574), the gate forces expected=0 so AllEnrichmentsDone
     // fires immediately without waiting for EnrichmentComplete events.
     bus.register(Box::new(if skip_lsp {
-        AllEnrichmentsGate::with_skip_lsp()
+        AllEnrichmentsGate::with_skip_lsp_and_planned_nodes(lsp_node_filter)
     } else {
-        AllEnrichmentsGate::new()
+        AllEnrichmentsGate::with_planned_nodes(lsp_node_filter)
     }));
 
     // OpenApi, gRPC, Embedding — subscribe to RootExtracted independently.
@@ -2721,7 +2766,7 @@ mod tests {
             dirty_slugs: None,
         };
 
-        let consumer = LanguageAccumulatorConsumer;
+        let consumer = LanguageAccumulatorConsumer::default();
         let follow_ons = consumer.on_event(&event).await.unwrap();
 
         // Should emit LanguageDetected for "rust" and "python"
@@ -2787,7 +2832,7 @@ mod tests {
             dirty_slugs: Some(std::collections::HashSet::from(["dirty_root".to_string()])),
         };
 
-        let consumer = LanguageAccumulatorConsumer;
+        let consumer = LanguageAccumulatorConsumer::default();
         let follow_ons = consumer.on_event(&event).await.unwrap();
 
         // Should only emit LanguageDetected for "rust" (from dirty_root).
@@ -2809,6 +2854,80 @@ mod tests {
             );
         } else {
             panic!("Expected LanguageDetected event");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_file_filter_limits_accumulator_and_gate_but_preserves_full_graph() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        fn scoped_node(file: &str, name: &str, language: &str) -> Node {
+            Node {
+                id: NodeId {
+                    root: "fixture".into(),
+                    file: PathBuf::from(file),
+                    name: name.into(),
+                    kind: NodeKind::Function,
+                },
+                language: language.into(),
+                line_start: 1,
+                line_end: 2,
+                signature: name.into(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }
+        }
+
+        let planned = scoped_node("src/changed.rs", "changed", "rust");
+        let duplicate_planned = planned.clone();
+        let unrelated = scoped_node("src/unrelated.py", "unrelated", "python");
+        let filter = Arc::new(HashSet::from([planned.stable_id()]));
+        let event = ExtractionEvent::RootExtracted {
+            slug: "fixture".into(),
+            path: PathBuf::from("."),
+            nodes: Arc::from(vec![planned, duplicate_planned, unrelated].into_boxed_slice()),
+            edges: Arc::from([]),
+            dirty_slugs: Some(HashSet::from(["fixture".to_string()])),
+        };
+
+        let accumulator =
+            LanguageAccumulatorConsumer::with_planned_nodes(Some(Arc::clone(&filter)));
+        let detected = accumulator.on_event(&event).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        match &detected[0] {
+            ExtractionEvent::LanguageDetected {
+                language, nodes, ..
+            } => {
+                assert_eq!(language, "rust");
+                assert_eq!(nodes.len(), 1);
+                assert!(nodes[0].stable_id().contains("src/changed.rs"));
+            }
+            other => panic!("expected LanguageDetected, got {other:?}"),
+        }
+
+        let gate = AllEnrichmentsGate::with_planned_nodes(Some(filter));
+        assert!(gate.on_event(&event).await.unwrap().is_empty());
+        let complete = ExtractionEvent::EnrichmentComplete {
+            slug: "fixture".into(),
+            language: "rust".into(),
+            added_edges: Arc::from([]),
+            new_nodes: Arc::from([]),
+            updated_nodes: Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            server_missing: false,
+            remediation: None,
+            aborted: false,
+        };
+        let finished = gate.on_event(&complete).await.unwrap();
+        assert_eq!(finished.len(), 1);
+        match &finished[0] {
+            ExtractionEvent::AllEnrichmentsDone { nodes, .. } => {
+                assert_eq!(nodes.len(), 3, "the full cached graph must survive scoping");
+            }
+            other => panic!("expected AllEnrichmentsDone, got {other:?}"),
         }
     }
 
@@ -2842,7 +2961,7 @@ mod tests {
             ),
             edges: std::sync::Arc::from([]),
         };
-        let consumer = LanguageAccumulatorConsumer;
+        let consumer = LanguageAccumulatorConsumer::default();
         let follow_ons = consumer.on_event(&event).await.unwrap();
         assert!(
             follow_ons.is_empty(),

@@ -1,6 +1,7 @@
 //! MCP server: RnaHandler, graph building, background scanner, and MCP dispatch.
 
 mod bg_scanner;
+mod changed_file_plan;
 mod enrichment;
 mod enrichment_jobs;
 mod graph;

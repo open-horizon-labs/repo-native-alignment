@@ -482,6 +482,7 @@ impl RnaHandler {
                                 embed_idx: None,
                                 lance_repo_root: None,
                                 skip_lsp: false, // incremental background path: LSP runs inline
+                                lsp_node_filter: None,
                             },
                             dirty_slugs,
                         )
@@ -1491,6 +1492,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                         skip_lsp: spawn_background || !enrichment.runs_lsp(),
+                        lsp_node_filter: None,
                     },
                     dirty_slugs,
                 )
@@ -2118,6 +2120,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                         skip_lsp: !enrichment.runs_lsp(),
+                        lsp_node_filter: None,
                     },
                     dirty_slugs,
                 )

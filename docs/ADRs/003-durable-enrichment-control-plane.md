@@ -21,6 +21,12 @@ validate:
     - extract::lsp::passes::tests::recovered_pass1_edges_are_applied_idempotently
     - extract::lsp::passes::tests::interrupt_restart_executor_fixture_invokes_only_retryable_items_once
     - extract::lsp::passes::tests::exhausted_recovery_fails_pass1_closed_without_invocation
+    - server::changed_file_plan::tests::one_file_change_never_schedules_unrelated_nodes
+    - server::changed_file_plan::tests::git_discovery_records_head_to_worktree_provenance
+    - server::changed_file_plan::tests::unsupported_language_is_reported_as_unmapped_not_scheduled
+    - extract::consumers::tests::changed_file_filter_limits_accumulator_and_gate_but_preserves_full_graph
+    - server::state::tests::test_scoped_lsp_coverage_blocks_dead_code_but_allows_review_context
+    - server::enrichment::tests::changed_file_scope_never_continues_to_repo_work
 ---
 
 # Durable Enrichment Control Plane

@@ -16,6 +16,7 @@ use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
+use super::changed_file_plan::discover_and_plan_changed_files;
 use super::enrichment_jobs::{
     EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
     ScanEnrichmentOptions,
@@ -157,6 +158,14 @@ impl EnrichmentContinuation {
     }
 }
 
+fn should_continue_lsp_enrichment(
+    scope: &EnrichmentScope,
+    continuation: EnrichmentContinuation,
+) -> bool {
+    continuation.enabled()
+        && !matches!(scope, EnrichmentScope::Repo | EnrichmentScope::ChangedFiles)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LspBudget {
     pub max_duration: Duration,
@@ -214,6 +223,7 @@ struct LspPipelineInput {
     scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
     skip_lsp: bool,
     dirty_slugs: Option<HashSet<String>>,
+    lsp_node_filter: Option<Arc<HashSet<String>>>,
 }
 
 async fn emit_lsp_pipeline_with_budget(
@@ -230,6 +240,7 @@ async fn emit_lsp_pipeline_with_budget(
             embed_idx: None,
             lance_repo_root: None,
             skip_lsp: input.skip_lsp,
+            lsp_node_filter: input.lsp_node_filter,
         },
         input.dirty_slugs,
     );
@@ -430,6 +441,7 @@ impl RnaHandler {
                 scan_stats: Arc::clone(&scan_stats),
                 skip_lsp: false,
                 dirty_slugs: Some(dirty_slugs),
+                lsp_node_filter: None,
             })
             .await;
 
@@ -869,6 +881,7 @@ impl RnaHandler {
                 scan_stats: bg_scan_stats,
                 skip_lsp: false,
                 dirty_slugs: None,
+                lsp_node_filter: None,
             })
             .await;
 
@@ -1180,6 +1193,7 @@ impl RnaHandler {
                         EnrichmentScope::Repo,
                         EnrichmentTrigger::ForegroundScan,
                         None,
+                        None,
                         true,
                     )
                     .await?;
@@ -1364,6 +1378,7 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: !enrichment.runs_lsp(),
             dirty_slugs,
+            lsp_node_filter: None,
         })
         .await;
         let bus_time = t2.elapsed();
@@ -1749,6 +1764,7 @@ impl RnaHandler {
                 scan_stats: Arc::clone(&self.scan_stats),
                 skip_lsp: !run_lsp_in_bus,
                 dirty_slugs: None,
+                lsp_node_filter: None,
             })
             .await;
             let elapsed = t2.elapsed();
@@ -2044,6 +2060,7 @@ impl RnaHandler {
         scope: EnrichmentScope,
         trigger: EnrichmentTrigger,
         dirty_slugs: Option<HashSet<String>>,
+        lsp_node_filter: Option<Arc<HashSet<String>>>,
         fail_on_lsp_error: bool,
     ) -> anyhow::Result<LspEnrichmentRun>
     where
@@ -2055,6 +2072,7 @@ impl RnaHandler {
             (gs.nodes.clone(), gs.edges.clone())
         };
         let repo_wide_lsp = dirty_slugs.is_none();
+        let scope_detail = scope.stable_key();
 
         let server_name = self.lsp_status.server_name();
         if let Some(ref name) = server_name {
@@ -2109,6 +2127,7 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: false,
             dirty_slugs,
+            lsp_node_filter,
         })
         .await;
 
@@ -2181,8 +2200,11 @@ impl RnaHandler {
                     self.lsp_status.set_complete(lsp_edge_count);
                 } else {
                     let existing_coverage = self.lsp_status.coverage_edge_count();
-                    self.lsp_status
-                        .set_complete_with_coverage(lsp_edge_count, existing_coverage);
+                    self.lsp_status.set_complete_scoped(
+                        lsp_edge_count,
+                        existing_coverage,
+                        scope_detail,
+                    );
                 }
 
                 self.enrichment_jobs.mark_progress(
@@ -2289,11 +2311,17 @@ impl RnaHandler {
                 );
             }
             EnrichmentCapability::CallReferences => {
-                if matches!(scope, EnrichmentScope::ChangedFiles) {
-                    anyhow::bail!(
-                        "changed-file call-reference enrichment is not supported by the LSP executor yet; use `--scope root --root <slug>` or `--scope repo`"
-                    );
-                }
+                let lsp_node_filter = if matches!(scope, EnrichmentScope::ChangedFiles) {
+                    let root_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+                    let plan =
+                        discover_and_plan_changed_files(&self.repo_root, &root_slug, &all_nodes)?;
+                    for line in plan.render_progress() {
+                        on_progress(&line);
+                    }
+                    Some(plan.planned_node_ids())
+                } else {
+                    None
+                };
                 let dirty_slugs = self.dirty_slugs_for_scope(&scope);
                 let run = self
                     .run_foreground_lsp_and_persist(
@@ -2301,6 +2329,7 @@ impl RnaHandler {
                         scope.clone(),
                         EnrichmentTrigger::Explicit,
                         dirty_slugs,
+                        lsp_node_filter,
                         true,
                     )
                     .await?;
@@ -2309,7 +2338,7 @@ impl RnaHandler {
                     "LSP explicit enrichment complete: {} call/reference edges",
                     run.edge_count
                 ));
-                if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+                if should_continue_lsp_enrichment(&scope, continuation) {
                     match continuation {
                         EnrichmentContinuation::Disabled => {}
                         EnrichmentContinuation::SpawnBackground => {
@@ -2336,6 +2365,7 @@ impl RnaHandler {
                                     &on_progress,
                                     EnrichmentScope::Repo,
                                     EnrichmentTrigger::Explicit,
+                                    None,
                                     None,
                                     true,
                                 )
@@ -2651,6 +2681,22 @@ mod tests {
                 .saturating_sub(report.started_at),
             duration.as_secs()
         );
+    }
+
+    #[test]
+    fn changed_file_scope_never_continues_to_repo_work() {
+        assert!(!should_continue_lsp_enrichment(
+            &EnrichmentScope::ChangedFiles,
+            EnrichmentContinuation::SpawnBackground,
+        ));
+        assert!(!should_continue_lsp_enrichment(
+            &EnrichmentScope::ChangedFiles,
+            EnrichmentContinuation::RunToCompletion,
+        ));
+        assert!(should_continue_lsp_enrichment(
+            &EnrichmentScope::Root("fixture".to_string()),
+            EnrichmentContinuation::RunToCompletion,
+        ));
     }
 
     #[test]

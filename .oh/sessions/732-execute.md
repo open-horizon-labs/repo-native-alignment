@@ -2,7 +2,7 @@
 
 **Issue:** #732  
 **Outcome:** context-assembly  
-**Status:** solution selected; implementation pending
+**Status:** implemented; ship gate pending
 
 ## Aim
 
@@ -80,13 +80,23 @@ Changed scope always suppresses background or run-to-completion repo continuatio
 
 ## Acceptance criteria
 
-- [ ] Planner inputs name repo/root, changed files, limits, and git base/ref provenance.
-- [ ] One changed file schedules only eligible nodes in that file and their supported operations.
-- [ ] Execution uses the #730 durable Pass 1 work-item ledger.
-- [ ] Missing provenance/mapping prerequisites reject before a job record is created and name root/repo alternatives.
-- [ ] Scoped completion remains partial for global dead-code and explicit for review-readiness.
-- [ ] Deleted, renamed, unmapped, non-git, and out-of-repo cases have deterministic diagnostics.
-- [ ] Changed scope cannot start repo-wide continuation.
+- [x] Planner inputs name repo/root, changed files, limits, and git base/ref provenance.
+- [x] One changed file schedules only eligible nodes in that file and their supported operations.
+- [x] Execution uses the #730 durable Pass 1 work-item ledger.
+- [x] Missing provenance/mapping prerequisites reject before a job record is created and name root/repo alternatives.
+- [x] Scoped completion remains partial for global dead-code and explicit for review-readiness.
+- [x] Deleted, renamed, unmapped, non-git, and out-of-repo cases have deterministic diagnostics.
+- [x] Changed scope cannot start repo-wide continuation.
+
+## Implementation evidence
+
+- Added a git-backed pure planner for `HEAD` → index/worktree changes with rename detection, repo/root provenance, deterministic diagnostics, and 4,096-node / 12,288-operation hard bounds.
+- Reused Pass 1's operation selector and delivered planned stable-node IDs through `BusOptions` to both `LanguageAccumulatorConsumer` and `AllEnrichmentsGate`.
+- Kept the complete cached graph in the event payload and persistence path while limiting only LSP work production.
+- Planned changed scope before `run_foreground_lsp_and_persist` opens the durable enrichment job and disabled every repo continuation mode for changed scope.
+- Changed non-repo completion to `set_complete_scoped`, preserving partial global dead-code readiness and explicit review-readiness context.
+- Added the one-file fanout oracle, real git provenance, deterministic rename/delete/unmapped, budget, non-git, scheduler/gate agreement, full-graph preservation, and readiness regressions.
+- Local verification: `cargo check --lib`; changed-file tests (6 passed); scoped-readiness regression; full library suite (1,938 passed, 2 ignored).
 
 ## Verification plan
 

@@ -19,6 +19,7 @@
 //!   [`PipelinedTransport`] (concurrent, enrichment-phase), plus URI helpers.
 
 mod passes;
+pub(crate) use passes::requested_operations_for_node;
 mod transport;
 pub(crate) mod work_items;
 use transport::{LspTransport, PipelinedTransport, path_to_uri};
