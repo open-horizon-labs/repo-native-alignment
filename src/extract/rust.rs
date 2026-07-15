@@ -275,12 +275,11 @@ fn collect_scope_import_bindings(
     matches: &mut Vec<String>,
 ) {
     for index in 0..node.child_count() {
-        if let Some(child) = node.child(index as u32) {
-            if child.kind() == "use_declaration"
-                && let Ok(text) = child.utf8_text(source)
-            {
-                collect_import_text_binding(text, name, matches);
-            }
+        if let Some(child) = node.child(index as u32)
+            && child.kind() == "use_declaration"
+            && let Ok(text) = child.utf8_text(source)
+        {
+            collect_import_text_binding(text, name, matches);
         }
     }
 }
