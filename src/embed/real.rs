@@ -902,13 +902,10 @@ impl EmbeddingIndex {
 
     /// Delete rows by ID in batches of 500. Used before add() to avoid merge_insert (#332).
     async fn delete_rows_by_ids(&self, table: &lancedb::Table, ids: &[&str]) -> Result<()> {
-        use lancedb::expr::{col, is_in, lit};
+        use crate::server::store::{PREDICATE_BATCH_SIZE, string_isin};
 
-        for chunk in ids.chunks(500) {
-            let filter = is_in(
-                col("id"),
-                chunk.iter().map(|id| lit((*id).to_owned())).collect(),
-            );
+        for chunk in ids.chunks(PREDICATE_BATCH_SIZE) {
+            let filter = string_isin("id", chunk.iter().map(|id| (*id).to_owned()));
             table
                 .delete(&filter)
                 .await

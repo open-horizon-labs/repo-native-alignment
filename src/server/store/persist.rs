@@ -5,23 +5,17 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arrow_array::RecordBatchIterator;
-use lancedb::expr::{DfExpr, col, is_in, lit};
+use lancedb::expr::{DfExpr, col, lit};
 
 use crate::graph::store::SCHEMA_VERSION;
 use crate::graph::{Edge, Node};
 
 use super::batch::{build_edges_batch, build_symbols_batch};
-use super::graph_lance_path;
 use super::migrate::{
     check_and_migrate_schema, drop_all_lance_tables, is_conflict_error, is_schema_mismatch_error,
     read_committed_scan_version, write_committed_scan_version,
 };
-
-const PREDICATE_BATCH_SIZE: usize = 500;
-
-fn string_isin(column: &str, values: impl IntoIterator<Item = String>) -> DfExpr {
-    is_in(col(column), values.into_iter().map(lit).collect())
-}
+use super::{PREDICATE_BATCH_SIZE, graph_lance_path, string_isin};
 
 /// Persist graph nodes and edges to LanceDB using append-only versioned writes.
 ///
