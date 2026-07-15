@@ -1,6 +1,7 @@
 //! Graph persistence: full persist, incremental upsert, compaction, and root pruning.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,6 +17,12 @@ use super::migrate::{
     read_committed_scan_version, write_committed_scan_version,
 };
 use super::{PREDICATE_BATCH_SIZE, graph_lance_path, string_isin};
+
+#[derive(Default)]
+struct PersistInstrumentation {
+    conflicts: AtomicU64,
+    successful_mutations: AtomicU64,
+}
 
 /// Persist graph nodes and edges to LanceDB using append-only versioned writes.
 ///
@@ -283,6 +290,7 @@ pub(crate) async fn persist_graph_incremental(
         deleted_edge_ids,
         deleted_files,
         retry_limit,
+        None,
     )
     .await
 }
@@ -294,6 +302,7 @@ async fn persist_graph_incremental_with_retry_limit(
     deleted_edge_ids: &[String],
     deleted_files: &[(String, PathBuf)],
     retry_limit: u64,
+    instrumentation: Option<&PersistInstrumentation>,
 ) -> anyhow::Result<bool> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
@@ -364,7 +373,12 @@ async fn persist_graph_incremental_with_retry_limit(
                         // Note: no when_not_matched_by_source_delete -- we only touch changed rows.
                         // Untouched rows (unchanged files) are left alone.
                         match merge.execute(Box::new(batches)).await {
-                            Ok(_) => break,
+                            Ok(_) => {
+                                if let Some(metrics) = instrumentation {
+                                    metrics.successful_mutations.fetch_add(1, Ordering::Relaxed);
+                                }
+                                break;
+                            }
                             Err(e) => {
                                 let err = anyhow::anyhow!("{}", e);
                                 if is_schema_mismatch_error(&err) {
@@ -375,6 +389,9 @@ async fn persist_graph_incremental_with_retry_limit(
                                     drop_all_lance_tables(&db_path);
                                     return Ok(true);
                                 } else if is_conflict_error(&err) && attempts < retry_limit {
+                                    if let Some(metrics) = instrumentation {
+                                        metrics.conflicts.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     attempts += 1;
                                     tracing::warn!(
                                         "LanceDB conflict on symbols merge_insert (attempt {}), retrying in {}ms",
@@ -434,7 +451,12 @@ async fn persist_graph_incremental_with_retry_limit(
                             .when_not_matched_insert_all();
                         // Note: no when_not_matched_by_source_delete -- untouched edges are preserved.
                         match merge.execute(Box::new(batches)).await {
-                            Ok(_) => break,
+                            Ok(_) => {
+                                if let Some(metrics) = instrumentation {
+                                    metrics.successful_mutations.fetch_add(1, Ordering::Relaxed);
+                                }
+                                break;
+                            }
                             Err(e) => {
                                 let err = anyhow::anyhow!("{}", e);
                                 if is_schema_mismatch_error(&err) {
@@ -445,6 +467,9 @@ async fn persist_graph_incremental_with_retry_limit(
                                     drop_all_lance_tables(&db_path);
                                     return Ok(true);
                                 } else if is_conflict_error(&err) && attempts < retry_limit {
+                                    if let Some(metrics) = instrumentation {
+                                        metrics.conflicts.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     attempts += 1;
                                     tracing::warn!(
                                         "LanceDB conflict on edges merge_insert (attempt {}), retrying in {}ms",
@@ -587,6 +612,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::time::Instant;
 
     use super::super::graph_lance_path;
@@ -640,6 +666,156 @@ mod tests {
         let (r1, r2) = tokio::join!(task1, task2);
         r1.expect("task1 panicked").expect("task1 returned error");
         r2.expect("task2 panicked").expect("task2 returned error");
+    }
+
+    #[tokio::test]
+    async fn in_process_serialization_and_retry_controls_are_independent() {
+        const WRITES_PER_TASK: usize = 12;
+
+        for (label, serialized, retry_limit) in [
+            ("mutex_on_retries_on", true, 3),
+            ("mutex_on_retries_off", true, 0),
+            ("mutex_off_retries_on", false, 3),
+            ("mutex_off_retries_off", false, 0),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            persist_graph_to_lance(dir.path(), &[make_test_node("baseline")], &[])
+                .await
+                .expect("baseline persist");
+            let mutex = Arc::new(tokio::sync::Mutex::new(()));
+            let metrics = Arc::new(PersistInstrumentation::default());
+            let lock_wait_micros = Arc::new(AtomicU64::new(0));
+            let started = Instant::now();
+            let mut tasks = Vec::new();
+            for task_id in 0..2 {
+                let root = dir.path().to_path_buf();
+                let mutex = Arc::clone(&mutex);
+                let metrics = Arc::clone(&metrics);
+                let lock_wait_micros = Arc::clone(&lock_wait_micros);
+                tasks.push(tokio::spawn(async move {
+                    for write_id in 0..WRITES_PER_TASK {
+                        let lock_started = Instant::now();
+                        let guard = if serialized {
+                            Some(mutex.lock().await)
+                        } else {
+                            None
+                        };
+                        lock_wait_micros.fetch_add(
+                            lock_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        let result = persist_graph_incremental_with_retry_limit(
+                            &root,
+                            &[make_test_node(&format!("task_{task_id}_{write_id}"))],
+                            &[],
+                            &[],
+                            &[],
+                            retry_limit,
+                            Some(&metrics),
+                        )
+                        .await;
+                        drop(guard);
+                        result?;
+                    }
+                    anyhow::Ok(())
+                }));
+            }
+            for task in tasks {
+                task.await
+                    .expect("writer task panicked")
+                    .unwrap_or_else(|error| panic!("{label}: protected writer failed: {error:#}"));
+            }
+            let state = load_graph_from_lance(dir.path())
+                .await
+                .expect("reopen final graph");
+            assert_eq!(state.nodes.len(), 1 + 2 * WRITES_PER_TASK, "{label}");
+            let unique: std::collections::HashSet<_> =
+                state.nodes.iter().map(Node::stable_id).collect();
+            assert_eq!(unique.len(), state.nodes.len(), "{label}: duplicate IDs");
+            let db = lancedb::connect(graph_lance_path(dir.path()).to_str().expect("utf-8 path"))
+                .execute()
+                .await
+                .expect("connect for table version");
+            let table_version = db
+                .open_table("symbols")
+                .execute()
+                .await
+                .expect("open symbols")
+                .version()
+                .await
+                .expect("read table version");
+            eprintln!(
+                "LanceDB in-process matrix: scenario={label} serialized={serialized} retry_limit={retry_limit} lock_wait_us={} conflicts={} successful_mutations={} elapsed_ms={} table_version={table_version} final_rows={}",
+                lock_wait_micros.load(Ordering::Relaxed),
+                metrics.conflicts.load(Ordering::Relaxed),
+                metrics.successful_mutations.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+                state.nodes.len(),
+            );
+        }
+    }
+
+    /// Foreground scans and background enrichment both perform full graph
+    /// persists. This scenario demonstrates why their shared mutex protects a
+    /// wider boundary than incremental merge conflict retries: without the
+    /// mutex, both writers may publish the same next scan version and expose a
+    /// union of snapshots rather than one complete snapshot.
+    #[tokio::test]
+    async fn full_persist_serialization_preserves_snapshot_semantics() {
+        for serialized in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            persist_graph_to_lance(dir.path(), &[make_test_node("baseline")], &[])
+                .await
+                .expect("baseline persist");
+            let mutex = Arc::new(tokio::sync::Mutex::new(()));
+            let wait_micros = Arc::new(AtomicU64::new(0));
+            let started = Instant::now();
+            let mut tasks = Vec::new();
+            for writer in ["foreground", "background"] {
+                let root = dir.path().to_path_buf();
+                let mutex = Arc::clone(&mutex);
+                let wait_micros = Arc::clone(&wait_micros);
+                tasks.push(tokio::spawn(async move {
+                    let lock_started = Instant::now();
+                    let guard = if serialized {
+                        Some(mutex.lock().await)
+                    } else {
+                        None
+                    };
+                    wait_micros
+                        .fetch_add(lock_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let result =
+                        persist_graph_to_lance(&root, &[make_test_node(writer)], &[]).await;
+                    drop(guard);
+                    result
+                }));
+            }
+            for task in tasks {
+                task.await
+                    .expect("full writer panicked")
+                    .expect("full writer failed");
+            }
+            let state = load_graph_from_lance(dir.path())
+                .await
+                .expect("store must remain readable");
+            let unique: std::collections::HashSet<_> =
+                state.nodes.iter().map(Node::stable_id).collect();
+            assert_eq!(unique.len(), state.nodes.len(), "duplicate stable IDs");
+            if serialized {
+                assert_eq!(
+                    state.nodes.len(),
+                    1,
+                    "serialized full persists expose exactly one complete snapshot"
+                );
+            }
+            let committed = read_committed_scan_version(&graph_lance_path(dir.path()));
+            eprintln!(
+                "LanceDB full/background matrix: serialized={serialized} lock_wait_us={} elapsed_ms={} committed_scan_version={committed} final_rows={}",
+                wait_micros.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+                state.nodes.len(),
+            );
+        }
     }
 
     /// Child-process entry point for the adversarial writer test below. Keeping
@@ -816,6 +992,44 @@ mod tests {
                 state.nodes.len(),
             );
         }
+    }
+
+    #[test]
+    fn interrupted_cross_process_writer_leaves_committed_store_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime
+            .block_on(persist_graph_to_lance(
+                dir.path(),
+                &[make_test_node("baseline")],
+                &[],
+            ))
+            .expect("baseline persist");
+
+        let test_binary = std::env::current_exe().expect("current test binary");
+        let mut child = writer_command(&test_binary, dir.path(), "interrupted", 500, 3)
+            .spawn()
+            .expect("spawn writer");
+        std::thread::sleep(Duration::from_millis(20));
+        child.kill().expect("interrupt writer");
+        let status = child.wait().expect("reap interrupted writer");
+        assert!(!status.success(), "writer should have been interrupted");
+
+        let state = runtime
+            .block_on(load_graph_from_lance(dir.path()))
+            .expect("interrupted writer must leave store readable");
+        assert!(
+            state.nodes.iter().any(|node| node.id.name == "baseline"),
+            "last committed baseline must survive interruption"
+        );
+        let unique: std::collections::HashSet<_> =
+            state.nodes.iter().map(Node::stable_id).collect();
+        assert_eq!(unique.len(), state.nodes.len(), "no duplicate stable IDs");
+        eprintln!(
+            "LanceDB interruption: final_rows={} committed_scan_version={} store_readable=true",
+            state.nodes.len(),
+            read_committed_scan_version(&graph_lance_path(dir.path())),
+        );
     }
 
     #[tokio::test]

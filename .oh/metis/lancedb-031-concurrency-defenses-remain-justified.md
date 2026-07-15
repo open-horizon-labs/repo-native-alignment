@@ -7,9 +7,20 @@ source_issue: 746
 
 ## What was measured
 
-RNA's incremental graph persistence was exercised through genuine child
-processes sharing one local LanceDB store. The regression matrix varies two
-controls independently:
+RNA's incremental graph persistence was exercised both with Tokio tasks that
+share the same mutex and with genuine child processes sharing one local
+LanceDB store. The in-process matrix toggles the actual equivalent of RNA's
+serialization boundary independently from its retry limit:
+
+| Scenario | Mutex | Retry limit | Successful mutations | Conflicts | Lock wait | Table version | Final rows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| mutex on, retries on | on | 3 | 24 | 0 | 169 ms | 26 | 25 |
+| mutex on, retries off | on | 0 | 24 | 0 | 149 ms | 26 | 25 |
+| mutex off, retries on | off | 3 | 24 | 0 | 0 | 26 | 25 |
+| mutex off, retries off | off | 0 | 24 | 0 | 0 | 26 | 25 |
+
+The separate-process matrix varies process scheduling and retry limit. It does
+not claim that scheduling toggles the in-process mutex:
 
 | Scenario | Process scheduling | Merge retry limit | Attempted writes | Final unique rows | Elapsed |
 |---|---:|---:|---:|---:|---:|
@@ -39,6 +50,18 @@ which cannot share the Tokio mutex. A zero-conflict sample is insufficient to
 retire a defense added after real failures. Removal would require a deterministic
 way to force and observe every supported writer overlap, including interrupted
 full persists and embedding delete-plus-add operations.
+
+The full-persist overlap supplies the decisive serialization evidence. With
+the mutex, foreground and background full writers committed scan versions 2
+then 3 and the reopened store exposed exactly one complete snapshot. Without
+the mutex, both selected scan version 2 and the reopened store exposed the
+union of both snapshots (two rows). That violates full-snapshot semantics even
+though the store remained readable, so serialization is required.
+
+An interrupted separate-process incremental writer is also killed mid-run and
+the store is reopened. The last committed baseline remains visible and stable
+IDs remain unique. Typed delete, edge delete, scan-version filtering, and stale
+version compaction remain covered by the adjacent persistence regression suite.
 
 ## Reproduction
 
