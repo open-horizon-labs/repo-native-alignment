@@ -1,6 +1,7 @@
 import process from "node:process";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -236,13 +237,32 @@ try {
 
   // ── 4c. exact current-filesystem source span ─────────────────────────────
   console.log("\n── search (exact source span) ──");
+  const diagnosticFixture = path.join(repoPath, "construction_error.rs");
+  const diagnosticOutput = path.join(repoPath, ".oh", ".cache", "construction_error.rmeta");
+  const compiler = spawnSync(
+    "rustc",
+    [diagnosticFixture, "--emit", "metadata", "-o", diagnosticOutput],
+    { encoding: "utf8" },
+  );
+  const diagnosticMatch = (compiler.stderr ?? "").match(
+    /--> .*construction_error\.rs:(\d+):(\d+)/,
+  );
+  if (!diagnosticMatch) {
+    fail(
+      "fixture compiler emits a source location",
+      compiler.stderr || `rustc exited ${compiler.status}`,
+    );
+  }
+  const diagnosticLocation = diagnosticMatch
+    ? `construction_error.rs:${diagnosticMatch[1]}:${diagnosticMatch[2]}`
+    : "construction_error.rs:2:17";
   const sourceSpanText = await callSearchWithRetry({
-    file: "lib.rs:1:8",
+    file: diagnosticLocation,
   });
   assertContains(
-    "MCP search retrieves compiler-style source location",
+    "MCP search retrieves construction site from fixture compiler diagnostic",
     sourceSpanText,
-    '1 | pub fn main() { println!("{}", hello()); }',
+    "let value = MissingThing { field: 1 };",
   );
   assertContains(
     "MCP source span labels current filesystem provenance",
@@ -332,6 +352,9 @@ try {
   }
 } finally {
   await client.close();
+  fs.rmSync(path.join(repoPath, ".oh", ".cache", "construction_error.rmeta"), {
+    force: true,
+  });
   if (previousWorkItemLedger) {
     fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
   } else {
