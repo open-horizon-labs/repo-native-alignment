@@ -66,6 +66,10 @@ The existing scorer seam now rejects empty query vectors and incompatible Arrow 
 - `cargo test --lib --features embeddings single_query_embedding_rejects_missing_or_malformed_output` (1 passed)
 - `cargo test --lib --features embeddings required_string_column_returns_schema_error_instead_of_panicking` (1 passed)
 
+## Independent review
+
+The required independent reviewer found that `tokio::spawn` contains a panic for the MCP response but the process panic hook can still emit its raw payload to stderr. The scorer boundary now installs a process-wide delegating hook and enables payload redaction only while polling scorer futures. Other panics still use the prior hook. Focused panic regressions verify the redacted hook runs before Tokio returns the `JoinError`.
+
 ### Risk retirement
 
 | Risk | Status | Tempting patch failed | Evidence |

@@ -4,7 +4,9 @@
 //! `search_flat`, `search_traversal`, or `search_batch` depending on the
 //! parameters supplied by the caller.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Once;
 
 use crate::embed::{EMBEDDING_MODEL_NAME, SearchFilters, SearchMode, SearchOutcome};
 use crate::graph::index::GraphIndex;
@@ -251,6 +253,67 @@ struct EmbeddingScorerDiagnostic {
     mode: SearchMode,
 }
 
+thread_local! {
+    static REDACT_SCORER_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
+static INSTALL_SCORER_PANIC_HOOK: Once = Once::new();
+
+#[cfg(test)]
+static REDACTED_SCORER_PANICS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn install_scorer_panic_hook() {
+    INSTALL_SCORER_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let redact = REDACT_SCORER_PANIC.try_with(Cell::get).unwrap_or(false);
+            if redact {
+                #[cfg(test)]
+                REDACTED_SCORER_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    component = "embedding_scorer",
+                    model = EMBEDDING_MODEL_NAME,
+                    index = "attached",
+                    failure = "task_panic",
+                    "Embedding scorer panicked; panic payload redacted"
+                );
+            } else {
+                previous(panic_info);
+            }
+        }));
+    });
+}
+
+struct ScorerPanicRedactionGuard {
+    previous: bool,
+}
+
+impl ScorerPanicRedactionGuard {
+    fn enter() -> Self {
+        let previous = REDACT_SCORER_PANIC.with(|redact| redact.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for ScorerPanicRedactionGuard {
+    fn drop(&mut self) {
+        REDACT_SCORER_PANIC.with(|redact| redact.set(self.previous));
+    }
+}
+
+async fn poll_scorer_with_content_safe_panic_hook<F>(scorer: F) -> anyhow::Result<SearchOutcome>
+where
+    F: std::future::Future<Output = anyhow::Result<SearchOutcome>>,
+{
+    let mut scorer = Box::pin(scorer);
+    std::future::poll_fn(move |cx| {
+        let _redaction = ScorerPanicRedactionGuard::enter();
+        scorer.as_mut().poll(cx)
+    })
+    .await
+}
+
 impl EmbeddingScorerDiagnostic {
     fn render(&self) -> String {
         let mode = match self.mode {
@@ -276,7 +339,8 @@ async fn isolate_embedding_scorer<F>(
 where
     F: std::future::Future<Output = anyhow::Result<SearchOutcome>> + Send + 'static,
 {
-    match tokio::spawn(scorer).await {
+    install_scorer_panic_hook();
+    match tokio::spawn(poll_scorer_with_content_safe_panic_hook(scorer)).await {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(_)) => {
             tracing::warn!(
@@ -2657,6 +2721,7 @@ mod tests {
     /// Without embed index, flat search falls back to name/signature matching.
     #[tokio::test]
     async fn test_scorer_panic_becomes_content_safe_actionable_diagnostic() {
+        let redacted_before = REDACTED_SCORER_PANICS.load(std::sync::atomic::Ordering::Relaxed);
         let repository_content = "secret-query src/private/customer.rs";
         let diagnostic = match isolate_embedding_scorer(
             async move {
@@ -2681,6 +2746,10 @@ mod tests {
         assert!(rendered.contains("bounded lexical/graph results"));
         assert!(!rendered.contains("secret-query"));
         assert!(!rendered.contains("customer.rs"));
+        assert!(
+            REDACTED_SCORER_PANICS.load(std::sync::atomic::Ordering::Relaxed) > redacted_before,
+            "the panic hook must redact the payload before Tokio converts the panic to JoinError"
+        );
     }
 
     #[tokio::test]
