@@ -1152,6 +1152,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_symbol_search_after_successful_live_worktree_map() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let query = "mapped_worktree_symbol_probe";
+        let symbols = [
+            "mapped_worktree_symbol_probe_one",
+            "mapped_worktree_symbol_probe_two",
+        ];
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            format!(
+                "pub fn {}() -> &'static str {{ \"mapped-one\" }}\npub fn {}() -> &'static str {{ \"mapped-two\" }}\n",
+                symbols[0], symbols[1]
+            ),
+        )
+        .unwrap();
+
+        let handler = make_handler(repo.path());
+        let graph = handler
+            .build_full_graph()
+            .await
+            .expect("live worktree map should succeed");
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| graph.nodes.iter().any(|node| node.id.name == *symbol)),
+            "mapped graph should contain both probe symbols"
+        );
+        handler
+            .graph
+            .store(std::sync::Arc::new(Some(std::sync::Arc::new(graph))));
+
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": query,
+            "repo": repo.path().to_string_lossy(),
+            "include_markdown": false,
+            "include_artifacts": false,
+            "search_mode": "hybrid",
+            "limit": 1,
+            "compact": true,
+            "verbose": false
+        }))
+        .unwrap();
+        let result = crate::service::search::with_test_embedding_scorer_panic(
+            format!("{query} src/private/customer.rs"),
+            handler.handle_search(args),
+        )
+        .await
+        .unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+
+        let returned_symbols = symbols
+            .iter()
+            .filter(|symbol| rendered.contains(**symbol))
+            .count();
+        assert!(
+            returned_symbols == 1,
+            "fallback should return exactly one mapped symbol at limit=1: {rendered}"
+        );
+        assert!(rendered.contains("failure=task_panic"), "got: {rendered}");
+        assert!(!rendered.contains("customer.rs"), "got: {rendered}");
+    }
+
     /// A path with just a slash followed by nothing is still absolute.
     #[test]
     fn test_resolve_repo_path_root_slash_is_absolute() {
