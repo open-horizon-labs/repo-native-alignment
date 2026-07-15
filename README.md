@@ -138,21 +138,33 @@ Example `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "rna": {
+    "rna-server": {
       "type": "stdio",
       "command": "/Users/me/.cargo/bin/repo-native-alignment",
-      "args": ["--repo", "/path/to/your/project"],
-      "env": {
-        "DOTNET_ROOT": "/opt/homebrew/opt/dotnet/libexec",
-        "DOTNET_ROOT_ARM64": "/opt/homebrew/opt/dotnet/libexec",
-        "PATH": "/Users/me/.dotnet/tools:/opt/homebrew/opt/dotnet/libexec:/Users/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-      }
+      "args": ["--repo", "/path/to/your/project"]
     }
   }
 }
 ```
 
-For Homebrew, mise, asdf, or official .NET installs, keep `command` as the RNA binary and put `DOTNET_ROOT`/`DOTNET_ROOT_ARM64` plus `~/.dotnet/tools` PATH entries in `env`; do not launch RNA through `mise exec`, `asdf exec`, or wrapper scripts.
+Keep `command` as the direct RNA binary. Do not launch RNA through `mise`,
+`asdf`, `brew`, another tool-manager command, or a wrapper script.
+
+#### Optional C#/.NET LSP enrichment
+
+Only investigate or configure .NET when the repository contains C#/.NET markers
+(such as `.cs`, `.csproj`, or `.sln` files), `repo-native-alignment setup`
+reports that the optional C# toolchain is needed, or the user explicitly asks
+for C# enrichment. Other repositories need no .NET environment configuration.
+
+C# call/reference enrichment requires `dotnet` and `csharp-ls`. Install
+`csharp-ls` with `dotnet tool install -g csharp-ls` and ensure
+`~/.dotnet/tools` is on `PATH`. If the MCP launcher does not inherit the shell
+environment, add the appropriate `DOTNET_ROOT` (and `DOTNET_ROOT_ARM64` on
+Apple Silicon) plus the .NET root and `~/.dotnet/tools` to the server's `env`
+block. Homebrew, mise, asdf, and official installs use different roots; use the
+root reported by the setup command. The MCP `command` must still be the direct
+RNA binary, never `mise`, `asdf`, `brew`, or another wrapper.
 
 For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382`
 

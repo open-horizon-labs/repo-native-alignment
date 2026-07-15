@@ -256,18 +256,13 @@ fn check_dep(cmd: &str, args: &[&str], remediation: &str) -> Result<()> {
 }
 
 fn report_optional_csharp_toolchain(project_path: &Path, dry_run: bool) {
-    if !has_csharp_markers(project_path) {
+    let Some(dry_run_guidance) = optional_csharp_dry_run_guidance(project_path) else {
         return;
-    }
+    };
 
     println!("Checking optional C#/.NET LSP toolchain...");
     if dry_run {
-        println!("  [dry-run] Would check: dotnet on PATH");
-        println!("  [dry-run] Would check: csharp-ls on PATH");
-        println!("  [dry-run] Would check: DOTNET_ROOT / DOTNET_ROOT_ARM64 for MCP stdio env");
-        println!(
-            "  Guidance: keep .mcp.json command as the direct repo-native-alignment binary; put DOTNET_ROOT and PATH additions in the server env instead of launching through mise/asdf/brew wrappers.\n"
-        );
+        println!("{dry_run_guidance}");
         return;
     }
 
@@ -318,6 +313,12 @@ fn report_optional_csharp_toolchain(project_path: &Path, dry_run: bool) {
             "  C#/.NET LSP prerequisites look usable. Mirror DOTNET_ROOT and PATH in .mcp.json env if your MCP launcher does not inherit shell profile setup.\n"
         );
     }
+}
+
+fn optional_csharp_dry_run_guidance(project_path: &Path) -> Option<&'static str> {
+    has_csharp_markers(project_path).then_some(
+        "  [dry-run] Would check: dotnet on PATH\n  [dry-run] Would check: csharp-ls on PATH\n  [dry-run] Would check: DOTNET_ROOT / DOTNET_ROOT_ARM64 for MCP stdio env\n  Guidance: keep .mcp.json command as the direct repo-native-alignment binary; put DOTNET_ROOT and PATH additions in the server env instead of launching through mise/asdf/brew wrappers.\n",
+    )
 }
 
 fn command_on_path(cmd: &str) -> bool {
@@ -1014,6 +1015,10 @@ mod tests {
             v["mcpServers"]["rna-server"]["timeout"],
             DEFAULT_MCP_TIMEOUT_MS
         );
+        assert!(
+            v["mcpServers"]["rna-server"].get("env").is_none(),
+            "non-.NET setup must not add optional .NET environment configuration"
+        );
     }
 
     // ── merge preserves other servers ────────────────────────────────────────
@@ -1213,12 +1218,50 @@ mod tests {
     }
 
     #[test]
+    fn test_has_csharp_markers_detects_source_files_and_solutions() {
+        for marker in ["Program.cs", "App.sln"] {
+            let (_dir, proj) = tmp();
+            std::fs::write(proj.join(marker), "marker").unwrap();
+            assert!(
+                has_csharp_markers(&proj),
+                "{marker} must activate optional C#/.NET setup guidance"
+            );
+        }
+    }
+
+    #[test]
     fn test_has_csharp_markers_ignores_non_csharp_project() {
         let (_dir, proj) = tmp();
         std::fs::create_dir_all(proj.join("src")).unwrap();
         std::fs::write(proj.join("src/main.rs"), "fn main() {}").unwrap();
 
         assert!(!has_csharp_markers(&proj));
+        assert!(
+            optional_csharp_dry_run_guidance(&proj).is_none(),
+            "non-.NET setup must not surface .NET environment guidance"
+        );
+    }
+
+    #[test]
+    fn test_csharp_setup_surfaces_optional_enrichment_prerequisites() {
+        let (_dir, proj) = tmp();
+        std::fs::write(proj.join("App.csproj"), "<Project />").unwrap();
+
+        let guidance = optional_csharp_dry_run_guidance(&proj)
+            .expect("C# setup must surface optional toolchain guidance");
+        for prerequisite in [
+            "dotnet",
+            "csharp-ls",
+            "DOTNET_ROOT",
+            "DOTNET_ROOT_ARM64",
+            "PATH",
+            "direct repo-native-alignment binary",
+        ] {
+            assert!(
+                guidance.contains(prerequisite),
+                "C# guidance must mention {prerequisite}: {guidance}"
+            );
+        }
     }
 
     #[test]
