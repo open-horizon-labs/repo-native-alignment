@@ -32,6 +32,7 @@ What are we actually optimizing? Not the feature, the outcome.
 Be precise. "Build a login page" is a feature. "Reduce time-to-first-value for new users" is an objective. The aim IS the abstraction.
 
 Ask:
+
 - What change in behavior would indicate success?
 - What metric would move if this worked?
 - What problem disappears if we get this right?
@@ -40,7 +41,7 @@ Ask:
 
 List what we're treating as fixed. Be explicit about each constraint's nature:
 
-```
+```text
 Constraint: [the boundary]
 Type: [hard | soft | assumed]
 Reason: [why it exists]
@@ -71,6 +72,7 @@ Every problem statement has embedded assumptions. Make them visible:
 > "We assume [assumption]. If this is false, [consequence]."
 
 Common hidden assumptions:
+
 - The current architecture must be preserved
 - The feature set is fixed
 - The timeline can't change
@@ -81,6 +83,7 @@ Common hidden assumptions:
 Are we solving the real problem (X) or the user's attempted solution (Y)?
 
 Signs of X-Y mismatch:
+
 - Request is oddly specific for a simple goal
 - You're building something that feels like a workaround
 - "How do I do [technique]" without explaining why
@@ -92,7 +95,7 @@ If potential X-Y problem detected:
 
 Always produce a problem space map in this structure:
 
-```
+```text
 ## Problem Space Map
 
 **Date:** [timestamp]
@@ -130,7 +133,7 @@ Always produce a problem space map in this structure:
 
 ### Example 1: Repeated Deployment Failures
 
-```
+```text
 /problem-space
 
 Deployments keep failing. We've added 3 config flags in the last month
@@ -138,7 +141,8 @@ and each one "fixes" something but creates new edge cases.
 ```
 
 **Output:**
-```
+
+```text
 ## Problem Space Map
 
 **Date:** 2024-01-15
@@ -177,14 +181,15 @@ No - Need to understand if this is a band-aid problem (more config) or a redesig
 
 ### Example 2: Performance Degradation
 
-```
+```text
 /problem-space
 
 App is slow. PM wants us to "optimize the database queries."
 ```
 
 **Output:**
-```
+
+```text
 ## Problem Space Map
 
 **Date:** 2024-01-15
@@ -226,9 +231,11 @@ No - Need performance profiling to identify actual bottleneck before optimizing 
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/problem-space auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/problem-space`):
+
 - After producing the problem space map, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the exploration topic
@@ -238,6 +245,11 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 **Writing:** After producing output, write the problem space map to the session file:
 
 ```markdown
+---
+session: <session>
+artifact_type: problem-space
+updated: <timestamp>
+---
 ## Problem Space
 **Updated:** <timestamp>
 
@@ -247,23 +259,26 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces problem space map through questioning. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for prior context (aim, problem statement)
 - Writes problem space map to the session file
 - Subsequent skills can read constraints and terrain
 
 ### With RNA MCP (repo-native-alignment)
 
-When the RNA MCP server is available (`oh_search_context` tool present), enrich the problem space map with repo-local situated knowledge before presenting it to the human.
+When RNA MCP is available, enrich the problem space map with repo-local situated knowledge before presenting it to the human.
 
-**At Step 2 (Map Constraints):** Call `oh_search_context` with the objective/domain and `phase: "problem-space"`. Surface any guardrails that apply — these are already-settled constraints the team has established, not assumptions to question. Fold them into the constraints table as `hard` with source attribution. Present remaining guardrail candidates for human confirmation.
+**At Step 2 (Map Constraints):** Call `search` with the objective/domain and `include_artifacts: true`; filter results to relevant guardrails. These are already-settled constraints, not assumptions to question. Fold them into the constraints table as `hard` with source attribution. Present remaining candidates for human confirmation.
 
-**At Step 3 (Terrain / Precedents):** Call `oh_search_context` with the problem domain. Surface relevant metis entries tagged to similar problem spaces or outcomes. Present as a short candidate list with provenance — human selects what to carry as precedents. Discard the rest; do not inject indiscriminately.
+**At Step 3 (Terrain / Precedents):** Call `search` with the problem domain and `include_artifacts: true`. Surface relevant metis tagged to similar problem spaces or outcomes. Present a short candidate list with provenance; the human selects what to carry. Discard the rest.
 
 **Format for surfaced candidates:**
-```
+
+```text
 **Relevant metis/guardrails from this repo:**
 - [metis title] (source: .oh/metis/filename.md) — [one-line relevance note]
   → Keep / Dismiss?
@@ -274,6 +289,7 @@ Human selects before the problem space map is finalized. What they select appear
 **Phase tag:** Pass `phase: "problem-space"` to filter for phase-appropriate entries. Cross-phase metis (solution-space learnings, implementation notes) is noise here and must be excluded unless explicitly requested.
 
 ### With Open Horizons MCP
+
 - Queries graph for related past decisions and their outcomes
 - Pulls relevant tribal knowledge about similar problem spaces
 - Retrieves guardrails that apply to this domain
@@ -288,6 +304,7 @@ Human selects before the problem space map is finalized. What they select appear
 ## Leads To
 
 After problem space mapping, typically:
+
 - `/problem-statement` - Crisp articulation of what needs solving
 - `/solution-space` - Explore candidate implementations
 - Return to stakeholders - If constraints need challenging

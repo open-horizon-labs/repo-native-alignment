@@ -25,11 +25,12 @@ Invoke `/teach-oh` when:
 Before exploring, check if RNA is available — it makes everything that follows richer.
 
 **Detection (in order):**
-1. Check if `oh_search_context` or `search_symbols` tools are available in the current session (RNA MCP already configured)
+
+1. Check if RNA's `search`, `repo_map`, `list_roots`, or `outcome_progress` tools are available in the current session
 2. Check if `repo-native-alignment` is on PATH: `which repo-native-alignment`
 3. Check if `.mcp.json` references `repo-native-alignment` or `rna-server`
 
-**If RNA is available:** Proceed to Step 1. Use RNA tools (`search_symbols`, `oh_search_context`, `graph_query`) throughout exploration instead of Grep/Read.
+**If RNA is available:** Proceed to Step 1. Use `repo_map` for orientation and `search` for symbols, artifacts, neighbors, and impact instead of Grep/Read.
 
 **If RNA is NOT available:** Offer to install it:
 
@@ -38,37 +39,43 @@ Before exploring, check if RNA is available — it makes everything that follows
 **If accepted:**
 
 1. Detect platform and chip:
+
    ```bash
    OS=$(uname -s)
    ARCH=$(uname -m)
    CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
    ```
+
    - macOS ARM M4+: `Darwin` + `arm64` + brand_string contains "M4" → use `darwin-arm64-m4`
    - macOS ARM (other): `Darwin` + `arm64` → use `darwin-arm64`
    - Linux x86_64: `Linux` + `x86_64` → use `linux-x86_64`
 
 2. Download the binary to `~/.local/bin/` (no sudo required):
+
    ```bash
-   mkdir -p ~/.cargo/bin
+   mkdir -p ~/.local/bin
 
    # macOS M4+
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
+   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
 
    # macOS M1/M2/M3
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
+   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
 
    # Linux x86_64
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
+   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
    ```
-   `~/.cargo/bin` is on PATH for Rust users (set up by rustup).
+
+   Ensure `~/.local/bin` is on PATH (for example, add `export PATH="$HOME/.local/bin:$PATH"` to the shell profile).
 
 3. Run setup for the current project:
+
    ```bash
    repo-native-alignment setup --project .
    ```
+
    This configures `.mcp.json` and verifies the pipeline.
 
-4. Tell the user: "RNA is installed. Continuing with RNA CLI tools for this session — `search` and `graph` work now. MCP tools (`oh_search_context`, `search_symbols`, `graph_query`) will be available after you restart Claude Code."
+4. Tell the user: "RNA is installed. Continuing with RNA CLI tools for this session. MCP tools (`search`, `repo_map`, `list_roots`, and `outcome_progress`) will be available after you restart the client."
 
 **If declined:** Proceed without RNA. teach-oh works fine without it — exploration just uses standard tools (Grep, Read, Glob).
 
@@ -77,16 +84,19 @@ Before exploring, check if RNA is available — it makes everything that follows
 Before asking questions, scan the project independently:
 
 **Structure & Stack**
+
 - Directory layout, key folders
 - Package files (package.json, Cargo.toml, go.mod, etc.)
 - Build configuration, CI/CD setup
 
 **Existing Context**
+
 - AGENTS.md, CLAUDE.md, README, CONTRIBUTING
 - `.oh/`, `docs/adr/` directories
 - Any existing project documentation
 
 **Patterns & Conventions**
+
 - Naming conventions in code
 - File organization patterns
 - Recent git commits for style and focus
@@ -98,21 +108,25 @@ Before asking questions, scan the project independently:
 After exploration, ask targeted questions about what couldn't be inferred. Focus on strategy and aims, not just code.
 
 #### Purpose & Aims
+
 - What is this project trying to achieve?
 - Who uses it? What change in their behavior indicates success?
 - What's the current focus or priority?
 
 #### Strategic Constraints
+
 - What constraints never bend? (Compliance, performance SLAs, etc.)
 - What trade-offs has the team made intentionally?
 - What's explicitly out of scope?
 
 #### Team & Decision-Making
+
 - How does the team make decisions?
 - What does "done" mean here?
 - Any patterns or practices that are sacred?
 
 #### What to Avoid
+
 - Past mistakes that shouldn't be repeated
 - Patterns that look tempting but don't fit
 - Areas of the codebase that are sensitive
@@ -138,7 +152,7 @@ Otherwise use the **skills variant**.
 
 **The shift:** Action is cheap. Knowing what to do is scarce.
 
-**The sequence:** aim → problem-space → problem-statement → solution-space → execute → ship
+**The sequence:** aim → problem-space → problem-statement → solution-space → draft PR → execute → ship
 
 **Where to start (triggers):**
 - Can't explain why you're building this → `/aim`
@@ -180,12 +194,13 @@ Otherwise use the **skills variant**.
 ```
 
 **Agents variant** (phase agents installed):
+
 ```markdown
 # Open Horizons Framework
 
 **The shift:** Action is cheap. Knowing what to do is scarce.
 
-**The sequence:** aim → problem-space → problem-statement → solution-space → execute → ship
+**The sequence:** aim → problem-space → problem-statement → solution-space → draft PR → execute → ship
 
 Each phase runs as an agent with isolated context and scoped tools. Dispatch via
 the `task` tool — each agent reads/writes `.oh/<session>.md` to pass context
@@ -196,7 +211,7 @@ between phases.
 - Keep hitting the same blockers → dispatch `oh-problem-space` agent
 - Solutions feel forced → dispatch `oh-problem-statement` agent
 - About to start coding → dispatch `oh-solution-space` agent
-- Ready to implement → dispatch `oh-execute` agent
+- Ready to implement → create the draft PR, then dispatch `oh-execute` agent
 - Code complete, need to deliver → dispatch `oh-ship` agent
 - Work is drifting or reversing → `/salvage`
 
@@ -236,7 +251,7 @@ between phases.
 
 Present findings for user approval before writing:
 
-```
+```text
 ## Teach-OH Summary
 
 ### What I Discovered
@@ -256,7 +271,7 @@ After your answers, I'll draft a AGENTS.md section for your approval.
 
 After user answers:
 
-```
+```text
 ## Proposed AGENTS.md Addition
 
 [Draft the Project Context section]
@@ -268,13 +283,13 @@ After user answers:
 
 ## Example
 
-```
+```text
 /teach-oh
 ```
 
 **Agent explores, then:**
 
-```
+```text
 ## Teach-OH Summary
 
 ### What I Discovered
@@ -292,14 +307,14 @@ After user answers:
 
 **User answers, agent drafts:**
 
-```
+```text
 ## Proposed AGENTS.md Addition
 
 # Open Horizons Framework
 
 **The shift:** Action is cheap. Knowing what to do is scarce.
 
-**The sequence:** aim → problem-space → problem-statement → solution-space → execute → ship
+**The sequence:** aim → problem-space → problem-statement → solution-space → draft PR → execute → ship
 
 **Where to start (triggers):**
 - Can't explain why you're building this → `/aim`
@@ -357,9 +372,11 @@ If the user is running OMP (oh-my-pi), offer to install the phase-aware skills h
 **If accepted:**
 
 1. Fetch the hook source from GitHub and write it to the project's `.omp/hooks/oh-skills-phase.ts` (create the directory if needed):
+
    ```
    https://raw.githubusercontent.com/open-horizon-labs/skills/master/hooks-omp/oh-skills-phase.ts
    ```
+
    Do NOT fabricate or rewrite the hook — always fetch the canonical source.
 
 2. Optionally create `.oh/skills-config.json` based on what you learned about the project. The config is loaded once at session start (changes require restarting OMP):
@@ -375,6 +392,7 @@ If the user is running OMP (oh-my-pi), offer to install the phase-aware skills h
 ```
 
 **Customization guidance:**
+
 - `projectSkills`: Include only the skills relevant to this project's workflow. A solo dev doing rapid iteration might skip `problem-space`. A team with compliance requirements might always want `dissent` before `execute`. **Note:** `phaseOverrides` targets must be included in `projectSkills` — override skills are filtered by the same allow list. Reflection skills (`review`, `dissent`, `salvage`, `distill`) are always-available and don't need to appear in `projectSkills` — they're invoked on demand, not phase-triggered.
 - `disabledSkills`: Skills that don't fit this project (e.g., `ship` for a library that publishes via CI).
 - `phaseOverrides`: Extra skills to suggest during specific phases. Common: adding `dissent` during `execute` for security-sensitive projects.
@@ -400,7 +418,7 @@ pre-built agent wrappers that give each phase its own context.
 
 Fetch all 6 agent files from GitHub and write each to `.omp/agents/` (create the directory if needed):
 
-```
+```text
 Base URL: https://raw.githubusercontent.com/open-horizon-labs/skills/master/agents-omp/
 Files:
   oh-aim.md
@@ -428,7 +446,7 @@ After writing all 6 files, append this block to each agent file:
 If OH MCP is not present, skip this block — the agents work without it.
 
 **RNA MCP preamble** (only if repo-native-alignment MCP is configured — check for
-`oh_search_context` in the parent session's available tools, or for `rna-server` in
+RNA `search` or `repo_map` in the parent session's available tools, or for `rna-server` in
 `.mcp.json`):
 After writing all 6 files, append this block to each agent file:
 
@@ -436,7 +454,7 @@ After writing all 6 files, append this block to each agent file:
 
 ## Repo-Native Alignment MCP
 When rna-server tools are available:
-- Before framing: call `oh_search_context` with your task description to find relevant outcomes, guardrails, and metis
+- Before framing: call `search` with the task description and `include_artifacts: true` to find relevant outcomes, guardrails, and metis
 - After producing output: write learnings to `.oh/metis/<slug>.md`
 - When checking progress: call `outcome_progress` with the relevant outcome ID
 - When discovering constraints: write to `.oh/guardrails/<slug>.md`
@@ -465,7 +483,7 @@ If the user is running Claude Code (not OMP), offer to install phase agents to `
 
 Fetch all 6 agent files from GitHub and write each to `.claude/agents/` (create the directory if needed):
 
-```
+```text
 Base URL: https://raw.githubusercontent.com/open-horizon-labs/skills/master/agents-claude/
 Files:
   oh-aim.md

@@ -28,6 +28,7 @@ Invoke `/solution-space` when:
 Exploration is cheap. The failure mode is defending the first solution that works.
 
 **Signs you're stuck on a local maximum:**
+
 - First solution considered is the only solution considered
 - You're explaining why alternatives won't work before trying them
 - You're acting as a crafter (defending) rather than an editor (filtering)
@@ -38,6 +39,7 @@ Exploration is cheap. The failure mode is defending the first solution that work
 Not all problems need redesigns. The ladder helps you find the right altitude.
 
 ### Level 1: Band-Aid Fix
+
 **Don't default to this.** Patch the symptom.
 
 - Fine under deadline pressure
@@ -47,6 +49,7 @@ Not all problems need redesigns. The ladder helps you find the right altitude.
 *Example: Add a null check. Catch the exception. Hardcode the edge case.*
 
 ### Level 2: Local Optimum
+
 **Better, but limited.** Optimize within current assumptions.
 
 - Classic refactor trap
@@ -56,6 +59,7 @@ Not all problems need redesigns. The ladder helps you find the right altitude.
 *Example: Extract a method. Add a parameter. Refactor for readability.*
 
 ### Level 3: Reframe
+
 **Now you're thinking.** Question the problem statement.
 
 - Different framing yields different solutions
@@ -65,6 +69,7 @@ Not all problems need redesigns. The ladder helps you find the right altitude.
 *Example: "We need faster cache invalidation" becomes "Why do we cache this at all?"*
 
 ### Level 4: Redesign
+
 **This is the goal.** Change the system so the problem doesn't exist.
 
 - The higher peak, the terraform
@@ -100,6 +105,7 @@ List at least 3-4 candidate approaches before evaluating any:
 ```
 
 **Rules for this step:**
+
 - No evaluation yet - just generation
 - Include at least one approach from a higher level than your instinct
 - Include the "obvious" solution even if you don't like it
@@ -193,13 +199,14 @@ If you explored genuinely and still landed on the first idea, that's fine. The d
 
 ### Example 1: Performance Problem
 
-```
+```text
 /solution-space
 
 Users report the dashboard is slow. Loading takes 8 seconds.
 ```
 
 **Output:**
+
 ```markdown
 ## Solution Space Analysis
 
@@ -251,7 +258,7 @@ Users report the dashboard is slow. Loading takes 8 seconds.
 
 ### Example 2: The Third Config Flag
 
-```
+```text
 /solution-space
 
 We have a bug where notifications fire twice. This is the third
@@ -259,6 +266,7 @@ config flag we're adding to work around notification timing issues.
 ```
 
 **Output:**
+
 ```markdown
 ## Solution Space Analysis
 
@@ -307,9 +315,11 @@ config flag we're adding to work around notification timing issues.
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/solution-space auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/solution-space`):
+
 - After producing the solution space analysis, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the problem being solved
@@ -328,20 +338,22 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces solution space analysis for discussion. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for prior context (aim, problem statement, constraints)
 - Writes solution analysis and recommendation to the session file
 - `/execute` can read the selected approach
 
 ### With RNA MCP (repo-native-alignment)
 
-When the RNA MCP server is available (`oh_search_context` tool present), surface repo-local situated knowledge at two moments in the solution space process.
+When RNA MCP is available, surface repo-local situated knowledge at two moments in the solution space process.
 
-**Before Step 2 (Generate Candidates):** Call `oh_search_context` with the problem statement + active outcome + `phase: "solution-space"`. Surface relevant metis — prior solution evaluations, approaches tried and their outcomes, patterns that recurred. Present as candidates:
+**Before Step 2 (Generate Candidates):** Call `search` with the problem statement + active outcome and `include_artifacts: true`; filter returned metis to the solution-space phase. Surface prior evaluations, attempted approaches, and recurring patterns. Present as candidates:
 
-```
+```text
 **Relevant metis from this repo:**
 - [metis title] (source: .oh/metis/filename.md) — [one-line relevance note]
   → Keep / Dismiss?
@@ -349,9 +361,10 @@ When the RNA MCP server is available (`oh_search_context` tool present), surface
 
 Human selects before candidates are generated. Selected metis informs the candidate list (may reveal options to include, anti-patterns to name explicitly, or prior attempts that constrain the space).
 
-**Before Step 3 (Evaluate Trade-offs):** Call `oh_search_context` with the active outcome. Surface applicable guardrails. These are not trade-offs to evaluate — they are constraints that rule options out before evaluation begins. Fold confirmed guardrails into the evaluation as hard constraints.
+**Before Step 3 (Evaluate Trade-offs):** Call `search` with the active outcome and `include_artifacts: true`. Surface applicable guardrails. These are not trade-offs to evaluate — they are constraints that rule options out before evaluation begins. Fold confirmed guardrails into the evaluation as hard constraints.
 
 **What this prevents:**
+
 - Proposing solutions the team has already tried and rejected (without knowing)
 - Ignoring guardrails that eliminate certain options entirely
 - Treating the solution space as empty when the repo has situated judgment
@@ -361,6 +374,7 @@ Human selects before candidates are generated. Selected metis informs the candid
 **Human judgment is required:** Do not auto-apply selected metis as constraints. Surface it; let the human decide how much weight it carries in this specific context.
 
 ### With Open Horizons MCP
+
 - Queries related past solution decisions
 - Finds similar problems across endeavors
 - Logs the solution space exploration and decision
@@ -369,13 +383,14 @@ Human selects before candidates are generated. Selected metis informs the candid
 ## Position in Framework
 
 **Comes after:** `/problem-statement` (you need a framed problem to evaluate solutions against).
-**Leads to:** `/execute` to implement, or `/dissent` to challenge the recommendation.
+**Leads to:** create a draft PR that records the selected solution, then `/execute`; or `/dissent` to challenge the recommendation.
 **Can loop back to:** `/problem-statement` (if exploration reveals the problem is mis-framed).
 
 ## Leads To
 
 After solution-space, typically:
-- `/execute` - Implement the selected approach
+
+- Create a draft PR, then `/execute` - Implement the selected approach only after the PR exists
 - `/dissent` - If the recommendation feels too easy
 - `/problem-statement` - If exploration revealed the problem is mis-framed
 

@@ -31,6 +31,7 @@ Before reframing, understand how the problem is currently being seen:
 > "The problem is currently framed as: [how it's being described]"
 
 Capture:
+
 - What's the stated problem?
 - What assumptions are embedded in how it's described?
 - What's being treated as fixed vs. changeable?
@@ -40,6 +41,7 @@ Capture:
 Watch for the X-Y problem pattern: someone asks for Y (their attempted solution) when they actually need X (the real problem).
 
 **Signs of X-Y mismatch:**
+
 - Request is oddly specific for what seems like a simple goal
 - The solution feels like a workaround
 - "How do I do [technique]?" without explaining why
@@ -59,6 +61,7 @@ A good problem statement articulates WHAT needs to change, not HOW to change it.
 **Right:** "Adding a new auth provider takes 2 weeks and touches 6 files"
 
 Test your statement:
+
 - Does it describe a symptom or a solution?
 - Could someone unfamiliar with the codebase understand what's wrong?
 - Does it leave room for multiple solution approaches?
@@ -68,16 +71,19 @@ Test your statement:
 Every problem exists within constraints. Name them explicitly:
 
 **Hard constraints** (actually immovable):
+
 - Regulatory requirements
 - Laws of physics
 - Existing user commitments
 
 **Soft constraints** (feel fixed but aren't):
+
 - "We've always done it this way"
 - Technical debt
 - Team preferences
 
 **Questions to surface flexibility:**
+
 - What would we do if [constraint] didn't exist?
 - Who decided [constraint] was fixed? Can we revisit?
 - What's the cost of violating [constraint] vs. the cost of keeping it?
@@ -87,6 +93,7 @@ Every problem exists within constraints. Name them explicitly:
 Structure: **[Who] needs [what outcome] because [why it matters], but currently [what's blocking].**
 
 Good problem statements are:
+
 - **Crisp** - One or two sentences, not a paragraph
 - **Outcome-focused** - Describes the desired state, not the current mess
 - **Testable** - You'll know when it's solved
@@ -95,7 +102,7 @@ Good problem statements are:
 **Examples:**
 
 | Bad | Good |
-|-----|------|
+| ----- | ------ |
 | "The API is slow" | "API responses take 800ms; our SLA requires 200ms" |
 | "We need microservices" | "Deploying a fix requires coordinating 4 teams and takes 2 weeks" |
 | "Users don't understand the UI" | "40% of support tickets are 'how do I X' where X is a core feature" |
@@ -114,7 +121,7 @@ Before committing to a problem statement, test it:
 
 Produce a problem statement in this structure:
 
-```
+```text
 ## Problem Statement
 
 **Current framing:** [How the problem is currently being described]
@@ -142,7 +149,8 @@ Produce a problem statement in this structure:
 > "How do I parse this JSON and extract the user IDs into a separate array?"
 
 **X-Y detection:**
-```
+
+```text
 ## Problem Statement
 
 **Current framing:** Need to parse JSON and extract user IDs into an array.
@@ -167,7 +175,8 @@ Produce a problem statement in this structure:
 > "We need to set up a message queue between services"
 
 **Problem statement work:**
-```
+
+```text
 ## Problem Statement
 
 **Current framing:** Set up message queue between services.
@@ -199,7 +208,8 @@ After discussion: "When Service A updates, Service B doesn't know about it. User
 > Started as "add a dark mode toggle." Now touching 14 files and we realize there's no theme system.
 
 **Problem statement work:**
-```
+
+```text
 ## Problem Statement
 
 **Current framing:** Add dark mode toggle.
@@ -232,9 +242,11 @@ The original ask revealed a missing capability, not a feature to add.
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/problem-statement auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/problem-statement`):
+
 - After producing the problem statement, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the problem topic
@@ -244,6 +256,11 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 **Writing:** After producing output, write the problem statement to the session file:
 
 ```markdown
+---
+session: <session>
+artifact_type: problem-statement
+updated: <timestamp>
+---
 ## Problem Statement
 **Updated:** <timestamp>
 
@@ -255,14 +272,17 @@ If the section exists, replace it. If not, append it after the Aim section.
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces problem statement for discussion. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for prior context (especially aim)
 - Writes problem statement to the session file
 - Subsequent skills can read the framing
 
 ### With Open Horizons MCP
+
 - Queries graph for similar problems and their eventual framings
 - Retrieves tribal knowledge about framing patterns that worked/failed
 - Logs the problem statement as a decision point in the endeavor
@@ -277,6 +297,7 @@ Works anywhere. Produces problem statement for discussion. No persistence.
 ## Leads To
 
 After problem statement, typically:
+
 - `/solution-space` - Explore candidate solutions given this framing
 - `/dissent` - Challenge the framing before committing
 - `/aim` - If the outcome itself is unclear (go back to clarify)

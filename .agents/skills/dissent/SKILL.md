@@ -64,7 +64,8 @@ Every decision rests on assumptions. Most aren't stated. Find them:
 - What are we assuming won't change?
 
 For each assumption:
-```
+
+```text
 Assumption: [what we're taking for granted]
 Evidence: [what supports this assumption]
 Risk if wrong: [what happens if this assumption breaks]
@@ -88,6 +89,7 @@ Always include the reasoning:
 If the decision is a **one-way door** (hard to reverse) and you recommend PROCEED or ADJUST, offer to create an Architecture Decision Record (ADR). Future team members will ask "why did we do it this way?"
 
 **Offer to create an ADR when:**
+
 - The decision affects system architecture
 - Multiple valid approaches were considered and rejected
 - The reasoning depends on current context that might not be obvious later
@@ -96,7 +98,7 @@ If the decision is a **one-way door** (hard to reverse) and you recommend PROCEE
 **The dissent report maps directly to ADR format:**
 
 | Dissent Section | ADR Section |
-|-----------------|-------------|
+| ----------------- | ------------- |
 | Decision under review | Title |
 | Steel-Man Position | Context |
 | Contrary Evidence + Pre-Mortem | Options Considered |
@@ -131,7 +133,7 @@ Generated from /dissent on [date]
 
 Always produce a dissent report in this structure:
 
-```
+```text
 ## Dissent Report
 
 **Decision under review:** [what's being challenged]
@@ -174,7 +176,7 @@ Always produce a dissent report in this structure:
 
 ### Example 1: Architecture Decision
 
-```
+```text
 /dissent
 
 We're about to adopt a microservices architecture for the new
@@ -182,7 +184,8 @@ payments system. The team agrees this is the right approach.
 ```
 
 **Output:**
-```
+
+```text
 ## Dissent Report
 
 **Decision under review:** Microservices architecture for payments
@@ -230,7 +233,7 @@ us the code organization benefits without the operational complexity.
 
 ### Example 2: Feature Decision
 
-```
+```text
 /dissent
 
 We're about to ship a recommendation system that suggests similar
@@ -238,7 +241,8 @@ items based on purchase history. Built over 3 sprints.
 ```
 
 **Output:**
-```
+
+```text
 ## Dissent Report
 
 **Decision under review:** Ship purchase-history recommendation system
@@ -292,9 +296,11 @@ validation. Risk is manageable with modifications.
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/dissent auth-decision`):
+
 - Reads/writes `.oh/auth-decision.md` directly
 
 **If no session name provided** (`/dissent`):
+
 - After producing the dissent report, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the decision topic
@@ -304,6 +310,11 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 **Writing:** After producing the dissent report:
 
 ```markdown
+---
+session: <session>
+artifact_type: dissent
+updated: <timestamp>
+---
 ## Dissent
 **Updated:** <timestamp>
 **Decision:** [PROCEED | ADJUST | RECONSIDER]
@@ -314,25 +325,31 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces dissent report for manual review. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for context on the decision
 - Writes dissent report to the session file
 - Subsequent skills see that dissent was performed
 
 ### With Open Horizons MCP
+
 - Queries past decisions on similar topics
 - Retrieves relevant guardrails and tribal knowledge
 - Logs dissent decision for future reference
 - Session file serves as local cache
 
 ### With RNA MCP (repo-native-alignment)
-- Call `oh_search_context("risks and constraints for [area]", artifact_types: ["guardrail", "metis"])` to ground dissent
+
+- Call `search("risks and constraints for [area]", include_artifacts: true)` to ground dissent
 - Call `outcome_progress` to assess whether the approach serves the outcome
-- Call `oh_record_metis` to capture dissent findings as durable learning
+- Present dissent findings as candidate learnings and request explicit human selection.
+- Write only human-approved candidates to `.oh/metis/`; compact or dismiss the rest.
 
 ### With Team Input
+
 - Aggregates dissent from multiple reviewers
 - Tracks which assumptions different team members question
 
@@ -345,6 +362,7 @@ Works anywhere. Produces dissent report for manual review. No persistence.
 ## Leads To
 
 After dissent, typically:
+
 - **PROCEED** - Continue to `/execute` or `/ship` with strengthened confidence
 - **ADJUST** - Update the approach, then `/review` the modifications
 - **RECONSIDER** - Return to `/solution-space` with new constraints

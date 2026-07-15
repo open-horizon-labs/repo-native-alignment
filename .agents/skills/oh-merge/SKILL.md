@@ -16,9 +16,11 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
 1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
 
 2. Find all PRs with `oh-merge` label:
+
    ```bash
    gh pr list --label oh-merge --json number,title,headRefName,baseRefName,additions,deletions
    ```
+
    **Only PRs with the `oh-merge` label are eligible for merge.**
 
    **IMPORTANT:** PRs with merge conflicts ARE eligible. The skill rebases and resolves conflicts in step 6. Do NOT skip PRs because of conflict status - that's exactly what this skill handles.
@@ -29,6 +31,7 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
    - Identify stacks: chains where child PRs target parent PR branches
    - **Detect cycles**: If a branch eventually targets itself, report error and skip
    - Example graph:
+
      ```
      main ← PR #42 (issue/123) ← PR #43 (issue/456)
      main ← PR #44 (issue/789)  [separate stack]
@@ -59,7 +62,13 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
 
    For each PR in the stack, starting from the root:
 
-   0. **Verify the full RNA ship gate completed:**
+   1. **Rewrite the branch onto its final target first:**
+      - Fetch, check out, and rebase onto the current target branch.
+      - Resolve conflicts, run repo-local `/review`, and force-push with lease.
+      - For a child whose parent has merged, retarget it to `main`, rebase, and force-push before any validation.
+      - Any later rewrite or retarget invalidates all prior ship, CodeRabbit, and CI evidence.
+
+   a. **Verify the full RNA ship gate completed on the final pushed commit:**
       - The PR is ready for review, not draft.
       - Required `/ship` step comments are present, including RNA-grounded review,
         independent review, regression oracle, merit assessment, manual verification,
@@ -68,49 +77,38 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
       - For a code-changing PR, CodeRabbit posted an explicit clean/approved review of the final diff. A skipped draft review or green status alone is insufficient.
       If any evidence is missing, stop and run `/ship <pr-number>`; do not merge directly.
 
-   a. **Verify CI is passing:**
+   b. **Verify CI is passing on that same final commit:**
+
       ```bash
       gh pr checks <pr-number> --fail-on-error
       ```
+
       If CI is failing, stop and report error.
 
-   b. **Rebase onto its target branch:**
-      ```bash
-      git fetch origin
-      gh pr checkout <pr-number>
-      git rebase origin/<base-branch>  # main for root, parent branch for children
-      ```
+   c. Squash merge:
 
-   c. **Resolve any rebase conflicts** (this is expected and normal):
-      - Conflicts WILL occur when main has moved since the PR was created
-      - Use standard git conflict resolution to fix each conflicting file
-      - This is the core value of oh-merge - handling what GitHub can't auto-merge
-      - Only fail if conflicts are truly unresolvable (contradictory changes)
-
-   d. Push rebased branch:
-      ```bash
-      git push --force-with-lease
-      ```
-
-   e. Squash merge:
       ```bash
       gh pr merge <pr-number> --squash
       ```
 
-   f. **For child PRs in the stack** (after parent merged):
+   d. **For child PRs in the stack** (after parent merged):
       - Update base branch to main:
+
         ```bash
         gh pr edit <child-pr-number> --base main
         ```
+
       - Rebase child onto main:
+
         ```bash
         gh pr checkout <child-pr-number>
         git rebase origin/main
         git push --force-with-lease
         ```
-      - Now child PR targets main and is rebased, continue to merge it (step a-e)
 
-   g. **On merge failure** - If any PR in the stack fails to merge:
+      - The rewrite invalidates prior validation. Return to step 0 and rerun the full ship gate, explicit CodeRabbit final-diff review, and CI before merging.
+
+   e. **On merge failure** - If any PR in the stack fails to merge:
       - Stop processing the stack
       - Report which PRs were merged successfully and which failed
       - Signal error: already-merged PRs stay merged, failed PR remains open
@@ -124,15 +122,18 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
 When PRs target other PR branches (not main), oh-merge detects the stack and processes it:
 
 **Detection:**
+
 ```bash
 gh pr list --label oh-merge --json number,title,headRefName,baseRefName
 ```
+
 - PRs with `baseRefName = main` are roots
 - PRs with `baseRefName = issue/<number>` are children targeting that parent
 - Ignore merge conflict status - we handle conflicts during rebase
 
 **Graph building:**
-```
+
+```text
 adjacency[baseRefName] = [list of PRs targeting it]
 
 Example:
@@ -144,13 +145,15 @@ Stack 2: main ← #44 (issue/789)
 ```
 
 **Merge sequence** (for Stack 1):
+
 1. Merge #42 to main
 2. Update #43: `gh pr edit 43 --base main`
 3. Rebase #43 onto main: `git rebase origin/main && git push --force-with-lease`
 4. Merge #43 to main
 
 **After processing:**
-```
+
+```text
 Before:  PR #43 → issue/123 → main
          PR #42 → main
          PR #44 → main (separate stack)
@@ -195,8 +198,9 @@ The holistic review checks what individual PR reviews can't:
 **CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
 
 **Signal based on outcome:**
+
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | Stack merged | `signal_completion(status: "success", message: "Merged N PRs")` |
 | No PRs to merge | `signal_completion(status: "success", message: "No PRs with oh-merge label")` |
 | Partial success | `signal_completion(status: "error", error: "Merged N PRs, failed on PR #X: <reason>")` |
@@ -210,7 +214,7 @@ The holistic review checks what individual PR reviews can't:
 
 ### Basic (no stacks)
 
-```
+```text
 $ /oh-merge
 
 Finding PRs with oh-merge label...
@@ -242,7 +246,7 @@ Done.
 
 ### Stacked PRs
 
-```
+```text
 $ /oh-merge
 
 Finding PRs with oh-merge label...

@@ -15,7 +15,7 @@ Invoke `/distill` when:
 
 - **After multiple sessions** - The corpus has grown and hasn't been reviewed
 - **Before a new phase** - Want to know what's actually settled before moving forward
-- **Search results feel noisy** - `oh_search_context` returning too much loosely-related content
+- **Search results feel noisy** - RNA `search` returns too much loosely-related content
 - **Similar learnings keep appearing** - `/salvage` keeps extracting the same insights (the meta-signal)
 - **End of a successful session** - Even good sessions produce learnings worth capturing before context is lost
 
@@ -37,6 +37,7 @@ Auto-promotion is never correct. A theme proposal is not a guardrail until a hum
 ### Step 1: Establish Scope
 
 Decide what corpus to work with:
+
 - **Session scope** (default, no RNA needed): learnings from this conversation
 - **Corpus scope** (RNA available): accumulated metis across all sessions, optionally filtered by outcome, phase, or tag
 
@@ -44,7 +45,8 @@ Decide what corpus to work with:
 
 **Session scope:** Review the conversation. What was learned? What assumptions were validated or invalidated? What constraints were discovered? What would be useful to know at the start of the next session?
 
-**Corpus scope (RNA):** Call `oh_search_context` broadly. Cluster by semantic similarity. Identify:
+**Corpus scope (RNA):** Call `search` broadly with `include_artifacts: true`. Cluster returned artifacts by semantic similarity. Identify:
+
 - Entries that appear together repeatedly (candidates for compaction)
 - Patterns across entries (candidates for guardrail promotion)
 - Entries that contradict each other (candidates for resolution)
@@ -54,7 +56,7 @@ Decide what corpus to work with:
 
 Present each candidate group with four possible actions:
 
-```
+```text
 **Theme: [theme name]**
 Entries: [list with source IDs and one-line summaries]
 Suggested action: [Keep / Promote / Compact / Dismiss]
@@ -64,6 +66,7 @@ Reason: [why this action fits]
 
 **Keep** — leave as individual metis entries, no change.
 **Promote** — pattern is recurring and stable enough to warrant a guardrail. Distill drafts a stub; human approves the content (editing as needed), then an agent writes the file:
+
   ```markdown
   ---
   id: [slug]
@@ -73,6 +76,7 @@ Reason: [why this action fits]
   ---
   [drafted body — human refines, agent writes to .oh/guardrails/]
   ```
+
 **Compact** — multiple entries say the same thing. Human approves a merged version; originals archived or deleted.
 **Dismiss** — stale, superseded, or so context-specific it misleads more than it helps.
 
@@ -133,21 +137,22 @@ Output: approved entries as markdown, ready to write to `.oh/metis/`.
 
 ### With RNA MCP (repo-native-alignment)
 
-Corpus mode: `oh_search_context` across all accumulated metis (or filtered subset), cluster by semantic similarity, surface candidate groups for human review.
+Corpus mode: RNA `search` across all accumulated metis (or a filtered subset), cluster by semantic similarity, and surface candidate groups for human review.
 
 Output is PR-able: distill produces a set of proposed file writes (new guardrail stubs, compacted metis, removal notes) formatted as a markdown summary. The human creates a branch, writes the approved files, and opens a PR — or uses `/oh-plan` to create issues for each promotion. Curation becomes a collaborative act, not a solo one.
 
-**Filtering options:** pass outcome ID, phase tag, or recency window to `oh_search_context` to narrow the corpus. Useful when the full corpus is large but only a domain slice needs curation.
+**Filtering options:** include an outcome ID, phase tag, or recency window in the `search` query to narrow the corpus. Useful when only a domain slice needs curation.
 
 ## Position in Framework
 
 **Comes after:** Multiple sessions of `/salvage` or `/execute` that have accumulated metis. Or: end of any session where learnings are worth capturing before context is lost.
-**Leads to:** Cleaner `oh_search_context` results. Guardrail candidates for human authoring. A compacted session file that seeds the next session.
+**Leads to:** Cleaner RNA search results. Guardrail candidates for human authoring. A compacted session file that seeds the next session.
 **Relationship to `/salvage`:** Salvage is per-session extraction (especially from failure). Distill is corpus-level curation (independent of any single session outcome). They're complementary — salvage feeds the corpus; distill keeps it from becoming noise.
 
 ## Leads To
 
 After distill, typically:
+
 - Write approved guardrail files to `.oh/guardrails/`
 - Open a PR with `.oh/` changes for team review (corpus mode)
 - Return to `/aim` or `/problem-space` with a cleaner, more settled context

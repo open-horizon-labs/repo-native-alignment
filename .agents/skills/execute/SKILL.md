@@ -19,6 +19,7 @@ Invoke `/execute` when:
 - **Ready to build** - not still exploring or discovering
 
 **Do not use when:**
+
 - Aim is unclear - use `/aim` first
 - Still exploring options - use `/solution-space` first
 - Problem is ambiguous - use `/problem-space` or `/problem-statement` first
@@ -29,7 +30,7 @@ Invoke `/execute` when:
 
 Before writing code, verify alignment:
 
-```
+```text
 Pre-flight Checklist:
 [ ] Aim is clear - what outcome am I producing?
 [ ] Constraints known - what must I NOT break?
@@ -47,12 +48,14 @@ If any box can't be checked, stop and address it before proceeding. Ask clarifyi
 Do the work. Keep it focused.
 
 **Build principles:**
+
 - Work in small, testable increments
 - Commit logical units of change
 - Stay within the declared scope
 - If scope expands, pause and reassess (see Drift Detection)
 
 **During build:**
+
 1. Make the change
 2. Verify it works (tests, manual check, whatever's appropriate)
 3. Stage changes
@@ -65,6 +68,7 @@ Do the work. Keep it focused.
 Periodically check alignment during execution:
 
 **Drift signals:**
+
 - Scope is expanding beyond original task
 - You're touching files not mentioned in the plan
 - "While I'm here" thoughts keep appearing
@@ -74,7 +78,7 @@ Periodically check alignment during execution:
 
 **When you notice drift:**
 
-```
+```text
 Drift Check:
 - Original aim: [aim]
 - What I'm actually doing now: [current work]
@@ -87,6 +91,7 @@ Drift Check:
 **Minor drift:** Note it, continue if still valuable, or refocus.
 
 **Significant drift:** Pause. Either:
+
 - Refocus on original aim and defer the tangent
 - Acknowledge scope change and get confirmation
 - Salvage and restart
@@ -113,7 +118,7 @@ Invoke `/salvage` to extract what you learned before restarting.
 
 When execution completes successfully:
 
-```
+```text
 ## Execution Complete
 
 **Task:** [what was done]
@@ -132,7 +137,7 @@ When execution completes successfully:
 
 When drift triggers a pause:
 
-```
+```text
 ## Execution Paused - Drift Detected
 
 **Original aim:** [aim]
@@ -151,14 +156,15 @@ Recommendation: [your assessment]
 
 ### Example 1: Clean Execution
 
-```
+```text
 /execute
 
 Task: Add validation for empty strings in user input
 ```
 
 **Pre-flight:**
-```
+
+```text
 Pre-flight Checklist:
 [x] Aim is clear - prevent empty strings from causing silent failures
 [x] Constraints known - don't break existing validation, maintain API compatibility
@@ -168,7 +174,8 @@ Pre-flight Checklist:
 ```
 
 **Output:**
-```
+
+```text
 ## Execution Complete
 
 **Task:** Add empty string validation to user input
@@ -191,14 +198,15 @@ Pre-flight Checklist:
 
 ### Example 2: Drift Detection Mid-Execution
 
-```
+```text
 /execute
 
 Task: Fix the timezone bug in calendar display
 ```
 
 **Mid-execution drift check:**
-```
+
+```text
 Drift Check:
 - Original aim: Fix timezone display bug
 - What I'm actually doing now: Refactoring the entire date handling library
@@ -207,7 +215,8 @@ Drift Check:
 ```
 
 **Output:**
-```
+
+```text
 ## Execution Paused - Drift Detected
 
 **Original aim:** Fix timezone bug in calendar display
@@ -228,14 +237,15 @@ proper design task, apply band-aid for now.
 
 ### Example 3: Triggering Salvage
 
-```
+```text
 /execute
 
 Building the new auth flow
 ```
 
 **After multiple iterations:**
-```
+
+```text
 ## Execution Paused - Salvaging
 
 **Original aim:** Simplify authentication flow
@@ -255,9 +265,11 @@ Invoking /salvage to extract learning before restart.
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/execute auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/execute`):
+
 - After pre-flight, offer to save execution context:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the task description
@@ -277,29 +289,36 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Manual pre-flight checklist, drift detection by reasoning. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for aim, constraints, selected solution
 - Writes execution status and notes to the session file
 - Drift detection compares current work against session aim
 
 ### With Open Horizons MCP
+
 - Queries related past decisions and learnings
 - Logs execution decisions to graph database
 - Session file serves as local cache
 
 ### With task management (GitHub issues)
+
 - Creates subtasks for non-trivial findings
 - Updates task status as work progresses
 - Links commits to tasks
 
 ### With code review (repo-local `/review`, CodeRabbit)
+
 - Runs automated review on staged changes
 - Triages findings by severity
 - Iterates until review passes
 
 ## Position in Framework
+
+**Entry gate:** A draft PR containing the problem, linked issue/outcome, and selected solution must already exist. If it does not, create it before changing code.
 
 **Comes after:** `/solution-space` (you need a chosen approach to execute).
 **Leads to:** `/ship` to deliver, `/review` to verify, `/salvage` if drifting.
@@ -308,6 +327,7 @@ Works anywhere. Manual pre-flight checklist, drift detection by reasoning. No pe
 ## Leads To
 
 After execute, typically:
+
 - `/review` - Verify the work before committing
 - `/ship` - Deploy the change to users
 - `/salvage` - If drift was detected and restart needed

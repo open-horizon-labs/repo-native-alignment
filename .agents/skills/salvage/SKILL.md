@@ -50,7 +50,8 @@ Work through these extraction categories. Not everything will apply; extract wha
 - What edge cases bit you?
 
 Format as explicit constraints:
-```
+
+```text
 Guardrail: [boundary]
 Reason: [why this matters]
 Trigger: [when to revisit this constraint]
@@ -73,6 +74,7 @@ Local practices = practical wisdom, the kind you can only get from experience.
 - What patterns should be captured?
 
 Good tribal knowledge is:
+
 - Specific enough to be actionable
 - General enough to apply beyond this exact case
 - Non-obvious (not "write tests" but "this API silently returns 200 on auth failure")
@@ -115,6 +117,7 @@ Synthesize the extraction into a restart kit:
 ### Step 4: Persist Learnings (if available)
 
 If Open Horizons MCP is available:
+
 1. **Log to OH** - Log tribal knowledge and guardrails to the graph
 2. **Update AGENTS.md** - If learnings are project-wide, suggest additions
 
@@ -124,7 +127,7 @@ If no persistent storage is available, output the salvage summary for the user t
 
 Always produce a salvage summary in this structure:
 
-```
+```text
 ## Salvage Report
 
 **Salvaged:** [date/session identifier]
@@ -154,7 +157,7 @@ Always produce a salvage summary in this structure:
 
 ### Example 1: Drifting Implementation
 
-```
+```text
 /salvage
 
 The auth refactor has changed direction 4 times. Originally simplifying
@@ -162,7 +165,8 @@ the flow, now it's more complex than before.
 ```
 
 **Output:**
-```
+
+```text
 ## Salvage Report
 
 **Salvaged:** Auth refactor session
@@ -193,7 +197,7 @@ Consider: is "simplify" the right aim? Maybe "make visible" is better.
 
 ### Example 2: Scope Creep
 
-```
+```text
 /salvage
 
 Started as "add dark mode toggle." Now touching 14 files and the
@@ -201,7 +205,8 @@ theme system doesn't exist yet.
 ```
 
 **Output:**
-```
+
+```text
 ## Salvage Report
 
 **Salvaged:** Dark mode implementation
@@ -241,9 +246,11 @@ infrastructure exists before estimating.
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/salvage auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/salvage`):
+
 - After producing the salvage report, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the work being salvaged
@@ -265,14 +272,17 @@ The salvage section is the capstone—it captures what was learned before the se
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces salvage summary for manual capture. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for full session context — aim and guardrails frame what counts as "off-track"
 - Writes salvage report to the session file; the report seeds the next session
 - After salvage, offer to compact the session file: remove stale planning artifacts, keep settled decisions as brief anchors
 
 ### With Open Horizons MCP
+
 - Queries related past decisions before salvaging
 - Logs learnings to graph database
 - Creates dive pack for restart session
@@ -280,19 +290,19 @@ Works anywhere. Produces salvage summary for manual capture. No persistence.
 
 ### With RNA MCP (repo-native-alignment)
 
-**Before extracting learnings:** call `oh_search_context` with the failure domain + active phase. Ask: was this predictable from the corpus? Three outcomes change what gets written:
+**Before extracting learnings:** call `search` with the failure domain, `include_artifacts: true`, and the active phase. Ask: was this predictable from the corpus? Three outcomes change what gets written:
 
 - **Relevant entry existed and applied** → failure was predictable. The learning is about process (corpus not consulted), not domain. Write that metis entry, not a domain one.
 - **Relevant entry existed but was insufficient** → update or strengthen existing entries rather than creating near-duplicates.
 - **Nothing found** → genuinely new territory. Write fresh metis with confidence.
 
 **After extracting:**
-- `oh_record_metis` with approved learnings (new entries only — no duplicates)
-- `oh_record_guardrail_candidate` for hard constraints discovered the hard way
+
+- Write human-approved learnings to `.oh/metis/` (new entries only — no duplicates)
+- Write human-approved hard constraints to `.oh/guardrails/`
 - `outcome_progress` to record what was accomplished toward the outcome before restarting
 
 **Meta-signal:** If salvage repeatedly surfaces similar learnings, the corpus has the knowledge but it's not being consulted. That pattern warrants `/distill`.
-
 
 ## Position in Framework
 
@@ -303,6 +313,7 @@ Works anywhere. Produces salvage summary for manual capture. No persistence.
 ## Leads To
 
 After salvage, typically:
+
 - `/aim` - Reclarify what we're actually trying to achieve
 - `/problem-space` - Fresh start with new understanding
 - Create new task/issue with salvage context attached

@@ -20,12 +20,14 @@ Review a PR, check it against the linked issue's requirements, and post structur
 
 ## Flow
 
-1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
+1. Load project background from `AGENTS.md` and relevant `.oh/` artifacts. Use RNA `repo_map` and `search` first for repository exploration. If RNA is empty or incomplete, broaden queries and remove filters; before any Read/Grep/Bash fallback, document the reason and record a friction event in the repository session context.
 
 2. Fetch PR metadata:
+
    ```bash
    gh pr view <pr-number> --json title,body,headRefName,baseRefName,additions,deletions,changedFiles,state,mergeable
    ```
+
    Abort if PR is not open.
 
 3. **Read the linked issue (CRITICAL)** — the issue is the source of truth for requirements:
@@ -35,6 +37,7 @@ Review a PR, check it against the linked issue's requirements, and post structur
    - If no linked issue found, note "No linked issue — cannot verify requirements" and review code quality only
 
 4. Fetch the PR diff:
+
    ```bash
    gh pr diff <pr-number>
    ```
@@ -46,6 +49,7 @@ Review a PR, check it against the linked issue's requirements, and post structur
    - Missing tests or documentation
 
 6. Write a structured review to a temp file:
+
    ```markdown
    ## Review: PR #<number> — <title>
 
@@ -68,10 +72,13 @@ Review a PR, check it against the linked issue's requirements, and post structur
 
 7. Post the review on the PR:
    - If blockers found or requirements not met:
+
      ```bash
      gh pr review <pr-number> --request-changes --body-file /tmp/review-<pr-number>.md
      ```
+
    - If no blockers and requirements met:
+
      ```bash
      gh pr review <pr-number> --approve --body-file /tmp/review-<pr-number>.md
      ```
@@ -103,7 +110,7 @@ Review a PR, check it against the linked issue's requirements, and post structur
 **Signal based on outcome:**
 
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | Review posted, PR approved | `signal_completion(status: "success", message: "Approved — N improvements noted")` |
 | Review posted, changes requested | `signal_completion(status: "blocked", blocker: "PR has N blockers — see review comment")` |
 | Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |
@@ -114,7 +121,7 @@ Review a PR, check it against the linked issue's requirements, and post structur
 
 ## Example
 
-```
+```text
 $ /oh-review 99
 
 Fetching PR #99...
@@ -147,4 +154,4 @@ signal_completion(status: "success", message: "Approved — 2 improvements noted
 Done.
 ```
 
-ARGUMENTS: 
+ARGUMENTS:

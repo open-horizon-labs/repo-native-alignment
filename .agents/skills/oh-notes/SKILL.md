@@ -23,6 +23,7 @@ Address feedback on a PR created by `oh-task`: work in an isolated worktree, res
 1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
 
 2. Get PR branch info and create worktree:
+
    ```bash
    # Save original directory for cleanup
    ORIGINAL_DIR=$(pwd)
@@ -38,12 +39,14 @@ Address feedback on a PR created by `oh-task`: work in an isolated worktree, res
    git worktree add .worktrees/pr-<pr-number> -B $BRANCH origin/$BRANCH
    cd .worktrees/pr-<pr-number>
    ```
+
    Note: `-B $BRANCH` creates/resets the local branch to track origin.
 
 3. Fetch PR comments (both top-level and inline review comments):
+
    ```bash
    gh pr view <pr-number> --json comments,reviews
-   gh api repos/{owner}/{repo}/pulls/<pr-number>/comments
+   gh api repos/{owner}/{repo}/pulls/<pr-number>/comments --paginate --slurp
    ```
 
 4. Identify unresolved comments:
@@ -62,6 +65,7 @@ Address feedback on a PR created by `oh-task`: work in an isolated worktree, res
       - P4: discard (nitpick)
 
    **Creating descendant issues:**
+
    ```bash
    # Create issue linked to parent
    NEW_ISSUE=$(gh issue create \
@@ -90,10 +94,12 @@ Address feedback on a PR created by `oh-task`: work in an isolated worktree, res
    - Stage changes
    - Run the repo-local `/review` skill (each issue gets its own review!)
    - Handle findings (may spawn more descendants)
-   - Commit with "Fixes #<issue-number>" to auto-close
-   - Loop until zero unclosed descendants
+   - Mark the descendant complete in the local session record after its fix is accepted; do not wait for `Fixes` to close it before merge
+   - If repository policy requires GitHub closure now, explicitly close the accepted issue with a comment
+   - Loop until every locally tracked descendant is accepted and accounted for
 
 7. Commit all fixes:
+
    ```bash
    # If there are descendant issues to close, include them in commit
    git commit -m "address PR #<pr-number> feedback
@@ -101,40 +107,48 @@ Address feedback on a PR created by `oh-task`: work in an isolated worktree, res
    - <summary of each addressed comment>
 
    Fixes #<descendant-issue-1>
-   Fixes #<descendant-issue-2>"
+   Fixes #<descendant-issue-2>
+
+   [outcome:<name>]"
    ```
 
 8. Push changes:
+
    ```bash
    git push
    ```
 
 9. Reply to addressed comments (optional but helpful):
+
    ```bash
    gh api repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies \
      -f body="Fixed in $(git rev-parse --short HEAD)"
    ```
 
 10. Cleanup worktree:
+
     ```bash
     cd $ORIGINAL_DIR
     git worktree remove .worktrees/pr-<pr-number>
     ```
 
 11. Exit and report:
-   - List addressed comments
-   - Note any unresolved items that need human decision
-   - Provide PR URL
+
+- List addressed comments
+- Note any unresolved items that need human decision
+- Provide PR URL
 
 ## Comment Handling
 
 ### Actionable Comments (address)
+
 - "This should handle null case"
 - "Missing error handling"
 - "Variable name is confusing"
 - "Add test for edge case"
 
 ### Non-Actionable (skip, report)
+
 - Questions without clear ask: "Why did you do it this way?" (can address with code comment if helpful)
 - Design debates: "Have you considered X approach?"
 - Requests requiring human decision: "Should we use A or B?"
@@ -153,10 +167,12 @@ When in doubt, address it. Better to over-fix than under-fix.
 - **Safety**: Max 10 issue iterations (prevent runaway)
 
 ## Completion Signaling (MANDATORY)
+
 **CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
 **Signal based on outcome:**
+
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | All comments addressed | `signal_completion(status: "success", pr: "<pr-url>")` |
 | Needs human decision | `signal_completion(status: "blocked", blocker: "<reason>")` |
 | Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |
@@ -166,7 +182,7 @@ When in doubt, address it. Better to over-fix than under-fix.
 
 ## Example
 
-```
+```text
 $ /oh-notes 42
 
 Getting PR #42 info...
@@ -224,7 +240,7 @@ PR: https://github.com/org/repo/pull/42
 
 ### With Descendant Issue
 
-```
+```text
 $ /oh-notes 43
 
 Getting PR #43 info...

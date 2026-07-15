@@ -44,7 +44,8 @@ The mechanism is your hypothesis - the causal lever you believe will produce the
 > "This will happen because [mechanism]."
 
 Format:
-```
+
+```text
 Mechanism: [What you're changing]
 Hypothesis: [Why you believe it will produce the outcome]
 Assumptions: [What must be true for this to work]
@@ -57,6 +58,7 @@ How will you know if the aim is achieved? What signal validates or disproves the
 > "We'll know it's working when [observable signal]."
 
 Good feedback signals are:
+
 - **Observable** - You can actually measure or see them
 - **Timely** - You'll know within a reasonable timeframe
 - **Attributable** - The signal connects to your mechanism, not noise
@@ -66,7 +68,8 @@ Good feedback signals are:
 What constraints should bound this work? What would cause you to stop or change direction?
 
 Format:
-```
+
+```text
 Guardrail: [boundary]
 Reason: [why this matters]
 Trigger: [when to revisit this constraint]
@@ -76,7 +79,7 @@ Trigger: [when to revisit this constraint]
 
 Always produce an aim statement in this structure:
 
-```
+```text
 ## Aim Statement
 
 **Aim:** [One sentence: the behavior change you want]
@@ -103,14 +106,16 @@ Always produce an aim statement in this structure:
 ### Example 1: Feature Request to Aim
 
 **Input:**
-```
+
+```text
 /aim
 
 We need to add a dark mode toggle to the settings page.
 ```
 
 **Output:**
-```
+
+```text
 ## Aim Statement
 
 **Aim:** Users can work comfortably during extended evening sessions without eye strain.
@@ -139,14 +144,16 @@ We need to add a dark mode toggle to the settings page.
 ### Example 2: Vague Strategic Goal to Aim
 
 **Input:**
-```
+
+```text
 /aim
 
 We need to improve developer experience.
 ```
 
 **Output:**
-```
+
+```text
 ## Aim Statement
 
 **Aim:** Developers spend less than 10 minutes from git clone to running their first successful test.
@@ -175,14 +182,16 @@ We need to improve developer experience.
 ### Example 3: Checking Aim Mid-Work
 
 **Input:**
-```
+
+```text
 /aim
 
 I'm three days into this auth refactor and not sure if I'm still solving the right problem.
 ```
 
 **Output:**
-```
+
+```text
 ## Aim Check
 
 **Original aim (inferred):** Simplify the authentication flow for easier maintenance.
@@ -214,9 +223,11 @@ Without clear answers, consider `/salvage` to extract what you've learned, then 
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/aim auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/aim`):
+
 - After producing the aim statement, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch (e.g., `feature/auth-flow` → `auth-flow`) or the aim content
@@ -227,6 +238,11 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 **Writing:** After producing output, write the aim statement to the session file:
 
 ```markdown
+---
+session: <session>
+artifact_type: aim
+updated: <timestamp>
+---
 # Session: <session>
 
 ## Aim
@@ -240,14 +256,17 @@ If the section exists, replace it. If not, create it.
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces aim statement for discussion. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for prior context from other skills
 - Writes aim statement to the session file
 - Subsequent skills (`/problem-statement`, `/solution-space`, etc.) can read the aim
 
 ### With Open Horizons MCP
+
 - Queries related endeavors to see if aim already exists
 - Pulls relevant tribal knowledge that might inform mechanism choice
 - Logs aim statement to graph database
@@ -263,6 +282,7 @@ Works anywhere. Produces aim statement for discussion. No persistence.
 ## Leads To
 
 After establishing aim, typically:
+
 - `/problem-space` - Map the terrain and constraints
 - `/problem-space` - Map constraints and what you're optimizing
 - `/review` - Check if current work still serves the aim

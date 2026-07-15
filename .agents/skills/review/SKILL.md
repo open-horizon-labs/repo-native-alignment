@@ -52,6 +52,7 @@ Is the work still pointed at the original aim?
 - Are we on the critical path, or did we drift to tangents?
 
 Signs of drift:
+
 - "While I'm at it..."
 - Refactoring unrelated code
 - Solving problems the user didn't mention
@@ -66,6 +67,7 @@ Is the approach appropriately sized for the problem?
 - Are we building infrastructure for a one-off task?
 
 Complexity signals:
+
 - RED: 3+ files for simple feature; new patterns for one-offs
 - YELLOW: proliferating Manager/Handler/Service classes
 - GREEN: direct solution; one file when possible; reuses existing patterns
@@ -100,7 +102,8 @@ Drift is the gap between where you started and where you are. Explicitly name an
 **Goal Drift** - The aim itself shifted without explicit decision
 
 For each drift detected:
-```
+
+```text
 Drift: [type]
 Started as: [original]
 Became: [current]
@@ -112,7 +115,7 @@ Impact: [what this means]
 Based on the review, choose one:
 
 | Decision | When | Action |
-|----------|------|--------|
+| ---------- | ------ | -------- |
 | **Continue** | Aligned, on track | Proceed with confidence |
 | **Adjust** | Minor drift, recoverable | Correct course and continue |
 | **Pause** | Unclear aim or major questions | Stop, clarify with user, then resume |
@@ -120,7 +123,7 @@ Based on the review, choose one:
 
 ## Output Format
 
-```
+```text
 ## Review Summary
 
 **Aim:** [original intent]
@@ -147,14 +150,15 @@ Based on the review, choose one:
 
 ### Example 1: Clean Review (Continue)
 
-```
+```text
 /review
 
 I've been working on the auth endpoint for 30 minutes.
 ```
 
 **Output:**
-```
+
+```text
 ## Review Summary
 
 **Aim:** Add JWT validation to the /api/users endpoint
@@ -181,14 +185,15 @@ Work is aligned and on track. JWT validation implemented using existing patterns
 
 ### Example 2: Drift Detected (Adjust)
 
-```
+```text
 /review
 
 Started adding error handling to the API. Now I'm refactoring the logger.
 ```
 
 **Output:**
-```
+
+```text
 ## Review Summary
 
 **Aim:** Improve error handling in /api/orders endpoint
@@ -219,14 +224,15 @@ Revert logger changes. Complete the original error handling task. If logger need
 
 ### Example 3: Major Drift (Salvage)
 
-```
+```text
 /review
 
 Third attempt at fixing the build. Each fix breaks something else.
 ```
 
 **Output:**
-```
+
+```text
 ## Review Summary
 
 **Aim:** Fix failing CI build (test timeout issue)
@@ -260,9 +266,11 @@ Stop. The approach has reversed multiple times. Extract what was learned about t
 This skill can persist context to `.oh/<session>.md` for use by subsequent skills.
 
 **If session name provided** (`/review auth-refactor`):
+
 - Reads/writes `.oh/auth-refactor.md` directly
 
 **If no session name provided** (`/review`):
+
 - After producing the review summary, offer to save it:
   > "Save to session? [suggested-name] [custom] [skip]"
 - Suggest a name based on git branch or the work being reviewed
@@ -282,32 +290,38 @@ This skill can persist context to `.oh/<session>.md` for use by subsequent skill
 ## Adaptive Enhancement
 
 ### Base Skill (prompt only)
+
 Works anywhere. Produces review summary based on conversation context. No persistence.
 
 ### With .oh/ session file
+
 - Reads `.oh/<session>.md` for aim, constraints, selected solution
 - Compares actual work against session aim
 - Writes review verdict and findings to the session file
 
 ### With git diff
+
 - Compares actual changes against stated aim
 - Detects file count, complexity signals
 - Identifies incomplete changes
 
 ### With CI Integration
+
 - Checks if tests pass before marking complete
 - Verifies linting, type checking
 - Confirms PR checks would pass
 
 ### With Open Horizons MCP
+
 - Pulls related past decisions for context
 - Logs review outcomes to graph
 - Session file serves as local cache
 
 ### With RNA MCP (repo-native-alignment)
-- Call `oh_search_context("constraints for [area]", artifact_types: ["guardrail"])` to check against relevant guardrails
+
+- Call `search("constraints for [area]", include_artifacts: true)` to check relevant guardrails and metis
 - Call `outcome_progress` to check work against the declared outcome
-- Call `oh_record_guardrail_candidate` if the review surfaces new constraints
+- Write approved new constraints to `.oh/guardrails/` with YAML frontmatter
 
 ## Completion Gate (Before "Done")
 
@@ -317,6 +331,7 @@ When the user or agent claims work is complete, verify:
 2. **Changes Reviewed?** - Has the branch diff been reviewed against intent?
 3. **CI Passing?** - Have automated checks been run and passed?
 4. **Feedback Addressed?** - Have reviewer comments been resolved?
+5. **CodeRabbit Approved?** - For every code-changing PR, did CodeRabbit explicitly post a clean or approved review of the final diff? Skipped or pending reviews block completion.
 
 If incomplete:
 > "Completion gate: [missing step]. Run the check before marking complete."
@@ -330,6 +345,7 @@ If incomplete:
 ## Leads To
 
 After review, typically:
+
 - **Continue** - Proceed to commit, PR, or next task
 - **Adjust** - Make corrections, then continue
 - **Salvage** - Run `/salvage` to extract learning before restart

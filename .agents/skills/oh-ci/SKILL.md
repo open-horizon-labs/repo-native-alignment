@@ -23,6 +23,7 @@ Fix CI failures on a pull request. Work in an isolated worktree, diagnose failur
 1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
 
 2. Get PR branch info and create worktree:
+
    ```bash
    # Save original directory for cleanup
    ORIGINAL_DIR=$(pwd)
@@ -37,6 +38,7 @@ Fix CI failures on a pull request. Work in an isolated worktree, diagnose failur
    ```
 
 3. Fetch CI check run details and logs:
+
    ```bash
    # Get the head SHA
    HEAD_SHA=$(gh pr view <pr-number> --json headRefName,commits -q '.commits[-1].oid')
@@ -44,14 +46,13 @@ Fix CI failures on a pull request. Work in an isolated worktree, diagnose failur
    # List all check runs for this commit
    gh api repos/{owner}/{repo}/commits/${HEAD_SHA}/check-runs --jq '.check_runs[] | select(.conclusion == "failure") | {name: .name, id: .id, conclusion: .conclusion}'
 
-   # For each failed check run, get the log
+   # For each failed check run, inspect annotations separately
    gh api repos/{owner}/{repo}/check-runs/{check_run_id}/annotations
-   ```
 
-   If check run logs are insufficient, also try:
-   ```bash
-   # Get workflow run logs (GitHub Actions)
-   gh run view --log-failed
+   # Resolve the failed workflow run non-interactively, then fetch its logs
+   RUN_ID=$(gh run list --commit "$HEAD_SHA" --status failure --limit 1 --json databaseId --jq '.[0].databaseId')
+   test -n "$RUN_ID"
+   gh run view "$RUN_ID" --log-failed
    ```
 
 4. Diagnose failures:
@@ -70,35 +71,42 @@ Fix CI failures on a pull request. Work in an isolated worktree, diagnose failur
      - P4: discard
 
 6. Verify the fix locally:
+
    ```bash
    # Run the same checks that failed, if possible
    # For TypeScript projects:
-   pnpm typecheck 2>&1 || true
-   pnpm test 2>&1 || true
-   pnpm lint 2>&1 || true
+   pnpm typecheck
+   pnpm test
+   pnpm lint
 
    # For Rust projects:
-   cargo check 2>&1 || true
-   cargo test 2>&1 || true
-   cargo clippy 2>&1 || true
+   cargo check
+   cargo test
+   cargo clippy
    ```
-   Adapt commands to the project's build system (check package.json scripts, Makefile, etc.).
+
+   Adapt commands to the project's build system. Capture every result and stop before commit or push if any required check fails.
 
 7. Commit fixes:
+
    ```bash
    git commit -m "fix: resolve CI failures on PR #<pr-number>
 
    - <summary of each fix>
 
-   Fixes #<descendant-issue> (if any)"
+   Fixes #<descendant-issue> (if any)
+
+   [outcome:<name>]"
    ```
 
 8. Push:
+
    ```bash
    git push
    ```
 
 9. Cleanup worktree:
+
    ```bash
    cd $ORIGINAL_DIR
    git worktree remove .worktrees/ci-<pr-number>
@@ -112,6 +120,7 @@ Fix CI failures on a pull request. Work in an isolated worktree, diagnose failur
 ## Descendant Issues
 
 If `repo-local review` finds non-trivial issues during the fix, create GitHub issues:
+
 ```bash
 PARENT_ISSUE=${BRANCH#issue/}
 NEW_ISSUE=$(gh issue create \
@@ -142,10 +151,12 @@ Complete ALL descendant issues before the final push.
 - **Error**: Cannot diagnose the failure or fix creates worse problems
 
 ## Completion Signaling (MANDATORY)
+
 **CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
 **Signal based on outcome:**
+
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | CI fixed, changes pushed | `signal_completion(status: "success", pr: "<pr-url>")` |
 | Needs human decision | `signal_completion(status: "blocked", blocker: "<reason>")` |
 | Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |

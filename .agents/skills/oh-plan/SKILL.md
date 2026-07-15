@@ -24,7 +24,7 @@ Creates well-structured GitHub issues ready for oh-task agents. Works in two mod
 
 At the start, check if the argument matches an existing session file:
 
-```
+```text
 If .oh/<arg>.md exists AND contains ## Solution Space:
     → Session mode (skip investigation, use context)
 Else:
@@ -32,6 +32,12 @@ Else:
 ```
 
 ## Session Mode Flow
+
+Shared setup for both session and task mode, before creating any issue:
+
+```bash
+gh label create oh-planned --description "Created via oh-plan skill" --color "0E8A16" 2>/dev/null || gh label view oh-planned >/dev/null
+```
 
 When `.oh/<session>.md` exists with solution-space context:
 
@@ -51,6 +57,7 @@ When `.oh/<session>.md` exists with solution-space context:
    - Aim for 1-4 hours of work per issue
 
 5. **Create GitHub issues** with enriched context from session:
+
    ```bash
    gh issue create --title "<title>" --label "oh-planned" --body "$(cat <<'EOF'
    ## Goal
@@ -79,7 +86,13 @@ When `.oh/<session>.md` exists with solution-space context:
    ```
 
 6. **Update session file** with created issues:
+
    ```markdown
+   ---
+   session: <session>
+   artifact_type: github-plan
+   updated: <timestamp>
+   ---
    ## Plan
    **Updated:** <timestamp>
    **Issues:** #43, #44, #45
@@ -87,7 +100,7 @@ When `.oh/<session>.md` exists with solution-space context:
 
 ### Session Mode Example
 
-```
+```text
 $ /oh-plan auth-refactor
 
 Found session file: .oh/auth-refactor.md
@@ -121,6 +134,9 @@ Done. Issues ready for /oh-task.
 When no session file exists (current behavior):
 
 1. **Explore the codebase** to understand:
+   - Use RNA `repo_map` and `search` first for architecture, symbols, artifacts, neighbors, and impact.
+   - If results are empty or incomplete, broaden queries and remove filters before fallback.
+   - Before any Read/Grep/Bash fallback, document why RNA was insufficient and log the friction event in the repository session context.
    - Project architecture and patterns
    - Relevant files that would be touched
    - Existing similar implementations to follow
@@ -139,10 +155,8 @@ When no session file exists (current behavior):
    - Aim for issues that are 1-4 hours of work each
 
 4. **Create GitHub issue(s)** with the `oh-planned` label:
-   ```bash
-   # Create label if it doesn't exist (one-time)
-   gh label create oh-planned --description "Created via oh-plan skill" --color "0E8A16" 2>/dev/null || true
 
+   ```bash
    # Create issue
    gh issue create --title "<clear, actionable title>" --label "oh-planned" --body "$(cat <<'EOF'
    ## Goal
@@ -222,12 +236,14 @@ Consider a separate integration issue when connecting components involves:
 - A meaningful test surface (end-to-end flows worth testing explicitly)
 
 **Don't** create integration issues for:
+
 - Simple API calls with straightforward error handling
 - Passing data from one component to another
 - Standard CRUD wiring
 
 **Pattern when integration IS complex:**
-```
+
+```text
 Issue #1: "Add theme persistence API" (Foundation)
 Issue #2: "Add theme toggle component" (Feature)
 Issue #3: "Wire theme system with fallback handling" (Integration - Depends on #1, #2)
@@ -241,7 +257,8 @@ Issue #3: "Wire theme system with fallback handling" (Integration - Depends on #
 **Task:** "Add dark mode support to the dashboard"
 
 **Over-decomposed (too many trivial issues):**
-```
+
+```text
 Issue #1: Add preferences API
 Issue #2: Add toggle component
 Issue #3: Add CSS variables
@@ -251,12 +268,14 @@ Issue #6: Handle loading states
 ```
 
 **Under-decomposed (one big issue):**
-```
+
+```text
 Issue #1: Add dark mode support (everything)
 ```
 
 **Right-sized:**
-```
+
+```text
 Issue #1: "Add user preferences API with theme support" (Foundation)
   - GET/POST /api/preferences
   - Includes theme field
@@ -276,7 +295,8 @@ Issue #3: "Handle theme edge cases" (Polish - Depends on #2)
 ### Dependency Notation
 
 Use "Depends on #N" in issue body:
-```
+
+```text
 ## Goal
 Add dark mode theming system with toggle and persistence.
 
@@ -294,7 +314,7 @@ Add dark mode theming system with toggle and persistence.
 ## Exit Conditions
 
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | Issue(s) created successfully | `signal_completion(status: "success")` |
 | User cancelled during questions | `signal_completion(status: "error", error: "User cancelled")` |
 | Failed to create issue | `signal_completion(status: "error", error: "<reason>")` |
@@ -302,7 +322,7 @@ Add dark mode theming system with toggle and persistence.
 
 ## Task Mode Example
 
-```
+```text
 $ /oh-plan "Add heartbeat monitoring for tmux sessions"
 
 Exploring codebase...

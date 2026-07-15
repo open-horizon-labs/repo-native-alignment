@@ -23,6 +23,7 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
 1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
 
 2. Get PR branch info:
+
    ```bash
    # Save original directory for cleanup
    ORIGINAL_DIR=$(pwd)
@@ -34,6 +35,7 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
    ```
 
 3. Create worktree and set up:
+
    ```bash
    git fetch origin
    git worktree add .worktrees/conflict-<pr-number> -B $BRANCH origin/$BRANCH
@@ -41,6 +43,7 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
    ```
 
 4. Understand the PR's intent before merging:
+
    ```bash
    # Read the linked issue to understand what this PR is trying to do
    PARENT_ISSUE=${BRANCH#issue/}
@@ -52,16 +55,20 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
    ```
 
 5. Attempt the merge:
+
    ```bash
    git merge origin/$BASE --no-edit
    ```
+
    This will fail with conflict markers in affected files.
 
 6. Resolve conflicts file by file:
    - For each conflicted file, read both sides:
+
      ```bash
      git diff --name-only --diff-filter=U  # List conflicted files
      ```
+
    - Understand the intent of BOTH sides:
      - **Ours (HEAD/PR branch)**: What did this PR change and why?
      - **Theirs (base branch)**: What changed on base since this PR branched?
@@ -71,47 +78,54 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
    - Stage each resolved file: `git add <file>`
 
 7. After all conflicts resolved, verify:
+
    ```bash
-   # Ensure no remaining conflict markers
-   grep -rn '<<<<<<< ' --include='*.ts' --include='*.js' --include='*.rs' . || echo "No conflict markers"
+   # Ensure Git has no unresolved paths and no tracked file has conflict markers
+   test -z "$(git diff --name-only --diff-filter=U)"
+   if git grep -n -e '^<<<<<<< ' -e '^=======$' -e '^>>>>>>> '; then exit 1; else echo "No conflict markers"; fi
 
    # Run project checks
    # For TypeScript projects:
-   pnpm typecheck 2>&1 || true
-   pnpm test 2>&1 || true
+   pnpm typecheck
+   pnpm test
 
    # For Rust projects:
-   cargo check 2>&1 || true
-   cargo test 2>&1 || true
+   cargo check
+   cargo test
    ```
-   Adapt commands to the project's build system.
+
+   Adapt commands to the project's build system. Capture every result and do not commit or push while a required check fails.
 
 8. If verification fails (e.g., type errors from merged code):
    - Fix the issues introduced by the merge
    - Stage fixes
-   - Run the repo-local `/review` skill on staged changes
-   - Handle review findings:
-     - P1-P3 trivial: fix inline
-     - P1-P3 non-trivial: create GitHub issue as descendant
-     - P4: discard
+   - Re-run verification after fixing introduced issues
 
-9. Complete the merge commit:
+9. Run the repo-local `/review` skill unconditionally on all staged conflict resolutions. Handle findings:
+   - P1-P3 trivial: fix inline and re-stage
+   - P1-P3 non-trivial: create a GitHub issue as descendant
+   - P4: discard with rationale
+
+10. Complete the merge commit:
+
    ```bash
    git commit --no-edit  # Uses the auto-generated merge commit message
    ```
 
-10. Push:
+1. Push:
+
     ```bash
     git push
     ```
 
-11. Cleanup worktree:
+2. Cleanup worktree:
+
     ```bash
     cd $ORIGINAL_DIR
     git worktree remove .worktrees/conflict-<pr-number>
     ```
 
-12. Exit and report:
+3. Exit and report:
     - List conflicted files and how each was resolved
     - Note any verification issues encountered
     - Provide PR URL
@@ -119,9 +133,11 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
 ## Conflict Resolution Strategy
 
 ### Simple cases (auto-resolve)
+
 - **Import additions on both sides**: Keep both imports
 - **Adjacent but non-overlapping changes**: Accept both
 - **Lockfile conflicts** (package-lock.json, pnpm-lock.yaml, Cargo.lock): Accept base version, then regenerate:
+
   ```bash
   # Accept theirs for lockfiles
   git checkout --theirs pnpm-lock.yaml
@@ -130,11 +146,13 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
   ```
 
 ### Complex cases (manual resolution)
+
 - **Same function changed on both sides**: Read the issue to understand PR intent, merge logically
 - **File moved on one side, edited on other**: Apply the edit to the moved file
 - **Schema/type changes on both sides**: Merge the types, verify all consumers
 
 ### When to escalate
+
 - **Architectural conflicts**: Both sides restructured the same module differently
 - **Semantic conflicts**: No textual conflict but merged code is logically wrong
 - Report as blocked with clear description of what needs human decision
@@ -142,6 +160,7 @@ Resolve merge conflicts on a pull request. Work in an isolated worktree, merge t
 ## Descendant Issues
 
 If `repo-local review` finds non-trivial issues during resolution:
+
 ```bash
 PARENT_ISSUE=${BRANCH#issue/}
 NEW_ISSUE=$(gh issue create \
@@ -166,10 +185,12 @@ Complete ALL descendant issues before the final push.
 - **Error**: Cannot resolve without breaking functionality
 
 ## Completion Signaling (MANDATORY)
+
 **CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
 **Signal based on outcome:**
+
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | Conflicts resolved, pushed | `signal_completion(status: "success", pr: "<pr-url>")` |
 | Needs human decision | `signal_completion(status: "blocked", blocker: "<reason>")` |
 | Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |

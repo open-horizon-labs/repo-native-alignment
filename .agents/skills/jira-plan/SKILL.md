@@ -14,7 +14,7 @@ Creates well-structured Jira subtasks ready for autonomous agents. Works in two 
 
 This skill requires a Jira MCP server to be configured. At startup, verify the MCP is available:
 
-```
+```text
 Check for Jira MCP tools:
 - jira_search or jira_search_issues
 - jira_create_issue
@@ -35,6 +35,7 @@ If tools are not available:
 ```
 
 **Arguments:**
+
 - First argument: Parent issue key (e.g., `PROJ-123`) - subtasks will be created under this
 - Second argument: Task description OR session name
 
@@ -42,7 +43,7 @@ If tools are not available:
 
 At the start, check if the second argument matches an existing session file:
 
-```
+```text
 If .oh/<arg>.md exists AND contains ## Solution Space:
     → Session mode (skip investigation, use context)
 Else:
@@ -69,6 +70,7 @@ When `.oh/<session>.md` exists with solution-space context:
    - Aim for 1-4 hours of work per subtask
 
 5. **Create Jira subtasks** with enriched context from session:
+
    ```
    Use Jira MCP to create subtask:
 
@@ -98,7 +100,13 @@ When `.oh/<session>.md` exists with solution-space context:
    ```
 
 6. **Update session file** with created subtasks:
+
    ```markdown
+   ---
+   session: <session>
+   artifact_type: jira-plan
+   updated: <timestamp>
+   ---
    ## Plan
    **Updated:** <timestamp>
    **Subtasks:** PROJ-124, PROJ-125, PROJ-126
@@ -106,7 +114,7 @@ When `.oh/<session>.md` exists with solution-space context:
 
 ### Session Mode Example
 
-```
+```text
 $ /jira-plan PROJ-100 auth-refactor
 
 Found session file: .oh/auth-refactor.md
@@ -140,6 +148,7 @@ Done. Subtasks ready for execution.
 When no session file exists:
 
 1. **Get parent issue context** using Jira MCP:
+
    ```
    Use jira_get_issue to fetch parent issue details:
    - Summary and description
@@ -147,7 +156,10 @@ When no session file exists:
    - Existing subtasks (to avoid duplication)
    ```
 
-2. **Explore the codebase** to understand:
+2. **Explore the codebase with RNA first** to understand:
+   - Start with `repo_map`, then use `search` for relevant symbols, artifacts, neighbors, and impact.
+   - If results are empty or incomplete, broaden queries and remove filters before fallback.
+   - Before any Read/Grep/Bash fallback, document why RNA was insufficient and log the friction event in the repository session context.
    - Project architecture and patterns
    - Relevant files that would be touched
    - Existing similar implementations to follow
@@ -166,6 +178,7 @@ When no session file exists:
    - Aim for subtasks that are 1-4 hours of work each
 
 5. **Create Jira subtask(s)** with the `jira-planned` label:
+
    ```
    Use Jira MCP to create subtask:
 
@@ -192,6 +205,7 @@ When no session file exists:
    ```
 
 6. **Link dependencies** between subtasks:
+
    ```
    If subtask B depends on subtask A:
    Use Jira MCP to create link:
@@ -248,7 +262,8 @@ Keep as one subtask when:
 **Task:** "Add dark mode support to the dashboard"
 
 **Over-decomposed (too many trivial subtasks):**
-```
+
+```text
 PROJ-101: Add preferences API
 PROJ-102: Add toggle component
 PROJ-103: Add CSS variables
@@ -258,12 +273,14 @@ PROJ-106: Handle loading states
 ```
 
 **Under-decomposed (one big subtask):**
-```
+
+```text
 PROJ-101: Add dark mode support (everything)
 ```
 
 **Right-sized:**
-```
+
+```text
 PROJ-101: "Add user preferences API with theme support" (Foundation)
   - GET/POST /api/preferences
   - Includes theme field
@@ -291,6 +308,7 @@ Always use `Sub-task` as the issue type. The parent issue should be a Story, Tas
 ### Fields
 
 Adapt to available Jira fields. Common optional fields:
+
 - **Story Points**: If the project uses them, estimate based on complexity
 - **Sprint**: Usually leave unassigned (let humans assign to sprints)
 - **Components**: If the project uses them, select appropriate component
@@ -299,6 +317,7 @@ Adapt to available Jira fields. Common optional fields:
 ### Description Formatting
 
 Jira uses wiki markup, not Markdown:
+
 - `h2.` for headers (not `##`)
 - `*` for bold (not `**`)
 - `* item` for bullets (not `- item`)
@@ -329,8 +348,9 @@ Always add `jira-planned` label to identify subtasks created by this skill.
 **CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
 
 **Signal based on outcome:**
+
 | Outcome | Call |
-|---------|------|
+| --------- | ------ |
 | Subtasks created | `signal_completion(status: "success", message: "Created N subtasks: PROJ-101, PROJ-102")` |
 | Jira MCP not available | `signal_completion(status: "error", error: "Jira MCP not configured")` |
 | User cancelled | `signal_completion(status: "error", error: "User cancelled")` |
@@ -344,7 +364,7 @@ Always add `jira-planned` label to identify subtasks created by this skill.
 
 ## Task Mode Example
 
-```
+```text
 $ /jira-plan PROJ-100 "Add heartbeat monitoring for tmux sessions"
 
 Fetching parent issue PROJ-100...

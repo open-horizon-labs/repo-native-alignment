@@ -21,6 +21,7 @@ The base defaults to `main`. Use another branch only for an intentional stacked 
 4. Run the repo-local `/aim`, `/problem-space`, `/problem-statement`, and `/solution-space` phases at the altitude required by the issue. Record the chosen solution.
 5. Create an isolated branch/worktree from the selected base.
 6. **Before changing implementation files**, push the branch and open a draft PR:
+
    ```bash
    git push -u origin issue/<number>
    gh pr create --draft --base <base-branch> --title "<issue-title>" --body "Closes #<number>
@@ -31,6 +32,7 @@ The base defaults to `main`. Use another branch only for an intentional stacked 
    ## Chosen solution
    <solution-space recommendation>"
    ```
+
 7. Execute the chosen solution. Keep all work within the declared issue scope.
 8. Run project checks and the repo-local `/review` skill. Fix every actionable finding.
 9. Commit focused changes tagged with the relevant `[outcome:X]` and push them to the draft PR.
