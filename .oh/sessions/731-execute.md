@@ -1,3 +1,10 @@
+---
+title: Issue 731 - Deterministic RustSec gate
+date: 2026-07-15
+outcome: context-assembly
+source_issue: 731
+---
+
 # Issue #731 — Deterministic RustSec gate
 
 ## Aim
