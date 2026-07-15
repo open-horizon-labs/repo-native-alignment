@@ -187,6 +187,8 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 **Index-updating indicator:** When the background scanner is actively rebuilding the index (triggered by a HEAD change), `search`, `repo_map`, and `outcome_progress` responses append: `_Index updating in background — results reflect last complete scan._` No note appears when the index is current. This is informational — results are still valid, just from the previous complete scan.
 
+**Search degradation:** If semantic scoring fails after a graph is mapped, `search` keeps the graph available, returns bounded lexical/graph results, and appends content-safe component/model/index diagnostics. Rebuild the embeddings capability for that root and retry semantic search; the diagnostic deliberately omits query text, file paths, and panic payloads.
+
 ### CLI ↔ MCP Equivalence
 
 CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete index, then query via either interface.
