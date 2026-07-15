@@ -84,7 +84,7 @@ Extend the event-bus options with an optional planned-node ID set. Apply the ide
 
 `run_foreground_lsp_and_persist` accepts the optional filter and still opens the normal durable enrichment job. For changed scope, planning and all prerequisite checks happen first, progress output renders provenance, scheduled counts, and deterministic diagnostics, then the planned node set is executed through the ordinary Pass 1 work-item ledger.
 
-Before execution, cached LSP edges touching planned nodes are removed from the pipeline input so stale scoped relationships cannot survive a refresh. Persistence deletes those prior edge IDs and upserts only refreshed scoped LSP edges and their virtual nodes through the incremental LanceDB seam; unrelated graph rows are not rewritten.
+Before execution, cached LSP edges touching planned nodes are removed from the pipeline input so stale scoped relationships cannot survive a refresh. Persistence deletes those prior edge IDs and incrementally upserts refreshed scoped LSP output plus newly emitted output from the other invoked enrichment consumers; unrelated graph rows are not rewritten. If schema migration explicitly requests a full reconstruction, the job ledger switches to full persisted counts before that write.
 
 Changed scope always suppresses background or run-to-completion repo continuation. The resulting LSP readiness is recorded with scoped coverage, never repo-wide completeness or a repo-wide sentinel.
 
@@ -103,11 +103,11 @@ Changed scope always suppresses background or run-to-completion repo continuatio
 
 - Added a git-backed pure planner for net `HEAD` → current-worktree changes with rename detection, repo/root provenance, deterministic diagnostics, and 4,096-node / 12,288-operation hard bounds.
 - Reused Pass 1's operation selector and delivered planned stable-node IDs through `BusOptions` to both `LanguageAccumulatorConsumer` and `AllEnrichmentsGate`.
-- Kept the complete cached graph in the event payload and in-memory finalization while replacing only planned-node LSP rows through incremental persistence.
+- Kept the complete cached graph in the event payload and in-memory finalization while incrementally replacing planned-node LSP rows and preserving new output from the other invoked consumers.
 - Planned changed scope before `run_foreground_lsp_and_persist` opens the durable enrichment job and disabled every repo continuation mode for changed scope.
 - Changed non-repo completion to `set_complete_scoped`, preserving partial global dead-code readiness and explicit review-readiness context.
 - Added the one-file fanout oracle, real git provenance, staged-then-restored, deterministic rename/delete/unmapped, budget, non-git, scheduler/gate agreement, scoped persistence, full-graph preservation, and readiness regressions.
-- Local verification after review fixes: `cargo +1.97.0 check --lib`; planner tests (7 passed); enrichment tests (9 passed); event-bus filter and scoped-readiness regressions (1 passed each); ADR validation (4/4 passed); `git diff --check`; targeted `rustfmt --check`. Exact-head full CI remains the final ship gate.
+- Local verification after review fixes: `cargo +1.97.0 check --lib`; planner tests (7 passed); enrichment tests (9 passed); event-bus filter and scoped-readiness regressions (1 passed each); ADRs 001/002/004 passed in the full validation run and ADR-003 passed on immediate isolated rerun after a transient child-process fixture failure; `git diff --check`; targeted `rustfmt --check`. Exact-head full CI remains the final ship gate.
 
 ## Verification plan
 

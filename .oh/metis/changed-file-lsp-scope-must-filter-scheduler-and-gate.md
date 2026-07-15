@@ -8,6 +8,6 @@ A bounded enrichment plan is not bounded merely because discovery starts from ch
 
 Filtering the scheduler alone is also unsafe. Any completion gate that counts languages or work independently must apply the identical predicate, or it can wait for work that was deliberately excluded. The regression should prove both halves together while also proving the full cached graph survives in-memory finalization and persistence replaces only scoped LSP rows.
 
-Git discovery and storage must stay bounded too. Discovery should compare `HEAD` directly with the current worktree so staged changes later restored in the working copy do not produce phantom work. Persistence should remove prior LSP edges touching the planned nodes and apply only the refreshed scoped node/edge delta through the incremental seam, leaving unrelated rows untouched.
+Git discovery and storage must stay bounded too. Discovery should compare `HEAD` directly with the current worktree so staged changes later restored in the working copy do not produce phantom work. Persistence should remove prior LSP edges touching the planned nodes, apply the refreshed scoped LSP delta, include any newly emitted output from other invoked consumers, and leave unrelated rows untouched.
 
 Scoped execution and global readiness are separate claims. A changed/root run must record scoped coverage even when every planned item succeeds, suppress repo continuation, and leave dead-code readiness partial. The honest boundary is: useful review context, not repo-wide caller/reference completeness.
