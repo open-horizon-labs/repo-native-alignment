@@ -138,7 +138,7 @@ Example `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "rna": {
+    "rna-server": {
       "type": "stdio",
       "command": "/Users/me/.cargo/bin/repo-native-alignment",
       "args": ["--repo", "/path/to/your/project"]
