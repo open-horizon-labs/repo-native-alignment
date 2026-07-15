@@ -1,3 +1,9 @@
+---
+title: Issue #735 - Remove number_prefix from the Metal feature chain
+date: 2026-07-15
+issue: 735
+---
+
 # Issue #735 — Remove number_prefix from the Metal feature chain
 
 ## Aim
@@ -47,7 +53,8 @@ Rejected.
 1. Open a draft prerequisite PR in `open-horizon-labs/metal-candle` before code.
 2. Upgrade only `hf-hub` 0.4 to 0.5 and adapt bounded API changes if the
    compiler identifies any.
-3. Verify the fork's embeddings/rerank paths on Apple Silicon and its MSRV.
+3. Verify the fork's embeddings paths on Apple Silicon and make its actual
+   resolved MSRV explicit.
 4. Point RNA's git dependency at the reviewed fork commit.
 5. Remove the exact `number_prefix` policy and fixtures, then prove the package
    is absent from the all-feature/all-target graph.
@@ -56,13 +63,32 @@ Rejected.
 
 ## Acceptance evidence
 
-- [ ] `cargo tree --all-features --target all -i number_prefix@0.4.0` finds no
+- [x] `cargo tree --all-features --target all -i number_prefix@0.4.0` finds no
   package.
-- [ ] Default and no-default graphs do not gain the optional Metal stack.
-- [ ] Rust 1.97 no-default, default, embeddings, and Metal checks pass.
-- [ ] Rust 1.91 remains the verified MSRV.
-- [ ] The real Metal rerank integration passes on the macOS runner.
-- [ ] RustSec passes without a number_prefix policy record or ignore.
+- [x] Default and no-default graphs do not gain the optional Metal stack.
+- [x] Rust 1.97 no-default, default, embeddings, and Metal checks pass.
+- [x] Rust 1.91 remains the verified MSRV.
+- [x] The real Metal embeddings integration passes on Apple Silicon.
+- [x] RustSec passes without a number_prefix policy record or ignore.
+
+## Implementation evidence
+
+- metal-candle PR #6 merged as
+  `9966033a92befe0d760813e3a61152271ecd2822`; RNA pins that reviewed commit.
+- The fork's fresh dependency graph made its stale Rust 1.75 declaration
+  explicit as Rust 1.88. At that floor, all-feature check and 457 executable
+  tests passed, with 9 documentation tests ignored.
+- The release-mode Metal embeddings example produced `[3, 384]` on CPU and
+  Metal with a maximum output difference of `0.000000`.
+- RNA's lockfile removed hf-hub 0.4.3, indicatif 0.17.11, number_prefix 0.4.0,
+  ureq 2.12.1, and their obsolete platform packages; metal-candle now shares
+  hf-hub 0.5 with fastembed.
+- The live RustSec gate reports 778 locked packages, zero vulnerabilities, and
+  only #736's declared `paste` warning.
+- Rust 1.91 and Rust 1.97 each pass no-default, default, embeddings, and Metal
+  library checks with the pinned fork commit.
+- RNA's ignored product-level rerank integration passed with Rust 1.97 and the
+  full embeddings feature graph: 1 passed, 0 failed, 2,002 filtered out.
 
 ## Stop / pivot triggers
 
