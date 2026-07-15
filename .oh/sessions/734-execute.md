@@ -60,11 +60,11 @@ with much larger compatibility and performance risk. Rejected.
 
 - [x] `cargo tree --all-features --target all -i lru@0.12.5` finds no package.
 - [x] RustSec passes without an lru policy record or advisory ignore.
-- [ ] LanceDB graph load/save, incremental persistence, schema migration,
+- [x] LanceDB graph load/save, incremental persistence, schema migration,
   custom metadata, FTS, and vector search tests pass.
 - [x] Rust 1.97 no-default and embeddings checks pass.
 - [x] Rust 1.91 remains the declared and verified MSRV.
-- [ ] A new exact-head artifact reads cache data written by the pre-upgrade
+- [x] A new exact-head artifact reads cache data written by the pre-upgrade
   exact-head artifact.
 
 ## Implementation evidence
@@ -80,9 +80,12 @@ with much larger compatibility and performance risk. Rejected.
   incremental-version tests pass locally on the selected stack.
 - `cargo +1.91.0 check --lib --no-default-features` passes on the selected
   stack without raising the declared toolchain floor.
-- Embeddings compile with the three additional LanceDB 0.30 `RecordBatch`
-  boundary adaptations; exact-head CI and artifact verification will complete
-  the FTS/vector and old-cache evidence.
+- Exact-head workflow run 29419161184 passed audit, lint, all tests, smoke,
+  TypeScript MCP SDK, and release artifact construction.
+- The exact-head LanceDB 0.30/Lance 7 artifact loaded the 20-symbol/25-edge
+  cache written by the pre-upgrade #731 LanceDB 0.26 artifact and returned the
+  persisted `main` symbol without a rebuild. The same artifact passed the fresh
+  pipeline smoke suite, including persistence and schema round-trips.
 
 ## Stop / pivot triggers
 
