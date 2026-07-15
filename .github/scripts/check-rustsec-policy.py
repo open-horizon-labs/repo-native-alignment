@@ -296,6 +296,16 @@ def live_feature_scopes() -> dict[str, list[str]]:
     return scopes
 
 
+def cargo_tree_reports_no_match(stderr: str) -> bool:
+    return bool(
+        re.search(
+            r"^error: package ID specification .+ did not match any packages$",
+            stderr,
+            re.MULTILINE,
+        )
+    )
+
+
 def verify_live_feature_reachability(
     policy: dict[str, Any], feature_scopes: dict[str, list[str]]
 ) -> list[str]:
@@ -347,21 +357,23 @@ def verify_live_feature_reachability(
             tree = subprocess.run(
                 command, capture_output=True, text=True, check=False
             )
-            if tree.returncode != 0:
-                errors.append(
-                    f"feature reachability probe failed for {package} {version} "
-                    f"({scope}): {tree.stderr.strip()}"
-                )
-                continue
             actual: set[str] = set()
-            for line in tree.stdout.splitlines():
-                match = re.match(r"^(\S+) v(\S+)", line.strip())
-                if not match:
+            if tree.returncode != 0:
+                if not cargo_tree_reports_no_match(tree.stderr):
+                    errors.append(
+                        f"feature reachability probe failed for {package} {version} "
+                        f"({scope}): {tree.stderr.strip()}"
+                    )
                     continue
-                name, resolved_version = match.groups()
-                if name == package and resolved_version == version:
-                    continue
-                actual.add(f"{name} {resolved_version}")
+            else:
+                for line in tree.stdout.splitlines():
+                    match = re.match(r"^(\S+) v(\S+)", line.strip())
+                    if not match:
+                        continue
+                    name, resolved_version = match.groups()
+                    if name == package and resolved_version == version:
+                        continue
+                    actual.add(f"{name} {resolved_version}")
             expected = set(expected_scopes.get(scope, []))
             missing = sorted(expected - actual)
             unexpected = sorted(actual - expected)
@@ -384,6 +396,12 @@ def self_test(script_dir: Path, policy: dict[str, Any]) -> list[str]:
     vulnerable = load_json(fixture_dir / "vulnerability.json")
     today = dt.date(2026, 7, 15)
     failures: list[str] = []
+    if not cargo_tree_reports_no_match(
+        "error: package ID specification `optional@1.0.0` did not match any packages\n"
+    ):
+        failures.append("cargo tree no-match output should produce empty reachability")
+    if cargo_tree_reports_no_match("error: cargo tree subprocess failed\n"):
+        failures.append("cargo tree subprocess errors must not look like no-match output")
     if evaluate(current, policy, today):
         failures.append("current-policy fixture should pass")
     if not any("vulnerability" in error for error in evaluate(vulnerable, policy, today)):
