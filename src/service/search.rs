@@ -2725,6 +2725,7 @@ mod tests {
         let repository_content = "secret-query src/private/customer.rs";
         let diagnostic = match isolate_embedding_scorer(
             async move {
+                tokio::task::yield_now().await;
                 panic!("{repository_content}");
                 #[allow(unreachable_code)]
                 Ok(SearchOutcome::NotReady)
