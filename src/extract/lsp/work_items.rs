@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -148,6 +152,76 @@ pub(crate) struct LspWorkItemLedger {
     store: Mutex<LspWorkItemStore>,
     last_flush: Mutex<Instant>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct WorkItemFileLock {
+    path: PathBuf,
+    owner: String,
+    acquired: bool,
+}
+
+impl WorkItemFileLock {
+    fn acquire(repo_root: &Path) -> Self {
+        let path = store_path(repo_root).with_extension("lock");
+        let owner = std::process::id().to_string();
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(%error, "Failed to create LSP work-item lock directory");
+        }
+
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(error) = writeln!(file, "{owner}") {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "Failed to write LSP work-item lock owner; continuing with process-local lock only"
+                        );
+                        let _ = std::fs::remove_file(&path);
+                        return Self {
+                            path,
+                            owner,
+                            acquired: false,
+                        };
+                    }
+                    return Self {
+                        path,
+                        owner,
+                        acquired: true,
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if work_item_lock_owner_is_dead(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "Failed to acquire LSP work-item file lock; continuing with process-local lock only"
+                    );
+                    return Self {
+                        path,
+                        owner,
+                        acquired: false,
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkItemFileLock {
+    fn drop(&mut self) {
+        if self.acquired && work_item_lock_is_owned_by(&self.path, &self.owner) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl LspWorkItemLedger {
@@ -486,6 +560,7 @@ fn merge_and_write_store(
     job_id: &str,
     current_job: &LspWorkItemStore,
 ) -> Result<()> {
+    let _file_lock = WorkItemFileLock::acquire(repo_root);
     let mut persisted = load_store(repo_root)?;
     persisted
         .records
@@ -494,6 +569,32 @@ fn merge_and_write_store(
     persisted.schema_version = STORE_SCHEMA_VERSION;
     retain_recent_jobs(&mut persisted, MAX_RETAINED_TERMINAL_JOBS);
     write_store(repo_root, &persisted)
+}
+
+fn work_item_lock_is_owned_by(path: &Path, owner: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.trim() == owner)
+        .unwrap_or(false)
+}
+
+fn work_item_lock_owner_is_dead(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
 }
 
 fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
@@ -734,5 +835,19 @@ mod tests {
         let snapshots = load_queue_snapshots(repo.path(), usize::MAX).unwrap();
         assert_eq!(snapshots.len(), MAX_RETAINED_ACTIVE_JOBS);
         assert!(snapshots.iter().all(|snapshot| snapshot.pending == 1));
+    }
+
+    #[test]
+    fn stale_cross_process_lock_is_reclaimed() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = store_path(repo.path()).with_extension("lock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "999999999").unwrap();
+
+        let lock = WorkItemFileLock::acquire(repo.path());
+        assert!(lock.acquired);
+        assert!(work_item_lock_is_owned_by(&path, &lock.owner));
+        drop(lock);
+        assert!(!path.exists());
     }
 }

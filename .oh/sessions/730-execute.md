@@ -47,3 +47,4 @@ Start with `cargo check --lib`, then focused persistence/rendering tests, mixed-
 - Serialized same-process writers per repository and changed full-store overwrites into merge-by-job writes; a concurrent-ledger regression proves both jobs survive.
 - Retained up to 32 active/interrupted jobs and 16 terminal jobs, so polyglot work remains visible while repeated crashes cannot grow the cache without bound.
 - Added defaults for legacy non-empty records and regression coverage for aged reports, concurrent ledgers, and bounded interrupted-job history.
+- Serialized cross-process writers with a stale-owner lock file before merge-and-rename, matching the existing enrichment-ledger coordination model.
