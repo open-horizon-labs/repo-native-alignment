@@ -41,6 +41,7 @@ Start with `cargo check --lib`, focused interrupt/restart and rendering tests, a
 - `cargo test --lib extract::lsp::work_items::tests::` (9 passed)
 - `cargo test --lib interrupt_restart_executor_fixture_invokes_only_retryable_items_once` (1 passed)
 - `cargo test --lib exhausted_recovery_fails_pass1_closed_without_invocation` (1 passed)
+- `cargo test` after rebasing onto `issue/730` (1934 library tests passed, 2 ignored; CLI contract passed; doc tests passed/ignored as declared)
 - `git diff --check`
 
 `cargo clippy --lib --tests -- -D warnings` reached the crate but the local Rust 1.97 toolchain reported 78 pre-existing all-target warnings outside this change; neither changed LSP file appeared in that warning set. CI remains the authoritative pinned-toolchain lint gate.
