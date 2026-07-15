@@ -1,0 +1,241 @@
+---
+name: oh-task
+description: Work a GitHub issue to completion in a branch, including review follow-ups, then PR for human review
+---
+
+# oh-task
+
+Claim a GitHub issue, work it to completion in an isolated branch, and open a PR for human review.
+
+## Invocation
+
+`/oh-task <issue-number> [branch]`
+
+- `<issue-number>` - the GitHub issue number (e.g., `123` or `#123`)
+- `[branch]` - optional base branch (default: `origin/main`)
+
+Use `[branch]` for stacked PRs where this issue depends on another in-flight PR.
+
+## Flow
+
+1. Determine the target branch:
+   - If `[branch]` specified: use that branch (strip `origin/` prefix if present)
+   - Otherwise: use `main`
+2. Sync with target branch from origin:
+   ```bash
+   git fetch origin
+   git checkout -B <target-branch> origin/<target-branch>
+   ```
+3. Fetch and validate issue:
+   ```bash
+   gh issue view <issue-number> --json number,title,body,state,assignees
+   ```
+   Abort if issue is closed or already assigned to someone else.
+4. Claim issue (assign to self):
+   ```bash
+   gh issue edit <issue-number> --add-assignee @me
+   ```
+   No commit needed - state is on GitHub.
+5. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
+6. Read and understand the issue:
+   - Review issue title and body
+   - Think through the approach
+   - Ask clarifying questions if requirements are ambiguous
+   - Only proceed when confident in the approach
+7. Create worktree from base branch:
+   ```bash
+   git fetch origin
+   git worktree add .worktrees/issue-<number> -b issue/<number> --no-track origin/<target-branch>
+   cd .worktrees/issue-<number>
+   ```
+8. Work until issue is resolved
+9. Stage changes (`git add`)
+10. Run code checks (cargo check, npm/pnpm build, go build, etc. based on project type).
+    Fix any errors, re-stage, re-run until clean.
+11. Run the repo-local `/review` skill on staged changes (do NOT use code-reviewer agent)
+12. Handle review findings:
+    - P1-P3 trivial: fix inline, re-stage, re-review
+    - P1-P3 non-trivial: create child issue with `gh issue create --title "..." --body "Parent: #<issue-number>"`
+    - P4: discard (nitpick)
+13. Commit code changes
+14. **CRITICAL: Complete ALL child issues before PR.**
+    Any `gh issue create` during this session = child that blocks PR.
+    No "follow-ups" - if you create it, you work it now.
+
+    While ANY unclosed issues created in this session:
+    - Claim: `gh issue edit <child-number> --add-assignee @me`
+    - Work until complete
+    - Stage changes
+    - Run code checks, fix errors until clean
+    - Run the repo-local `/review` skill (each issue gets its own review!)
+    - Handle findings (may spawn more children)
+    - Commit
+    - Loop until zero unclosed children
+15. ALL issues addressed -> push and create PR:
+    ```bash
+    git push -u origin issue/<number>
+    gh pr create --base <target-branch> --title "<issue-title>" --body "$(cat <<'EOF'
+    Closes #<issue-number>
+
+    ## Also Closes
+    - #<child-1>
+    - #<child-2>
+
+    ## Summary
+    <brief description of changes>
+    EOF
+    )"
+    ```
+    The "Closes #N" syntax auto-closes issues when PR merges.
+16. Wait for CodeRabbit review, then iterate:
+    - `gh pr view <pr-number> --comments` to check for CodeRabbit feedback
+    - Handle like review findings:
+      - Trivial: fix inline
+      - Non-trivial: create child issue
+      - Nits: ignore
+    - For each fix or new issue:
+      - Stage changes
+      - Run code checks, fix errors until clean
+      - Run the repo-local `/review` skill (CodeRabbit fixes get repo-local reviewed too!)
+      - Handle any new findings
+      - Commit
+    - Push all changes
+    - Repeat until CodeRabbit has no new comments
+17. Verify CI is green:
+    ```bash
+    gh pr checks <pr-number> --watch --fail-on-error
+    ```
+    If CI fails:
+    - Read the failing check logs
+    - Attempt to fix the issue
+    - Stage changes, run code checks, run the repo-local `/review` skill
+    - Commit and push
+    - Wait for CI again: `gh pr checks <pr-number> --watch --fail-on-error`
+    - Max 3 CI fix attempts. If still failing, signal `status: "error"` with the failure reason.
+18. Return to main repo and signal completion:
+    ```bash
+    cd <original-dir>
+    ```
+    Call `signal_completion(status: "success", pr: "<pr-url>")` to notify the orchestrator.
+    **CRITICAL:** Signal BEFORE cleanup.
+19. Cleanup worktree:
+    ```bash
+    git worktree remove .worktrees/issue-<number>
+    ```
+20. Exit and report PR URL
+
+## Git Workflow
+
+- Create isolated worktree in `.worktrees/issue-<number>`
+- All work happens on `issue/<number>` branch
+- Branch from main/master at start
+- Each issue = one or more commits
+- Keep commits focused and atomic
+- PR encompasses entire issue tree (parent + children)
+- Worktree cleaned up after PR created
+
+## Review Handling
+
+- **P1-P3 findings**: Create as GitHub issues, work them in this session
+- **P4 findings**: Discard as nitpicks (don't create issues)
+
+## Human Touchpoint
+
+The PR is the **only** human review point.
+Everything before is autonomous.
+
+## Exit Conditions
+
+- **Success**: PR created, CI green, all issues in tree will close on merge
+- **Blocked**: An issue needs human decision - stop and report
+- **Safety**: Max 10 issue iterations (prevent runaway)
+
+## Completion Signaling (MANDATORY)
+**CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
+**Signal based on outcome:**
+| Outcome | Call |
+|---------|------|
+| PR created, reviewed, CI green | `signal_completion(status: "success", pr: "<pr-url>")` |
+| Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |
+| Needs human decision | `signal_completion(status: "blocked", blocker: "<reason>")` |
+**If you do not signal, the orchestrator will not know you are done and the session becomes orphaned.**
+
+**Fallback:** If the `signal_completion` tool is not available, output your completion status as your final message in the format: `COMPLETION: status=<status> pr=<url>` or `COMPLETION: status=<status> error=<reason>`.
+
+## Example
+
+```
+$ /oh-task 42
+
+Fetching issue #42...
+Issue: "Fix validation bug in auth module"
+State: open, unassigned
+
+Claiming issue #42...
+Assigned to @me
+
+Reading dive context...
+No dive context found.
+
+Reading issue details...
+Issue: Input validation fails silently on empty strings
+Approach: Add explicit empty string check before processing
+No clarifying questions needed, proceeding.
+
+Creating worktree .worktrees/issue-42 on branch issue/42
+Loading repo-local review guidance...
+Working on issue...
+Staging changes...
+Running repo-local `/review`...
+Found 2 issues:
+  - P3: Add test for edge case -> non-trivial, created issue #43 (Parent: #42)
+  - P4: Consider renaming variable -> discarded (nitpick)
+Review clean (P3 spawned as issue, P4 discarded)
+[commit] fix: validate input before processing
+
+Working on child issue #43...
+Claiming issue #43...
+Staging changes...
+Running repo-local `/review`...
+No issues found.
+[commit] test: add edge case coverage
+
+All issues complete.
+Pushing issue/42...
+Creating PR...
+PR created: https://github.com/org/repo/pull/99
+Body includes: Closes #42, Closes #43
+
+Waiting for CodeRabbit review...
+CodeRabbit found 2 issues:
+  - "Add nil check before dereferencing" -> trivial, fixing inline
+  - "Consider refactoring to reduce complexity" -> nit, ignoring
+[commit] fix: add nil check per CodeRabbit
+Pushing...
+CodeRabbit review passed.
+Waiting for CI checks...
+CI passed (3/3 checks green).
+Returning to main repo...
+signal_completion(status: "success", pr: "https://github.com/org/repo/pull/99")
+Cleaning up worktree...
+Done.
+```
+
+### Stacked PRs Example
+
+```
+$ /oh-task 42
+# Claims issue #42 on main
+# Creates PR #99: issue/42 -> main (Closes #42)
+
+$ /oh-task 43 issue/42
+# Checks out issue/42, claims issue #43
+# Creates PR #100: issue/43 -> issue/42 (Closes #43)
+
+$ /oh-task 44 issue/43
+# Checks out issue/43, claims issue #44
+# Creates PR #101: issue/44 -> issue/43 (Closes #44)
+
+$ /drummer
+# Merges in order: #99 -> main, rebases #100 -> main, rebases #101 -> main
+```
