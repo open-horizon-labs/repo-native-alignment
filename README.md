@@ -119,9 +119,11 @@ python3 .github/scripts/check-rustsec-policy.py --self-test
 python3 .github/scripts/check-rustsec-policy.py --live
 ```
 
-Warning decisions and their dependency paths, owners, removal issues, review
-triggers, and expiries live in `security/rustsec-policy.json`. The policy does
-not use cargo-audit advisory ignores.
+Warning decisions and their dependency paths, exact feature reachability,
+upstream status, impact rationale, owners, removal issues, review triggers, and
+expiries live in `security/rustsec-policy.json`. Live mode recomputes direct
+dependents for the default, embeddings, and Metal graphs and fails when they
+drift. The policy does not use cargo-audit advisory ignores.
 
 ### 2. Connect to your MCP client
 

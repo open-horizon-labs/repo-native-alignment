@@ -96,14 +96,44 @@ required human judgment; automation supplies and checks the graph evidence.
 5. Verify default, embeddings, and Metal builds on Rust 1.91 and 1.97, then run
    the exact-head release, CLI, and MCP delivery gates.
 
+## Implementation evidence
+
+- The policy contract now requires feature reachability, upstream status, and
+  impact rationale in addition to exact advisory/package/version identity,
+  dependency paths, owner, decision issue, review triggers, approval, and
+  expiry.
+- Live mode runs a locked, all-target reverse tree for `default`, `embeddings`,
+  and `metal`, then compares each exact direct dependent with the policy. The
+  scopes come from live Cargo metadata, so a newly added top-level feature also
+  fails until its reachability is declared.
+- The record names all ten default direct dependents and all 22 direct
+  dependents selected by embeddings/Metal, plus eleven complete path families
+  from `paste` to RNA.
+- Self-tests reject missing upstream, impact, or reachability evidence and an
+  incomplete feature-scope map. The live audit reports 778 locked packages,
+  zero vulnerabilities, and exactly the declared `paste` warning.
+- A manual graph-drift adversarial test changed the declared default
+  `random_word` version from 0.5.2 to 0.5.3. Live mode failed with both the
+  missing declaration and the undeclared resolved parent, then passed again
+  after restoring the exact evidence.
+- A second adversarial test renamed the declared `metal` scope. Live mode
+  reported the missing Cargo feature and the unknown policy scope without
+  redundantly listing all 22 Metal parents.
+- README reproduction guidance now states that live mode recomputes feature
+  reachability rather than treating policy prose as sufficient evidence.
+- The branch has no `Cargo.toml`, `Cargo.lock`, or `src/` diff from #735, so
+  #735's Rust 1.91/1.97 default, embeddings, Metal, real Metal inference, and
+  rerank evidence applies unchanged. The exact #736 workflow will repeat the
+  default release/test surface.
+
 ## Acceptance evidence
 
 - [x] Recomputed the post-#734/#735 all-feature reverse tree.
 - [x] Probed every currently available bounded parent migration.
-- [ ] CI requires feature, upstream, impact, ownership, trigger, and expiry
+- [x] CI requires feature, upstream, impact, ownership, trigger, and expiry
   evidence for warning decisions.
-- [ ] The live all-target audit matches only the exact `paste` decision.
-- [ ] Default, embeddings, and Metal verification passes at both Rust
+- [x] The live all-target audit matches only the exact `paste` decision.
+- [x] Default, embeddings, and Metal verification passes at both Rust
   boundaries.
 - [ ] Exact-head release artifact passes CLI and real MCP delivery checks.
 
