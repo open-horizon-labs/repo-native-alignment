@@ -24,6 +24,17 @@ struct PersistInstrumentation {
     successful_mutations: AtomicU64,
 }
 
+#[cfg(test)]
+fn signal_test_write_started() {
+    let Ok(path) = std::env::var("RNA_TEST_LANCE_READY_FILE") else {
+        return;
+    };
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+}
+
 /// Persist graph nodes and edges to LanceDB using append-only versioned writes.
 ///
 /// Each call appends a new `scan_version` (monotonically incrementing) to the tables
@@ -372,6 +383,8 @@ async fn persist_graph_incremental_with_retry_limit(
                             .when_not_matched_insert_all();
                         // Note: no when_not_matched_by_source_delete -- we only touch changed rows.
                         // Untouched rows (unchanged files) are left alone.
+                        #[cfg(test)]
+                        signal_test_write_started();
                         match merge.execute(Box::new(batches)).await {
                             Ok(_) => {
                                 if let Some(metrics) = instrumentation {
@@ -450,6 +463,8 @@ async fn persist_graph_incremental_with_retry_limit(
                             .when_matched_update_all(None)
                             .when_not_matched_insert_all();
                         // Note: no when_not_matched_by_source_delete -- untouched edges are preserved.
+                        #[cfg(test)]
+                        signal_test_write_started();
                         match merge.execute(Box::new(batches)).await {
                             Ok(_) => {
                                 if let Some(metrics) = instrumentation {
@@ -720,15 +735,29 @@ mod tests {
                     anyhow::Ok(())
                 }));
             }
-            for task in tasks {
-                task.await
-                    .expect("writer task panicked")
-                    .unwrap_or_else(|error| panic!("{label}: protected writer failed: {error:#}"));
+            let errors: Vec<anyhow::Error> = futures::future::join_all(tasks)
+                .await
+                .into_iter()
+                .map(|result| result.expect("writer task panicked"))
+                .filter_map(Result::err)
+                .collect();
+            if !errors.is_empty() {
+                assert!(
+                    !serialized && retry_limit == 0,
+                    "{label}: protected writer failed: {errors:#?}"
+                );
+                eprintln!("{label}: expected unprotected zero-retry failures: {errors:#?}");
             }
             let state = load_graph_from_lance(dir.path())
                 .await
                 .expect("reopen final graph");
-            assert_eq!(state.nodes.len(), 1 + 2 * WRITES_PER_TASK, "{label}");
+            assert!(
+                state.nodes.iter().any(|node| node.id.name == "baseline"),
+                "{label}: committed baseline must remain visible"
+            );
+            if errors.is_empty() {
+                assert_eq!(state.nodes.len(), 1 + 2 * WRITES_PER_TASK, "{label}");
+            }
             let unique: std::collections::HashSet<_> =
                 state.nodes.iter().map(Node::stable_id).collect();
             assert_eq!(unique.len(), state.nodes.len(), "{label}: duplicate IDs");
@@ -1007,10 +1036,18 @@ mod tests {
             .expect("baseline persist");
 
         let test_binary = std::env::current_exe().expect("current test binary");
-        let mut child = writer_command(&test_binary, dir.path(), "interrupted", 500, 3)
-            .spawn()
-            .expect("spawn writer");
-        std::thread::sleep(Duration::from_millis(20));
+        let ready_file = dir.path().join("writer-entered-merge");
+        let mut command = writer_command(&test_binary, dir.path(), "interrupted", 500, 3);
+        command.env("RNA_TEST_LANCE_READY_FILE", &ready_file);
+        let mut child = command.spawn().expect("spawn writer");
+        let wait_started = Instant::now();
+        while !ready_file.exists() {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(5),
+                "writer did not reach LanceDB merge boundary"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         child.kill().expect("interrupt writer");
         let status = child.wait().expect("reap interrupted writer");
         assert!(!status.success(), "writer should have been interrupted");
