@@ -1,0 +1,77 @@
+contract_version = 1
+
+[[case]]
+id = "body-backed-control"
+source = "body-backed-control.md"
+candidate = "supports"
+expected_status = "valid"
+expected_edges = 1
+expected_diagnostics = []
+evidence_snippet = "The retry budget supports graceful recovery after a transient outage."
+
+[[case]]
+id = "metadata-only"
+source = "metadata-only.md"
+candidate = "supports"
+expected_status = "invalid"
+expected_edges = 0
+expected_diagnostics = ["content.metadata_without_body_evidence"]
+
+[[case]]
+id = "sidecar-only"
+source = "sidecar-only.md"
+sidecar = "sidecar-only.relationships.toml"
+candidate = "supports"
+expected_status = "invalid"
+expected_edges = 0
+expected_diagnostics = ["content.sidecar_without_body_evidence"]
+
+[[case]]
+id = "missing-body-evidence"
+source = "missing-body-evidence.md"
+candidate = "supports"
+expected_status = "unresolved"
+expected_edges = 0
+expected_diagnostics = ["content.missing_body_evidence"]
+
+[[case]]
+id = "broken-anchor"
+source = "broken-anchor.md"
+candidate = "references"
+expected_status = "unresolved"
+expected_edges = 0
+expected_diagnostics = ["content.unresolved_anchor"]
+
+[[case]]
+id = "orphan-quote"
+source = "orphan-quote.md"
+sidecar = "orphan-quote.registry.toml"
+candidate = "quotes"
+expected_status = "unresolved"
+expected_edges = 0
+expected_diagnostics = ["content.orphan_quote"]
+
+[[case]]
+id = "chart-screenshot"
+source = "chart-screenshot.md"
+candidate = "visualizes"
+expected_status = "invalid"
+expected_edges = 0
+expected_diagnostics = ["content.visual_not_evidence"]
+
+[[case]]
+id = "stale-verification"
+source = "stale-verification.md"
+sidecar = "stale-verification.relationships.toml"
+candidate = "supports"
+expected_status = "stale"
+expected_edges = 0
+expected_diagnostics = ["content.stale_verification"]
+
+[[case]]
+id = "public-worksheet-prose"
+source = "public-worksheet-prose.md"
+candidate = "classifies"
+expected_status = "invalid"
+expected_edges = 0
+expected_diagnostics = ["content.public_vocabulary_leak"]

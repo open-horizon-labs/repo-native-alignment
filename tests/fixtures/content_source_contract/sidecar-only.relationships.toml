@@ -1,0 +1,4 @@
+[[relationship]]
+kind = "supports"
+source = "sidecar-only"
+target = "graceful-recovery"
