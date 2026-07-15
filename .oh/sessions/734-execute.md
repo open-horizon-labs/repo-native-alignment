@@ -32,11 +32,13 @@ forces it. Rejected.
 
 ### C. Upgrade the coherent LanceDB/Lance/Arrow stack
 
-Move to LanceDB 0.31.0, Lance/lance-index 8.0.0, and Arrow 58. Registry metadata
-declares Rust 1.91 for both LanceDB and lance-index. Lance 8's index dependencies
-no longer list Tantivy, removing the owning `lru` path. Use compiler-driven API
-migration and verify RNA's persistence, schema migration, vector/FTS, metadata,
-and graph round-trip boundaries. Selected.
+Move to LanceDB 0.30.0, Lance/lance-index 7.0.0, and Arrow 58. Registry metadata
+declares Rust 1.91 for both LanceDB and lance-index. Lance 7's index dependencies
+no longer list Tantivy, removing the owning `lru` path. Unlike LanceDB 0.31 /
+Lance 8, this stack does not add the target-specific `lance-testing -> pprof ->
+inferno -> quick-xml 0.26` vulnerability path found by the #731 gate. Use
+compiler-driven API migration and verify RNA's persistence, schema migration,
+vector/FTS, metadata, and graph round-trip boundaries. Selected.
 
 ### D. Replace LanceDB
 
@@ -56,17 +58,35 @@ with much larger compatibility and performance risk. Rejected.
 
 ## Acceptance evidence
 
-- [ ] `cargo tree --all-features -i lru@0.12.5` finds no package.
-- [ ] RustSec passes without an lru policy record or advisory ignore.
+- [x] `cargo tree --all-features --target all -i lru@0.12.5` finds no package.
+- [x] RustSec passes without an lru policy record or advisory ignore.
 - [ ] LanceDB graph load/save, incremental persistence, schema migration,
   custom metadata, FTS, and vector search tests pass.
-- [ ] Rust 1.97 no-default and embeddings checks pass.
-- [ ] Rust 1.91 remains the declared and verified MSRV.
+- [x] Rust 1.97 no-default and embeddings checks pass.
+- [x] Rust 1.91 remains the declared and verified MSRV.
 - [ ] A new exact-head artifact reads cache data written by the pre-upgrade
   exact-head artifact.
 
+## Implementation evidence
+
+- Selected stack: LanceDB 0.30.0, Lance/lance-index 7.0.0, Arrow 58.3.0,
+  DataFusion 53.1.0.
+- Rejected stack: LanceDB 0.31.0 / Lance 8.0.0 because the all-target RustSec
+  gate found `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` through
+  `lance-testing -> pprof -> inferno -> quick-xml 0.26.0`.
+- The live gate reports 795 locked packages, zero vulnerabilities, and only the
+  two declared removal issues (#735 and #736).
+- Nineteen graph persistence, load, migration, custom-edge, metadata, and
+  incremental-version tests pass locally on the selected stack.
+- `cargo +1.91.0 check --lib --no-default-features` passes on the selected
+  stack without raising the declared toolchain floor.
+- Embeddings compile with the three additional LanceDB 0.30 `RecordBatch`
+  boundary adaptations; exact-head CI and artifact verification will complete
+  the FTS/vector and old-cache evidence.
+
 ## Stop / pivot triggers
 
-- Stop if Lance 8 cannot read or deliberately rebuild RNA's existing cache.
+- Stop if the selected Lance stack cannot read or deliberately rebuild RNA's
+  existing cache.
 - Return to solution space if the migration requires raising Rust above 1.91 or
   replacing the persistence model rather than adapting bounded APIs.
