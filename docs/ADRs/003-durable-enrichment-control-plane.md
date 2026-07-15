@@ -23,10 +23,12 @@ validate:
     - extract::lsp::passes::tests::exhausted_recovery_fails_pass1_closed_without_invocation
     - server::changed_file_plan::tests::one_file_change_never_schedules_unrelated_nodes
     - server::changed_file_plan::tests::git_discovery_records_head_to_worktree_provenance
+    - server::changed_file_plan::tests::staged_edit_restored_in_worktree_is_not_scheduled
     - server::changed_file_plan::tests::unsupported_language_is_reported_as_unmapped_not_scheduled
     - extract::consumers::tests::changed_file_filter_limits_accumulator_and_gate_but_preserves_full_graph
     - server::state::tests::test_scoped_lsp_coverage_blocks_dead_code_but_allows_review_context
     - server::enrichment::tests::changed_file_scope_never_continues_to_repo_work
+    - server::enrichment::tests::scoped_lsp_persistence_replaces_only_planned_edges
 ---
 
 # Durable Enrichment Control Plane
@@ -65,6 +67,8 @@ The ledger is persisted at `.oh/.cache/enrichment_jobs.json` and records:
 Pass 1 call/reference enrichment also persists versioned per-work-item records at `.oh/.cache/lsp_pass1_work_items.json`. Each record keeps its job, repo/root/file/node identity, requested operations, lifecycle state, attempt and phase history, timestamps, and last error. Queue snapshots are reconstructed from these records and attached to `OperationReport`; `list_roots` therefore delivers the same pending, in-flight, terminal, phase-count, and oldest-work view through MCP. Writes are atomic, phase writes are throttled, terminal state is flushed before the pass returns, and only a bounded number of jobs is retained.
 
 Interrupted Pass 1 jobs recover at the same ledger seam. Records match by stable node identity, source-input fingerprint, and requested operations. Completed output and skipped state carry forward without another LSP request only while that input identity matches; schema-v1 and changed-input records replay conservatively. Pending, stale in-flight, and failed items retry up to three attempts; exhausted items remain terminal, fail readiness closed, and surface bounded actionable diagnostics. Recovered edges and virtual nodes are applied by stable identity so replay remains idempotent. A fresh job starts only when no overlapping pending, in-flight, failed, or exhausted job exists; an exhausted-only matching queue therefore remains selected and cannot silently reset its retry budget.
+
+Changed-file call/reference enrichment plans the net `HEAD`-to-current-worktree state, not the union of staged and unstaged intermediate states. Before the scoped run, cached LSP edges touching planned nodes are removed from the pipeline input. The refreshed LSP nodes and edges are then upserted and the prior scoped edge IDs deleted through incremental persistence, leaving unrelated LanceDB rows untouched. A full reconstruction is permitted only when schema migration has explicitly dropped the tables and the incremental seam requests it.
 
 Scan callers now pass structured `ScanEnrichmentOptions` instead of relying on implicit behavior:
 

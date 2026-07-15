@@ -315,23 +315,14 @@ fn discover_git_worktree_changes(
         .unwrap_or_else(|| "HEAD".to_string());
 
     let mut changes = BTreeSet::new();
-
-    let mut staged_options = DiffOptions::new();
-    staged_options.include_typechange(true);
-    let mut staged = repo
-        .diff_tree_to_index(Some(&head_tree), None, Some(&mut staged_options))
-        .context("failed to diff HEAD against git index")?;
-    detect_renames(&mut staged)?;
-    collect_diff_changes(&staged, root_prefix, &mut changes)?;
-
     let mut worktree_options = DiffOptions::new();
     worktree_options
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_typechange(true);
     let mut worktree = repo
-        .diff_index_to_workdir(None, Some(&mut worktree_options))
-        .context("failed to diff git index against worktree")?;
+        .diff_tree_to_workdir(Some(&head_tree), Some(&mut worktree_options))
+        .context("failed to diff HEAD against git worktree")?;
     detect_renames(&mut worktree)?;
     collect_diff_changes(&worktree, root_prefix, &mut changes)?;
 
@@ -611,5 +602,37 @@ mod tests {
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.planned_nodes.len(), 1);
         assert!(plan.planned_nodes[0].stable_id.contains("src/changed.rs"));
+    }
+
+    #[test]
+    fn staged_edit_restored_in_worktree_is_not_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let original = "fn changed() {}\n";
+        std::fs::write(dir.path().join("src/changed.rs"), original).unwrap();
+
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("src/changed.rs")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("RNA test", "rna@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        std::fs::write(
+            dir.path().join("src/changed.rs"),
+            "fn changed() { println!(\"staged\"); }\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("src/changed.rs")).unwrap();
+        index.write().unwrap();
+        std::fs::write(dir.path().join("src/changed.rs"), original).unwrap();
+
+        let (_, changes) = discover_git_worktree_changes(dir.path()).unwrap();
+        assert!(changes.is_empty());
     }
 }

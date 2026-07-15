@@ -1,3 +1,11 @@
+---
+issue: https://github.com/open-horizon-labs/repo-native-alignment/issues/732
+outcome: context-assembly
+phase: execute
+status: complete
+updated: 2026-07-15
+---
+
 # Issue 732: Bounded changed-file call/reference enrichment
 
 **Issue:** #732
@@ -14,7 +22,7 @@ An agent preparing a review can ask RNA to enrich the files it changed, see exac
 
 The implementation must also preserve two truths:
 
-- the complete cached graph still flows through post-passes and persistence, so scoped enrichment does not erase unrelated graph state;
+- the complete cached graph still flows through post-passes and in-memory finalization, while scoped incremental persistence cannot erase unrelated graph state;
 - scoped coverage remains partial for global capabilities such as dead-code, even when every planned changed node completes.
 
 ## Solution space
@@ -44,12 +52,12 @@ Selected: it is the smallest design that makes bounded scope explicit while reus
 Add a pure changed-file planner with explicit inputs:
 
 - repository path and primary root slug;
-- git change records for `HEAD -> index/worktree`, including old/new paths and status;
+- git change records for the net `HEAD -> current worktree` state, including old/new paths and status;
 - provenance containing the resolved HEAD object ID and the `working-tree` target;
 - the cached graph nodes from which work can be scheduled;
 - an explicit maximum planned-node and operation budget.
 
-Git discovery enables rename detection for index and worktree diffs. Non-git repositories, bare repositories, unreadable HEAD/provenance, an empty usable change set, or an over-budget plan fail before `begin_job`, with help to use `--scope root --root <slug>` or `--scope repo`.
+Git discovery enables rename detection on one direct tree-to-worktree diff. Non-git repositories, bare repositories, unreadable HEAD/provenance, an empty usable change set, or an over-budget plan fail before `begin_job`, with help to use `--scope root --root <slug>` or `--scope repo`.
 
 ### Deterministic mapping
 
@@ -76,6 +84,8 @@ Extend the event-bus options with an optional planned-node ID set. Apply the ide
 
 `run_foreground_lsp_and_persist` accepts the optional filter and still opens the normal durable enrichment job. For changed scope, planning and all prerequisite checks happen first, progress output renders provenance, scheduled counts, and deterministic diagnostics, then the planned node set is executed through the ordinary Pass 1 work-item ledger.
 
+Before execution, cached LSP edges touching planned nodes are removed from the pipeline input so stale scoped relationships cannot survive a refresh. Persistence deletes those prior edge IDs and upserts only refreshed scoped LSP edges and their virtual nodes through the incremental LanceDB seam; unrelated graph rows are not rewritten.
+
 Changed scope always suppresses background or run-to-completion repo continuation. The resulting LSP readiness is recorded with scoped coverage, never repo-wide completeness or a repo-wide sentinel.
 
 ## Acceptance criteria
@@ -87,16 +97,17 @@ Changed scope always suppresses background or run-to-completion repo continuatio
 - [x] Scoped completion remains partial for global dead-code and explicit for review-readiness.
 - [x] Deleted, renamed, unmapped, non-git, and out-of-repo cases have deterministic diagnostics.
 - [x] Changed scope cannot start repo-wide continuation.
+- [x] Changed scope persists only its LSP delta and removes stale scoped edges without rewriting unrelated rows.
 
 ## Implementation evidence
 
-- Added a git-backed pure planner for `HEAD` → index/worktree changes with rename detection, repo/root provenance, deterministic diagnostics, and 4,096-node / 12,288-operation hard bounds.
+- Added a git-backed pure planner for net `HEAD` → current-worktree changes with rename detection, repo/root provenance, deterministic diagnostics, and 4,096-node / 12,288-operation hard bounds.
 - Reused Pass 1's operation selector and delivered planned stable-node IDs through `BusOptions` to both `LanguageAccumulatorConsumer` and `AllEnrichmentsGate`.
-- Kept the complete cached graph in the event payload and persistence path while limiting only LSP work production.
+- Kept the complete cached graph in the event payload and in-memory finalization while replacing only planned-node LSP rows through incremental persistence.
 - Planned changed scope before `run_foreground_lsp_and_persist` opens the durable enrichment job and disabled every repo continuation mode for changed scope.
 - Changed non-repo completion to `set_complete_scoped`, preserving partial global dead-code readiness and explicit review-readiness context.
-- Added the one-file fanout oracle, real git provenance, deterministic rename/delete/unmapped, budget, non-git, scheduler/gate agreement, full-graph preservation, and readiness regressions.
-- Local verification: `cargo check --lib`; changed-file tests (8 passed); scoped-readiness regression; full library suite (1,938 passed, 2 ignored); ADR-003 validation (1/1 passed).
+- Added the one-file fanout oracle, real git provenance, staged-then-restored, deterministic rename/delete/unmapped, budget, non-git, scheduler/gate agreement, scoped persistence, full-graph preservation, and readiness regressions.
+- Local verification after review fixes: `cargo +1.97.0 check --lib`; planner tests (7 passed); enrichment tests (9 passed); event-bus filter and scoped-readiness regressions (1 passed each); ADR validation (4/4 passed); `git diff --check`; targeted `rustfmt --check`. Exact-head full CI remains the final ship gate.
 
 ## Verification plan
 
