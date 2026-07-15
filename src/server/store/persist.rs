@@ -268,6 +268,33 @@ pub(crate) async fn persist_graph_incremental(
     deleted_edge_ids: &[String],
     deleted_files: &[(String, PathBuf)],
 ) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    let retry_limit = std::env::var("RNA_TEST_LANCE_RETRY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3);
+    #[cfg(not(test))]
+    let retry_limit = 3;
+
+    persist_graph_incremental_with_retry_limit(
+        repo_root,
+        upsert_nodes,
+        upsert_edges,
+        deleted_edge_ids,
+        deleted_files,
+        retry_limit,
+    )
+    .await
+}
+
+async fn persist_graph_incremental_with_retry_limit(
+    repo_root: &Path,
+    upsert_nodes: &[Node],
+    upsert_edges: &[Edge],
+    deleted_edge_ids: &[String],
+    deleted_files: &[(String, PathBuf)],
+    retry_limit: u64,
+) -> anyhow::Result<bool> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
@@ -347,7 +374,7 @@ pub(crate) async fn persist_graph_incremental(
                                     );
                                     drop_all_lance_tables(&db_path);
                                     return Ok(true);
-                                } else if is_conflict_error(&err) && attempts < 3 {
+                                } else if is_conflict_error(&err) && attempts < retry_limit {
                                     attempts += 1;
                                     tracing::warn!(
                                         "LanceDB conflict on symbols merge_insert (attempt {}), retrying in {}ms",
@@ -417,7 +444,7 @@ pub(crate) async fn persist_graph_incremental(
                                     );
                                     drop_all_lance_tables(&db_path);
                                     return Ok(true);
-                                } else if is_conflict_error(&err) && attempts < 3 {
+                                } else if is_conflict_error(&err) && attempts < retry_limit {
                                     attempts += 1;
                                     tracing::warn!(
                                         "LanceDB conflict on edges merge_insert (attempt {}), retrying in {}ms",
@@ -559,6 +586,8 @@ pub(crate) async fn delete_nodes_for_roots(
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     use super::super::graph_lance_path;
     use super::super::load::load_graph_from_lance;
@@ -611,6 +640,182 @@ mod tests {
         let (r1, r2) = tokio::join!(task1, task2);
         r1.expect("task1 panicked").expect("task1 returned error");
         r2.expect("task2 panicked").expect("task2 returned error");
+    }
+
+    /// Child-process entry point for the adversarial writer test below. Keeping
+    /// this ignored prevents normal test runs from writing without a parent-
+    /// supplied shared repository and writer identity.
+    #[test]
+    #[ignore]
+    fn cross_process_incremental_writer_helper() {
+        let repo_root = PathBuf::from(
+            std::env::var("RNA_TEST_LANCE_REPO").expect("parent supplies shared repo"),
+        );
+        let writer = std::env::var("RNA_TEST_LANCE_WRITER").expect("parent supplies writer id");
+        let writes = std::env::var("RNA_TEST_LANCE_WRITES")
+            .expect("parent supplies write count")
+            .parse::<usize>()
+            .expect("write count is numeric");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            for index in 0..writes {
+                persist_graph_incremental(
+                    &repo_root,
+                    &[make_test_node(&format!("writer_{writer}_{index}"))],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("writer {writer} failed at {index}: {error:#}"));
+            }
+        });
+    }
+
+    fn writer_command(
+        test_binary: &std::path::Path,
+        repo_root: &Path,
+        writer: &str,
+        writes: usize,
+        retry_limit: u64,
+    ) -> Command {
+        let mut command = Command::new(test_binary);
+        command
+            .arg("--exact")
+            .arg("server::store::persist::tests::cross_process_incremental_writer_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("RNA_TEST_LANCE_REPO", repo_root)
+            .env("RNA_TEST_LANCE_WRITER", writer)
+            .env("RNA_TEST_LANCE_WRITES", writes.to_string())
+            .env("RNA_TEST_LANCE_RETRY_LIMIT", retry_limit.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Reproduces the historical failure boundary with genuine OS processes,
+    /// not Tokio tasks sharing an in-process mutex. The matrix varies process
+    /// serialization and merge-conflict retries independently and verifies the
+    /// final store rather than accepting successful exit codes as correctness.
+    #[test]
+    fn cross_process_write_matrix_preserves_all_rows() {
+        const WRITES_PER_PROCESS: usize = 12;
+        let test_binary = std::env::current_exe().expect("current test binary");
+
+        for (label, concurrent, retry_limit) in [
+            ("serialized_with_retries", false, 3),
+            ("serialized_without_retries", false, 0),
+            ("concurrent_with_retries", true, 3),
+            ("concurrent_without_retries", true, 0),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo_root = dir.path();
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            runtime
+                .block_on(persist_graph_to_lance(
+                    repo_root,
+                    &[make_test_node("baseline")],
+                    &[],
+                ))
+                .expect("baseline persist");
+
+            let started = Instant::now();
+            let outputs = if concurrent {
+                let first = writer_command(
+                    &test_binary,
+                    repo_root,
+                    &format!("{label}_a"),
+                    WRITES_PER_PROCESS,
+                    retry_limit,
+                )
+                .spawn()
+                .expect("spawn first writer");
+                let second = writer_command(
+                    &test_binary,
+                    repo_root,
+                    &format!("{label}_b"),
+                    WRITES_PER_PROCESS,
+                    retry_limit,
+                )
+                .spawn()
+                .expect("spawn second writer");
+                vec![
+                    first.wait_with_output().expect("wait for first writer"),
+                    second.wait_with_output().expect("wait for second writer"),
+                ]
+            } else {
+                vec![
+                    writer_command(
+                        &test_binary,
+                        repo_root,
+                        &format!("{label}_a"),
+                        WRITES_PER_PROCESS,
+                        retry_limit,
+                    )
+                    .output()
+                    .expect("run first writer"),
+                    writer_command(
+                        &test_binary,
+                        repo_root,
+                        &format!("{label}_b"),
+                        WRITES_PER_PROCESS,
+                        retry_limit,
+                    )
+                    .output()
+                    .expect("run second writer"),
+                ]
+            };
+            let elapsed = started.elapsed();
+
+            let all_writers_succeeded = outputs.iter().all(|output| output.status.success());
+            if !all_writers_succeeded {
+                assert_eq!(
+                    retry_limit,
+                    0,
+                    "{label}: a protected writer failed: {}",
+                    outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, output)| !output.status.success())
+                        .map(|(index, output)| format!(
+                            "writer {index}\nstdout:\n{}\nstderr:\n{}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr),
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                assert!(
+                    concurrent,
+                    "{label}: serialized writers must not need conflict retries"
+                );
+                eprintln!(
+                    "LanceDB write matrix: scenario={label} observed an unprotected concurrent-writer failure after {}ms",
+                    elapsed.as_millis()
+                );
+                continue;
+            }
+
+            let state = runtime
+                .block_on(load_graph_from_lance(repo_root))
+                .expect("load final graph");
+            let expected = 1 + 2 * WRITES_PER_PROCESS;
+            assert_eq!(
+                state.nodes.len(),
+                expected,
+                "{label}: every stable ID must remain unique and visible"
+            );
+            let unique_ids: std::collections::HashSet<_> =
+                state.nodes.iter().map(Node::stable_id).collect();
+            assert_eq!(unique_ids.len(), expected, "{label}: duplicate stable IDs");
+            eprintln!(
+                "LanceDB write matrix: scenario={label} processes=2 writes={} retry_limit={retry_limit} elapsed_ms={} final_rows={}",
+                2 * WRITES_PER_PROCESS,
+                elapsed.as_millis(),
+                state.nodes.len(),
+            );
+        }
     }
 
     #[tokio::test]
