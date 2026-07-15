@@ -33,6 +33,49 @@ jobs:
               - '.github/workflows/**'
               - '.github/scripts/**'
               - '.github/fixtures/**'
+              - 'security/rustsec-policy.json'
+
+  audit:
+    needs: changes
+    runs-on: namespace-profile-cached
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Skip (no Rust changes)
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust changes — skipping RustSec audit"
+      - name: Checkout
+        if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Cache Cargo downloads
+        if: needs.changes.outputs.rust == 'true'
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Cache pinned cargo-audit
+        if: needs.changes.outputs.rust == 'true'
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-0.22.2
+      - name: Install pinned cargo-audit
+        if: needs.changes.outputs.rust == 'true' && steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Prove RustSec policy decisions
+        if: needs.changes.outputs.rust == 'true'
+        run: python3 .github/scripts/check-rustsec-policy.py --self-test
+      - name: Audit authoritative lockfile
+        if: needs.changes.outputs.rust == 'true'
+        run: python3 .github/scripts/check-rustsec-policy.py --live
 
   lint:
     needs: changes

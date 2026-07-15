@@ -107,6 +107,22 @@ cd repo-native-alignment
 cargo install --locked --path .
 ```
 
+### Reproduce the RustSec release decision
+
+Rust CI audits the authoritative `Cargo.lock` with a pinned scanner and rejects
+vulnerabilities, undeclared warnings, stale policy records, and expired warning
+decisions. Run the same decision locally:
+
+```bash
+cargo install cargo-audit --version 0.22.2 --locked
+python3 .github/scripts/check-rustsec-policy.py --self-test
+python3 .github/scripts/check-rustsec-policy.py --live
+```
+
+Warning decisions and their dependency paths, owners, removal issues, review
+triggers, and expiries live in `security/rustsec-policy.json`. The policy does
+not use cargo-audit advisory ignores.
+
 ### 2. Connect to your MCP client
 
 The MCP server command is `repo-native-alignment` with `--repo` as an argument. Use a direct binary path for `command` — the `--repo` flag goes in `args`, not in `command`, and MCP stdio launchers should not rely on shell splitting or shell-profile/tool-manager wrappers.
