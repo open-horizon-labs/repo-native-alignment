@@ -1,3 +1,9 @@
+---
+title: Issue #734 - Remove the lru advisory through the Lance parent chain
+date: 2026-07-15
+issue: 734
+---
+
 # Issue #734 — Remove the lru advisory through the Lance parent chain
 
 ## Aim
