@@ -50,22 +50,10 @@ Before exploring, check if RNA is available — it makes everything that follows
    - macOS ARM (other): `Darwin` + `arm64` → use `darwin-arm64`
    - Linux x86_64: `Linux` + `x86_64` → use `linux-x86_64`
 
-2. Download the binary to `~/.local/bin/` (no sudo required):
-
-   ```bash
-   mkdir -p ~/.local/bin
-
-   # macOS M4+
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
-
-   # macOS M1/M2/M3
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
-
-   # Linux x86_64
-   curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.local/bin/repo-native-alignment && chmod +x ~/.local/bin/repo-native-alignment
-   ```
-
-   Ensure `~/.local/bin` is on PATH (for example, add `export PATH="$HOME/.local/bin:$PATH"` to the shell profile).
+2. Invoke the repo-local `/rna-mcp:setup` skill. It owns installation, selects a
+   successful CI release artifact for an immutable commit, verifies the artifact,
+   and configures the client. Never download a mutable `latest` artifact or use a
+   locally compiled binary as a shipped build.
 
 3. Run setup for the current project:
 
@@ -371,13 +359,9 @@ If the user is running OMP (oh-my-pi), offer to install the phase-aware skills h
 
 **If accepted:**
 
-1. Fetch the hook source from GitHub and write it to the project's `.omp/hooks/oh-skills-phase.ts` (create the directory if needed):
-
-   ```
-   https://raw.githubusercontent.com/open-horizon-labs/skills/master/hooks-omp/oh-skills-phase.ts
-   ```
-
-   Do NOT fabricate or rewrite the hook — always fetch the canonical source.
+1. Copy the hook only from a checked-in repo-local vendored asset into
+   `.omp/hooks/oh-skills-phase.ts`. If it is absent, skip installation and ask
+   that it be vendored through a reviewed PR. Never fetch mutable remote content.
 
 2. Optionally create `.oh/skills-config.json` based on what you learned about the project. The config is loaded once at session start (changes require restarting OMP):
 
@@ -416,10 +400,10 @@ pre-built agent wrappers that give each phase its own context.
 
 **If accepted:**
 
-Fetch all 6 agent files from GitHub and write each to `.omp/agents/` (create the directory if needed):
+Copy all 6 agent files from checked-in repo-local vendored assets into
+`.omp/agents/` (create the directory if needed):
 
 ```text
-Base URL: https://raw.githubusercontent.com/open-horizon-labs/skills/master/agents-omp/
 Files:
   oh-aim.md
   oh-problem-space.md
@@ -429,7 +413,8 @@ Files:
   oh-ship.md
 ```
 
-Do NOT fabricate or rewrite the agent files — always fetch the canonical source.
+If the assets are absent, skip installation and ask that they be vendored through
+a reviewed PR. Do not fabricate them or fetch mutable remote content.
 
 **MCP preamble** (only if OH MCP is configured — check for `oh_get_endeavors` in
 the parent session's available tools, or for `.oh/mcp.json` in the project):
@@ -481,10 +466,10 @@ If the user is running Claude Code (not OMP), offer to install phase agents to `
 
 **If accepted:**
 
-Fetch all 6 agent files from GitHub and write each to `.claude/agents/` (create the directory if needed):
+Copy all 6 agent files from checked-in repo-local vendored assets into
+`.claude/agents/` (create the directory if needed):
 
 ```text
-Base URL: https://raw.githubusercontent.com/open-horizon-labs/skills/master/agents-claude/
 Files:
   oh-aim.md
   oh-problem-space.md
@@ -494,7 +479,8 @@ Files:
   oh-ship.md
 ```
 
-Do NOT fabricate or rewrite the agent files — always fetch the canonical source.
+If the assets are absent, skip installation and ask that they be vendored through
+a reviewed PR. Do not fabricate them or fetch mutable remote content.
 
 **MCP preambles:** The pre-packaged Claude Code agents already include OH MCP and RNA MCP preamble sections. No additional append needed.
 

@@ -33,7 +33,7 @@ The independent reviewer confirmed the generic `ship` conflict and found residua
 
 ## Step 3: Fix
 
-**Status:** complete; awaiting final-diff re-review
+**Status:** pending final-diff re-review
 
 - Replaced the generic repo-local `ship` skill with a project-specific delegate to `.claude/agents/ship.md`.
 - Reworked `oh-task` to create a draft PR before implementation and hand off to `/ship`.
@@ -57,4 +57,6 @@ The independent reviewer confirmed the generic `ship` conflict and found residua
 - GitHub Rust CI, lint, audit, test, CodeQL, and checklist checks passed for commit `159781d8`.
 - Local library suite: 1,952 passed, 2 ignored, 0 failed.
 - One environment-sensitive integration assertion failed locally because the installed real `rust-analyzer` bypassed the test's simulated failure; the same integration suite passed in clean GitHub CI. No Rust source changed in this PR.
-- A final CI and CodeRabbit review are required after the review-fix commit is pushed.
+- CI passed on `a0a8de5f`; CodeRabbit requested three further changes, all being
+  addressed before another exact-SHA review. Step 3 remains pending until the final
+  commit has both green CI and an explicit clean/approved CodeRabbit verdict.

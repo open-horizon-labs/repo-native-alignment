@@ -101,6 +101,11 @@ When `.oh/<session>.md` exists with solution-space context:
 
 6. **Update session file** with created subtasks:
 
+   Read-modify-write the existing `.oh/<session>.md`: preserve Aim, Problem
+   Space, Problem Statement, Solution Space, and all unrelated sections. Update
+   the document's existing frontmatter timestamp and replace or append only the
+   Plan section below; do not overwrite the session with this excerpt.
+
    ```markdown
    ---
    session: <session>
@@ -209,7 +214,7 @@ When no session file exists:
    ```
    If subtask B depends on subtask A:
    Use Jira MCP to create link:
-   - Type: "Blocks" or "is blocked by"
+   - Type: "Blocks"
    - From: A
    - To: B
    ```

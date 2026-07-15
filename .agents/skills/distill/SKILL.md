@@ -65,7 +65,9 @@ Reason: [why this action fits]
 ```
 
 **Keep** — leave as individual metis entries, no change.
-**Promote** — pattern is recurring and stable enough to warrant a guardrail. Distill drafts a stub; human approves the content (editing as needed), then an agent writes the file:
+**Promote** — pattern is recurring and stable enough to warrant a guardrail.
+Distill drafts a stub; the human reviews, edits as needed, and explicitly
+approves the final content. Only then may an agent write the file:
 
   ```markdown
   ---
@@ -84,10 +86,15 @@ Reason: [why this action fits]
 
 Only write what the human approved. No auto-promotion, no auto-deletion.
 
-- New metis entries → `.oh/metis/<slug>.md`
-- Guardrail candidates → draft for human to write to `.oh/guardrails/<slug>.md`
-- Compactions → new merged entry + note which originals can be removed
-- Session file compaction → offer to remove stale planning artifacts, keep settled decisions as brief anchors
+- Every created or modified `.oh/**/*.md` artifact must have valid YAML
+  frontmatter in deterministic BTreeMap key order.
+- New metis entries → `.oh/metis/<slug>.md` after human approval.
+- Guardrail candidates → human reviews/edits and explicitly approves the draft;
+  only then may the agent write `.oh/guardrails/<slug>.md`.
+- Compactions → write an approved merged entry with frontmatter and note which
+  originals the human may remove.
+- Session compaction → preserve valid frontmatter; offer to remove stale planning
+  artifacts while keeping settled decisions as brief anchors.
 
 ## Output Format
 
