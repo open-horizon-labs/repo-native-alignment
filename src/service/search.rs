@@ -51,19 +51,34 @@ fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<St
     let mut saw_any = false;
     let mut last_was_newline = false;
     let mut completed = false;
+    let mut utf8_pending = Vec::new();
 
-    'read: loop {
+    loop {
         let count = file
             .read(&mut buffer)
             .map_err(|error| format!("cannot read file: {error}"))?;
         if count == 0 {
             break;
         }
+        if buffer[..count].contains(&0) {
+            return Err("binary (contains NUL bytes)".to_string());
+        }
+        utf8_pending.extend_from_slice(&buffer[..count]);
+        match std::str::from_utf8(&utf8_pending) {
+            Ok(_) => utf8_pending.clear(),
+            Err(error) if error.error_len().is_some() => {
+                return Err("binary or is not valid UTF-8".to_string());
+            }
+            Err(error) => {
+                let incomplete_start = error.valid_up_to();
+                utf8_pending.drain(..incomplete_start);
+            }
+        }
         for &byte in &buffer[..count] {
             saw_any = true;
             last_was_newline = byte == b'\n';
-            if byte == 0 {
-                return Err("binary (contains NUL bytes)".to_string());
+            if completed {
+                continue;
             }
             if (start..=end).contains(&line_number) && byte != b'\n' {
                 selected_bytes += 1;
@@ -83,11 +98,14 @@ fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<St
                 }
                 if line_number == end {
                     completed = true;
-                    break 'read;
+                    continue;
                 }
                 line_number = line_number.saturating_add(1);
             }
         }
+    }
+    if !utf8_pending.is_empty() {
+        return Err("binary or is not valid UTF-8".to_string());
     }
 
     let available_lines = if completed {
@@ -2661,6 +2679,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("folder")).unwrap();
         std::fs::write(tmp.path().join("binary.bin"), b"GIF89a\0payload").unwrap();
+        std::fs::write(
+            tmp.path().join("binary-after.rs"),
+            b"valid source\n\0binary tail",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("invalid-after.rs"),
+            b"valid source\n\xff\xfe",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("short.rs"), "one\n").unwrap();
         let graph = make_graph_state(vec![]);
         let ctx = make_search_context(&graph, tmp.path());
@@ -2679,6 +2707,16 @@ mod tests {
             search(&lookup("binary.bin", 1), &ctx)
                 .await
                 .contains("binary (contains NUL bytes)")
+        );
+        assert!(
+            search(&lookup("binary-after.rs", 1), &ctx)
+                .await
+                .contains("binary (contains NUL bytes)")
+        );
+        assert!(
+            search(&lookup("invalid-after.rs", 1), &ctx)
+                .await
+                .contains("not valid UTF-8")
         );
         assert!(
             search(&lookup("short.rs", 2), &ctx)
