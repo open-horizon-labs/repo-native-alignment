@@ -5,16 +5,17 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arrow_array::RecordBatchIterator;
+use lancedb::expr::{DfExpr, col, lit};
 
 use crate::graph::store::SCHEMA_VERSION;
 use crate::graph::{Edge, Node};
 
 use super::batch::{build_edges_batch, build_symbols_batch};
-use super::graph_lance_path;
 use super::migrate::{
     check_and_migrate_schema, drop_all_lance_tables, is_conflict_error, is_schema_mismatch_error,
     read_committed_scan_version, write_committed_scan_version,
 };
+use super::{PREDICATE_BATCH_SIZE, graph_lance_path, string_isin};
 
 /// Persist graph nodes and edges to LanceDB using append-only versioned writes.
 ///
@@ -203,7 +204,7 @@ pub(crate) async fn compact_stale_versions(
         return Ok(());
     }
     let cutoff = committed_version - 1; // delete scan_version < cutoff
-    let predicate = format!("scan_version < {}", cutoff);
+    let predicate = col("scan_version").lt(lit(cutoff));
 
     let db = lancedb::connect(db_path.to_str().unwrap_or_default())
         .execute()
@@ -301,19 +302,19 @@ pub(crate) async fn persist_graph_incremental(
         if !deleted_files.is_empty()
             && let Ok(tbl) = db.open_table("symbols").execute().await
         {
-            let predicates: Vec<String> = deleted_files
-                .iter()
-                .map(|(root, path)| {
-                    format!(
-                        "(root_id = '{}' AND file_path = '{}')",
-                        root.replace('\'', "''"),
-                        path.display().to_string().replace('\'', "''")
-                    )
-                })
-                .collect();
-            let predicate = predicates.join(" OR ");
-            if let Err(e) = tbl.delete(&predicate).await {
-                tracing::warn!("Failed to delete symbols for removed files: {}", e);
+            for chunk in deleted_files.chunks(PREDICATE_BATCH_SIZE) {
+                let predicate = chunk
+                    .iter()
+                    .map(|(root, path)| {
+                        col("root_id")
+                            .eq(lit(root.clone()))
+                            .and(col("file_path").eq(lit(path.display().to_string())))
+                    })
+                    .reduce(DfExpr::or)
+                    .expect("non-empty deleted-files chunk");
+                if let Err(e) = tbl.delete(&predicate).await {
+                    tracing::warn!("Failed to delete symbols for removed files: {}", e);
+                }
             }
         }
 
@@ -380,13 +381,11 @@ pub(crate) async fn persist_graph_incremental(
         if !deleted_edge_ids.is_empty()
             && let Ok(tbl) = db.open_table("edges").execute().await
         {
-            let quoted: Vec<String> = deleted_edge_ids
-                .iter()
-                .map(|id| format!("'{}'", id.replace('\'', "''")))
-                .collect();
-            let predicate = format!("id IN ({})", quoted.join(", "));
-            if let Err(e) = tbl.delete(&predicate).await {
-                tracing::warn!("Failed to delete edges for removed files: {}", e);
+            for chunk in deleted_edge_ids.chunks(PREDICATE_BATCH_SIZE) {
+                let predicate = string_isin("id", chunk.iter().cloned());
+                if let Err(e) = tbl.delete(&predicate).await {
+                    tracing::warn!("Failed to delete edges for removed files: {}", e);
+                }
             }
         }
 
@@ -536,23 +535,19 @@ pub(crate) async fn delete_nodes_for_roots(
         .await
         .context("Failed to connect to LanceDB for worktree cleanup")?;
 
-    // Build a SQL predicate: root_id IN ('slug1', 'slug2', ...)
-    let quoted: Vec<String> = slugs
-        .iter()
-        .map(|s| format!("'{}'", s.replace('\'', "''")))
-        .collect();
-    let predicate = format!("root_id IN ({})", quoted.join(", "));
-
     // Delete from all tables that carry a root_id column.
     for table_name in ["symbols", "edges", "file_index", "pr_merges"] {
-        if let Ok(tbl) = db.open_table(table_name).execute().await
-            && let Err(e) = tbl.delete(&predicate).await
-        {
-            tracing::warn!(
-                "Failed to delete {} for removed worktrees: {}",
-                table_name,
-                e
-            );
+        if let Ok(tbl) = db.open_table(table_name).execute().await {
+            for chunk in slugs.chunks(PREDICATE_BATCH_SIZE) {
+                let predicate = string_isin("root_id", chunk.iter().cloned());
+                if let Err(e) = tbl.delete(&predicate).await {
+                    tracing::warn!(
+                        "Failed to delete {} for removed worktrees: {}",
+                        table_name,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -771,6 +766,124 @@ mod tests {
         assert!(
             !names2.contains(&"fn_incremental"),
             "fn_incremental (version 1) should not appear after version 2 rebuild"
+        );
+    }
+
+    /// LanceDB 0.31 does not select MemWAL automatically. An explicit primary
+    /// key and LSM write spec route this upsert to MemWAL (reported as version
+    /// zero), but the ordinary Table query API used by RNA does not yet merge
+    /// MemWAL generations into reads. Production therefore keeps the standard
+    /// merge path until the read side can deliver those rows.
+    #[tokio::test]
+    async fn test_lancedb_031_memwal_path_requires_explicit_spec() {
+        use lancedb::table::LsmWriteSpec;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        persist_graph_to_lance(repo_root, &[make_test_node("base")], &[])
+            .await
+            .expect("create symbols table");
+
+        let db_path = graph_lance_path(repo_root);
+        let db = lancedb::connect(db_path.to_str().expect("utf-8 path"))
+            .execute()
+            .await
+            .expect("connect");
+        let table = db
+            .open_table("symbols")
+            .execute()
+            .await
+            .expect("open symbols");
+        table
+            .set_unenforced_primary_key(["id"])
+            .await
+            .expect("set primary key");
+        table
+            .set_lsm_write_spec(LsmWriteSpec::unsharded())
+            .await
+            .expect("set explicit LSM spec");
+
+        let batch =
+            build_symbols_batch(&[make_test_node("memwal_only")], 1).expect("build symbols batch");
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        let result = merge.execute(Box::new(batches)).await.expect("LSM merge");
+        assert_eq!(result.num_rows, 1);
+        assert_eq!(result.version, 0, "version zero identifies the MemWAL path");
+
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("ordinary RNA read");
+        assert!(
+            state.nodes.iter().all(|node| node.id.name != "memwal_only"),
+            "ordinary Table queries do not yet deliver MemWAL-only rows"
+        );
+        table
+            .close_lsm_writers()
+            .await
+            .expect("close MemWAL writer");
+    }
+
+    #[tokio::test]
+    async fn test_typed_predicates_handle_quotes_in_ids_roots_and_paths() {
+        use crate::graph::{Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let mut quoted = make_test_node("fn_'quoted");
+        quoted.id.root = "root_'quoted".to_string();
+        quoted.id.file = PathBuf::from("src/path_'quoted.rs");
+        let target = make_test_node("target");
+        let edge = Edge {
+            from: quoted.id.clone(),
+            to: target.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        };
+        let edge_id = edge.stable_id();
+
+        persist_graph_to_lance(repo_root, &[quoted.clone(), target], &[edge])
+            .await
+            .expect("full persist with quoted identifiers");
+        persist_graph_incremental(
+            repo_root,
+            &[],
+            &[],
+            &[edge_id],
+            &[(quoted.id.root.clone(), quoted.id.file.clone())],
+        )
+        .await
+        .expect("typed incremental deletes");
+
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after typed deletes");
+        assert!(
+            state.nodes.iter().all(|node| node.id != quoted.id),
+            "quoted root/path node should be deleted exactly"
+        );
+        assert!(state.edges.is_empty(), "quoted edge ID should be deleted");
+
+        persist_graph_to_lance(repo_root, &[quoted.clone()], &[])
+            .await
+            .expect("re-persist quoted root");
+        delete_nodes_for_roots(repo_root, &[quoted.id.root.clone()])
+            .await
+            .expect("typed root delete");
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after root delete");
+        assert!(
+            state
+                .nodes
+                .iter()
+                .all(|node| node.id.root != quoted.id.root),
+            "quoted root should be deleted exactly"
         );
     }
 
