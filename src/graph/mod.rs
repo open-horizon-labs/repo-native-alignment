@@ -155,7 +155,9 @@ pub enum EdgeKind {
     HasField,
     Evolves,
     ReferencedBy,
-    /// A concrete struct-literal site constructs a locally declared struct.
+    /// A concrete construction site constructs a locally declared struct.
+    /// Currently emitted only for Rust struct literals; other extractors can opt in
+    /// by emitting the same construction metadata when their semantics are defined.
     /// Direction: construction site → struct declaration.
     Constructs,
     /// A node references another (e.g., markdown link to another file).

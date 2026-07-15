@@ -140,6 +140,12 @@ impl Extractor for RustExtractor {
                 &mut result.edges,
             );
             enrich_static_metadata(tree.root_node(), content.as_bytes(), &mut result.nodes);
+            enrich_struct_module_paths(
+                path,
+                tree.root_node(),
+                content.as_bytes(),
+                &mut result.nodes,
+            );
             // Compute exact `cargo test -- --list` style paths from the AST.
             // Walks enclosing `mod_item` ancestors so tests inside
             // `#[cfg(test)] mod tests { ... }` get the correct `tests::` segment.
@@ -174,6 +180,14 @@ fn extract_struct_constructions(
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("constructed_type".into(), constructed_type.clone());
         metadata.insert("type_path".into(), type_path.to_string());
+        metadata.insert("construction_site".into(), "struct".into());
+        metadata.insert(
+            "module_path".into(),
+            rust_lexical_module_path(node, path, source),
+        );
+        if let Some(import_path) = imported_binding_path(node, constructed_type.as_str(), source) {
+            metadata.insert("imported_type_path".into(), import_path);
+        }
         metadata.insert(
             "name_col".into(),
             name_node.start_position().column.to_string(),
@@ -182,8 +196,16 @@ fn extract_struct_constructions(
             metadata.insert("parent_scope".into(), owner_name);
             metadata.insert("parent_scope_kind".into(), owner_kind);
         }
-        let body = node.utf8_text(source).unwrap_or("").to_string();
-        let signature = body.lines().next().unwrap_or("").trim().to_string();
+        // Keep construction nodes bounded: nested literals can overlap almost their
+        // entire source ranges, so copying every complete body is quadratic.
+        let signature = node
+            .utf8_text(source)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         nodes.push(Node {
             id: NodeId {
                 root: String::new(),
@@ -195,7 +217,7 @@ fn extract_struct_constructions(
             line_start,
             line_end,
             signature,
-            body,
+            body: String::new(),
             metadata,
             source: ExtractionSource::TreeSitter,
         });
@@ -204,6 +226,121 @@ fn extract_struct_constructions(
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
             extract_struct_constructions(child, path, source, nodes);
+        }
+    }
+}
+
+fn rust_lexical_module_path(node: tree_sitter::Node, path: &Path, source: &[u8]) -> String {
+    let mut segments = rust_module_segments(path);
+    let mut inline = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "mod_item"
+            && let Some(name) = current.child_by_field_name("name")
+            && let Ok(name) = name.utf8_text(source)
+        {
+            inline.push(name.to_string());
+        }
+        ancestor = current.parent();
+    }
+    inline.reverse();
+    segments.extend(inline);
+    segments.join("::")
+}
+
+/// Return an import path that binds `name` in this source file. Multiple bindings
+/// are marked ambiguous so the post-pass remains conservative.
+fn imported_binding_path(node: tree_sitter::Node, name: &str, source: &[u8]) -> Option<String> {
+    let mut scope = node.parent();
+    let mut matches = Vec::new();
+    while let Some(current) = scope {
+        if matches!(current.kind(), "block" | "declaration_list" | "source_file") {
+            collect_scope_import_bindings(current, name, source, &mut matches);
+        }
+        scope = current.parent();
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [path] => Some(path.clone()),
+        [] => None,
+        _ => Some("<ambiguous>".into()),
+    }
+}
+
+fn collect_scope_import_bindings(
+    node: tree_sitter::Node,
+    name: &str,
+    source: &[u8],
+    matches: &mut Vec<String>,
+) {
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            if child.kind() == "use_declaration"
+                && let Ok(text) = child.utf8_text(source)
+            {
+                collect_import_text_binding(text, name, matches);
+            }
+        }
+    }
+}
+
+fn collect_import_text_binding(text: &str, name: &str, matches: &mut Vec<String>) {
+    let import = text
+        .trim()
+        .strip_prefix("pub ")
+        .unwrap_or(text.trim())
+        .strip_prefix("use ")
+        .unwrap_or("")
+        .trim_end_matches(';')
+        .trim();
+    if let Some((prefix, members)) = import.split_once("::{") {
+        for member in members.trim_end_matches('}').split(',').map(str::trim) {
+            let (target, binding) = member
+                .rsplit_once(" as ")
+                .map(|(target, alias)| (target.trim(), alias.trim()))
+                .unwrap_or_else(|| (member, member.rsplit("::").next().unwrap_or(member)));
+            if binding == name {
+                matches.push(format!("{prefix}::{target}"));
+            }
+        }
+    } else {
+        let (path, binding) = import
+            .rsplit_once(" as ")
+            .map(|(path, alias)| (path.trim(), alias.trim()))
+            .unwrap_or_else(|| (import, import.rsplit("::").next().unwrap_or(import)));
+        if binding == name {
+            matches.push(path.to_string());
+        }
+    }
+}
+
+fn enrich_struct_module_paths(
+    path: &Path,
+    node: tree_sitter::Node,
+    source: &[u8],
+    nodes: &mut [Node],
+) {
+    if node.kind() == "struct_item"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+    {
+        let line = node.start_position().row + 1;
+        if let Some(extracted) = nodes.iter_mut().find(|candidate| {
+            candidate.id.file == path
+                && candidate.id.kind == NodeKind::Struct
+                && candidate.id.name == name
+                && candidate.line_start == line
+        }) {
+            extracted.metadata.insert(
+                "module_path".into(),
+                rust_lexical_module_path(node, path, source),
+            );
+        }
+    }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            enrich_struct_module_paths(path, child, source, nodes);
         }
     }
 }
@@ -1838,5 +1975,49 @@ fn build() {
 
         assert_eq!(sites.len(), 128, "node growth must equal AST expression count");
         assert_eq!(unique_ids.len(), 128, "every site must have a stable unique ID");
+    }
+
+    #[test]
+    fn struct_literals_capture_import_and_inline_module_context() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+use external_crate::Config;
+mod inner {
+    struct Local { value: usize }
+    fn build() {
+        let _external = Config { value: 1 };
+        let _local = Local { value: 2 };
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let external = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.metadata.get("constructed_type").map(String::as_str) == Some("Config")
+            })
+            .unwrap();
+        assert_eq!(
+            external
+                .metadata
+                .get("imported_type_path")
+                .map(String::as_str),
+            Some("external_crate::Config")
+        );
+        assert_eq!(
+            external.metadata.get("module_path").map(String::as_str),
+            Some("inner")
+        );
+
+        let declaration = result
+            .nodes
+            .iter()
+            .find(|node| node.id.kind == NodeKind::Struct && node.id.name == "Local")
+            .unwrap();
+        assert_eq!(
+            declaration.metadata.get("module_path").map(String::as_str),
+            Some("inner")
+        );
     }
 }

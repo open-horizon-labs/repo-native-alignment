@@ -3,8 +3,7 @@
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use std::collections::HashMap;
 
-use super::rust::rust_module_segments;
-
+#[cfg(test)]
 const STRUCT_LITERAL_KIND: &str = "struct_literal";
 
 /// Emit construction → declaration edges for unambiguous repo-local Rust structs.
@@ -15,7 +14,7 @@ const STRUCT_LITERAL_KIND: &str = "struct_literal";
 pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
     let mut declarations: HashMap<(&str, &str), Vec<&Node>> = HashMap::new();
     for node in nodes {
-        if node.language == "rust" && node.id.kind == NodeKind::Struct {
+        if node.id.kind == NodeKind::Struct {
             declarations
                 .entry((node.id.root.as_str(), node.id.name.as_str()))
                 .or_default()
@@ -26,8 +25,9 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
     nodes
         .iter()
         .filter(|node| {
-            node.language == "rust"
-                && matches!(&node.id.kind, NodeKind::Other(kind) if kind == STRUCT_LITERAL_KIND)
+            node.metadata
+                .get("construction_site")
+                .is_some_and(|kind| kind == "struct")
         })
         .filter_map(|site| {
             let target = site.metadata.get("constructed_type")?;
@@ -45,14 +45,20 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
 }
 
 fn resolve_declaration<'a>(site: &Node, candidates: &[&'a Node]) -> Option<&'a Node> {
-    let type_path = site.metadata.get("type_path")?;
+    let type_path = site
+        .metadata
+        .get("imported_type_path")
+        .or_else(|| site.metadata.get("type_path"))?;
+    if type_path == "<ambiguous>" {
+        return None;
+    }
     let path_segments = type_path_segments(type_path);
     if path_segments.len() > 1 {
         let target_module = resolve_qualified_module(site, &path_segments)?;
         let mut matching = candidates
             .iter()
             .copied()
-            .filter(|candidate| rust_module_segments(&candidate.id.file) == target_module);
+            .filter(|candidate| module_segments(candidate) == target_module);
         let first = matching.next()?;
         return matching.next().is_none().then_some(first);
     }
@@ -90,9 +96,9 @@ fn resolve_qualified_module(site: &Node, path_segments: &[&str]) -> Option<Vec<S
     let qualifiers = path_segments.get(..path_segments.len().checked_sub(1)?)?;
     let mut resolved = match qualifiers.first().copied()? {
         "crate" => Vec::new(),
-        "self" => rust_module_segments(&site.id.file),
+        "self" => module_segments(site),
         "super" => {
-            let mut current = rust_module_segments(&site.id.file);
+            let mut current = module_segments(site);
             let super_count = qualifiers
                 .iter()
                 .take_while(|segment| **segment == "super")
@@ -125,15 +131,36 @@ fn resolve_qualified_module(site: &Node, path_segments: &[&str]) -> Option<Vec<S
     Some(resolved)
 }
 
+fn module_segments(node: &Node) -> Vec<String> {
+    node.metadata
+        .get("module_path")
+        .map(|path| {
+            path.split("::")
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::extract::rust::rust_module_segments;
     use crate::graph::{NodeId, NodeKind};
 
     fn node(name: &str, kind: NodeKind, file: &str) -> Node {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "module_path".into(),
+            rust_module_segments(std::path::Path::new(file)).join("::"),
+        );
+        if matches!(kind, NodeKind::Other(_)) {
+            metadata.insert("construction_site".into(), "struct".into());
+        }
         Node {
             id: NodeId {
                 root: "repo".into(),
@@ -146,7 +173,7 @@ mod tests {
             line_end: 1,
             signature: String::new(),
             body: String::new(),
-            metadata: BTreeMap::new(),
+            metadata,
             source: ExtractionSource::TreeSitter,
         }
     }
@@ -284,6 +311,80 @@ mod tests {
             edges
                 .iter()
                 .any(|edge| edge.from == super_site.id && edge.to == parent.id)
+        );
+    }
+
+    #[test]
+    fn import_binding_prevents_external_basename_false_link() {
+        let declaration = node("Config", NodeKind::Struct, "src/local.rs");
+        let mut site = node(
+            "Config@1:1",
+            NodeKind::Other(STRUCT_LITERAL_KIND.into()),
+            "src/current.rs",
+        );
+        site.metadata
+            .insert("constructed_type".into(), "Config".into());
+        site.metadata.insert("type_path".into(), "Config".into());
+        site.metadata
+            .insert("imported_type_path".into(), "external::Config".into());
+
+        assert!(struct_construction_pass(&[declaration, site]).is_empty());
+    }
+
+    #[test]
+    fn inline_module_metadata_disambiguates_same_file_declarations() {
+        let mut a = node("Config", NodeKind::Struct, "src/lib.rs");
+        a.metadata.insert("module_path".into(), "a".into());
+        let mut b = node("Config", NodeKind::Struct, "src/lib.rs");
+        b.metadata.insert("module_path".into(), "b".into());
+        let mut site = node(
+            "Config@1:1",
+            NodeKind::Other(STRUCT_LITERAL_KIND.into()),
+            "src/lib.rs",
+        );
+        site.metadata
+            .insert("constructed_type".into(), "Config".into());
+        site.metadata
+            .insert("type_path".into(), "crate::a::Config".into());
+
+        let edges = struct_construction_pass(&[a.clone(), b, site.clone()]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, site.id);
+        assert_eq!(edges[0].to, a.id);
+    }
+
+    /// Hot-path regression fixture following the existing post-pass convention:
+    /// 100k nodes, deterministic edge-count assertion, and wall-clock diagnostics.
+    #[test]
+    fn struct_construction_pass_scan_time_regression() {
+        use std::time::Instant;
+
+        const PAIRS: usize = 50_000;
+        let mut nodes = Vec::with_capacity(PAIRS * 2);
+        for index in 0..PAIRS {
+            let name = format!("Type{index}");
+            let declaration = node(&name, NodeKind::Struct, &format!("src/type_{index}.rs"));
+            let mut site = node(
+                &format!("{name}@1:1"),
+                NodeKind::Other(STRUCT_LITERAL_KIND.into()),
+                &format!("src/use_{index}.rs"),
+            );
+            site.metadata
+                .insert("constructed_type".into(), name.clone());
+            site.metadata.insert("type_path".into(), name);
+            nodes.push(declaration);
+            nodes.push(site);
+        }
+
+        let started = Instant::now();
+        let edges = struct_construction_pass(&nodes);
+        let elapsed = started.elapsed();
+        assert_eq!(edges.len(), PAIRS);
+        println!(
+            "struct_construction_pass_scan_time: {:.2}ms ({} nodes, {} edges)",
+            elapsed.as_secs_f64() * 1_000.0,
+            nodes.len(),
+            edges.len()
         );
     }
 }
