@@ -1,13 +1,12 @@
 //! Graph persistence: full persist, incremental upsert, compaction, and root pruning.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use arrow_array::RecordBatchIterator;
 
-use crate::graph::store::{SCHEMA_VERSION, edges_schema, symbols_schema};
+use crate::graph::store::SCHEMA_VERSION;
 use crate::graph::{Edge, Node};
 
 use super::batch::{build_edges_batch, build_symbols_batch};
@@ -62,7 +61,6 @@ pub(crate) async fn persist_graph_to_lance(
 
     // -- Append symbols (nodes) with new_version --
     {
-        let schema = Arc::new(symbols_schema());
         let batch = build_symbols_batch(nodes, new_version)?;
 
         match db.open_table("symbols").execute().await {
@@ -70,8 +68,7 @@ pub(crate) async fn persist_graph_to_lance(
                 // Table exists -- append the new-version rows.
                 let mut attempts: u64 = 0;
                 loop {
-                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-                    match tbl.add(batches).execute().await {
+                    match tbl.add(batch.clone()).execute().await {
                         Ok(_) => break,
                         Err(e) => {
                             let err = anyhow::anyhow!("{}", e);
@@ -102,8 +99,7 @@ pub(crate) async fn persist_graph_to_lance(
             }
             Err(_) => {
                 // Table doesn't exist yet -- create it with the first batch.
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                db.create_table("symbols", Box::new(batches))
+                db.create_table("symbols", batch)
                     .execute()
                     .await
                     .context("Failed to create symbols table")?;
@@ -125,15 +121,13 @@ pub(crate) async fn persist_graph_to_lance(
 
     // -- Append edges with new_version --
     {
-        let schema = Arc::new(edges_schema());
         let batch = build_edges_batch(edges, new_version)?;
 
         match db.open_table("edges").execute().await {
             Ok(tbl) => {
                 let mut attempts: u64 = 0;
                 loop {
-                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-                    match tbl.add(batches).execute().await {
+                    match tbl.add(batch.clone()).execute().await {
                         Ok(_) => break,
                         Err(e) => {
                             let err = anyhow::anyhow!("{}", e);
@@ -162,8 +156,7 @@ pub(crate) async fn persist_graph_to_lance(
                 }
             }
             Err(_) => {
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                db.create_table("edges", Box::new(batches))
+                db.create_table("edges", batch)
                     .execute()
                     .await
                     .context("Failed to create edges table")?;
@@ -372,8 +365,7 @@ pub(crate) async fn persist_graph_incremental(
                 }
                 Err(_) => {
                     // Table doesn't exist yet -- create it (first incremental run after a fresh repo)
-                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
-                    db.create_table("symbols", Box::new(batches))
+                    db.create_table("symbols", batch)
                         .execute()
                         .await
                         .context("Failed to create symbols table")?;
@@ -445,8 +437,7 @@ pub(crate) async fn persist_graph_incremental(
                 }
                 Err(_) => {
                     // Table doesn't exist yet -- create it
-                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
-                    db.create_table("edges", Box::new(batches))
+                    db.create_table("edges", batch)
                         .execute()
                         .await
                         .context("Failed to create edges table")?;

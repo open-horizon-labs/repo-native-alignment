@@ -2,9 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
-use arrow_array::{
-    Array as ArrowArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-};
+use arrow_array::{Array as ArrowArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -883,9 +881,8 @@ impl EmbeddingIndex {
         let id_refs: Vec<&str> = ids_for_delete.iter().map(|s| s.as_str()).collect();
         self.delete_rows_by_ids(&table, &id_refs).await?;
 
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         table
-            .add(Box::new(batches))
+            .add(batch)
             .execute()
             .await
             .context("Failed to add enriched node embeddings")?;
@@ -1360,9 +1357,8 @@ impl EmbeddingIndex {
 
                 if !table_exists && batch_idx == 0 {
                     // First batch on a fresh table: create it
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
                     self.db
-                        .create_table(&self.table_name, Box::new(batches))
+                        .create_table(&self.table_name, batch)
                         .execute()
                         .await
                         .context("Failed to create LanceDB table")?;
@@ -1377,9 +1373,8 @@ impl EmbeddingIndex {
                         .execute()
                         .await
                         .context("Failed to open table for add")?;
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
                     table
-                        .add(Box::new(batches))
+                        .add(batch)
                         .execute()
                         .await
                         .context("Failed to add batch to LanceDB table")?;

@@ -61,9 +61,9 @@ arc-swap = "1"
 uuid = { version = "1", features = ["v4"] }
 
 # Vector + columnar store
-lancedb = "0.26"
-arrow-array = "57"
-arrow-schema = "57"
+lancedb = "0.30"
+arrow-array = "58"
+arrow-schema = "58"
 
 # Optional local embeddings — Metal GPU on Apple Silicon, CPU fallback
 metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", default-features = false, features = ["embeddings"], optional = true }
@@ -88,7 +88,7 @@ serde_yaml = "0.9"
 toml = "0.8"
 
 # Optional FTS types for embedding-backed hybrid search (FullTextSearchQuery)
-lance-index = { version = "2.0", optional = true }
+lance-index = { version = "7.0", optional = true }
 
 # Async streams (for LanceDB query results)
 futures = "0.3"
