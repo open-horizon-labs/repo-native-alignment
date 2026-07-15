@@ -234,6 +234,27 @@ try {
     assertContains('search mode="" behaves like flat search', blankModeText, 'main');
   }
 
+  // ── 4c. exact current-filesystem source span ─────────────────────────────
+  console.log("\n── search (exact source span) ──");
+  const sourceSpanText = await callSearchWithRetry({
+    file: "lib.rs:1:8",
+  });
+  assertContains(
+    "MCP search retrieves compiler-style source location",
+    sourceSpanText,
+    '1 | pub fn main() { println!("{}", hello()); }',
+  );
+  assertContains(
+    "MCP source span labels current filesystem provenance",
+    sourceSpanText,
+    "current filesystem state",
+  );
+  assertContains(
+    "MCP source span reports root provenance",
+    sourceSpanText,
+    "**Root:**",
+  );
+
   // ── 5. outcome_progress ─────────────────────────────────────────────────
   console.log("\n── outcome_progress ──");
   const progResult = await client.callTool({

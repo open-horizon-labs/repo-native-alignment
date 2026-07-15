@@ -1983,6 +1983,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         file: None,
         line: None,
         end_line: None,
+        root: None,
         limit: Some(50),
         sort_by: None,
         min_complexity: None,

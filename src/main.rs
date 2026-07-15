@@ -974,6 +974,7 @@ async fn async_main() -> anyhow::Result<()> {
                 file: args.file.clone(),
                 line: args.line,
                 end_line: args.end_line,
+                root: args.root.clone(),
                 limit: Some(args.limit),
                 sort_by: args.sort_by.clone(),
                 min_complexity: args.min_complexity,

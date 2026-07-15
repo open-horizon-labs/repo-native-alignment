@@ -48,22 +48,21 @@ fn compiler_location(file: &Option<String>) -> Option<(String, u32)> {
     (!path.is_empty()).then(|| (path.to_string(), line))
 }
 
-fn source_roots(ctx: &SearchContext<'_>) -> Vec<(String, PathBuf)> {
+fn source_roots(params: &SearchParams, ctx: &SearchContext<'_>) -> Vec<(String, PathBuf)> {
     let workspace = crate::roots::WorkspaceConfig::load()
         .with_primary_root(ctx.repo_root.to_path_buf())
         .with_declared_roots(ctx.repo_root);
     let mut roots: Vec<_> = workspace
         .resolved_roots()
         .into_iter()
-        .filter(|root| {
-            ctx.root_filter
-                .as_ref()
-                .map(|selected| root.slug.eq_ignore_ascii_case(selected))
-                .unwrap_or(root.path == ctx.repo_root)
+        .filter(|root| match params.root.as_deref() {
+            Some(selected) if selected.eq_ignore_ascii_case("all") => true,
+            Some(selected) => root.slug.eq_ignore_ascii_case(selected),
+            None => root.path == ctx.repo_root,
         })
         .map(|root| (root.slug, root.path))
         .collect();
-    if roots.is_empty() && ctx.root_filter.is_none() {
+    if roots.is_empty() && params.root.is_none() {
         roots.push((
             crate::roots::RootConfig::code_project(ctx.repo_root.to_path_buf()).slug(),
             ctx.repo_root.to_path_buf(),
@@ -114,7 +113,8 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     };
     let parsed_location = compiler_location(&params.file);
     let (file, start) = match (params.line, parsed_location) {
-        (Some(line), _) => (raw_file.to_string(), line),
+        (Some(line), Some((path, _))) => (path, line),
+        (Some(line), None) => (raw_file.to_string(), line),
         (None, Some((path, line))) => (path, line),
         (None, None) => {
             return "Source span lookup requires `line`, or a compiler-style `file` value such as src/lib.rs:42:7.".to_string();
@@ -149,11 +149,11 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         );
     }
 
-    let roots = source_roots(ctx);
+    let roots = source_roots(params, ctx);
     if roots.is_empty() {
         return format!(
             "Selected root `{}` is not configured or is unavailable.",
-            ctx.root_filter.as_deref().unwrap_or_default()
+            params.root.as_deref().unwrap_or_default()
         );
     }
     let mut candidates = Vec::new();
@@ -173,7 +173,7 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         for path in paths {
             match fs::canonicalize(&path) {
                 Ok(canonical) if canonical.starts_with(&canonical_root) => {
-                    candidates.push((slug.clone(), root.clone(), canonical));
+                    candidates.push((slug.clone(), canonical_root.clone(), canonical));
                 }
                 Ok(_) => {
                     return format!(
@@ -219,6 +219,9 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         Ok(bytes) => bytes,
         Err(error) => return format!("Cannot read source file `{}`: {error}.", path.display()),
     };
+    if bytes.contains(&0) {
+        return format!("Source file `{file}` is binary (contains NUL bytes).");
+    }
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(_) => return format!("Source file `{file}` is binary or is not valid UTF-8."),
@@ -241,8 +244,14 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let relative = path.strip_prefix(&root).unwrap_or(&path);
+    let longest_backtick_run = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.saturating_add(1).max(3));
     format!(
-        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines per request\n\n```text\n{numbered}\n```",
+        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines per request\n\n{fence}text\n{numbered}\n{fence}",
         root.display(),
         relative.display()
     )
@@ -2443,6 +2452,17 @@ mod tests {
         assert!(result.contains("2 |     let value = Thing { field: 1 };"));
         assert!(result.contains("current filesystem state"));
         assert!(result.contains("**Root:**"));
+
+        let explicit_line = SearchParams {
+            file: Some("src/main.rs:1:1".into()),
+            line: Some(2),
+            ..Default::default()
+        };
+        assert!(
+            search(&explicit_line, &ctx)
+                .await
+                .contains("2 |     let value")
+        );
     }
 
     #[tokio::test]
@@ -2464,6 +2484,42 @@ mod tests {
 
         assert!(result.contains("is ambiguous"));
         assert!(result.find("a/same.rs").unwrap() < result.find("b/same.rs").unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_span_honors_specific_and_all_workspace_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let secondary = tmp.path().join("secondary");
+        std::fs::create_dir_all(primary.join(".oh")).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+        std::fs::write(
+            primary.join(".oh/config.toml"),
+            "[workspace.roots]\nsecondary = \"../secondary\"\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("same.rs"), "primary\n").unwrap();
+        std::fs::write(secondary.join("same.rs"), "secondary\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, &primary);
+
+        let all = SearchParams {
+            file: Some("same.rs".into()),
+            line: Some(1),
+            root: Some("all".into()),
+            ..Default::default()
+        };
+        let ambiguous = search(&all, &ctx).await;
+        assert!(ambiguous.contains("is ambiguous"));
+        assert!(ambiguous.contains("[primary] same.rs"), "{ambiguous}");
+        assert!(ambiguous.contains("[secondary] same.rs"), "{ambiguous}");
+        let selected = SearchParams {
+            root: Some("secondary".into()),
+            ..all
+        };
+        let result = search(&selected, &ctx).await;
+        assert!(result.contains("1 | secondary"));
+        assert!(result.contains("**Root:** `secondary`"));
     }
 
     #[tokio::test]
@@ -2525,7 +2581,7 @@ mod tests {
     async fn source_span_reports_directory_binary_and_out_of_range() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("folder")).unwrap();
-        std::fs::write(tmp.path().join("binary.bin"), [0xff, 0xfe]).unwrap();
+        std::fs::write(tmp.path().join("binary.bin"), b"GIF89a\0payload").unwrap();
         std::fs::write(tmp.path().join("short.rs"), "one\n").unwrap();
         let graph = make_graph_state(vec![]);
         let ctx = make_search_context(&graph, tmp.path());
@@ -2543,7 +2599,7 @@ mod tests {
         assert!(
             search(&lookup("binary.bin", 1), &ctx)
                 .await
-                .contains("not valid UTF-8")
+                .contains("binary (contains NUL bytes)")
         );
         assert!(
             search(&lookup("short.rs", 2), &ctx)
@@ -2555,6 +2611,24 @@ mod tests {
                 .await
                 .contains("was not found")
         );
+    }
+
+    #[tokio::test]
+    async fn source_span_uses_a_safe_markdown_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("fenced.md"), "```\ncontent\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("fenced.md".into()),
+            line: Some(1),
+            end_line: Some(2),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("````text\n     1 | ```\n     2 | content\n````"));
     }
 
     #[tokio::test]
