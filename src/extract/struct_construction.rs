@@ -12,11 +12,32 @@ const STRUCT_LITERAL_KIND: &str = "struct_literal";
 /// deliberately deferred until the full node set exists so literals can link across
 /// files without LSP. Ambiguous and external names remain unlinked.
 pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
-    let mut declarations: HashMap<(&str, &str), Vec<&Node>> = HashMap::new();
+    type NameKey = (String, String, String);
+    type ModuleKey = (String, String, String, String);
+    type FileKey = (String, String, String, std::path::PathBuf);
+
+    let mut by_name: HashMap<NameKey, Vec<&Node>> = HashMap::new();
+    let mut by_module: HashMap<ModuleKey, Vec<&Node>> = HashMap::new();
+    let mut by_file: HashMap<FileKey, Vec<&Node>> = HashMap::new();
     for node in nodes {
         if node.id.kind == NodeKind::Struct {
-            declarations
-                .entry((node.id.root.as_str(), node.id.name.as_str()))
+            let name_key = (
+                node.id.root.clone(),
+                node.language.clone(),
+                node.id.name.clone(),
+            );
+            by_name.entry(name_key.clone()).or_default().push(node);
+            by_module
+                .entry((
+                    name_key.0.clone(),
+                    name_key.1.clone(),
+                    name_key.2.clone(),
+                    node.metadata.get("module_path").cloned().unwrap_or_default(),
+                ))
+                .or_default()
+                .push(node);
+            by_file
+                .entry((name_key.0, name_key.1, name_key.2, node.id.file.clone()))
                 .or_default()
                 .push(node);
         }
@@ -31,8 +52,43 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
         })
         .filter_map(|site| {
             let target = site.metadata.get("constructed_type")?;
-            let candidates = declarations.get(&(site.id.root.as_str(), target.as_str()))?;
-            let declaration = resolve_declaration(site, candidates)?;
+            let name_key = (
+                site.id.root.clone(),
+                site.language.clone(),
+                target.clone(),
+            );
+            let type_path = site
+                .metadata
+                .get("imported_type_path")
+                .or_else(|| site.metadata.get("type_path"))?;
+            if type_path == "<ambiguous>" {
+                return None;
+            }
+            let path_segments = type_path_segments(type_path);
+            let candidates = if path_segments.len() > 1 {
+                let target_module = resolve_qualified_module(site, &path_segments)?.join("::");
+                by_module.get(&(
+                    name_key.0.clone(),
+                    name_key.1.clone(),
+                    name_key.2.clone(),
+                    target_module,
+                ))?
+            } else {
+                let named = by_name.get(&name_key)?;
+                if named.len() == 1 {
+                    named
+                } else {
+                    by_file.get(&(
+                        name_key.0,
+                        name_key.1,
+                        name_key.2,
+                        site.id.file.clone(),
+                    ))?
+                }
+            };
+            let [declaration] = candidates.as_slice() else {
+                return None;
+            };
             Some(Edge {
                 from: site.id.clone(),
                 to: declaration.id.clone(),
@@ -42,40 +98,6 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
             })
         })
         .collect()
-}
-
-fn resolve_declaration<'a>(site: &Node, candidates: &[&'a Node]) -> Option<&'a Node> {
-    let type_path = site
-        .metadata
-        .get("imported_type_path")
-        .or_else(|| site.metadata.get("type_path"))?;
-    if type_path == "<ambiguous>" {
-        return None;
-    }
-    let path_segments = type_path_segments(type_path);
-    if path_segments.len() > 1 {
-        let target_module = resolve_qualified_module(site, &path_segments)?;
-        let mut matching = candidates
-            .iter()
-            .copied()
-            .filter(|candidate| module_segments(candidate) == target_module);
-        let first = matching.next()?;
-        return matching.next().is_none().then_some(first);
-    }
-
-    if candidates.len() == 1 {
-        return Some(candidates[0]);
-    }
-
-    // A same-file declaration is unambiguous even when another module declares a
-    // struct with the same basename. Otherwise do not guess: qualified Rust paths
-    // can involve aliases/re-exports that require semantic resolution.
-    let mut same_file = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.id.file == site.id.file);
-    let first = same_file.next()?;
-    same_file.next().is_none().then_some(first)
 }
 
 fn type_path_segments(type_path: &str) -> Vec<&str> {
@@ -329,6 +351,22 @@ mod tests {
             .insert("imported_type_path".into(), "external::Config".into());
 
         assert!(struct_construction_pass(&[declaration, site]).is_empty());
+    }
+
+    #[test]
+    fn construction_only_links_same_language_declarations() {
+        let mut foreign = node("Config", NodeKind::Struct, "src/config.go");
+        foreign.language = "go".into();
+        let mut site = node(
+            "Config@1:1",
+            NodeKind::Other(STRUCT_LITERAL_KIND.into()),
+            "src/current.rs",
+        );
+        site.metadata
+            .insert("constructed_type".into(), "Config".into());
+        site.metadata.insert("type_path".into(), "Config".into());
+
+        assert!(struct_construction_pass(&[foreign, site]).is_empty());
     }
 
     #[test]
