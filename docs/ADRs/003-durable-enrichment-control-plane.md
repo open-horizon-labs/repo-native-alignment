@@ -15,6 +15,12 @@ validate:
     - extract::lsp::work_items::tests::job_ids_are_unique_and_process_scoped_across_processes
     - extract::lsp::work_items::tests::concurrent_process_does_not_reclaim_initializing_owner_file
     - server::operation_report::tests::persisted_lsp_work_queue_is_attached_and_rendered_for_list_roots
+    - extract::lsp::work_items::tests::interrupted_queue_resumes_only_eligible_items_once
+    - extract::lsp::work_items::tests::schema_v1_completed_items_are_replayed_conservatively
+    - extract::lsp::work_items::tests::changed_node_input_replays_instead_of_carrying_stale_output
+    - extract::lsp::passes::tests::recovered_pass1_edges_are_applied_idempotently
+    - extract::lsp::passes::tests::interrupt_restart_executor_fixture_invokes_only_retryable_items_once
+    - extract::lsp::passes::tests::exhausted_recovery_fails_pass1_closed_without_invocation
 ---
 
 # Durable Enrichment Control Plane
@@ -51,6 +57,8 @@ The ledger is persisted at `.oh/.cache/enrichment_jobs.json` and records:
 `RnaHandler` owns a shared `EnrichmentJobLedger`. Foreground and background LSP/embedding paths begin jobs before work, update progress while running, mark persisting before cache writes, and complete/fail explicitly. In-process overlapping work for the same repo/capability/scope joins the active job. Persisted non-terminal jobs from a previous process are superseded by the next job for that same key.
 
 Pass 1 call/reference enrichment also persists versioned per-work-item records at `.oh/.cache/lsp_pass1_work_items.json`. Each record keeps its job, repo/root/file/node identity, requested operations, lifecycle state, attempt and phase history, timestamps, and last error. Queue snapshots are reconstructed from these records and attached to `OperationReport`; `list_roots` therefore delivers the same pending, in-flight, terminal, phase-count, and oldest-work view through MCP. Writes are atomic, phase writes are throttled, terminal state is flushed before the pass returns, and only a bounded number of jobs is retained.
+
+Interrupted Pass 1 jobs recover at the same ledger seam. Records match by stable node identity, source-input fingerprint, and requested operations. Completed output and skipped state carry forward without another LSP request only while that input identity matches; schema-v1 and changed-input records replay conservatively. Pending, stale in-flight, and failed items retry up to three attempts; exhausted items remain terminal, fail readiness closed, and surface bounded actionable diagnostics. Recovered edges and virtual nodes are applied by stable identity so replay remains idempotent. New scans start a fresh job once the prior queue has no unfinished eligible work.
 
 Scan callers now pass structured `ScanEnrichmentOptions` instead of relying on implicit behavior:
 

@@ -182,6 +182,54 @@ struct Pass1TaskResult {
     had_error: bool,
 }
 
+fn runnable_pass1_work_items(
+    work_items: Vec<LspPass1WorkItem>,
+    ledger: &LspWorkItemLedger,
+) -> Vec<LspPass1WorkItem> {
+    work_items
+        .into_iter()
+        .filter(|item| ledger.should_run(item.id))
+        .collect()
+}
+
+fn recovery_failure_state(ledger: &LspWorkItemLedger) -> (u32, bool, Option<String>) {
+    let exhausted = ledger.exhausted_count();
+    if exhausted == 0 {
+        return (0, false, None);
+    }
+    (
+        exhausted.try_into().unwrap_or(u32::MAX),
+        true,
+        Some(format!(
+            "{exhausted} LSP work item(s) exhausted the retry budget; inspect list_roots for the failed phase, then retry with narrower scope or fix the language server"
+        )),
+    )
+}
+
+fn extend_unique_edges(
+    target: &mut Vec<Edge>,
+    seen: &mut std::collections::HashSet<String>,
+    incoming: impl IntoIterator<Item = Edge>,
+) {
+    for edge in incoming {
+        if seen.insert(edge.stable_id()) {
+            target.push(edge);
+        }
+    }
+}
+
+fn extend_unique_nodes(
+    target: &mut Vec<Node>,
+    seen: &mut std::collections::HashSet<String>,
+    incoming: impl IntoIterator<Item = Node>,
+) {
+    for node in incoming {
+        if seen.insert(node.stable_id()) {
+            target.push(node);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InFlightTaskDiagnostic {
     file: PathBuf,
@@ -284,17 +332,19 @@ impl LspPass1Diagnostics {
         }
     }
 
-    async fn finish(&self, item: &LspPass1WorkItem, success: bool) {
+    async fn finish(&self, item: &LspPass1WorkItem, success: bool, edges: &[Edge], nodes: &[Node]) {
         self.finish_with_error(
             item,
             success,
             (!success).then(|| "one or more LSP operations failed".to_string()),
+            edges,
+            nodes,
         )
         .await;
     }
 
     async fn finish_failed(&self, item: &LspPass1WorkItem, error: impl Into<String>) {
-        self.finish_with_error(item, false, Some(error.into()))
+        self.finish_with_error(item, false, Some(error.into()), &[], &[])
             .await;
     }
 
@@ -303,6 +353,8 @@ impl LspPass1Diagnostics {
         item: &LspPass1WorkItem,
         success: bool,
         error: Option<String>,
+        edges: &[Edge],
+        nodes: &[Node],
     ) {
         {
             let mut in_flight = self.in_flight.lock().await;
@@ -321,7 +373,9 @@ impl LspPass1Diagnostics {
         }
         if let Some(work_items) = &self.work_items {
             let result = if success {
-                work_items.mark_completed(item.id).await
+                work_items
+                    .mark_completed_with_output(item.id, edges, nodes)
+                    .await
             } else {
                 work_items
                     .mark_failed(
@@ -601,7 +655,6 @@ impl LspEnricher {
                 attempt_count: 1,
             })
             .collect();
-        let total_nodes = work_items.len();
         let persisted_seeds = work_items
             .iter()
             .map(|item| LspWorkItemSeed {
@@ -625,6 +678,27 @@ impl LspEnricher {
                 return (0, 1, true, Some(diagnostic));
             }
         };
+        let (recovered_edges, recovered_nodes) = work_item_ledger.recovered_output();
+        let mut seen_edge_ids = result
+            .added_edges
+            .iter()
+            .map(Edge::stable_id)
+            .collect::<std::collections::HashSet<_>>();
+        extend_unique_edges(&mut result.added_edges, &mut seen_edge_ids, recovered_edges);
+        let mut seen_virtual_ids = result
+            .new_nodes
+            .iter()
+            .map(Node::stable_id)
+            .collect::<std::collections::HashSet<_>>();
+        extend_unique_nodes(
+            &mut result.new_nodes,
+            &mut seen_virtual_ids,
+            recovered_nodes,
+        );
+        let (recovery_errors, recovery_aborted, recovery_diagnostic) =
+            recovery_failure_state(&work_item_ledger);
+        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        let total_nodes = work_items.len();
         let worker_count = total_nodes.clamp(1, PIPELINE_MAX_CONCURRENCY);
         let diagnostics = Arc::new(LspPass1Diagnostics::with_ledger(
             total_nodes,
@@ -686,7 +760,6 @@ impl LspEnricher {
         let mut errors = 0u32;
         let mut aborted = false;
         let mut abort_diagnostic = None;
-        let mut seen_virtual_ids = std::collections::HashSet::new();
         let mut last_progress_log = std::time::Instant::now();
         let mut last_logged_count = 0u64;
         let mut no_progress_deadline = Box::pin(tokio::time::sleep(pass1_no_progress_timeout()));
@@ -703,12 +776,16 @@ impl LspEnricher {
                     if task_result.had_error {
                         errors += 1;
                     }
-                    result.added_edges.extend(task_result.edges);
-                    for vnode in task_result.new_nodes {
-                        if seen_virtual_ids.insert(vnode.id.clone()) {
-                            result.new_nodes.push(vnode);
-                        }
-                    }
+                    extend_unique_edges(
+                        &mut result.added_edges,
+                        &mut seen_edge_ids,
+                        task_result.edges,
+                    );
+                    extend_unique_nodes(
+                        &mut result.new_nodes,
+                        &mut seen_virtual_ids,
+                        task_result.new_nodes,
+                    );
 
                     no_progress_deadline.as_mut().reset(
                         tokio::time::Instant::now() + pass1_no_progress_timeout(),
@@ -810,6 +887,14 @@ impl LspEnricher {
             abort_diagnostic = Some(format!(
                 "failed to flush LSP Pass 1 work-item ledger: {error}"
             ));
+        }
+
+        errors = errors.saturating_add(recovery_errors);
+        if recovery_aborted {
+            aborted = true;
+            if abort_diagnostic.is_none() {
+                abort_diagnostic = recovery_diagnostic;
+            }
         }
 
         tracing::info!(
@@ -950,7 +1035,9 @@ impl LspEnricher {
             }
         }
 
-        diagnostics.finish(item, !had_error).await;
+        diagnostics
+            .finish(item, !had_error, &edges, &new_nodes)
+            .await;
         Pass1TaskResult {
             edges,
             new_nodes,
@@ -1864,5 +1951,163 @@ mod tests {
         assert_eq!(snapshot.oldest.len(), PASS1_DIAGNOSTIC_SAMPLE_LIMIT);
         assert!(rendered.contains("requesting_references=8"), "{rendered}");
         assert!(rendered.contains("attempt=1"), "{rendered}");
+    }
+
+    #[test]
+    fn recovered_pass1_edges_are_applied_idempotently() {
+        let edge = Edge {
+            from: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                kind: NodeKind::Function,
+                name: "caller".to_string(),
+            },
+            to: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                kind: NodeKind::Function,
+                name: "callee".to_string(),
+            },
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+        let mut edges = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        extend_unique_edges(&mut edges, &mut seen, [edge.clone()]);
+        extend_unique_edges(&mut edges, &mut seen, [edge]);
+
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupt_restart_executor_fixture_invokes_only_retryable_items_once() {
+        let repo = tempfile::tempdir().unwrap();
+        let make_node = |id: usize| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(format!("src/item_{id}.rs")),
+                kind: NodeKind::Function,
+                name: format!("item_{id}"),
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: format!("fn item_{id}()"),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let work_items = (0..2)
+            .map(|id| LspPass1WorkItem {
+                id,
+                node: make_node(id),
+                requested_operations: vec!["textDocument/references"],
+                attempt_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let seeds = work_items
+            .iter()
+            .map(|item| LspWorkItemSeed {
+                item_id: item.id,
+                node: item.node.clone(),
+                requested_operations: item
+                    .requested_operations
+                    .iter()
+                    .map(|operation| (*operation).to_string())
+                    .collect(),
+                attempt_count: item.attempt_count,
+            })
+            .collect::<Vec<_>>();
+        let initial = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "executor-restart".to_string(),
+            &seeds,
+        )
+        .await
+        .unwrap();
+        let recovered_edge = Edge {
+            from: make_node(0).id,
+            to: make_node(1).id,
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+        initial
+            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
+            .await
+            .unwrap();
+        initial
+            .mark_phase(1, "requesting_references")
+            .await
+            .unwrap();
+        initial.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds).await.unwrap();
+        let scheduled = runnable_pass1_work_items(work_items, &resumed);
+        let mut invocations = [0usize; 2];
+        for item in scheduled {
+            invocations[item.id] += 1;
+        }
+
+        assert_eq!(invocations, [0, 1]);
+        let (edges, _) = resumed.recovered_output();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), recovered_edge.stable_id());
+    }
+
+    #[tokio::test]
+    async fn exhausted_recovery_fails_pass1_closed_without_invocation() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/exhausted.rs"),
+                kind: NodeKind::Function,
+                name: "exhausted".to_string(),
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn exhausted()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let seed = LspWorkItemSeed {
+            item_id: 0,
+            node: node.clone(),
+            requested_operations: vec!["textDocument/references".to_string()],
+            attempt_count: 3,
+        };
+        let initial = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "exhausted-restart".to_string(),
+            std::slice::from_ref(&seed),
+        )
+        .await
+        .unwrap();
+        initial
+            .mark_failed(0, "server remained unavailable")
+            .await
+            .unwrap();
+        initial.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &[seed])
+            .await
+            .unwrap();
+        let work_items = vec![LspPass1WorkItem {
+            id: 0,
+            node,
+            requested_operations: vec!["textDocument/references"],
+            attempt_count: 3,
+        }];
+
+        assert!(runnable_pass1_work_items(work_items, &resumed).is_empty());
+        let (errors, aborted, diagnostic) = recovery_failure_state(&resumed);
+        assert_eq!(errors, 1);
+        assert!(aborted);
+        assert!(diagnostic.unwrap().contains("exhausted the retry budget"));
     }
 }
