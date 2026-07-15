@@ -21,7 +21,10 @@ REQUIRED_FIELDS = {
     "version",
     "kind",
     "dependency_paths",
+    "feature_reachability",
     "rationale",
+    "upstream_status",
+    "impact_rationale",
     "owner",
     "removal_issue",
     "review_triggers",
@@ -103,7 +106,41 @@ def validate_policy(policy: dict[str, Any], today: dt.date) -> list[str]:
                 isinstance(value, str) and value.strip() for value in values
             ):
                 errors.append(f"{prefix} {field} must be a non-empty string list")
-        for field in ("rationale", "owner", "approved_by", "approval_evidence"):
+        reachability = entry.get("feature_reachability")
+        if not isinstance(reachability, dict) or not reachability:
+            errors.append(f"{prefix} feature_reachability must be a non-empty object")
+        else:
+            if "default" not in reachability:
+                errors.append(f"{prefix} feature_reachability must include default")
+            for feature, dependents in reachability.items():
+                if not isinstance(feature, str) or not feature.strip():
+                    errors.append(
+                        f"{prefix} feature_reachability keys must be non-empty strings"
+                    )
+                if not isinstance(dependents, list) or not all(
+                    isinstance(dependent, str) and dependent.strip()
+                    for dependent in dependents
+                ):
+                    errors.append(
+                        f"{prefix} feature_reachability[{feature!r}] must be a "
+                        "string list"
+                    )
+                elif len(dependents) != len(set(dependents)):
+                    errors.append(
+                        f"{prefix} feature_reachability[{feature!r}] contains duplicates"
+                    )
+                elif dependents != sorted(dependents):
+                    errors.append(
+                        f"{prefix} feature_reachability[{feature!r}] must be sorted"
+                    )
+        for field in (
+            "rationale",
+            "upstream_status",
+            "impact_rationale",
+            "owner",
+            "approved_by",
+            "approval_evidence",
+        ):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 errors.append(f"{prefix} {field} must be non-empty")
         if kind == "unsound" and not str(entry.get("approval_evidence", "")).strip():
@@ -228,12 +265,143 @@ def run_live() -> tuple[dict[str, Any], int]:
     return report, audit.returncode
 
 
+def live_feature_scopes() -> dict[str, list[str]]:
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if metadata.returncode != 0:
+        raise ValueError(f"cargo metadata failed: {metadata.stderr.strip()}")
+    try:
+        document = json.loads(metadata.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"cargo metadata did not return JSON: {exc}") from exc
+    manifest = Path("Cargo.toml").resolve()
+    packages = [
+        package
+        for package in document.get("packages", [])
+        if Path(str(package.get("manifest_path", ""))).resolve() == manifest
+    ]
+    if len(packages) != 1:
+        raise ValueError("cargo metadata did not identify the root package")
+    features = packages[0].get("features")
+    if not isinstance(features, dict):
+        raise ValueError("cargo metadata root package is missing features")
+    scopes = {"default": []}
+    for feature in sorted(features):
+        if feature != "default":
+            scopes[feature] = [feature]
+    return scopes
+
+
+def cargo_tree_reports_no_match(stderr: str) -> bool:
+    return bool(
+        re.search(
+            r"^error: package ID specification .+ did not match any packages$",
+            stderr,
+            re.MULTILINE,
+        )
+    )
+
+
+def verify_live_feature_reachability(
+    policy: dict[str, Any], feature_scopes: dict[str, list[str]]
+) -> list[str]:
+    errors: list[str] = []
+    for entry in policy.get("warnings", []):
+        if not isinstance(entry, dict):
+            continue
+        package = str(entry.get("package", ""))
+        version = str(entry.get("version", ""))
+        expected_scopes = entry.get("feature_reachability", {})
+        if not package or not version or not isinstance(expected_scopes, dict):
+            continue
+        missing_scopes = sorted(feature_scopes.keys() - expected_scopes.keys())
+        unexpected_scopes = sorted(expected_scopes.keys() - feature_scopes.keys())
+        if missing_scopes:
+            errors.append(
+                f"feature reachability scopes missing for {package} {version}: "
+                f"{', '.join(missing_scopes)}"
+            )
+        if unexpected_scopes:
+            errors.append(
+                f"feature reachability scopes undeclared by Cargo.toml for "
+                f"{package} {version}: {', '.join(unexpected_scopes)}"
+            )
+        for scope, features in feature_scopes.items():
+            if scope not in expected_scopes:
+                continue
+            command = [
+                "cargo",
+                "tree",
+                "--locked",
+                "--target",
+                "all",
+            ]
+            if features:
+                command.extend(["--features", ",".join(features)])
+            command.extend(
+                [
+                    "-i",
+                    f"{package}@{version}",
+                    "--depth",
+                    "1",
+                    "--prefix",
+                    "none",
+                    "--format",
+                    "{p}",
+                ]
+            )
+            tree = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            actual: set[str] = set()
+            if tree.returncode != 0:
+                if not cargo_tree_reports_no_match(tree.stderr):
+                    errors.append(
+                        f"feature reachability probe failed for {package} {version} "
+                        f"({scope}): {tree.stderr.strip()}"
+                    )
+                    continue
+            else:
+                for line in tree.stdout.splitlines():
+                    match = re.match(r"^(\S+) v(\S+)", line.strip())
+                    if not match:
+                        continue
+                    name, resolved_version = match.groups()
+                    if name == package and resolved_version == version:
+                        continue
+                    actual.add(f"{name} {resolved_version}")
+            expected = set(expected_scopes.get(scope, []))
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            if missing:
+                errors.append(
+                    f"feature reachability missing for {package} {version} "
+                    f"({scope}): {', '.join(missing)}"
+                )
+            if unexpected:
+                errors.append(
+                    f"feature reachability undeclared for {package} {version} "
+                    f"({scope}): {', '.join(unexpected)}"
+                )
+    return errors
+
+
 def self_test(script_dir: Path, policy: dict[str, Any]) -> list[str]:
     fixture_dir = script_dir.parent / "fixtures" / "rustsec"
     current = load_json(fixture_dir / "current-policy.json")
     vulnerable = load_json(fixture_dir / "vulnerability.json")
     today = dt.date(2026, 7, 15)
     failures: list[str] = []
+    if not cargo_tree_reports_no_match(
+        "error: package ID specification `optional@1.0.0` did not match any packages\n"
+    ):
+        failures.append("cargo tree no-match output should produce empty reachability")
+    if cargo_tree_reports_no_match("error: cargo tree subprocess failed\n"):
+        failures.append("cargo tree subprocess errors must not look like no-match output")
     if evaluate(current, policy, today):
         failures.append("current-policy fixture should pass")
     if not any("vulnerability" in error for error in evaluate(vulnerable, policy, today)):
@@ -259,6 +427,22 @@ def self_test(script_dir: Path, policy: dict[str, Any]) -> list[str]:
     expired["warnings"][0]["expires"] = "2026-07-14"
     if not any("expired" in error for error in evaluate(current, expired, today)):
         failures.append("expired policy should fail")
+
+    for field in ("feature_reachability", "upstream_status", "impact_rationale"):
+        incomplete = copy.deepcopy(policy)
+        incomplete["warnings"][0].pop(field)
+        if not any(field in error for error in evaluate(current, incomplete, today)):
+            failures.append(f"policy missing {field} should fail")
+
+    malformed_reachability = copy.deepcopy(policy)
+    malformed_reachability["warnings"][0]["feature_reachability"] = {
+        "embeddings": []
+    }
+    if not any(
+        "feature_reachability must include default" in error
+        for error in evaluate(current, malformed_reachability, today)
+    ):
+        failures.append("incomplete feature reachability should fail")
     return failures
 
 
@@ -285,10 +469,14 @@ def main() -> int:
             return 0
         if args.live:
             report, audit_status = run_live()
+            live_errors = verify_live_feature_reachability(
+                policy, live_feature_scopes()
+            )
         else:
             report, audit_status = load_json(args.report), 0
+            live_errors = []
         print_report(report, policy)
-        errors = evaluate(report, policy, args.today)
+        errors = evaluate(report, policy, args.today) + live_errors
         if audit_status != 0 and not any("vulnerability" in error for error in errors):
             errors.append(f"cargo audit exited with status {audit_status}")
         if errors:
