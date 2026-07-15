@@ -154,6 +154,8 @@ gh pr ready <PR>
 
 Wait briefly for CodeRabbit to start its review, then continue with the remaining steps. CodeRabbit findings will be addressed in step 6 (Resolve TODOs) if any arrive during the pipeline run.
 
+**Code PR requirement:** If the PR changes executable code, libraries, tests, build scripts, or runtime configuration, explicitly trigger CodeRabbit review after marking ready (for example, comment `@coderabbitai review` when no review starts automatically). Before merge, CodeRabbit must post an actual clean/approved review verdict. A skipped draft notice, pending run, or status check without review content does not satisfy this gate.
+
 ### 4. Regression Oracle
 
 Write tests seeded from acceptance criteria and concrete review findings — NOT from dismissed abstract concerns.
@@ -305,6 +307,7 @@ External reviewers (CodeRabbit, humans) post findings after step 3b (mark ready)
    - Is there an explicit reply explaining why it's N/A? → OK
    - Neither? → **Fix it now** or explicitly mark N/A with reasoning
 3. If any fixes were made, push and re-run step 9 (smoke test) and step 10 (CI green).
+4. For every code-changing PR, verify that CodeRabbit posted an explicit review on the final diff and that its verdict is clean/approved. If no final review exists, trigger one and wait. If CodeRabbit requests changes, return to step 3.
 
 **Severity rules:**
 - **Critical/Major findings** — must be fixed, no exceptions
@@ -329,6 +332,8 @@ EOF
 **Pre-merge gate: acceptance criteria.**
 
 Before merging, re-read the linked issue's acceptance criteria. Every checkbox must be checked off — either verified done or explicitly filed as a follow-up issue with a link. If any criterion is unmet and not deferred, **do not merge**. Go back to step 3 (fix).
+
+For code-changing PRs, also re-check the explicit CodeRabbit approval requirement. **Do not merge** without a clean/approved CodeRabbit review of the final diff.
 
 ```bash
 # Check off acceptance criteria on the issue

@@ -36,6 +36,8 @@ Summary: review → dissent → fix → **mark ready** → adversarial test → 
 
 Step 3b (mark ready) converts the draft PR to ready-for-review, which triggers smoke tests and CodeRabbit review in CI. Both are gated behind `draft == false` so they skip during the draft phase when code is still being iterated on.
 
+Every PR that changes code must explicitly trigger CodeRabbit review and receive a clean/approved CodeRabbit verdict before merge. A skipped draft review, a pending review, or a green status without an actual CodeRabbit review is not sufficient.
+
 No step is optional. "Merge when green" is not ship. Steps answer different questions — don't collapse them:
 - Review/dissent: "Is the code correct?"
 - Adversarial test: "What breaks under pressure?"
@@ -115,6 +117,7 @@ RNA compiles the fractal, repo-local knowledge absent from model training data�
 - **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
 - **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
 - **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use the successful GitHub Actions artifact for the target commit, not a local cargo install from source. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
+- **coderabbit-approval-for-code-prs**: Every code-changing PR must receive an explicit clean/approved CodeRabbit review before merge. [Details](.oh/guardrails/coderabbit-approval-for-code-prs.md)
 
 ### Soft guardrails
 - **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)

@@ -53,9 +53,20 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
      - Report issues
      - Ask human whether to proceed or address first
 
+   This batch review supplements, but never replaces, each PR's project-specific `/ship` gate.
+
 6. **Merge stack in dependency order** (root first, then children):
 
    For each PR in the stack, starting from the root:
+
+   0. **Verify the full RNA ship gate completed:**
+      - The PR is ready for review, not draft.
+      - Required `/ship` step comments are present, including RNA-grounded review,
+        independent review, regression oracle, merit assessment, manual verification,
+        delivery verification, and final comment sweep.
+      - The final acceptance-criteria gate passed.
+      - For a code-changing PR, CodeRabbit posted an explicit clean/approved review of the final diff. A skipped draft review or green status alone is insufficient.
+      If any evidence is missing, stop and run `/ship <pr-number>`; do not merge directly.
 
    a. **Verify CI is passing:**
       ```bash
@@ -162,6 +173,9 @@ The holistic review checks what individual PR reviews can't:
 ## Prerequisites
 
 - PRs must have the `oh-merge` label (human approval gate)
+- Each PR must have completed the repository-specific `/ship` pipeline
+- PRs must be ready for review, not draft
+- Every code-changing PR must have an explicit clean/approved CodeRabbit review
 - PRs must have CI passing
 - PRs should have "Closes #N" in body for auto-close (created by oh-task)
 - Batch review must pass (or human override)

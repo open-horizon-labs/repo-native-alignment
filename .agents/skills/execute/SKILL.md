@@ -56,7 +56,7 @@ Do the work. Keep it focused.
 1. Make the change
 2. Verify it works (tests, manual check, whatever's appropriate)
 3. Stage changes
-4. Run review if available (`sg review` or equivalent)
+4. Run the repo-local `/review` skill
 5. Handle review findings (fix trivial, create tasks for non-trivial)
 6. Commit with clear message
 
@@ -289,12 +289,12 @@ Works anywhere. Manual pre-flight checklist, drift detection by reasoning. No pe
 - Logs execution decisions to graph database
 - Session file serves as local cache
 
-### With task management (ba, GitHub issues)
+### With task management (GitHub issues)
 - Creates subtasks for non-trivial findings
 - Updates task status as work progresses
 - Links commits to tasks
 
-### With code review (sg, CodeRabbit)
+### With code review (repo-local `/review`, CodeRabbit)
 - Runs automated review on staged changes
 - Triages findings by severity
 - Iterates until review passes
