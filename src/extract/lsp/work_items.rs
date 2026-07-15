@@ -11,15 +11,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::Node;
+use crate::graph::{Edge, Node};
 
-const STORE_SCHEMA_VERSION: u32 = 1;
+const STORE_SCHEMA_VERSION: u32 = 2;
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const OLDEST_SAMPLE_LIMIT: usize = 5;
 const LOCK_OWNER_INITIALIZATION_GRACE: Duration = Duration::from_secs(2);
+const MAX_ATTEMPTS: u32 = 3;
 
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
@@ -42,9 +43,21 @@ pub enum LspWorkItemState {
     Completed,
     Failed,
     Skipped,
+    Exhausted,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspWorkItemRecovery {
+    #[default]
+    New,
+    CarriedCompleted,
+    CarriedSkipped,
+    Retried,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspWorkItemRecord {
     #[serde(default)]
@@ -57,6 +70,8 @@ pub struct LspWorkItemRecord {
     pub node_id: String,
     pub node_name: String,
     pub node_kind: String,
+    #[serde(default)]
+    pub input_hash: String,
     #[serde(default)]
     pub requested_operations: Vec<String>,
     #[serde(default)]
@@ -77,9 +92,15 @@ pub struct LspWorkItemRecord {
     pub completed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub recovery: LspWorkItemRecovery,
+    #[serde(default)]
+    pub output_edges: Vec<Edge>,
+    #[serde(default)]
+    pub output_nodes: Vec<Node>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LspWorkItemStore {
     #[serde(default)]
     schema_version: u32,
@@ -108,10 +129,15 @@ pub struct LspWorkItemQueueSnapshot {
     pub completed: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub exhausted: usize,
+    pub resumed: usize,
+    pub retried: usize,
     #[serde(default)]
     pub phase_counts: BTreeMap<String, usize>,
     #[serde(default)]
     pub oldest_in_flight: Vec<String>,
+    #[serde(default)]
+    pub exhausted_items: Vec<String>,
     #[serde(default)]
     pub updated_at_ms: u64,
 }
@@ -132,8 +158,13 @@ impl LspWorkItemQueueSnapshot {
         } else {
             self.oldest_in_flight.join("; ")
         };
+        let exhausted_items = if self.exhausted_items.is_empty() {
+            "none".to_string()
+        } else {
+            self.exhausted_items.join("; ")
+        };
         format!(
-            "job={} total={} pending={} in_flight={} completed={} failed={} skipped={} phases=[{}] oldest=[{}]",
+            "job={} total={} pending={} in_flight={} completed={} failed={} skipped={} exhausted={} resumed={} retried={} phases=[{}] oldest=[{}] exhausted_items=[{}]",
             self.job_id,
             self.total,
             self.pending,
@@ -141,8 +172,12 @@ impl LspWorkItemQueueSnapshot {
             self.completed,
             self.failed,
             self.skipped,
+            self.exhausted,
+            self.resumed,
+            self.retried,
             phases,
-            oldest
+            oldest,
+            exhausted_items
         )
     }
 }
@@ -153,6 +188,8 @@ pub(crate) struct LspWorkItemLedger {
     store: Mutex<LspWorkItemStore>,
     last_flush: Mutex<Instant>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
+    runnable_item_ids: BTreeSet<usize>,
+    recovered_output: Mutex<(Vec<Edge>, Vec<Node>)>,
 }
 
 struct WorkItemFileLock {
@@ -227,11 +264,161 @@ impl Drop for WorkItemFileLock {
 
 impl LspWorkItemLedger {
     pub(crate) async fn begin(repo_root: &Path, seeds: &[LspWorkItemSeed]) -> Result<Arc<Self>> {
-        let job_id = new_job_id();
-        Self::begin_with_job_id(repo_root, job_id, seeds).await
+        let persisted = load_store(repo_root)?;
+        let Some((job_id, prior_records)) = select_recovery_job(&persisted, seeds) else {
+            return Self::begin_with_job_id(repo_root, new_job_id(), seeds).await;
+        };
+        let now = unix_millis();
+        let current_item_keys = seeds
+            .iter()
+            .map(|seed| (seed.node.stable_id(), seed.requested_operations.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut prior_by_key = prior_records
+            .into_iter()
+            .map(|record| {
+                (
+                    recovery_key(
+                        &record.node_id,
+                        &record.input_hash,
+                        &record.requested_operations,
+                    ),
+                    record,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut store = LspWorkItemStore::default();
+        let mut runnable_item_ids = BTreeSet::new();
+        let mut recovered_edges = Vec::new();
+        let mut recovered_nodes = Vec::new();
+
+        for seed in seeds {
+            let node_id = seed.node.stable_id();
+            let input_hash = node_input_hash(&seed.node);
+            let key = recovery_key(&node_id, &input_hash, &seed.requested_operations);
+            let prior_record = prior_by_key.remove(&key);
+            let is_new = prior_record.is_none();
+            let mut record =
+                prior_record.unwrap_or_else(|| new_record(repo_root, &job_id, seed, now));
+            record.item_id = seed.item_id;
+            record.job_id = job_id.clone();
+            record.repo = repo_root.display().to_string();
+            record.root = seed.node.id.root.clone();
+            record.file = seed.node.id.file.display().to_string();
+            record.node_id = node_id;
+            record.node_name = seed.node.id.name.clone();
+            record.node_kind = seed.node.id.kind.to_string();
+            record.input_hash = input_hash;
+            record.requested_operations = seed.requested_operations.clone();
+            record.schema_version = STORE_SCHEMA_VERSION;
+            record.updated_at_ms = now;
+
+            if is_new {
+                runnable_item_ids.insert(seed.item_id);
+                store
+                    .records
+                    .insert(record_key(&job_id, seed.item_id), record);
+                continue;
+            }
+
+            match record.state {
+                LspWorkItemState::Completed => {
+                    record.recovery = LspWorkItemRecovery::CarriedCompleted;
+                    recovered_edges.extend(record.output_edges.clone());
+                    recovered_nodes.extend(record.output_nodes.clone());
+                }
+                LspWorkItemState::Skipped => {
+                    record.recovery = LspWorkItemRecovery::CarriedSkipped;
+                }
+                LspWorkItemState::Exhausted => {
+                    record.recovery = LspWorkItemRecovery::Exhausted;
+                }
+                LspWorkItemState::Pending
+                | LspWorkItemState::InFlight
+                | LspWorkItemState::Failed => {
+                    if record.attempt_count >= MAX_ATTEMPTS {
+                        let previous_error = record.last_error.take();
+                        record.state = LspWorkItemState::Exhausted;
+                        record.recovery = LspWorkItemRecovery::Exhausted;
+                        record.output_edges.clear();
+                        record.output_nodes.clear();
+                        record.last_phase =
+                            record.current_phase.take().or(record.last_phase.take());
+                        record.completed_at_ms = Some(now);
+                        record.last_error = Some(format!(
+                            "retry budget exhausted after {} attempts; inspect phase {} and retry with narrower scope or fix the language server{}",
+                            record.attempt_count,
+                            record.last_phase.as_deref().unwrap_or("unknown"),
+                            previous_error
+                                .as_deref()
+                                .map(|error| format!("; last server error: {error}"))
+                                .unwrap_or_default()
+                        ));
+                    } else {
+                        let previous_state = record.state;
+                        let previous_error = record.last_error.take();
+                        record.state = LspWorkItemState::Pending;
+                        record.recovery = LspWorkItemRecovery::Retried;
+                        record.attempt_count = record.attempt_count.saturating_add(1);
+                        record.last_phase =
+                            record.current_phase.take().or(record.last_phase.take());
+                        record.started_at_ms = None;
+                        record.completed_at_ms = None;
+                        record.output_edges.clear();
+                        record.output_nodes.clear();
+                        record.last_error = Some(format!(
+                            "resumed after {previous_state:?} at phase {}{}",
+                            record.last_phase.as_deref().unwrap_or("unknown"),
+                            previous_error
+                                .as_deref()
+                                .map(|error| format!("; prior error: {error}"))
+                                .unwrap_or_default()
+                        ));
+                        runnable_item_ids.insert(seed.item_id);
+                    }
+                }
+            }
+            store
+                .records
+                .insert(record_key(&job_id, seed.item_id), record);
+        }
+
+        let remaining_records = prior_by_key.into_values().filter(|record| {
+            !current_item_keys
+                .contains(&(record.node_id.clone(), record.requested_operations.clone()))
+        });
+        for (next_item_id, mut record) in (seeds.len()..).zip(remaining_records) {
+            record.schema_version = STORE_SCHEMA_VERSION;
+            record.item_id = next_item_id;
+            record.state = LspWorkItemState::Skipped;
+            record.recovery = LspWorkItemRecovery::CarriedSkipped;
+            record.last_phase = record.current_phase.take().or(record.last_phase.take());
+            record.completed_at_ms = Some(now);
+            record.updated_at_ms = now;
+            record.output_edges.clear();
+            record.output_nodes.clear();
+            record.last_error = Some(
+                "persisted work item is no longer present in the enrichable node set; skipped"
+                    .to_string(),
+            );
+            store
+                .records
+                .insert(record_key(&job_id, next_item_id), record);
+        }
+
+        let ledger = Arc::new(Self {
+            repo_root: repo_root.to_path_buf(),
+            job_id,
+            store: Mutex::new(store),
+            last_flush: Mutex::new(Instant::now()),
+            persist_lock: store_lock(repo_root)?,
+            runnable_item_ids,
+            recovered_output: Mutex::new((recovered_edges, recovered_nodes)),
+        });
+        ledger.flush().await?;
+        Ok(ledger)
     }
 
-    async fn begin_with_job_id(
+    pub(crate) async fn begin_with_job_id(
         repo_root: &Path,
         job_id: String,
         seeds: &[LspWorkItemSeed],
@@ -239,28 +426,7 @@ impl LspWorkItemLedger {
         let mut store = LspWorkItemStore::default();
         let now = unix_millis();
         for seed in seeds {
-            let node = &seed.node;
-            let record = LspWorkItemRecord {
-                schema_version: STORE_SCHEMA_VERSION,
-                job_id: job_id.clone(),
-                item_id: seed.item_id,
-                repo: repo_root.display().to_string(),
-                root: node.id.root.clone(),
-                file: node.id.file.display().to_string(),
-                node_id: node.stable_id(),
-                node_name: node.id.name.clone(),
-                node_kind: node.id.kind.to_string(),
-                requested_operations: seed.requested_operations.clone(),
-                state: LspWorkItemState::Pending,
-                attempt_count: seed.attempt_count,
-                current_phase: None,
-                last_phase: None,
-                created_at_ms: now,
-                updated_at_ms: now,
-                started_at_ms: None,
-                completed_at_ms: None,
-                last_error: None,
-            };
+            let record = new_record(repo_root, &job_id, seed, now);
             store
                 .records
                 .insert(record_key(&job_id, seed.item_id), record);
@@ -272,9 +438,45 @@ impl LspWorkItemLedger {
             store: Mutex::new(store),
             last_flush: Mutex::new(Instant::now()),
             persist_lock: store_lock(repo_root)?,
+            runnable_item_ids: seeds.iter().map(|seed| seed.item_id).collect(),
+            recovered_output: Mutex::new((Vec::new(), Vec::new())),
         });
         ledger.flush().await?;
         Ok(ledger)
+    }
+
+    pub(crate) fn should_run(&self, item_id: usize) -> bool {
+        self.runnable_item_ids.contains(&item_id)
+    }
+
+    pub(crate) fn attempt_count(&self, item_id: usize) -> Option<u32> {
+        self.store
+            .lock()
+            .unwrap()
+            .records
+            .get(&record_key(&self.job_id, item_id))
+            .map(|record| record.attempt_count)
+    }
+
+    pub(crate) fn recovered_output(&self) -> (Vec<Edge>, Vec<Node>) {
+        let mut recovered = self.recovered_output.lock().unwrap();
+        (
+            std::mem::take(&mut recovered.0),
+            std::mem::take(&mut recovered.1),
+        )
+    }
+
+    pub(crate) fn exhausted_count(&self) -> usize {
+        self.store
+            .lock()
+            .map(|store| {
+                store
+                    .records
+                    .values()
+                    .filter(|record| record.state == LspWorkItemState::Exhausted)
+                    .count()
+            })
+            .unwrap_or(1)
     }
 
     pub(crate) async fn mark_phase(&self, item_id: usize, phase: &str) -> Result<()> {
@@ -289,7 +491,21 @@ impl LspWorkItemLedger {
         self.maybe_flush().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn mark_completed(&self, item_id: usize) -> Result<()> {
+        self.mark_completed_with_output(item_id, &[], &[]).await
+    }
+
+    pub(crate) async fn mark_completed_with_output(
+        &self,
+        item_id: usize,
+        edges: &[Edge],
+        nodes: &[Node],
+    ) -> Result<()> {
+        self.update(item_id, |record| {
+            record.output_edges = edges.to_vec();
+            record.output_nodes = nodes.to_vec();
+        })?;
         self.mark_terminal(item_id, LspWorkItemState::Completed, None)
             .await
     }
@@ -321,7 +537,13 @@ impl LspWorkItemLedger {
             record.last_phase = record.current_phase.take().or(record.last_phase.take());
             record.updated_at_ms = now;
             record.completed_at_ms = Some(now);
-            record.last_error = error;
+            if let Some(error) = error {
+                record.last_error = Some(error);
+            }
+            if state != LspWorkItemState::Completed {
+                record.output_edges.clear();
+                record.output_nodes.clear();
+            }
         })?;
         self.maybe_flush().await
     }
@@ -396,6 +618,131 @@ impl LspWorkItemLedger {
     }
 }
 
+fn new_record(
+    repo_root: &Path,
+    job_id: &str,
+    seed: &LspWorkItemSeed,
+    now: u64,
+) -> LspWorkItemRecord {
+    let node = &seed.node;
+    LspWorkItemRecord {
+        schema_version: STORE_SCHEMA_VERSION,
+        job_id: job_id.to_string(),
+        item_id: seed.item_id,
+        repo: repo_root.display().to_string(),
+        root: node.id.root.clone(),
+        file: node.id.file.display().to_string(),
+        node_id: node.stable_id(),
+        node_name: node.id.name.clone(),
+        node_kind: node.id.kind.to_string(),
+        input_hash: node_input_hash(node),
+        requested_operations: seed.requested_operations.clone(),
+        state: LspWorkItemState::Pending,
+        attempt_count: seed.attempt_count,
+        current_phase: None,
+        last_phase: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+        started_at_ms: None,
+        completed_at_ms: None,
+        last_error: None,
+        recovery: LspWorkItemRecovery::New,
+        output_edges: Vec::new(),
+        output_nodes: Vec::new(),
+    }
+}
+
+fn node_input_hash(node: &Node) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for value in [
+        node.stable_id(),
+        node.language.clone(),
+        node.line_start.to_string(),
+        node.line_end.to_string(),
+        node.signature.clone(),
+        node.body.clone(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(&[0]);
+    }
+    for (key, value) in &node.metadata {
+        hasher.update(key.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(value.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn recovery_key(node_id: &str, input_hash: &str, requested_operations: &[String]) -> String {
+    let mut operations = requested_operations.to_vec();
+    operations.sort();
+    format!(
+        "{node_id}\u{1f}{input_hash}\u{1f}{}",
+        operations.join("\u{1f}")
+    )
+}
+
+fn select_recovery_job(
+    store: &LspWorkItemStore,
+    seeds: &[LspWorkItemSeed],
+) -> Option<(String, Vec<LspWorkItemRecord>)> {
+    let seed_keys = seeds
+        .iter()
+        .map(|seed| {
+            recovery_key(
+                &seed.node.stable_id(),
+                &node_input_hash(&seed.node),
+                &seed.requested_operations,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut jobs: BTreeMap<&str, Vec<&LspWorkItemRecord>> = BTreeMap::new();
+    for record in store.records.values() {
+        jobs.entry(&record.job_id).or_default().push(record);
+    }
+    jobs.into_iter()
+        .filter_map(|(job_id, records)| {
+            let has_unfinished = records.iter().any(|record| {
+                matches!(
+                    record.state,
+                    LspWorkItemState::Pending
+                        | LspWorkItemState::InFlight
+                        | LspWorkItemState::Failed
+                        | LspWorkItemState::Exhausted
+                )
+            });
+            if !has_unfinished {
+                return None;
+            }
+            let overlap = records
+                .iter()
+                .filter(|record| {
+                    seed_keys.contains(&recovery_key(
+                        &record.node_id,
+                        &record.input_hash,
+                        &record.requested_operations,
+                    ))
+                })
+                .count();
+            if overlap == 0 {
+                return None;
+            }
+            let updated_at = records
+                .iter()
+                .map(|record| record.updated_at_ms)
+                .max()
+                .unwrap_or_default();
+            Some((
+                (updated_at, overlap),
+                job_id.to_string(),
+                records.into_iter().cloned().collect::<Vec<_>>(),
+            ))
+        })
+        .max_by_key(|(rank, _, _)| *rank)
+        .map(|(_, job_id, records)| (job_id, records))
+}
+
 pub fn load_queue_snapshots(
     repo_root: &Path,
     limit: usize,
@@ -464,6 +811,12 @@ fn snapshots_from_store(store: &LspWorkItemStore, limit: usize) -> Vec<LspWorkIt
             for record in records {
                 roots.insert(record.root.clone());
                 snapshot.updated_at_ms = snapshot.updated_at_ms.max(record.updated_at_ms);
+                if record.recovery != LspWorkItemRecovery::New {
+                    snapshot.resumed += 1;
+                }
+                if record.recovery == LspWorkItemRecovery::Retried {
+                    snapshot.retried += 1;
+                }
                 match record.state {
                     LspWorkItemState::Pending => snapshot.pending += 1,
                     LspWorkItemState::InFlight => {
@@ -488,6 +841,18 @@ fn snapshots_from_store(store: &LspWorkItemStore, limit: usize) -> Vec<LspWorkIt
                     LspWorkItemState::Completed => snapshot.completed += 1,
                     LspWorkItemState::Failed => snapshot.failed += 1,
                     LspWorkItemState::Skipped => snapshot.skipped += 1,
+                    LspWorkItemState::Exhausted => {
+                        snapshot.exhausted += 1;
+                        if snapshot.exhausted_items.len() < OLDEST_SAMPLE_LIMIT {
+                            snapshot.exhausted_items.push(format!(
+                                "file={} node={} attempt={} error={}",
+                                record.file,
+                                record.node_name,
+                                record.attempt_count,
+                                record.last_error.as_deref().unwrap_or("unknown")
+                            ));
+                        }
+                    }
                 }
             }
             oldest.sort_by_key(|(started_at, _)| *started_at);
@@ -703,7 +1068,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+    use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
     use super::*;
 
@@ -734,6 +1099,16 @@ mod tests {
                 attempt_count: 1,
             })
             .collect()
+    }
+
+    fn edge(from: &str, to: &str) -> Edge {
+        Edge {
+            from: node(from).id,
+            to: node(to).id,
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        }
     }
 
     #[tokio::test]
@@ -829,6 +1204,142 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert!(snapshots.iter().any(|snapshot| snapshot.job_id == "first"));
         assert!(snapshots.iter().any(|snapshot| snapshot.job_id == "second"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_queue_resumes_only_eligible_items_once() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial_seeds = seeds(6);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "resume-job".to_string(),
+            &initial_seeds,
+        )
+        .await
+        .unwrap();
+        let recovered_edge = edge("item_0", "item_1");
+        ledger
+            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
+            .await
+            .unwrap();
+        ledger.mark_skipped(1, "not supported").await.unwrap();
+        ledger.mark_phase(2, "requesting_references").await.unwrap();
+        ledger.mark_failed(3, "server disconnected").await.unwrap();
+        ledger.mark_failed(4, "temporary timeout").await.unwrap();
+        ledger.mark_completed(5).await.unwrap();
+        {
+            let mut store = ledger.store.lock().unwrap();
+            store.records.get_mut("resume-job:3").unwrap().attempt_count = MAX_ATTEMPTS;
+        }
+        ledger.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(7))
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "resume-job");
+        assert!(!resumed.should_run(0));
+        assert!(!resumed.should_run(1));
+        assert!(resumed.should_run(2));
+        assert!(!resumed.should_run(3));
+        assert!(resumed.should_run(4));
+        assert!(!resumed.should_run(5));
+        assert!(resumed.should_run(6));
+        let (edges, nodes) = resumed.recovered_output();
+        assert!(nodes.is_empty());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), recovered_edge.stable_id());
+
+        let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
+        assert_eq!(snapshot.total, 7);
+        assert_eq!(snapshot.pending, 3);
+        assert_eq!(snapshot.completed, 2);
+        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(snapshot.exhausted, 1);
+        assert_eq!(snapshot.resumed, 6);
+        assert_eq!(snapshot.retried, 2);
+        assert!(snapshot.exhausted_items[0].contains("retry with narrower scope"));
+        assert!(snapshot.render().contains("exhausted_items=[file="));
+
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(store.records["resume-job:2"].attempt_count, 2);
+        assert_eq!(store.records["resume-job:3"].attempt_count, MAX_ATTEMPTS);
+        assert_eq!(store.records["resume-job:4"].attempt_count, 2);
+        assert!(
+            store.records["resume-job:3"]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("retry budget exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_v1_completed_items_are_replayed_conservatively() {
+        let repo = tempfile::tempdir().unwrap();
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "schema-v1-job".to_string(),
+            &seeds(2),
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        {
+            let mut store = ledger.store.lock().unwrap();
+            store.schema_version = 1;
+            for record in store.records.values_mut() {
+                record.schema_version = 1;
+                record.input_hash.clear();
+                record.output_edges.clear();
+                record.output_nodes.clear();
+            }
+        }
+        ledger.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+            .await
+            .unwrap();
+
+        assert_ne!(resumed.job_id(), "schema-v1-job");
+        assert!(resumed.should_run(0));
+        assert!(resumed.should_run(1));
+        let (edges, nodes) = resumed.recovered_output();
+        assert!(edges.is_empty());
+        assert!(nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_node_input_replays_instead_of_carrying_stale_output() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-input-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger
+            .mark_completed_with_output(0, &[edge("item_0", "item_1")], &[])
+            .await
+            .unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut changed = seeds(2);
+        changed[0].node.body = "let changed = true;".to_string();
+        let resumed = LspWorkItemLedger::begin(repo.path(), &changed)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "changed-input-job");
+        assert!(resumed.should_run(0));
+        assert!(resumed.should_run(1));
+        assert!(resumed.recovered_output().0.is_empty());
+        let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
+        assert_eq!(snapshot.total, changed.len());
     }
 
     #[tokio::test]
