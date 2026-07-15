@@ -54,12 +54,25 @@ warning metadata. Rejected for this issue.
 
 ## Acceptance evidence
 
-- [ ] CI installs an exact locked cargo-audit release.
-- [ ] Vulnerability fixtures and live vulnerability reports fail.
-- [ ] Current warning decisions are explicit, complete, unexpired, and visible.
-- [ ] Unknown, stale, or expired warning policy records fail.
-- [ ] The current lockfile passes the declared policy.
-- [ ] Local reproduction is documented.
+- [x] CI installs exact locked `cargo-audit` 0.22.2.
+- [x] The vulnerability fixture exits 1 and names the advisory/package/version.
+- [x] Current warning decisions are explicit, complete, unexpired, and printed.
+- [x] Self-tests reject unknown, stale, and expired warning policy records.
+- [x] The 829-dependency current lockfile passes with 0 vulnerabilities and the
+  three exact warning records.
+- [x] README documents the fixture and live local reproduction commands.
+
+## Verification evidence
+
+- `python3 .github/scripts/check-rustsec-policy.py --self-test` — pass.
+- `python3 .github/scripts/check-rustsec-policy.py --live` — pass against
+  RustSec database commit `9f3e138091487e69144f536d36976e427a7a3307`.
+- Vulnerability fixture command — expected exit 1 with
+  `RUSTSEC-2099-9999: fixture-vulnerable 1.0.0`.
+- `cargo tree --all-features -i` evidence captured exact reverse paths for
+  `lru@0.12.5`, `number_prefix@0.4.0`, and `paste@1.0.15`.
+- Ruby YAML parse of `.github/workflows/rust-main-merge.yml` — pass.
+- `git diff --check` — pass.
 
 ## Stop / pivot triggers
 

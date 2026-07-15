@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "warnings": [
+    {
+      "advisory_id": "RUSTSEC-2026-0002",
+      "package": "lru",
+      "version": "0.12.5",
+      "kind": "unsound",
+      "dependency_paths": [
+        "lru 0.12.5 -> tantivy 0.24.2 -> lance 2.0.0 / lance-index 2.0.0 -> lancedb 0.26.2 -> repo-native-alignment"
+      ],
+      "rationale": "RNA does not call lru directly; the affected IterMut implementation is transitive through Tantivy. No compatible parent requirement currently selects patched lru >=0.16.3. Removal is the active P1, not a permanent acceptance.",
+      "owner": "@muness",
+      "removal_issue": "https://github.com/open-horizon-labs/repo-native-alignment/issues/734",
+      "review_triggers": [
+        "any Tantivy, Lance, lance-index, or LanceDB dependency change",
+        "the removal issue changes state",
+        "the expiry date is reached"
+      ],
+      "expires": "2026-09-30",
+      "approved_by": "@muness",
+      "approval_evidence": "User-directed execution of the complete P1 RustSec remediation batch on 2026-07-15; exact dependency-path evidence is recorded in PR #743."
+    },
+    {
+      "advisory_id": "RUSTSEC-2025-0119",
+      "package": "number_prefix",
+      "version": "0.4.0",
+      "kind": "unmaintained",
+      "dependency_paths": [
+        "number_prefix 0.4.0 -> indicatif 0.17.11 -> hf-hub 0.4.3 -> metal-candle 1.3.0 -> repo-native-alignment (feature: metal)"
+      ],
+      "rationale": "The warning is confined to the optional Metal feature through the repo-owned metal-candle fork. The capability remains supported while its parent chain is upgraded in the linked P1.",
+      "owner": "@muness",
+      "removal_issue": "https://github.com/open-horizon-labs/repo-native-alignment/issues/735",
+      "review_triggers": [
+        "any metal-candle, hf-hub, or indicatif dependency change",
+        "the removal issue changes state",
+        "the expiry date is reached"
+      ],
+      "expires": "2026-09-30",
+      "approved_by": "@muness",
+      "approval_evidence": "User-directed execution of the complete P1 RustSec remediation batch on 2026-07-15; exact dependency-path evidence is recorded in PR #743."
+    },
+    {
+      "advisory_id": "RUSTSEC-2024-0436",
+      "package": "paste",
+      "version": "1.0.15",
+      "kind": "unmaintained",
+      "dependency_paths": [
+        "paste 1.0.15 -> DataFusion / Lance utilities -> lancedb 0.26.2 -> repo-native-alignment",
+        "paste 1.0.15 -> gemm / Candle / tokenizers -> metal-candle 1.3.0 -> repo-native-alignment (feature: metal)",
+        "paste 1.0.15 -> tokenizers 0.22.2 -> fastembed 5.17.2 -> repo-native-alignment (feature: embeddings)"
+      ],
+      "rationale": "Multiple base and optional parent stacks still use the unmaintained macro crate. The residual graph must be recomputed after the Lance and Metal migrations before choosing removal or a narrower exception.",
+      "owner": "@muness",
+      "removal_issue": "https://github.com/open-horizon-labs/repo-native-alignment/issues/736",
+      "review_triggers": [
+        "completion of issue #734 or #735",
+        "any LanceDB, DataFusion, Candle, tokenizers, fastembed, or metal-candle dependency change",
+        "the expiry date is reached"
+      ],
+      "expires": "2026-09-30",
+      "approved_by": "@muness",
+      "approval_evidence": "User-directed execution of the complete P1 RustSec remediation batch on 2026-07-15; all-features reverse-path evidence is recorded in PR #743."
+    }
+  ]
+}
