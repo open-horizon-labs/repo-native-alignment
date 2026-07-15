@@ -132,6 +132,12 @@ struct SearchArgs {
     language: Option<String>,
     #[arg(long)]
     file: Option<String>,
+    /// First 1-based source line. Also accepts --file path:line:column.
+    #[arg(long)]
+    line: Option<u32>,
+    /// Last 1-based source line (inclusive, maximum span: 200 lines).
+    #[arg(long)]
+    end_line: Option<u32>,
     #[arg(long, default_value_t = 20)]
     limit: usize,
     #[arg(long)]
@@ -966,6 +972,8 @@ async fn async_main() -> anyhow::Result<()> {
                 kind: args.kind.clone(),
                 language: args.language.clone(),
                 file: args.file.clone(),
+                line: args.line,
+                end_line: args.end_line,
                 limit: Some(args.limit),
                 sort_by: args.sort_by.clone(),
                 min_complexity: args.min_complexity,

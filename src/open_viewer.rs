@@ -186,6 +186,8 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 kind,
                 language: None,
                 file: None,
+                line: None,
+                end_line: None,
                 limit,
                 sort_by: None,
                 min_complexity: None,

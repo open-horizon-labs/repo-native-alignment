@@ -6,6 +6,8 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 
 use crate::embed::{EMBEDDING_MODEL_NAME, SearchFilters, SearchMode, SearchOutcome};
@@ -34,6 +36,217 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 /// This catches cases where a small number of nodes with verbose bodies (non-
 /// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
+
+const MAX_SOURCE_SPAN_LINES: u32 = 200;
+
+fn compiler_location(file: &Option<String>) -> Option<(String, u32)> {
+    let value = file.as_deref()?;
+    let (before_column, column) = value.rsplit_once(':')?;
+    column.parse::<u32>().ok()?;
+    let (path, line) = before_column.rsplit_once(':')?;
+    let line = line.parse::<u32>().ok()?;
+    (!path.is_empty()).then(|| (path.to_string(), line))
+}
+
+fn source_roots(ctx: &SearchContext<'_>) -> Vec<(String, PathBuf)> {
+    let workspace = crate::roots::WorkspaceConfig::load()
+        .with_primary_root(ctx.repo_root.to_path_buf())
+        .with_declared_roots(ctx.repo_root);
+    let mut roots: Vec<_> = workspace
+        .resolved_roots()
+        .into_iter()
+        .filter(|root| {
+            ctx.root_filter
+                .as_ref()
+                .map(|selected| root.slug.eq_ignore_ascii_case(selected))
+                .unwrap_or(root.path == ctx.repo_root)
+        })
+        .map(|root| (root.slug, root.path))
+        .collect();
+    if roots.is_empty() && ctx.root_filter.is_none() {
+        roots.push((
+            crate::roots::RootConfig::code_project(ctx.repo_root.to_path_buf()).slug(),
+            ctx.repo_root.to_path_buf(),
+        ));
+    }
+    roots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    roots
+}
+
+fn collect_suffix_matches(dir: &Path, suffix: &Path, matches: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if matches!(
+            entry.file_name().to_str(),
+            Some(".git" | "target" | "node_modules" | ".cache")
+        ) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            if path.ends_with(suffix) {
+                matches.push(path);
+            }
+        } else if file_type.is_dir() {
+            collect_suffix_matches(&path, suffix, matches);
+        } else if file_type.is_file() && path.ends_with(suffix) {
+            matches.push(path);
+        }
+    }
+}
+
+fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    let Some(raw_file) = params
+        .file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return "Source span lookup requires `file` plus `line` (or `file` as path:line:column)."
+            .to_string();
+    };
+    let parsed_location = compiler_location(&params.file);
+    let (file, start) = match (params.line, parsed_location) {
+        (Some(line), _) => (raw_file.to_string(), line),
+        (None, Some((path, line))) => (path, line),
+        (None, None) => {
+            return "Source span lookup requires `line`, or a compiler-style `file` value such as src/lib.rs:42:7.".to_string();
+        }
+    };
+    let end = params.end_line.unwrap_or(start);
+    if start == 0 || end == 0 {
+        return "Source line numbers are 1-based; `line` and `end_line` must be at least 1."
+            .to_string();
+    }
+    if end < start {
+        return format!("Invalid source span {start}-{end}: `end_line` must be >= `line`.");
+    }
+    let count = u64::from(end) - u64::from(start) + 1;
+    if count > u64::from(MAX_SOURCE_SPAN_LINES) {
+        return format!(
+            "Source span {start}-{end} requests {count} lines; the hard maximum is {MAX_SOURCE_SPAN_LINES}. Narrow the range."
+        );
+    }
+
+    let requested = PathBuf::from(&file);
+    if requested.is_absolute()
+        || requested.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return format!(
+            "Rejected source path `{file}`: use a repo/root-relative path without parent traversal."
+        );
+    }
+
+    let roots = source_roots(ctx);
+    if roots.is_empty() {
+        return format!(
+            "Selected root `{}` is not configured or is unavailable.",
+            ctx.root_filter.as_deref().unwrap_or_default()
+        );
+    }
+    let mut candidates = Vec::new();
+    for (slug, root) in roots {
+        let Ok(canonical_root) = fs::canonicalize(&root) else {
+            continue;
+        };
+        let exact = root.join(&requested);
+        let mut paths = if exact.symlink_metadata().is_ok() {
+            vec![exact]
+        } else {
+            let mut suffix_matches = Vec::new();
+            collect_suffix_matches(&root, &requested, &mut suffix_matches);
+            suffix_matches
+        };
+        paths.sort();
+        for path in paths {
+            match fs::canonicalize(&path) {
+                Ok(canonical) if canonical.starts_with(&canonical_root) => {
+                    candidates.push((slug.clone(), root.clone(), canonical));
+                }
+                Ok(_) => {
+                    return format!(
+                        "Rejected source path `{file}`: the resolved path escapes root `{}` through a symlink.",
+                        root.display()
+                    );
+                }
+                Err(error) => {
+                    return format!("Cannot resolve source path `{}`: {error}.", path.display());
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.2.cmp(&b.2));
+    candidates.dedup_by(|a, b| a.2 == b.2);
+    if candidates.is_empty() {
+        return format!("Source file `{file}` was not found in the selected repository/root.");
+    }
+    if candidates.len() > 1 {
+        let paths = candidates
+            .iter()
+            .map(|(slug, root, path)| {
+                format!(
+                    "- [{slug}] {}",
+                    path.strip_prefix(root).unwrap_or(path).display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!(
+            "Source path `{file}` is ambiguous. Provide one exact repo/root-relative path. Candidates:\n{paths}"
+        );
+    }
+    let (slug, root, path) = candidates.pop().unwrap();
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => return format!("Cannot inspect source file `{}`: {error}.", path.display()),
+    };
+    if !metadata.is_file() {
+        return format!("Source path `{file}` is not a regular file.");
+    }
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return format!("Cannot read source file `{}`: {error}.", path.display()),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return format!("Source file `{file}` is binary or is not valid UTF-8."),
+    };
+    let lines: Vec<_> = text.lines().collect();
+    if start as usize > lines.len() {
+        return format!(
+            "Source line {start} is out of range for `{file}` (file has {} lines).",
+            lines.len()
+        );
+    }
+    if end as usize > lines.len() {
+        return format!(
+            "Source end line {end} is out of range for `{file}` (file has {} lines).",
+            lines.len()
+        );
+    }
+    let numbered = (start..=end)
+        .map(|number| format!("{number:>6} | {}", lines[number as usize - 1]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let relative = path.strip_prefix(&root).unwrap_or(&path);
+    format!(
+        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines per request\n\n```text\n{numbered}\n```",
+        root.display(),
+        relative.display()
+    )
+}
 
 fn format_verbose_readiness(
     gs: &GraphState,
@@ -172,6 +385,13 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
 
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    if params.line.is_some()
+        || params.end_line.is_some()
+        || compiler_location(&params.file).is_some()
+    {
+        return source_span(params, ctx);
+    }
+
     let query = params
         .query
         .as_deref()
@@ -2200,6 +2420,141 @@ mod tests {
         assert!(p.query.is_none());
         assert!(!p.compact);
         assert!(!p.rerank);
+    }
+
+    #[tokio::test]
+    async fn source_span_reads_compiler_location_without_index_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/main.rs"),
+            "fn main() {\n    let value = Thing { field: 1 };\n}\n",
+        )
+        .unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("src/main.rs:2:17".into()),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("2 |     let value = Thing { field: 1 };"));
+        assert!(result.contains("current filesystem state"));
+        assert!(result.contains("**Root:**"));
+    }
+
+    #[tokio::test]
+    async fn source_span_rejects_ambiguous_suffix_and_lists_sorted_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["a", "b"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("same.rs"), "one\n").unwrap();
+        }
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("same.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("is ambiguous"));
+        assert!(result.find("a/same.rs").unwrap() < result.find("b/same.rs").unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_span_rejects_traversal_and_range_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let traversal = SearchParams {
+            file: Some("../secret".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        let oversized = SearchParams {
+            file: Some("anything.rs".into()),
+            line: Some(1),
+            end_line: Some(MAX_SOURCE_SPAN_LINES + 1),
+            ..Default::default()
+        };
+
+        assert!(search(&traversal, &ctx).await.contains("parent traversal"));
+        assert!(
+            search(&oversized, &ctx)
+                .await
+                .contains("hard maximum is 200")
+        );
+        let overflow_probe = SearchParams {
+            file: Some("anything.rs".into()),
+            line: Some(1),
+            end_line: Some(u32::MAX),
+            ..Default::default()
+        };
+        assert!(
+            search(&overflow_probe, &ctx)
+                .await
+                .contains("hard maximum is 200")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_span_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), tmp.path().join("escape.rs")).unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("escape.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+
+        assert!(search(&params, &ctx).await.contains("escapes root"));
+    }
+
+    #[tokio::test]
+    async fn source_span_reports_directory_binary_and_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("folder")).unwrap();
+        std::fs::write(tmp.path().join("binary.bin"), [0xff, 0xfe]).unwrap();
+        std::fs::write(tmp.path().join("short.rs"), "one\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let lookup = |file: &str, line| SearchParams {
+            file: Some(file.into()),
+            line: Some(line),
+            ..Default::default()
+        };
+
+        assert!(
+            search(&lookup("folder", 1), &ctx)
+                .await
+                .contains("not a regular file")
+        );
+        assert!(
+            search(&lookup("binary.bin", 1), &ctx)
+                .await
+                .contains("not valid UTF-8")
+        );
+        assert!(
+            search(&lookup("short.rs", 2), &ctx)
+                .await
+                .contains("out of range")
+        );
+        assert!(
+            search(&lookup("missing.rs", 1), &ctx)
+                .await
+                .contains("was not found")
+        );
     }
 
     #[tokio::test]
