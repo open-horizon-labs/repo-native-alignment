@@ -120,7 +120,15 @@ tree-sitter-gdscript = "6.1"
 [features]
 default = []
 embeddings = ["dep:metal-candle", "dep:candle-core", "dep:fastembed", "dep:lance-index"]
+
 metal = ["embeddings", "candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
+
+# LanceDB 0.31 accidentally declares its test-only `lance-testing` crate as a
+# production dependency. Upstream approved moving it to dev-dependencies in
+# lancedb/lancedb#3661. This narrow override backports that manifest behavior
+# without pulling the PR head's incompatible Lance 9 / LanceDB 0.32 beta line.
+[patch.crates-io]
+lance-testing = { path = "patches/lance-testing-production-stub" }
 
 # Dev: fastest possible compile, no optimization on own code
 [profile.dev]

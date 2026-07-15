@@ -1,0 +1,10 @@
+[package]
+name = "lance-testing"
+version = "8.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Production-only compatibility stub for LanceDB 0.31's accidental test dependency"
+
+[lib]
+path = "src/lib.rs"
