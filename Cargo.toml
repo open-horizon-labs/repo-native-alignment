@@ -61,7 +61,7 @@ arc-swap = "1"
 uuid = { version = "1", features = ["v4"] }
 
 # Vector + columnar store
-lancedb = "0.30"
+lancedb = "0.31"
 arrow-array = "58"
 arrow-schema = "58"
 
@@ -88,7 +88,7 @@ serde_yaml = "0.9"
 toml = "0.8"
 
 # Optional FTS types for embedding-backed hybrid search (FullTextSearchQuery)
-lance-index = { version = "7.0", optional = true }
+lance-index = { version = "8.0", optional = true }
 
 # Async streams (for LanceDB query results)
 futures = "0.3"
