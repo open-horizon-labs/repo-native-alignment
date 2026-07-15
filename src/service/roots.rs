@@ -352,6 +352,7 @@ pub fn list_roots_from_slugs(
         total,
         lines.join("\n")
     );
+    out.push_str(&crate::extract::lsp::work_items::render_queue_snapshots_markdown(repo_root, 3));
     out.push_str(&crate::server::operation_report::render_recent_reports_markdown(repo_root, 3));
     out
 }
@@ -458,6 +459,58 @@ mod tests {
 
         assert!(result.contains("## Recent Operations"), "got: {}", result);
         assert!(result.contains("Extract-only scan"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_list_roots_from_slugs_includes_live_lsp_work_queue() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        use crate::extract::lsp::work_items::{LspWorkItemLedger, LspWorkItemSeed};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let ledger = LspWorkItemLedger::begin(
+            repo,
+            &[LspWorkItemSeed {
+                item_id: 0,
+                node: Node {
+                    id: NodeId {
+                        root: "fixture".to_string(),
+                        file: PathBuf::from("src/lib.rs"),
+                        name: "queued_symbol".to_string(),
+                        kind: NodeKind::Function,
+                    },
+                    language: "rust".to_string(),
+                    line_start: 1,
+                    line_end: 1,
+                    signature: "fn queued_symbol()".to_string(),
+                    body: String::new(),
+                    metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
+                },
+                requested_operations: vec!["textDocument/references".to_string()],
+                attempt_count: 1,
+            }],
+        )
+        .await
+        .unwrap();
+        ledger.mark_phase(0, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let result =
+            list_roots_from_slugs(repo, &std::collections::HashSet::new(), None, None, None);
+
+        assert!(
+            result.contains("## LSP Pass 1 Work Queues"),
+            "got: {result}"
+        );
+        assert!(result.contains("in_flight=1"), "got: {result}");
+        assert!(
+            result.contains("phase=requesting_references"),
+            "got: {result}"
+        );
     }
 
     /// When active_slugs contains the primary slug, only that root is shown

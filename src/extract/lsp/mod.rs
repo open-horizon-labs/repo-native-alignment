@@ -20,6 +20,7 @@
 
 mod passes;
 mod transport;
+pub(crate) mod work_items;
 use transport::{LspTransport, PipelinedTransport, path_to_uri};
 
 use std::collections::HashMap;

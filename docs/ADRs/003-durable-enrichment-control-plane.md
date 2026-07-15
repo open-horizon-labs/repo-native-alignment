@@ -44,6 +44,8 @@ The ledger is persisted at `.oh/.cache/enrichment_jobs.json` and records:
 
 `RnaHandler` owns a shared `EnrichmentJobLedger`. Foreground and background LSP/embedding paths begin jobs before work, update progress while running, mark persisting before cache writes, and complete/fail explicitly. In-process overlapping work for the same repo/capability/scope joins the active job. Persisted non-terminal jobs from a previous process are superseded by the next job for that same key.
 
+Pass 1 call/reference enrichment also persists versioned per-work-item records at `.oh/.cache/lsp_pass1_work_items.json`. Each record keeps its job, repo/root/file/node identity, requested operations, lifecycle state, attempt and phase history, timestamps, and last error. Queue snapshots are reconstructed from these records and attached to `OperationReport`; `list_roots` therefore delivers the same pending, in-flight, terminal, phase-count, and oldest-work view through MCP. Writes are atomic, phase writes are throttled, terminal state is flushed before the pass returns, and only a bounded number of jobs is retained.
+
 Scan callers now pass structured `ScanEnrichmentOptions` instead of relying on implicit behavior:
 
 - `all()` runs LSP and embeddings;
@@ -73,6 +75,7 @@ RNA is repo-native and lightweight. A separate daemon, database, or queue would 
 - Scoped scans can deliberately avoid LSP/embedding work without pretending those capabilities are refreshed.
 - Incremental scans that skip LSP must clear stale LSP sentinels after a successful persist.
 - The ledger is not a distributed lock. It coordinates active jobs inside one process and supersedes stale persisted state after restart.
+- Pass 1 work-item persistence makes queue state inspectable after restart; recovery/retry policy is a separate decision and must not silently replay completed items.
 - The job file is cache/control-plane state, not source truth; the graph and LanceDB cache remain the query substrate.
 
 ## Validation Notes
@@ -84,6 +87,8 @@ Current executable coverage proves:
 - stale persisted running jobs are superseded after restart;
 - scan options preserve independent LSP and embedding capability choices;
 - foreground incremental and schema-version rebuild paths still work with explicit enrichment options.
+- mixed pending, in-flight, completed, failed, and skipped Pass 1 records round-trip and reconstruct the same bounded queue snapshot;
+- persisted Pass 1 snapshots are attached to OperationReport history and rendered through the `list_roots` MCP surface.
 
 Manual CLI verification also covered:
 
@@ -95,6 +100,7 @@ Manual CLI verification also covered:
 ## References
 
 - Issue #664
+- Issue #730
 - PR #665
 - ADR-001 (event bus extraction pipeline)
 - ADR-002 (ArcSwap graph concurrency)
