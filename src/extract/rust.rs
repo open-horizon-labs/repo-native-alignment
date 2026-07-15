@@ -407,7 +407,7 @@ fn enrich_test_paths_walk(
 /// - `tests/integration.rs`     -> `["integration"]`
 /// - `src/lib.rs` / `src/main.rs` -> `[]` (libtest emits these as `tests::name`,
 ///   not `lib::tests::name` / `main::tests::name`)
-fn rust_module_segments(path: &Path) -> Vec<String> {
+pub(super) fn rust_module_segments(path: &Path) -> Vec<String> {
     let mut parts: Vec<String> = path
         .iter()
         .map(|part| part.to_string_lossy().to_string())
@@ -1810,5 +1810,33 @@ fn build() {
         assert!(sites.iter().any(|node| {
             node.metadata.get("type_path").map(String::as_str) == Some("LspPipelineInput::<String>")
         }));
+    }
+
+    #[test]
+    fn test_struct_literal_node_growth_is_one_per_ast_expression() {
+        let extractor = RustExtractor::new();
+        let mut code = String::from("struct Config { value: usize }\nfn build() {\n");
+        for index in 0..128 {
+            code.push_str(&format!(
+                "let _config_{index} = Config {{ value: {index} }};\n"
+            ));
+        }
+        code.push_str("}\n");
+
+        let result = extractor
+            .extract(Path::new("src/fixture.rs"), &code)
+            .unwrap();
+        let sites: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "struct_literal"),
+            )
+            .collect();
+        let unique_ids: std::collections::HashSet<_> =
+            sites.iter().map(|node| node.stable_id()).collect();
+
+        assert_eq!(sites.len(), 128, "node growth must equal AST expression count");
+        assert_eq!(unique_ids.len(), 128, "every site must have a stable unique ID");
     }
 }
