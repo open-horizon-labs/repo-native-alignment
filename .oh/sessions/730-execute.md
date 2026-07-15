@@ -28,7 +28,7 @@ Start with `cargo check --lib`, then focused persistence/rendering tests, mixed-
 
 ## Implementation
 
-- Added a versioned repo-local Pass 1 work-item ledger with atomic temp-file replacement and a bounded two-job history.
+- Added a versioned repo-local Pass 1 work-item ledger with atomic temp-file replacement, up to 32 active/interrupted jobs, and 16 terminal jobs.
 - Persisted queue identity, requested operations, lifecycle state, attempts, phases, timestamps, and terminal errors while the existing bounded worker pool executes.
 - Reconstructed live queue snapshots from disk and delivered them directly through `list_roots`; completed operation reports retain and link the same job snapshots.
 - Documented the control-plane seam in ADR-003 and the user-visible `list_roots` contract in the README.
@@ -40,6 +40,12 @@ Start with `cargo check --lib`, then focused persistence/rendering tests, mixed-
 - `cargo test --lib test_list_roots_from_slugs_includes_live_lsp_work_queue -- --nocapture`
 - `cargo test --lib persisted_lsp_work_queue_is_attached_and_rendered_for_list_roots -- --nocapture`
 - `git diff --check`
+
+## Final review fixes
+
+CodeRabbit's ready-for-review sweep found two cross-process races and two smaller drifts. Job IDs now include the process ID and have a multi-process collision regression. Empty or unparsable owner files receive an initialization grace period, with a child-process regression covering the `create_new`-to-owner-write window. OperationReport job-ID attachment now uses a set while preserving vector order, and the retention documentation states the implemented 32 active/interrupted + 16 terminal bounds.
+
+Focused verification: `cargo check --lib`; the two new child-process regressions; persisted queue attachment test; target-file rustfmt; diff check. The exact-head CI and real-client MCP gates must rerun after this review-fix commit.
 
 ## Review fixes
 

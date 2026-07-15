@@ -19,6 +19,7 @@ const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const OLDEST_SAMPLE_LIMIT: usize = 5;
+const LOCK_OWNER_INITIALIZATION_GRACE: Duration = Duration::from_secs(2);
 
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
@@ -578,11 +579,13 @@ fn work_item_lock_is_owned_by(path: &Path, owner: &str) -> bool {
 }
 
 fn work_item_lock_owner_is_dead(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return true;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return work_item_lock_initialization_grace_elapsed(path),
     };
     let Ok(pid) = content.trim().parse::<u32>() else {
-        return true;
+        return work_item_lock_initialization_grace_elapsed(path);
     };
     if pid == std::process::id() {
         return false;
@@ -595,6 +598,14 @@ fn work_item_lock_owner_is_dead(path: &Path) -> bool {
         .status()
         .map(|status| !status.success())
         .unwrap_or(true)
+}
+
+fn work_item_lock_initialization_grace_elapsed(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= LOCK_OWNER_INITIALIZATION_GRACE)
 }
 
 fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
@@ -671,8 +682,9 @@ fn record_key(job_id: &str, item_id: usize) -> String {
 
 fn new_job_id() -> String {
     format!(
-        "lsp-pass1-{}-{}",
+        "lsp-pass1-{}-{}-{}",
         unix_millis(),
+        std::process::id(),
         JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -849,5 +861,121 @@ mod tests {
         assert!(work_item_lock_is_owned_by(&path, &lock.owner));
         drop(lock);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn job_id_process_helper() {
+        let Ok(output) = std::env::var("RNA_JOB_ID_HELPER_OUTPUT") else {
+            return;
+        };
+        std::fs::write(
+            output,
+            format!("{}\n{}\n", std::process::id(), new_job_id()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn job_ids_are_unique_and_process_scoped_across_processes() {
+        let repo = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        let mut outputs = Vec::new();
+        for index in 0..4 {
+            let output = repo.path().join(format!("job-id-{index}"));
+            let child = std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("extract::lsp::work_items::tests::job_id_process_helper")
+                .arg("--nocapture")
+                .env("RNA_JOB_ID_HELPER_OUTPUT", &output)
+                .spawn()
+                .unwrap();
+            children.push(child);
+            outputs.push(output);
+        }
+
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let mut job_ids = std::collections::BTreeSet::new();
+        for output in outputs {
+            let content = std::fs::read_to_string(output).unwrap();
+            let mut lines = content.lines();
+            let pid = lines.next().unwrap();
+            let job_id = lines.next().unwrap();
+            assert!(job_id.contains(&format!("-{pid}-")), "{job_id}");
+            assert!(job_ids.insert(job_id.to_string()), "duplicate {job_id}");
+        }
+        assert_eq!(job_ids.len(), 4);
+    }
+
+    #[test]
+    fn lock_initialization_process_helper() {
+        let Ok(repo) = std::env::var("RNA_LOCK_HELPER_REPO") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var("RNA_LOCK_HELPER_READY").unwrap());
+        let release = PathBuf::from(std::env::var("RNA_LOCK_HELPER_RELEASE").unwrap());
+        let lock_path = store_path(Path::new(&repo)).with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        std::fs::write(&ready, b"ready").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(release.exists(), "parent never released helper");
+        writeln!(file, "{}", std::process::id()).unwrap();
+        file.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        std::fs::remove_file(lock_path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_process_does_not_reclaim_initializing_owner_file() {
+        let repo = tempfile::tempdir().unwrap();
+        let ready = repo.path().join("owner-ready");
+        let release = repo.path().join("owner-release");
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("extract::lsp::work_items::tests::lock_initialization_process_helper")
+            .arg("--nocapture")
+            .env("RNA_LOCK_HELPER_REPO", repo.path())
+            .env("RNA_LOCK_HELPER_READY", &ready)
+            .env("RNA_LOCK_HELPER_RELEASE", &release)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "helper did not create empty owner file");
+
+        let repo_path = repo.path().to_path_buf();
+        let contender = thread::spawn(move || WorkItemFileLock::acquire(&repo_path));
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !contender.is_finished(),
+            "contender reclaimed a lock whose owner was still initializing"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        let child_status = child.wait().unwrap();
+        if !child_status.success() {
+            let _ = std::fs::remove_file(store_path(repo.path()).with_extension("lock"));
+        }
+        assert!(child_status.success());
+        let lock = contender.join().unwrap();
+        assert!(lock.acquired);
+        assert!(work_item_lock_is_owned_by(&lock.path, &lock.owner));
+        drop(lock);
     }
 }

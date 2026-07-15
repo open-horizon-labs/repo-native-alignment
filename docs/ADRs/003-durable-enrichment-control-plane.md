@@ -9,6 +9,12 @@ validate:
     - server::enrichment_jobs::tests::scan_enrichment_options_preserve_structured_modes
     - server::tests::test_foreground_pipeline_incremental_on_second_run
     - server::tests::test_schema_version_bump_forces_full_rebuild_on_incremental_path
+    - extract::lsp::work_items::tests::mixed_work_item_state_round_trips_and_reconstructs_snapshot
+    - extract::lsp::work_items::tests::concurrent_ledgers_merge_without_losing_jobs
+    - extract::lsp::work_items::tests::interrupted_jobs_are_bounded_separately_from_terminal_history
+    - extract::lsp::work_items::tests::job_ids_are_unique_and_process_scoped_across_processes
+    - extract::lsp::work_items::tests::concurrent_process_does_not_reclaim_initializing_owner_file
+    - server::operation_report::tests::persisted_lsp_work_queue_is_attached_and_rendered_for_list_roots
 ---
 
 # Durable Enrichment Control Plane

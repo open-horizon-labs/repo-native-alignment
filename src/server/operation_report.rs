@@ -650,8 +650,13 @@ impl OperationReportStore {
                     Vec::new()
                 });
         }
+        let mut related_job_ids = report
+            .related_job_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         for snapshot in &report.lsp_work_item_queues {
-            if !report.related_job_ids.contains(&snapshot.job_id) {
+            if related_job_ids.insert(snapshot.job_id.clone()) {
                 report.related_job_ids.push(snapshot.job_id.clone());
             }
         }
