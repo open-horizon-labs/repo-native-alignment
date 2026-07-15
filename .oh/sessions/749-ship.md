@@ -43,20 +43,63 @@ The independent reviewer confirmed the generic `ship` conflict and found residua
 - Addressed all 17 CodeRabbit findings, including final-SHA validation after rebase, `/ship` and CodeRabbit gates in `oh-join`, RNA-first exploration, current MCP tool names, verification failure propagation, and human approval before persisting metis.
 - Applied the requested Markdown fence/table cleanup and revalidated all repo-local skills.
 
-## Steps 4–8: Quality and Delivery
+## Step 3b: Mark Ready
 
-- Regression oracle: 8 workflow assertions passed.
-- Merit verdict: MERGE.
-- All review TODOs are addressed without silent deferral.
-- Fresh-checkout manual verification passed.
-- Real MCP protocol smoke passed with all 4 required tools visible.
-- README update is not applicable because no product capability or CLI behavior changed.
+The draft PR was marked ready, which triggered Rust CI and explicit CodeRabbit
+review. Every CodeRabbit change request is handled as a blocking Step 3 finding.
 
-## Step 9: Tests and CI
+## Step 4: Regression Oracle
 
-- GitHub Rust CI, lint, audit, test, CodeQL, and checklist checks passed for commit `159781d8`.
-- Local library suite: 1,952 passed, 2 ignored, 0 failed.
-- One environment-sensitive integration assertion failed locally because the installed real `rust-analyzer` bypassed the test's simulated failure; the same integration suite passed in clean GitHub CI. No Rust source changed in this PR.
-- CI passed on `a0a8de5f`; CodeRabbit requested three further changes, all being
-  addressed before another exact-SHA review. Step 3 remains pending until the final
-  commit has both green CI and an explicit clean/approved CodeRabbit verdict.
+Eight executable workflow assertions passed, covering skill validation,
+forbidden dependencies, draft-PR ordering, full-ship delegation, merge gates,
+CodeRabbit policy, portable MCP configuration, and RNA startup.
+
+## Step 5: Merit Assessment
+
+Verdict: MERGE. The repo now carries its own agent workflow, RNA configuration,
+and enforceable review gates without changing product runtime code.
+
+## Step 6: Resolve TODOs
+
+All Step 1, Step 2, and CodeRabbit findings were fixed. Nothing was silently
+deferred; follow-up reviews were explicitly requested after every fix commit.
+
+## Step 7a: Manual Verification
+
+A fresh clone contained the repo-local skills and portable MCP configuration;
+the configured RNA command resolved and started successfully.
+
+## Step 7b: Delivery Verification
+
+The real MCP protocol smoke passed and exposed all four required tools. Product
+metadata persistence checks are N/A because no graph metadata changed.
+
+## Step 8: README
+
+N/A with rationale: no user-facing RNA product capability, CLI behavior, or flag
+changed. Repository workflow documentation lives in `AGENTS.md` and the skills.
+
+## Step 9: Smoke Test
+
+The local library suite passed 1,952 tests with 2 ignored and 0 failures. One
+environment-sensitive integration assertion failed because the installed real
+`rust-analyzer` bypassed its simulated failure; the same integration test passed
+in clean GitHub CI. No Rust source changed in this PR.
+
+## Step 10: CI Green
+
+Rust CI, lint, audit, test, CodeQL, and checklist checks passed on each pushed
+review-fix commit. Final CI must also pass on the exact merge SHA.
+
+## Step 10b: Final Comment Sweep
+
+Every external comment has been fetched with pagination and addressed. The final
+exact-SHA CodeRabbit review remains the last pre-merge gate; a status check alone
+does not qualify.
+
+## Step 11: Merge
+
+Acceptance criteria are satisfied and the PR is mergeable. Squash merge is
+authorized only after Step 10 and Step 10b pass on the final SHA. The post-merge
+PR comment is the truthful evidence for this terminal step; it cannot be recorded
+as completed in a commit before the merge occurs.
