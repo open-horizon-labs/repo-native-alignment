@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
+use crate::embed::{EMBEDDING_MODEL_NAME, SearchFilters, SearchMode, SearchOutcome};
 use crate::graph::index::GraphIndex;
 use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
@@ -245,6 +245,75 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingScorerDiagnostic {
+    failure: &'static str,
+    mode: SearchMode,
+}
+
+impl EmbeddingScorerDiagnostic {
+    fn render(&self) -> String {
+        let mode = match self.mode {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Keyword => "keyword",
+            SearchMode::Semantic => "semantic",
+        };
+        format!(
+            "### Search degradation\n\n\
+             Embedding scorer unavailable: `component=embedding_scorer \
+             model={EMBEDDING_MODEL_NAME} index=attached mode={mode} failure={}`. \
+             RNA returned bounded lexical/graph results and kept the mapped graph available. \
+             Rebuild the embeddings capability for this root, then retry semantic search.",
+            self.failure
+        )
+    }
+}
+
+async fn isolate_embedding_scorer<F>(
+    scorer: F,
+    mode: SearchMode,
+) -> Result<SearchOutcome, EmbeddingScorerDiagnostic>
+where
+    F: std::future::Future<Output = anyhow::Result<SearchOutcome>> + Send + 'static,
+{
+    match tokio::spawn(scorer).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(_)) => {
+            tracing::warn!(
+                component = "embedding_scorer",
+                model = EMBEDDING_MODEL_NAME,
+                index = "attached",
+                failure = "search_error",
+                "Embedding scorer failed; using bounded lexical/graph fallback"
+            );
+            Err(EmbeddingScorerDiagnostic {
+                failure: "search_error",
+                mode,
+            })
+        }
+        Err(join_error) => {
+            let failure = if join_error.is_cancelled() {
+                "task_cancelled"
+            } else {
+                "task_panic"
+            };
+            tracing::warn!(
+                component = "embedding_scorer",
+                model = EMBEDDING_MODEL_NAME,
+                index = "attached",
+                failure,
+                "Embedding scorer task failed; using bounded lexical/graph fallback"
+            );
+            Err(EmbeddingScorerDiagnostic { failure, mode })
+        }
+    }
+}
+
+struct FlatCodeSymbolSearch<'a> {
+    matches: Vec<&'a Node>,
+    scorer_diagnostic: Option<EmbeddingScorerDiagnostic>,
+}
+
 async fn search_flat(
     params: &SearchParams,
     query: Option<&str>,
@@ -273,7 +342,10 @@ async fn search_flat(
     let graph_state = ctx.graph_state;
 
     // Try embedding-ranked code symbol search first; fall back to name/signature matching.
-    let matches: Vec<&Node> = flat_code_symbol_search(
+    let FlatCodeSymbolSearch {
+        matches,
+        mut scorer_diagnostic,
+    } = flat_code_symbol_search_with_diagnostics(
         query_str,
         search_mode,
         limit,
@@ -312,15 +384,17 @@ async fn search_flat(
         && !query_str.is_empty()
         && let Some(embed_idx) = ctx.embed_index
     {
-        match embed_idx
-            .search_with_mode(
-                query_str,
-                params.artifact_types.as_deref(),
-                limit,
-                search_mode,
-            )
-            .await
-        {
+        let scorer = {
+            let embed_idx = embed_idx.clone();
+            let query = query_str.to_string();
+            let artifact_types = params.artifact_types.clone();
+            async move {
+                embed_idx
+                    .search_with_mode(&query, artifact_types.as_deref(), limit, search_mode)
+                    .await
+            }
+        };
+        match isolate_embedding_scorer(scorer, search_mode).await {
             Ok(SearchOutcome::Results(results)) => {
                 let filtered: Vec<_> = results
                     .into_iter()
@@ -345,8 +419,14 @@ async fn search_flat(
             Ok(SearchOutcome::NotReady) => {
                 sections.push("Embedding index: building -- artifact results will appear shortly. Retry in a few seconds.".to_string());
             }
-            Err(e) => sections.push(format!("Artifact search error: {}", e)),
+            Err(diagnostic) => {
+                scorer_diagnostic.get_or_insert(diagnostic);
+            }
         }
+    }
+
+    if let Some(diagnostic) = scorer_diagnostic {
+        sections.push(diagnostic.render());
     }
 
     if params.include_markdown
@@ -423,6 +503,7 @@ async fn search_flat(
 /// 3. Apply post-filters (kind, language, file, root, synthetic, min_complexity).
 /// 4. Apply sort_by overrides (complexity, importance) if requested; otherwise
 ///    preserve embed ranking or use name-match ranking for fallback results.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn flat_code_symbol_search<'a>(
     query_str: &str,
@@ -434,6 +515,31 @@ async fn flat_code_symbol_search<'a>(
     sort_by_complexity: bool,
     sort_by_importance: bool,
 ) -> Vec<&'a Node> {
+    flat_code_symbol_search_with_diagnostics(
+        query_str,
+        search_mode,
+        limit,
+        params,
+        graph_state,
+        ctx,
+        sort_by_complexity,
+        sort_by_importance,
+    )
+    .await
+    .matches
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flat_code_symbol_search_with_diagnostics<'a>(
+    query_str: &str,
+    search_mode: SearchMode,
+    limit: usize,
+    params: &SearchParams,
+    graph_state: &'a GraphState,
+    ctx: &SearchContext<'_>,
+    sort_by_complexity: bool,
+    sort_by_importance: bool,
+) -> FlatCodeSymbolSearch<'a> {
     let query_lower = query_str.to_lowercase();
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
 
@@ -540,6 +646,7 @@ async fn flat_code_symbol_search<'a>(
         min_complexity: params.min_complexity,
     };
     let has_embed_filters = embed_filters.to_sql().is_some();
+    let mut scorer_diagnostic = None;
 
     // Try embed-ranked search for code symbols when query is non-empty.
     // For path/name queries use only the name part so the embedding attends to
@@ -556,16 +663,23 @@ async fn flat_code_symbol_search<'a>(
             } else {
                 rerank_over_fetch * 3
             };
-            match embed_idx
-                .search_with_filters(
-                    embed_query_str,
-                    None,
-                    over_fetch,
-                    search_mode,
-                    &embed_filters,
-                )
-                .await
-            {
+            let scorer = {
+                let embed_idx = embed_idx.clone();
+                let embed_query = embed_query_str.to_string();
+                let embed_filters = embed_filters.clone();
+                async move {
+                    embed_idx
+                        .search_with_filters(
+                            &embed_query,
+                            None,
+                            over_fetch,
+                            search_mode,
+                            &embed_filters,
+                        )
+                        .await
+                }
+            };
+            match isolate_embedding_scorer(scorer, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
@@ -580,7 +694,10 @@ async fn flat_code_symbol_search<'a>(
                 }
                 // Embedding index not ready -- fall through to name/signature fallback.
                 Ok(SearchOutcome::NotReady) => Vec::new(),
-                Err(_) => Vec::new(),
+                Err(diagnostic) => {
+                    scorer_diagnostic = Some(diagnostic);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -770,7 +887,10 @@ async fn flat_code_symbol_search<'a>(
     }
 
     matches.truncate(limit);
-    matches
+    FlatCodeSymbolSearch {
+        matches,
+        scorer_diagnostic,
+    }
 }
 
 async fn search_traversal(
@@ -2535,6 +2655,118 @@ mod tests {
     // ── flat_code_symbol_search tests ──────────────────────────────────
 
     /// Without embed index, flat search falls back to name/signature matching.
+    #[tokio::test]
+    async fn test_scorer_panic_becomes_content_safe_actionable_diagnostic() {
+        let repository_content = "secret-query src/private/customer.rs";
+        let diagnostic = match isolate_embedding_scorer(
+            async move {
+                panic!("{repository_content}");
+                #[allow(unreachable_code)]
+                Ok(SearchOutcome::NotReady)
+            },
+            SearchMode::Semantic,
+        )
+        .await
+        {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("panicking scorer must degrade"),
+        };
+
+        let rendered = diagnostic.render();
+        assert!(rendered.contains("component=embedding_scorer"));
+        assert!(rendered.contains(&format!("model={EMBEDDING_MODEL_NAME}")));
+        assert!(rendered.contains("index=attached"));
+        assert!(rendered.contains("mode=semantic"));
+        assert!(rendered.contains("failure=task_panic"));
+        assert!(rendered.contains("bounded lexical/graph results"));
+        assert!(!rendered.contains("secret-query"));
+        assert!(!rendered.contains("customer.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_scorer_error_does_not_echo_repository_content() {
+        let diagnostic = match isolate_embedding_scorer(
+            async {
+                Err(anyhow::anyhow!(
+                    "failed near src/private/customer.rs for secret-query"
+                ))
+            },
+            SearchMode::Hybrid,
+        )
+        .await
+        {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("failing scorer must degrade"),
+        };
+
+        let rendered = diagnostic.render();
+        assert!(rendered.contains("failure=search_error"));
+        assert!(!rendered.contains("secret-query"));
+        assert!(!rendered.contains("customer.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_mapped_graph_fallback_remains_bounded_after_scorer_panic() {
+        let nodes = (0..5)
+            .map(|index| {
+                make_node(
+                    &format!("auth_handler_{index}"),
+                    NodeKind::Function,
+                    &format!("src/auth_{index}.rs"),
+                )
+            })
+            .collect();
+        let gs = make_graph_state(nodes);
+        let stable_ids_before: Vec<String> = gs.nodes.iter().map(Node::stable_id).collect();
+
+        let diagnostic = match isolate_embedding_scorer(
+            async {
+                panic!("simulated scorer failure after worktree map");
+                #[allow(unreachable_code)]
+                Ok(SearchOutcome::NotReady)
+            },
+            SearchMode::Hybrid,
+        )
+        .await
+        {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("panicking scorer must degrade"),
+        };
+        assert_eq!(diagnostic.failure, "task_panic");
+
+        let repo_root = PathBuf::from("/tmp/live-worktree-map");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            limit: Some(2),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+        let matches = flat_code_symbol_search(
+            "auth",
+            SearchMode::Hybrid,
+            2,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            matches.len(),
+            2,
+            "fallback must respect the requested limit"
+        );
+        assert_eq!(
+            gs.nodes.iter().map(Node::stable_id).collect::<Vec<_>>(),
+            stable_ids_before,
+            "scorer failure must not invalidate the mapped graph"
+        );
+    }
+
     #[tokio::test]
     async fn test_flat_search_fallback_name_matching() {
         let nodes = vec![

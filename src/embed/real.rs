@@ -528,6 +528,35 @@ pub enum SearchOutcome {
     NotReady,
 }
 
+fn single_query_embedding(mut embeddings: Vec<Vec<f32>>) -> Result<Vec<f32>> {
+    if embeddings.len() != 1 {
+        anyhow::bail!(
+            "embedding scorer shape mismatch: expected 1 query vector, received {}",
+            embeddings.len()
+        );
+    }
+    let embedding = embeddings.pop().expect("length checked above");
+    if embedding.is_empty() {
+        anyhow::bail!("embedding scorer shape mismatch: query vector is empty");
+    }
+    Ok(embedding)
+}
+
+fn required_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let column = batch.column_by_name(name).ok_or_else(|| {
+        anyhow::anyhow!("embedding scorer schema mismatch: missing `{name}` column")
+    })?;
+    column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding scorer schema mismatch: `{name}` must be Utf8, received {:?}",
+                column.data_type()
+            )
+        })
+}
+
 /// A search result with the artifact and its relevance score.
 pub struct SearchResult {
     pub id: String,
@@ -1572,9 +1601,10 @@ impl EmbeddingIndex {
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let query_embedding =
+                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?;
                 let mut search = table
-                    .vector_search(query_embedding[0].clone())
+                    .vector_search(query_embedding)
                     .context("Failed to create vector search")?
                     .distance_type(lancedb::DistanceType::Cosine)
                     .limit(over_fetch);
@@ -1588,7 +1618,8 @@ impl EmbeddingIndex {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let query_embedding =
+                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
@@ -1596,7 +1627,7 @@ impl EmbeddingIndex {
                     q = q.only_if(sql.clone());
                 }
                 let hybrid_result = q
-                    .nearest_to(query_embedding[0].as_slice())
+                    .nearest_to(query_embedding.as_slice())
                     .context("Failed to create hybrid search")?
                     .distance_type(lancedb::DistanceType::Cosine)
                     .execute()
@@ -1609,7 +1640,7 @@ impl EmbeddingIndex {
                         // completes, or old cache). Fall back to pure vector search.
                         tracing::warn!("Hybrid search failed ({}), falling back to vector-only", e);
                         let mut search = table
-                            .vector_search(query_embedding[0].clone())
+                            .vector_search(query_embedding.clone())
                             .context("Failed to create fallback vector search")?
                             .distance_type(lancedb::DistanceType::Cosine)
                             .limit(over_fetch);
@@ -1657,30 +1688,10 @@ impl EmbeddingIndex {
                 continue;
             }
 
-            let ids = batch
-                .column_by_name("id")
-                .expect("checked above")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("id column is StringArray");
-            let kinds = batch
-                .column_by_name("kind")
-                .expect("checked above")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("kind column is StringArray");
-            let titles = batch
-                .column_by_name("title")
-                .expect("checked above")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("title column is StringArray");
-            let bodies = batch
-                .column_by_name("body")
-                .expect("checked above")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("body column is StringArray");
+            let ids = required_string_column(batch, "id")?;
+            let kinds = required_string_column(batch, "kind")?;
+            let titles = required_string_column(batch, "title")?;
+            let bodies = required_string_column(batch, "body")?;
 
             for i in 0..batch.num_rows() {
                 let kind = kinds.value(i).to_string();
@@ -1755,8 +1766,40 @@ mod tests {
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
         EmbeddingIndex, SearchFilters, SearchResult, build_artifact_embedding_text,
         build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
-        node_scalar_filters, truncate_chars,
+        node_scalar_filters, required_string_column, single_query_embedding, truncate_chars,
     };
+
+    #[test]
+    fn single_query_embedding_rejects_missing_or_malformed_output() {
+        let missing = single_query_embedding(Vec::new()).unwrap_err().to_string();
+        assert!(missing.contains("expected 1 query vector"));
+
+        let empty = single_query_embedding(vec![Vec::new()])
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("query vector is empty"));
+
+        let multiple = single_query_embedding(vec![vec![0.1], vec![0.2]])
+            .unwrap_err()
+            .to_string();
+        assert!(multiple.contains("received 2"));
+    }
+
+    #[test]
+    fn required_string_column_returns_schema_error_instead_of_panicking() {
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use std::sync::Arc;
+
+        let batch =
+            RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+
+        let error = required_string_column(&batch, "id")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`id` must be Utf8"));
+        assert!(error.contains("Int32"));
+    }
     use std::collections::BTreeMap;
 
     #[test]

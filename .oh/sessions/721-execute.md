@@ -42,10 +42,54 @@ Invalidated if the reproduced failure corrupts persisted graph state before scor
 
 ## Execution and risk-retirement checklist
 
-- [ ] Reproduce or simulate empty/malformed scorer output after map construction.
-- [ ] Add a check that fails direct indexing/downcast panics.
-- [ ] Add a check that fails diagnostics containing query, symbol body, or repository path.
-- [ ] Add a check that fails unbounded fallback.
-- [ ] Add a check that fails graph invalidation after scorer failure.
-- [ ] Run `cargo check --lib` before focused and full tests.
-- [ ] Run staged `/review`, the project ship gate, real MCP smoke, and CI.
+- [x] Reproduce or simulate empty/malformed scorer output after map construction.
+- [x] Add a check that fails direct indexing/downcast panics.
+- [x] Add a check that fails diagnostics containing query, symbol body, or repository path.
+- [x] Add a check that fails unbounded fallback.
+- [x] Add a check that fails graph invalidation after scorer failure.
+- [x] Run `cargo check --lib` before focused tests.
+- [x] Run staged `/review`.
+- [ ] Run the project ship gate, real MCP smoke, full tests, and CI.
+
+## Execute
+
+### Execution complete
+
+The existing scorer seam now rejects empty query vectors and incompatible Arrow columns as errors. Both code-symbol and artifact scoring execute behind a Tokio task boundary; scorer errors, panics, and cancellations produce a bounded lexical/graph fallback plus a content-safe agent-facing diagnostic. A real temporary worktree is scanned through `build_full_graph` and searched through the MCP handler, while adversarial fixtures prove scorer failure cannot mutate the mapped graph or exceed the requested result limit.
+
+### Verification
+
+- `cargo check --lib`
+- `cargo check --lib --features embeddings`
+- `cargo test --lib scorer_` (3 passed)
+- `cargo test --lib test_symbol_search_after_successful_live_worktree_map` (1 passed)
+- `cargo test --lib --features embeddings single_query_embedding_rejects_missing_or_malformed_output` (1 passed)
+- `cargo test --lib --features embeddings required_string_column_returns_schema_error_instead_of_panicking` (1 passed)
+
+### Risk retirement
+
+| Risk | Status | Tempting patch failed | Evidence |
+|---|---|---|---|
+| Empty scorer output still indexes element zero | Retired | Catch only service errors | Shape validation and feature-enabled test |
+| Lance result schema still panics | Retired | Guard column presence but keep unchecked downcasts | Typed column helper and feature-enabled test |
+| Panic escapes async search | Retired | Handle `Result` only | Tokio task isolation panic fixture |
+| Diagnostic leaks repository content | Retired | Echo raw `anyhow` or panic payload | Error and panic redaction fixtures |
+| Artifact search re-enters failed scorer | Retired | Isolate only code-symbol search | Shared isolation boundary for both scoring calls |
+| Fallback corrupts or replaces mapped graph | Retired | Rebuild/reset graph on scorer failure | Stable-ID preservation and bounded fallback fixture |
+| Test claims a map without scanning | Retired | Construct `GraphState` directly | Temp worktree `build_full_graph` plus handler search |
+
+## Review
+
+**Aim:** Keep RNA-first worktree navigation usable and honest when semantic scoring fails.
+
+**Status:** Continue
+
+- Necessary: yes; the unguarded scorer could crash the primary discovery path.
+- Aligned: yes; changes remain inside scorer validation, service isolation, and regression coverage.
+- Sufficient: yes after two adjustments found in review: artifact scoring now shares the isolation boundary, and the map/search regression uses a real scanner-built graph.
+- Mechanism clear: invalid scorer shapes become errors; task failure becomes a safe diagnostic; existing lexical/graph ranking supplies bounded results.
+- Risks retired: all model-checkable risks from the handoff have adversarial evidence.
+- Frame check: intact. The graph remains valid; the failure belongs at the scorer boundary.
+- Drift detected: none. No model, index-format, or search-framework redesign was introduced.
+
+Needs human verification: final delivery through the installed CI artifact and real MCP client remains in the ship gate.

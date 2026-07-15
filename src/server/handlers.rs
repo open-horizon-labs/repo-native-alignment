@@ -1152,6 +1152,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_symbol_search_after_successful_live_worktree_map() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let symbol = "mapped_worktree_symbol_probe";
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            format!("pub fn {symbol}() -> &'static str {{ \"mapped\" }}\n"),
+        )
+        .unwrap();
+
+        let handler = make_handler(repo.path());
+        let graph = handler
+            .build_full_graph()
+            .await
+            .expect("live worktree map should succeed");
+        assert!(
+            graph.nodes.iter().any(|node| node.id.name == symbol),
+            "mapped graph should contain the probe symbol"
+        );
+        handler
+            .graph
+            .store(std::sync::Arc::new(Some(std::sync::Arc::new(graph))));
+
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": symbol,
+            "repo": repo.path().to_string_lossy(),
+            "include_markdown": false,
+            "include_artifacts": false,
+            "search_mode": "keyword",
+            "compact": true,
+            "verbose": false
+        }))
+        .unwrap();
+        let result = handler.handle_search(args).await.unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+
+        assert!(
+            rendered.contains(symbol),
+            "symbol search should return a symbol from the successfully mapped worktree: {rendered}"
+        );
+    }
+
     /// A path with just a slash followed by nothing is still absolute.
     #[test]
     fn test_resolve_repo_path_root_slash_is_absolute() {

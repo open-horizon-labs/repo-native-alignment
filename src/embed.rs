@@ -5,6 +5,8 @@ mod real;
 #[cfg(feature = "embeddings")]
 pub use real::*;
 
+pub const EMBEDDING_MODEL_NAME: &str = "MiniLM-L6-v2";
+
 #[cfg(not(feature = "embeddings"))]
 use std::path::Path;
 
