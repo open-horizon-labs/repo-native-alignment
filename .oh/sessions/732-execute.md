@@ -1,7 +1,7 @@
 # Issue 732: Bounded changed-file call/reference enrichment
 
-**Issue:** #732  
-**Outcome:** context-assembly  
+**Issue:** #732
+**Outcome:** context-assembly
 **Status:** implemented; ship gate pending
 
 ## Aim
@@ -96,7 +96,7 @@ Changed scope always suppresses background or run-to-completion repo continuatio
 - Planned changed scope before `run_foreground_lsp_and_persist` opens the durable enrichment job and disabled every repo continuation mode for changed scope.
 - Changed non-repo completion to `set_complete_scoped`, preserving partial global dead-code readiness and explicit review-readiness context.
 - Added the one-file fanout oracle, real git provenance, deterministic rename/delete/unmapped, budget, non-git, scheduler/gate agreement, full-graph preservation, and readiness regressions.
-- Local verification: `cargo check --lib`; changed-file tests (6 passed); scoped-readiness regression; full library suite (1,938 passed, 2 ignored).
+- Local verification: `cargo check --lib`; changed-file tests (8 passed); scoped-readiness regression; full library suite (1,938 passed, 2 ignored); ADR-003 validation (1/1 passed).
 
 ## Verification plan
 
