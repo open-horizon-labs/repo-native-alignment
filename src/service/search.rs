@@ -6,6 +6,9 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 
 use crate::embed::{EMBEDDING_MODEL_NAME, SearchFilters, SearchMode, SearchOutcome};
@@ -34,6 +37,350 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 /// This catches cases where a small number of nodes with verbose bodies (non-
 /// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
+
+const MAX_SOURCE_SPAN_LINES: u32 = 200;
+const MAX_SOURCE_SPAN_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_PATH_ENTRIES: usize = 50_000;
+const MAX_SOURCE_CANDIDATES: usize = 20;
+
+fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<String>, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("cannot read file: {error}"))?;
+    let mut buffer = [0_u8; 8192];
+    let mut selected = Vec::<Vec<u8>>::new();
+    let mut current = Vec::new();
+    let mut selected_bytes = 0_usize;
+    let mut line_number = 1_u32;
+    let mut saw_any = false;
+    let mut last_was_newline = false;
+    let mut completed = false;
+    let mut utf8_pending = Vec::new();
+
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read file: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        if buffer[..count].contains(&0) {
+            return Err("binary (contains NUL bytes)".to_string());
+        }
+        utf8_pending.extend_from_slice(&buffer[..count]);
+        match std::str::from_utf8(&utf8_pending) {
+            Ok(_) => utf8_pending.clear(),
+            Err(error) if error.error_len().is_some() => {
+                return Err("binary or is not valid UTF-8".to_string());
+            }
+            Err(error) => {
+                let incomplete_start = error.valid_up_to();
+                utf8_pending.drain(..incomplete_start);
+            }
+        }
+        for &byte in &buffer[..count] {
+            saw_any = true;
+            last_was_newline = byte == b'\n';
+            if completed {
+                continue;
+            }
+            if (start..=end).contains(&line_number) && byte != b'\n' {
+                selected_bytes += 1;
+                if selected_bytes > MAX_SOURCE_SPAN_BYTES {
+                    return Err(format!(
+                        "requested source text exceeds the hard maximum of {MAX_SOURCE_SPAN_BYTES} bytes"
+                    ));
+                }
+                current.push(byte);
+            }
+            if byte == b'\n' {
+                if (start..=end).contains(&line_number) {
+                    if current.last() == Some(&b'\r') {
+                        current.pop();
+                    }
+                    selected.push(std::mem::take(&mut current));
+                }
+                if line_number == end {
+                    completed = true;
+                    continue;
+                }
+                line_number = line_number.saturating_add(1);
+            }
+        }
+    }
+    if !utf8_pending.is_empty() {
+        return Err("binary or is not valid UTF-8".to_string());
+    }
+
+    let available_lines = if completed {
+        end
+    } else if !saw_any {
+        0
+    } else if last_was_newline {
+        line_number.saturating_sub(1)
+    } else {
+        if (start..=end).contains(&line_number) {
+            if current.last() == Some(&b'\r') {
+                current.pop();
+            }
+            selected.push(current);
+        }
+        line_number
+    };
+    if start > available_lines {
+        return Err(format!(
+            "line {start} is out of range (file has {available_lines} lines)"
+        ));
+    }
+    if end > available_lines {
+        return Err(format!(
+            "end line {end} is out of range (file has {available_lines} lines)"
+        ));
+    }
+    selected
+        .into_iter()
+        .map(|line| String::from_utf8(line).map_err(|_| "binary or is not valid UTF-8".to_string()))
+        .collect()
+}
+
+fn compiler_location(file: &Option<String>) -> Option<(String, u32)> {
+    let value = file.as_deref()?;
+    let (before_column, column) = value.rsplit_once(':')?;
+    column.parse::<u32>().ok()?;
+    let (path, line) = before_column.rsplit_once(':')?;
+    let line = line.parse::<u32>().ok()?;
+    (!path.is_empty()).then(|| (path.to_string(), line))
+}
+
+fn source_roots(params: &SearchParams, repo_root: &Path) -> Vec<(String, PathBuf)> {
+    let workspace = crate::roots::WorkspaceConfig::load()
+        .with_primary_root(repo_root.to_path_buf())
+        .with_declared_roots(repo_root);
+    let mut roots: Vec<_> = workspace
+        .resolved_roots()
+        .into_iter()
+        .filter(|root| match params.root.as_deref() {
+            Some(selected) if selected.eq_ignore_ascii_case("all") => true,
+            Some(selected) => root.slug.eq_ignore_ascii_case(selected),
+            None => root.path == repo_root,
+        })
+        .map(|root| (root.slug, root.path))
+        .collect();
+    if roots.is_empty() && params.root.is_none() {
+        roots.push((
+            crate::roots::RootConfig::code_project(repo_root.to_path_buf()).slug(),
+            repo_root.to_path_buf(),
+        ));
+    }
+    roots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    roots
+}
+
+fn collect_suffix_matches(
+    dir: &Path,
+    suffix: &Path,
+    matches: &mut Vec<PathBuf>,
+    visited: &mut usize,
+) -> Result<(), String> {
+    if matches.len() > MAX_SOURCE_CANDIDATES {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        *visited += 1;
+        if *visited > MAX_SOURCE_PATH_ENTRIES {
+            return Err(format!(
+                "source path lookup exceeded the hard traversal maximum of {MAX_SOURCE_PATH_ENTRIES} filesystem entries; provide a more exact path"
+            ));
+        }
+        let path = entry.path();
+        if matches!(
+            entry.file_name().to_str(),
+            Some(".git" | "target" | "node_modules" | ".cache")
+        ) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            if path.ends_with(suffix) {
+                matches.push(path);
+            }
+        } else if file_type.is_dir() {
+            collect_suffix_matches(&path, suffix, matches, visited)?;
+        } else if file_type.is_file() && path.ends_with(suffix) {
+            matches.push(path);
+        }
+        if matches.len() > MAX_SOURCE_CANDIDATES {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn source_span(params: &SearchParams, repo_root: &Path) -> String {
+    let Some(raw_file) = params
+        .file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return "Source span lookup requires `file` plus `line` (or `file` as path:line:column)."
+            .to_string();
+    };
+    let parsed_location = compiler_location(&params.file);
+    let (file, start) = match (params.line, parsed_location) {
+        (Some(line), Some((path, _))) => (path, line),
+        (Some(line), None) => (raw_file.to_string(), line),
+        (None, Some((path, line))) => (path, line),
+        (None, None) => {
+            return "Source span lookup requires `line`, or a compiler-style `file` value such as src/lib.rs:42:7.".to_string();
+        }
+    };
+    let end = params.end_line.unwrap_or(start);
+    if start == 0 || end == 0 {
+        return "Source line numbers are 1-based; `line` and `end_line` must be at least 1."
+            .to_string();
+    }
+    if end < start {
+        return format!("Invalid source span {start}-{end}: `end_line` must be >= `line`.");
+    }
+    let count = u64::from(end) - u64::from(start) + 1;
+    if count > u64::from(MAX_SOURCE_SPAN_LINES) {
+        return format!(
+            "Source span {start}-{end} requests {count} lines; the hard maximum is {MAX_SOURCE_SPAN_LINES}. Narrow the range."
+        );
+    }
+
+    let requested = PathBuf::from(&file);
+    if requested.is_absolute()
+        || requested.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return format!(
+            "Rejected source path `{file}`: use a repo/root-relative path without parent traversal."
+        );
+    }
+
+    let roots = source_roots(params, repo_root);
+    if roots.is_empty() {
+        return format!(
+            "Selected root `{}` is not configured or is unavailable.",
+            params.root.as_deref().unwrap_or_default()
+        );
+    }
+    let mut candidates = Vec::new();
+    let mut visited = 0;
+    let mut omitted_candidates = false;
+    for (slug, root) in roots {
+        let Ok(canonical_root) = fs::canonicalize(&root) else {
+            continue;
+        };
+        let exact = root.join(&requested);
+        let mut paths = if exact.symlink_metadata().is_ok() {
+            vec![exact]
+        } else {
+            let mut suffix_matches = Vec::new();
+            if let Err(error) =
+                collect_suffix_matches(&root, &requested, &mut suffix_matches, &mut visited)
+            {
+                return format!("Source path lookup failed: {error}.");
+            }
+            if suffix_matches.len() > MAX_SOURCE_CANDIDATES {
+                suffix_matches.truncate(MAX_SOURCE_CANDIDATES);
+                omitted_candidates = true;
+            }
+            suffix_matches
+        };
+        paths.sort();
+        for path in paths {
+            match fs::canonicalize(&path) {
+                Ok(canonical) if canonical.starts_with(&canonical_root) => {
+                    candidates.push((slug.clone(), canonical_root.clone(), canonical));
+                    if candidates.len() > MAX_SOURCE_CANDIDATES {
+                        omitted_candidates = true;
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    return format!(
+                        "Rejected source path `{file}`: the resolved path escapes root `{}` through a symlink.",
+                        root.display()
+                    );
+                }
+                Err(error) => {
+                    return format!("Cannot resolve source path `{}`: {error}.", path.display());
+                }
+            }
+        }
+        if candidates.len() > MAX_SOURCE_CANDIDATES {
+            candidates.truncate(MAX_SOURCE_CANDIDATES);
+            break;
+        }
+    }
+    candidates.sort_by(|a, b| a.2.cmp(&b.2));
+    candidates.dedup_by(|a, b| a.2 == b.2);
+    if candidates.is_empty() {
+        return format!("Source file `{file}` was not found in the selected repository/root.");
+    }
+    if candidates.len() > 1 {
+        let paths = candidates
+            .iter()
+            .map(|(slug, root, path)| {
+                format!(
+                    "- [{slug}] {}",
+                    path.strip_prefix(root).unwrap_or(path).display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let omitted = if omitted_candidates {
+            format!("\n- … additional matches omitted after {MAX_SOURCE_CANDIDATES} candidates")
+        } else {
+            String::new()
+        };
+        return format!(
+            "Source path `{file}` is ambiguous. Provide one exact repo/root-relative path. Candidates:\n{paths}{omitted}"
+        );
+    }
+    let (slug, root, path) = candidates.pop().unwrap();
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => return format!("Cannot inspect source file `{}`: {error}.", path.display()),
+    };
+    if !metadata.is_file() {
+        return format!("Source path `{file}` is not a regular file.");
+    }
+    let lines = match read_bounded_source_lines(&path, start, end) {
+        Ok(lines) => lines,
+        Err(error) => return format!("Cannot read source file `{file}`: {error}."),
+    };
+    let numbered = lines
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>6} | {line}", start as usize + offset))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let relative = path.strip_prefix(&root).unwrap_or(&path);
+    let longest_backtick_run = numbered
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.saturating_add(1).max(3));
+    format!(
+        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines and {MAX_SOURCE_SPAN_BYTES} source bytes per request\n\n{fence}text\n{numbered}\n{fence}",
+        root.display(),
+        relative.display()
+    )
+}
 
 fn format_verbose_readiness(
     gs: &GraphState,
@@ -172,6 +519,17 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
 
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    if params.line.is_some()
+        || params.end_line.is_some()
+        || compiler_location(&params.file).is_some()
+    {
+        let params = params.clone();
+        let repo_root = ctx.repo_root.to_path_buf();
+        return tokio::task::spawn_blocking(move || source_span(&params, &repo_root))
+            .await
+            .unwrap_or_else(|error| format!("Source span lookup task failed: {error}."));
+    }
+
     let query = params
         .query
         .as_deref()
@@ -2200,6 +2558,272 @@ mod tests {
         assert!(p.query.is_none());
         assert!(!p.compact);
         assert!(!p.rerank);
+    }
+
+    #[tokio::test]
+    async fn source_span_reads_compiler_location_without_index_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/main.rs"),
+            "fn main() {\n    let value = Thing { field: 1 };\n}\n",
+        )
+        .unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("src/main.rs:2:17".into()),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("2 |     let value = Thing { field: 1 };"));
+        assert!(result.contains("current filesystem state"));
+        assert!(result.contains("**Root:**"));
+
+        let explicit_line = SearchParams {
+            file: Some("src/main.rs:1:1".into()),
+            line: Some(2),
+            ..Default::default()
+        };
+        assert!(
+            search(&explicit_line, &ctx)
+                .await
+                .contains("2 |     let value")
+        );
+    }
+
+    #[tokio::test]
+    async fn source_span_rejects_ambiguous_suffix_and_lists_sorted_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["a", "b"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("same.rs"), "one\n").unwrap();
+        }
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("same.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("is ambiguous"));
+        assert!(result.find("a/same.rs").unwrap() < result.find("b/same.rs").unwrap());
+
+        for index in 0..25 {
+            let dir = tmp.path().join(format!("many-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("common.rs"), "one\n").unwrap();
+        }
+        let capped = SearchParams {
+            file: Some("common.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        let capped_result = search(&capped, &ctx).await;
+        assert!(capped_result.contains("additional matches omitted after 20 candidates"));
+        assert_eq!(
+            capped_result
+                .lines()
+                .filter(|line| line.starts_with("- ["))
+                .count(),
+            MAX_SOURCE_CANDIDATES
+        );
+    }
+
+    #[tokio::test]
+    async fn source_span_honors_specific_and_all_workspace_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let secondary = tmp.path().join("secondary");
+        std::fs::create_dir_all(primary.join(".oh")).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+        std::fs::write(
+            primary.join(".oh/config.toml"),
+            "[workspace.roots]\nsecondary = \"../secondary\"\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("same.rs"), "primary\n").unwrap();
+        std::fs::write(secondary.join("same.rs"), "secondary\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, &primary);
+
+        let all = SearchParams {
+            file: Some("same.rs".into()),
+            line: Some(1),
+            root: Some("all".into()),
+            ..Default::default()
+        };
+        let ambiguous = search(&all, &ctx).await;
+        assert!(ambiguous.contains("is ambiguous"));
+        assert!(ambiguous.contains("[primary] same.rs"), "{ambiguous}");
+        assert!(ambiguous.contains("[secondary] same.rs"), "{ambiguous}");
+        let selected = SearchParams {
+            root: Some("secondary".into()),
+            ..all
+        };
+        let result = search(&selected, &ctx).await;
+        assert!(result.contains("1 | secondary"));
+        assert!(result.contains("**Root:** `secondary`"));
+    }
+
+    #[tokio::test]
+    async fn source_span_rejects_traversal_and_range_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.rs"),
+            vec![b'x'; MAX_SOURCE_SPAN_BYTES + 1],
+        )
+        .unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let traversal = SearchParams {
+            file: Some("../secret".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        let oversized = SearchParams {
+            file: Some("anything.rs".into()),
+            line: Some(1),
+            end_line: Some(MAX_SOURCE_SPAN_LINES + 1),
+            ..Default::default()
+        };
+
+        assert!(search(&traversal, &ctx).await.contains("parent traversal"));
+        assert!(
+            search(&oversized, &ctx)
+                .await
+                .contains("hard maximum is 200")
+        );
+        let overflow_probe = SearchParams {
+            file: Some("anything.rs".into()),
+            line: Some(1),
+            end_line: Some(u32::MAX),
+            ..Default::default()
+        };
+        assert!(
+            search(&overflow_probe, &ctx)
+                .await
+                .contains("hard maximum is 200")
+        );
+        let huge_line = SearchParams {
+            file: Some("huge.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            search(&huge_line, &ctx)
+                .await
+                .contains("hard maximum of 65536 bytes")
+        );
+
+        let mut matches = Vec::new();
+        let mut visited = MAX_SOURCE_PATH_ENTRIES;
+        let traversal_error = collect_suffix_matches(
+            tmp.path(),
+            Path::new("missing.rs"),
+            &mut matches,
+            &mut visited,
+        )
+        .unwrap_err();
+        assert!(traversal_error.contains("hard traversal maximum of 50000"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_span_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), tmp.path().join("escape.rs")).unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("escape.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+
+        assert!(search(&params, &ctx).await.contains("escapes root"));
+    }
+
+    #[tokio::test]
+    async fn source_span_reports_directory_binary_and_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("folder")).unwrap();
+        std::fs::write(tmp.path().join("binary.bin"), b"GIF89a\0payload").unwrap();
+        std::fs::write(
+            tmp.path().join("binary-after.rs"),
+            b"valid source\n\0binary tail",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("invalid-after.rs"),
+            b"valid source\n\xff\xfe",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("short.rs"), "one\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let lookup = |file: &str, line| SearchParams {
+            file: Some(file.into()),
+            line: Some(line),
+            ..Default::default()
+        };
+
+        assert!(
+            search(&lookup("folder", 1), &ctx)
+                .await
+                .contains("not a regular file")
+        );
+        assert!(
+            search(&lookup("binary.bin", 1), &ctx)
+                .await
+                .contains("binary (contains NUL bytes)")
+        );
+        assert!(
+            search(&lookup("binary-after.rs", 1), &ctx)
+                .await
+                .contains("binary (contains NUL bytes)")
+        );
+        assert!(
+            search(&lookup("invalid-after.rs", 1), &ctx)
+                .await
+                .contains("not valid UTF-8")
+        );
+        assert!(
+            search(&lookup("short.rs", 2), &ctx)
+                .await
+                .contains("out of range")
+        );
+        assert!(
+            search(&lookup("missing.rs", 1), &ctx)
+                .await
+                .contains("was not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn source_span_uses_a_safe_markdown_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("fenced.md"), "```\ncontent\n").unwrap();
+        let graph = make_graph_state(vec![]);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            file: Some("fenced.md".into()),
+            line: Some(1),
+            end_line: Some(2),
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("````text\n     1 | ```\n     2 | content\n````"));
     }
 
     #[tokio::test]
