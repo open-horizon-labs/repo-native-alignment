@@ -306,11 +306,11 @@ mod tests {
             Some("build")
         );
 
-        let edge_kind = EdgeKind::Other("constructed_at".into());
+        let edge_kind = EdgeKind::Constructs;
         let neighbors = state.index.neighbors(
             &declaration.stable_id(),
             Some(std::slice::from_ref(&edge_kind)),
-            petgraph::Direction::Outgoing,
+            petgraph::Direction::Incoming,
         );
         assert_eq!(neighbors, vec![site.stable_id()]);
 
@@ -321,7 +321,7 @@ mod tests {
             &state.index,
             false,
         );
-        assert!(rendered.contains("Constructed at (1)"));
+        assert!(rendered.contains("Constructs (1)"));
         assert!(rendered.contains("BusOptions@1:"));
     }
 

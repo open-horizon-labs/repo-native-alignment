@@ -155,6 +155,9 @@ pub enum EdgeKind {
     HasField,
     Evolves,
     ReferencedBy,
+    /// A concrete struct-literal site constructs a locally declared struct.
+    /// Direction: construction site → struct declaration.
+    Constructs,
     /// A node references another (e.g., markdown link to another file).
     References,
     TopologyBoundary,
@@ -201,6 +204,7 @@ impl fmt::Display for EdgeKind {
             EdgeKind::HasField => write!(f, "has_field"),
             EdgeKind::Evolves => write!(f, "evolves"),
             EdgeKind::ReferencedBy => write!(f, "referenced_by"),
+            EdgeKind::Constructs => write!(f, "constructs"),
             EdgeKind::References => write!(f, "references"),
             EdgeKind::TopologyBoundary => write!(f, "topology_boundary"),
             EdgeKind::Modified => write!(f, "modified"),
@@ -234,6 +238,7 @@ impl EdgeKind {
             "has_field" => EdgeKind::HasField,
             "evolves" => EdgeKind::Evolves,
             "referenced_by" => EdgeKind::ReferencedBy,
+            "constructs" => EdgeKind::Constructs,
             "references" => EdgeKind::References,
             "topology_boundary" => EdgeKind::TopologyBoundary,
             "modified" => EdgeKind::Modified,

@@ -6,7 +6,7 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind}
 
 const STRUCT_LITERAL_KIND: &str = "struct_literal";
 
-/// Emit declaration → construction edges for unambiguous repo-local Rust structs.
+/// Emit construction → declaration edges for unambiguous repo-local Rust structs.
 ///
 /// Construction nodes are produced while the Rust AST is available. Resolution is
 /// deliberately deferred until the full node set exists so literals can link across
@@ -33,9 +33,9 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
             let candidates = declarations.get(&(site.id.root.as_str(), target.as_str()))?;
             let declaration = resolve_declaration(site, candidates)?;
             Some(Edge {
-                from: declaration.id.clone(),
-                to: site.id.clone(),
-                kind: EdgeKind::Other("constructed_at".to_string()),
+                from: site.id.clone(),
+                to: declaration.id.clone(),
+                kind: EdgeKind::Constructs,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
             })
@@ -98,9 +98,9 @@ mod tests {
 
         let edges = struct_construction_pass(&[declaration.clone(), site.clone()]);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].from, declaration.id);
-        assert_eq!(edges[0].to, site.id);
-        assert_eq!(edges[0].kind.to_string(), "constructed_at");
+        assert_eq!(edges[0].from, site.id);
+        assert_eq!(edges[0].to, declaration.id);
+        assert_eq!(edges[0].kind, EdgeKind::Constructs);
     }
 
     #[test]
