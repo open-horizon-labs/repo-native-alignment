@@ -30,7 +30,7 @@ pub use search::search;
 /// defaults. `derive(Default)` would leave them `false`, diverging from
 /// `from_mcp_search()` and silently disabling artifact/markdown search for
 /// any code that constructs `SearchParams::default()`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SearchParams {
     pub query: Option<String>,
     pub node: Option<String>,
@@ -42,6 +42,9 @@ pub struct SearchParams {
     pub kind: Option<String>,
     pub language: Option<String>,
     pub file: Option<String>,
+    pub line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub root: Option<String>,
     pub limit: Option<usize>,
     pub sort_by: Option<String>,
     pub min_complexity: Option<u32>,
@@ -73,6 +76,9 @@ impl Default for SearchParams {
             kind: None,
             language: None,
             file: None,
+            line: None,
+            end_line: None,
+            root: None,
             limit: None,
             sort_by: None,
             min_complexity: None,
@@ -141,6 +147,9 @@ impl SearchParams {
             kind: non_blank_optional(&args.kind),
             language: non_blank_optional(&args.language),
             file: non_blank_optional(&args.file),
+            line: args.line,
+            end_line: args.end_line,
+            root: non_blank_optional(&args.root),
             limit: args.limit.map(|k| k as usize),
             sort_by: non_blank_optional(&args.sort_by),
             min_complexity: args.min_complexity,
@@ -206,6 +215,24 @@ mod tests {
         let params = SearchParams::from_mcp_search(&search);
 
         assert_eq!(params.mode.as_deref(), Some("neighbors"));
+    }
+
+    #[test]
+    fn from_mcp_search_preserves_source_span_contract() {
+        let search: Search = serde_json::from_value(json!({
+            "file": " src/main.rs ",
+            "line": 12,
+            "end_line": 14,
+            "root": " secondary "
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.file.as_deref(), Some("src/main.rs"));
+        assert_eq!(params.line, Some(12));
+        assert_eq!(params.end_line, Some(14));
+        assert_eq!(params.root.as_deref(), Some("secondary"));
     }
 
     #[test]

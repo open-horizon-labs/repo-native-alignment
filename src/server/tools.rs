@@ -152,9 +152,24 @@ pub struct Search {
     /// Language: rust, python, typescript, go, markdown
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// File path substring filter
+    /// File path substring filter. With `line`, this becomes an exact or uniquely
+    /// resolved repo/root-relative source path. Also accepts `path:line:column`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// First 1-based source line. Enables bounded current-filesystem source retrieval.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub line: Option<u32>,
+    /// Last 1-based source line (inclusive). Defaults to `line`; at most 200 lines.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_line: Option<u32>,
     /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,

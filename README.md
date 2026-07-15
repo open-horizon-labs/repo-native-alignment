@@ -50,6 +50,8 @@ Six jobs agents can do after RNA is running that they could not do reliably befo
 **Find code by meaning, not just by name**
 `search("payment processing")` returns ranked results across symbols, docs, commits, and artifacts in one call. Path scoping works too: `search("auth/handlers/validate")` returns only symbols named `validate` in files matching `auth/handlers`.
 
+When a compiler or test runner already provides a location, `search(file="src/service.rs", line=120, end_line=130)` returns that exact, numbered span from the current filesystem. Compiler-style locations such as `search(file="src/service.rs:120:7")` work too. Source spans are root-scoped, reject ambiguous or escaping paths, and are capped at 200 lines and 64 KiB of source text per request.
+
 **Trace call paths and blast radius**
 `search(node="AuthHandler", mode="impact")` returns transitive dependents grouped by subsystem. `search(node="X", mode="path", query="Y")` returns the directed call chain between two nodes.
 
@@ -196,7 +198,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` (default for MCP) for cross-encoder precision. Use `include_body: true` (requires `node` or `nodes`) to return function bodies; add `minify_body: true` to strip comments and shorten locals with a legend (tree-sitter AST for TS/JS, Rust, Python, Go; text fallback for others). |
+| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Retrieve bounded current-filesystem source with `file` + `line`/`end_line` (or `file="path:line:column"`; maximum 200 lines). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` (default for MCP) for cross-encoder precision. Use `include_body: true` (requires `node` or `nodes`) to return function bodies; add `minify_body: true` to strip comments and shorten locals with a legend (tree-sitter AST for TS/JS, Rust, Python, Go; text fallback for others). |
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase), durable Pass 1 queue snapshots (pending, in-flight, completed, failed, skipped, exhausted, resumed/retried counts, phase counts, oldest work, and bounded actionable exhaustion samples) from `.oh/.cache/lsp_pass1_work_items.json`, and recent OperationReport history from `.oh/.cache/operation_reports.json`. Interrupted queues resume only eligible work: completed output and skipped state are carried forward only when the node input fingerprint is unchanged. OperationReports persist the same queue snapshot for post-run inspection. Includes LSP servers available to install for each root's detected languages. |
