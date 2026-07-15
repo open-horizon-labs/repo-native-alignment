@@ -15,6 +15,8 @@ pub(crate) mod persist;
 
 use std::path::{Path, PathBuf};
 
+use lancedb::expr::{DfExpr, col, is_in, lit};
+
 use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
 
 // ── Re-exports ────────────────────────────────────────────────────────
@@ -35,6 +37,12 @@ pub use load::load_graph_from_lance;
 /// LanceDB path for graph persistence.
 pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
+}
+
+pub(crate) const PREDICATE_BATCH_SIZE: usize = 500;
+
+pub(crate) fn string_isin(column: &str, values: impl IntoIterator<Item = String>) -> DfExpr {
+    is_in(col(column), values.into_iter().map(lit).collect())
 }
 
 // ── Parse helpers ────────────────────────────────────────────────────
