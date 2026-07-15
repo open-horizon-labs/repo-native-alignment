@@ -21,4 +21,3 @@ For dependency migrations, evaluate the fully resolved all-feature/all-target
 graph before adapting APIs. Prefer the newest coherent stack that satisfies the
 actual security and compatibility constraints, then verify the repository's
 storage boundary and old-cache behavior with exact CI artifacts.
-
