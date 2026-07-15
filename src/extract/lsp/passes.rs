@@ -18,6 +18,7 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 use super::transport::{
     PipelinedTransport, find_enclosing_symbol, path_to_uri, uri_to_relative_path,
 };
+use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
     ZERO_EDGE_TIMEOUT,
@@ -239,16 +240,23 @@ struct LspPass1Diagnostics {
     completed: AtomicI64,
     failed: AtomicI64,
     last_success: Mutex<Option<String>>,
+    work_items: Option<Arc<LspWorkItemLedger>>,
 }
 
 impl LspPass1Diagnostics {
+    #[cfg(test)]
     fn new(total: usize) -> Self {
+        Self::with_ledger(total, None)
+    }
+
+    fn with_ledger(total: usize, work_items: Option<Arc<LspWorkItemLedger>>) -> Self {
         Self {
             total,
             in_flight: Mutex::new(HashMap::new()),
             completed: AtomicI64::new(0),
             failed: AtomicI64::new(0),
             last_success: Mutex::new(None),
+            work_items,
         }
     }
 
@@ -264,9 +272,38 @@ impl LspPass1Diagnostics {
                 started_at: Instant::now(),
             },
         );
+        drop(in_flight);
+        if let Some(work_items) = &self.work_items
+            && let Err(error) = work_items.mark_phase(item.id, phase).await
+        {
+            tracing::warn!(
+                item_id = item.id,
+                %error,
+                "Failed to persist LSP work-item phase"
+            );
+        }
     }
 
     async fn finish(&self, item: &LspPass1WorkItem, success: bool) {
+        self.finish_with_error(
+            item,
+            success,
+            (!success).then(|| "one or more LSP operations failed".to_string()),
+        )
+        .await;
+    }
+
+    async fn finish_failed(&self, item: &LspPass1WorkItem, error: impl Into<String>) {
+        self.finish_with_error(item, false, Some(error.into()))
+            .await;
+    }
+
+    async fn finish_with_error(
+        &self,
+        item: &LspPass1WorkItem,
+        success: bool,
+        error: Option<String>,
+    ) {
         {
             let mut in_flight = self.in_flight.lock().await;
             in_flight.remove(&item.id);
@@ -281,6 +318,25 @@ impl LspPass1Diagnostics {
             ));
         } else {
             self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(work_items) = &self.work_items {
+            let result = if success {
+                work_items.mark_completed(item.id).await
+            } else {
+                work_items
+                    .mark_failed(
+                        item.id,
+                        error.unwrap_or_else(|| "LSP work item failed".to_string()),
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    item_id = item.id,
+                    %error,
+                    "Failed to persist terminal LSP work-item state"
+                );
+            }
         }
     }
 
@@ -546,8 +602,34 @@ impl LspEnricher {
             })
             .collect();
         let total_nodes = work_items.len();
+        let persisted_seeds = work_items
+            .iter()
+            .map(|item| LspWorkItemSeed {
+                item_id: item.id,
+                node: item.node.clone(),
+                requested_operations: item
+                    .requested_operations
+                    .iter()
+                    .map(|operation| (*operation).to_string())
+                    .collect(),
+                attempt_count: item.attempt_count,
+            })
+            .collect::<Vec<_>>();
+        let work_item_ledger = match LspWorkItemLedger::begin(root, &persisted_seeds).await {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                let diagnostic = format!(
+                    "failed to persist LSP Pass 1 work-item ledger: {error}; no work was started"
+                );
+                tracing::warn!("{diagnostic}");
+                return (0, 1, true, Some(diagnostic));
+            }
+        };
         let worker_count = total_nodes.clamp(1, PIPELINE_MAX_CONCURRENCY);
-        let diagnostics = Arc::new(LspPass1Diagnostics::new(total_nodes));
+        let diagnostics = Arc::new(LspPass1Diagnostics::with_ledger(
+            total_nodes,
+            Some(Arc::clone(&work_item_ledger)),
+        ));
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let mut join_set = tokio::task::JoinSet::new();
@@ -722,6 +804,14 @@ impl LspEnricher {
             }
         }
 
+        if let Err(error) = work_item_ledger.flush().await {
+            errors += 1;
+            aborted = true;
+            abort_diagnostic = Some(format!(
+                "failed to flush LSP Pass 1 work-item ledger: {error}"
+            ));
+        }
+
         tracing::info!(
             "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
             pass1_start.elapsed(),
@@ -762,7 +852,9 @@ impl LspEnricher {
                     node.id.file.display(),
                     e
                 );
-                diagnostics.finish(item, false).await;
+                diagnostics
+                    .finish_failed(item, format!("failed to resolve file URI: {e}"))
+                    .await;
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -778,7 +870,9 @@ impl LspEnricher {
         {
             error_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("{}", e);
-            diagnostics.finish(item, false).await;
+            diagnostics
+                .finish_failed(item, format!("failed to send textDocument/didOpen: {e}"))
+                .await;
             return Pass1TaskResult {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),

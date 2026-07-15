@@ -37,6 +37,8 @@ pub struct OperationReport {
     pub diagnostics: Vec<DiagnosticNotice>,
     #[serde(default)]
     pub related_job_ids: Vec<String>,
+    #[serde(default)]
+    pub lsp_work_item_queues: Vec<crate::extract::lsp::work_items::LspWorkItemQueueSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
 }
@@ -61,6 +63,7 @@ impl OperationReport {
             next_steps: Vec::new(),
             diagnostics: Vec::new(),
             related_job_ids: Vec::new(),
+            lsp_work_item_queues: Vec::new(),
             failure: None,
         }
     }
@@ -159,6 +162,14 @@ impl OperationReport {
             lines.push("Capabilities:".to_string());
             for capability in &self.capabilities {
                 lines.push(format!("  - {}", capability.render_cli()));
+            }
+        }
+
+        if !self.lsp_work_item_queues.is_empty() {
+            lines.push("".to_string());
+            lines.push("LSP work queues:".to_string());
+            for snapshot in &self.lsp_work_item_queues {
+                lines.push(format!("  - {}", snapshot.render()));
             }
         }
 
@@ -619,9 +630,36 @@ impl OperationReportStore {
 
     pub fn record_with_limit(
         repo_root: &Path,
-        report: OperationReport,
+        mut report: OperationReport,
         limit: usize,
     ) -> Result<()> {
+        if report.lsp_work_item_queues.is_empty() {
+            report.lsp_work_item_queues =
+                crate::extract::lsp::work_items::load_queue_snapshots_since(
+                    repo_root,
+                    report
+                        .started_at
+                        .saturating_mul(1_000)
+                        .saturating_sub(1_000),
+                )
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Could not attach LSP work-item snapshots to operation report"
+                    );
+                    Vec::new()
+                });
+        }
+        let mut related_job_ids = report
+            .related_job_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for snapshot in &report.lsp_work_item_queues {
+            if related_job_ids.insert(snapshot.job_id.clone()) {
+                report.related_job_ids.push(snapshot.job_id.clone());
+            }
+        }
         let mut store = match Self::read(repo_root) {
             Ok(store) => store,
             Err(err) => {
@@ -1013,6 +1051,63 @@ mod tests {
         assert!(rendered.contains("embeddings: skipped"));
         assert!(rendered.contains("semantic search: embeddings skipped"));
         assert!(rendered.contains("repo-native-alignment enrich --capability embeddings"));
+    }
+
+    #[tokio::test]
+    async fn persisted_lsp_work_queue_is_attached_and_rendered_for_list_roots() {
+        use std::collections::BTreeMap;
+
+        use crate::extract::lsp::work_items::{LspWorkItemLedger, LspWorkItemSeed};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "queued_symbol".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn queued_symbol()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let ledger = LspWorkItemLedger::begin(
+            repo.path(),
+            &[LspWorkItemSeed {
+                item_id: 0,
+                node,
+                requested_operations: vec!["textDocument/references".to_string()],
+                attempt_count: 1,
+            }],
+        )
+        .await
+        .unwrap();
+        ledger.mark_phase(0, "requesting_references").await.unwrap();
+        ledger.age_records_for_test(Duration::from_secs(10));
+        ledger.flush().await.unwrap();
+
+        let mut report =
+            OperationReport::new(OperationKind::Enrich, OperationTrigger::Test, repo.path())
+                .complete(Duration::from_millis(10));
+        report.started_at = unix_now().saturating_sub(30);
+        OperationReportStore::record(repo.path(), report).unwrap();
+
+        let persisted = OperationReportStore::recent(repo.path(), 1);
+        assert_eq!(persisted[0].lsp_work_item_queues.len(), 1);
+        assert_eq!(persisted[0].related_job_ids.len(), 1);
+        assert_eq!(
+            persisted[0].related_job_ids[0],
+            persisted[0].lsp_work_item_queues[0].job_id
+        );
+        let rendered = render_recent_reports_markdown(repo.path(), 1);
+        assert!(rendered.contains("LSP work queues:"));
+        assert!(rendered.contains("in_flight=1"));
+        assert!(rendered.contains("phase=requesting_references"));
     }
 
     #[test]

@@ -106,6 +106,9 @@ fn build_pipeline_operation_report(
         OperationReport::new(input.operation, OperationTrigger::ForegroundScan, repo_root)
             .with_scope("repo")
             .complete(input.duration);
+    if let Some(completed_at) = report.completed_at {
+        report.started_at = completed_at.saturating_sub(input.duration.as_secs());
+    }
     report.outputs = OutputReport {
         symbol_count: Some(input.symbol_count),
         edge_count: Some(input.edge_count),
@@ -2617,6 +2620,37 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         }
+    }
+
+    #[test]
+    fn pipeline_report_preserves_the_actual_operation_start() {
+        let duration = Duration::from_secs(60);
+        let report = build_pipeline_operation_report(
+            std::path::Path::new("/tmp/repo"),
+            PipelineReportInput {
+                operation: OperationKind::Scan,
+                enrichment: ScanEnrichmentOptions::extract_only(),
+                duration,
+                symbol_count: 0,
+                edge_count: 0,
+                file_count: 0,
+                lsp_edge_count: 0,
+                lsp_state: CapabilityState::Skipped,
+                lsp_detail: None,
+                embedding_count: 0,
+                embeddings_attached: false,
+                phases: Vec::new(),
+                related_job_ids: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            report
+                .completed_at
+                .unwrap()
+                .saturating_sub(report.started_at),
+            duration.as_secs()
+        );
     }
 
     #[test]

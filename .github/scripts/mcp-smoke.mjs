@@ -1,4 +1,6 @@
 import process from "node:process";
+import fs from "node:fs";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -7,6 +9,44 @@ if (!serverPath || !repoPath) {
   console.error("Usage: node .github/scripts/mcp-smoke.mjs <server-path> <repo-path>");
   process.exit(2);
 }
+
+const workItemLedgerPath = path.join(
+  repoPath,
+  ".oh",
+  ".cache",
+  "lsp_pass1_work_items.json",
+);
+const previousWorkItemLedger = fs.existsSync(workItemLedgerPath)
+  ? fs.readFileSync(workItemLedgerPath)
+  : null;
+const now = Date.now();
+fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
+fs.writeFileSync(
+  workItemLedgerPath,
+  JSON.stringify({
+    schema_version: 1,
+    records: {
+      "mcp-smoke:0": {
+        schema_version: 1,
+        job_id: "mcp-smoke",
+        item_id: 0,
+        repo: repoPath,
+        root: "fixture",
+        file: "src/main.rs",
+        node_id: "fixture:src/main.rs:main:function",
+        node_name: "main",
+        node_kind: "function",
+        requested_operations: ["textDocument/references"],
+        state: "in_flight",
+        attempt_count: 1,
+        current_phase: "mcp_smoke_probe",
+        created_at_ms: now,
+        updated_at_ms: now,
+        started_at_ms: now,
+      },
+    },
+  }),
+);
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -212,6 +252,17 @@ try {
   const rootsResult = await client.callTool({ name: "list_roots", arguments: {} });
   const rootsText = extractText(rootsResult);
   assertContains("list_roots response contains 'Workspace Roots'", rootsText, "Workspace Roots");
+  assertContains(
+    "list_roots delivers persisted LSP work queues through MCP",
+    rootsText,
+    "LSP Pass 1 Work Queues",
+  );
+  assertContains("list_roots delivers in-flight queue count", rootsText, "in_flight=1");
+  assertContains(
+    "list_roots delivers current LSP phase",
+    rootsText,
+    "mcp_smoke_probe=1",
+  );
 
   // ── 7. search (neighbors depth=2) ──────────────────────────────────────
   // Verifies that the depth parameter is accepted and processed through the
@@ -260,6 +311,11 @@ try {
   }
 } finally {
   await client.close();
+  if (previousWorkItemLedger) {
+    fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
+  } else {
+    fs.rmSync(workItemLedgerPath, { force: true });
+  }
 }
 
 if (failures > 0) process.exit(1);
