@@ -70,6 +70,8 @@ The existing scorer seam now rejects empty query vectors and incompatible Arrow 
 
 The required independent reviewer found that `tokio::spawn` contains a panic for the MCP response but the process panic hook can still emit its raw payload to stderr. The scorer boundary now installs a process-wide delegating hook and enables payload redaction only while polling scorer futures. Other panics still use the prior hook. Focused panic regressions verify the redacted hook runs before Tokio returns the `JoinError`.
 
+CodeRabbit then found that the live-worktree regression and scorer-failure regression exercised adjacent paths rather than one end-to-end path. A task-local test injection now fails the scorer inside `flat_code_symbol_search_with_diagnostics`; both the service regression and the real handler path prove the live mapped graph survives, fallback honors `limit`, and the delivered diagnostic omits the injected private path.
+
 ### Risk retirement
 
 | Risk | Status | Tempting patch failed | Evidence |

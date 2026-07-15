@@ -373,6 +373,29 @@ where
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_EMBEDDING_SCORER_PANIC: String;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_embedding_scorer_panic<T>(
+    payload: String,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_EMBEDDING_SCORER_PANIC.scope(payload, future).await
+}
+
+#[cfg(test)]
+fn test_embedding_scorer_panic_payload() -> Option<String> {
+    TEST_EMBEDDING_SCORER_PANIC.try_with(Clone::clone).ok()
+}
+
+#[cfg(not(test))]
+fn test_embedding_scorer_panic_payload() -> Option<String> {
+    None
+}
+
 struct FlatCodeSymbolSearch<'a> {
     matches: Vec<&'a Node>,
     scorer_diagnostic: Option<EmbeddingScorerDiagnostic>,
@@ -717,7 +740,19 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     // the symbol name rather than a slash-delimited path string.
     let mut used_embed = false;
     let mut matches: Vec<&Node> = if !query_str.is_empty() {
-        if let Some(embed_idx) = ctx.embed_index {
+        if let Some(panic_payload) = test_embedding_scorer_panic_payload() {
+            let scorer = async move {
+                tokio::task::yield_now().await;
+                panic!("{panic_payload}");
+                #[allow(unreachable_code)]
+                Ok(SearchOutcome::NotReady)
+            };
+            match isolate_embedding_scorer(scorer, search_mode).await {
+                Err(diagnostic) => scorer_diagnostic = Some(diagnostic),
+                Ok(_) => unreachable!("injected scorer panic must degrade"),
+            }
+            Vec::new()
+        } else if let Some(embed_idx) = ctx.embed_index {
             // With scalar pre-filters active, fetch exactly rerank_over_fetch rows —
             // only matching rows are scored, so no over-fetch needed.
             // Without filters, keep the 3x over-fetch to allow for graph-side
@@ -2789,21 +2824,6 @@ mod tests {
         let gs = make_graph_state(nodes);
         let stable_ids_before: Vec<String> = gs.nodes.iter().map(Node::stable_id).collect();
 
-        let diagnostic = match isolate_embedding_scorer(
-            async {
-                panic!("simulated scorer failure after worktree map");
-                #[allow(unreachable_code)]
-                Ok(SearchOutcome::NotReady)
-            },
-            SearchMode::Hybrid,
-        )
-        .await
-        {
-            Err(diagnostic) => diagnostic,
-            Ok(_) => panic!("panicking scorer must degrade"),
-        };
-        assert_eq!(diagnostic.failure, "task_panic");
-
         let repo_root = PathBuf::from("/tmp/live-worktree-map");
         let ctx = make_search_context(&gs, &repo_root);
         let params = SearchParams {
@@ -2813,20 +2833,31 @@ mod tests {
             include_markdown: false,
             ..Default::default()
         };
-        let matches = flat_code_symbol_search(
-            "auth",
-            SearchMode::Hybrid,
-            2,
-            &params,
-            &gs,
-            &ctx,
-            false,
-            false,
+        let search = with_test_embedding_scorer_panic(
+            "auth src/private/customer.rs".to_string(),
+            flat_code_symbol_search_with_diagnostics(
+                "auth",
+                SearchMode::Hybrid,
+                2,
+                &params,
+                &gs,
+                &ctx,
+                false,
+                false,
+            ),
         )
         .await;
 
+        let diagnostic = search
+            .scorer_diagnostic
+            .expect("scorer panic should be delivered with fallback results")
+            .render();
+        assert!(diagnostic.contains("failure=task_panic"));
+        assert!(!diagnostic.contains("auth"));
+        assert!(!diagnostic.contains("customer.rs"));
+
         assert_eq!(
-            matches.len(),
+            search.matches.len(),
             2,
             "fallback must respect the requested limit"
         );

@@ -1156,10 +1156,17 @@ mod tests {
     async fn test_symbol_search_after_successful_live_worktree_map() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        let symbol = "mapped_worktree_symbol_probe";
+        let query = "mapped_worktree_symbol_probe";
+        let symbols = [
+            "mapped_worktree_symbol_probe_one",
+            "mapped_worktree_symbol_probe_two",
+        ];
         std::fs::write(
             repo.path().join("src/lib.rs"),
-            format!("pub fn {symbol}() -> &'static str {{ \"mapped\" }}\n"),
+            format!(
+                "pub fn {}() -> &'static str {{ \"mapped-one\" }}\npub fn {}() -> &'static str {{ \"mapped-two\" }}\n",
+                symbols[0], symbols[1]
+            ),
         )
         .unwrap();
 
@@ -1169,30 +1176,44 @@ mod tests {
             .await
             .expect("live worktree map should succeed");
         assert!(
-            graph.nodes.iter().any(|node| node.id.name == symbol),
-            "mapped graph should contain the probe symbol"
+            symbols
+                .iter()
+                .all(|symbol| graph.nodes.iter().any(|node| node.id.name == *symbol)),
+            "mapped graph should contain both probe symbols"
         );
         handler
             .graph
             .store(std::sync::Arc::new(Some(std::sync::Arc::new(graph))));
 
         let args: Search = serde_json::from_value(serde_json::json!({
-            "query": symbol,
+            "query": query,
             "repo": repo.path().to_string_lossy(),
             "include_markdown": false,
             "include_artifacts": false,
-            "search_mode": "keyword",
+            "search_mode": "hybrid",
+            "limit": 1,
             "compact": true,
             "verbose": false
         }))
         .unwrap();
-        let result = handler.handle_search(args).await.unwrap();
+        let result = crate::service::search::with_test_embedding_scorer_panic(
+            format!("{query} src/private/customer.rs"),
+            handler.handle_search(args),
+        )
+        .await
+        .unwrap();
         let rendered = serde_json::to_string(&result).unwrap();
 
+        let returned_symbols = symbols
+            .iter()
+            .filter(|symbol| rendered.contains(**symbol))
+            .count();
         assert!(
-            rendered.contains(symbol),
-            "symbol search should return a symbol from the successfully mapped worktree: {rendered}"
+            returned_symbols == 1,
+            "fallback should return exactly one mapped symbol at limit=1: {rendered}"
         );
+        assert!(rendered.contains("failure=task_panic"), "got: {rendered}");
+        assert!(!rendered.contains("customer.rs"), "got: {rendered}");
     }
 
     /// A path with just a slash followed by nothing is still absolute.
