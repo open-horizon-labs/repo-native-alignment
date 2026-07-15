@@ -1,3 +1,11 @@
+---
+issue: https://github.com/open-horizon-labs/repo-native-alignment/issues/733
+outcome: context-assembly
+phase: execute
+status: complete
+updated: 2026-07-15
+---
+
 # Issue 733 execution handoff
 
 ## Aim
@@ -6,11 +14,11 @@ Interrupted LSP work resumes from durable item state, preserving completed progr
 
 ## Problem
 
-#730 persists Pass 1 identity and state, but a later run still creates a fresh queue. Replaying the full repo wastes completed work; failing every non-terminal item throws away safe partial progress.
+Issue `#730` persists Pass 1 identity and state, but a later run still creates a fresh queue. Replaying the full repo wastes completed work; failing every non-terminal item throws away safe partial progress.
 
 ## Chosen solution
 
-Add recovery policy at the existing `LspWorkItemLedger::begin` seam. Match persisted items by stable node identity plus requested operations, carry terminal completed/skipped records forward without scheduling them, re-enqueue pending or stale in-flight records with an incremented attempt, and mark records exhausted once the bounded attempt policy is reached. Keep graph application idempotent through the existing edge identity/deduplication path.
+Add recovery policy at the existing `LspWorkItemLedger::begin` seam. Match persisted items by stable node identity, source-input fingerprint, and requested operations; carry terminal completed/skipped records forward without scheduling them; re-enqueue pending or stale in-flight records with an incremented attempt; and mark records exhausted once the bounded attempt policy is reached. Keep graph application idempotent through the existing edge identity/deduplication path.
 
 This extends the shared durable work-item control plane. It does not add leases, a second scheduler, or changed-file planning.
 
@@ -38,9 +46,11 @@ Start with `cargo check --lib`, focused interrupt/restart and rendering tests, a
 ## Focused verification
 
 - `cargo check --lib`
-- `cargo test --lib extract::lsp::work_items::tests::` (9 passed)
+- `cargo +1.97.0 test --lib extract::lsp::work_items::tests -- --nocapture` (13 passed)
+- `cargo +1.97.0 test --lib extract::lsp::passes::tests -- --nocapture` (6 passed)
 - `cargo test --lib interrupt_restart_executor_fixture_invokes_only_retryable_items_once` (1 passed)
 - `cargo test --lib exhausted_recovery_fails_pass1_closed_without_invocation` (1 passed)
+- `cargo test --lib changed_node_input_replays_instead_of_carrying_stale_output` (1 passed)
 - `cargo test` after rebasing onto `issue/730` (1934 library tests passed, 2 ignored; CLI contract passed; doc tests passed/ignored as declared)
 - `git diff --check`
 

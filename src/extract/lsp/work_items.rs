@@ -189,8 +189,7 @@ pub(crate) struct LspWorkItemLedger {
     last_flush: Mutex<Instant>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     runnable_item_ids: BTreeSet<usize>,
-    recovered_edges: Vec<Edge>,
-    recovered_nodes: Vec<Node>,
+    recovered_output: Mutex<(Vec<Edge>, Vec<Node>)>,
 }
 
 struct WorkItemFileLock {
@@ -270,6 +269,10 @@ impl LspWorkItemLedger {
             return Self::begin_with_job_id(repo_root, new_job_id(), seeds).await;
         };
         let now = unix_millis();
+        let current_item_keys = seeds
+            .iter()
+            .map(|seed| (seed.node.stable_id(), seed.requested_operations.clone()))
+            .collect::<BTreeSet<_>>();
         let mut prior_by_key = prior_records
             .into_iter()
             .map(|record| {
@@ -379,7 +382,11 @@ impl LspWorkItemLedger {
                 .insert(record_key(&job_id, seed.item_id), record);
         }
 
-        for (next_item_id, (_, mut record)) in (seeds.len()..).zip(prior_by_key) {
+        let remaining_records = prior_by_key.into_values().filter(|record| {
+            !current_item_keys
+                .contains(&(record.node_id.clone(), record.requested_operations.clone()))
+        });
+        for (next_item_id, mut record) in (seeds.len()..).zip(remaining_records) {
             record.schema_version = STORE_SCHEMA_VERSION;
             record.item_id = next_item_id;
             record.state = LspWorkItemState::Skipped;
@@ -405,8 +412,7 @@ impl LspWorkItemLedger {
             last_flush: Mutex::new(Instant::now()),
             persist_lock: store_lock(repo_root)?,
             runnable_item_ids,
-            recovered_edges,
-            recovered_nodes,
+            recovered_output: Mutex::new((recovered_edges, recovered_nodes)),
         });
         ledger.flush().await?;
         Ok(ledger)
@@ -433,8 +439,7 @@ impl LspWorkItemLedger {
             last_flush: Mutex::new(Instant::now()),
             persist_lock: store_lock(repo_root)?,
             runnable_item_ids: seeds.iter().map(|seed| seed.item_id).collect(),
-            recovered_edges: Vec::new(),
-            recovered_nodes: Vec::new(),
+            recovered_output: Mutex::new((Vec::new(), Vec::new())),
         });
         ledger.flush().await?;
         Ok(ledger)
@@ -444,8 +449,21 @@ impl LspWorkItemLedger {
         self.runnable_item_ids.contains(&item_id)
     }
 
+    pub(crate) fn attempt_count(&self, item_id: usize) -> Option<u32> {
+        self.store
+            .lock()
+            .unwrap()
+            .records
+            .get(&record_key(&self.job_id, item_id))
+            .map(|record| record.attempt_count)
+    }
+
     pub(crate) fn recovered_output(&self) -> (Vec<Edge>, Vec<Node>) {
-        (self.recovered_edges.clone(), self.recovered_nodes.clone())
+        let mut recovered = self.recovered_output.lock().unwrap();
+        (
+            std::mem::take(&mut recovered.0),
+            std::mem::take(&mut recovered.1),
+        )
     }
 
     pub(crate) fn exhausted_count(&self) -> usize {
@@ -1320,6 +1338,8 @@ mod tests {
         assert!(resumed.should_run(0));
         assert!(resumed.should_run(1));
         assert!(resumed.recovered_output().0.is_empty());
+        let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
+        assert_eq!(snapshot.total, changed.len());
     }
 
     #[tokio::test]

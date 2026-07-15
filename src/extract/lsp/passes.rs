@@ -188,8 +188,69 @@ fn runnable_pass1_work_items(
 ) -> Vec<LspPass1WorkItem> {
     work_items
         .into_iter()
-        .filter(|item| ledger.should_run(item.id))
+        .filter_map(|mut item| {
+            if !ledger.should_run(item.id) {
+                return None;
+            }
+            if let Some(attempt_count) = ledger.attempt_count(item.id) {
+                item.attempt_count = attempt_count;
+            }
+            Some(item)
+        })
         .collect()
+}
+
+fn spawn_pass1_workers<Executor, Execution>(
+    work_items: Vec<LspPass1WorkItem>,
+    ledger: &Arc<LspWorkItemLedger>,
+    max_concurrency: usize,
+    executor: Executor,
+) -> (
+    usize,
+    Arc<LspPass1Diagnostics>,
+    tokio::task::JoinSet<()>,
+    tokio::sync::mpsc::Receiver<Pass1TaskResult>,
+)
+where
+    Executor: Fn(LspPass1WorkItem, Arc<LspPass1Diagnostics>) -> Execution + Send + Sync + 'static,
+    Execution: std::future::Future<Output = Pass1TaskResult> + Send + 'static,
+{
+    let work_items = Arc::new(runnable_pass1_work_items(work_items, ledger));
+    let total_nodes = work_items.len();
+    let channel_capacity = max_concurrency.max(1);
+    let worker_count = total_nodes.clamp(1, channel_capacity);
+    let diagnostics = Arc::new(LspPass1Diagnostics::with_ledger(
+        total_nodes,
+        Some(Arc::clone(ledger)),
+    ));
+    let next_work_index = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(executor);
+    let (result_tx, result_rx) = tokio::sync::mpsc::channel::<Pass1TaskResult>(channel_capacity);
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for _ in 0..worker_count {
+        let diagnostics = Arc::clone(&diagnostics);
+        let work_items = Arc::clone(&work_items);
+        let next_work_index = Arc::clone(&next_work_index);
+        let executor = Arc::clone(&executor);
+        let result_tx = result_tx.clone();
+
+        join_set.spawn(async move {
+            loop {
+                let index = next_work_index.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = work_items.get(index).cloned() else {
+                    break;
+                };
+                let result = executor(item, Arc::clone(&diagnostics)).await;
+                if result_tx.send(result).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(result_tx);
+
+    (total_nodes, diagnostics, join_set, result_rx)
 }
 
 fn recovery_failure_state(ledger: &LspWorkItemLedger) -> (u32, bool, Option<String>) {
@@ -695,44 +756,30 @@ impl LspEnricher {
             &mut seen_virtual_ids,
             recovered_nodes,
         );
+        let pass1_edge_baseline = result.added_edges.len();
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
-        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
-        let total_nodes = work_items.len();
-        let worker_count = total_nodes.clamp(1, PIPELINE_MAX_CONCURRENCY);
-        let diagnostics = Arc::new(LspPass1Diagnostics::with_ledger(
-            total_nodes,
-            Some(Arc::clone(&work_item_ledger)),
-        ));
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
-        let mut join_set = tokio::task::JoinSet::new();
-        let work_items = Arc::new(work_items);
-        let next_work_index = Arc::new(AtomicUsize::new(0));
-        let (result_tx, mut result_rx) =
-            tokio::sync::mpsc::channel::<Pass1TaskResult>(PIPELINE_MAX_CONCURRENCY);
-
-        for _ in 0..worker_count {
-            let transport = Arc::clone(transport);
-            let root = root.to_path_buf();
-            let matching_owned = Arc::clone(matching_nodes_owned);
-            let refs_by_file = Arc::clone(refs_by_file_shared);
-            let language = language.clone();
-            let error_count = Arc::clone(&error_count);
-            let did_open = Arc::clone(&did_open);
-            let diagnostics = Arc::clone(&diagnostics);
-            let work_items = Arc::clone(&work_items);
-            let next_work_index = Arc::clone(&next_work_index);
-            let result_tx = result_tx.clone();
-
-            join_set.spawn(async move {
-                loop {
-                    let index = next_work_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = work_items.get(index) else {
-                        break;
-                    };
-                    let result = Self::run_pass1_work_item(
-                        item,
+        let transport = Arc::clone(transport);
+        let root = root.to_path_buf();
+        let matching_owned = Arc::clone(matching_nodes_owned);
+        let refs_by_file = Arc::clone(refs_by_file_shared);
+        let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
+            work_items,
+            &work_item_ledger,
+            PIPELINE_MAX_CONCURRENCY,
+            move |item, diagnostics| {
+                let transport = Arc::clone(&transport);
+                let root = root.clone();
+                let matching_owned = Arc::clone(&matching_owned);
+                let refs_by_file = Arc::clone(&refs_by_file);
+                let language = language.clone();
+                let error_count = Arc::clone(&error_count);
+                let did_open = Arc::clone(&did_open);
+                async move {
+                    Self::run_pass1_work_item(
+                        &item,
                         &transport,
                         &root,
                         &matching_owned,
@@ -744,14 +791,10 @@ impl LspEnricher {
                         &diagnostics,
                         &error_count,
                     )
-                    .await;
-                    if result_tx.send(result).await.is_err() {
-                        break;
-                    }
+                    .await
                 }
-            });
-        }
-        drop(result_tx);
+            },
+        );
 
         // Collect results from all queued work items. A no-progress watchdog emits
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
@@ -848,7 +891,7 @@ impl LspEnricher {
             // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
             // OR spent >= 2 minutes with 0 edges, the language server is likely
             // misconfigured.
-            if result.added_edges.is_empty()
+            if result.added_edges.len() == pass1_edge_baseline
                 && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD
                     && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                     || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
@@ -2045,13 +2088,31 @@ mod tests {
         initial.flush().await.unwrap();
 
         let resumed = LspWorkItemLedger::begin(repo.path(), &seeds).await.unwrap();
-        let scheduled = runnable_pass1_work_items(work_items, &resumed);
-        let mut invocations = [0usize; 2];
-        for item in scheduled {
-            invocations[item.id] += 1;
+        let invocations = Arc::new(std::sync::Mutex::new([(0usize, 0u32); 2]));
+        let (scheduled, _, mut workers, mut results) =
+            spawn_pass1_workers(work_items, &resumed, 2, {
+                let invocations = Arc::clone(&invocations);
+                move |item, _| {
+                    let invocations = Arc::clone(&invocations);
+                    async move {
+                        let mut invocations = invocations.lock().unwrap();
+                        invocations[item.id].0 += 1;
+                        invocations[item.id].1 = item.attempt_count;
+                        Pass1TaskResult {
+                            edges: Vec::new(),
+                            new_nodes: Vec::new(),
+                            had_error: false,
+                        }
+                    }
+                }
+            });
+        while results.recv().await.is_some() {}
+        while let Some(worker) = workers.join_next().await {
+            worker.unwrap();
         }
 
-        assert_eq!(invocations, [0, 1]);
+        assert_eq!(scheduled, 1);
+        assert_eq!(*invocations.lock().unwrap(), [(0, 0), (1, 2)]);
         let (edges, _) = resumed.recovered_output();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].stable_id(), recovered_edge.stable_id());
@@ -2104,7 +2165,29 @@ mod tests {
             attempt_count: 3,
         }];
 
-        assert!(runnable_pass1_work_items(work_items, &resumed).is_empty());
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let (scheduled, _, mut workers, mut results) =
+            spawn_pass1_workers(work_items, &resumed, 1, {
+                let invocations = Arc::clone(&invocations);
+                move |_, _| {
+                    let invocations = Arc::clone(&invocations);
+                    async move {
+                        invocations.fetch_add(1, Ordering::Relaxed);
+                        Pass1TaskResult {
+                            edges: Vec::new(),
+                            new_nodes: Vec::new(),
+                            had_error: false,
+                        }
+                    }
+                }
+            });
+        while results.recv().await.is_some() {}
+        while let Some(worker) = workers.join_next().await {
+            worker.unwrap();
+        }
+
+        assert_eq!(scheduled, 0);
+        assert_eq!(invocations.load(Ordering::Relaxed), 0);
         let (errors, aborted, diagnostic) = recovery_failure_state(&resumed);
         assert_eq!(errors, 1);
         assert!(aborted);
