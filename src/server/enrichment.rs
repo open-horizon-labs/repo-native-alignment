@@ -16,6 +16,7 @@ use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
+use super::changed_file_plan::discover_and_plan_changed_files;
 use super::enrichment_jobs::{
     EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
     ScanEnrichmentOptions,
@@ -26,7 +27,7 @@ use super::operation_report::{
     lsp_capability_from_status, scan_capability_reports,
 };
 use super::state::GraphState;
-use super::store::persist_graph_to_lance;
+use super::store::{persist_graph_incremental, persist_graph_to_lance};
 use super::{PipelineResult, RnaHandler};
 
 /// Check if a cached graph is missing enrichment passes output that should exist.
@@ -157,6 +158,14 @@ impl EnrichmentContinuation {
     }
 }
 
+fn should_continue_lsp_enrichment(
+    scope: &EnrichmentScope,
+    continuation: EnrichmentContinuation,
+) -> bool {
+    continuation.enabled()
+        && !matches!(scope, EnrichmentScope::Repo | EnrichmentScope::ChangedFiles)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LspBudget {
     pub max_duration: Duration,
@@ -178,6 +187,77 @@ impl LspBudget {
 struct LspEnrichmentRun {
     edge_count: usize,
     job_id: String,
+}
+
+#[derive(Debug)]
+struct ScopedLspPersistenceDelta {
+    upsert_nodes: Vec<Node>,
+    upsert_edges: Vec<Edge>,
+    deleted_edge_ids: Vec<String>,
+}
+
+fn is_scoped_lsp_edge(edge: &Edge, node_filter: &HashSet<String>) -> bool {
+    edge.source == crate::graph::ExtractionSource::Lsp
+        && (node_filter.contains(&edge.from.to_stable_id())
+            || node_filter.contains(&edge.to.to_stable_id()))
+}
+
+fn remove_existing_scoped_lsp_edges(
+    edges: &mut Vec<Edge>,
+    node_filter: &HashSet<String>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    edges.retain(|edge| {
+        if is_scoped_lsp_edge(edge, node_filter) {
+            removed.push(edge.stable_id());
+            false
+        } else {
+            true
+        }
+    });
+    removed.sort();
+    removed.dedup();
+    removed
+}
+
+fn scoped_lsp_persistence_delta(
+    enriched_nodes: &[Node],
+    enriched_edges: &[Edge],
+    node_filter: &HashSet<String>,
+    existing_node_ids: &HashSet<String>,
+    existing_edge_ids: &HashSet<String>,
+    deleted_edge_ids: Vec<String>,
+) -> ScopedLspPersistenceDelta {
+    let mut upsert_edges = enriched_edges
+        .iter()
+        .filter(|edge| {
+            is_scoped_lsp_edge(edge, node_filter) || !existing_edge_ids.contains(&edge.stable_id())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    upsert_edges.sort_by_key(Edge::stable_id);
+
+    let endpoint_ids = upsert_edges
+        .iter()
+        .flat_map(|edge| [edge.from.to_stable_id(), edge.to.to_stable_id()])
+        .collect::<HashSet<_>>();
+    let mut upsert_nodes = enriched_nodes
+        .iter()
+        .filter(|node| {
+            let stable_id = node.stable_id();
+            !existing_node_ids.contains(&stable_id)
+                || (node.source == crate::graph::ExtractionSource::Lsp
+                    && endpoint_ids.contains(&stable_id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    upsert_nodes.sort_by_key(Node::stable_id);
+
+    ScopedLspPersistenceDelta {
+        upsert_nodes,
+        upsert_edges,
+        deleted_edge_ids,
+    }
 }
 
 #[derive(Debug)]
@@ -214,6 +294,7 @@ struct LspPipelineInput {
     scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
     skip_lsp: bool,
     dirty_slugs: Option<HashSet<String>>,
+    lsp_node_filter: Option<Arc<HashSet<String>>>,
 }
 
 async fn emit_lsp_pipeline_with_budget(
@@ -230,6 +311,7 @@ async fn emit_lsp_pipeline_with_budget(
             embed_idx: None,
             lance_repo_root: None,
             skip_lsp: input.skip_lsp,
+            lsp_node_filter: input.lsp_node_filter,
         },
         input.dirty_slugs,
     );
@@ -430,6 +512,7 @@ impl RnaHandler {
                 scan_stats: Arc::clone(&scan_stats),
                 skip_lsp: false,
                 dirty_slugs: Some(dirty_slugs),
+                lsp_node_filter: None,
             })
             .await;
 
@@ -869,6 +952,7 @@ impl RnaHandler {
                 scan_stats: bg_scan_stats,
                 skip_lsp: false,
                 dirty_slugs: None,
+                lsp_node_filter: None,
             })
             .await;
 
@@ -1180,6 +1264,7 @@ impl RnaHandler {
                         EnrichmentScope::Repo,
                         EnrichmentTrigger::ForegroundScan,
                         None,
+                        None,
                         true,
                     )
                     .await?;
@@ -1364,6 +1449,7 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: !enrichment.runs_lsp(),
             dirty_slugs,
+            lsp_node_filter: None,
         })
         .await;
         let bus_time = t2.elapsed();
@@ -1749,6 +1835,7 @@ impl RnaHandler {
                 scan_stats: Arc::clone(&self.scan_stats),
                 skip_lsp: !run_lsp_in_bus,
                 dirty_slugs: None,
+                lsp_node_filter: None,
             })
             .await;
             let elapsed = t2.elapsed();
@@ -2044,17 +2131,42 @@ impl RnaHandler {
         scope: EnrichmentScope,
         trigger: EnrichmentTrigger,
         dirty_slugs: Option<HashSet<String>>,
+        lsp_node_filter: Option<Arc<HashSet<String>>>,
         fail_on_lsp_error: bool,
     ) -> anyhow::Result<LspEnrichmentRun>
     where
         F: Fn(&str) + Send + Sync,
     {
-        let (all_nodes, all_edges) = {
+        let (all_nodes, mut all_edges) = {
             let snap = self.graph.load_full();
             let gs = snap.as_ref().as_ref().unwrap();
             (gs.nodes.clone(), gs.edges.clone())
         };
+        let existing_node_ids = lsp_node_filter
+            .as_ref()
+            .map(|_| {
+                all_nodes
+                    .iter()
+                    .map(Node::stable_id)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let existing_edge_ids = lsp_node_filter
+            .as_ref()
+            .map(|_| {
+                all_edges
+                    .iter()
+                    .map(Edge::stable_id)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let removed_scoped_lsp_edge_ids = lsp_node_filter
+            .as_deref()
+            .map(|node_filter| remove_existing_scoped_lsp_edges(&mut all_edges, node_filter))
+            .unwrap_or_default();
+        let persistence_node_filter = lsp_node_filter.clone();
         let repo_wide_lsp = dirty_slugs.is_none();
+        let scope_detail = scope.stable_key();
 
         let server_name = self.lsp_status.server_name();
         if let Some(ref name) = server_name {
@@ -2109,6 +2221,7 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: false,
             dirty_slugs,
+            lsp_node_filter,
         })
         .await;
 
@@ -2125,13 +2238,34 @@ impl RnaHandler {
                     enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
 
-                let lsp_edge_count = enriched_edges
-                    .iter()
-                    .filter(|e| {
-                        e.source == crate::graph::ExtractionSource::Lsp
-                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                let scoped_delta = persistence_node_filter.as_deref().map(|node_filter| {
+                    scoped_lsp_persistence_delta(
+                        &enriched_nodes,
+                        &enriched_edges,
+                        node_filter,
+                        &existing_node_ids,
+                        &existing_edge_ids,
+                        removed_scoped_lsp_edge_ids,
+                    )
+                });
+                let lsp_edge_count = scoped_delta
+                    .as_ref()
+                    .map(|delta| {
+                        delta
+                            .upsert_edges
+                            .iter()
+                            .filter(|edge| matches!(edge.kind, crate::graph::EdgeKind::Calls))
+                            .count()
                     })
-                    .count();
+                    .unwrap_or_else(|| {
+                        enriched_edges
+                            .iter()
+                            .filter(|edge| {
+                                edge.source == crate::graph::ExtractionSource::Lsp
+                                    && matches!(edge.kind, crate::graph::EdgeKind::Calls)
+                            })
+                            .count()
+                    });
 
                 let lsp_abort_detail = {
                     let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
@@ -2181,8 +2315,11 @@ impl RnaHandler {
                     self.lsp_status.set_complete(lsp_edge_count);
                 } else {
                     let existing_coverage = self.lsp_status.coverage_edge_count();
-                    self.lsp_status
-                        .set_complete_with_coverage(lsp_edge_count, existing_coverage);
+                    self.lsp_status.set_complete_scoped(
+                        lsp_edge_count,
+                        existing_coverage,
+                        scope_detail,
+                    );
                 }
 
                 self.enrichment_jobs.mark_progress(
@@ -2192,16 +2329,51 @@ impl RnaHandler {
                     lsp_edge_count,
                     None,
                 );
-                // Persist with enriched edges.
+                let (mut persisted_node_count, mut persisted_edge_count) = scoped_delta
+                    .as_ref()
+                    .map(|delta| (delta.upsert_nodes.len(), delta.upsert_edges.len()))
+                    .unwrap_or((enriched_nodes.len(), enriched_edges.len()));
                 self.enrichment_jobs.mark_persisting(
                     &self.repo_root,
                     &job_id,
-                    enriched_nodes.len(),
-                    enriched_edges.len(),
+                    persisted_node_count,
+                    persisted_edge_count,
                 );
-                if let Err(e) =
+                let persist_result = if let Some(delta) = scoped_delta.as_ref() {
+                    match persist_graph_incremental(
+                        &self.repo_root,
+                        &delta.upsert_nodes,
+                        &delta.upsert_edges,
+                        &delta.deleted_edge_ids,
+                        &[],
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            // Schema migration drops the old tables, so the incremental seam
+                            // explicitly requires a one-time full reconstruction.
+                            persisted_node_count = enriched_nodes.len();
+                            persisted_edge_count = enriched_edges.len();
+                            self.enrichment_jobs.mark_persisting(
+                                &self.repo_root,
+                                &job_id,
+                                persisted_node_count,
+                                persisted_edge_count,
+                            );
+                            persist_graph_to_lance(
+                                &self.repo_root,
+                                &enriched_nodes,
+                                &enriched_edges,
+                            )
+                            .await
+                        }
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                } else {
                     persist_graph_to_lance(&self.repo_root, &enriched_nodes, &enriched_edges).await
-                {
+                };
+                if let Err(e) = persist_result {
                     tracing::error!("Foreground LSP persist failed: {}", e);
                     self.enrichment_jobs
                         .mark_failed(&self.repo_root, &job_id, format!("{}", e));
@@ -2219,8 +2391,8 @@ impl RnaHandler {
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
                     &job_id,
-                    enriched_nodes.len(),
-                    enriched_edges.len(),
+                    persisted_node_count,
+                    persisted_edge_count,
                 );
 
                 Ok(LspEnrichmentRun {
@@ -2289,11 +2461,17 @@ impl RnaHandler {
                 );
             }
             EnrichmentCapability::CallReferences => {
-                if matches!(scope, EnrichmentScope::ChangedFiles) {
-                    anyhow::bail!(
-                        "changed-file call-reference enrichment is not supported by the LSP executor yet; use `--scope root --root <slug>` or `--scope repo`"
-                    );
-                }
+                let lsp_node_filter = if matches!(scope, EnrichmentScope::ChangedFiles) {
+                    let root_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+                    let plan =
+                        discover_and_plan_changed_files(&self.repo_root, &root_slug, &all_nodes)?;
+                    for line in plan.render_progress() {
+                        on_progress(&line);
+                    }
+                    Some(plan.planned_node_ids())
+                } else {
+                    None
+                };
                 let dirty_slugs = self.dirty_slugs_for_scope(&scope);
                 let run = self
                     .run_foreground_lsp_and_persist(
@@ -2301,6 +2479,7 @@ impl RnaHandler {
                         scope.clone(),
                         EnrichmentTrigger::Explicit,
                         dirty_slugs,
+                        lsp_node_filter,
                         true,
                     )
                     .await?;
@@ -2309,7 +2488,7 @@ impl RnaHandler {
                     "LSP explicit enrichment complete: {} call/reference edges",
                     run.edge_count
                 ));
-                if continuation.enabled() && !matches!(scope, EnrichmentScope::Repo) {
+                if should_continue_lsp_enrichment(&scope, continuation) {
                     match continuation {
                         EnrichmentContinuation::Disabled => {}
                         EnrichmentContinuation::SpawnBackground => {
@@ -2336,6 +2515,7 @@ impl RnaHandler {
                                     &on_progress,
                                     EnrichmentScope::Repo,
                                     EnrichmentTrigger::Explicit,
+                                    None,
                                     None,
                                     true,
                                 )
@@ -2600,7 +2780,7 @@ impl RnaHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{ExtractionSource, NodeId, NodeKind};
+    use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -2650,6 +2830,116 @@ mod tests {
                 .unwrap()
                 .saturating_sub(report.started_at),
             duration.as_secs()
+        );
+    }
+
+    #[test]
+    fn changed_file_scope_never_continues_to_repo_work() {
+        assert!(!should_continue_lsp_enrichment(
+            &EnrichmentScope::ChangedFiles,
+            EnrichmentContinuation::SpawnBackground,
+        ));
+        assert!(!should_continue_lsp_enrichment(
+            &EnrichmentScope::ChangedFiles,
+            EnrichmentContinuation::RunToCompletion,
+        ));
+        assert!(should_continue_lsp_enrichment(
+            &EnrichmentScope::Root("fixture".to_string()),
+            EnrichmentContinuation::RunToCompletion,
+        ));
+    }
+
+    #[test]
+    fn scoped_lsp_persistence_replaces_only_planned_edges() {
+        let planned = make_node("planned", NodeKind::Function);
+        let unrelated = make_node("unrelated", NodeKind::Function);
+        let mut old_target = make_node("old_target", NodeKind::Function);
+        old_target.id.root = "external".to_string();
+        old_target.source = ExtractionSource::Lsp;
+        let mut new_target = make_node("new_target", NodeKind::Function);
+        new_target.id.root = "external".to_string();
+        new_target.source = ExtractionSource::Lsp;
+        let new_non_lsp_node = make_node("framework", NodeKind::Other("framework".to_string()));
+
+        let stale_scoped_edge = Edge {
+            from: planned.id.clone(),
+            to: old_target.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+        let unrelated_edge = Edge {
+            from: unrelated.id.clone(),
+            to: old_target.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+        let fresh_scoped_edge = Edge {
+            from: planned.id.clone(),
+            to: new_target.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+        let new_non_lsp_edge = Edge {
+            from: new_non_lsp_node.id.clone(),
+            to: planned.id.clone(),
+            kind: EdgeKind::DependsOn,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        };
+        let node_filter = HashSet::from([planned.stable_id()]);
+        let mut cached_edges = vec![stale_scoped_edge.clone(), unrelated_edge.clone()];
+        let existing_node_ids = [&planned, &unrelated, &old_target]
+            .into_iter()
+            .map(|node| node.stable_id())
+            .collect::<HashSet<_>>();
+        let existing_edge_ids = cached_edges
+            .iter()
+            .map(Edge::stable_id)
+            .collect::<HashSet<_>>();
+
+        let deleted_edge_ids = remove_existing_scoped_lsp_edges(&mut cached_edges, &node_filter);
+        assert_eq!(cached_edges.len(), 1);
+        assert_eq!(cached_edges[0].stable_id(), unrelated_edge.stable_id());
+
+        let delta = scoped_lsp_persistence_delta(
+            &[
+                planned,
+                unrelated,
+                old_target,
+                new_target.clone(),
+                new_non_lsp_node.clone(),
+            ],
+            &[
+                unrelated_edge,
+                fresh_scoped_edge.clone(),
+                new_non_lsp_edge.clone(),
+            ],
+            &node_filter,
+            &existing_node_ids,
+            &existing_edge_ids,
+            deleted_edge_ids,
+        );
+        assert_eq!(delta.deleted_edge_ids, vec![stale_scoped_edge.stable_id()]);
+        let upsert_edge_ids = delta
+            .upsert_edges
+            .iter()
+            .map(Edge::stable_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            upsert_edge_ids,
+            HashSet::from([fresh_scoped_edge.stable_id(), new_non_lsp_edge.stable_id(),])
+        );
+        let upsert_node_ids = delta
+            .upsert_nodes
+            .iter()
+            .map(Node::stable_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            upsert_node_ids,
+            HashSet::from([new_target.stable_id(), new_non_lsp_node.stable_id()])
         );
     }
 

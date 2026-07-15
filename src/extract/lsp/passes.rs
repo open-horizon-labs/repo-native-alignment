@@ -510,7 +510,7 @@ fn language_id_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn requested_operations_for_node(
+pub(crate) fn requested_operations_for_node(
     kind: &NodeKind,
     has_references: bool,
     has_call_hierarchy: bool,

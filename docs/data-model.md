@@ -495,6 +495,8 @@ Scan and enrichment operations produce durable `OperationReport` records through
 
 `src/server/enrichment_jobs.rs` supplies the scoped enrichment control-plane primitives: LSP and embedding run/skip options, capabilities, scopes (`repo`, `root`, `changed_files`, `explicit`), triggers, job states, and a restart-visible job ledger. It is intentionally a ledger/control plane, not a worker scheduler.
 
+Changed-file call/reference enrichment plans the git `HEAD` → current-worktree state before a job is opened. The plan maps present changed paths to a bounded stable-node-ID and LSP-operation set, records rename/delete/unmapped diagnostics, and filters only LSP scheduling. The complete cached graph still flows through post-passes and in-memory finalization, while LanceDB persistence replaces the scoped LSP delta, includes newly emitted output from other invoked enrichment consumers, and leaves unrelated rows untouched. Changed/root completion is scoped coverage and cannot satisfy repo-wide dead-code readiness.
+
 ---
 
 ## 7. Content-Addressed Consumer Cache
