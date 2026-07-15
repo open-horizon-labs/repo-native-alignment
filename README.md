@@ -41,6 +41,8 @@ search(query="ConnectionPool", mode="impact", max_hops=3)
 
 RNA runs LSP servers internally. It fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a cross-language graph — so the agent gets the LSP depth without doing the LSP orchestration.
 
+For Rust, exact search and graph traversal also expose struct-literal construction sites. A struct query returns both its declaration and local initializers, while `impact` traces the explicit `Constructs` relationships without requiring LSP or embeddings.
+
 ## What Changes After Installing
 
 Six jobs agents can do after RNA is running that they could not do reliably before:
