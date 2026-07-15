@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 
@@ -38,6 +39,87 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
 
 const MAX_SOURCE_SPAN_LINES: u32 = 200;
+const MAX_SOURCE_SPAN_BYTES: usize = 64 * 1024;
+
+fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<String>, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("cannot read file: {error}"))?;
+    let mut buffer = [0_u8; 8192];
+    let mut selected = Vec::<Vec<u8>>::new();
+    let mut current = Vec::new();
+    let mut selected_bytes = 0_usize;
+    let mut line_number = 1_u32;
+    let mut saw_any = false;
+    let mut last_was_newline = false;
+    let mut completed = false;
+
+    'read: loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read file: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        for &byte in &buffer[..count] {
+            saw_any = true;
+            last_was_newline = byte == b'\n';
+            if byte == 0 {
+                return Err("binary (contains NUL bytes)".to_string());
+            }
+            if (start..=end).contains(&line_number) && byte != b'\n' {
+                selected_bytes += 1;
+                if selected_bytes > MAX_SOURCE_SPAN_BYTES {
+                    return Err(format!(
+                        "requested source text exceeds the hard maximum of {MAX_SOURCE_SPAN_BYTES} bytes"
+                    ));
+                }
+                current.push(byte);
+            }
+            if byte == b'\n' {
+                if (start..=end).contains(&line_number) {
+                    if current.last() == Some(&b'\r') {
+                        current.pop();
+                    }
+                    selected.push(std::mem::take(&mut current));
+                }
+                if line_number == end {
+                    completed = true;
+                    break 'read;
+                }
+                line_number = line_number.saturating_add(1);
+            }
+        }
+    }
+
+    let available_lines = if completed {
+        end
+    } else if !saw_any {
+        0
+    } else if last_was_newline {
+        line_number.saturating_sub(1)
+    } else {
+        if (start..=end).contains(&line_number) {
+            if current.last() == Some(&b'\r') {
+                current.pop();
+            }
+            selected.push(current);
+        }
+        line_number
+    };
+    if start > available_lines {
+        return Err(format!(
+            "line {start} is out of range (file has {available_lines} lines)"
+        ));
+    }
+    if end > available_lines {
+        return Err(format!(
+            "end line {end} is out of range (file has {available_lines} lines)"
+        ));
+    }
+    selected
+        .into_iter()
+        .map(|line| String::from_utf8(line).map_err(|_| "binary or is not valid UTF-8".to_string()))
+        .collect()
+}
 
 fn compiler_location(file: &Option<String>) -> Option<(String, u32)> {
     let value = file.as_deref()?;
@@ -215,43 +297,25 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     if !metadata.is_file() {
         return format!("Source path `{file}` is not a regular file.");
     }
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => return format!("Cannot read source file `{}`: {error}.", path.display()),
+    let lines = match read_bounded_source_lines(&path, start, end) {
+        Ok(lines) => lines,
+        Err(error) => return format!("Cannot read source file `{file}`: {error}."),
     };
-    if bytes.contains(&0) {
-        return format!("Source file `{file}` is binary (contains NUL bytes).");
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return format!("Source file `{file}` is binary or is not valid UTF-8."),
-    };
-    let lines: Vec<_> = text.lines().collect();
-    if start as usize > lines.len() {
-        return format!(
-            "Source line {start} is out of range for `{file}` (file has {} lines).",
-            lines.len()
-        );
-    }
-    if end as usize > lines.len() {
-        return format!(
-            "Source end line {end} is out of range for `{file}` (file has {} lines).",
-            lines.len()
-        );
-    }
-    let numbered = (start..=end)
-        .map(|number| format!("{number:>6} | {}", lines[number as usize - 1]))
+    let numbered = lines
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>6} | {line}", start as usize + offset))
         .collect::<Vec<_>>()
         .join("\n");
     let relative = path.strip_prefix(&root).unwrap_or(&path);
-    let longest_backtick_run = text
+    let longest_backtick_run = numbered
         .split(|character| character != '`')
         .map(str::len)
         .max()
         .unwrap_or(0);
     let fence = "`".repeat(longest_backtick_run.saturating_add(1).max(3));
     format!(
-        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines per request\n\n{fence}text\n{numbered}\n{fence}",
+        "## Source span\n\n- **Root:** `{slug}` (`{}`)\n- **File:** `{}`\n- **Lines:** {start}-{end}\n- **Provenance:** current filesystem state (may differ from the last indexed snapshot)\n- **Bound:** at most {MAX_SOURCE_SPAN_LINES} lines and {MAX_SOURCE_SPAN_BYTES} source bytes per request\n\n{fence}text\n{numbered}\n{fence}",
         root.display(),
         relative.display()
     )
@@ -2525,6 +2589,11 @@ mod tests {
     #[tokio::test]
     async fn source_span_rejects_traversal_and_range_overflow() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.rs"),
+            vec![b'x'; MAX_SOURCE_SPAN_BYTES + 1],
+        )
+        .unwrap();
         let graph = make_graph_state(vec![]);
         let ctx = make_search_context(&graph, tmp.path());
         let traversal = SearchParams {
@@ -2555,6 +2624,16 @@ mod tests {
             search(&overflow_probe, &ctx)
                 .await
                 .contains("hard maximum is 200")
+        );
+        let huge_line = SearchParams {
+            file: Some("huge.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            search(&huge_line, &ctx)
+                .await
+                .contains("hard maximum of 65536 bytes")
         );
     }
 

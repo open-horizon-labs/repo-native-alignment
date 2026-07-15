@@ -48,7 +48,7 @@ Six jobs agents can do after RNA is running that they could not do reliably befo
 **Find code by meaning, not just by name**
 `search("payment processing")` returns ranked results across symbols, docs, commits, and artifacts in one call. Path scoping works too: `search("auth/handlers/validate")` returns only symbols named `validate` in files matching `auth/handlers`.
 
-When a compiler or test runner already provides a location, `search(file="src/service.rs", line=120, end_line=130)` returns that exact, numbered span from the current filesystem. Compiler-style locations such as `search(file="src/service.rs:120:7")` work too. Source spans are root-scoped, reject ambiguous or escaping paths, and are capped at 200 lines per request.
+When a compiler or test runner already provides a location, `search(file="src/service.rs", line=120, end_line=130)` returns that exact, numbered span from the current filesystem. Compiler-style locations such as `search(file="src/service.rs:120:7")` work too. Source spans are root-scoped, reject ambiguous or escaping paths, and are capped at 200 lines and 64 KiB of source text per request.
 
 **Trace call paths and blast radius**
 `search(node="AuthHandler", mode="impact")` returns transitive dependents grouped by subsystem. `search(node="X", mode="path", query="Y")` returns the directed call chain between two nodes.
