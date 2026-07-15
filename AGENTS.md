@@ -4,6 +4,8 @@
 
 **The sequence:** aim → problem-space → problem-statement → solution-space → **draft PR** → execute → ship
 
+**Repo-local skills:** The canonical workflow skills for this project live in `.agents/skills/`. Agents must prefer these repo-local versions over similarly named global skills so the workflow travels with the repository.
+
 **Where to start (triggers):**
 - Can't explain why you're building this → `/aim`
 - Keep hitting the same blockers → `/problem-space`
@@ -33,6 +35,8 @@ This ensures every piece of work has a PR home before implementation begins. No 
 Summary: review → dissent → fix → **mark ready** → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
 
 Step 3b (mark ready) converts the draft PR to ready-for-review, which triggers smoke tests and CodeRabbit review in CI. Both are gated behind `draft == false` so they skip during the draft phase when code is still being iterated on.
+
+Every PR that changes code must explicitly trigger CodeRabbit review and receive a clean/approved CodeRabbit verdict before merge. A skipped draft review, a pending review, or a green status without an actual CodeRabbit review is not sufficient.
 
 No step is optional. "Merge when green" is not ship. Steps answer different questions — don't collapse them:
 - Review/dissent: "Is the code correct?"
@@ -88,12 +92,19 @@ This project IS the RNA MCP server. When working here, use its own tools.
 # Project Context
 
 ## Purpose
-Local context discovery and alignment tool for coding agents. Makes the fractal, local knowledge in a codebase — the stuff not in training data — discoverable and queryable. If an agent can't find something through RNA, RNA is broken.
+
+Help coding agents understand a repository without wasting context and time on repeated grep, sed, and file-reading loops.
+
+RNA compiles the fractal, repo-local knowledge absent from model training data—including code structure, relationships, business artifacts, outcomes, and domain context—into a discoverable graph. If relevant repository knowledge exists but an agent cannot find or navigate it through RNA, RNA is broken.
 
 ## Current Aims
-- **context-assembly** (active): Agents discover and navigate code, business artifacts, and structural relationships through RNA — no grep fallback needed. If something exists and RNA can't find it, that's a bug.
+
+- **context-assembly** (active): Agents discover and navigate code, business artifacts, and structural relationships through RNA without grep/read fallback. Search, traversal, and enrichment must deliver enough context for agents to understand before acting.
+- **domain-context-compiler** (active): Repositories can declare domain-specific entities and relationships from structured files, allowing agents to understand system meaning beyond programming-language structure.
+- **codebase-to-warehouse-pipeline** (active): Repo-local knowledge is extracted, enriched, persisted, and delivered through a dependable pipeline rather than assembled repeatedly through ad hoc file reads.
+- **subsystem-detection** (active): Agents receive a useful architectural map of unfamiliar repositories, including coherent subsystems, interfaces, entry points, and hotspots.
 - **agent-alignment** (maintenance): Work stays connected to declared outcomes. Architecture settled, feedback loop exists. Remaining work: bug fixes, tool cleanup, adoption.
-- **human-led-curation** (proposed): LLM-assisted corpus curation. Deferred until manual /distill sessions prove insufficient.
+- **human-led-curation** (proposed): LLMs surface candidates for corpus improvement, while humans decide what to promote, compact, or dismiss. Deferred until manual `/distill` sessions prove insufficient.
 
 ## Key Constraints
 
@@ -106,6 +117,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
 - **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
 - **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use the successful GitHub Actions artifact for the target commit, not a local cargo install from source. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
+- **coderabbit-approval-for-code-prs**: Every code-changing PR must receive an explicit clean/approved CodeRabbit review before merge. [Details](.oh/guardrails/coderabbit-approval-for-code-prs.md)
 
 ### Soft guardrails
 - **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)

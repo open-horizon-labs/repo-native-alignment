@@ -1,0 +1,286 @@
+---
+name: oh-merge
+description: Review and merge open PRs for GitHub issues as a cohesive batch
+---
+
+# oh-merge
+
+Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge them as a cohesive batch.
+
+## Invocation
+
+`/oh-merge`
+
+## Flow
+
+1. Load project background from `AGENTS.md`, relevant `.oh/` artifacts, and RNA MCP context when available.
+
+2. Find all PRs with `oh-merge` label:
+
+   ```bash
+   gh pr list --label oh-merge --json number,title,headRefName,baseRefName,additions,deletions
+   ```
+
+   **Only PRs with the `oh-merge` label are eligible for merge.**
+
+   **IMPORTANT:** PRs with merge conflicts ARE eligible. The skill rebases and resolves conflicts in step 6. Do NOT skip PRs because of conflict status - that's exactly what this skill handles.
+
+3. **Build dependency graph and identify stacks:**
+   - Create adjacency list: `baseRefName → [PRs targeting it]`
+   - Find root PRs: those where `baseRefName = main` (or master)
+   - Identify stacks: chains where child PRs target parent PR branches
+   - **Detect cycles**: If a branch eventually targets itself, report error and skip
+   - Example graph:
+
+     ```
+     main ← PR #42 (issue/123) ← PR #43 (issue/456)
+     main ← PR #44 (issue/789)  [separate stack]
+     ```
+
+4. **Select stack to process:**
+   - If multiple independent stacks exist, pick first by lowest root PR number (FIFO by age)
+   - If multiple PRs target the same base branch, order by PR number (lowest first)
+   - Report other stacks as "queued for next run"
+   - Process only one stack per invocation to keep merges atomic
+   - **Orphaned children**: If a child PR targets a branch that doesn't exist (parent merged externally), update its base to main and treat as a root
+
+5. **Batch review** - evaluate all PRs in the selected stack together:
+   - Collect combined diff of all PRs against main
+   - Run the repo-local `/review` skill on the combined changes
+   - Evaluate:
+     - Do changes conflict logically? (same code modified differently)
+     - Is there duplicate work? (two PRs solving same problem)
+     - Do changes compose well? (feature A + feature B = coherent whole)
+     - Any cross-cutting concerns? (shared dependencies, API changes)
+   - If concerns found:
+     - Report issues
+     - Ask human whether to proceed or address first
+
+   This batch review supplements, but never replaces, each PR's project-specific `/ship` gate.
+
+6. **Merge stack in dependency order** (root first, then children):
+
+   For each PR in the stack, starting from the root:
+
+   1. **Rewrite the branch onto its final target first:**
+      - Fetch, check out, and rebase onto the current target branch.
+      - Resolve conflicts, run repo-local `/review`, and force-push with lease.
+      - For a child whose parent has merged, retarget it to `main`, rebase, and force-push before any validation.
+      - Any later rewrite or retarget invalidates all prior ship, CodeRabbit, and CI evidence.
+
+   a. **Verify the full RNA ship gate completed on the final pushed commit:**
+      - The PR is ready for review, not draft.
+      - Required `/ship` step comments are present, including RNA-grounded review,
+        independent review, regression oracle, merit assessment, manual verification,
+        delivery verification, and final comment sweep.
+      - The final acceptance-criteria gate passed.
+      - For a code-changing PR, CodeRabbit posted an explicit clean/approved review of the final diff. A skipped draft review or green status alone is insufficient.
+      If any evidence is missing, stop and run `/ship <pr-number>`; do not merge directly.
+
+   b. **Verify CI is passing on that same final commit:**
+
+      ```bash
+      gh pr checks <pr-number> --fail-on-error
+      ```
+
+      If CI is failing, stop and report error.
+
+   c. Squash merge:
+
+      ```bash
+      gh pr merge <pr-number> --squash
+      ```
+
+   d. **For child PRs in the stack** (after parent merged):
+      - Update base branch to main:
+
+        ```bash
+        gh pr edit <child-pr-number> --base main
+        ```
+
+      - Rebase child onto main:
+
+        ```bash
+        gh pr checkout <child-pr-number>
+        git rebase origin/main
+        git push --force-with-lease
+        ```
+
+      - The rewrite invalidates prior validation. Return to step 0 and rerun the full ship gate, explicit CodeRabbit final-diff review, and CI before merging.
+
+   e. **On merge failure** - If any PR in the stack fails to merge:
+      - Stop processing the stack
+      - Report which PRs were merged successfully and which failed
+      - Signal error: already-merged PRs stay merged, failed PR remains open
+      - Next oh-merge run will see the failed PR as a new root (its parent is now in main)
+
+   **Note:** GitHub automatically closes linked issues when the PR merges through
+   `Closes #N` in the PR body.
+
+## Stacked PRs
+
+When PRs target other PR branches (not main), oh-merge detects the stack and processes it:
+
+**Detection:**
+
+```bash
+gh pr list --label oh-merge --json number,title,headRefName,baseRefName
+```
+
+- PRs with `baseRefName = main` are roots
+- PRs with `baseRefName = issue/<number>` are children targeting that parent
+- Ignore merge conflict status - we handle conflicts during rebase
+
+**Graph building:**
+
+```text
+adjacency[baseRefName] = [list of PRs targeting it]
+
+Example:
+  adjacency["main"] = [PR #42, PR #44]
+  adjacency["issue/123"] = [PR #43]
+
+Stack 1: main ← #42 (issue/123) ← #43 (issue/456)
+Stack 2: main ← #44 (issue/789)
+```
+
+**Merge sequence** (for Stack 1):
+
+1. Merge #42 to main
+2. Update #43: `gh pr edit 43 --base main`
+3. Rebase #43 onto main: `git rebase origin/main && git push --force-with-lease`
+4. Merge #43 to main
+
+**After processing:**
+
+```text
+Before:  PR #43 → issue/123 → main
+         PR #42 → main
+         PR #44 → main (separate stack)
+
+After:   PR #42 merged to main (issue #123 auto-closed)
+         PR #43 rebased onto main, merged to main (issue #456 auto-closed)
+         PR #44 remains for next oh-merge run
+```
+
+## Batch Review Criteria
+
+The holistic review checks what individual PR reviews can't:
+
+- **Logical conflicts**: PR A assumes X, PR B assumes not-X
+- **Duplication**: Both PRs add similar functionality
+- **Integration issues**: Combined changes break something neither breaks alone
+- **Ordering dependencies**: PR B depends on PR A being merged first (auto-detected for stacked PRs)
+- **Scope creep**: Batch as a whole does more than originally intended
+
+## Prerequisites
+
+- PRs must have the `oh-merge` label (human approval gate)
+- Each PR must have completed the repository-specific `/ship` pipeline
+- PRs must be ready for review, not draft
+- Every code-changing PR must have an explicit clean/approved CodeRabbit review
+- PRs must have CI passing
+- PRs should have "Closes #N" in body for auto-close (created by oh-task)
+- Batch review must pass (or human override)
+
+**Note:** The `oh-merge` label must be created in the repo. This is opt-in per repo.
+
+## Exit Conditions
+
+- **Success**: Selected stack fully merged
+- **Partial success**: Some PRs in stack merged, then failure
+- **Needs attention**: Batch review raised concerns - waiting for human decision
+- **Error**: Unrecoverable failure (code conflicts, CI failing, cycle detected)
+- **No work**: No PRs with `oh-merge` label found
+
+## Completion Signaling (MANDATORY)
+
+**CRITICAL: You MUST signal completion when done.** Call the `signal_completion` tool as your FINAL action.
+
+**Signal based on outcome:**
+
+| Outcome | Call |
+| --------- | ------ |
+| Stack merged | `signal_completion(status: "success", message: "Merged N PRs")` |
+| No PRs to merge | `signal_completion(status: "success", message: "No PRs with oh-merge label")` |
+| Partial success | `signal_completion(status: "error", error: "Merged N PRs, failed on PR #X: <reason>")` |
+| Unrecoverable failure | `signal_completion(status: "error", error: "<reason>")` |
+
+**If you do not signal, the orchestrator will not know you are done and the session becomes orphaned.**
+
+**Fallback:** If the `signal_completion` tool is not available, output your completion status as your final message in the format: `COMPLETION: status=<status> message=<message>` or `COMPLETION: status=<status> error=<reason>`.
+
+## Example
+
+### Basic (no stacks)
+
+```text
+$ /oh-merge
+
+Finding PRs with oh-merge label...
+Found 2 PRs:
+  PR #42 "Fix validation bug" (issue/123) → main (CI ✓)
+  PR #44 "Refactor validator" (issue/789) → main (CI ✓)
+
+Building dependency graph...
+  Stack 1: main ← #42
+  Stack 2: main ← #44
+  2 independent stacks, processing Stack 1
+
+Running batch review on Stack 1 (1 PR)...
+Batch review complete: ✓ No issues
+
+Processing PR #42 (Fix validation bug)...
+  Verifying CI... ✓
+  Rebasing onto main... clean
+  Squash merging... ✓
+  Issue #123 will auto-close on merge
+
+Merge complete.
+  Merged: 1 PR (#42)
+  Remaining: 1 PR (#44 - queued for next run)
+
+signal_completion(status: "success", message: "Merged 1 PR (#42)")
+Done.
+```
+
+### Stacked PRs
+
+```text
+$ /oh-merge
+
+Finding PRs with oh-merge label...
+Found 3 PRs:
+  PR #42 "Fix validation bug" (issue/123) → main (CI ✓)
+  PR #43 "Add edge case tests" (issue/456) → issue/123 (CI ✓)
+  PR #44 "Refactor validator" (issue/789) → main (CI ✓)
+
+Building dependency graph...
+  Stack 1: main ← #42 (issue/123) ← #43 (issue/456)
+  Stack 2: main ← #44
+  2 stacks found, processing Stack 1 (2 PRs)
+
+Running batch review on Stack 1...
+Collecting diffs: +547 -103 across 8 files
+Batch review complete: ✓ No issues
+
+Processing stack root: PR #42 (Fix validation bug)...
+  Verifying CI... ✓
+  Rebasing onto main... clean
+  Squash merging... ✓
+  Issue #123 will auto-close on merge
+
+Processing stack child: PR #43 (Add edge case tests)...
+  Verifying CI... ✓
+  Updating base branch to main... done
+  Rebasing onto main... clean
+  Squash merging... ✓
+  Issue #456 will auto-close on merge
+
+Stack merged.
+  Merged: 2 PRs (#42, #43)
+  Remaining: 1 PR (#44 - queued for next run)
+
+signal_completion(status: "success", message: "Merged 2 PRs (#42, #43)")
+Done.
+```
