@@ -30,7 +30,7 @@ pub use search::search;
 /// defaults. `derive(Default)` would leave them `false`, diverging from
 /// `from_mcp_search()` and silently disabling artifact/markdown search for
 /// any code that constructs `SearchParams::default()`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SearchParams {
     pub query: Option<String>,
     pub node: Option<String>,

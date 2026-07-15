@@ -175,6 +175,26 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 .get("subsystem")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let file = call
+                .params
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let line = call
+                .params
+                .get("line")
+                .and_then(value_as_u64_tolerant)
+                .and_then(|v| u32::try_from(v).ok());
+            let end_line = call
+                .params
+                .get("end_line")
+                .and_then(value_as_u64_tolerant)
+                .and_then(|v| u32::try_from(v).ok());
+            let root = call
+                .params
+                .get("root")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let params = SearchParams {
                 query,
@@ -185,10 +205,10 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 hops,
                 kind,
                 language: None,
-                file: None,
-                line: None,
-                end_line: None,
-                root: None,
+                file,
+                line,
+                end_line,
+                root,
                 limit,
                 sort_by: None,
                 min_complexity: None,

@@ -40,6 +40,8 @@ const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
 
 const MAX_SOURCE_SPAN_LINES: u32 = 200;
 const MAX_SOURCE_SPAN_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_PATH_ENTRIES: usize = 50_000;
+const MAX_SOURCE_CANDIDATES: usize = 20;
 
 fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<String>, String> {
     let mut file = fs::File::open(path).map_err(|error| format!("cannot read file: {error}"))?;
@@ -148,37 +150,51 @@ fn compiler_location(file: &Option<String>) -> Option<(String, u32)> {
     (!path.is_empty()).then(|| (path.to_string(), line))
 }
 
-fn source_roots(params: &SearchParams, ctx: &SearchContext<'_>) -> Vec<(String, PathBuf)> {
+fn source_roots(params: &SearchParams, repo_root: &Path) -> Vec<(String, PathBuf)> {
     let workspace = crate::roots::WorkspaceConfig::load()
-        .with_primary_root(ctx.repo_root.to_path_buf())
-        .with_declared_roots(ctx.repo_root);
+        .with_primary_root(repo_root.to_path_buf())
+        .with_declared_roots(repo_root);
     let mut roots: Vec<_> = workspace
         .resolved_roots()
         .into_iter()
         .filter(|root| match params.root.as_deref() {
             Some(selected) if selected.eq_ignore_ascii_case("all") => true,
             Some(selected) => root.slug.eq_ignore_ascii_case(selected),
-            None => root.path == ctx.repo_root,
+            None => root.path == repo_root,
         })
         .map(|root| (root.slug, root.path))
         .collect();
     if roots.is_empty() && params.root.is_none() {
         roots.push((
-            crate::roots::RootConfig::code_project(ctx.repo_root.to_path_buf()).slug(),
-            ctx.repo_root.to_path_buf(),
+            crate::roots::RootConfig::code_project(repo_root.to_path_buf()).slug(),
+            repo_root.to_path_buf(),
         ));
     }
     roots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     roots
 }
 
-fn collect_suffix_matches(dir: &Path, suffix: &Path, matches: &mut Vec<PathBuf>) {
+fn collect_suffix_matches(
+    dir: &Path,
+    suffix: &Path,
+    matches: &mut Vec<PathBuf>,
+    visited: &mut usize,
+) -> Result<(), String> {
+    if matches.len() > MAX_SOURCE_CANDIDATES {
+        return Ok(());
+    }
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return Ok(());
     };
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
+        *visited += 1;
+        if *visited > MAX_SOURCE_PATH_ENTRIES {
+            return Err(format!(
+                "source path lookup exceeded the hard traversal maximum of {MAX_SOURCE_PATH_ENTRIES} filesystem entries; provide a more exact path"
+            ));
+        }
         let path = entry.path();
         if matches!(
             entry.file_name().to_str(),
@@ -194,14 +210,18 @@ fn collect_suffix_matches(dir: &Path, suffix: &Path, matches: &mut Vec<PathBuf>)
                 matches.push(path);
             }
         } else if file_type.is_dir() {
-            collect_suffix_matches(&path, suffix, matches);
+            collect_suffix_matches(&path, suffix, matches, visited)?;
         } else if file_type.is_file() && path.ends_with(suffix) {
             matches.push(path);
         }
+        if matches.len() > MAX_SOURCE_CANDIDATES {
+            return Ok(());
+        }
     }
+    Ok(())
 }
 
-fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+fn source_span(params: &SearchParams, repo_root: &Path) -> String {
     let Some(raw_file) = params
         .file
         .as_deref()
@@ -249,7 +269,7 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         );
     }
 
-    let roots = source_roots(params, ctx);
+    let roots = source_roots(params, repo_root);
     if roots.is_empty() {
         return format!(
             "Selected root `{}` is not configured or is unavailable.",
@@ -257,6 +277,8 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         );
     }
     let mut candidates = Vec::new();
+    let mut visited = 0;
+    let mut omitted_candidates = false;
     for (slug, root) in roots {
         let Ok(canonical_root) = fs::canonicalize(&root) else {
             continue;
@@ -266,7 +288,15 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             vec![exact]
         } else {
             let mut suffix_matches = Vec::new();
-            collect_suffix_matches(&root, &requested, &mut suffix_matches);
+            if let Err(error) =
+                collect_suffix_matches(&root, &requested, &mut suffix_matches, &mut visited)
+            {
+                return format!("Source path lookup failed: {error}.");
+            }
+            if suffix_matches.len() > MAX_SOURCE_CANDIDATES {
+                suffix_matches.truncate(MAX_SOURCE_CANDIDATES);
+                omitted_candidates = true;
+            }
             suffix_matches
         };
         paths.sort();
@@ -274,6 +304,10 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             match fs::canonicalize(&path) {
                 Ok(canonical) if canonical.starts_with(&canonical_root) => {
                     candidates.push((slug.clone(), canonical_root.clone(), canonical));
+                    if candidates.len() > MAX_SOURCE_CANDIDATES {
+                        omitted_candidates = true;
+                        break;
+                    }
                 }
                 Ok(_) => {
                     return format!(
@@ -285,6 +319,10 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
                     return format!("Cannot resolve source path `{}`: {error}.", path.display());
                 }
             }
+        }
+        if candidates.len() > MAX_SOURCE_CANDIDATES {
+            candidates.truncate(MAX_SOURCE_CANDIDATES);
+            break;
         }
     }
     candidates.sort_by(|a, b| a.2.cmp(&b.2));
@@ -303,8 +341,13 @@ fn source_span(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let omitted = if omitted_candidates {
+            format!("\n- … additional matches omitted after {MAX_SOURCE_CANDIDATES} candidates")
+        } else {
+            String::new()
+        };
         return format!(
-            "Source path `{file}` is ambiguous. Provide one exact repo/root-relative path. Candidates:\n{paths}"
+            "Source path `{file}` is ambiguous. Provide one exact repo/root-relative path. Candidates:\n{paths}{omitted}"
         );
     }
     let (slug, root, path) = candidates.pop().unwrap();
@@ -480,7 +523,11 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         || params.end_line.is_some()
         || compiler_location(&params.file).is_some()
     {
-        return source_span(params, ctx);
+        let params = params.clone();
+        let repo_root = ctx.repo_root.to_path_buf();
+        return tokio::task::spawn_blocking(move || source_span(&params, &repo_root))
+            .await
+            .unwrap_or_else(|error| format!("Source span lookup task failed: {error}."));
     }
 
     let query = params
@@ -2566,6 +2613,26 @@ mod tests {
 
         assert!(result.contains("is ambiguous"));
         assert!(result.find("a/same.rs").unwrap() < result.find("b/same.rs").unwrap());
+
+        for index in 0..25 {
+            let dir = tmp.path().join(format!("many-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("common.rs"), "one\n").unwrap();
+        }
+        let capped = SearchParams {
+            file: Some("common.rs".into()),
+            line: Some(1),
+            ..Default::default()
+        };
+        let capped_result = search(&capped, &ctx).await;
+        assert!(capped_result.contains("additional matches omitted after 20 candidates"));
+        assert_eq!(
+            capped_result
+                .lines()
+                .filter(|line| line.starts_with("- ["))
+                .count(),
+            MAX_SOURCE_CANDIDATES
+        );
     }
 
     #[tokio::test]
@@ -2653,6 +2720,17 @@ mod tests {
                 .await
                 .contains("hard maximum of 65536 bytes")
         );
+
+        let mut matches = Vec::new();
+        let mut visited = MAX_SOURCE_PATH_ENTRIES;
+        let traversal_error = collect_suffix_matches(
+            tmp.path(),
+            Path::new("missing.rs"),
+            &mut matches,
+            &mut visited,
+        )
+        .unwrap_err();
+        assert!(traversal_error.contains("hard traversal maximum of 50000"));
     }
 
     #[cfg(unix)]

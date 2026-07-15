@@ -274,6 +274,16 @@ try {
     sourceSpanText,
     "**Root:**",
   );
+  const explicitSpanText = await callSearchWithRetry({
+    file: "lib.rs",
+    line: 1,
+    end_line: 1,
+  });
+  assertContains(
+    "MCP search accepts explicit line and end_line arguments",
+    explicitSpanText,
+    '1 | pub fn main() { println!("{}", hello()); }',
+  );
 
   // ── 5. outcome_progress ─────────────────────────────────────────────────
   console.log("\n── outcome_progress ──");
