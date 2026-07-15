@@ -29,6 +29,7 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         EdgeKind::Implements => 0.8,
         EdgeKind::DependsOn => 0.5,
         EdgeKind::ReferencedBy => 0.5,
+        EdgeKind::Constructs => 0.5,
         EdgeKind::References => 0.5,
         EdgeKind::ConnectsTo => 0.3,
         EdgeKind::Defines => 0.1,
@@ -2162,6 +2163,7 @@ mod tests {
         assert!((edge_weight(&EdgeKind::Implements) - 0.8).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::DependsOn) - 0.5).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::ReferencedBy) - 0.5).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::Constructs) - 0.5).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::ConnectsTo) - 0.3).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::Defines) - 0.1).abs() < f64::EPSILON);
         assert!((edge_weight(&EdgeKind::HasField) - 0.1).abs() < f64::EPSILON);

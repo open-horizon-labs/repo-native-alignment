@@ -521,14 +521,15 @@ impl ExtractionConsumer for SdkPathInferenceConsumer {
 /// 4. `sdk_path_inference_pass` — infers full paths for FastAPI endpoints still unresolved
 ///    (chained routers without explicit `prefix=` args); uses SDK Const nodes (#517).
 ///    Gated on `detected_frameworks.contains("fastapi")` — zero invocations on non-FastAPI repos.
-/// 5. `api_link_pass` — links HTTP handlers to route definitions
-/// 6. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
-/// 7. `manifest_pass` — package.json / Cargo.toml dependency nodes
-/// 8. `tested_by_pass` — naming-convention test edges
-/// 9. `adr_validation_pass` — ADR frontmatter -> exact test function edges
-/// 10. `import_calls_pass` — resolves bare function calls via import nodes
-/// 11. `directory_module_pass` — directory-level module nodes
-/// 12. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
+/// 5. `struct_construction_pass` — links Rust struct literals to local declarations
+/// 6. `api_link_pass` — links HTTP handlers to route definitions
+/// 7. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
+/// 8. `manifest_pass` — package.json / Cargo.toml dependency nodes
+/// 9. `tested_by_pass` — naming-convention test edges
+/// 10. `adr_validation_pass` — ADR frontmatter -> exact test function edges
+/// 11. `import_calls_pass` — resolves bare function calls via import nodes
+/// 12. `directory_module_pass` — directory-level module nodes
+/// 13. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
 ///     `grpc_client_calls_pass`, `extractor_config_pass` — gate on detected_frameworks
 ///
 /// **Why passes run here, not in individual consumers:**
@@ -665,7 +666,17 @@ impl EnrichmentFinalizer {
             crate::extract::sdk_path_inference::sdk_path_inference_pass(&mut all_nodes);
         }
 
-        // Step 5: api_link — links HTTP handlers to route definitions.
+        // Step 5: struct constructions — link AST-derived Rust literal sites to
+        // unambiguous local declarations before persistence and graph rendering.
+        {
+            let new_edges =
+                crate::extract::struct_construction::struct_construction_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 6: api_link — links HTTP handlers to route definitions.
         {
             let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
             if !new_edges.is_empty() {
@@ -673,7 +684,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 6: openapi_sdk_link — links SDK functions to OpenAPI spec operations.
+        // Step 7: openapi_sdk_link — links SDK functions to OpenAPI spec operations.
         {
             let new_edges = crate::extract::openapi_sdk_link::openapi_sdk_link_pass(&all_nodes);
             if !new_edges.is_empty() {
@@ -681,7 +692,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 7: manifest — package.json / Cargo.toml / pyproject.toml dependency nodes.
+        // Step 8: manifest — package.json / Cargo.toml / pyproject.toml dependency nodes.
         {
             let result = crate::extract::manifest::manifest_pass(&self.root_pairs);
             if !result.nodes.is_empty() || !result.edges.is_empty() {
@@ -690,7 +701,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 8: tested_by — naming-convention test edges (test_foo → foo).
+        // Step 9: tested_by — naming-convention test edges (test_foo → foo).
         {
             let new_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
             if !new_edges.is_empty() {
@@ -698,7 +709,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 9: ADR validation links.
+        // Step 10: ADR validation links.
         // - ADR frontmatter points directly at exact Rust cargo test names.
         // - extracted test functions can reference ADRs back via doc comments.
         {
@@ -709,7 +720,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 10: import_calls — resolves bare function calls via import nodes.
+        // Step 11: import_calls — resolves bare function calls via import nodes.
         {
             let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
             if !new_edges.is_empty() {
@@ -717,7 +728,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 11: directory_module — directory-level module nodes.
+        // Step 12: directory_module — directory-level module nodes.
         {
             let result = crate::extract::directory_module::directory_module_pass(&all_nodes);
             if !result.nodes.is_empty() || !result.edges.is_empty() {
@@ -726,7 +737,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 12: framework-gated passes — run only when the relevant framework is detected.
+        // Step 13: framework-gated passes — run only when the relevant framework is detected.
         // pubsub
         if crate::extract::pubsub::should_run(&detected_frameworks) {
             let result = crate::extract::pubsub::pubsub_pass(

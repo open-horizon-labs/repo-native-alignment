@@ -4,11 +4,12 @@
 //! and use declarations from Rust source files. Also detects topology
 //! patterns (subprocess spawn, network listeners, async boundaries).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::generic::{GenericExtractor, LangConfig};
 use super::query::RouteQueryConfig;
@@ -133,6 +134,14 @@ impl Extractor for RustExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
+            let scope_imports = build_scope_import_index(tree.root_node(), content.as_bytes());
+            let struct_indices: HashMap<(String, usize), usize> = result
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.id.kind == NodeKind::Struct && node.id.file == path)
+                .map(|(index, node)| ((node.id.name.clone(), node.line_start), index))
+                .collect();
             detect_topology_patterns(
                 tree.root_node(),
                 path,
@@ -140,14 +149,277 @@ impl Extractor for RustExtractor {
                 &mut result.edges,
             );
             enrich_static_metadata(tree.root_node(), content.as_bytes(), &mut result.nodes);
+            enrich_struct_module_paths(
+                path,
+                tree.root_node(),
+                content.as_bytes(),
+                &mut result.nodes,
+                &struct_indices,
+            );
             // Compute exact `cargo test -- --list` style paths from the AST.
             // Walks enclosing `mod_item` ancestors so tests inside
             // `#[cfg(test)] mod tests { ... }` get the correct `tests::` segment.
             enrich_test_paths(path, tree.root_node(), content.as_bytes(), &mut result.nodes);
+            extract_struct_constructions(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &scope_imports,
+            );
         }
 
         Ok(result)
     }
+}
+
+/// Capture Rust struct expressions while the AST is available.
+fn extract_struct_constructions(
+    node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    scope_imports: &ScopeImportIndex,
+) {
+    if node.kind() == "struct_expression"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(type_path) = name_node.utf8_text(source)
+        && let Some(constructed_type) = rust_type_basename(type_path)
+    {
+        let line_start = node.start_position().row + 1;
+        let line_end = node.end_position().row + 1;
+        let column = node.start_position().column + 1;
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("constructed_type".into(), constructed_type.clone());
+        metadata.insert("type_path".into(), type_path.to_string());
+        metadata.insert("construction_site".into(), "struct".into());
+        metadata.insert(
+            "module_path".into(),
+            rust_lexical_module_path(node, path, source),
+        );
+        if let Some(import_path) =
+            imported_binding_path(node, constructed_type.as_str(), scope_imports)
+        {
+            metadata.insert("imported_type_path".into(), import_path);
+        }
+        metadata.insert(
+            "name_col".into(),
+            name_node.start_position().column.to_string(),
+        );
+        if let Some((owner_name, owner_kind)) = nearest_owning_symbol(node, source) {
+            metadata.insert("parent_scope".into(), owner_name);
+            metadata.insert("parent_scope_kind".into(), owner_kind);
+        }
+        // Keep construction nodes bounded: nested literals can overlap almost their
+        // entire source ranges, so copying every complete body is quadratic.
+        let signature = node
+            .utf8_text(source)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        nodes.push(Node {
+            id: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: format!("{constructed_type}@{line_start}:{column}"),
+                kind: NodeKind::Other("struct_literal".into()),
+            },
+            language: "rust".into(),
+            line_start,
+            line_end,
+            signature,
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        });
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            extract_struct_constructions(child, path, source, nodes, scope_imports);
+        }
+    }
+}
+
+fn rust_lexical_module_path(node: tree_sitter::Node, path: &Path, source: &[u8]) -> String {
+    let mut segments = rust_module_segments(path);
+    let mut inline = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "mod_item"
+            && let Some(name) = current.child_by_field_name("name")
+            && let Ok(name) = name.utf8_text(source)
+        {
+            inline.push(name.to_string());
+        }
+        ancestor = current.parent();
+    }
+    inline.reverse();
+    segments.extend(inline);
+    segments.join("::")
+}
+
+/// Return an import path that binds `name` in this source file. Multiple bindings
+/// are marked ambiguous so the post-pass remains conservative.
+type ScopeKey = (usize, usize);
+type ScopeImportIndex = HashMap<ScopeKey, HashMap<String, Vec<String>>>;
+
+fn imported_binding_path(
+    node: tree_sitter::Node,
+    name: &str,
+    scope_imports: &ScopeImportIndex,
+) -> Option<String> {
+    let mut scope = node.parent();
+    let mut matches = Vec::new();
+    while let Some(current) = scope {
+        if matches!(current.kind(), "block" | "declaration_list" | "source_file") {
+            let key = (current.start_byte(), current.end_byte());
+            if let Some(paths) = scope_imports.get(&key).and_then(|bindings| bindings.get(name)) {
+                matches.extend(paths.iter().cloned());
+            }
+        }
+        scope = current.parent();
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [path] => Some(path.clone()),
+        [] => None,
+        _ => Some("<ambiguous>".into()),
+    }
+}
+
+fn build_scope_import_index(node: tree_sitter::Node, source: &[u8]) -> ScopeImportIndex {
+    fn walk(node: tree_sitter::Node, source: &[u8], index: &mut ScopeImportIndex) {
+        if matches!(node.kind(), "block" | "declaration_list" | "source_file") {
+            let mut bindings: HashMap<String, Vec<String>> = HashMap::new();
+            for child_index in 0..node.child_count() {
+                if let Some(child) = node.child(child_index as u32)
+                    && child.kind() == "use_declaration"
+                    && let Ok(text) = child.utf8_text(source)
+                {
+                    for (binding, path) in import_text_bindings(text) {
+                        bindings.entry(binding).or_default().push(path);
+                    }
+                }
+            }
+            if !bindings.is_empty() {
+                index.insert((node.start_byte(), node.end_byte()), bindings);
+            }
+        }
+        for child_index in 0..node.child_count() {
+            if let Some(child) = node.child(child_index as u32) {
+                walk(child, source, index);
+            }
+        }
+    }
+
+    let mut index = HashMap::new();
+    walk(node, source, &mut index);
+    index
+}
+
+fn import_text_bindings(text: &str) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
+    let import = text
+        .trim()
+        .strip_prefix("pub ")
+        .unwrap_or(text.trim())
+        .strip_prefix("use ")
+        .unwrap_or("")
+        .trim_end_matches(';')
+        .trim();
+    if let Some((prefix, members)) = import.split_once("::{") {
+        for member in members.trim_end_matches('}').split(',').map(str::trim) {
+            let (target, binding) = member
+                .rsplit_once(" as ")
+                .map(|(target, alias)| (target.trim(), alias.trim()))
+                .unwrap_or_else(|| (member, member.rsplit("::").next().unwrap_or(member)));
+            bindings.push((binding.to_string(), format!("{prefix}::{target}")));
+        }
+    } else {
+        let (path, binding) = import
+            .rsplit_once(" as ")
+            .map(|(path, alias)| (path.trim(), alias.trim()))
+            .unwrap_or_else(|| (import, import.rsplit("::").next().unwrap_or(import)));
+        bindings.push((binding.to_string(), path.to_string()));
+    }
+    bindings
+}
+
+fn enrich_struct_module_paths(
+    path: &Path,
+    node: tree_sitter::Node,
+    source: &[u8],
+    nodes: &mut [Node],
+    struct_indices: &HashMap<(String, usize), usize>,
+) {
+    if node.kind() == "struct_item"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+    {
+        let line = node.start_position().row + 1;
+        if let Some(index) = struct_indices.get(&(name.to_string(), line))
+            && let Some(extracted) = nodes.get_mut(*index)
+        {
+            extracted.metadata.insert(
+                "module_path".into(),
+                rust_lexical_module_path(node, path, source),
+            );
+        }
+    }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            enrich_struct_module_paths(path, child, source, nodes, struct_indices);
+        }
+    }
+}
+
+fn rust_type_basename(type_path: &str) -> Option<String> {
+    let without_generics = type_path
+        .split("::<")
+        .next()
+        .unwrap_or(type_path)
+        .split('<')
+        .next()
+        .unwrap_or(type_path);
+    without_generics
+        .rsplit("::")
+        .find(|part| !part.is_empty())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn nearest_owning_symbol(node: tree_sitter::Node, source: &[u8]) -> Option<(String, String)> {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        let (field, kind) = match current.kind() {
+            "function_item" | "function_signature_item" => ("name", "function"),
+            "impl_item" => ("type", "impl"),
+            "struct_item" => ("name", "struct"),
+            "trait_item" => ("name", "trait"),
+            "enum_item" => ("name", "enum"),
+            "mod_item" => ("name", "module"),
+            "const_item" | "static_item" => ("name", "const"),
+            _ => {
+                ancestor = current.parent();
+                continue;
+            }
+        };
+        if let Some(name) = current
+            .child_by_field_name(field)
+            .and_then(|child| child.utf8_text(source).ok())
+            .filter(|name| !name.is_empty())
+        {
+            return Some((name.to_string(), kind.to_string()));
+        }
+        ancestor = current.parent();
+    }
+    None
 }
 
 /// Metadata key for the resolved `cargo test -- --list` style path.
@@ -305,7 +577,7 @@ fn enrich_test_paths_walk(
 /// - `tests/integration.rs`     -> `["integration"]`
 /// - `src/lib.rs` / `src/main.rs` -> `[]` (libtest emits these as `tests::name`,
 ///   not `lib::tests::name` / `main::tests::name`)
-fn rust_module_segments(path: &Path) -> Vec<String> {
+pub(super) fn rust_module_segments(path: &Path) -> Vec<String> {
     let mut parts: Vec<String> = path
         .iter()
         .map(|part| part.to_string_lossy().to_string())
@@ -1659,4 +1931,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_struct_literal_sites_include_paths_generics_location_and_owner() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct BusOptions { enabled: bool }
+struct LspPipelineInput<T> { value: T }
+struct LangConfig { name: &'static str }
+
+fn build() {
+    let _a = BusOptions { enabled: true };
+    let _b = crate::server::BusOptions { enabled: false };
+    let _c = LspPipelineInput::<String> { value: String::new() };
+    let _d = LangConfig { name: "rust" };
+    let _field = _a.enabled;
+    let BusOptions { enabled: _ } = _a;
+    fake_macro!(BusOptions { enabled: true });
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let sites: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "struct_literal"),
+            )
+            .collect();
+
+        // The macro token tree is opaque to tree-sitter and the destructuring pattern
+        // is a different AST kind, so only the four real expressions are captured.
+        assert_eq!(sites.len(), 4, "unexpected sites: {sites:#?}");
+        assert_eq!(
+            sites
+                .iter()
+                .filter_map(|node| node.metadata.get("constructed_type"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["BusOptions", "BusOptions", "LspPipelineInput", "LangConfig"]
+        );
+        assert!(sites.iter().all(|node| node.line_start > 0));
+        assert!(sites.iter().all(|node| {
+            node.metadata.get("parent_scope").map(String::as_str) == Some("build")
+                && node.metadata.get("parent_scope_kind").map(String::as_str) == Some("function")
+        }));
+        assert!(sites.iter().any(|node| {
+            node.metadata.get("type_path").map(String::as_str) == Some("crate::server::BusOptions")
+        }));
+        assert!(sites.iter().any(|node| {
+            node.metadata.get("type_path").map(String::as_str) == Some("LspPipelineInput::<String>")
+        }));
+    }
+
+    #[test]
+    fn test_struct_literal_node_growth_is_one_per_ast_expression() {
+        let extractor = RustExtractor::new();
+        let mut code = String::from("struct Config { value: usize }\nfn build() {\n");
+        for index in 0..128 {
+            code.push_str(&format!(
+                "let _config_{index} = Config {{ value: {index} }};\n"
+            ));
+        }
+        code.push_str("}\n");
+
+        let result = extractor
+            .extract(Path::new("src/fixture.rs"), &code)
+            .unwrap();
+        let sites: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(&node.id.kind, NodeKind::Other(kind) if kind == "struct_literal"),
+            )
+            .collect();
+        let unique_ids: std::collections::HashSet<_> =
+            sites.iter().map(|node| node.stable_id()).collect();
+
+        assert_eq!(sites.len(), 128, "node growth must equal AST expression count");
+        assert_eq!(unique_ids.len(), 128, "every site must have a stable unique ID");
+    }
+
+    #[test]
+    fn struct_literals_capture_import_and_inline_module_context() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+use external_crate::Config;
+mod inner {
+    struct Local { value: usize }
+    fn build() {
+        let _external = Config { value: 1 };
+        let _local = Local { value: 2 };
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let external = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.metadata.get("constructed_type").map(String::as_str) == Some("Config")
+            })
+            .unwrap();
+        assert_eq!(
+            external
+                .metadata
+                .get("imported_type_path")
+                .map(String::as_str),
+            Some("external_crate::Config")
+        );
+        assert_eq!(
+            external.metadata.get("module_path").map(String::as_str),
+            Some("inner")
+        );
+
+        let declaration = result
+            .nodes
+            .iter()
+            .find(|node| node.id.kind == NodeKind::Struct && node.id.name == "Local")
+            .unwrap();
+        assert_eq!(
+            declaration.metadata.get("module_path").map(String::as_str),
+            Some("inner")
+        );
+    }
 }

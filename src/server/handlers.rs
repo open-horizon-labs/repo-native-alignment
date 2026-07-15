@@ -368,7 +368,11 @@ pub(crate) fn run_traversal(
         }
         "impact" => {
             let max_hops = hops.unwrap_or(3) as usize;
-            let default_filter = [EdgeKind::Calls, EdgeKind::ReferencedBy];
+            let default_filter = [
+                EdgeKind::Calls,
+                EdgeKind::ReferencedBy,
+                EdgeKind::Constructs,
+            ];
             let filter = edge_filter.unwrap_or(&default_filter);
             Ok(index.impact(node_id, max_hops, Some(filter)))
         }
@@ -861,11 +865,27 @@ mod tests {
 
         let groups = run_traversal_grouped(&index, "c", "impact", None, None, None).unwrap();
         assert!(!groups.is_empty(), "should find dependents via Calls edges");
-        // b is a direct incoming neighbor via Calls (impact defaults to Calls+ReferencedBy)
+        // b is a direct incoming neighbor via Calls (impact defaults to dependency edges)
         assert!(
             groups.contains_key(&EdgeKind::Calls),
             "should have Calls group"
         );
+    }
+
+    #[test]
+    fn test_run_traversal_impact_includes_struct_constructions() {
+        let mut index = GraphIndex::new();
+        index.add_edge(
+            "site",
+            "struct_literal",
+            "declaration",
+            "struct",
+            EdgeKind::Constructs,
+        );
+
+        let groups =
+            run_traversal_grouped(&index, "declaration", "impact", None, None, None).unwrap();
+        assert_eq!(groups[&EdgeKind::Constructs], vec!["site".to_string()]);
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub mod scan_stats;
 pub mod sdk_path_inference;
 pub mod sql;
 pub mod string_literals;
+pub mod struct_construction;
 pub mod subsystem_pass;
 pub mod swift;
 pub mod toml_extractor;
