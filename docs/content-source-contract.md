@@ -22,6 +22,7 @@ Every evidence-bearing fact carries one or more selectors with these fields:
 
 | Field | Requirement | Meaning |
 |---|---|---|
+| `root_id` | required | Workspace root slug containing the selected file; prevents equal relative paths in different roots from sharing evidence identity. |
 | `file_path` | required | Normalized, repository-relative path; no absolute paths or `..`. |
 | `line_start`, `line_end` | required | One-indexed, inclusive range in the current file. |
 | `byte_start`, `byte_end` | required for content-native Markdown | Zero-indexed, half-open UTF-8 byte range. A Markdown fact without both cannot be `valid` or `confirmed`. |

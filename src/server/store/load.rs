@@ -618,7 +618,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 });
             }
         }
-        crate::graph::revalidate_edge_evidence(&mut edges, &nodes);
+        let _ = crate::graph::revalidate_edge_evidence(&mut edges, &nodes);
         edges
     };
 

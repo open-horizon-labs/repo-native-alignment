@@ -43,3 +43,21 @@ updated: 2026-07-16
 - Post-merge `cargo test`: pass (2018 library tests passed, 4 ignored; 2 binary tests, CLI exit contract, content-source contract, and doc tests all passed).
 - `cargo fmt --all -- --check` was not used as a branch gate because the installed formatter proposes repository-wide changes in untouched current-main files; no unrelated formatting rewrite was applied.
 - Prior final-head CI and exact-artifact evidence are treated as stale; full tests, CI, CodeRabbit, and exact-artifact MCP verification will be repeated against the updated head.
+
+## Independent review follow-up
+
+Fresh independent review found two P1 lifecycle gaps:
+
+1. third-file evidence edits were not revalidated in live incremental graph paths or scheduled for persistence;
+2. selectors were ambiguous when multiple workspace roots shared the same relative path/body-node ID.
+
+Both are fixed:
+
+- `EvidenceSelector` now carries root identity; legacy unscoped selectors work only for a unique cross-root match and otherwise fail closed as unresolved/detected.
+- Root identity participates in stable evidence identity and rendered locations.
+- Foreground fast snapshots, their background full pipeline, `update_graph_with_scan`, and the multi-root background scanner all revalidate after node merge/dedup.
+- Revalidation returns changed same-ID edges, which replace stale persistence upserts.
+- New regressions prove root isolation, ambiguous legacy fail-closed behavior, and a third-file edit downgrading both the live edge and persistence delta.
+- Independent re-review verdict: APPROVE.
+- Strict Clippy: pass.
+- Clean full suite: 2020 library tests passed, 4 ignored; binary, CLI contract, content-source contract, and doc tests passed.

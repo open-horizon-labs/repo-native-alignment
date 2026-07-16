@@ -720,10 +720,19 @@ pub(crate) fn format_edge_evidence_for_groups(
             {
                 for evidence in &edge.evidence {
                     for selector in &evidence.selectors {
+                        let location = if selector.root_id.is_empty() {
+                            selector.file_path.display().to_string()
+                        } else {
+                            format!(
+                                "{}/{}",
+                                selector.root_id,
+                                selector.file_path.display()
+                            )
+                        };
                         rendered.push(format!(
                             "- **{}** evidence: `{}:{}-{}` — {}\n  - rule: `{}`; extractor: `{}`{}; confidence: `{}`; validation: `{:?}`",
                             kind,
-                            selector.file_path.display(),
+                            location,
                             selector.line_start,
                             selector.line_end,
                             selector.snippet.trim(),
@@ -1052,6 +1061,7 @@ mod tests {
         let peer = make_test_node("peer");
         let evidence = |snippet: &str| EdgeEvidence {
             selectors: vec![EvidenceSelector {
+                root_id: origin.id.root.clone(),
                 file_path: std::path::PathBuf::from("chapter.md"),
                 line_start: 2,
                 line_end: 2,

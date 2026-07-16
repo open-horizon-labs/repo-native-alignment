@@ -286,6 +286,7 @@ mod tests {
         source.metadata.insert("byte_end".into(), "47".into());
         let claim = node("claim", "graceful-recovery", "claims.md");
         let selector = EvidenceSelector {
+            root_id: source.id.root.clone(),
             file_path: source.id.file.clone(),
             line_start: 4,
             line_end: 4,

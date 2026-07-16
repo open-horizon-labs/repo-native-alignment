@@ -135,6 +135,84 @@ mod tests {
         assert!(!is_manifest_package_edge(&openapi_dep));
         assert!(is_manifest_package_edge(&package_dep));
     }
+
+    #[test]
+    fn third_file_evidence_edit_updates_live_edge_and_persist_delta() {
+        use crate::graph::{
+            Confidence, EdgeEvidence, EdgeKind, EvidenceSelector, ExtractionSource,
+            ValidationStatus,
+        };
+
+        let mut evidence_node = node(NodeKind::Other("paragraph".into()), "body");
+        evidence_node.id.root = "repo".into();
+        evidence_node.id.file = PathBuf::from("chapter.md");
+        evidence_node.body = "edited evidence".into();
+        evidence_node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        evidence_node
+            .metadata
+            .insert("byte_start".into(), "10".into());
+        evidence_node
+            .metadata
+            .insert("byte_end".into(), "25".into());
+
+        let mut edge = Edge {
+            from: crate::graph::NodeId {
+                root: "repo".into(),
+                file: PathBuf::from("claims.md"),
+                name: "claim".into(),
+                kind: NodeKind::Other("claim".into()),
+            },
+            to: crate::graph::NodeId {
+                root: "repo".into(),
+                file: PathBuf::from("facts.md"),
+                name: "fact".into(),
+                kind: NodeKind::Other("fact".into()),
+            },
+            kind: EdgeKind::Other("supports".into()),
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Confirmed,
+            evidence: vec![EdgeEvidence {
+                selectors: vec![EvidenceSelector {
+                    root_id: "repo".into(),
+                    file_path: PathBuf::from("chapter.md"),
+                    line_start: 1,
+                    line_end: 1,
+                    byte_start: 10,
+                    byte_end: 25,
+                    body_node_id: "chapter.md::body::ast:paragraph[0]".into(),
+                    snippet_hash: blake3::hash(b"original evidence")
+                        .to_hex()
+                        .to_string(),
+                    snippet: "original evidence".into(),
+                }],
+                extractor_id: "markdown-ast@1".into(),
+                pack_id: Some("test-pack@1".into()),
+                rule_id: "supports@1".into(),
+                confidence: Confidence::Confirmed,
+                validation_status: ValidationStatus::Valid,
+            }],
+        };
+        let stable_id = edge.stable_id();
+        let mut upsert_edges = vec![edge.clone()];
+
+        let changed = revalidate_incremental_edge_evidence(
+            std::slice::from_ref(&evidence_node),
+            std::slice::from_mut(&mut edge),
+        );
+        replace_edge_upserts(&mut upsert_edges, changed);
+
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Stale
+        );
+        assert_eq!(upsert_edges.len(), 1);
+        assert_eq!(upsert_edges[0].stable_id(), stable_id);
+        assert_eq!(upsert_edges[0].confidence, Confidence::Detected);
+    }
 }
 
 fn collect_post_pass_node_upserts(
@@ -151,6 +229,23 @@ fn collect_post_pass_node_upserts(
             upsert_node_ids.insert(sid);
         }
     }
+}
+
+pub(super) fn revalidate_incremental_edge_evidence(
+    nodes: &[Node],
+    edges: &mut [Edge],
+) -> Vec<Edge> {
+    crate::graph::revalidate_edge_evidence(edges, nodes)
+}
+
+pub(super) fn replace_edge_upserts(upsert_edges: &mut Vec<Edge>, changed_edges: Vec<Edge>) {
+    if changed_edges.is_empty() {
+        return;
+    }
+    let changed_ids: std::collections::HashSet<String> =
+        changed_edges.iter().map(|edge| edge.stable_id()).collect();
+    upsert_edges.retain(|edge| !changed_ids.contains(&edge.stable_id()));
+    upsert_edges.extend(changed_edges);
 }
 
 impl RnaHandler {
@@ -299,6 +394,13 @@ impl RnaHandler {
             }
             fast_state.nodes.extend(extraction.nodes);
             fast_state.edges.extend(extraction.edges);
+            // Evidence may come from a third file that is neither edge endpoint.
+            // Revalidate immediately so the fast MCP snapshot never exposes stale
+            // evidence as confirmed while the background pipeline catches up.
+            let _ = revalidate_incremental_edge_evidence(
+                &fast_state.nodes,
+                &mut fast_state.edges,
+            );
 
             // Rebuild petgraph index for the fast graph
             fast_state.index = crate::graph::index::GraphIndex::new();
@@ -560,6 +662,11 @@ impl RnaHandler {
                             .edges
                             .retain(|e| seen_edges.insert(e.stable_id()));
                     }
+                    let changed_evidence_edges = revalidate_incremental_edge_evidence(
+                        &full_state.nodes,
+                        &mut full_state.edges,
+                    );
+                    replace_edge_upserts(&mut upsert_edges, changed_evidence_edges);
 
                     // Rebuild index
                     full_state.index = GraphIndex::new();
@@ -2234,6 +2341,9 @@ impl RnaHandler {
             let mut seen_edges = std::collections::HashSet::new();
             graph.edges.retain(|e| seen_edges.insert(e.stable_id()));
         }
+        let changed_evidence_edges =
+            revalidate_incremental_edge_evidence(&graph.nodes, &mut graph.edges);
+        replace_edge_upserts(&mut upsert_edges, changed_evidence_edges);
 
         // Rebuild petgraph index
         graph.index = GraphIndex::new();

@@ -295,6 +295,10 @@ pub(super) async fn update_graph(
                 .edges
                 .retain(|e| seen_edges.insert(e.stable_id()));
         }
+        let changed_evidence_edges = super::graph::revalidate_incremental_edge_evidence(
+            &graph_state.nodes,
+            &mut graph_state.edges,
+        );
 
         // Collect net-new nodes/edges from the passes for LanceDB persist.
         let new_nodes: Vec<Node> = graph_state
@@ -303,12 +307,13 @@ pub(super) async fn update_graph(
             .filter(|n| !before_node_ids.contains(&n.stable_id()))
             .cloned()
             .collect();
-        let new_edges: Vec<Edge> = graph_state
+        let mut new_edges: Vec<Edge> = graph_state
             .edges
             .iter()
             .filter(|e| !before_edge_ids.contains(&e.stable_id()))
             .cloned()
             .collect();
+        super::graph::replace_edge_upserts(&mut new_edges, changed_evidence_edges);
 
         if !new_nodes.is_empty() || !new_edges.is_empty() {
             tracing::info!(
