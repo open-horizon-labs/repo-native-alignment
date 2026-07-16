@@ -31,4 +31,6 @@ outcome: context-assembly
 
 The reviewer found three correctness gaps: changed-file planning bypassed the shared profile, outer Pass 1 deadlines omitted cancelled work from timeout metrics, and Pass 2 recorded one scheduled request instead of the observation's actual request count. All three were fixed with planner, timeout, and type-hierarchy regression tests before the PR was marked ready.
 
+The first follow-up found a cancellation race in aggregate timeout ownership. Telemetry now registers only started work by item ID; completion and deadline attribution atomically remove that ID, so late completions are ignored and queued work that never issued a request is not labeled timed out. The regression explicitly exercises a completion arriving after timeout attribution.
+
 Formatting-only changes are confined to files materially edited by #767 and result from applying the repository toolchain's formatter to those files. They are acknowledged as review noise but do not alter unrelated behavior.

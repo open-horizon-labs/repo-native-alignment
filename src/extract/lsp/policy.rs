@@ -283,7 +283,7 @@ pub(crate) struct LspQueryTelemetry {
 #[derive(Debug, Default)]
 struct LspQueryTelemetryState {
     metrics: BTreeMap<LspQueryMetricKey, LspQueryMetric>,
-    pending_work: BTreeMap<LspQueryMetricKey, usize>,
+    pending_work: BTreeMap<usize, LspQueryMetricKey>,
 }
 
 impl LspQueryTelemetry {
@@ -297,6 +297,7 @@ impl LspQueryTelemetry {
 
     pub(crate) fn register_work_item(
         &self,
+        work_item_id: usize,
         operation: LspQueryOperation,
         declaration: LspDeclarationClass,
     ) {
@@ -308,7 +309,7 @@ impl LspQueryTelemetry {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        *state.pending_work.entry(key).or_default() += 1;
+        state.pending_work.insert(work_item_id, key);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -323,17 +324,72 @@ impl LspQueryTelemetry {
         errors: usize,
         timeouts: usize,
     ) {
-        let key = LspQueryMetricKey {
-            operation,
-            declaration,
-        };
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(pending) = state.pending_work.get_mut(&key) {
-            *pending = pending.saturating_sub(1);
-        }
+        self.record_locked(
+            &mut state,
+            LspQueryMetricKey {
+                operation,
+                declaration,
+            },
+            scheduled_requests,
+            non_empty_responses,
+            emitted_edges,
+            latency,
+            errors,
+            timeouts,
+        );
+    }
+
+    /// Complete a registered Pass 1 item exactly once. If the outer deadline
+    /// already claimed the item, a late worker completion is ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_work_item(
+        &self,
+        work_item_id: usize,
+        scheduled_requests: usize,
+        non_empty_responses: usize,
+        emitted_edges: usize,
+        latency: Duration,
+        errors: usize,
+        timeouts: usize,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(key) = state.pending_work.remove(&work_item_id) else {
+            return false;
+        };
+        self.record_locked(
+            &mut state,
+            key,
+            scheduled_requests,
+            non_empty_responses,
+            emitted_edges,
+            latency,
+            errors,
+            timeouts,
+        );
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_locked(
+        &self,
+        state: &mut LspQueryTelemetryState,
+        key: LspQueryMetricKey,
+        scheduled_requests: usize,
+        non_empty_responses: usize,
+        emitted_edges: usize,
+        latency: Duration,
+        errors: usize,
+        timeouts: usize,
+    ) {
+        let operation = key.operation;
+        let declaration = key.declaration;
         let metric = state.metrics.entry(key).or_insert_with(|| LspQueryMetric {
             language: self.language.clone(),
             server: self.server.clone(),
@@ -357,38 +413,16 @@ impl LspQueryTelemetry {
     }
 
     /// Attribute work items cancelled by the outer job deadline. Completed
-    /// items have already decremented their pending count in `record`, so this
-    /// drains only queued or in-flight operations and cannot double count them.
+    /// items have already atomically removed their IDs, so this drains only
+    /// in-flight operations and owns their terminal outcome.
     pub(crate) fn record_job_timeout(&self, latency: Duration) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let pending = std::mem::take(&mut state.pending_work);
-        for (key, count) in pending {
-            if count == 0 {
-                continue;
-            }
-            let metric = state.metrics.entry(key.clone()).or_insert_with(|| LspQueryMetric {
-                language: self.language.clone(),
-                server: self.server.clone(),
-                operation: key.operation.as_str().to_string(),
-                declaration_class: key.declaration.as_str().to_string(),
-                scheduled_requests: 0,
-                non_empty_responses: 0,
-                emitted_edges: 0,
-                latency_ms: 0,
-                timeouts: 0,
-                errors: 0,
-            });
-            metric.latency_ms = metric.latency_ms.saturating_add(
-                latency
-                    .as_millis()
-                    .saturating_mul(count as u128)
-                    .min(u64::MAX as u128) as u64,
-            );
-            metric.timeouts = metric.timeouts.saturating_add(count);
-            metric.errors = metric.errors.saturating_add(count);
+        for (_, key) in pending {
+            self.record_locked(&mut state, key, 0, 0, 0, latency, 1, 1);
         }
     }
 
@@ -583,25 +617,35 @@ mod tests {
         let profile = LspQueryProfile::new("rust", "rust-analyzer");
         let telemetry = LspQueryTelemetry::new(&profile);
         telemetry.register_work_item(
+            1,
             LspQueryOperation::CallHierarchy,
             LspDeclarationClass::Function,
         );
         telemetry.register_work_item(
+            2,
             LspQueryOperation::CallHierarchy,
             LspDeclarationClass::Function,
         );
-        telemetry.record(
-            LspQueryOperation::CallHierarchy,
-            LspDeclarationClass::Function,
+        assert!(telemetry.record_work_item(
+            1,
             3,
             1,
             2,
             Duration::from_millis(10),
             0,
             0,
-        );
+        ));
 
         telemetry.record_job_timeout(Duration::from_millis(50));
+        assert!(!telemetry.record_work_item(
+            2,
+            2,
+            1,
+            1,
+            Duration::from_millis(60),
+            0,
+            0,
+        ));
 
         let metrics = telemetry.snapshot();
         assert_eq!(metrics.len(), 1);

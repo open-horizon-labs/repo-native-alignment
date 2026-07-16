@@ -788,14 +788,6 @@ impl LspEnricher {
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
         let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
-        for item in &work_items {
-            if let (Some(operation), Some(declaration)) = (
-                item.requested_operations.first().copied(),
-                LspDeclarationClass::from_kind(&item.node.id.kind),
-            ) {
-                telemetry.register_work_item(operation, declaration);
-            }
-        }
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
@@ -817,6 +809,12 @@ impl LspEnricher {
                 let did_open = Arc::clone(&did_open);
                 let telemetry = Arc::clone(&telemetry);
                 async move {
+                    if let (Some(operation), Some(declaration)) = (
+                        item.requested_operations.first().copied(),
+                        LspDeclarationClass::from_kind(&item.node.id.kind),
+                    ) {
+                        telemetry.register_work_item(item.id, operation, declaration);
+                    }
                     Self::run_pass1_work_item(
                         &item,
                         &transport,
@@ -1022,11 +1020,7 @@ impl LspEnricher {
                 diagnostics
                     .finish_failed(item, format!("failed to resolve file URI: {e}"))
                     .await;
-                if let (Some(operation), Some(declaration)) =
-                    (operation, LspDeclarationClass::from_kind(&node.id.kind))
-                {
-                    telemetry.record(operation, declaration, 0, 0, 0, started_at.elapsed(), 1, 0);
-                }
+                telemetry.record_work_item(item.id, 0, 0, 0, started_at.elapsed(), 1, 0);
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -1045,22 +1039,17 @@ impl LspEnricher {
             diagnostics
                 .finish_failed(item, format!("failed to send textDocument/didOpen: {e}"))
                 .await;
-            if let (Some(operation), Some(declaration)) =
-                (operation, LspDeclarationClass::from_kind(&node.id.kind))
-            {
-                let mut observation = QueryObservation::default();
-                observation.record_error(&e);
-                telemetry.record(
-                    operation,
-                    declaration,
-                    0,
-                    0,
-                    0,
-                    started_at.elapsed(),
-                    observation.errors,
-                    observation.timeouts,
-                );
-            }
+            let mut observation = QueryObservation::default();
+            observation.record_error(&e);
+            telemetry.record_work_item(
+                item.id,
+                0,
+                0,
+                0,
+                started_at.elapsed(),
+                observation.errors,
+                observation.timeouts,
+            );
             return Pass1TaskResult {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
@@ -1144,20 +1133,15 @@ impl LspEnricher {
         };
         had_error |= observation.errors > 0;
 
-        if let (Some(operation), Some(declaration)) =
-            (operation, LspDeclarationClass::from_kind(&node.id.kind))
-        {
-            telemetry.record(
-                operation,
-                declaration,
-                observation.scheduled_requests,
-                observation.non_empty_responses,
-                edges.len(),
-                started_at.elapsed(),
-                observation.errors,
-                observation.timeouts,
-            );
-        }
+        telemetry.record_work_item(
+            item.id,
+            observation.scheduled_requests,
+            observation.non_empty_responses,
+            edges.len(),
+            started_at.elapsed(),
+            observation.errors,
+            observation.timeouts,
+        );
 
         diagnostics
             .finish(item, !had_error, &edges, &new_nodes)
