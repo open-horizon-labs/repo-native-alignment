@@ -3823,18 +3823,99 @@ mod tests {
             language: &'static str,
             server: &'static str,
             args: &'static [&'static str],
+            version_command: &'static str,
+            version_args: &'static [&'static str],
             extension: &'static str,
             config_name: &'static str,
             config: &'static str,
             sources: &'static [(&'static str, &'static str)],
+            expected_const_requests: usize,
+            expected_const_edges:
+                &'static [(&'static str, &'static str, &'static str, &'static str)],
             expect_enable: bool,
         }
+
+        const RUST_CONST_EDGES: &[(&str, &str, &str, &str)] = &[
+            (
+                "src/lib.rs",
+                "local_retry_limit",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            ("src/lib.rs", "make_config", "src/lib.rs", "RETRY_LIMIT"),
+            (
+                "src/worker.rs",
+                "worker_retry_limit",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_config",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            ("src/lib.rs", "local_timeout", "src/lib.rs", "TIMEOUT_MS"),
+            (
+                "src/worker.rs",
+                "worker_timeout",
+                "src/lib.rs",
+                "TIMEOUT_MS",
+            ),
+            ("src/lib.rs", "local_port", "src/lib.rs", "DEFAULT_PORT"),
+            ("src/worker.rs", "worker_port", "src/lib.rs", "DEFAULT_PORT"),
+            ("src/lib.rs", "local_feature", "src/lib.rs", "FEATURE_FLAG"),
+            (
+                "src/worker.rs",
+                "worker_feature",
+                "src/lib.rs",
+                "FEATURE_FLAG",
+            ),
+            (
+                "src/lib.rs",
+                "local_static_timeout",
+                "src/lib.rs",
+                "STATIC_TIMEOUT_MS",
+            ),
+            (
+                "src/worker.rs",
+                "worker_static_timeout",
+                "src/lib.rs",
+                "STATIC_TIMEOUT_MS",
+            ),
+            (
+                "src/lib.rs",
+                "local_mutable_limit",
+                "src/lib.rs",
+                "MUTABLE_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_mutable_limit",
+                "src/lib.rs",
+                "MUTABLE_LIMIT",
+            ),
+            (
+                "src/lib.rs",
+                "local_associated_limit",
+                "src/lib.rs",
+                "ASSOCIATED_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_associated_limit",
+                "src/lib.rs",
+                "ASSOCIATED_LIMIT",
+            ),
+        ];
 
         let cases = [
             FixtureCase {
                 language: "rust",
                 server: "rust-analyzer",
                 args: &[],
+                version_command: "rust-analyzer",
+                version_args: &["--version"],
                 extension: "rs",
                 config_name: "Cargo.toml",
                 config: include_str!("../../../tests/fixtures/lsp_const_yield/rust/Cargo.toml"),
@@ -3848,12 +3929,16 @@ mod tests {
                         include_str!("../../../tests/fixtures/lsp_const_yield/rust/src/worker.rs"),
                     ),
                 ],
+                expected_const_requests: 8,
+                expected_const_edges: RUST_CONST_EDGES,
                 expect_enable: true,
             },
             FixtureCase {
                 language: "python",
                 server: "pyright-langserver",
                 args: &["--stdio"],
+                version_command: "pyright",
+                version_args: &["--version"],
                 extension: "py",
                 config_name: "pyproject.toml",
                 config: include_str!(
@@ -3869,19 +3954,30 @@ mod tests {
                         include_str!("../../../tests/fixtures/lsp_const_yield/python/consumer.py"),
                     ),
                 ],
+                expected_const_requests: 5,
+                expected_const_edges: &[],
                 expect_enable: false,
             },
         ];
 
         for case in cases {
-            if tokio::process::Command::new(case.server)
-                .arg("--version")
+            let version = tokio::process::Command::new(case.version_command)
+                .args(case.version_args)
                 .output()
                 .await
-                .is_err()
-            {
-                panic!("{} is required for the #768 measurement probe", case.server);
-            }
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} is required for the #768 measurement probe: {error}",
+                        case.version_command
+                    )
+                });
+            assert!(
+                version.status.success(),
+                "{} version command failed: {}",
+                case.version_command,
+                String::from_utf8_lossy(&version.stderr)
+            );
+            let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
 
             let fixture = tempfile::tempdir().expect("create measurement fixture");
             std::fs::write(fixture.path().join(case.config_name), case.config)
@@ -3952,23 +4048,10 @@ mod tests {
                     edge.kind == EdgeKind::ReferencedBy && edge.to.kind == NodeKind::Const
                 })
                 .collect::<Vec<_>>();
-            let expected_constants = ["RETRY_LIMIT", "TIMEOUT_MS", "DEFAULT_PORT", "FEATURE_FLAG"];
-            let expected_referrers = [
-                "local_retry_limit",
-                "local_timeout",
-                "local_port",
-                "local_feature",
-                "worker_retry_limit",
-                "worker_timeout",
-                "worker_port",
-                "worker_feature",
-                "make_config",
-                "worker_config",
-            ];
 
             assert_eq!(
-                const_metric.scheduled_requests, 5,
-                "{} should measure exactly five declared constants",
+                const_metric.scheduled_requests, case.expected_const_requests,
+                "{} measured an unexpected declared-constant surface",
                 case.server
             );
             let const_average_ms =
@@ -3990,38 +4073,52 @@ mod tests {
             assert!(
                 const_edges
                     .iter()
-                    .all(|edge| expected_constants.contains(&edge.to.name.as_str())),
-                "{} emitted a Const edge to an unexpected declaration: {const_edges:#?}",
-                case.server
-            );
-            assert!(
-                const_edges
-                    .iter()
-                    .all(|edge| expected_referrers.contains(&edge.from.name.as_str())),
-                "{} emitted a Const edge from an unexpected referrer: {const_edges:#?}",
-                case.server
-            );
-            assert!(
-                const_edges
-                    .iter()
                     .all(|edge| edge.to.name != "UNUSED_SENTINEL"),
                 "{} emitted a spurious edge to the unused control constant",
                 case.server
             );
             if case.expect_enable {
-                for constant in expected_constants {
-                    assert!(
-                        const_edges.iter().any(|edge| edge.to.name == constant),
-                        "{} failed to emit a correct sampled edge for {constant}",
-                        case.server
-                    );
-                }
+                let actual_pairs = const_edges
+                    .iter()
+                    .map(|edge| {
+                        (
+                            edge.from.file.to_string_lossy().to_string(),
+                            edge.from.name.clone(),
+                            edge.to.file.to_string_lossy().to_string(),
+                            edge.to.name.clone(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected_pairs = case
+                    .expected_const_edges
+                    .iter()
+                    .map(|(from_file, from_name, to_file, to_name)| {
+                        (
+                            (*from_file).to_string(),
+                            (*from_name).to_string(),
+                            (*to_file).to_string(),
+                            (*to_name).to_string(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    const_edges.len(),
+                    expected_pairs.len(),
+                    "{} emitted duplicate or extra Const edges: {const_edges:#?}",
+                    case.server
+                );
+                assert_eq!(
+                    actual_pairs, expected_pairs,
+                    "{} Const edge mapping was not exactly correct",
+                    case.server
+                );
             }
 
             eprintln!(
-                "CONST_YIELD_RESULT language={} server={} eligible={} result_errors={} metrics={:#?} const_edges={:#?}",
+                "CONST_YIELD_RESULT language={} server={} version={:?} eligible={} result_errors={} metrics={:#?} const_edges={:#?}",
                 case.language,
                 case.server,
+                version,
                 clears_threshold,
                 result.error_count,
                 result.lsp_query_metrics,
