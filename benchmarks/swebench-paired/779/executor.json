@@ -1,0 +1,19 @@
+{
+  "command": "claude -p --verbose --output-format stream-json --strict-mcp-config --mcp-config \"$SWEBENCH_MCP_CONFIG\" --permission-mode bypassPermissions --model claude-haiku-4-5-20251001 --effort high --max-budget-usd 2 --no-session-persistence \"$(cat \"$SWEBENCH_TASK_PROMPT\")\"",
+  "model": {
+    "budget_usd": 2,
+    "effort": "high",
+    "executor": "Claude Code",
+    "executor_version": "2.1.112",
+    "immutable_id": "claude-haiku-4-5-20251001",
+    "provider": "Anthropic first-party via claude.ai Team authentication",
+    "temperature": "provider default; Claude Code does not expose a temperature flag",
+    "timeout_seconds": 1800
+  },
+  "parity": {
+    "command_shared_across_arms": true,
+    "prompt_shared_across_arms": true,
+    "sampling_shared_across_arms": true,
+    "only_mcp_config_differs": true
+  }
+}

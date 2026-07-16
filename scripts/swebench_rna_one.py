@@ -311,22 +311,33 @@ def unknown_metric(reason: str = "executor/provider did not report this category
     return {"status": "unknown", "value": None, "source": None, "reason": reason}
 
 
-def stage_ledger_skeleton() -> dict[str, Any]:
+def stage_ledger_skeleton(*, arm: str = "rna") -> dict[str, Any]:
     stages: dict[str, Any] = {}
     for stage in STAGE_NAMES:
         stages[stage] = {field: unknown_metric() for field in TOKEN_FIELDS}
-    stages["rna_tool_results_orientation_and_planning"]["delivered_bytes"] = {
-        "status": "pending",
-        "value": None,
-        "source": "mcp_trace",
-        "reason": None,
-    }
-    stages["rna_tool_results_orientation_and_planning"]["mcp_calls"] = {
-        "status": "pending",
-        "value": None,
-        "source": "mcp_trace",
-        "reason": None,
-    }
+    rna_stage = stages["rna_tool_results_orientation_and_planning"]
+    if arm == "rna":
+        rna_stage["delivered_bytes"] = {
+            "status": "pending",
+            "value": None,
+            "source": "mcp_trace",
+            "reason": None,
+        }
+        rna_stage["mcp_calls"] = {
+            "status": "pending",
+            "value": None,
+            "source": "mcp_trace",
+            "reason": None,
+        }
+    else:
+        reason = "not applicable: RNA is intentionally unavailable in baseline arm"
+        for field in (*TOKEN_FIELDS, "delivered_bytes", "mcp_calls"):
+            rna_stage[field] = {
+                "status": "not_applicable",
+                "value": None,
+                "source": "paired_design",
+                "reason": reason,
+            }
     return {
         "schema_version": 2,
         "generated_at": utc_now(),
@@ -352,7 +363,7 @@ def make_task_prompt(instance: Mapping[str, Any], path: Path) -> None:
                 " ".join(
                     [
                         "Solve the issue in the current isolated checkout.",
-                        "Use the configured `rna-server` MCP tools for repository",
+                        "Use the repository tools available in this run for",
                         "orientation before editing. Do not search the network for",
                         "the upstream patch or commit history. Make the smallest",
                         "correct implementation and run focused verification.",
@@ -1112,7 +1123,7 @@ def validate_prerequisites(args: argparse.Namespace, *, dry_run: bool) -> dict[s
                 results[key] = importlib.metadata.version(package)
     if not results["git"]:
         raise HarnessError("git is required")
-    if not args.rna_binary.is_file() and not dry_run:
+    if args.arm == "rna" and not args.rna_binary.is_file() and not dry_run:
         raise HarnessError(f"RNA binary not found: {args.rna_binary}")
     if not dry_run:
         if not results["docker"]:
@@ -1145,6 +1156,12 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("instance_id")
+    parser.add_argument(
+        "--arm",
+        choices=("baseline", "rna"),
+        default="rna",
+        help="paired experiment arm; baseline disables RNA preparation and MCP",
+    )
     executor = parser.add_mutually_exclusive_group(required=True)
     executor.add_argument(
         "--executor-command",
@@ -1215,6 +1232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": "initializing",
         "started_at": utc_now(),
         "instance_id": args.instance_id,
+        "arm": args.arm,
         "dataset": {
             "name": DATASET_NAME,
             "split": DATASET_SPLIT,
@@ -1247,16 +1265,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "configuration": executor_config,
         }
         manifest["rna"] = {
-            "binary": str(args.rna_binary.resolve()),
+            "availability": "available" if args.arm == "rna" else "unavailable",
+            "binary": (
+                str(args.rna_binary.resolve()) if args.arm == "rna" else None
+            ),
             "revision": {
-                "version": prerequisites["rna_version"],
+                "version": prerequisites["rna_version"] if args.arm == "rna" else None,
                 "sha256": (
                     sha256_file(args.rna_binary.resolve())
-                    if args.rna_binary.is_file()
+                    if args.arm == "rna" and args.rna_binary.is_file()
                     else None
                 ),
             },
-            "selected_enrichment_condition": args.enrichment_condition,
+            "selected_enrichment_condition": (
+                args.enrichment_condition if args.arm == "rna" else None
+            ),
         }
         checkout = run_dir / "checkout"
         materialize_started = time.monotonic()
@@ -1271,26 +1294,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         task_prompt = run_dir / "task.md"
         make_task_prompt(instance, task_prompt)
-        ledger = stage_ledger_skeleton()
+        ledger = stage_ledger_skeleton(arm=args.arm)
         ledger_path = run_dir / "stage-ledger.json"
         write_json(ledger_path, ledger)
         proxy_script = Path(__file__).with_name("swebench_rna_mcp_proxy.py").resolve()
         mcp_trace = run_dir / "mcp-trace.jsonl"
         mcp_config_path = run_dir / "mcp-config.json"
-        write_json(
-            mcp_config_path,
+        mcp_config = (
             proxy_config(
                 proxy_script=proxy_script,
                 rna_binary=args.rna_binary.resolve(),
                 checkout=checkout,
                 trace_path=mcp_trace,
                 stderr_path=run_dir / "rna-mcp.stderr.log",
-            ),
+            )
+            if args.arm == "rna"
+            else {"mcpServers": {}}
         )
+        write_json(mcp_config_path, mcp_config)
         predictions_path = run_dir / "prediction.jsonl"
         evaluation_dir = run_dir / "evaluation"
         run_id = (
-            f"rna-{args.instance_id.replace('__', '-').replace('/', '-')}-"
+            f"{args.arm}-{args.instance_id.replace('__', '-').replace('/', '-')}-"
             f"{dt.datetime.now().strftime('%Y%m%d%H%M%S')}"
         )
         evaluator_command = build_evaluator_command(
@@ -1341,21 +1366,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Dry run bundle: {run_dir}")
             return 0
 
-        prewarm_started = time.monotonic()
-        enrichment_state, prewarm_commands = prewarm_rna(
-            rna_binary=args.rna_binary.resolve(),
-            checkout=checkout,
-            run_dir=run_dir,
-            condition=args.enrichment_condition,
-            timeout=args.prewarm_timeout_seconds,
-        )
-        manifest["rna"]["enrichment_state"] = enrichment_state
-        manifest["rna"]["prewarm_commands"] = [
-            dataclasses.asdict(command) for command in prewarm_commands
-        ]
-        manifest["timings"]["prewarm_seconds"] = round(
-            time.monotonic() - prewarm_started, 3
-        )
+        if args.arm == "rna":
+            prewarm_started = time.monotonic()
+            enrichment_state, prewarm_commands = prewarm_rna(
+                rna_binary=args.rna_binary.resolve(),
+                checkout=checkout,
+                run_dir=run_dir,
+                condition=args.enrichment_condition,
+                timeout=args.prewarm_timeout_seconds,
+            )
+            manifest["rna"]["enrichment_state"] = enrichment_state
+            manifest["rna"]["prewarm_commands"] = [
+                dataclasses.asdict(command) for command in prewarm_commands
+            ]
+            manifest["timings"]["prewarm_seconds"] = round(
+                time.monotonic() - prewarm_started, 3
+            )
+        else:
+            manifest["rna"]["enrichment_state"] = {
+                "observed": "not_applicable",
+                "reason": "RNA intentionally unavailable in baseline arm",
+            }
+            manifest["rna"]["prewarm_commands"] = []
+            manifest["timings"]["prewarm_seconds"] = 0.0
         write_json(manifest_path, manifest)
 
         executor_report = run_dir / "executor-report.json"
@@ -1411,18 +1444,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     event for event in supplied_fallbacks if isinstance(event, dict)
                 )
         write_jsonl(run_dir / "fallback-events.jsonl", fallback_events)
-        merge_stage_ledger(
-            ledger,
-            executor_report=executor_report,
-            usage=usage,
-            mcp_summary=mcp_summary,
-        )
+        if args.arm == "rna":
+            merge_stage_ledger(
+                ledger,
+                executor_report=executor_report,
+                usage=usage,
+                mcp_summary=mcp_summary,
+            )
+        else:
+            merge_stage_ledger(
+                ledger,
+                executor_report=executor_report,
+                usage=usage,
+                mcp_summary={
+                    "orientation_delivered_tool_result_bytes": 0,
+                    "orientation_tool_calls": 0,
+                },
+            )
+            ledger["stages"]["rna_tool_results_orientation_and_planning"] = (
+                stage_ledger_skeleton(arm="baseline")["stages"][
+                    "rna_tool_results_orientation_and_planning"
+                ]
+            )
         write_json(ledger_path, ledger)
         if executor_result.exit_code != 0:
             raise HarnessError(
                 f"executor exited {executor_result.exit_code}; artifacts were preserved"
             )
-        if not mcp_summary["observed_real_mcp_use"]:
+        if args.arm == "rna" and not mcp_summary["observed_real_mcp_use"]:
             raise HarnessError(
                 "executor completed without observable traffic through the provided "
                 "RNA stdio MCP endpoint"

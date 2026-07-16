@@ -416,6 +416,6 @@ MIT — see [LICENSE](LICENSE).
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning, dirty-slugs optimization
 - [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
-- [One-instance SWE-bench RNA harness](docs/swebench-rna-one.md) — isolated Verified task, real MCP executor, official evaluator, and auditable token/cost ledger
+- [SWE-bench baseline/RNA harnesses](docs/swebench-rna-one.md) — isolated Verified tasks, paired arms, real MCP executor, official evaluator, and auditable token/cost ledger
 - [ADR Index](docs/ADRs/README.md) — architecture decisions and executable validation references
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration
