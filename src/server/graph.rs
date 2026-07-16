@@ -152,8 +152,8 @@ mod tests {
         assert!(is_manifest_package_edge(&package_dep));
     }
 
-    #[test]
-    fn third_file_evidence_edit_updates_live_edge_and_persist_delta() {
+    #[tokio::test]
+    async fn third_file_evidence_edit_updates_live_edge_and_persist_delta() {
         use crate::graph::{
             Confidence, EdgeEvidence, EdgeKind, EvidenceSelector, ExtractionSource,
             ValidationStatus,
@@ -162,7 +162,7 @@ mod tests {
         let mut evidence_node = node(NodeKind::Other("paragraph".into()), "body");
         evidence_node.id.root = "repo".into();
         evidence_node.id.file = PathBuf::from("chapter.md");
-        evidence_node.body = "edited evidence".into();
+        evidence_node.body = "original evidence".into();
         evidence_node.metadata.insert(
             "body_node_id".into(),
             "chapter.md::body::ast:paragraph[0]".into(),
@@ -199,9 +199,7 @@ mod tests {
                     byte_start: 10,
                     byte_end: 25,
                     body_node_id: "chapter.md::body::ast:paragraph[0]".into(),
-                    snippet_hash: blake3::hash(b"original evidence")
-                        .to_hex()
-                        .to_string(),
+                    snippet_hash: blake3::hash(b"original evidence").to_hex().to_string(),
                     snippet: "original evidence".into(),
                 }],
                 extractor_id: "markdown-ast@1".into(),
@@ -212,6 +210,16 @@ mod tests {
             }],
         };
         let stable_id = edge.stable_id();
+        let dir = tempfile::tempdir().expect("tempdir");
+        persist_graph_to_lance(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            std::slice::from_ref(&edge),
+        )
+        .await
+        .expect("persist initial valid graph");
+
+        evidence_node.body = "edited evidence".into();
         let mut upsert_edges = vec![edge.clone()];
 
         let changed = revalidate_incremental_edge_evidence(
@@ -221,13 +229,76 @@ mod tests {
         replace_edge_upserts(&mut upsert_edges, changed);
 
         assert_eq!(edge.confidence, Confidence::Detected);
-        assert_eq!(
-            edge.evidence[0].validation_status,
-            ValidationStatus::Stale
-        );
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
         assert_eq!(upsert_edges.len(), 1);
         assert_eq!(upsert_edges[0].stable_id(), stable_id);
         assert_eq!(upsert_edges[0].confidence, Confidence::Detected);
+        assert_eq!(
+            upsert_edges[0].evidence[0].confidence,
+            Confidence::Confirmed,
+            "incremental invalidation must preserve declared confidence"
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            &upsert_edges,
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist stale incremental state");
+        assert!(!migrated);
+
+        let mut stale_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load stale graph");
+        assert_eq!(stale_state.edges[0].confidence, Confidence::Detected);
+        assert_eq!(
+            stale_state.edges[0].evidence[0].confidence,
+            Confidence::Confirmed
+        );
+        assert_eq!(
+            stale_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Stale
+        );
+
+        evidence_node.body = "original evidence".into();
+        let restored_edges = revalidate_incremental_edge_evidence(
+            std::slice::from_ref(&evidence_node),
+            &mut stale_state.edges,
+        );
+        assert_eq!(restored_edges.len(), 1);
+        assert_eq!(restored_edges[0].stable_id(), stable_id);
+        assert_eq!(restored_edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            restored_edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            &restored_edges,
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist restored incremental state");
+        assert!(!migrated);
+
+        let restored_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load restored graph");
+        assert_eq!(restored_state.edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            restored_state.edges[0].evidence[0].confidence,
+            Confidence::Confirmed
+        );
+        assert_eq!(
+            restored_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
     }
 
     #[test]

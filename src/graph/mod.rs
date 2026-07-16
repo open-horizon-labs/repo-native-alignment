@@ -351,6 +351,10 @@ pub struct EdgeEvidence {
     pub extractor_id: String,
     pub pack_id: Option<String>,
     pub rule_id: String,
+    /// Confidence declared by the producing extractor/pack. Validation status
+    /// determines whether the containing edge may currently retain that trust;
+    /// the declared value remains intact so a later source restoration can
+    /// recover confidence without regenerating the edge.
     pub confidence: Confidence,
     pub validation_status: ValidationStatus,
 }
@@ -524,6 +528,12 @@ impl Edge {
     }
 
     fn revalidate_evidence_with_index(&mut self, index: &EvidenceNodeIndex<'_>) {
+        let was_lifecycle_downgraded = self.confidence == Confidence::Detected
+            && self.evidence.iter().any(|evidence| {
+                evidence.confidence == Confidence::Confirmed
+                    && evidence.validation_status != ValidationStatus::Valid
+            });
+        let mut all_evidence_valid = true;
         for evidence in &mut self.evidence {
             let custom_provenance_is_valid = !matches!(self.kind, EdgeKind::Other(_))
                 || (!evidence.extractor_id.trim().is_empty()
@@ -567,7 +577,15 @@ impl Edge {
             }
             evidence.validation_status = status;
             if evidence.validation_status != ValidationStatus::Valid {
-                evidence.confidence = Confidence::Detected;
+                all_evidence_valid = false;
+            }
+        }
+        if !self.evidence.is_empty() {
+            if all_evidence_valid {
+                if was_lifecycle_downgraded {
+                    self.confidence = Confidence::Confirmed;
+                }
+            } else {
                 self.confidence = Confidence::Detected;
             }
         }
@@ -873,6 +891,11 @@ mod tests {
         edge.evidence = vec![evidence_for(&node, old_hash)];
         edge.revalidate_evidence(&[node]);
         assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].confidence,
+            Confidence::Confirmed,
+            "source-declared confidence must survive lifecycle downgrades"
+        );
         assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
     }
 
