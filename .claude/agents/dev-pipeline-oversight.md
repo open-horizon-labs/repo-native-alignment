@@ -45,7 +45,7 @@ Runs AFTER Phase 4 merges. Skip if Phase 4 did not merge.
 5. Verify the mandatory independent final-diff review evidence:
    - A fresh, separate repo-local `/review` sub-agent posted explicit `APPROVE`
    - The comment identifies the reviewer task and exact reviewed commit SHA
-   - The reviewed SHA equals the commit that was merged
+   - The reviewed SHA equals the PR's final `headRefOid` at merge time; record the resulting squash merge commit separately
    - No diff change occurred after approval
    - CodeRabbit was not triggered or awaited; if it commented anyway, any actionable finding was handled under step 2
 
