@@ -505,23 +505,41 @@ impl Edge {
 
     fn revalidate_evidence_with_index(&mut self, index: &EvidenceNodeIndex<'_>) {
         for evidence in &mut self.evidence {
-            let mut status = ValidationStatus::Valid;
-            for selector in &evidence.selectors {
-                let matching = index.get(selector);
-                let Some(node) = matching else {
-                    status = ValidationStatus::Unresolved;
-                    break;
-                };
-                let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
-                let ranges_match = node.line_start == selector.line_start
-                    && node.line_end == selector.line_end
-                    && node.metadata.get("byte_start").and_then(|v| v.parse().ok())
-                        == Some(selector.byte_start)
-                    && node.metadata.get("byte_end").and_then(|v| v.parse().ok())
-                        == Some(selector.byte_end);
-                if hash != selector.snippet_hash || !ranges_match {
-                    status = ValidationStatus::Stale;
-                    break;
+            let custom_provenance_is_valid = !matches!(self.kind, EdgeKind::Other(_))
+                || (!evidence.extractor_id.trim().is_empty()
+                    && !evidence.rule_id.trim().is_empty()
+                    && evidence
+                        .pack_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty()));
+            let mut status = if custom_provenance_is_valid {
+                ValidationStatus::Valid
+            } else {
+                ValidationStatus::Invalid
+            };
+            if custom_provenance_is_valid {
+                for selector in &mut evidence.selectors {
+                    let matching = index.get(selector);
+                    let Some(node) = matching else {
+                        status = ValidationStatus::Unresolved;
+                        break;
+                    };
+                    let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+                    let ranges_match = node.line_start == selector.line_start
+                        && node.line_end == selector.line_end
+                        && node.metadata.get("byte_start").and_then(|v| v.parse().ok())
+                            == Some(selector.byte_start)
+                        && node.metadata.get("byte_end").and_then(|v| v.parse().ok())
+                            == Some(selector.byte_end);
+                    if hash != selector.snippet_hash || !ranges_match {
+                        status = ValidationStatus::Stale;
+                        break;
+                    }
+                    // The snippet is display data, not authority. Refresh it only
+                    // after the selector's current hash and source ranges validate
+                    // so MCP output cannot render producer-supplied stale text as
+                    // valid evidence.
+                    selector.snippet.clone_from(&node.body);
                 }
             }
             if evidence.selectors.is_empty() {
@@ -758,7 +776,7 @@ mod tests {
             confidence: Confidence::Detected,
             evidence: Vec::new(),
         }
-        }
+    }
 
     fn evidence_for(node: &Node, hash: String) -> EdgeEvidence {
         EdgeEvidence {
@@ -836,6 +854,83 @@ mod tests {
         edge.revalidate_evidence(&[node]);
         assert_eq!(edge.confidence, Confidence::Detected);
         assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
+    }
+
+    #[test]
+    fn valid_evidence_refreshes_untrusted_display_snippet() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "current source-backed evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "40".into());
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        edge.evidence[0].selectors[0].snippet = "untrusted producer text".into();
+
+        edge.revalidate_evidence(&[node.clone()]);
+
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Valid);
+        assert_eq!(edge.evidence[0].selectors[0].snippet, node.body);
+    }
+
+    #[test]
+    fn custom_evidence_requires_nonblank_provenance_but_generic_evidence_does_not_require_pack() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "source-backed evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "32".into());
+        let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+
+        let mut custom = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        custom.confidence = Confidence::Confirmed;
+        custom.evidence = vec![evidence_for(&node, hash.clone())];
+        custom.evidence[0].extractor_id = " ".into();
+        custom.evidence[0].rule_id.clear();
+        custom.evidence[0].pack_id = Some(" ".into());
+        custom.revalidate_evidence(&[node.clone()]);
+        assert_eq!(custom.confidence, Confidence::Detected);
+        assert_eq!(
+            custom.evidence[0].validation_status,
+            ValidationStatus::Invalid
+        );
+
+        let mut generic = make_edge("claim", "fact", EdgeKind::Calls);
+        generic.confidence = Confidence::Confirmed;
+        generic.evidence = vec![evidence_for(&node, hash)];
+        generic.evidence[0].pack_id = None;
+        generic.revalidate_evidence(&[node]);
+        assert_eq!(generic.confidence, Confidence::Confirmed);
+        assert_eq!(
+            generic.evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
     }
 
     #[test]

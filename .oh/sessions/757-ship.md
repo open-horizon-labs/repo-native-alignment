@@ -61,3 +61,36 @@ Both are fixed:
 - Independent re-review verdict: APPROVE.
 - Strict Clippy: pass.
 - Clean full suite: 2020 library tests passed, 4 ignored; binary, CLI contract, content-source contract, and doc tests passed.
+
+## 2026-07-16 current-main review fixes
+
+Fresh independent review of `e64a1b32` found two final trust gaps:
+
+1. selectors with correct hashes/ranges could retain and render an unrelated
+   producer-supplied `snippet`;
+2. custom edges could remain valid/confirmed without nonblank extractor, rule,
+   and pack provenance.
+
+Both are fixed:
+
+- successful hash/range validation now refreshes display snippets from the
+  matched current body node before MCP rendering;
+- `EdgeKind::Other` evidence fails closed as `Invalid`/`Detected` unless
+  extractor, rule, and pack identifiers are all present and nonblank;
+- generic evidence remains compatible with `pack_id: None`;
+- unit regressions cover correct-hash/wrong-snippet refresh and custom versus
+  generic provenance behavior;
+- the LanceDB round-trip/render regression begins with an untrusted snippet and
+  proves load-time validation replaces it with current source text.
+
+Verification:
+
+- focused evidence tests: 9 passed;
+- `cargo check --lib`: pass;
+- `cargo clippy --no-default-features -- -D warnings`: pass;
+- full suite excluding the known checkout-history/cache-sensitive
+  `test_list_roots_from_slugs_lsp_stats_per_language`: 2,043 library tests,
+  5 binary tests, CLI exit contract, content-source contract, and doc tests
+  passed;
+- the excluded test's ambient live-operation-report failure is unchanged and
+  unrelated to this diff; clean CI remains authoritative for it.

@@ -294,7 +294,7 @@ mod tests {
             byte_end: 47,
             body_node_id: source.metadata["body_node_id"].clone(),
             snippet_hash: blake3::hash(source.body.as_bytes()).to_hex().to_string(),
-            snippet: source.body.clone(),
+            snippet: "stale producer-supplied display text".into(),
         };
         let edge = Edge {
             from: source.id.clone(),
@@ -321,6 +321,10 @@ mod tests {
             state.edges[0].evidence[0].validation_status,
             ValidationStatus::Valid
         );
+        assert_eq!(
+            state.edges[0].evidence[0].selectors[0].snippet, source.body,
+            "load-time validation must refresh display text from the current body"
+        );
         let groups = std::collections::BTreeMap::from([(
             EdgeKind::Other("supports".into()),
             vec![claim.stable_id()],
@@ -333,6 +337,7 @@ mod tests {
         );
         assert!(rendered.contains("chapter.md:4-4"));
         assert!(rendered.contains("Retries cap cascading load."));
+        assert!(!rendered.contains("stale producer-supplied display text"));
         assert!(rendered.contains("supports@1"));
         assert!(rendered.contains("Valid"));
     }
