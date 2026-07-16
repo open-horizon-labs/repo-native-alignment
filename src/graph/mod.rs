@@ -484,12 +484,32 @@ impl Edge {
             base
         } else {
             // Lifecycle state and confidence may change after revalidation; they
-            // are deliberately excluded from identity. Material source/rule
-            // differences remain identity-bearing.
+            // are deliberately excluded from identity. The rendered snippet is
+            // refreshed from current source after validation and is display-only,
+            // so identity uses only authoritative selector coordinates/hash plus
+            // source/rule provenance.
             let identity: Vec<_> = self
                 .evidence
                 .iter()
-                .map(|e| (&e.selectors, &e.extractor_id, &e.pack_id, &e.rule_id))
+                .map(|e| {
+                    let selectors: Vec<_> = e
+                        .selectors
+                        .iter()
+                        .map(|selector| {
+                            (
+                                &selector.root_id,
+                                &selector.file_path,
+                                selector.line_start,
+                                selector.line_end,
+                                selector.byte_start,
+                                selector.byte_end,
+                                &selector.body_node_id,
+                                &selector.snippet_hash,
+                            )
+                        })
+                        .collect();
+                    (selectors, &e.extractor_id, &e.pack_id, &e.rule_id)
+                })
                 .collect();
             let encoded = serde_json::to_vec(&identity).unwrap_or_default();
             format!("{base}->evidence:{}", blake3::hash(&encoded).to_hex())
@@ -881,12 +901,18 @@ mod tests {
             blake3::hash(node.body.as_bytes()).to_hex().to_string(),
         )];
         edge.evidence[0].selectors[0].snippet = "untrusted producer text".into();
+        let stable_id_before_refresh = edge.stable_id();
 
         edge.revalidate_evidence(&[node.clone()]);
 
         assert_eq!(edge.confidence, Confidence::Confirmed);
         assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Valid);
         assert_eq!(edge.evidence[0].selectors[0].snippet, node.body);
+        assert_eq!(
+            edge.stable_id(),
+            stable_id_before_refresh,
+            "refreshing display-only snippet text must not churn durable edge identity"
+        );
     }
 
     #[test]

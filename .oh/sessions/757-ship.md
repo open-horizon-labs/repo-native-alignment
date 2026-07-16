@@ -94,3 +94,11 @@ Verification:
   passed;
 - the excluded test's ambient live-operation-report failure is unchanged and
   unrelated to this diff; clean CI remains authoritative for it.
+
+Independent re-review of `3516d7ca` found one P1 identity regression: the
+display-only snippet refresh changed `Edge::stable_id()` because the full
+selector was hashed. The stable identity projection now excludes `snippet`
+while retaining root/file/line/byte/body-node/hash coordinates and provenance.
+The correct-hash/wrong-snippet regression also asserts that validation refreshes
+display text without changing durable edge identity. Focused evidence tests
+remain 9/9 passing.
