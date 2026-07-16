@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
@@ -177,8 +178,573 @@ impl Extractor for MarkdownExtractor {
         // 4. Local knowledge graph declarations: human-editable frontmatter -> custom nodes/edges.
         emit_local_knowledge_graph(path, content, &mut nodes, &mut edges);
 
+        // 5. Source-addressable body AST. Keep the legacy section nodes above for
+        // compatibility while exposing every Markdown body construct through the
+        // canonical content-source selector contract.
+        emit_body_ast(path, content, &mut nodes, &mut edges);
+
         Ok(ExtractionResult { nodes, edges })
     }
+}
+
+const MARKDOWN_EXTRACTOR_ID: &str = "rna.markdown.pulldown-cmark@1";
+
+#[derive(Debug)]
+struct OpenBodyNode {
+    kind: &'static str,
+    start: usize,
+    ordinal: usize,
+    parent_path: String,
+    explicit_id: Option<String>,
+    anchor: Option<String>,
+    target: Option<String>,
+}
+
+fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>) {
+    let mut stack: Vec<OpenBodyNode> = Vec::new();
+    let mut sibling_counts: Vec<BTreeMap<&'static str, usize>> = vec![BTreeMap::new()];
+    let mut explicit_ids: BTreeMap<String, usize> = BTreeMap::new();
+    let options = Options::all();
+
+    for (event, range) in Parser::new_ext(content, options).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                let Some(kind) = body_kind(&tag) else {
+                    continue;
+                };
+                let depth = stack.len();
+                while sibling_counts.len() <= depth {
+                    sibling_counts.push(BTreeMap::new());
+                }
+                let ordinal = *sibling_counts[depth].entry(kind).or_insert(0);
+                *sibling_counts[depth].entry(kind).or_insert(0) += 1;
+                sibling_counts.truncate(depth + 1);
+                sibling_counts.push(BTreeMap::new());
+                let parent_path = stack.last().map(ast_path).unwrap_or_default();
+                let (explicit_id, anchor, target) = tag_identity(&tag, content, range.clone());
+                stack.push(OpenBodyNode {
+                    kind,
+                    start: range.start,
+                    ordinal,
+                    parent_path,
+                    explicit_id,
+                    anchor,
+                    target,
+                });
+            }
+            Event::End(end) => {
+                let Some(kind) = end_kind(end) else { continue };
+                let Some(index) = stack.iter().rposition(|open| open.kind == kind) else {
+                    continue;
+                };
+                let open = stack.remove(index);
+                let end = range.end.max(open.start).min(content.len());
+                let node = make_body_node(path, content, &open, end, &mut explicit_ids);
+                if open.kind == "image" {
+                    let selected = &content[open.start..end];
+                    if let Some(close) = selected.strip_prefix("![").and_then(|rest| rest.find(']'))
+                        && close > 0
+                    {
+                        let caption_start = open.start + 2;
+                        emit_leaf_body_node(
+                            path,
+                            content,
+                            "caption",
+                            caption_start..caption_start + close,
+                            None,
+                            ast_path(&open),
+                            0,
+                            nodes,
+                        );
+                    }
+                }
+                nodes.push(node);
+            }
+            Event::FootnoteReference(label) => {
+                let depth = stack.len();
+                while sibling_counts.len() <= depth {
+                    sibling_counts.push(BTreeMap::new());
+                }
+                let ordinal = *sibling_counts[depth].entry("citation").or_insert(0);
+                *sibling_counts[depth].entry("citation").or_insert(0) += 1;
+                let open = OpenBodyNode {
+                    kind: "citation",
+                    start: range.start,
+                    ordinal,
+                    parent_path: stack.last().map(ast_path).unwrap_or_default(),
+                    explicit_id: None,
+                    anchor: None,
+                    target: None,
+                };
+                let mut node =
+                    make_body_node(path, content, &open, range.end, &mut BTreeMap::new());
+                node.metadata
+                    .insert("citation_label".into(), label.to_string());
+                nodes.push(node);
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                let kind = if html.trim_start().starts_with("<!--") {
+                    "html_comment"
+                } else {
+                    "html_directive"
+                };
+                let depth = stack.len();
+                while sibling_counts.len() <= depth {
+                    sibling_counts.push(BTreeMap::new());
+                }
+                let ordinal = *sibling_counts[depth].entry(kind).or_insert(0);
+                *sibling_counts[depth].entry(kind).or_insert(0) += 1;
+                emit_leaf_body_node(
+                    path,
+                    content,
+                    kind,
+                    range.clone(),
+                    None,
+                    stack.last().map(ast_path).unwrap_or_default(),
+                    ordinal,
+                    nodes,
+                );
+                let directive = html
+                    .trim()
+                    .trim_start_matches("<!--")
+                    .trim_start_matches('<')
+                    .trim()
+                    .split(|c: char| c == ':' || c == '>' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(directive.as_str(), "prompt" | "exercise") {
+                    let semantic_kind = if directive == "prompt" {
+                        "prompt"
+                    } else {
+                        "exercise"
+                    };
+                    let ordinal = *sibling_counts[depth].entry(semantic_kind).or_insert(0);
+                    *sibling_counts[depth].entry(semantic_kind).or_insert(0) += 1;
+                    emit_leaf_body_node(
+                        path,
+                        content,
+                        semantic_kind,
+                        range,
+                        None,
+                        stack.last().map(ast_path).unwrap_or_default(),
+                        ordinal,
+                        nodes,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (explicit_id, _count) in explicit_ids.iter().filter(|(_, count)| **count > 1) {
+        for node in nodes.iter_mut().filter(|node| {
+            node.id.file == path && node.metadata.get("explicit_id") == Some(explicit_id)
+        }) {
+            node.metadata
+                .insert("validation_status".into(), "invalid".into());
+            node.metadata
+                .insert("diagnostic_code".into(), "content.duplicate_body_id".into());
+            node.metadata
+                .insert("diagnostic_severity".into(), "error".into());
+            node.metadata.insert(
+                "diagnostic_message".into(),
+                format!("duplicate explicit Markdown body ID: {explicit_id}"),
+            );
+        }
+    }
+}
+
+fn body_kind(tag: &Tag<'_>) -> Option<&'static str> {
+    Some(match tag {
+        Tag::Paragraph => "paragraph",
+        Tag::Heading { .. } => "heading",
+        Tag::BlockQuote(_) => "blockquote",
+        Tag::CodeBlock(_) => "code_fence",
+        Tag::HtmlBlock => "html_directive",
+        Tag::FootnoteDefinition(_) => "footnote",
+        Tag::Table(_) => "table",
+        Tag::TableHead => "table_head",
+        Tag::TableRow => "table_row",
+        Tag::TableCell => "table_cell",
+        Tag::Link { .. } => "link",
+        Tag::Image { .. } => "image",
+        _ => return None,
+    })
+}
+
+fn end_kind(end: TagEnd) -> Option<&'static str> {
+    Some(match end {
+        TagEnd::Paragraph => "paragraph",
+        TagEnd::Heading(_) => "heading",
+        TagEnd::BlockQuote(_) => "blockquote",
+        TagEnd::CodeBlock => "code_fence",
+        TagEnd::HtmlBlock => "html_directive",
+        TagEnd::FootnoteDefinition => "footnote",
+        TagEnd::Table => "table",
+        TagEnd::TableHead => "table_head",
+        TagEnd::TableRow => "table_row",
+        TagEnd::TableCell => "table_cell",
+        TagEnd::Link => "link",
+        TagEnd::Image => "image",
+        _ => return None,
+    })
+}
+
+fn tag_identity(
+    tag: &Tag<'_>,
+    content: &str,
+    range: std::ops::Range<usize>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Tag::Heading { id, .. } = tag {
+        let explicit = id
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| explicit_inline_id(&content[range.clone()]));
+        let anchor = explicit
+            .clone()
+            .or_else(|| Some(slugify_heading(&content[range])));
+        (explicit, anchor, None)
+    } else if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = tag {
+        (None, None, Some(dest_url.to_string()))
+    } else {
+        (None, None, None)
+    }
+}
+
+fn explicit_inline_id(text: &str) -> Option<String> {
+    let marker = text.rsplit_once("{#")?.1;
+    Some(marker.split('}').next()?.trim().to_string()).filter(|id| !id.is_empty())
+}
+
+fn slugify_heading(text: &str) -> String {
+    text.trim_start_matches('#')
+        .trim()
+        .trim_end_matches(['\r', '\n'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+fn ast_path(open: &OpenBodyNode) -> String {
+    let own = format!("{}[{}]", open.kind, open.ordinal);
+    if open.parent_path.is_empty() {
+        own
+    } else {
+        format!("{}/{}", open.parent_path, own)
+    }
+}
+
+fn body_node_id(path: &Path, open: &OpenBodyNode) -> NodeId {
+    let contract_file = contract_path(path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let stable = match &open.explicit_id {
+        Some(id) => format!("{contract_file}::body::explicit:{}", percent_encode(id)),
+        None => format!("{contract_file}::body::ast:{}", ast_path(open)),
+    };
+    NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: stable,
+        kind: NodeKind::MarkdownSection,
+    }
+}
+
+fn make_body_node(
+    path: &Path,
+    content: &str,
+    open: &OpenBodyNode,
+    end: usize,
+    explicit_ids: &mut BTreeMap<String, usize>,
+) -> Node {
+    let mut metadata = selector_metadata(
+        path,
+        content,
+        open.start,
+        end,
+        open.kind,
+        open.explicit_id.as_deref(),
+    );
+    let id = body_node_id(path, open);
+    metadata.insert("body_node_id".into(), id.name.clone());
+    if let Some(anchor) = &open.anchor {
+        metadata.insert("anchor".into(), anchor.clone());
+    }
+    if let Some(oh_kind) = detect_oh_kind(path) {
+        metadata.insert("oh_kind".into(), oh_kind);
+    }
+    if let Some(explicit) = &open.explicit_id {
+        let count = explicit_ids.entry(explicit.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            metadata.insert("validation_status".into(), "invalid".into());
+            metadata.insert("diagnostic_code".into(), "content.duplicate_body_id".into());
+        }
+    }
+    let selected = &content[open.start..end];
+    if open.kind == "image"
+        && let Some(caption) = selected
+            .split_once("![")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(caption, _)| caption)
+        && !caption.is_empty()
+    {
+        metadata.insert("caption".into(), caption.to_string());
+    }
+    if open.kind == "link"
+        && let Some(destination) = open.target.as_deref()
+        && let Some((file, anchor)) = destination.split_once('#')
+        && !anchor.is_empty()
+        && !destination.starts_with("http://")
+        && !destination.starts_with("https://")
+        && !destination.starts_with("mailto:")
+        && !destination.starts_with("data:")
+        && !Path::new(file).is_absolute()
+    {
+        let target_file = if file.is_empty() {
+            path.to_path_buf()
+        } else {
+            normalize_path(&path.parent().unwrap_or(Path::new("")).join(file))
+        };
+        metadata.insert("target_file".into(), target_file.display().to_string());
+        metadata.insert("target_anchor".into(), anchor.to_string());
+        if metadata.get("validation_status").map(String::as_str) == Some("valid") {
+            metadata.insert("validation_status".into(), "unresolved".into());
+        }
+    }
+    if matches!(open.kind, "html_comment" | "html_directive") {
+        let directive = selected
+            .trim()
+            .trim_start_matches("<!--")
+            .trim_start_matches('<')
+            .trim()
+            .split(|c: char| c == ':' || c == '>' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if !directive.is_empty() {
+            metadata.insert("directive_name".into(), directive.to_ascii_lowercase());
+        }
+    }
+    Node {
+        id,
+        language: "markdown".into(),
+        line_start: line_at(content, open.start),
+        line_end: line_end_at(content, open.start, end),
+        signature: open.kind.into(),
+        body: content[open.start..end].to_string(),
+        metadata,
+        source: ExtractionSource::Markdown,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf_body_node(
+    path: &Path,
+    content: &str,
+    kind: &'static str,
+    range: std::ops::Range<usize>,
+    explicit: Option<String>,
+    parent_path: String,
+    ordinal: usize,
+    nodes: &mut Vec<Node>,
+) {
+    let open = OpenBodyNode {
+        kind,
+        start: range.start,
+        ordinal,
+        parent_path,
+        explicit_id: explicit,
+        anchor: None,
+        target: None,
+    };
+    nodes.push(make_body_node(
+        path,
+        content,
+        &open,
+        range.end,
+        &mut BTreeMap::new(),
+    ));
+}
+
+fn selector_metadata(
+    path: &Path,
+    content: &str,
+    start: usize,
+    end: usize,
+    kind: &str,
+    explicit: Option<&str>,
+) -> BTreeMap<String, String> {
+    let end = end.min(content.len());
+    let mut metadata = BTreeMap::new();
+    metadata.insert("markdown_kind".into(), kind.into());
+    if let Some(contract_path) = contract_path(path) {
+        metadata.insert("file_path".into(), contract_path.display().to_string());
+    } else {
+        metadata.insert("file_path".into(), path.display().to_string());
+        metadata.insert("validation_status".into(), "invalid".into());
+        metadata.insert(
+            "diagnostic_code".into(),
+            "content.invalid_selector_path".into(),
+        );
+        metadata.insert("diagnostic_severity".into(), "error".into());
+        metadata.insert(
+            "diagnostic_message".into(),
+            "selector file_path must be normalized and repository-relative".into(),
+        );
+    }
+    metadata.insert("line_start".into(), line_at(content, start).to_string());
+    metadata.insert(
+        "line_end".into(),
+        line_end_at(content, start, end).to_string(),
+    );
+    metadata.insert("byte_start".into(), start.to_string());
+    metadata.insert("byte_end".into(), end.to_string());
+    metadata.insert(
+        "snippet_hash".into(),
+        blake3::hash(&content.as_bytes()[start..end])
+            .to_hex()
+            .to_string(),
+    );
+    metadata.insert("extractor_id".into(), MARKDOWN_EXTRACTOR_ID.into());
+    metadata.insert("confidence".into(), "detected".into());
+    metadata
+        .entry("validation_status".into())
+        .or_insert_with(|| "valid".into());
+    if let Some(id) = explicit {
+        metadata.insert("explicit_id".into(), id.into());
+    }
+    metadata
+}
+
+fn line_at(content: &str, byte: usize) -> usize {
+    content[..byte.min(content.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1
+}
+
+fn line_end_at(content: &str, start: usize, end: usize) -> usize {
+    line_at(content, if end > start { end - 1 } else { end })
+}
+
+fn percent_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (*byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn contract_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+    let normalized = normalize_path(path);
+    if matches!(
+        normalized.components().next(),
+        Some(std::path::Component::ParentDir)
+    ) {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Resolve exact Markdown anchors after all files have been extracted. Unresolved
+/// candidates remain visible on their source link node with the contract diagnostic.
+pub fn markdown_anchor_pass(all_nodes: &mut [Node]) -> Vec<Edge> {
+    let mut candidates: BTreeMap<(String, PathBuf, String), Vec<NodeId>> = BTreeMap::new();
+    for node in all_nodes
+        .iter()
+        .filter(|node| node.metadata.get("validation_status").map(String::as_str) == Some("valid"))
+    {
+        if let Some(anchor) = node.metadata.get("anchor") {
+            candidates
+                .entry((node.id.root.clone(), node.id.file.clone(), anchor.clone()))
+                .or_default()
+                .push(node.id.clone());
+        }
+    }
+    let duplicate_ids: std::collections::HashSet<NodeId> = candidates
+        .values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .cloned()
+        .collect();
+    for node in all_nodes
+        .iter_mut()
+        .filter(|node| duplicate_ids.contains(&node.id))
+    {
+        node.metadata
+            .insert("validation_status".into(), "invalid".into());
+        node.metadata
+            .insert("diagnostic_code".into(), "content.duplicate_anchor".into());
+        node.metadata
+            .insert("diagnostic_severity".into(), "error".into());
+        node.metadata.insert(
+            "diagnostic_message".into(),
+            "duplicate generated Markdown anchor".into(),
+        );
+    }
+    let anchors: BTreeMap<_, _> = candidates
+        .into_iter()
+        .filter_map(|(key, ids)| (ids.len() == 1).then(|| (key, ids[0].clone())))
+        .collect();
+    let mut edges = Vec::new();
+    for node in all_nodes.iter_mut() {
+        let (Some(target_file), Some(target_anchor)) = (
+            node.metadata.get("target_file").cloned(),
+            node.metadata.get("target_anchor").cloned(),
+        ) else {
+            continue;
+        };
+        let key = (
+            node.id.root.clone(),
+            PathBuf::from(target_file),
+            target_anchor,
+        );
+        if let Some(target) = anchors.get(&key) {
+            node.metadata
+                .insert("validation_status".into(), "valid".into());
+            node.metadata.remove("diagnostic_code");
+            node.metadata.remove("diagnostic_severity");
+            node.metadata.remove("diagnostic_message");
+            edges.push(Edge {
+                from: node.id.clone(),
+                to: target.clone(),
+                kind: EdgeKind::References,
+                source: ExtractionSource::Markdown,
+                confidence: Confidence::Confirmed,
+            });
+        } else {
+            node.metadata
+                .insert("validation_status".into(), "unresolved".into());
+            node.metadata
+                .insert("diagnostic_code".into(), "content.unresolved_anchor".into());
+            node.metadata
+                .insert("diagnostic_severity".into(), "error".into());
+            node.metadata.insert(
+                "diagnostic_message".into(),
+                format!(
+                    "Markdown anchor #{} does not resolve in {}",
+                    key.2,
+                    key.1.display()
+                ),
+            );
+        }
+    }
+    edges
 }
 
 /// Emit `Defines` edges from parent heading sections to child heading sections.
@@ -857,6 +1423,14 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
+    fn legacy_section_count(result: &ExtractionResult) -> usize {
+        result
+            .nodes
+            .iter()
+            .filter(|node| !node.metadata.contains_key("markdown_kind"))
+            .count()
+    }
+
     #[test]
     fn test_markdown_extractor_basic() {
         let extractor = MarkdownExtractor::new();
@@ -864,24 +1438,29 @@ mod tests {
             "# Title\n\nIntro text.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        assert_eq!(result.nodes.len(), 3);
+        let sections: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| !node.metadata.contains_key("markdown_kind"))
+            .collect();
+        assert_eq!(sections.len(), 3);
 
         // First node: Title section
-        assert_eq!(result.nodes[0].id.name, "Title");
+        assert_eq!(sections[0].id.name, "Title");
         assert_eq!(
-            result.nodes[0].metadata.get("heading_level"),
+            sections[0].metadata.get("heading_level"),
             Some(&"1".to_string())
         );
 
         // Second node: Section A
-        assert_eq!(result.nodes[1].id.name, "Section A");
+        assert_eq!(sections[1].id.name, "Section A");
         assert_eq!(
-            result.nodes[1].metadata.get("heading_hierarchy"),
+            sections[1].metadata.get("heading_hierarchy"),
             Some(&"# Title > ## Section A".to_string())
         );
 
         // Third node: Section B
-        assert_eq!(result.nodes[2].id.name, "Section B");
+        assert_eq!(sections[2].id.name, "Section B");
     }
 
     #[test]
@@ -1145,7 +1724,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
         let content = "Some preamble text.\n\n# First Heading\n\nBody.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        assert_eq!(result.nodes.len(), 2);
+        assert_eq!(legacy_section_count(&result), 2);
         assert_eq!(result.nodes[0].id.name, "preamble");
         assert_eq!(
             result.nodes[0].metadata.get("heading_level"),
@@ -1159,7 +1738,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
         let content = "# The `Config` struct\n\nUse `Config::new()` to create.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(legacy_section_count(&result), 1);
         let meta = &result.nodes[0].metadata;
         assert!(meta.get("code_spans").unwrap().contains("Config"));
         assert!(meta.get("code_spans").unwrap().contains("Config::new()"));
@@ -1171,7 +1750,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
         let content = "# Top\n\n## Sub\n\n### Deep\n\nDeep content.\n\n## Another Sub\n\nMore.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        assert_eq!(result.nodes.len(), 4);
+        assert_eq!(legacy_section_count(&result), 4);
 
         // Deep section should have full hierarchy
         assert_eq!(result.nodes[2].id.name, "Deep");
@@ -1440,7 +2019,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
         let content = "# Top\n\n## Child A\n\nContent A.\n\n## Child B\n\nContent B.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        assert_eq!(result.nodes.len(), 3);
+        assert_eq!(legacy_section_count(&result), 3);
 
         // Should have 2 Defines edges: Top -> Child A, Top -> Child B
         let defines: Vec<_> = result
@@ -2312,5 +2891,343 @@ The manuscript uses the proxy-risk claim in the opening argument.
             detect_oh_kind(Path::new(".github/ISSUE_TEMPLATE/bug.md")),
             None
         );
+    }
+
+    #[test]
+    fn body_ast_emits_required_source_backed_constructs() {
+        let source = "# Title {#stable-title}\n\nParagraph with [link](#stable-title), ![caption](image.png), and note[^1].\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n[^1]: citation\n\n<!-- prompt: explain the result -->\n<!-- exercise: try another input -->\n";
+        let mut result = MarkdownExtractor::new()
+            .extract(Path::new("docs/example.md"), source)
+            .unwrap();
+        let anchor_edges = markdown_anchor_pass(&mut result.nodes);
+        let kinds: HashSet<&str> = result
+            .nodes
+            .iter()
+            .filter_map(|node| node.metadata.get("markdown_kind").map(String::as_str))
+            .collect();
+
+        for required in [
+            "heading",
+            "paragraph",
+            "link",
+            "image",
+            "citation",
+            "footnote",
+            "blockquote",
+            "code_fence",
+            "table",
+            "table_row",
+            "table_cell",
+            "html_comment",
+            "prompt",
+            "exercise",
+            "caption",
+        ] {
+            assert!(kinds.contains(required), "missing {required}: {kinds:?}");
+        }
+
+        for node in result
+            .nodes
+            .iter()
+            .filter(|node| node.metadata.contains_key("markdown_kind"))
+        {
+            for key in [
+                "body_node_id",
+                "file_path",
+                "line_start",
+                "line_end",
+                "byte_start",
+                "byte_end",
+                "snippet_hash",
+                "extractor_id",
+                "confidence",
+                "validation_status",
+            ] {
+                assert!(
+                    node.metadata.contains_key(key),
+                    "{} lacks {key}",
+                    node.id.name
+                );
+            }
+            let start: usize = node.metadata["byte_start"].parse().unwrap();
+            let end: usize = node.metadata["byte_end"].parse().unwrap();
+            assert_eq!(node.body, source[start..end]);
+            assert_eq!(
+                node.metadata["snippet_hash"],
+                blake3::hash(source[start..end].as_bytes())
+                    .to_hex()
+                    .to_string()
+            );
+        }
+
+        assert!(anchor_edges.iter().any(|edge| {
+            edge.kind == EdgeKind::References && edge.confidence == Confidence::Confirmed
+        }));
+    }
+
+    #[test]
+    fn explicit_inline_id_preserves_identity_when_heading_moves() {
+        let extractor = MarkdownExtractor::new();
+        let before = extractor
+            .extract(Path::new("doc.md"), "# Stable {#same-id}\n")
+            .unwrap();
+        let after = extractor
+            .extract(Path::new("doc.md"), "Prelude\n\n# Stable {#same-id}\n")
+            .unwrap();
+        let explicit = |result: &ExtractionResult| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.metadata.get("explicit_id") == Some(&"same-id".to_string()))
+                .unwrap()
+                .id
+                .name
+                .clone()
+        };
+        assert_eq!(explicit(&before), explicit(&after));
+        assert!(explicit(&before).ends_with("::body::explicit:same-id"));
+        assert_eq!(percent_encode("same id/✓"), "same%20id%2F%E2%9C%93");
+    }
+
+    #[test]
+    fn structural_identity_survives_text_edit_but_hash_changes() {
+        let extractor = MarkdownExtractor::new();
+        let before = extractor.extract(Path::new("doc.md"), "First.\n").unwrap();
+        let after = extractor.extract(Path::new("doc.md"), "Second.\n").unwrap();
+        let before_paragraph = before
+            .nodes
+            .iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+            .unwrap();
+        let after_paragraph = after
+            .nodes
+            .iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+            .unwrap();
+        assert_eq!(before_paragraph.id, after_paragraph.id);
+        assert_ne!(
+            before_paragraph.metadata["snippet_hash"],
+            after_paragraph.metadata["snippet_hash"]
+        );
+    }
+
+    #[test]
+    fn unresolved_same_file_anchor_emits_contract_diagnostic() {
+        let mut result = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "[missing](#does-not-exist)\n")
+            .unwrap();
+        assert!(markdown_anchor_pass(&mut result.nodes).is_empty());
+        let diagnostic = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.metadata.get("diagnostic_code")
+                    == Some(&"content.unresolved_anchor".to_string())
+            })
+            .expect("unresolved anchor diagnostic");
+        assert_eq!(diagnostic.metadata["validation_status"], "unresolved");
+        assert_eq!(diagnostic.metadata["diagnostic_severity"], "error");
+        assert!(diagnostic.metadata["diagnostic_message"].contains("does not resolve"));
+    }
+
+    #[test]
+    fn cross_file_anchor_resolves_only_against_exact_target() {
+        let extractor = MarkdownExtractor::new();
+        let mut nodes = extractor
+            .extract(Path::new("docs/source.md"), "[target](target.md#exact)\n")
+            .unwrap()
+            .nodes;
+        nodes.extend(
+            extractor
+                .extract(Path::new("docs/target.md"), "# Target {#exact}\n")
+                .unwrap()
+                .nodes,
+        );
+        let edges = markdown_anchor_pass(&mut nodes);
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].to.file.ends_with("docs/target.md"));
+        let link = nodes
+            .iter()
+            .find(|node| node.metadata.get("target_anchor") == Some(&"exact".to_string()))
+            .unwrap();
+        assert_eq!(link.metadata["validation_status"], "valid");
+        assert!(!link.metadata.contains_key("diagnostic_code"));
+    }
+
+    #[test]
+    fn reference_style_anchor_uses_parser_resolved_destination() {
+        let extractor = MarkdownExtractor::new();
+        let mut nodes = extractor
+            .extract(
+                Path::new("docs/source.md"),
+                "[target][ref]\n\n[ref]: target.md#exact\n",
+            )
+            .unwrap()
+            .nodes;
+        nodes.extend(
+            extractor
+                .extract(Path::new("docs/target.md"), "# Target {#exact}\n")
+                .unwrap()
+                .nodes,
+        );
+        assert_eq!(markdown_anchor_pass(&mut nodes).len(), 1);
+    }
+
+    #[test]
+    fn selector_paths_reject_absolute_and_repo_escape_paths() {
+        for path in [Path::new("/tmp/doc.md"), Path::new("../doc.md")] {
+            let result = MarkdownExtractor::new().extract(path, "Body.\n").unwrap();
+            let body = result
+                .nodes
+                .iter()
+                .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+                .unwrap();
+            assert_eq!(body.metadata["validation_status"], "invalid");
+            assert_eq!(
+                body.metadata["diagnostic_code"],
+                "content.invalid_selector_path"
+            );
+            assert!(body.metadata.contains_key("diagnostic_message"));
+        }
+    }
+
+    #[test]
+    fn merged_contract_fixtures_drive_extractor_validation() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/content_source_contract");
+        let positive = std::fs::read_to_string(root.join("body-backed-control.md")).unwrap();
+        let mut positive_nodes = MarkdownExtractor::new()
+            .extract(Path::new("body-backed-control.md"), &positive)
+            .unwrap()
+            .nodes;
+        assert!(positive_nodes.iter().any(|node| {
+            node.metadata.get("markdown_kind") == Some(&"paragraph".to_string())
+                && node.metadata.get("validation_status") == Some(&"valid".to_string())
+                && node.metadata.contains_key("snippet_hash")
+        }));
+        let broken = std::fs::read_to_string(root.join("broken-anchor.md")).unwrap();
+        let mut broken_nodes = MarkdownExtractor::new()
+            .extract(Path::new("broken-anchor.md"), &broken)
+            .unwrap()
+            .nodes;
+        markdown_anchor_pass(&mut broken_nodes);
+        assert!(broken_nodes.iter().any(|node| {
+            node.metadata.get("diagnostic_code") == Some(&"content.unresolved_anchor".to_string())
+        }));
+        // Keep the mutable binding used above meaningful: the positive corpus
+        // must not acquire an unresolved selector when it has no broken link.
+        assert!(markdown_anchor_pass(&mut positive_nodes).is_empty());
+    }
+
+    #[test]
+    fn duplicate_explicit_ids_are_invalid() {
+        let result = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "# One {#dup}\n\n# Two {#dup}\n")
+            .unwrap();
+        assert!(result.nodes.iter().any(|node| {
+            node.metadata.get("diagnostic_code") == Some(&"content.duplicate_body_id".to_string())
+                && node.metadata.get("validation_status") == Some(&"invalid".to_string())
+        }));
+    }
+
+    #[test]
+    fn captions_use_exact_nonempty_alt_text_span() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "![caption](image.png) ![](empty.png)\n",
+            )
+            .unwrap();
+        let captions: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| node.metadata.get("markdown_kind") == Some(&"caption".to_string()))
+            .collect();
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0].body, "caption");
+        assert_eq!(captions[0].line_start, 1);
+    }
+
+    #[test]
+    fn duplicate_generated_anchors_are_diagnosed_not_resolved() {
+        let mut nodes = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "# Same\n\n# Same\n\n[link](#same)\n")
+            .unwrap()
+            .nodes;
+        assert!(markdown_anchor_pass(&mut nodes).is_empty());
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.metadata.get("diagnostic_code")
+                        == Some(&"content.duplicate_anchor".to_string())
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn external_fragment_links_do_not_become_repository_targets() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "[external](https://example.com/doc#part)\n",
+            )
+            .unwrap();
+        let link = result
+            .nodes
+            .iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"link".to_string()))
+            .unwrap();
+        assert!(!link.metadata.contains_key("target_anchor"));
+    }
+
+    #[test]
+    fn repeated_citations_have_occurrence_identity_and_label_metadata() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "First[^n], second[^n].\n\n[^n]: note\n",
+            )
+            .unwrap();
+        let citations: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| node.metadata.get("markdown_kind") == Some(&"citation".to_string()))
+            .collect();
+        assert_eq!(citations.len(), 2);
+        assert_ne!(citations[0].id, citations[1].id);
+        assert!(
+            citations
+                .iter()
+                .all(|node| node.metadata.get("citation_label") == Some(&"n".to_string()))
+        );
+    }
+
+    #[test]
+    fn markdown_anchor_pass_timing_smoke_100k_nodes() {
+        use std::time::Instant;
+        let template = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "Body.\n")
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+            .unwrap();
+        let mut nodes = Vec::with_capacity(100_000);
+        for index in 0..100_000 {
+            let mut node = template.clone();
+            node.id.name = format!("paragraph-{index}");
+            nodes.push(node);
+        }
+        let started = Instant::now();
+        let edges = markdown_anchor_pass(&mut nodes);
+        println!(
+            "markdown_anchor_pass on 100k nodes: {:?}",
+            started.elapsed()
+        );
+        assert!(edges.is_empty());
+        assert_eq!(nodes.len(), 100_000);
     }
 }
