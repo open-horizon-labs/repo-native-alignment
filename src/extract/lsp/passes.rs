@@ -2292,6 +2292,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
         };
         let mut edges = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -2354,6 +2355,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
         };
         initial
             .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])

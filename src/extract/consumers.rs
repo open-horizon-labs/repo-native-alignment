@@ -3460,6 +3460,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
         };
 
         let gate = AllEnrichmentsGate::new();

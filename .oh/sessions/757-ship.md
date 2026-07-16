@@ -2,7 +2,7 @@
 session: 757-ship
 artifact_type: ship
 outcome: context-assembly
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Ship Pipeline — PR #757
@@ -31,3 +31,15 @@ updated: 2026-07-15
 - `cargo test --lib`: 1998 passed, 3 ignored.
 - Targeted identity, stale-on-edit, persistence/load/render, frontmatter-only, and reciprocal-direction tests: pass.
 - Local optimized candidate passed the real TypeScript MCP smoke client (all four tools visible; all assertions passed).
+
+## 2026-07-16 continuation
+
+- Merged current `origin/main` at `5e6699f6`, incorporating shipped work through #768/#774.
+- Resolved the sole semantic conflict in `src/extract/lsp/passes.rs` by retaining current LSP admission/telemetry behavior and adding empty evidence payloads to the seven new LSP edge constructors.
+- Full-suite compilation found three additional current-main test-only `Edge` constructors; added explicit empty evidence payloads without changing test semantics.
+- Preserved the two unrelated untracked `.oh` files unchanged.
+- Post-merge `cargo check --lib`: pass.
+- Post-merge `cargo clippy --no-default-features -- -D warnings`: pass.
+- Post-merge `cargo test`: pass (2018 library tests passed, 4 ignored; 2 binary tests, CLI exit contract, content-source contract, and doc tests all passed).
+- `cargo fmt --all -- --check` was not used as a branch gate because the installed formatter proposes repository-wide changes in untouched current-main files; no unrelated formatting rewrite was applied.
+- Prior final-head CI and exact-artifact evidence are treated as stale; full tests, CI, CodeRabbit, and exact-artifact MCP verification will be repeated against the updated head.
