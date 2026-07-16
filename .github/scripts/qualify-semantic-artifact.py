@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 import subprocess
 
 
@@ -21,7 +22,15 @@ def sha256(path: Path) -> str:
 
 
 def run_json(command: list[str]) -> dict:
-    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "command failed closed\n"
+            f"command: {shlex.join(command)}\n"
+            f"exit: {completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
     return json.loads(completed.stdout)
 
 def validate_search_report(report: dict) -> None:

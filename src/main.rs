@@ -804,7 +804,7 @@ fn fingerprint_index(repo_root: &std::path::Path) -> anyhow::Result<(u128, Strin
                 if hint.version == 0 {
                     anyhow::bail!("invalid Lance version 0 in {}", path.display());
                 }
-                let encoded_version = u64::MAX - (hint.version - 1);
+                let encoded_version = u64::MAX - hint.version;
                 let manifest = path
                     .parent()
                     .expect("version hint has parent")
@@ -1846,7 +1846,9 @@ mod tests {
         let repo = tempfile::tempdir().expect("temp repo");
         let lance = repo.path().join(".oh/.cache/lance");
         let versions = lance.join("symbols.lance/_versions");
+        let edge_versions = lance.join("edges.lance/_versions");
         std::fs::create_dir_all(&versions).expect("create versions");
+        std::fs::create_dir_all(&edge_versions).expect("create edge versions");
         std::fs::write(lance.join("scan_version"), "23").expect("scan version");
         std::fs::write(
             versions.join("latest_version_hint.json"),
@@ -1854,19 +1856,29 @@ mod tests {
         )
         .expect("version hint");
         std::fs::write(
-            versions.join(format!("{}.manifest", u64::MAX - 1)),
+            versions.join(format!("{}.manifest", u64::MAX - 2)),
             "active manifest",
         )
         .expect("active manifest");
         std::fs::write(
-            versions.join(format!("{}.manifest", u64::MAX)),
+            edge_versions.join("latest_version_hint.json"),
+            r#"{"version":1}"#,
+        )
+        .expect("edge version hint");
+        std::fs::write(
+            edge_versions.join(format!("{}.manifest", u64::MAX - 1)),
+            "active edge manifest",
+        )
+        .expect("active edge manifest");
+        std::fs::write(
+            versions.join(format!("{}.manifest", u64::MAX - 1)),
             "stale manifest",
         )
         .expect("stale manifest");
 
         let first = fingerprint_index(repo.path()).expect("fingerprint");
         std::fs::write(
-            versions.join(format!("{}.manifest", u64::MAX)),
+            versions.join(format!("{}.manifest", u64::MAX - 1)),
             "changed stale manifest",
         )
         .expect("change stale");

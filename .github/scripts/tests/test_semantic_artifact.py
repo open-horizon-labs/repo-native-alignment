@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -57,6 +58,21 @@ def sample_report() -> dict:
 
 
 class SemanticArtifactScriptsTest(unittest.TestCase):
+    def test_run_json_surfaces_captured_failure_evidence(self) -> None:
+        qualifier = load_qualifier()
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; print('visible-out'); "
+            "print('visible-err', file=sys.stderr); sys.exit(7)",
+        ]
+        with self.assertRaisesRegex(RuntimeError, "exit: 7") as raised:
+            qualifier.run_json(command)
+        message = str(raised.exception)
+        self.assertIn("visible-out", message)
+        self.assertIn("visible-err", message)
+        self.assertIn(f"command: {shlex.join(command)}", message)
+
     def test_package_manifest_digest_covers_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
