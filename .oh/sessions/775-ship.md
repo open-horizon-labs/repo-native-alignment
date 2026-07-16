@@ -43,6 +43,9 @@ updated: 2026-07-16
 - The first ready-state CI run exposed five stale legacy assertions that still
   expected default warm-up to mean full broad-reference readiness. The
   assertions now enforce the new `default_profile`/partial contract.
+- The next run exposed one binary-level assertion that treated the process-local
+  `Complete` sentinel as stronger than persisted partial evidence. The renamed
+  regression now proves durable evidence replaces that optimistic sentinel.
 - Remaining gates: clean ready-state CI, CodeRabbit approval, exact-head CI
   artifact MCP delivery, final comment sweep, merge, and post-merge audit.
 

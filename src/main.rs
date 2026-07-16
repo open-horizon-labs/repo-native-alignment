@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_hydration_does_not_overwrite_current_terminal_lsp_result() {
+    fn ledger_hydration_replaces_optimistic_complete_with_durable_partial_evidence() {
         let tmp = tempfile::tempdir().expect("temp repo");
         let handler = RnaHandler {
             repo_root: tmp.path().to_path_buf(),
@@ -1583,7 +1583,14 @@ mod tests {
 
         let related = hydrate_lsp_status_from_ledger(&handler, tmp.path(), 3, false);
 
-        assert_eq!(handler.lsp_status.current_state(), LspState::Complete);
+        assert_eq!(handler.lsp_status.current_state(), LspState::Degraded);
+        assert!(
+            handler
+                .lsp_status
+                .call_reference_readiness()
+                .detail
+                .contains("historical abort")
+        );
         assert_eq!(related, vec![historical_job]);
     }
 
