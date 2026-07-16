@@ -460,7 +460,8 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub source: ExtractionSource,
     pub confidence: Confidence,
-    /// Ordered source evidence. Ordinary code edges leave this empty.
+    /// Ordered source evidence. Ordinary code edges leave this empty; content
+    /// edges retain material selectors even when validation later downgrades them.
     #[serde(default)]
     pub evidence: Vec<EdgeEvidence>,
 }
