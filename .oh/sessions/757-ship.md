@@ -30,7 +30,7 @@ updated: 2026-07-16
 - `cargo check --lib`: pass.
 - `cargo test --lib`: 1998 passed, 3 ignored.
 - Targeted identity, stale-on-edit, persistence/load/render, frontmatter-only, and reciprocal-direction tests: pass.
-- Local optimized candidate passed the real TypeScript MCP smoke client (all four tools visible; all assertions passed).
+- Development-only local optimized candidate passed the real TypeScript MCP smoke client; this is not shipped verification.
 
 ## 2026-07-16 continuation
 
@@ -95,18 +95,34 @@ Verification:
 - the excluded test's ambient live-operation-report failure is unchanged and
   unrelated to this diff; clean CI remains authoritative for it.
 
-Independent re-review of `3516d7ca` found one P1 identity regression: the
+Historical independent re-review of `3516d7ca` found one P1 identity regression: the
 display-only snippet refresh changed `Edge::stable_id()` because the full
 selector was hashed. The stable identity projection now excludes `snippet`
-while retaining root/file/line/byte/body-node/hash coordinates and provenance.
+while retaining the then-current selector projection. This conclusion was
+superseded by later review fixes that also removed mutable line/byte coordinates.
 The correct-hash/wrong-snippet regression also asserts that validation refreshes
 display text without changing durable edge identity. Focused evidence tests
 remain 9/9 passing.
 
-Final independent re-review of `7fcea80c`: **APPROVE**. The reviewer confirmed
+Historical independent re-review of `7fcea80c`: **APPROVE**. The reviewer confirmed
 the identity projection excludes only display text while retaining ordered
-authoritative selector coordinates/hash and extractor/pack/rule provenance.
-Final local verification at that head passed: focused evidence tests, library
+selector identity/hash and extractor/pack/rule provenance. This verdict predates
+later final-diff findings and is not the merge approval. Local verification at
+that head passed: focused evidence tests, library
 check, strict no-default-features Clippy, 2,043 library tests (excluding the
 known live-cache-sensitive roots test), 5 binary tests, CLI exit contract,
 content-source contract, and doc tests.
+
+## Exact CI artifact verification after final external-review fixes
+
+- Corrected product head: `03e1d827f2d5167f758b40a6ad7bd6d16ade9ad0`.
+- Successful GitHub Actions run: [29515057097](https://github.com/open-horizon-labs/repo-native-alignment/actions/runs/29515057097).
+- The run passed RustSec audit, strict lint, the full clean-environment test
+  suite, optimized artifact construction, hosted RNA/CLI/graph smoke, and the
+  real TypeScript MCP SDK smoke.
+- The downloaded `repo-native-alignment-darwin-arm64-fast` artifact reports
+  version 0.2.10 and independently passed every MCP assertion, including
+  persisted provenance, source spans, traversal, roots, and outcome delivery.
+- Local build/smoke results remain development evidence only. Shipped
+  verification is the successful CI artifact above; this subsequent
+  session-only documentation update does not change the product tree.
