@@ -61,6 +61,7 @@ Implemented:
   interval separately;
 - require a successful correlated pre-first-edit RNA tool response;
 - retain tool-call params and SHA-256 wire-message hashes in the proxy trace;
+- reject both JSON-RPC errors and MCP-native tool results with `isError: true`;
 - remove the unused import and implicit string concatenation warnings.
 
 Ten harness regression tests pass, including repeated-message, exact-stage

@@ -156,6 +156,21 @@ class SwebenchRnaOneTests(unittest.TestCase):
             self.assertFalse(summary["observed_real_mcp_use"])
             self.assertEqual(summary["successful_tool_responses"], 0)
 
+            pending = {}
+            PROXY.trace_row(
+                "client_to_server",
+                b'{"jsonrpc":"2.0","id":8,"method":"tools/call","params":'
+                b'{"name":"search","arguments":{"query":"missing"}}}\n',
+                pending,
+            )
+            mcp_error = PROXY.trace_row(
+                "server_to_client",
+                b'{"jsonrpc":"2.0","id":8,"result":{"isError":true,'
+                b'"content":[{"type":"text","text":"failed"}]}}\n',
+                pending,
+            )
+            self.assertTrue(mcp_error["is_error"])
+
     def test_proxy_trace_correlates_arguments_and_response_hash(self) -> None:
         pending = {}
         request = (

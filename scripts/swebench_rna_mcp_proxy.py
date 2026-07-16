@@ -68,6 +68,8 @@ def trace_row(
     tool_name = None
     if method == "tools/call" and isinstance(params, dict):
         tool_name = params.get("name")
+    result = message.get("result")
+    tool_result_error = isinstance(result, dict) and result.get("isError") is True
     return {
         "observed_at": utc_now(),
         "direction": direction,
@@ -80,7 +82,7 @@ def trace_row(
         "response_to_tool": response_to_tool,
         "response_to_params": response_to_params,
         "tool_name": tool_name,
-        "is_error": "error" in message,
+        "is_error": "error" in message or tool_result_error,
     }
 
 
