@@ -644,12 +644,7 @@ impl LspEnricher {
             // This is configured per-language via LangConfig (e.g., Python restricts
             // to Function+Trait because pyright's textDocument/references hangs on
             // class/enum/const lookups).
-            .filter(|n| {
-                if let Some(ref kinds) = self.lsp_enrichable_kinds {
-                    return kinds.contains(&n.id.kind);
-                }
-                true
-            })
+            .filter(|n| self.admits_pass1_node(n))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {

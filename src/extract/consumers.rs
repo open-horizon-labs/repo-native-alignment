@@ -2333,26 +2333,15 @@ pub fn build_builtin_bus(
     // completes without waiting for LSP servers. The caller spawns LSP enrichment
     // in background and ArcSwaps the enriched graph when it finishes.
     if !skip_lsp {
-        // Build the enricher registry once and extract individual enrichers per language.
-        // Each `LspConsumer` owns an `Arc<dyn Enricher>` so it doesn't re-instantiate.
-        let enricher_registry = crate::extract::EnricherRegistry::with_builtins();
         let lsp_roots: Arc<Vec<(String, PathBuf)>> = Arc::new(root_pairs.clone());
 
-        // Build enrichers indexed by language for O(1) lookup.
-        // EnricherRegistry does not expose individual enrichers, so we rebuild
-        // per-language enrichers via LspEnricher::new (same as EnricherRegistry internals).
-        // This avoids exposing registry internals and keeps consumers self-contained.
-        let mut supported_languages: Vec<String> = enricher_registry
-            .supported_languages()
-            .into_iter()
+        let mut supported_languages: Vec<String> = crate::extract::lsp::builtin_lsp_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.language().to_string())
             .collect();
         supported_languages.sort(); // deterministic registration order
 
         for lang in &supported_languages {
-            // Build a single-language enricher for this consumer.
-            // The enricher is the same type as what EnricherRegistry uses internally.
-            // We use `EnricherRegistry::with_builtins()` filtered to this language
-            // rather than duplicating the language-server config table.
             let single_lang_enricher = build_single_language_enricher(lang);
             bus.register(Box::new(LspConsumer {
                 language: lang.clone(),
@@ -2404,120 +2393,11 @@ pub fn build_builtin_bus(
 
 /// Build a single-language `Arc<dyn Enricher>` for use in `LspConsumer`.
 ///
-/// Constructs an `LspEnricher` with the same configuration as `EnricherRegistry::with_builtins()`
-/// for the given language. Returns a no-op enricher if the language is not recognised.
+/// Construct a built-in enricher through the same descriptor factory used by
+/// [`crate::extract::EnricherRegistry`].
 fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enricher> {
-    use crate::extract::lsp::LspEnricher;
-
-    // Mirror the server table from EnricherRegistry::with_builtins().
-    // Keep this in sync with that table — a test in consumers::tests verifies parity.
-    let servers: &[(&str, &str, &[&str], &[&str])] = &[
-        ("rust", "rust-analyzer", &[], &["rs"]),
-        ("python", "pyright-langserver", &["--stdio"], &["py"]),
-        (
-            "typescript",
-            "typescript-language-server",
-            &["--stdio"],
-            &["ts", "tsx", "js", "jsx"],
-        ),
-        ("go", "gopls", &["serve"], &["go"]),
-        ("markdown", "marksman", &["server"], &["md"]),
-        (
-            "c-cpp",
-            "clangd",
-            &[],
-            &["c", "cc", "cpp", "cxx", "h", "hpp"],
-        ),
-        ("java", "jdtls", &[], &["java"]),
-        ("ruby", "solargraph", &["stdio"], &["rb"]),
-        ("csharp", "csharp-ls", &[], &["cs"]),
-        ("swift", "sourcekit-lsp", &[], &["swift"]),
-        ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
-        ("lua", "lua-language-server", &[], &["lua"]),
-        ("zig", "zls", &[], &["zig"]),
-        ("elixir", "elixir-ls", &[], &["ex", "exs"]),
-        ("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
-        ("ocaml", "ocamllsp", &[], &["ml", "mli"]),
-        ("scala", "metals", &[], &["scala", "sc"]),
-        ("dart", "dart", &["language-server"], &["dart"]),
-        (
-            "r",
-            "R",
-            &["--no-echo", "-e", "languageserver::run()"],
-            &["r", "R"],
-        ),
-        (
-            "julia",
-            "julia",
-            &[
-                "--startup-file=no",
-                "-e",
-                "using LanguageServer; runserver()",
-            ],
-            &["jl"],
-        ),
-        ("php", "intelephense", &["--stdio"], &["php"]),
-        (
-            "css",
-            "vscode-css-languageserver",
-            &["--stdio"],
-            &["css", "scss", "less"],
-        ),
-        (
-            "html",
-            "vscode-html-languageserver",
-            &["--stdio"],
-            &["html", "htm"],
-        ),
-        (
-            "yaml",
-            "yaml-language-server",
-            &["--stdio"],
-            &["yaml", "yml"],
-        ),
-        (
-            "json",
-            "vscode-json-languageserver",
-            &["--stdio"],
-            &["json"],
-        ),
-        ("toml", "taplo", &["lsp", "stdio"], &["toml"]),
-        ("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
-        ("nix", "nil", &[], &["nix"]),
-        ("vue", "vue-language-server", &["--stdio"], &["vue"]),
-        ("svelte", "svelteserver", &["--stdio"], &["svelte"]),
-        ("erlang", "erlang_ls", &[], &["erl", "hrl"]),
-        ("gleam", "gleam", &["lsp"], &["gleam"]),
-        ("nim", "nimlsp", &[], &["nim"]),
-        ("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
-        ("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"]),
-        ("protobuf", "buf", &["lsp"], &["proto"]),
-        ("latex", "texlab", &[], &["tex", "bib"]),
-        ("typst", "tinymist", &[], &["typ"]),
-    ];
-
-    for &(lang, cmd, args, exts) in servers {
-        if lang == language {
-            let enricher = LspEnricher::new(lang, cmd, args, exts);
-            let enricher = match lang {
-                "python" => enricher.with_settings(serde_json::json!({
-                    "python": { "analysis": { "autoSearchPaths": true } }
-                })),
-                "csharp" => enricher
-                    .with_toolchain_remediation(crate::extract::lsp::CSHARP_TOOLCHAIN_REMEDIATION),
-                _ => enricher,
-            };
-            let enricher = match lang {
-                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
-                "python" => enricher.with_config_file("pyproject.toml"),
-                "go" => enricher.with_config_file("go.mod"),
-                "rust" => enricher.with_config_file("Cargo.toml"),
-                "java" => enricher.with_config_file("pom.xml"),
-                "kotlin" => enricher.with_config_file("build.gradle.kts"),
-                _ => enricher,
-            };
-            return Arc::new(enricher);
-        }
+    if let Some(enricher) = build_single_language_lsp_enricher(language) {
+        return Arc::new(enricher);
     }
 
     // Fallback: no-op enricher for unrecognised languages.
@@ -2529,6 +2409,10 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
     Arc::new(NoopEnricher {
         language: language.to_string(),
     })
+}
+
+fn build_single_language_lsp_enricher(language: &str) -> Option<crate::extract::lsp::LspEnricher> {
+    crate::extract::lsp::builtin_lsp_enricher(language)
 }
 
 /// No-op enricher used as a fallback when a language is not in the server table.
@@ -3092,6 +2976,55 @@ mod tests {
             bus.len(),
             expected_total,
             lsp_count
+        );
+    }
+
+    #[test]
+    fn test_event_bus_and_registry_factory_policy_parity() {
+        let descriptor = crate::extract::lsp::builtin_lsp_descriptors()
+            .iter()
+            .find(|descriptor| descriptor.language() == "python")
+            .expect("python descriptor");
+        let registry_path = descriptor.build();
+        let event_bus_path =
+            build_single_language_lsp_enricher("python").expect("python EventBus enricher");
+
+        assert_eq!(
+            event_bus_path.enrichable_kinds(),
+            registry_path.enrichable_kinds(),
+            "both construction paths must apply the descriptor's eligibility policy"
+        );
+        assert_eq!(
+            event_bus_path.enrichable_kinds(),
+            Some(
+                [
+                    crate::graph::NodeKind::Function,
+                    crate::graph::NodeKind::Trait
+                ]
+                .as_slice()
+            ),
+            "Python must retain Function/Trait eligibility in the EventBus path"
+        );
+        assert_eq!(
+            event_bus_path.allows_declared_const_references(),
+            registry_path.allows_declared_const_references(),
+            "both construction paths must share declared-Const policy"
+        );
+        assert!(
+            !event_bus_path.allows_declared_const_references(),
+            "built-in declared-Const references remain disabled pending #768"
+        );
+        assert_eq!(
+            crate::extract::Enricher::name(&event_bus_path),
+            crate::extract::Enricher::name(&registry_path)
+        );
+        assert_eq!(
+            crate::extract::Enricher::config_file_hint(&event_bus_path),
+            crate::extract::Enricher::config_file_hint(&registry_path)
+        );
+        assert_eq!(
+            crate::extract::Enricher::toolchain_remediation(&event_bus_path),
+            crate::extract::Enricher::toolchain_remediation(&registry_path)
         );
     }
 

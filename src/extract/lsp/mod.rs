@@ -43,6 +43,213 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 
 pub const CSHARP_TOOLCHAIN_REMEDIATION: &str = "C# LSP needs dotnet, csharp-ls, and a visible .NET root. Install .NET (brew install --cask dotnet-sdk, mise use dotnet@latest, asdf install dotnet latest, or Microsoft installer), install csharp-ls with `dotnet tool install -g csharp-ls`, add `$HOME/.dotnet/tools` to PATH, and set DOTNET_ROOT/DOTNET_ROOT_ARM64 to the installed .NET root for MCP stdio env.";
 
+type InitSettingsFactory = fn() -> serde_json::Value;
+
+#[derive(Clone, Copy)]
+enum LspEligibilityPolicy {
+    /// Resolve language-specific request-target kinds from the extractor's
+    /// [`LangConfig`](crate::extract::generic::LangConfig).
+    LangConfig {
+        /// Declared constants stay default-off until a measured server/language
+        /// profile explicitly earns reference enrichment (#768).
+        declared_const_references: bool,
+    },
+}
+
+/// Complete construction profile for a built-in language server.
+///
+/// Keeping process configuration and admission policy in one descriptor means
+/// every scan path can construct an identical enricher without mirroring tables.
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinLspDescriptor {
+    language: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    extensions: &'static [&'static str],
+    init_settings: Option<InitSettingsFactory>,
+    config_file: Option<&'static str>,
+    toolchain_remediation: Option<&'static str>,
+    eligibility: LspEligibilityPolicy,
+}
+
+impl BuiltinLspDescriptor {
+    pub(crate) fn language(&self) -> &'static str {
+        self.language
+    }
+
+    pub(crate) fn build(&self) -> LspEnricher {
+        let mut enricher =
+            LspEnricher::new(self.language, self.command, self.args, self.extensions);
+        if let Some(settings) = self.init_settings {
+            enricher = enricher.with_settings(settings());
+        }
+        if let Some(config_file) = self.config_file {
+            enricher = enricher.with_config_file(config_file);
+        }
+        if let Some(remediation) = self.toolchain_remediation {
+            enricher = enricher.with_toolchain_remediation(remediation);
+        }
+        match self.eligibility {
+            LspEligibilityPolicy::LangConfig {
+                declared_const_references,
+            } => {
+                enricher.allow_declared_const_references = declared_const_references;
+                if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
+                    .and_then(|config| config.lsp_enrichable_kinds)
+                {
+                    enricher = enricher.with_enrichable_kinds(kinds);
+                }
+            }
+        }
+        enricher
+    }
+}
+
+fn python_init_settings() -> serde_json::Value {
+    serde_json::json!({
+        "python": { "analysis": { "autoSearchPaths": true } }
+    })
+}
+
+macro_rules! builtin_lsp {
+    ($language:literal, $command:literal, $args:expr, $extensions:expr) => {
+        BuiltinLspDescriptor {
+            language: $language,
+            command: $command,
+            args: $args,
+            extensions: $extensions,
+            init_settings: None,
+            config_file: None,
+            toolchain_remediation: None,
+            eligibility: LspEligibilityPolicy::LangConfig {
+                declared_const_references: false,
+            },
+        }
+    };
+}
+
+static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
+    BuiltinLspDescriptor {
+        init_settings: None,
+        config_file: Some("Cargo.toml"),
+        ..builtin_lsp!("rust", "rust-analyzer", &[], &["rs"])
+    },
+    BuiltinLspDescriptor {
+        init_settings: Some(python_init_settings),
+        config_file: Some("pyproject.toml"),
+        ..builtin_lsp!("python", "pyright-langserver", &["--stdio"], &["py"])
+    },
+    BuiltinLspDescriptor {
+        config_file: Some("tsconfig.json"),
+        ..builtin_lsp!(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"]
+        )
+    },
+    BuiltinLspDescriptor {
+        config_file: Some("go.mod"),
+        ..builtin_lsp!("go", "gopls", &["serve"], &["go"])
+    },
+    builtin_lsp!("markdown", "marksman", &["server"], &["md"]),
+    builtin_lsp!(
+        "c-cpp",
+        "clangd",
+        &[],
+        &["c", "cc", "cpp", "cxx", "h", "hpp"]
+    ),
+    BuiltinLspDescriptor {
+        config_file: Some("pom.xml"),
+        ..builtin_lsp!("java", "jdtls", &[], &["java"])
+    },
+    builtin_lsp!("ruby", "solargraph", &["stdio"], &["rb"]),
+    BuiltinLspDescriptor {
+        toolchain_remediation: Some(CSHARP_TOOLCHAIN_REMEDIATION),
+        ..builtin_lsp!("csharp", "csharp-ls", &[], &["cs"])
+    },
+    builtin_lsp!("swift", "sourcekit-lsp", &[], &["swift"]),
+    BuiltinLspDescriptor {
+        config_file: Some("build.gradle.kts"),
+        ..builtin_lsp!("kotlin", "kotlin-language-server", &[], &["kt", "kts"])
+    },
+    builtin_lsp!("lua", "lua-language-server", &[], &["lua"]),
+    builtin_lsp!("zig", "zls", &[], &["zig"]),
+    builtin_lsp!("elixir", "elixir-ls", &[], &["ex", "exs"]),
+    builtin_lsp!("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
+    builtin_lsp!("ocaml", "ocamllsp", &[], &["ml", "mli"]),
+    builtin_lsp!("scala", "metals", &[], &["scala", "sc"]),
+    builtin_lsp!("dart", "dart", &["language-server"], &["dart"]),
+    builtin_lsp!(
+        "r",
+        "R",
+        &["--no-echo", "-e", "languageserver::run()"],
+        &["r", "R"]
+    ),
+    builtin_lsp!(
+        "julia",
+        "julia",
+        &[
+            "--startup-file=no",
+            "-e",
+            "using LanguageServer; runserver()"
+        ],
+        &["jl"]
+    ),
+    builtin_lsp!("php", "intelephense", &["--stdio"], &["php"]),
+    builtin_lsp!(
+        "css",
+        "vscode-css-languageserver",
+        &["--stdio"],
+        &["css", "scss", "less"]
+    ),
+    builtin_lsp!(
+        "html",
+        "vscode-html-languageserver",
+        &["--stdio"],
+        &["html", "htm"]
+    ),
+    builtin_lsp!(
+        "yaml",
+        "yaml-language-server",
+        &["--stdio"],
+        &["yaml", "yml"]
+    ),
+    builtin_lsp!(
+        "json",
+        "vscode-json-languageserver",
+        &["--stdio"],
+        &["json"]
+    ),
+    builtin_lsp!("toml", "taplo", &["lsp", "stdio"], &["toml"]),
+    builtin_lsp!("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
+    builtin_lsp!("nix", "nil", &[], &["nix"]),
+    builtin_lsp!("vue", "vue-language-server", &["--stdio"], &["vue"]),
+    builtin_lsp!("svelte", "svelteserver", &["--stdio"], &["svelte"]),
+    builtin_lsp!("erlang", "erlang_ls", &[], &["erl", "hrl"]),
+    builtin_lsp!("gleam", "gleam", &["lsp"], &["gleam"]),
+    builtin_lsp!("nim", "nimlsp", &[], &["nim"]),
+    builtin_lsp!("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
+    BuiltinLspDescriptor {
+        config_file: Some("tsconfig.json"),
+        ..builtin_lsp!("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"])
+    },
+    builtin_lsp!("protobuf", "buf", &["lsp"], &["proto"]),
+    builtin_lsp!("latex", "texlab", &[], &["tex", "bib"]),
+    builtin_lsp!("typst", "tinymist", &[], &["typ"]),
+];
+
+pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
+    BUILTIN_LSP_DESCRIPTORS
+}
+
+pub(crate) fn builtin_lsp_enricher(language: &str) -> Option<LspEnricher> {
+    BUILTIN_LSP_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.language == language)
+        .map(BuiltinLspDescriptor::build)
+}
+
 // ---------------------------------------------------------------------------
 // LspEnricher
 // ---------------------------------------------------------------------------
@@ -91,6 +298,9 @@ pub struct LspEnricher {
     /// Which node kinds to enrich via LSP. None = all enrichable kinds.
     /// Configured per-language via LangConfig::lsp_enrichable_kinds.
     lsp_enrichable_kinds: Option<Vec<NodeKind>>,
+    /// Whether declared constants may produce Pass 1 reference work.
+    /// Built-ins default to false until #768 measures a useful bounded profile.
+    allow_declared_const_references: bool,
 }
 
 struct LspState {
@@ -194,6 +404,7 @@ impl LspEnricher {
             }),
             startup_root_override: std::sync::OnceLock::new(),
             lsp_enrichable_kinds: None,
+            allow_declared_const_references: false,
         }
     }
 
@@ -240,6 +451,33 @@ impl LspEnricher {
     pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
         self.lsp_enrichable_kinds = Some(kinds.to_vec());
         self
+    }
+
+    pub(crate) fn enrichable_kinds(&self) -> Option<&[NodeKind]> {
+        self.lsp_enrichable_kinds.as_deref()
+    }
+
+    pub(crate) fn allows_declared_const_references(&self) -> bool {
+        self.allow_declared_const_references
+    }
+
+    pub(crate) fn admits_pass1_node(&self, node: &Node) -> bool {
+        if node.id.kind == NodeKind::Const && !self.allows_declared_const_references() {
+            return false;
+        }
+        self.enrichable_kinds()
+            .is_none_or(|kinds| kinds.contains(&node.id.kind))
+    }
+
+    /// Common admission boundary for every LSP pass.
+    ///
+    /// Synthetic graph values are searchable evidence, not compiler symbols.
+    /// Rejecting them before `matching_nodes` is shared with any pass prevents
+    /// them from becoming per-node or file-derived LSP work targets.
+    pub(crate) fn admits_node(&self, node: &Node) -> bool {
+        node.language == self.language
+            && !matches!(&node.id.kind, NodeKind::Other(kind) if kind == "crate")
+            && node.metadata.get("synthetic").map(String::as_str) != Some("true")
     }
 
     /// Check if an `experimental/serverStatus` notification indicates readiness.
@@ -2270,13 +2508,9 @@ impl Enricher for LspEnricher {
     ) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
-        // Filter to nodes matching this enricher's language.
-        // Skip virtual crate nodes emitted by Pass 0 and diagnostic nodes.
-        let matching_nodes: Vec<&Node> = nodes
-            .iter()
-            .filter(|n| n.language == self.language)
-            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
-            .collect();
+        // Establish one admitted input set before any pass derives work from it.
+        let matching_nodes: Vec<&Node> =
+            nodes.iter().filter(|node| self.admits_node(node)).collect();
 
         let fn_count = matching_nodes
             .iter()
@@ -2536,6 +2770,78 @@ mod tests {
         assert_eq!(enricher.server_command, "rust-analyzer");
         assert!(enricher.server_args.is_empty());
         assert_eq!(enricher.extensions, vec!["rs"]);
+    }
+
+    #[test]
+    fn test_builtin_python_factory_applies_lang_config_policy() {
+        let python = builtin_lsp_enricher("python").expect("python is a built-in LSP profile");
+
+        assert_eq!(python.server_command, "pyright-langserver");
+        assert_eq!(python.server_args, vec!["--stdio"]);
+        assert_eq!(python.config_file_hint(), Some("pyproject.toml"));
+        assert_eq!(
+            python.enrichable_kinds(),
+            Some([NodeKind::Function, NodeKind::Trait].as_slice()),
+            "the shared factory must retain Python's Function/Trait admission policy"
+        );
+        assert!(
+            !python.allows_declared_const_references(),
+            "built-in profiles must keep declared-Const references default-off"
+        );
+        assert_eq!(
+            python.init_settings,
+            Some(serde_json::json!({
+                "python": { "analysis": { "autoSearchPaths": true } }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthetic_const_produces_no_lsp_work_item() {
+        let enricher = LspEnricher::new(
+            "python",
+            "rna-test-server-must-not-be-started",
+            &[],
+            &["py"],
+        );
+        let mut metadata = BTreeMap::new();
+        metadata.insert("synthetic".to_string(), "true".to_string());
+        let synthetic_const = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("app.py"),
+                name: "application/json".into(),
+                kind: NodeKind::Const,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "application/json".into(),
+            body: "application/json".into(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        };
+
+        assert!(!enricher.admits_node(&synthetic_const));
+        let mut declared_const = synthetic_const.clone();
+        declared_const
+            .metadata
+            .insert("synthetic".to_string(), "false".to_string());
+        assert!(
+            enricher.admits_node(&declared_const),
+            "the common boundary must distinguish declared constants from synthetic values"
+        );
+        assert!(
+            !enricher.admits_pass1_node(&declared_const),
+            "declared constants must not produce default Pass 1 reference work"
+        );
+        let result = enricher
+            .enrich(&[synthetic_const], &GraphIndex::new(), Path::new("."))
+            .await
+            .expect("an empty admitted set must return before starting an LSP server");
+        assert!(result.added_edges.is_empty());
+        assert!(result.updated_nodes.is_empty());
+        assert!(result.new_nodes.is_empty());
     }
 
     /// Verify enrichers for each language have correct properties.
