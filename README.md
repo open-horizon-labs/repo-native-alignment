@@ -215,6 +215,12 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase), durable Pass 1 queue snapshots (pending, in-flight, completed, failed, skipped, exhausted, resumed/retried counts, phase counts, oldest work, and bounded actionable exhaustion samples) from `.oh/.cache/lsp_pass1_work_items.json`, and recent OperationReport history from `.oh/.cache/operation_reports.json`. Interrupted queues resume only eligible work: completed output and skipped state are carried forward only when the node input fingerprint is unchanged. OperationReports persist the same queue snapshot for post-run inspection. Includes LSP servers available to install for each root's detected languages. |
 
+Markdown is source-addressable beyond headings: body nodes for paragraphs, blockquotes,
+links, footnotes, tables, images, code fences, and HTML directives carry stable structural
+or explicit IDs, exact line/byte spans, and content hashes. Exact same-file and
+repository-relative cross-file anchors such as `target.md#anchor` become graph
+references; unresolved anchors are exposed as diagnostics.
+
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root.
 
 **Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first.

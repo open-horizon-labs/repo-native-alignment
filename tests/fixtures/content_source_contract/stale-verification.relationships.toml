@@ -1,0 +1,6 @@
+[[relationship]]
+kind = "supports"
+target = "graceful-recovery"
+body_node_id = "paragraph:recovery:1"
+snippet_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+verified_snippet = "The retry budget supports graceful recovery after a transient outage."

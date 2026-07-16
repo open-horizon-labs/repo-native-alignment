@@ -1,0 +1,11 @@
+id = "fixture.strategy-worksheet"
+version = 1
+
+[[visibility_rule]]
+private_heading = "Strategy Worksheet"
+
+[[visibility_rule]]
+private_heading = "Tactic Classification"
+
+[[visibility_rule]]
+private_heading = "Evidence Registry"
