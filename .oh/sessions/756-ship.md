@@ -12,7 +12,7 @@ updated: "2026-07-15"
 
 - Extended the existing registered Markdown extractor with an offset-aware body AST pass.
 - Preserved legacy heading sections while adding canonical source selectors.
-- Final focused Markdown suite: 71 passed.
+- Final focused Markdown suite: 76 passed.
 
 ### Step 1: RNA-Grounded Review
 
@@ -27,7 +27,7 @@ contract fixtures now have regression coverage.
 
 ### Regression and Delivery
 
-- Final Markdown suite: 71 passed.
+- Final Markdown suite: 76 passed.
 - Full CI test job passed on the implementation commit.
 - Local clippy with `-D warnings` passed after the lint fix.
 - Release candidate corpus scan exposed canonical selectors and diagnostics.
