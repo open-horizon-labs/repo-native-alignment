@@ -542,7 +542,7 @@ impl EnrichmentJobLedger {
             .retain(|job| job.schema_version == SCHEMA_VERSION);
         store
             .jobs
-            .sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+            .sort_by_key(|job| std::cmp::Reverse((job.updated_at, job.revision)));
         store.jobs.truncate(limit);
         store.jobs
     }

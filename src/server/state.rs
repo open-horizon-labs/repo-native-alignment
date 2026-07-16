@@ -1236,6 +1236,7 @@ mod tests {
         assert_eq!(LspState::Unavailable.label(), "UNAVAILABLE");
         assert_eq!(LspState::ServerFound.label(), "SERVER_FOUND");
         assert_eq!(LspState::Failed.label(), "FAILED");
+        assert_eq!(LspState::Degraded.label(), "DEGRADED");
     }
 
     #[test]

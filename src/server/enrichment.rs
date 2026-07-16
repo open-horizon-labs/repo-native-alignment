@@ -408,40 +408,41 @@ impl RnaHandler {
                     )
                     .await;
 
-                    if !diagnostics.is_empty() {
-                        let detail = diagnostics.join("; ");
-                        let lsp_edge_count = graph_state
-                            .edges
-                            .iter()
-                            .filter(|edge| {
-                                edge.source == crate::graph::ExtractionSource::Lsp
-                                    && matches!(edge.kind, crate::graph::EdgeKind::Calls)
-                            })
-                            .count();
-                        lsp_status.set_degraded(lsp_edge_count, &detail);
-                        super::sentinel::clear_lsp_sentinel(&repo_root);
-                        if let Ok(JobStart::Started(job)) = enrichment_jobs.begin_job(
+                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    let degraded_job_id = if degraded_detail.is_some() {
+                        match enrichment_jobs.begin_job(
                             &repo_root,
                             EnrichmentCapability::CallReferences,
                             EnrichmentScope::ChangedFiles,
                             EnrichmentTrigger::BackgroundScan,
                             None,
                         ) {
-                            enrichment_jobs.mark_degraded(
-                                &repo_root,
-                                &job.job_id,
-                                graph_state.nodes.len(),
-                                graph_state.edges.len(),
-                                detail,
-                            );
+                            Ok(JobStart::Started(job)) => Some(job.job_id),
+                            Ok(JobStart::Joined { existing_job_id }) => Some(existing_job_id),
+                            Err(error) => {
+                                tracing::error!(
+                                    "Background scan: failed to begin durable degraded LSP job: {error:#}"
+                                );
+                                None
+                            }
                         }
+                    } else {
+                        None
+                    };
+                    if let Some(job_id) = degraded_job_id.as_deref() {
+                        enrichment_jobs.mark_persisting(
+                            &repo_root,
+                            job_id,
+                            graph_state.nodes.len(),
+                            graph_state.edges.len(),
+                        );
                     }
 
                     // Atomic swap: publish the new graph state.
                     graph.store(Arc::new(Some(Arc::new(graph_state))));
 
                     // Stage 3: persist deltas to LanceDB.
-                    super::bg_scanner::persist_deltas(
+                    let persist_succeeded = super::bg_scanner::persist_deltas(
                         lance_deltas,
                         &scan_result.per_root_scans,
                         &scan_result.removed_slugs,
@@ -450,6 +451,60 @@ impl RnaHandler {
                         &lance_write_lock,
                     )
                     .await;
+
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        let persisted_snapshot = graph.load_full();
+                        let (node_count, edge_count, lsp_edge_count) = persisted_snapshot
+                            .as_ref()
+                            .as_ref()
+                            .map(|graph_state| {
+                                (
+                                    graph_state.nodes.len(),
+                                    graph_state.edges.len(),
+                                    graph_state
+                                        .edges
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.source == crate::graph::ExtractionSource::Lsp
+                                                && matches!(
+                                                    edge.kind,
+                                                    crate::graph::EdgeKind::Calls
+                                                )
+                                        })
+                                        .count(),
+                                )
+                            })
+                            .unwrap_or((0, 0, 0));
+                        if persist_succeeded && degraded_job_id.is_some() {
+                            lsp_status.set_degraded(lsp_edge_count, detail);
+                            super::sentinel::clear_lsp_sentinel(&repo_root);
+                            if let Some(job_id) = degraded_job_id.as_deref() {
+                                enrichment_jobs.mark_degraded(
+                                    &repo_root,
+                                    job_id,
+                                    node_count,
+                                    edge_count,
+                                    detail,
+                                );
+                            }
+                        } else if !persist_succeeded
+                            && let Some(job_id) = degraded_job_id.as_deref()
+                        {
+                            enrichment_jobs.mark_failed(
+                                &repo_root,
+                                job_id,
+                                "degraded LSP output was not durably persisted",
+                            );
+                        } else if persist_succeeded {
+                            // The graph is durable, but readiness cannot be claimed without a
+                            // matching durable job record. Keep the sentinel absent so a later
+                            // process retries enrichment instead of trusting process-local state.
+                            super::sentinel::clear_lsp_sentinel(&repo_root);
+                            tracing::error!(
+                                "Background scan: degraded LSP output persisted without a durable job record; readiness left unchanged"
+                            );
+                        }
+                    }
                 }
 
                 prev_root_slugs = scan_result.current_root_slugs;

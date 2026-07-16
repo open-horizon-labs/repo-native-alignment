@@ -1,3 +1,9 @@
+---
+date: 2026-07-15
+pr: 772
+type: friction-log
+---
+
 # PR #772 Ship Friction
 
 | Time | Tool/Path | Severity | Friction | Fallback | Impact |
@@ -8,3 +14,5 @@
 | 2026-07-15 | `repo-native-alignment scan --repo . --full` | blocking | The mandatory full scan repeatedly timed out writing `didOpen` for `src/extract/extractor_config.rs` and made no forward progress for more than two minutes. | Interrupted the stalled enrichment and refreshed the changed-source graph with `--full --extract-only`; the ship delivery gate will use the CI artifact and a bounded real MCP fixture. | Current-source review is indexed, but repo-wide live LSP caller coverage remains unavailable. |
 | 2026-07-15 | `cargo fmt --check` | skipped | Main is not globally rustfmt-clean; the formatter reports pre-existing changes across many unrelated files. | Kept formatting scoped to the changed hunks and relied on compile/tests plus diff review. | Avoids an unrelated repository-wide formatting rewrite in #766. |
 | 2026-07-16 | RNA `run_pipeline_foreground_full` body | blocking | The live RNA cache returned the pre-fix four-argument readiness call and unconditional LSP sentinel logic for a final-head function whose current source already had the five-argument diagnostic call and degraded-sentinel guard. | Used RNA to identify the owning path and impact, then inspected only the bounded current-source spans needed to diagnose the artifact failure. | Exact CI-artifact verification caught a real double-LSP execution bug that stale graph content could not explain. |
+| 2026-07-16 | RNA review follow-up source spans | skipped | RNA identified every CodeRabbit-commented symbol but does not expose current working-tree bodies reliably in this session. | Inspected only the bounded source spans named by review after RNA symbol lookup. | Enabled precise fixes while keeping exploration RNA-first. |
+| 2026-07-16 | `cargo fmt -- <files>` | skipped | Cargo formatted child modules beyond the named files, creating unrelated whitespace churn, and `apply_patch` cannot represent restoration of a missing final newline. | Reversed the formatter hunks through `apply_patch`; used a one-byte truncate only to restore the pre-existing no-final-newline state in `gdscript.rs`. | The final diff contains no unrelated formatter changes. |

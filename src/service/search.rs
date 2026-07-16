@@ -401,25 +401,28 @@ fn format_verbose_readiness(
                     && matches!(edge.kind, EdgeKind::Calls | EdgeKind::ReferencedBy)
             })
             .count();
-        let completed_repo_order = ctx.enrichment_jobs.iter().filter(|job| {
-            job.capability == EnrichmentCapability::CallReferences
-                && job.scope == EnrichmentScope::Repo
-                && job.state == EnrichmentJobState::Completed
-                && job.completed_at.is_some()
-                && job.failure.is_none()
-                && job.counters.edge_count.unwrap_or(0) > 0
-        }).map(|job| (job.updated_at, job.revision)).max();
+        let completed_repo_order = ctx
+            .enrichment_jobs
+            .iter()
+            .filter(|job| {
+                job.capability == EnrichmentCapability::CallReferences
+                    && job.scope == EnrichmentScope::Repo
+                    && job.state == EnrichmentJobState::Completed
+                    && job.completed_at.is_some()
+                    && job.failure.is_none()
+            })
+            .map(|job| (job.updated_at, job.revision))
+            .max();
         if let Some(degraded_job) = ctx
             .enrichment_jobs
             .iter()
             .filter(|job| {
                 job.capability == EnrichmentCapability::CallReferences
                     && job.state == EnrichmentJobState::Degraded
-                    && completed_repo_order.is_none_or(|completed| {
-                        (job.updated_at, job.revision) > completed
-                    })
+                    && completed_repo_order
+                        .is_none_or(|completed| (job.updated_at, job.revision) > completed)
             })
-            .max_by_key(|job| job.updated_at)
+            .max_by_key(|job| (job.updated_at, job.revision))
         {
             let status = LspEnrichmentStatus::default();
             status.set_degraded(
@@ -430,7 +433,7 @@ fn format_verbose_readiness(
                     .unwrap_or("call-reference enrichment finalized with degraded output"),
             );
             Some(status)
-        } else if completed_repo_order.is_some() && persisted_lsp_edges > 0 {
+        } else if completed_repo_order.is_some() {
             let status = LspEnrichmentStatus::default();
             status.set_complete(persisted_lsp_edges);
             Some(status)
@@ -444,7 +447,7 @@ fn format_verbose_readiness(
                     && job.completed_at.is_some()
                     && job.failure.is_none()
             })
-            .max_by_key(|job| job.updated_at)
+            .max_by_key(|job| (job.updated_at, job.revision))
         {
             let status = LspEnrichmentStatus::default();
             let scoped_edge_count = scoped_job.counters.edge_count.unwrap_or(0);
@@ -467,7 +470,7 @@ fn format_verbose_readiness(
                             | EnrichmentJobState::Superseded
                     )
             })
-            .max_by_key(|job| job.updated_at)
+            .max_by_key(|job| (job.updated_at, job.revision))
         {
             let status = LspEnrichmentStatus::default();
             match job.state {
@@ -3257,6 +3260,65 @@ mod tests {
         );
         assert!(
             !result.contains("LSP call/reference coverage**: partial/degraded"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_newer_zero_edge_repo_success_supersedes_historical_degraded_job() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state(vec![caller]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let degraded = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::ChangedFiles,
+                crate::server::EnrichmentTrigger::BackgroundScan,
+                None,
+            )
+            .expect("begin degraded job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_degraded(tmp.path(), &degraded, 1, 0, "historical abort");
+        let completed = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin successful zero-edge repo job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(tmp.path(), &completed, 1, 0);
+        let mut ctx = make_search_context(&gs, tmp.path());
+        ctx.enrichment_jobs = ledger.recent_jobs(tmp.path(), 5);
+
+        let result = search(
+            &SearchParams {
+                query: Some("caller".into()),
+                verbose: true,
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            result.contains("LSP completed with 0 persisted call/reference edges"),
+            "got: {result}"
+        );
+        assert!(
+            !result.contains("degraded after finalization"),
             "got: {result}"
         );
     }

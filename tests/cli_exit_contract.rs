@@ -20,11 +20,17 @@ fn foreground_full_scan_lsp_failure_exits_nonzero() {
         "[package]\nname = \"rna_pass1_abort_contract\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
     )
     .expect("write Cargo.toml");
-    std::fs::write(
-        tmp.path().join("src/lib.rs"),
-        "pub fn alpha() -> i32 { beta() }\npub fn beta() -> i32 { 42 }\n",
-    )
-    .expect("write lib.rs");
+    // A deliberately large call graph makes the one-millisecond no-progress
+    // watchdog deterministic: rust-analyzer cannot complete every reference
+    // request before the watchdog observes the unfinished pass.
+    let mut source = String::with_capacity(1_000_000);
+    for index in 0..12_000 {
+        let next = (index + 1) % 12_000;
+        source.push_str(&format!(
+            "pub fn node_{index}() -> usize {{ node_{next}() }}\n"
+        ));
+    }
+    std::fs::write(tmp.path().join("src/lib.rs"), source).expect("write lib.rs");
 
     let output = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
         .env("RNA_LSP_PASS1_NO_PROGRESS_TIMEOUT_MS", "1")
@@ -58,13 +64,11 @@ fn foreground_full_scan_lsp_failure_exits_nonzero() {
     let forced_abort_observed = stderr.contains("Diagnostic snapshot: pass=lsp_pass1_references")
         || stderr.contains("LSP call-reference enrichment aborted")
         || stderr.contains("LSP enrichment aborted");
-    if output.status.success() && !forced_abort_observed {
-        eprintln!(
-            "skipping forced Pass 1 abort contract: language server completed before the zero-duration watchdog was observed; stderr:\n{}",
-            stderr
-        );
-        return;
-    }
+    assert!(
+        forced_abort_observed,
+        "large fixture must deterministically trigger the forced Pass 1 abort; status={:?}\nstderr:\n{}",
+        output.status, stderr
+    );
     assert!(
         !output.status.success(),
         "foreground aborted LSP enrichment must be non-zero; status={:?}\nstderr:\n{}",
@@ -77,5 +81,45 @@ fn foreground_full_scan_lsp_failure_exits_nonzero() {
             || stderr.contains("Error: EventBus enrichment pipeline: PassesComplete event absent"),
         "expected delivered LSP failure diagnostic in stderr:\n{}",
         stderr
+    );
+
+    // Commit scanner state without replacing the durable call-reference job, then
+    // start a fresh CLI process on the cache-only path. The degraded readiness and
+    // original diagnostic must survive the process boundary via the job ledger.
+    let prepare_cache_only = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+        .args([
+            "scan",
+            "--extract-only",
+            "--repo",
+            tmp.path().to_str().expect("utf-8 temp path"),
+        ])
+        .output()
+        .expect("commit scanner state for cache-only restart");
+    assert!(
+        prepare_cache_only.status.success(),
+        "extract-only scanner-state preparation failed:\n{}",
+        String::from_utf8_lossy(&prepare_cache_only.stderr)
+    );
+
+    let restarted = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+        .args([
+            "scan",
+            "--no-embed",
+            "--repo",
+            tmp.path().to_str().expect("utf-8 temp path"),
+            "--timings",
+        ])
+        .output()
+        .expect("run cache-only scan in fresh process");
+    let restarted_stderr = String::from_utf8_lossy(&restarted.stderr);
+    assert!(restarted.status.success(), "cache-only scan failed:\n{restarted_stderr}");
+    assert!(
+        restarted_stderr.contains("call_references: degraded"),
+        "cache-only summary lost durable degraded readiness:\n{restarted_stderr}"
+    );
+    assert!(
+        restarted_stderr.contains("forced no-progress")
+            || restarted_stderr.contains("no progress"),
+        "cache-only summary lost durable abort diagnostic:\n{restarted_stderr}"
     );
 }

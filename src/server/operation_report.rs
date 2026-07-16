@@ -1285,6 +1285,22 @@ mod tests {
     }
 
     #[test]
+    fn lsp_capability_preserves_degraded_coverage_and_diagnostic() {
+        let (state, detail) = lsp_capability_from_status(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            super::super::state::LspState::Degraded,
+            Some("forced no-progress abort after 11 attempted nodes"),
+            7,
+            true,
+        );
+
+        assert_eq!(state, CapabilityState::Degraded);
+        let detail = detail.expect("degraded capability has actionable detail");
+        assert!(detail.contains("7 partial edges"), "got: {detail}");
+        assert!(detail.contains("forced no-progress abort"), "got: {detail}");
+    }
+
+    #[test]
     fn store_marks_non_terminal_reports_stale_on_read() {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo = tmp.path();

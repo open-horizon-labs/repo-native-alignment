@@ -366,7 +366,9 @@ pub(super) async fn persist_deltas(
     repo_root: &std::path::Path,
     graph: &arc_swap::ArcSwap<Option<Arc<GraphState>>>,
     lance_write_lock: &tokio::sync::Mutex<()>,
-) {
+) -> bool {
+    let expected_slugs: HashSet<String> =
+        lance_deltas.iter().map(|(slug, ..)| slug.clone()).collect();
     let mut persisted_slugs: HashSet<String> = HashSet::new();
     for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in
         lance_deltas
@@ -446,4 +448,6 @@ pub(super) async fn persist_deltas(
             tracing::warn!("Failed to delete LanceDB rows for removed worktrees: {}", e);
         }
     }
+
+    expected_slugs.is_subset(&persisted_slugs)
 }
