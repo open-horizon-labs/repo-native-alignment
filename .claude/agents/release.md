@@ -92,8 +92,8 @@ for c in cs:
     python3 -c "
 import json,sys
 cs = [c for c in json.load(sys.stdin) if 'github-actions' not in c.get('user',{}).get('login','').lower()]
-for c in cs[:3]:
-    print(f'  [HUMAN] {c.get(\"user\",{}).get(\"login\",\"\")}')
+for c in cs:
+    print(f'  [COMMENT] {c.get(\"user\",{}).get(\"login\",\"\")}')
     print(f'    {c.get(\"body\",\"\")[:150]}')
 " 2>/dev/null
 done
