@@ -271,8 +271,10 @@ pub struct Edge {
 
 Edges without evidence retain the stable ID `from_stable_id->kind->to_stable_id`.
 Evidence-bearing edges append a deterministic evidence hash so equal endpoint/kind
-triples backed by materially different spans remain distinct. Edges are directional:
-A→B and B→A are distinct.
+triples backed by materially different body identities/content hashes remain
+distinct. Mutable line/byte coordinates, display snippets, confidence, and
+validation state do not change identity. Edges are directional: A→B and B→A are
+distinct.
 
 ### EdgeKind
 

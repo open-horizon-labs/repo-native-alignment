@@ -490,7 +490,8 @@ impl Edge {
             // Lifecycle state and confidence may change after revalidation; they
             // are deliberately excluded from identity. The rendered snippet is
             // refreshed from current source after validation and is display-only,
-            // so identity uses only authoritative selector coordinates/hash plus
+            // while line/byte coordinates may shift without changing the body
+            // node. Identity therefore uses stable body identity/content plus
             // source/rule provenance.
             let identity: Vec<_> = self
                 .evidence
@@ -503,10 +504,6 @@ impl Edge {
                             (
                                 &selector.root_id,
                                 &selector.file_path,
-                                selector.line_start,
-                                selector.line_end,
-                                selector.byte_start,
-                                selector.byte_end,
                                 &selector.body_node_id,
                                 &selector.snippet_hash,
                             )
@@ -872,6 +869,42 @@ mod tests {
             blake3::hash(node.body.as_bytes()).to_hex().to_string(),
         )];
         assert_ne!(first.stable_id(), second.stable_id());
+    }
+
+    #[test]
+    fn evidence_location_shift_preserves_edge_identity() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "stable evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "25".into());
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        let original_id = edge.stable_id();
+
+        edge.evidence[0].selectors[0].line_start = 30;
+        edge.evidence[0].selectors[0].line_end = 30;
+        edge.evidence[0].selectors[0].byte_start = 410;
+        edge.evidence[0].selectors[0].byte_end = 425;
+
+        assert_eq!(
+            edge.stable_id(),
+            original_id,
+            "offset-only source movement must remain a same-ID edge update"
+        );
     }
 
     #[test]

@@ -299,6 +299,59 @@ mod tests {
             restored_state.edges[0].evidence[0].validation_status,
             ValidationStatus::Valid
         );
+
+        let mut shifted_node = evidence_node.clone();
+        shifted_node.line_start = 30;
+        shifted_node.line_end = 30;
+        shifted_node
+            .metadata
+            .insert("byte_start".into(), "410".into());
+        shifted_node
+            .metadata
+            .insert("byte_end".into(), "425".into());
+        let mut shifted_edge = restored_state.edges[0].clone();
+        shifted_edge.evidence[0].selectors[0].line_start = 30;
+        shifted_edge.evidence[0].selectors[0].line_end = 30;
+        shifted_edge.evidence[0].selectors[0].byte_start = 410;
+        shifted_edge.evidence[0].selectors[0].byte_end = 425;
+        assert_eq!(
+            shifted_edge.stable_id(),
+            stable_id,
+            "offset-only evidence movement must preserve durable edge identity"
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&shifted_node),
+            std::slice::from_ref(&shifted_edge),
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist shifted evidence coordinates");
+        assert!(!migrated);
+
+        let shifted_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load shifted evidence graph");
+        assert_eq!(
+            shifted_state.edges.len(),
+            1,
+            "same-ID coordinate shift must update rather than duplicate the edge"
+        );
+        assert_eq!(shifted_state.edges[0].stable_id(), stable_id);
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].selectors[0].line_start,
+            30
+        );
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].selectors[0].byte_start,
+            410
+        );
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
     }
 
     #[test]

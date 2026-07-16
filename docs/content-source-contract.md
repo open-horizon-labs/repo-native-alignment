@@ -61,8 +61,10 @@ Changing only the selected text also preserves identity but invalidates its hash
 
 For multi-span evidence, store an ordered, non-empty selector list. Edge identity
 MUST distinguish equal source/target/kind triples supported by materially
-different evidence. A display snippet is derived from the selected bytes and is
-not itself authoritative.
+different evidence. Its selector projection uses ordered root/file/body-node
+identity and content hash; mutable line/byte coordinates, display snippets,
+confidence, and validation status do not participate. A display snippet is
+derived from the selected bytes and is not itself authoritative.
 
 ## Validation states and transitions
 
