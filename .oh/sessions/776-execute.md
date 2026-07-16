@@ -85,6 +85,9 @@ Review findings fixed before the first implementation commit:
    cleanly.
 5. Provider aggregate totals are not double-counted as stage events, and
    unobservable handoff/verification categories remain explicit unknowns.
+6. CI exposed that dry-run validation still required an installed RNA binary
+   even though it never launches RNA. Dry run now records binary availability
+   and an unknown checksum when absent; live runs still fail closed.
 
 Verification:
 

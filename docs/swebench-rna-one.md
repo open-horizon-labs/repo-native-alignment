@@ -146,7 +146,8 @@ Unreported stages remain explicit unknowns.
 
 The repository fixture validates checkout isolation, manifest creation,
 prediction construction, evaluator command construction, and the full stage
-ledger without starting RNA, an executor, Docker, or the evaluator:
+ledger without requiring an installed RNA binary or starting RNA, an executor,
+Docker, or the evaluator:
 
 ```bash
 python3 scripts/swebench_rna_one.py fixture__repo-1 \

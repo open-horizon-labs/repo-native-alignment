@@ -1000,6 +1000,7 @@ def validate_prerequisites(args: argparse.Namespace, *, dry_run: bool) -> dict[s
     results = {
         "git": shutil.which("git"),
         "rna_binary": str(args.rna_binary),
+        "rna_binary_available": args.rna_binary.is_file(),
         "rna_version": command_version(str(args.rna_binary)),
         "python": sys.executable,
         "docker": shutil.which("docker"),
@@ -1022,7 +1023,7 @@ def validate_prerequisites(args: argparse.Namespace, *, dry_run: bool) -> dict[s
                 results[key] = importlib.metadata.version(package)
     if not results["git"]:
         raise HarnessError("git is required")
-    if not args.rna_binary.is_file():
+    if not args.rna_binary.is_file() and not dry_run:
         raise HarnessError(f"RNA binary not found: {args.rna_binary}")
     if not dry_run:
         if not results["docker"]:
@@ -1160,7 +1161,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "binary": str(args.rna_binary.resolve()),
             "revision": {
                 "version": prerequisites["rna_version"],
-                "sha256": sha256_file(args.rna_binary.resolve()),
+                "sha256": (
+                    sha256_file(args.rna_binary.resolve())
+                    if args.rna_binary.is_file()
+                    else None
+                ),
             },
             "selected_enrichment_condition": args.enrichment_condition,
         }
