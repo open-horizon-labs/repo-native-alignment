@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import subprocess
 import sys
@@ -32,6 +33,57 @@ def parse_message(line: bytes) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def trace_row(
+    direction: str,
+    line: bytes,
+    pending: dict[Any, dict[str, Any]],
+) -> dict[str, Any]:
+    message = parse_message(line)
+    message_id = message.get("id")
+    method = message.get("method")
+    response_to_method = None
+    response_to_tool = None
+    request_params = None
+    response_to_params = None
+    if direction == "client_to_server" and method and message_id is not None:
+        params = message.get("params")
+        tool_name = (
+            params.get("name")
+            if method == "tools/call" and isinstance(params, dict)
+            else None
+        )
+        request_params = params if method == "tools/call" else None
+        pending[message_id] = {
+            "method": str(method),
+            "tool_name": tool_name,
+            "request_params": request_params,
+        }
+    elif direction == "server_to_client" and message_id is not None:
+        request = pending.pop(message_id, None)
+        if request:
+            response_to_method = request["method"]
+            response_to_tool = request["tool_name"]
+            response_to_params = request["request_params"]
+    params = message.get("params")
+    tool_name = None
+    if method == "tools/call" and isinstance(params, dict):
+        tool_name = params.get("name")
+    return {
+        "observed_at": utc_now(),
+        "direction": direction,
+        "message_bytes": len(line),
+        "message_sha256": hashlib.sha256(line).hexdigest(),
+        "id": message_id,
+        "method": method,
+        "request_params": request_params,
+        "response_to_method": response_to_method,
+        "response_to_tool": response_to_tool,
+        "response_to_params": response_to_params,
+        "tool_name": tool_name,
+        "is_error": "error" in message,
+    }
+
+
 def main() -> int:
     args = arguments()
     args.trace.parent.mkdir(parents=True, exist_ok=True)
@@ -48,42 +100,7 @@ def main() -> int:
         )
 
         def record(direction: str, line: bytes) -> None:
-            message = parse_message(line)
-            message_id = message.get("id")
-            method = message.get("method")
-            response_to_method = None
-            response_to_tool = None
-            if direction == "client_to_server" and method and message_id is not None:
-                params = message.get("params")
-                tool_name = (
-                    params.get("name")
-                    if method == "tools/call" and isinstance(params, dict)
-                    else None
-                )
-                pending[message_id] = {
-                    "method": str(method),
-                    "tool_name": tool_name,
-                }
-            elif direction == "server_to_client" and message_id is not None:
-                request = pending.pop(message_id, None)
-                if request:
-                    response_to_method = request["method"]
-                    response_to_tool = request["tool_name"]
-            params = message.get("params")
-            tool_name = None
-            if method == "tools/call" and isinstance(params, dict):
-                tool_name = params.get("name")
-            row = {
-                "observed_at": utc_now(),
-                "direction": direction,
-                "message_bytes": len(line),
-                "id": message_id,
-                "method": method,
-                "response_to_method": response_to_method,
-                "response_to_tool": response_to_tool,
-                "tool_name": tool_name,
-                "is_error": "error" in message,
-            }
+            row = trace_row(direction, line, pending)
             with lock, args.trace.open("a", encoding="utf-8") as trace:
                 trace.write(json.dumps(row, sort_keys=True) + "\n")
 

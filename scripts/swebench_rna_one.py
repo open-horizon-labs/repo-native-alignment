@@ -12,7 +12,6 @@ import importlib.util
 import importlib.metadata
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -349,10 +348,15 @@ def make_task_prompt(instance: Mapping[str, Any], path: Path) -> None:
             [
                 f"# SWE-bench task: {instance['instance_id']}",
                 "",
-                "Solve the issue in the current isolated checkout. Use the configured "
-                "`rna-server` MCP tools for repository orientation before editing. "
-                "Do not search the network for the upstream patch or commit history. "
-                "Make the smallest correct implementation and run focused verification.",
+                " ".join(
+                    [
+                        "Solve the issue in the current isolated checkout.",
+                        "Use the configured `rna-server` MCP tools for repository",
+                        "orientation before editing. Do not search the network for",
+                        "the upstream patch or commit history. Make the smallest",
+                        "correct implementation and run focused verification.",
+                    ]
+                ),
                 "",
                 "## Problem statement",
                 "",
@@ -637,6 +641,8 @@ def collect_usage_and_fallbacks(
     before = {field: 0 for field in usage_fields}
     after = {field: 0 for field in usage_fields}
     observed = {"before": False, "after": False}
+    usage_by_message_id: dict[str, tuple[str, dict[str, float | int | None]]] = {}
+    anonymous_usage: list[tuple[str, dict[str, float | int | None]]] = []
     totals: dict[str, float | int | None] = {
         "input_tokens": None,
         "cache_creation_input_tokens": None,
@@ -695,10 +701,11 @@ def collect_usage_and_fallbacks(
                 totals["cost_usd"] = float(cost)
             candidates: list[Any] = []
         elif event_type == "assistant" and isinstance(event.get("message"), dict):
-            candidates = [event["message"].get("usage")]
+            message = event["message"]
+            candidates = [(message.get("id"), message.get("usage"))]
         else:
-            candidates = [event.get("usage")]
-        for usage in candidates:
+            candidates = [(None, event.get("usage"))]
+        for message_id, usage in candidates:
             if not isinstance(usage, dict):
                 continue
             values = {
@@ -721,10 +728,12 @@ def collect_usage_and_fallbacks(
                 ),
             }
             if any(value is not None for value in values.values()):
-                observed[bucket_name] = True
-                for key, value in values.items():
-                    if value is not None:
-                        bucket[key] += value
+                if isinstance(message_id, str) and message_id:
+                    previous = usage_by_message_id.get(message_id)
+                    stable_bucket = previous[0] if previous else bucket_name
+                    usage_by_message_id[message_id] = (stable_bucket, values)
+                else:
+                    anonymous_usage.append((bucket_name, values))
         tool = event.get("tool_name") or event.get("name")
         if tool in {"Read", "Grep", "Glob", "Bash", "Shell", "Computer"}:
             fallback_events.append(
@@ -760,6 +769,15 @@ def collect_usage_and_fallbacks(
                             "event": item,
                         }
                     )
+    for bucket_name, values in [
+        *usage_by_message_id.values(),
+        *anonymous_usage,
+    ]:
+        observed[bucket_name] = True
+        bucket = before if bucket_name == "before" else after
+        for key, value in values.items():
+            if value is not None:
+                bucket[key] += value
     return {
         "before": before if observed["before"] else None,
         "after": after if observed["after"] else None,
@@ -793,6 +811,9 @@ def summarize_mcp_trace(
         for row in responses
         if row.get("response_to_method") == "tools/call"
     ]
+    successful_tool_responses = [
+        row for row in tool_responses if not row.get("is_error", False)
+    ]
     orientation_calls = [
         row
         for row in tool_calls
@@ -802,6 +823,9 @@ def summarize_mcp_trace(
         row
         for row in tool_responses
         if first_edit_at is None or str(row.get("observed_at", "")) < first_edit_at
+    ]
+    successful_orientation_responses = [
+        row for row in orientation_responses if not row.get("is_error", False)
     ]
     return {
         "trace_rows": len(rows),
@@ -821,10 +845,11 @@ def summarize_mcp_trace(
         "orientation_delivered_tool_result_bytes": sum(
             int(row.get("message_bytes", 0)) for row in orientation_responses
         ),
-        "observed_real_mcp_use": any(
-            row.get("method") in {"initialize", "tools/list", "tools/call"}
-            for row in calls
+        "successful_tool_responses": len(successful_tool_responses),
+        "successful_orientation_tool_responses": len(
+            successful_orientation_responses
         ),
+        "observed_real_mcp_use": bool(successful_orientation_responses),
     }
 
 
@@ -854,15 +879,25 @@ def merge_stage_ledger(
     before = usage.get("before")
     if isinstance(before, dict):
         for field, value in before.items():
-            ledger["stages"]["frontier_before_first_edit"][field] = known_metric(
-                value, "timestamped_executor_transcript"
-            )
+            metric = ledger["stages"]["frontier_before_first_edit"].get(field)
+            if isinstance(metric, dict) and metric.get("status") == "unknown":
+                ledger["stages"]["frontier_before_first_edit"][field] = known_metric(
+                    value, "timestamped_executor_transcript"
+                )
     after = usage.get("after")
     if isinstance(after, dict):
-        for field, value in after.items():
-            ledger["stages"]["first_edit_through_handoff"][field] = known_metric(
-                value, "timestamped_executor_transcript_until_executor_exit"
-            )
+        ledger["observed_intervals"] = {
+            "post_first_edit_until_executor_exit": {
+                field: known_metric(
+                    value, "timestamped_executor_transcript_until_executor_exit"
+                )
+                for field, value in after.items()
+            },
+            "note": (
+                "No handoff or patch-complete boundary was observed, so this interval "
+                "is not assigned to a required handoff or verification stage."
+            ),
+        }
     totals = usage.get("totals")
     if isinstance(totals, dict):
         for field, value in totals.items():

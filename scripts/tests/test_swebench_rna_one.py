@@ -14,12 +14,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "swebench_rna_one.py"
+PROXY_SCRIPT = ROOT / "scripts" / "swebench_rna_mcp_proxy.py"
 FIXTURES = ROOT / "scripts" / "tests" / "fixtures"
 SPEC = importlib.util.spec_from_file_location("swebench_rna_one", SCRIPT)
 assert SPEC and SPEC.loader
 HARNESS = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
+PROXY_SPEC = importlib.util.spec_from_file_location(
+    "swebench_rna_mcp_proxy", PROXY_SCRIPT
+)
+assert PROXY_SPEC and PROXY_SPEC.loader
+PROXY = importlib.util.module_from_spec(PROXY_SPEC)
+sys.modules[PROXY_SPEC.name] = PROXY
+PROXY_SPEC.loader.exec_module(PROXY)
 
 
 class SwebenchRnaOneTests(unittest.TestCase):
@@ -115,6 +123,56 @@ class SwebenchRnaOneTests(unittest.TestCase):
             self.assertEqual(
                 summary["orientation_delivered_tool_result_bytes"], 300
             )
+            self.assertEqual(summary["successful_orientation_tool_responses"], 1)
+            self.assertTrue(summary["observed_real_mcp_use"])
+
+    def test_mcp_summary_rejects_handshake_only_and_error_only_traffic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary) / "mcp.jsonl"
+            HARNESS.write_jsonl(
+                trace,
+                [
+                    {
+                        "direction": "client_to_server",
+                        "method": "initialize",
+                        "observed_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "direction": "client_to_server",
+                        "method": "tools/call",
+                        "observed_at": "2026-01-01T00:00:01+00:00",
+                    },
+                    {
+                        "direction": "server_to_client",
+                        "response_to_method": "tools/call",
+                        "is_error": True,
+                        "observed_at": "2026-01-01T00:00:02+00:00",
+                    },
+                ],
+            )
+            summary = HARNESS.summarize_mcp_trace(
+                trace, first_edit_at="2026-01-01T00:00:03+00:00"
+            )
+            self.assertFalse(summary["observed_real_mcp_use"])
+            self.assertEqual(summary["successful_tool_responses"], 0)
+
+    def test_proxy_trace_correlates_arguments_and_response_hash(self) -> None:
+        pending = {}
+        request = (
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":'
+            b'{"name":"search","arguments":{"query":"SessionBase"}}}\n'
+        )
+        response = b'{"jsonrpc":"2.0","id":7,"result":{"content":[]}}\n'
+        request_row = PROXY.trace_row("client_to_server", request, pending)
+        response_row = PROXY.trace_row("server_to_client", response, pending)
+        self.assertEqual(
+            request_row["request_params"]["arguments"]["query"], "SessionBase"
+        )
+        self.assertEqual(response_row["response_to_tool"], "search")
+        self.assertEqual(
+            response_row["response_to_params"]["arguments"]["query"], "SessionBase"
+        )
+        self.assertEqual(len(response_row["message_sha256"]), 64)
 
     def test_provider_cache_tokens_are_recorded_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -127,12 +185,31 @@ class SwebenchRnaOneTests(unittest.TestCase):
                         {
                             "type": "assistant",
                             "message": {
+                                "id": "message-1",
                                 "usage": {
                                     "input_tokens": 2,
                                     "cache_creation_input_tokens": 30,
                                     "cache_read_input_tokens": 400,
                                     "output_tokens": 5,
                                 }
+                            },
+                        }
+                    ),
+                },
+                {
+                    "observed_at": "2026-01-01T00:00:01.5+00:00",
+                    "observed_monotonic": 1.5,
+                    "line": json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "id": "message-1",
+                                "usage": {
+                                    "input_tokens": 3,
+                                    "cache_creation_input_tokens": 40,
+                                    "cache_read_input_tokens": 500,
+                                    "output_tokens": 6,
+                                },
                             },
                         }
                     ),
@@ -158,11 +235,57 @@ class SwebenchRnaOneTests(unittest.TestCase):
             usage, _ = HARNESS.collect_usage_and_fallbacks(
                 trace, first_edit_monotonic=2.0
             )
-            self.assertEqual(usage["before"]["cache_creation_input_tokens"], 30)
-            self.assertEqual(usage["before"]["cache_read_input_tokens"], 400)
+            self.assertEqual(usage["before"]["cache_creation_input_tokens"], 40)
+            self.assertEqual(usage["before"]["cache_read_input_tokens"], 500)
             self.assertEqual(usage["totals"]["cache_creation_input_tokens"], 80)
             self.assertEqual(usage["totals"]["cache_read_input_tokens"], 900)
             self.assertEqual(usage["totals"]["cost_usd"], 0.25)
+
+    def test_stage_report_wins_and_unobserved_handoff_stays_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "executor-report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "stages": {
+                            "frontier_before_first_edit": {"input_tokens": 99}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = HARNESS.stage_ledger_skeleton()
+            HARNESS.merge_stage_ledger(
+                ledger,
+                executor_report=report,
+                usage={
+                    "before": {"input_tokens": 5},
+                    "after": {"input_tokens": 7},
+                    "totals": {},
+                },
+                mcp_summary={
+                    "orientation_delivered_tool_result_bytes": 1,
+                    "orientation_tool_calls": 1,
+                },
+            )
+            self.assertEqual(
+                ledger["stages"]["frontier_before_first_edit"]["input_tokens"][
+                    "value"
+                ],
+                99,
+            )
+            self.assertEqual(
+                ledger["stages"]["first_edit_through_handoff"]["input_tokens"][
+                    "status"
+                ],
+                "unknown",
+            )
+            self.assertEqual(
+                ledger["observed_intervals"][
+                    "post_first_edit_until_executor_exit"
+                ]["input_tokens"]["value"],
+                7,
+            )
 
     def test_enrichment_state_includes_embedding_capability_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

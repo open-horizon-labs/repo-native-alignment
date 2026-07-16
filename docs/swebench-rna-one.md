@@ -101,7 +101,11 @@ The output directory contains:
   executor/model configuration, timings, isolation proof, selected and observed
   enrichment state, MCP-use summary, evaluator outcome, and errors.
 - `checkout/`: isolated one-commit agent workspace.
-- `mcp-config.json`, `mcp-trace.jsonl`, and `rna-mcp.stderr.log`.
+- `mcp-config.json`, `mcp-trace.jsonl`, and `rna-mcp.stderr.log`. The trace
+  correlates each call and response, retains tool-call parameters, records exact
+  byte sizes, and hashes each wire message. A live run requires at least one
+  successful RNA tool response before the first edit; protocol handshake alone
+  is not accepted as RNA use.
 - `executor.stdout.log`, `executor.stderr.log`, and
   `executor-timed-trace.jsonl`.
 - `fallback-events.jsonl`: raw-read/shell fallback events when exposed by the
@@ -143,6 +147,10 @@ JSON to `SWEBENCH_EXECUTOR_REPORT`:
 ```
 
 Unreported stages remain explicit unknowns.
+When the transcript exposes usage after the first edit but no explicit handoff
+or patch-complete boundary, the ledger records a supplemental
+`post_first_edit_until_executor_exit` interval. It does not mislabel that
+interval as handoff, post-handoff, or verification usage.
 
 ## Token-free dry run
 
