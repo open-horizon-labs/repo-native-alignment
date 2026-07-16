@@ -73,3 +73,40 @@ Findings and fixes:
 
 Focused fixes, `cargo check --lib`, and `cargo clippy --lib -- -D warnings`
 pass. Independent re-review verdict: **APPROVE**.
+
+## CodeRabbit changes-requested follow-up
+
+The authoritative review on commit `3fe2f0f3` contained three inline findings
+and two outside-diff findings. The O(nodes × selectors) scope planner finding
+was already resolved on `c681d987`; the remaining four were addressed:
+
+1. Every live changed-file background/incremental completion now publishes
+   scoped readiness, matching its durable `EnrichmentScope::ChangedFiles`
+   evidence. Repository warm-up alone retains `default_profile`.
+2. Degraded repository evidence now hydrates and renders with repo-wide
+   coverage plus the persisted edge count; it no longer claims explicit
+   scoped review context.
+3. Zero-edge `default_profile` completion retains the omitted-broad-reference
+   explanation instead of falling through to generic zero-coverage wording.
+4. Shared deadlines are enforced inside `LspEnricher`. Initialization, Pass 0,
+   and later passes are bounded around the caller-owned result, while Pass 1
+   owns both the shared-budget and job watchdog branches so every abort drains
+   workers and flushes the durable work-item ledger before returning partial
+   output. `LspConsumer` keeps an outer fallback only for enrichers that do not
+   declare internal deadline ownership.
+
+Verification after these fixes:
+
+- `cargo check --lib`: pass.
+- Eight focused readiness/deadline regressions: pass.
+- `cargo clippy --lib -- -D warnings`: pass.
+- Targeted rustfmt with child-module traversal disabled: pass.
+- `git diff --check`: pass.
+- Full library suite excluding the checkout-history-sensitive
+  `test_list_roots_from_slugs_lsp_stats_per_language`: 2,031 passed,
+  4 ignored, 0 failed. The excluded test independently passes in clean CI;
+  locally it reads the real repo's persisted degraded scan text.
+- Final independent re-review initially found two P1 gaps (no absolute
+  unbudgeted phase deadline and zero fresh scoped coverage). Both were fixed
+  with one absolute job deadline plus `max(existing, latest)` scoped coverage.
+  Final verdict: **APPROVE**, no blocking findings.

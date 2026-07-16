@@ -438,16 +438,25 @@ fn hydrate_lsp_status_from_ledger(
                     );
                 }
                 server::LspEvidenceReadiness::Partial => {
-                    handler.lsp_status.set_degraded_scoped(
-                        job.counters.edge_count.unwrap_or(0),
-                        persisted_lsp_edges,
-                        evidence.scope.clone(),
-                        evidence
-                            .detail
-                            .as_deref()
-                            .or(job.failure.as_deref())
-                            .unwrap_or("call-reference enrichment finalized with partial evidence"),
-                    );
+                    let detail = evidence
+                        .detail
+                        .as_deref()
+                        .or(job.failure.as_deref())
+                        .unwrap_or("call-reference enrichment finalized with partial evidence");
+                    if job.scope == EnrichmentScope::Repo {
+                        handler.lsp_status.set_degraded_with_coverage(
+                            job.counters.edge_count.unwrap_or(0),
+                            persisted_lsp_edges,
+                            detail,
+                        );
+                    } else {
+                        handler.lsp_status.set_degraded_scoped(
+                            job.counters.edge_count.unwrap_or(0),
+                            persisted_lsp_edges,
+                            evidence.scope.clone(),
+                            detail,
+                        );
+                    }
                 }
                 server::LspEvidenceReadiness::Unavailable => {
                     handler.lsp_status.set_unavailable_with_detail(
@@ -1584,12 +1593,15 @@ mod tests {
         let related = hydrate_lsp_status_from_ledger(&handler, tmp.path(), 3, false);
 
         assert_eq!(handler.lsp_status.current_state(), LspState::Degraded);
+        let readiness = handler.lsp_status.call_reference_readiness();
+        assert!(readiness.detail.contains("historical abort"));
+        assert!(readiness.detail.contains("for repo-wide"));
         assert!(
-            handler
+            !handler
                 .lsp_status
-                .call_reference_readiness()
+                .review_readiness()
                 .detail
-                .contains("historical abort")
+                .contains("explicit scoped/degraded context")
         );
         assert_eq!(related, vec![historical_job]);
     }

@@ -520,10 +520,19 @@ impl RnaHandler {
                                 let degraded_detail =
                                     (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                                 if let Some(detail) = degraded_detail.as_deref() {
-                                    lsp_status.set_degraded(lsp_call_edge_count, detail);
-                                } else if lsp_edge_count > 0 {
-                                    lsp_status.set_complete_default_profile_for_warmup(
+                                    let existing_coverage = lsp_status.coverage_edge_count();
+                                    lsp_status.set_degraded_scoped(
                                         lsp_call_edge_count,
+                                        existing_coverage,
+                                        EnrichmentScope::ChangedFiles.stable_key(),
+                                        detail,
+                                    );
+                                } else if lsp_edge_count > 0 {
+                                    let existing_coverage = lsp_status.coverage_edge_count();
+                                    lsp_status.set_complete_scoped(
+                                        lsp_call_edge_count,
+                                        existing_coverage,
+                                        EnrichmentScope::ChangedFiles.stable_key(),
                                     );
                                 } else {
                                     lsp_status.set_unavailable();
@@ -2157,22 +2166,22 @@ impl RnaHandler {
                 Some(std::iter::once(primary_slug.clone()).collect());
 
             let pipeline_result = crate::extract::consumers::emit_enrichment_pipeline(
-                    std::mem::take(&mut graph.nodes),
-                    std::mem::take(&mut graph.edges),
-                    root_pairs_incremental,
-                    primary_slug.clone(),
-                    self.repo_root.clone(),
-                    crate::extract::consumers::BusOptions {
-                        scan_stats: Some(Arc::clone(&self.scan_stats)),
-                        embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
-                        lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
-                        skip_lsp: !enrichment.runs_lsp(),
-                        lsp_node_filter: None,
-                        broad_reference_budget: None,
-                    },
-                    dirty_slugs,
-                )
-                .await;
+                std::mem::take(&mut graph.nodes),
+                std::mem::take(&mut graph.edges),
+                root_pairs_incremental,
+                primary_slug.clone(),
+                self.repo_root.clone(),
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(Arc::clone(&self.scan_stats)),
+                    embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
+                    lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                    skip_lsp: !enrichment.runs_lsp(),
+                    lsp_node_filter: None,
+                    broad_reference_budget: None,
+                },
+                dirty_slugs,
+            )
+            .await;
             let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics) =
                 match pipeline_result {
                     Ok(result) => result,
@@ -2184,9 +2193,9 @@ impl RnaHandler {
                                 format!("incremental enrichment pipeline failed: {error:#}"),
                             );
                         }
-                    // Pipeline invariant violated — abort the incremental update so the
-                    // partial graph is not persisted. Scanner state is not committed on
-                    // Err return, so the next scan will retry the full pass sequence.
+                        // Pipeline invariant violated — abort the incremental update so the
+                        // partial graph is not persisted. Scanner state is not committed on
+                        // Err return, so the next scan will retry the full pass sequence.
                         return Err(error.context(
                             "incremental update aborted: post-extraction passes did not complete",
                         ));
@@ -2512,7 +2521,13 @@ impl RnaHandler {
             && let Some((lsp_call_edge_count, degraded_detail)) = incremental_lsp_outcome
         {
             if let Some(detail) = degraded_detail.as_deref() {
-                self.lsp_status.set_degraded(lsp_call_edge_count, detail);
+                let existing_coverage = self.lsp_status.coverage_edge_count();
+                self.lsp_status.set_degraded_scoped(
+                    lsp_call_edge_count,
+                    existing_coverage,
+                    EnrichmentScope::ChangedFiles.stable_key(),
+                    detail,
+                );
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_degraded(
                         &self.repo_root,
@@ -2534,8 +2549,12 @@ impl RnaHandler {
             } else {
                 // A clean, durable incremental pass supersedes any prior
                 // degraded/running state, including the valid zero-edge case.
-                self.lsp_status
-                    .set_complete_default_profile_for_warmup(lsp_call_edge_count);
+                let existing_coverage = self.lsp_status.coverage_edge_count();
+                self.lsp_status.set_complete_scoped(
+                    lsp_call_edge_count,
+                    existing_coverage,
+                    EnrichmentScope::ChangedFiles.stable_key(),
+                );
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_completed(
                         &self.repo_root,
@@ -2545,9 +2564,7 @@ impl RnaHandler {
                     );
                 }
             }
-        } else if !persist_succeeded
-            && let Some(job_id) = incremental_lsp_job_id.as_deref()
-        {
+        } else if !persist_succeeded && let Some(job_id) = incremental_lsp_job_id.as_deref() {
             self.enrichment_jobs.mark_failed(
                 &self.repo_root,
                 job_id,

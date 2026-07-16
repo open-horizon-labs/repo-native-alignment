@@ -590,7 +590,13 @@ impl RnaHandler {
                             })
                             .unwrap_or((0, 0, 0));
                         if persist_succeeded && degraded_job_id.is_some() {
-                            lsp_status.set_degraded(lsp_edge_count, detail);
+                            let existing_coverage = lsp_status.coverage_edge_count();
+                            lsp_status.set_degraded_scoped(
+                                lsp_edge_count,
+                                existing_coverage,
+                                EnrichmentScope::ChangedFiles.stable_key(),
+                                detail,
+                            );
                             super::sentinel::clear_lsp_sentinel(&repo_root);
                             if let Some(job_id) = degraded_job_id.as_deref() {
                                 enrichment_jobs.mark_degraded(
@@ -727,9 +733,20 @@ impl RnaHandler {
                     );
                     let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                     if let Some(detail) = degraded_detail.as_deref() {
-                        lsp_status.set_degraded(lsp_call_edge_count, detail);
+                        let existing_coverage = lsp_status.coverage_edge_count();
+                        lsp_status.set_degraded_scoped(
+                            lsp_call_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                            detail,
+                        );
                     } else {
-                        lsp_status.set_complete_default_profile_for_warmup(lsp_call_edge_count);
+                        let existing_coverage = lsp_status.coverage_edge_count();
+                        lsp_status.set_complete_scoped(
+                            lsp_call_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                        );
                     }
                     if lsp_edge_count > 0 {
                         tracing::info!(
@@ -1737,11 +1754,21 @@ impl RnaHandler {
                 if enrichment.runs_lsp() {
                     let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                     if let Some(detail) = degraded_detail.as_deref() {
-                        self.lsp_status.set_degraded(lsp_edge_count, detail);
+                        let existing_coverage = self.lsp_status.coverage_edge_count();
+                        self.lsp_status.set_degraded_scoped(
+                            lsp_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                            detail,
+                        );
                         lsp_degraded_detail = Some(detail.to_string());
                     } else {
-                        self.lsp_status
-                            .set_complete_default_profile_for_warmup(lsp_edge_count);
+                        let existing_coverage = self.lsp_status.coverage_edge_count();
+                        self.lsp_status.set_complete_scoped(
+                            lsp_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                        );
                     }
                     lsp_stage_completed = true;
                 }

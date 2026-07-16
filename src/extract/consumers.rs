@@ -1500,7 +1500,9 @@ impl ExtractionConsumer for LspConsumer {
             }
             enricher.enrich(&nodes_vec, &index, &repo_root).await
         };
-        let enrichment_result = if let Some(budget) = self.broad_reference_budget.as_ref() {
+        let enrichment_result = if self.enricher.manages_broad_reference_deadline() {
+            enrichment_future.await
+        } else if let Some(budget) = self.broad_reference_budget.as_ref() {
             match budget.remaining_duration() {
                 Some(remaining) => match tokio::time::timeout(remaining, enrichment_future).await {
                     Ok(result) => result,
@@ -3492,6 +3494,87 @@ mod tests {
         let snapshot = budget.snapshot();
         assert!(snapshot.circuit_open);
         assert_eq!(snapshot.scheduled_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn internally_managed_deadline_preserves_partial_enrichment_output() {
+        struct InternallyManagedEnricher;
+
+        #[async_trait::async_trait]
+        impl crate::extract::Enricher for InternallyManagedEnricher {
+            fn languages(&self) -> &[&str] {
+                &["rust"]
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn name(&self) -> &str {
+                "internally-managed-test-enricher"
+            }
+
+            fn manages_broad_reference_deadline(&self) -> bool {
+                true
+            }
+
+            async fn enrich(
+                &self,
+                _nodes: &[Node],
+                _index: &crate::graph::index::GraphIndex,
+                _repo_root: &std::path::Path,
+            ) -> anyhow::Result<crate::extract::EnrichmentResult> {
+                Ok(crate::extract::EnrichmentResult {
+                    updated_nodes: vec![(
+                        "fixture:src/lib.rs:caller:function".to_string(),
+                        std::collections::BTreeMap::from([(
+                            "partial".to_string(),
+                            "preserved".to_string(),
+                        )]),
+                    )],
+                    any_enricher_ran: true,
+                    aborted: true,
+                    error_count: 1,
+                    diagnostic: Some(
+                        "broad-reference time budget exhausted; partial output preserved"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let budget = Arc::new(crate::extract::lsp::LspBroadReferenceBudget::new(
+            10,
+            std::time::Duration::from_millis(1),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(InternallyManagedEnricher),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: Some(budget),
+        };
+
+        let events = consumer
+            .on_event(&ExtractionEvent::LanguageDetected {
+                slug: "fixture".into(),
+                language: "rust".into(),
+                nodes: Arc::from([]),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &events[0],
+            ExtractionEvent::EnrichmentComplete {
+                aborted: true,
+                updated_nodes,
+                diagnostic: Some(detail),
+                ..
+            } if updated_nodes.len() == 1 && detail.contains("partial output preserved")
+        ));
     }
 
     /// Regression for #766: an aborted enricher is a degraded completion, not a

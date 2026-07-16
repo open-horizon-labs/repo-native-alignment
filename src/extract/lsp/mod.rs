@@ -238,9 +238,7 @@ pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
     planned_operations_for_node_inner(node, false)
 }
 
-pub(crate) fn planned_operations_for_node_with_broad_references(
-    node: &Node,
-) -> Vec<String> {
+pub(crate) fn planned_operations_for_node_with_broad_references(node: &Node) -> Vec<String> {
     planned_operations_for_node_inner(node, true)
 }
 
@@ -508,16 +506,72 @@ impl LspEnricher {
         self
     }
 
-    pub(crate) fn with_broad_references(
-        mut self,
-        budget: Arc<LspBroadReferenceBudget>,
-    ) -> Self {
+    pub(crate) fn with_broad_references(mut self, budget: Arc<LspBroadReferenceBudget>) -> Self {
         self.query_profile = self.query_profile.with_broad_references(budget);
         self
     }
 
     pub(crate) fn broad_reference_budget(&self) -> Option<&Arc<LspBroadReferenceBudget>> {
         self.query_profile.broad_reference_budget()
+    }
+
+    async fn within_enrichment_deadline<T>(
+        &self,
+        job_deadline: tokio::time::Instant,
+        phase: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, String> {
+        enum DeadlineKind<'a> {
+            Job,
+            BroadReference(&'a LspBroadReferenceBudget),
+        }
+
+        let now = tokio::time::Instant::now();
+        let (deadline, kind) = if let Some(budget) = self.broad_reference_budget() {
+            let broad_deadline = budget
+                .remaining_duration()
+                .map_or(now, |remaining| now + remaining);
+            if broad_deadline <= job_deadline {
+                (broad_deadline, DeadlineKind::BroadReference(budget))
+            } else {
+                (job_deadline, DeadlineKind::Job)
+            }
+        } else {
+            (job_deadline, DeadlineKind::Job)
+        };
+
+        match tokio::time::timeout_at(deadline, future).await {
+            Ok(output) => Ok(output),
+            Err(_) => match kind {
+                DeadlineKind::BroadReference(budget) => {
+                    budget.open_time_circuit();
+                    Err(Self::broad_reference_deadline_detail(budget, phase))
+                }
+                DeadlineKind::Job => Err(format!(
+                    "LSP enrichment job timed out after {}s during {phase}",
+                    lsp_job_timeout().as_secs()
+                )),
+            },
+        }
+    }
+
+    fn broad_reference_deadline_detail(budget: &LspBroadReferenceBudget, phase: &str) -> String {
+        let reason = budget
+            .snapshot()
+            .circuit_reason
+            .unwrap_or_else(|| "broad-reference time budget exhausted".to_string());
+        format!("{reason} during {phase}")
+    }
+
+    fn mark_broad_reference_deadline(&self, result: &mut EnrichmentResult, detail: String) {
+        result.any_enricher_ran = true;
+        result.aborted = true;
+        result.error_count = result.error_count.saturating_add(1);
+        result.diagnostic = Some(format!(
+            "LSP enrichment aborted for {}: {}; safely produced partial output was preserved",
+            self.server_command, detail
+        ));
+        tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
     }
 
     #[cfg(test)]
@@ -2619,6 +2673,10 @@ impl Enricher for LspEnricher {
         self.toolchain_remediation
     }
 
+    fn manages_broad_reference_deadline(&self) -> bool {
+        true
+    }
+
     async fn enrich(
         &self,
         nodes: &[Node],
@@ -2626,6 +2684,7 @@ impl Enricher for LspEnricher {
         repo_root: &Path,
     ) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
+        let job_deadline = tokio::time::Instant::now() + lsp_job_timeout();
 
         // Establish one admitted input set before any pass derives work from it.
         let matching_nodes: Vec<&Node> =
@@ -2651,10 +2710,28 @@ impl Enricher for LspEnricher {
             return Ok(result);
         }
 
-        // Try to initialize the language server using the repo root from --repo
-        if let Err(e) = self.ensure_initialized(repo_root).await {
-            tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
-            return Err(e);
+        // Try to initialize the language server using the repo root from --repo.
+        // Scoped requests enforce their shared deadline here rather than at the
+        // event-bus boundary, where cancellation would discard Pass 1 output.
+        match self
+            .within_enrichment_deadline(
+                job_deadline,
+                "language-server initialization",
+                self.ensure_initialized(repo_root),
+            )
+            .await
+        {
+            Ok(Ok(())) => {
+                result.any_enricher_ran = true;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
+                return Err(e);
+            }
+            Err(detail) => {
+                self.mark_broad_reference_deadline(&mut result, detail);
+                return Ok(result);
+            }
         }
 
         // Extract state under lock, then release for concurrent work.
@@ -2700,8 +2777,17 @@ impl Enricher for LspEnricher {
         };
 
         // Pass 0: crate-level dependency graph (Rust only, no quiescence needed)
-        self.run_pass0_crate_graph(&transport, &matching_nodes, &mut result)
-            .await;
+        if let Err(detail) = self
+            .within_enrichment_deadline(
+                job_deadline,
+                "Pass 0 crate graph",
+                self.run_pass0_crate_graph(&transport, &matching_nodes, &mut result),
+            )
+            .await
+        {
+            self.mark_broad_reference_deadline(&mut result, detail);
+            return Ok(result);
+        }
 
         // Guard: skip enrichment passes when server never reached quiescent state
         if !was_quiescent {
@@ -2743,38 +2829,20 @@ impl Enricher for LspEnricher {
         let query_telemetry = Arc::new(policy::LspQueryTelemetry::new(&self.query_profile));
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
-        let pass1 = self.run_pass1_references(
-            &transport,
-            &root,
-            &matching_nodes,
-            &matching_nodes_owned,
-            &refs_by_file_shared,
-            capabilities,
-            &mut query_budget,
-            &query_telemetry,
-            &mut result,
-        );
-        let (attempted, errors, aborted, abort_diagnostic) = match tokio::time::timeout(
-            lsp_job_timeout(),
-            pass1,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                query_telemetry.record_job_timeout();
-                result.aborted = true;
-                result.error_count = result.error_count.saturating_add(1);
-                result.diagnostic = Some(format!(
-                    "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
-                    self.server_command,
-                    lsp_job_timeout().as_secs()
-                ));
-                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
-                result.lsp_query_metrics = query_telemetry.snapshot();
-                return Ok(result);
-            }
-        };
+        let (attempted, errors, aborted, abort_diagnostic) = self
+            .run_pass1_references(
+                &transport,
+                &root,
+                &matching_nodes,
+                &matching_nodes_owned,
+                &refs_by_file_shared,
+                capabilities,
+                &mut query_budget,
+                &query_telemetry,
+                &mut result,
+                job_deadline,
+            )
+            .await;
         if aborted {
             result.error_count = errors as usize;
             result.aborted = true;
@@ -2790,18 +2858,30 @@ impl Enricher for LspEnricher {
         }
 
         // Pass 2: type hierarchy (sequential -- strike counting needs order)
-        let (has_type_hierarchy, type_hierarchy_strikes) = self
-            .run_pass2_type_hierarchy(
-                &transport,
-                &root,
-                &matching_nodes,
-                capabilities,
-                &mut query_budget,
-                &query_telemetry,
-                type_hierarchy_strikes,
-                &mut result,
+        let (has_type_hierarchy, type_hierarchy_strikes) = match self
+            .within_enrichment_deadline(
+                job_deadline,
+                "Pass 2 type hierarchy",
+                self.run_pass2_type_hierarchy(
+                    &transport,
+                    &root,
+                    &matching_nodes,
+                    capabilities,
+                    &mut query_budget,
+                    &query_telemetry,
+                    type_hierarchy_strikes,
+                    &mut result,
+                ),
             )
-            .await;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(detail) => {
+                self.mark_broad_reference_deadline(&mut result, detail);
+                result.lsp_query_metrics = query_telemetry.snapshot();
+                return Ok(result);
+            }
+        };
 
         // Persist strike counter back to state
         {
@@ -2811,18 +2891,38 @@ impl Enricher for LspEnricher {
         }
 
         // Pass 4: BelongsTo edges -- module hierarchy
-        self.run_pass4_belongs_to(&transport, &root, &matching_nodes, &mut result)
-            .await;
+        if let Err(detail) = self
+            .within_enrichment_deadline(
+                job_deadline,
+                "Pass 4 module hierarchy",
+                self.run_pass4_belongs_to(&transport, &root, &matching_nodes, &mut result),
+            )
+            .await
+        {
+            self.mark_broad_reference_deadline(&mut result, detail);
+            result.lsp_query_metrics = query_telemetry.snapshot();
+            return Ok(result);
+        }
 
         // Pass 5: InlayHints -- inferred types in embeddings
-        self.run_pass5_inlay_hints(
-            &transport,
-            &root,
-            &matching_nodes,
-            has_inlay_hints,
-            &mut result,
-        )
-        .await;
+        if let Err(detail) = self
+            .within_enrichment_deadline(
+                job_deadline,
+                "Pass 5 inlay hints",
+                self.run_pass5_inlay_hints(
+                    &transport,
+                    &root,
+                    &matching_nodes,
+                    has_inlay_hints,
+                    &mut result,
+                ),
+            )
+            .await
+        {
+            self.mark_broad_reference_deadline(&mut result, detail);
+            result.lsp_query_metrics = query_telemetry.snapshot();
+            return Ok(result);
+        }
 
         // Pass 3: diagnostics (runs last, guarded by quiescence)
         if !was_quiescent {
@@ -2830,17 +2930,25 @@ impl Enricher for LspEnricher {
                 "LSP Pass 3 skipped: {} did not reach quiescent state during initialization",
                 self.server_command
             );
-        } else {
-            self.run_pass3_diagnostics(
-                &transport,
-                &root,
-                &matching_nodes,
-                has_pull_diagnostics,
-                &diag_sink,
-                repo_root,
-                &mut result,
+        } else if let Err(detail) = self
+            .within_enrichment_deadline(
+                job_deadline,
+                "Pass 3 diagnostics",
+                self.run_pass3_diagnostics(
+                    &transport,
+                    &root,
+                    &matching_nodes,
+                    has_pull_diagnostics,
+                    &diag_sink,
+                    repo_root,
+                    &mut result,
+                ),
             )
-            .await;
+            .await
+        {
+            self.mark_broad_reference_deadline(&mut result, detail);
+            result.lsp_query_metrics = query_telemetry.snapshot();
+            return Ok(result);
         }
 
         let diag_count = result
@@ -2918,6 +3026,64 @@ mod tests {
             .unwrap();
         assert!(result.added_edges.is_empty());
         assert!(result.updated_nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_broad_reference_deadline_keeps_completed_partial_mutations() {
+        let budget = Arc::new(LspBroadReferenceBudget::new(
+            10,
+            std::time::Duration::from_millis(5),
+        ));
+        let enricher =
+            LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]).with_broad_references(budget);
+        let mut partial_output = Vec::new();
+
+        let detail = enricher
+            .within_enrichment_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                "test phase",
+                async {
+                    partial_output.push("completed edge");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                },
+            )
+            .await
+            .expect_err("deadline should expire");
+
+        assert_eq!(partial_output, vec!["completed edge"]);
+        assert!(detail.contains("test phase"));
+        let mut result = EnrichmentResult::default();
+        enricher.mark_broad_reference_deadline(&mut result, detail);
+        assert!(result.aborted);
+        assert!(result.any_enricher_ran);
+        assert!(
+            result
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("partial output was preserved"))
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_job_deadline_bounds_unbudgeted_phases_and_preserves_partial_mutations() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let mut partial_output = Vec::new();
+
+        let detail = enricher
+            .within_enrichment_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(5),
+                "unbudgeted test phase",
+                async {
+                    partial_output.push("completed edge");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                },
+            )
+            .await
+            .expect_err("job deadline should expire");
+
+        assert_eq!(partial_output, vec!["completed edge"]);
+        assert!(detail.contains("job timed out"));
+        assert!(detail.contains("unbudgeted test phase"));
     }
 
     /// Verify the LspEnricher can be constructed with correct properties for each language.

@@ -709,6 +709,20 @@ impl LspEnrichmentStatus {
         self.set_degraded_with_scope(edge_count, edge_count, LspCoverageScope::Repo, detail);
     }
 
+    pub fn set_degraded_with_coverage(
+        &self,
+        latest_edge_count: usize,
+        coverage_edge_count: usize,
+        detail: &str,
+    ) {
+        self.set_degraded_with_scope(
+            latest_edge_count,
+            coverage_edge_count,
+            LspCoverageScope::Repo,
+            detail,
+        );
+    }
+
     pub fn set_degraded_scoped(
         &self,
         latest_edge_count: usize,
@@ -718,7 +732,7 @@ impl LspEnrichmentStatus {
     ) {
         self.set_degraded_with_scope(
             latest_edge_count,
-            coverage_edge_count,
+            coverage_edge_count.max(latest_edge_count),
             LspCoverageScope::Scoped(scope_detail.into()),
             detail,
         );
@@ -808,8 +822,10 @@ impl LspEnrichmentStatus {
     ) {
         self.edge_count
             .store(latest_edge_count, std::sync::atomic::Ordering::Release);
-        self.coverage_edge_count
-            .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count.store(
+            coverage_edge_count.max(latest_edge_count),
+            std::sync::atomic::Ordering::Release,
+        );
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
         *self.coverage_scope.lock().unwrap() = LspCoverageScope::Scoped(scope_detail.into());
@@ -937,6 +953,16 @@ impl LspEnrichmentStatus {
                             coverage_edge_count, latest_edge_count
                         ),
                     ),
+                    (_, false, LspCoverageScope::DefaultProfile(detail)) => {
+                        CapabilityReadiness::new(
+                            "LSP call/reference coverage",
+                            CapabilityReadinessState::Partial,
+                            format!(
+                                "{} persisted call/reference edges available for the default query profile; {}",
+                                coverage_edge_count, detail
+                            ),
+                        )
+                    }
                     (0, false, _) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Partial,
@@ -950,16 +976,6 @@ impl LspEnrichmentStatus {
                             coverage_edge_count, scope_detail
                         ),
                     ),
-                    (_, false, LspCoverageScope::DefaultProfile(detail)) => {
-                        CapabilityReadiness::new(
-                            "LSP call/reference coverage",
-                            CapabilityReadinessState::Partial,
-                            format!(
-                                "{} persisted call/reference edges available for the default query profile; {}",
-                                coverage_edge_count, detail
-                            ),
-                        )
-                    }
                     (_, false, LspCoverageScope::Repo) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Ready,
@@ -1590,10 +1606,11 @@ mod tests {
     fn test_scoped_lsp_coverage_blocks_dead_code_but_allows_review_context() {
         let status = LspEnrichmentStatus::default();
         status.set_running();
-        status.set_complete_scoped(4, 4, "changed_files scope");
+        status.set_complete_scoped(4, 0, "changed_files scope");
 
         let lsp = status.call_reference_readiness();
         assert_eq!(lsp.state, CapabilityReadinessState::Partial);
+        assert!(lsp.detail.contains("4 persisted"));
         assert!(
             lsp.detail.contains("repo-wide coverage is not proven"),
             "got: {}",
@@ -1618,6 +1635,22 @@ mod tests {
     }
 
     #[test]
+    fn fresh_degraded_scoped_output_is_usable_review_context() {
+        let status = LspEnrichmentStatus::default();
+        status.set_degraded_scoped(3, 0, "changed_files", "budget exhausted");
+
+        assert_eq!(status.coverage_edge_count(), 3);
+        let readiness = status.review_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(
+            readiness
+                .detail
+                .contains("explicit scoped/degraded context")
+        );
+        assert!(readiness.detail.contains("3 partial call/reference edges"));
+    }
+
+    #[test]
     fn default_profile_lsp_coverage_is_not_reported_as_full() {
         let status = LspEnrichmentStatus::default();
         status.set_complete_default_profile(
@@ -1634,6 +1667,22 @@ mod tests {
             status.dead_code_readiness().state,
             CapabilityReadinessState::Partial
         );
+    }
+
+    #[test]
+    fn zero_edge_default_profile_preserves_omitted_broad_reference_detail() {
+        let status = LspEnrichmentStatus::default();
+        status.set_complete_default_profile(
+            0,
+            0,
+            "broad references were omitted; request explicit scope",
+        );
+
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(readiness.detail.contains("default query profile"));
+        assert!(readiness.detail.contains("broad references were omitted"));
+        assert!(!readiness.detail.contains("false-negative prone"));
     }
 
     #[test]

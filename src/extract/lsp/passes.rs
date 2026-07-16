@@ -25,7 +25,7 @@ use super::transport::{
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
-    ZERO_EDGE_TIMEOUT,
+    ZERO_EDGE_TIMEOUT, lsp_job_timeout,
 };
 use crate::scanner::LspConfig;
 
@@ -643,6 +643,7 @@ impl LspEnricher {
         budget: &mut LspQueryBudget,
         telemetry: &Arc<LspQueryTelemetry>,
         result: &mut EnrichmentResult,
+        job_deadline: tokio::time::Instant,
     ) -> (u32, u32, bool, Option<String>) {
         let pass1_start = std::time::Instant::now();
         let language = self.language.clone();
@@ -863,6 +864,7 @@ impl LspEnricher {
         let mut last_progress_log = std::time::Instant::now();
         let mut last_logged_count = 0u64;
         let mut no_progress_deadline = Box::pin(tokio::time::sleep(pass1_no_progress_timeout()));
+        let mut job_deadline = Box::pin(tokio::time::sleep_until(job_deadline));
         let broad_reference_budget = self.broad_reference_budget().cloned();
         let broad_reference_deadline = async {
             match broad_reference_budget.as_ref() {
@@ -920,6 +922,19 @@ impl LspEnricher {
                         pass1_no_progress_timeout().as_secs(),
                         rendered_snapshot
                     ));
+                    join_set.abort_all();
+                    break;
+                }
+                _ = &mut job_deadline => {
+                    let detail = format!(
+                        "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
+                        self.server_command,
+                        lsp_job_timeout().as_secs()
+                    );
+                    tracing::warn!("{detail}");
+                    errors += 1;
+                    aborted = true;
+                    abort_diagnostic = Some(detail);
                     join_set.abort_all();
                     break;
                 }
@@ -1180,13 +1195,7 @@ impl LspEnricher {
                     && operation == Some(LspQueryOperation::DocumentLinks)
                 {
                     Self::enrich_document_links(
-                        transport,
-                        &file_uri,
-                        node,
-                        root,
-                        item.id,
-                        telemetry,
-                        &mut edges,
+                        transport, &file_uri, node, root, item.id, telemetry, &mut edges,
                     )
                     .await
                 } else {

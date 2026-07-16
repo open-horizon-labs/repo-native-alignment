@@ -432,12 +432,20 @@ fn format_verbose_readiness(
                 .or(degraded_job.failure.as_deref())
                 .unwrap_or("call-reference enrichment finalized with degraded output");
             if let Some(evidence) = degraded_job.lsp_evidence.as_ref() {
-                status.set_degraded_scoped(
-                    degraded_job.counters.edge_count.unwrap_or(0),
-                    persisted_lsp_edges,
-                    evidence.scope.clone(),
-                    detail,
-                );
+                if degraded_job.scope == EnrichmentScope::Repo {
+                    status.set_degraded_with_coverage(
+                        degraded_job.counters.edge_count.unwrap_or(0),
+                        persisted_lsp_edges,
+                        detail,
+                    );
+                } else {
+                    status.set_degraded_scoped(
+                        degraded_job.counters.edge_count.unwrap_or(0),
+                        persisted_lsp_edges,
+                        evidence.scope.clone(),
+                        detail,
+                    );
+                }
             } else {
                 status.set_degraded(persisted_lsp_edges, detail);
             }
@@ -3412,6 +3420,11 @@ mod tests {
             result.contains("forced no-progress abort after 7 attempted nodes"),
             "got: {result}"
         );
+        assert!(result.contains("for repo-wide"), "got: {result}");
+        assert!(
+            !result.contains("explicit scoped/degraded context"),
+            "got: {result}"
+        );
         assert!(!result.contains("LSP call/reference coverage**: ready"));
     }
 
@@ -3523,7 +3536,13 @@ mod tests {
         .await;
 
         assert!(
-            result.contains("LSP completed with 0 persisted call/reference edges"),
+            result.contains(
+                "0 persisted call/reference edges available for the default query profile"
+            ),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("broad references were omitted"),
             "got: {result}"
         );
         assert!(
