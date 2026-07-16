@@ -9,8 +9,8 @@ use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities}
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
-    self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentJobState,
-    EnrichmentScope, RnaHandler, ScanEnrichmentOptions,
+    self, BroadReferenceBudget, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger,
+    EnrichmentJobState, EnrichmentScope, RnaHandler, ScanEnrichmentOptions,
 };
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
@@ -103,6 +103,18 @@ struct EnrichArgs {
     /// Workspace root slug to enrich when `--scope root` is selected.
     #[arg(long)]
     root: Option<String>,
+    /// Target stable node ID or unique symbol name. Repeat for multiple targets.
+    #[arg(long = "target-symbol")]
+    target_symbols: Vec<String>,
+    /// Task-relevant repository-relative file. Repeat for multiple files.
+    #[arg(long = "task-file")]
+    task_files: Vec<String>,
+    /// Maximum broad-reference requests across all language servers.
+    #[arg(long, default_value_t = 512)]
+    max_requests: usize,
+    /// Maximum elapsed time for the scoped broad-reference request.
+    #[arg(long, default_value_t = 120_000)]
+    max_duration_ms: u64,
     /// Do not continue repo-wide enrichment after the requested scope completes.
     #[arg(long)]
     no_background_continuation: bool,
@@ -119,6 +131,8 @@ enum EnrichScopeArg {
     Repo,
     Root,
     Changed,
+    Targets,
+    Task,
 }
 #[derive(clap::Args, Debug)]
 struct SearchArgs {
@@ -393,12 +407,69 @@ fn hydrate_lsp_status_from_ledger(
         return Vec::new();
     };
 
-    let should_hydrate = matches!(
-        handler.lsp_status.current_state(),
-        server::LspState::NotStarted | server::LspState::ServerFound
-    ) || (hydrate_probe_unavailable
-        && handler.lsp_status.current_state() == server::LspState::Unavailable);
+    let should_hydrate = job.lsp_evidence.is_some()
+        || matches!(
+            handler.lsp_status.current_state(),
+            server::LspState::NotStarted | server::LspState::ServerFound
+        )
+        || (hydrate_probe_unavailable
+            && handler.lsp_status.current_state() == server::LspState::Unavailable);
     if should_hydrate {
+        if let Some(evidence) = job.lsp_evidence.as_ref() {
+            match evidence.readiness {
+                server::LspEvidenceReadiness::DefaultProfile => {
+                    handler.lsp_status.set_complete_default_profile(
+                        job.counters.edge_count.unwrap_or(0),
+                        persisted_lsp_edges,
+                        evidence
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| "broad references were omitted".to_string()),
+                    );
+                }
+                server::LspEvidenceReadiness::Full => {
+                    handler.lsp_status.set_complete(persisted_lsp_edges);
+                }
+                server::LspEvidenceReadiness::Scoped => {
+                    handler.lsp_status.set_complete_scoped(
+                        job.counters.edge_count.unwrap_or(0),
+                        persisted_lsp_edges,
+                        evidence.scope.clone(),
+                    );
+                }
+                server::LspEvidenceReadiness::Partial => {
+                    let detail = evidence
+                        .detail
+                        .as_deref()
+                        .or(job.failure.as_deref())
+                        .unwrap_or("call-reference enrichment finalized with partial evidence");
+                    if job.scope == EnrichmentScope::Repo {
+                        handler.lsp_status.set_degraded_with_coverage(
+                            job.counters.edge_count.unwrap_or(0),
+                            persisted_lsp_edges,
+                            detail,
+                        );
+                    } else {
+                        handler.lsp_status.set_degraded_scoped(
+                            job.counters.edge_count.unwrap_or(0),
+                            persisted_lsp_edges,
+                            evidence.scope.clone(),
+                            detail,
+                        );
+                    }
+                }
+                server::LspEvidenceReadiness::Unavailable => {
+                    handler.lsp_status.set_unavailable_with_detail(
+                        evidence
+                            .detail
+                            .as_deref()
+                            .or(job.failure.as_deref())
+                            .unwrap_or("call-reference evidence unavailable"),
+                    );
+                }
+            }
+            return vec![job.job_id.clone()];
+        }
         match job.state {
             EnrichmentJobState::Completed if job.scope == EnrichmentScope::Repo => {
                 handler.lsp_status.set_complete(persisted_lsp_edges);
@@ -727,13 +798,12 @@ async fn async_main() -> anyhow::Result<()> {
                 };
                 let elapsed = t0.elapsed();
                 let lsp_edge_count = lsp_call_edge_count(&graph);
-                let related_job_ids =
-                    hydrate_lsp_status_from_ledger(
-                        &handler,
-                        &repo_root,
-                        lsp_edge_count,
-                        operation == server::operation_report::OperationKind::CacheLoad,
-                    );
+                let related_job_ids = hydrate_lsp_status_from_ledger(
+                    &handler,
+                    &repo_root,
+                    lsp_edge_count,
+                    operation == server::operation_report::OperationKind::CacheLoad,
+                );
                 let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                     enrichment,
                     handler.lsp_status.current_state(),
@@ -772,12 +842,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let elapsed = t0.elapsed();
                     let lsp_edge_count = lsp_call_edge_count(&graph);
                     let related_job_ids =
-                        hydrate_lsp_status_from_ledger(
-                            &handler,
-                            &repo_root,
-                            lsp_edge_count,
-                            false,
-                        );
+                        hydrate_lsp_status_from_ledger(&handler, &repo_root, lsp_edge_count, false);
                     let (lsp_state, lsp_detail) =
                         server::operation_report::lsp_capability_from_status(
                             enrichment,
@@ -878,6 +943,31 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                     EnrichmentScope::Root(root)
                 }
+                EnrichScopeArg::Targets => {
+                    if args.target_symbols.is_empty() {
+                        anyhow::bail!(
+                            "--target-symbol is required when --scope targets is selected"
+                        );
+                    }
+                    let mut symbols = args.target_symbols.clone();
+                    symbols.sort();
+                    symbols.dedup();
+                    EnrichmentScope::TargetSymbols(symbols)
+                }
+                EnrichScopeArg::Task => {
+                    if args.target_symbols.is_empty() && args.task_files.is_empty() {
+                        anyhow::bail!(
+                            "--task-file and/or --target-symbol is required when --scope task is selected"
+                        );
+                    }
+                    let mut files = args.task_files.clone();
+                    files.sort();
+                    files.dedup();
+                    let mut symbols = args.target_symbols.clone();
+                    symbols.sort();
+                    symbols.dedup();
+                    EnrichmentScope::TaskRelevant { files, symbols }
+                }
             };
             let lsp_only_roots = workspace_config.lsp_only_roots();
             let handler = RnaHandler {
@@ -913,8 +1003,19 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
             let enrich_start = std::time::Instant::now();
+            let broad_reference_budget = (capability == EnrichmentCapability::CallReferences
+                && matches!(
+                    scope,
+                    EnrichmentScope::ChangedFiles
+                        | EnrichmentScope::TargetSymbols(_)
+                        | EnrichmentScope::TaskRelevant { .. }
+                ))
+            .then_some(BroadReferenceBudget {
+                max_requests: args.max_requests,
+                max_duration_ms: args.max_duration_ms,
+            });
             let related_job_ids = handler
-                .run_explicit_enrichment(
+                .run_explicit_enrichment_with_broad_reference_budget(
                     capability,
                     scope.clone(),
                     if args.no_background_continuation {
@@ -922,6 +1023,7 @@ async fn async_main() -> anyhow::Result<()> {
                     } else {
                         EnrichmentContinuation::RunToCompletion
                     },
+                    broad_reference_budget,
                     |msg| {
                         eprintln!("{}", msg);
                     },
@@ -1354,7 +1456,112 @@ mod tests {
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
 
     #[test]
-    fn ledger_hydration_does_not_overwrite_current_terminal_lsp_result() {
+    fn enrich_cli_exposes_target_scope_and_visible_budget() {
+        let cli = Cli::try_parse_from([
+            "repo-native-alignment",
+            "enrich",
+            "--capability",
+            "call-references",
+            "--scope",
+            "targets",
+            "--target-symbol",
+            "root:src/lib.rs:Thing:struct",
+            "--max-requests",
+            "7",
+            "--max-duration-ms",
+            "900",
+        ])
+        .expect("target-scope CLI should parse");
+        let Some(Commands::Enrich(args)) = cli.command else {
+            panic!("expected enrich command");
+        };
+        assert!(matches!(args.scope, EnrichScopeArg::Targets));
+        assert_eq!(
+            args.target_symbols,
+            vec!["root:src/lib.rs:Thing:struct".to_string()]
+        );
+        assert_eq!(args.max_requests, 7);
+        assert_eq!(args.max_duration_ms, 900);
+    }
+
+    #[test]
+    fn enrich_cli_task_scope_accepts_files_and_symbols() {
+        let cli = Cli::try_parse_from([
+            "repo-native-alignment",
+            "enrich",
+            "--capability",
+            "call-references",
+            "--scope",
+            "task",
+            "--task-file",
+            "src/lib.rs",
+            "--target-symbol",
+            "Thing",
+        ])
+        .expect("task-scope CLI should parse");
+        let Some(Commands::Enrich(args)) = cli.command else {
+            panic!("expected enrich command");
+        };
+        assert!(matches!(args.scope, EnrichScopeArg::Task));
+        assert_eq!(args.task_files, vec!["src/lib.rs".to_string()]);
+        assert_eq!(args.target_symbols, vec!["Thing".to_string()]);
+        assert_eq!(args.max_requests, 512);
+        assert_eq!(args.max_duration_ms, 120_000);
+    }
+
+    #[test]
+    fn completed_repo_job_hydrates_as_default_profile_without_manual_evidence_write() {
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let handler = RnaHandler {
+            repo_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let job_id = match handler
+            .enrichment_jobs
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .expect("begin repo warm-up job")
+        {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        handler
+            .enrichment_jobs
+            .mark_completed(tmp.path(), &job_id, 10, 7);
+        // Simulate a sentinel/cache path that optimistically restored COMPLETE.
+        handler.lsp_status.set_complete(7);
+
+        hydrate_lsp_status_from_ledger(&handler, tmp.path(), 7, false);
+
+        let readiness = handler.lsp_status.call_reference_readiness();
+        assert_eq!(
+            readiness.state,
+            server::state::CapabilityReadinessState::Partial
+        );
+        assert!(readiness.detail.contains("default query profile"));
+        assert!(readiness.detail.contains("broad references were omitted"));
+        assert_eq!(
+            handler.lsp_status.dead_code_readiness().state,
+            server::state::CapabilityReadinessState::Partial
+        );
+        let job = handler
+            .enrichment_jobs
+            .recent_jobs(tmp.path(), 1)
+            .pop()
+            .expect("persisted repo job");
+        assert_eq!(
+            job.lsp_evidence.map(|evidence| evidence.readiness),
+            Some(server::LspEvidenceReadiness::DefaultProfile)
+        );
+    }
+
+    #[test]
+    fn ledger_hydration_replaces_optimistic_complete_with_durable_partial_evidence() {
         let tmp = tempfile::tempdir().expect("temp repo");
         let handler = RnaHandler {
             repo_root: tmp.path().to_path_buf(),
@@ -1385,7 +1592,17 @@ mod tests {
 
         let related = hydrate_lsp_status_from_ledger(&handler, tmp.path(), 3, false);
 
-        assert_eq!(handler.lsp_status.current_state(), LspState::Complete);
+        assert_eq!(handler.lsp_status.current_state(), LspState::Degraded);
+        let readiness = handler.lsp_status.call_reference_readiness();
+        assert!(readiness.detail.contains("historical abort"));
+        assert!(readiness.detail.contains("for repo-wide"));
+        assert!(
+            !handler
+                .lsp_status
+                .review_readiness()
+                .detail
+                .contains("explicit scoped/degraded context")
+        );
         assert_eq!(related, vec![historical_job]);
     }
 

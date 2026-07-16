@@ -259,7 +259,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `scan --repo <dir>` | Scan + extract + embed + persist. Prints an OperationReport summary with ready capabilities, degraded query classes, and next enrichment commands. |
 | `scan --repo <dir> --timings` | Include measured operation phase timings in the scan summary. Unmeasured subphases are omitted rather than inferred. |
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. Persists a recent OperationReport for `list_roots`. |
-| `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed` | Run selected enrichment against an existing graph cache without source extraction. Persists an OperationReport linked to relevant enrichment jobs. Use `--root <slug>` with `--scope root`; use `--no-background-continuation` to skip remaining repo-wide coverage. Changed-file call/reference scope plans the bounded `HEAD` → working-tree diff, reports renamed/deleted/unmapped files, never continues repo-wide, and rejects when honest bounded mapping is unavailable. |
+| `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed\|targets\|task` | Run selected enrichment against an existing graph cache without source extraction. Broad type/constant references are default-off and run only for an explicit `changed`, `targets`, or `task` scope with visible `--max-requests` and `--max-duration-ms` limits. Use repeated `--target-symbol` values for `targets`; use `--task-file` and/or `--target-symbol` for `task`. Scoped broad-reference work never continues repo-wide, persists `default_profile`/full/scoped/partial/unavailable evidence, and rejects empty, ambiguous, or unmapped declarations rather than widening the request. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `outcome-progress <id> --repo <dir>` | Join outcome artifacts, tagged commits, and impacted symbols |
 | `list-roots` | Show configured roots, scan state, readiness, and recent OperationReports |
@@ -416,5 +416,6 @@ MIT — see [LICENSE](LICENSE).
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning, dirty-slugs optimization
 - [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
+- [One-instance SWE-bench RNA harness](docs/swebench-rna-one.md) — isolated Verified task, real MCP executor, official evaluator, and auditable token/cost ledger
 - [ADR Index](docs/ADRs/README.md) — architecture decisions and executable validation references
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration

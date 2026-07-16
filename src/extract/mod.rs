@@ -277,6 +277,17 @@ pub trait Enricher: Send + Sync {
     fn toolchain_remediation(&self) -> Option<&str> {
         None
     }
+
+    /// Whether this enricher enforces the shared broad-reference deadline
+    /// internally while preserving any partial output it has already produced.
+    ///
+    /// The event-bus consumer applies a fallback outer timeout for enrichers
+    /// that return `false`. `LspEnricher` returns `true` because cancelling its
+    /// top-level future would discard Pass 1 output and preempt the durable
+    /// work-item ledger flush.
+    fn manages_broad_reference_deadline(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
