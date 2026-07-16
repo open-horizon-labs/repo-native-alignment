@@ -533,6 +533,10 @@ impl Edge {
                 evidence.confidence == Confidence::Confirmed
                     && evidence.validation_status != ValidationStatus::Valid
             });
+        let all_evidence_confirmed = self
+            .evidence
+            .iter()
+            .all(|evidence| evidence.confidence == Confidence::Confirmed);
         let mut all_evidence_valid = true;
         for evidence in &mut self.evidence {
             let custom_provenance_is_valid = !matches!(self.kind, EdgeKind::Other(_))
@@ -581,11 +585,13 @@ impl Edge {
             }
         }
         if !self.evidence.is_empty() {
-            if all_evidence_valid {
+            if all_evidence_valid && all_evidence_confirmed {
                 if was_lifecycle_downgraded {
                     self.confidence = Confidence::Confirmed;
                 }
             } else {
+                // Effective edge trust cannot exceed either lifecycle validity
+                // or the confidence declared by every supporting evidence record.
                 self.confidence = Confidence::Detected;
             }
         }

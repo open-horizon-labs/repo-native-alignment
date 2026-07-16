@@ -340,6 +340,33 @@ mod tests {
         assert!(!rendered.contains("stale producer-supplied display text"));
         assert!(rendered.contains("supports@1"));
         assert!(rendered.contains("Valid"));
+
+        let mut detected_evidence_edge = state.edges[0].clone();
+        detected_evidence_edge.confidence = Confidence::Confirmed;
+        detected_evidence_edge.evidence[0].confidence = Confidence::Detected;
+        persist_graph_to_lance(
+            dir.path(),
+            &[source, claim],
+            std::slice::from_ref(&detected_evidence_edge),
+        )
+        .await
+        .expect("persist valid edge with detected evidence");
+        let detected_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load valid edge with detected evidence");
+        assert_eq!(
+            detected_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+        assert_eq!(
+            detected_state.edges[0].evidence[0].confidence,
+            Confidence::Detected
+        );
+        assert_eq!(
+            detected_state.edges[0].confidence,
+            Confidence::Detected,
+            "valid detected evidence must cap the containing edge at detected confidence"
+        );
     }
 
     #[tokio::test]
