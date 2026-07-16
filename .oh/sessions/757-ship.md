@@ -102,3 +102,11 @@ while retaining root/file/line/byte/body-node/hash coordinates and provenance.
 The correct-hash/wrong-snippet regression also asserts that validation refreshes
 display text without changing durable edge identity. Focused evidence tests
 remain 9/9 passing.
+
+Final independent re-review of `7fcea80c`: **APPROVE**. The reviewer confirmed
+the identity projection excludes only display text while retaining ordered
+authoritative selector coordinates/hash and extractor/pack/rule provenance.
+Final local verification at that head passed: focused evidence tests, library
+check, strict no-default-features Clippy, 2,043 library tests (excluding the
+known live-cache-sensitive roots test), 5 binary tests, CLI exit contract,
+content-source contract, and doc tests.
