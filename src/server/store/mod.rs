@@ -201,7 +201,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::extract::{Extractor, rust::RustExtractor};
-    use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+    use crate::graph::{
+        Confidence, Edge, EdgeEvidence, EdgeKind, EvidenceSelector, ExtractionSource, Node, NodeId,
+        NodeKind, ValidationStatus,
+    };
 
     use super::{load_graph_from_lance, parse_edge_kind, persist_graph_to_lance};
 
@@ -234,7 +237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_edge_kind_survives_persist_load_and_traversal() {
+    async fn evidenceless_custom_edge_survives_persist_load_but_is_not_confirmed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = node("quote", "quote.goodhart", ".oh/sources/goodhart.md");
         let claim = node("claim", "claim.proxy-risk", ".oh/knowledge/proxy-risk.md");
@@ -244,6 +247,7 @@ mod tests {
             kind: EdgeKind::Other("supports".to_string()),
             source: ExtractionSource::Markdown,
             confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
         };
 
         persist_graph_to_lance(dir.path(), &[source.clone(), claim.clone()], &[edge])
@@ -257,7 +261,11 @@ mod tests {
             "custom edge must not be dropped on load"
         );
         assert_eq!(state.edges[0].kind, EdgeKind::Other("supports".to_string()));
-        assert_eq!(state.edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            state.edges[0].confidence,
+            Confidence::Detected,
+            "custom relationships without body evidence must fail closed on load"
+        );
 
         let neighbors = state.index.neighbors(
             &source.stable_id(),
@@ -265,6 +273,105 @@ mod tests {
             petgraph::Direction::Outgoing,
         );
         assert_eq!(neighbors, vec![claim.stable_id()]);
+    }
+
+    #[tokio::test]
+    async fn edge_evidence_survives_persist_load_and_renders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut source = node("paragraph", "body", "chapter.md");
+        source.line_start = 4;
+        source.line_end = 4;
+        source.body = "Retries cap cascading load.".into();
+        source.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        source.metadata.insert("byte_start".into(), "20".into());
+        source.metadata.insert("byte_end".into(), "47".into());
+        let claim = node("claim", "graceful-recovery", "claims.md");
+        let selector = EvidenceSelector {
+            root_id: source.id.root.clone(),
+            file_path: source.id.file.clone(),
+            line_start: 4,
+            line_end: 4,
+            byte_start: 20,
+            byte_end: 47,
+            body_node_id: source.metadata["body_node_id"].clone(),
+            snippet_hash: blake3::hash(source.body.as_bytes()).to_hex().to_string(),
+            snippet: "stale producer-supplied display text".into(),
+        };
+        let edge = Edge {
+            from: source.id.clone(),
+            to: claim.id.clone(),
+            kind: EdgeKind::Other("supports".into()),
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Confirmed,
+            evidence: vec![EdgeEvidence {
+                selectors: vec![selector],
+                extractor_id: "markdown-ast@1".into(),
+                pack_id: Some("reliability@1".into()),
+                rule_id: "supports@1".into(),
+                confidence: Confidence::Confirmed,
+                validation_status: ValidationStatus::Valid,
+                diagnostics: Vec::new(),
+            }],
+        };
+
+        persist_graph_to_lance(dir.path(), &[source.clone(), claim.clone()], &[edge])
+            .await
+            .expect("persist graph");
+        let state = load_graph_from_lance(dir.path()).await.expect("load graph");
+        assert_eq!(state.edges[0].evidence.len(), 1);
+        assert_eq!(
+            state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+        assert_eq!(
+            state.edges[0].evidence[0].selectors[0].snippet, source.body,
+            "load-time validation must refresh display text from the current body"
+        );
+        let groups = std::collections::BTreeMap::from([(
+            EdgeKind::Other("supports".into()),
+            vec![claim.stable_id()],
+        )]);
+        let rendered = crate::server::helpers::format_edge_evidence_for_groups(
+            &state.edges,
+            &source.stable_id(),
+            &groups,
+            "outgoing",
+        );
+        assert!(rendered.contains("chapter.md:4-4"));
+        assert!(rendered.contains("Retries cap cascading load."));
+        assert!(!rendered.contains("stale producer-supplied display text"));
+        assert!(rendered.contains("supports@1"));
+        assert!(rendered.contains("Valid"));
+
+        let mut detected_evidence_edge = state.edges[0].clone();
+        detected_evidence_edge.confidence = Confidence::Confirmed;
+        detected_evidence_edge.evidence[0].confidence = Confidence::Detected;
+        persist_graph_to_lance(
+            dir.path(),
+            &[source, claim],
+            std::slice::from_ref(&detected_evidence_edge),
+        )
+        .await
+        .expect("persist valid edge with detected evidence");
+        let detected_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load valid edge with detected evidence");
+        assert_eq!(
+            detected_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+        assert_eq!(
+            detected_state.edges[0].evidence[0].confidence,
+            Confidence::Detected
+        );
+        assert_eq!(
+            detected_state.edges[0].confidence,
+            Confidence::Detected,
+            "valid detected evidence must cap the containing edge at detected confidence"
+        );
     }
 
     #[tokio::test]

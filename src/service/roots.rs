@@ -753,6 +753,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::TreeSitter,
             confidence: crate::graph::Confidence::Confirmed,
+            evidence: Vec::new(),
         }
     }
 
@@ -1129,6 +1130,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::TreeSitter,
             confidence: crate::graph::Confidence::Confirmed,
+            evidence: Vec::new(),
         };
         let gs = make_test_graph_state(nodes, vec![cross_edge]);
 

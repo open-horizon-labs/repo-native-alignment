@@ -316,6 +316,58 @@ pub enum Confidence {
     Confirmed,
 }
 
+/// Lifecycle state for source evidence backing a content-derived edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationStatus {
+    Valid,
+    Stale,
+    Unresolved,
+    Invalid,
+}
+
+/// An exact repository body span that supports an edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceSelector {
+    /// Required workspace root slug for the selected file.
+    pub root_id: String,
+    pub file_path: PathBuf,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub body_node_id: String,
+    pub snippet_hash: String,
+    pub snippet: String,
+}
+
+/// Stable, persisted validation feedback for content-derived evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceDiagnostic {
+    pub code: String,
+    pub severity: String,
+    pub file_path: PathBuf,
+    pub selector: Option<EvidenceSelector>,
+    pub message: String,
+}
+
+/// Generic, domain-neutral provenance for a content-derived relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EdgeEvidence {
+    pub selectors: Vec<EvidenceSelector>,
+    pub extractor_id: String,
+    pub pack_id: Option<String>,
+    pub rule_id: String,
+    /// Confidence declared by the producing extractor/pack. Validation status
+    /// determines whether the containing edge may currently retain that trust;
+    /// the declared value remains intact so a later source restoration can
+    /// recover confidence without regenerating the edge.
+    pub confidence: Confidence,
+    pub validation_status: ValidationStatus,
+    #[serde(default)]
+    pub diagnostics: Vec<EvidenceDiagnostic>,
+}
+
 impl fmt::Display for Confidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -426,18 +478,344 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub source: ExtractionSource,
     pub confidence: Confidence,
+    /// Ordered source evidence. Ordinary code edges leave this empty; content
+    /// edges retain material selectors even when validation later downgrades them.
+    #[serde(default)]
+    pub evidence: Vec<EdgeEvidence>,
+}
+
+fn hash_identity_component(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 impl Edge {
     /// Deterministic string ID for storage.
     pub fn stable_id(&self) -> String {
-        format!(
+        let base = format!(
             "{}->{}->{}",
             self.from.to_stable_id(),
             self.kind,
             self.to.to_stable_id()
-        )
+        );
+        if self.evidence.is_empty() {
+            base
+        } else {
+            // Lifecycle state and confidence may change after revalidation; they
+            // are deliberately excluded from identity. The rendered snippet is
+            // refreshed from current source after validation and is display-only,
+            // while line/byte coordinates may shift without changing the body
+            // node. Identity therefore uses stable body identity/content plus
+            // source/rule provenance.
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&(self.evidence.len() as u64).to_le_bytes());
+            for evidence in &self.evidence {
+                hasher.update(&(evidence.selectors.len() as u64).to_le_bytes());
+                for selector in &evidence.selectors {
+                    hash_identity_component(&mut hasher, selector.root_id.as_bytes());
+                    hash_identity_component(
+                        &mut hasher,
+                        selector.file_path.as_os_str().as_encoded_bytes(),
+                    );
+                    hash_identity_component(&mut hasher, selector.body_node_id.as_bytes());
+                    hash_identity_component(&mut hasher, selector.snippet_hash.as_bytes());
+                }
+                hash_identity_component(&mut hasher, evidence.extractor_id.as_bytes());
+                match evidence.pack_id.as_deref() {
+                    Some(pack_id) => {
+                        hasher.update(&[1]);
+                        hash_identity_component(&mut hasher, pack_id.as_bytes());
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+                hash_identity_component(&mut hasher, evidence.rule_id.as_bytes());
+            }
+            format!("{base}->evidence:{}", hasher.finalize().to_hex())
+        }
     }
+
+    /// Revalidate content evidence against the current extracted Markdown body nodes.
+    /// Any non-valid selector synchronously removes confirmed confidence.
+    pub fn revalidate_evidence(&mut self, nodes: &[Node]) {
+        let index = EvidenceNodeIndex::new(nodes);
+        self.revalidate_evidence_with_index(&index);
+    }
+
+    fn revalidate_evidence_with_index(&mut self, index: &EvidenceNodeIndex<'_>) {
+        if matches!(self.kind, EdgeKind::Other(_)) && self.evidence.is_empty() {
+            // Repo-local/custom relationship labels are content claims. Without
+            // material body evidence they may remain discoverable, but must fail
+            // closed rather than retaining producer-supplied confirmation.
+            self.confidence = Confidence::Detected;
+            return;
+        }
+        let was_lifecycle_downgraded = self.confidence == Confidence::Detected
+            && self.evidence.iter().any(|evidence| {
+                evidence.confidence == Confidence::Confirmed
+                    && evidence.validation_status != ValidationStatus::Valid
+            });
+        let all_evidence_confirmed = self
+            .evidence
+            .iter()
+            .all(|evidence| evidence.confidence == Confidence::Confirmed);
+        let mut all_evidence_valid = true;
+        for evidence in &mut self.evidence {
+            evidence.diagnostics.retain(|diagnostic| {
+                !matches!(
+                    diagnostic.code.as_str(),
+                    "content.stale_verification" | "content.duplicate_body_id"
+                )
+            });
+            let mut pending_diagnostics = Vec::new();
+            let custom_provenance_is_valid = !matches!(self.kind, EdgeKind::Other(_))
+                || (!evidence.extractor_id.trim().is_empty()
+                    && !evidence.rule_id.trim().is_empty()
+                    && evidence
+                        .pack_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty()));
+            let mut status = if custom_provenance_is_valid {
+                ValidationStatus::Valid
+            } else {
+                ValidationStatus::Invalid
+            };
+            if custom_provenance_is_valid {
+                for selector in &mut evidence.selectors {
+                    let selector_is_well_formed = !selector.root_id.trim().is_empty()
+                        && !selector.file_path.as_os_str().is_empty()
+                        && !selector.file_path.is_absolute()
+                        && !selector.file_path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::CurDir
+                                    | std::path::Component::ParentDir
+                                    | std::path::Component::RootDir
+                                    | std::path::Component::Prefix(_)
+                            )
+                        })
+                        && selector.line_start > 0
+                        && selector.line_start <= selector.line_end
+                        && selector.byte_start < selector.byte_end
+                        && !selector.body_node_id.trim().is_empty()
+                        && selector.snippet_hash.len() == 64
+                        && selector
+                            .snippet_hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                    if !selector_is_well_formed {
+                        status = ValidationStatus::Invalid;
+                        break;
+                    }
+                    let node = match index.get(selector) {
+                        EvidenceNodeMatch::Found(node) => node,
+                        EvidenceNodeMatch::Invalid(invalid) => {
+                            status = ValidationStatus::Invalid;
+                            pending_diagnostics.push(EvidenceDiagnostic {
+                                code: invalid.code.clone(),
+                                severity: invalid.severity.clone(),
+                                file_path: selector.file_path.clone(),
+                                selector: Some(selector.clone()),
+                                message: invalid.message.clone(),
+                            });
+                            break;
+                        }
+                        EvidenceNodeMatch::Missing => {
+                            status = ValidationStatus::Unresolved;
+                            break;
+                        }
+                    };
+                    let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+                    let selected_byte_len = selector.byte_end - selector.byte_start;
+                    let selected_line_count = selector.line_end - selector.line_start + 1;
+                    let body_line_count = node.body.lines().count();
+                    let location_matches = node.line_start == selector.line_start
+                        && node.line_end == selector.line_end
+                        && node.metadata.get("byte_start").and_then(|v| v.parse().ok())
+                            == Some(selector.byte_start)
+                        && node.metadata.get("byte_end").and_then(|v| v.parse().ok())
+                            == Some(selector.byte_end);
+                    if !location_matches || hash != selector.snippet_hash {
+                        status = ValidationStatus::Stale;
+                        pending_diagnostics.push(EvidenceDiagnostic {
+                            code: "content.stale_verification".into(),
+                            severity: "error".into(),
+                            file_path: selector.file_path.clone(),
+                            selector: Some(selector.clone()),
+                            message:
+                                "stored evidence no longer matches the current selected body bytes"
+                                    .into(),
+                        });
+                        break;
+                    }
+                    if selected_byte_len != node.body.len()
+                        || body_line_count == 0
+                        || selected_line_count != body_line_count
+                    {
+                        status = ValidationStatus::Invalid;
+                        pending_diagnostics.push(EvidenceDiagnostic {
+                            code: "content.stale_verification".into(),
+                            severity: "error".into(),
+                            file_path: selector.file_path.clone(),
+                            selector: Some(selector.clone()),
+                            message: "stored evidence has inconsistent line or byte ranges".into(),
+                        });
+                        break;
+                    }
+                    // The snippet is display data, not authority. Refresh it only
+                    // after the selector's current hash and source ranges validate
+                    // so MCP output cannot render producer-supplied stale text as
+                    // valid evidence.
+                    selector.snippet.clone_from(&node.body);
+                }
+            }
+            if evidence.selectors.is_empty() {
+                status = ValidationStatus::Invalid;
+                if !evidence.diagnostics.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.code.as_str(),
+                        "content.metadata_without_body_evidence"
+                            | "content.sidecar_without_body_evidence"
+                            | "content.missing_body_evidence"
+                    )
+                }) {
+                    pending_diagnostics.push(EvidenceDiagnostic {
+                        code: "content.missing_body_evidence".into(),
+                        severity: "error".into(),
+                        file_path: self.from.file.clone(),
+                        selector: None,
+                        message: "relationship candidate has no supporting body selector".into(),
+                    });
+                }
+            }
+            for diagnostic in pending_diagnostics {
+                if !evidence.diagnostics.contains(&diagnostic) {
+                    evidence.diagnostics.push(diagnostic);
+                }
+            }
+            evidence.validation_status = status;
+            if evidence.validation_status != ValidationStatus::Valid {
+                all_evidence_valid = false;
+            }
+        }
+        if !self.evidence.is_empty() {
+            if all_evidence_valid && all_evidence_confirmed {
+                if was_lifecycle_downgraded {
+                    self.confidence = Confidence::Confirmed;
+                }
+            } else {
+                // Effective edge trust cannot exceed either lifecycle validity
+                // or the confidence declared by every supporting evidence record.
+                self.confidence = Confidence::Detected;
+            }
+        }
+    }
+}
+
+struct EvidenceNodeIndex<'a> {
+    scoped: HashMap<(String, PathBuf, String), EvidenceNodeEntry<'a>>,
+}
+
+#[derive(Clone)]
+struct InvalidEvidenceNode {
+    code: String,
+    severity: String,
+    message: String,
+}
+
+enum EvidenceNodeEntry<'a> {
+    Found(&'a Node),
+    Invalid(InvalidEvidenceNode),
+}
+
+enum EvidenceNodeMatch<'a> {
+    Found(&'a Node),
+    Invalid(InvalidEvidenceNode),
+    Missing,
+}
+
+impl<'a> EvidenceNodeIndex<'a> {
+    fn new(nodes: &'a [Node]) -> Self {
+        let mut scoped = HashMap::new();
+        for node in nodes {
+            let Some(body_node_id) = node.metadata.get("body_node_id") else {
+                continue;
+            };
+            let key = (
+                node.id.root.clone(),
+                node.id.file.clone(),
+                body_node_id.clone(),
+            );
+            let invalid = (node.metadata.get("validation_status").map(String::as_str)
+                == Some("invalid"))
+            .then(|| InvalidEvidenceNode {
+                code: node
+                    .metadata
+                    .get("diagnostic_code")
+                    .cloned()
+                    .unwrap_or_else(|| "content.invalid_body_evidence".into()),
+                severity: node
+                    .metadata
+                    .get("diagnostic_severity")
+                    .cloned()
+                    .unwrap_or_else(|| "error".into()),
+                message: node
+                    .metadata
+                    .get("diagnostic_message")
+                    .cloned()
+                    .unwrap_or_else(|| "selected body node is invalid".into()),
+            });
+            match scoped.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(match invalid {
+                        Some(invalid) => EvidenceNodeEntry::Invalid(invalid),
+                        None => EvidenceNodeEntry::Found(node),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(EvidenceNodeEntry::Invalid(InvalidEvidenceNode {
+                        code: "content.duplicate_body_id".into(),
+                        severity: "error".into(),
+                        message: "multiple body nodes share the same evidence identity".into(),
+                    }));
+                }
+            }
+        }
+        Self { scoped }
+    }
+
+    fn get(&self, selector: &EvidenceSelector) -> EvidenceNodeMatch<'a> {
+        match self.scoped.get(&(
+            selector.root_id.clone(),
+            selector.file_path.clone(),
+            selector.body_node_id.clone(),
+        )) {
+            Some(EvidenceNodeEntry::Found(node)) => EvidenceNodeMatch::Found(node),
+            Some(EvidenceNodeEntry::Invalid(invalid)) => {
+                EvidenceNodeMatch::Invalid(invalid.clone())
+            }
+            None => EvidenceNodeMatch::Missing,
+        }
+    }
+}
+
+/// Revalidate a graph's evidence in O(nodes + selectors), avoiding an edge×node scan.
+///
+/// Returns the edges whose confidence or evidence lifecycle changed so
+/// incremental writers can upsert the downgraded records.
+pub fn revalidate_edge_evidence(edges: &mut [Edge], nodes: &[Node]) -> Vec<Edge> {
+    let index = EvidenceNodeIndex::new(nodes);
+    let mut changed = Vec::new();
+    for edge in edges {
+        let previous_confidence = edge.confidence.clone();
+        let previous_evidence = edge.evidence.clone();
+        edge.revalidate_evidence_with_index(&index);
+        if edge.confidence != previous_confidence || edge.evidence != previous_evidence {
+            changed.push(edge.clone());
+        }
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +970,406 @@ mod tests {
             kind,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         }
+    }
+
+    fn evidence_for(node: &Node, hash: String) -> EdgeEvidence {
+        EdgeEvidence {
+            selectors: vec![EvidenceSelector {
+                root_id: node.id.root.clone(),
+                file_path: node.id.file.clone(),
+                line_start: node.line_start,
+                line_end: node.line_end,
+                byte_start: node.metadata["byte_start"].parse().unwrap(),
+                byte_end: node.metadata["byte_end"].parse().unwrap(),
+                body_node_id: node.metadata["body_node_id"].clone(),
+                snippet_hash: hash,
+                snippet: node.body.clone(),
+            }],
+            extractor_id: "markdown-ast@1".into(),
+            pack_id: Some("test-pack@1".into()),
+            rule_id: "supports-body@1".into(),
+            confidence: Confidence::Confirmed,
+            validation_status: ValidationStatus::Valid,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn evidence_distinguishes_otherwise_identical_edges() {
+        let mut first = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        let mut second = first.clone();
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "first span".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "20".into());
+        first.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        node.body = "other span".into();
+        second.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        assert_ne!(first.stable_id(), second.stable_id());
+    }
+
+    #[test]
+    fn evidence_location_shift_preserves_edge_identity() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "stable evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "25".into());
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        let original_id = edge.stable_id();
+
+        edge.evidence[0].selectors[0].line_start = 30;
+        edge.evidence[0].selectors[0].line_end = 30;
+        edge.evidence[0].selectors[0].byte_start = 410;
+        edge.evidence[0].selectors[0].byte_end = 425;
+
+        assert_eq!(
+            edge.stable_id(),
+            original_id,
+            "offset-only source movement must remain a same-ID edge update"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_identity_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.body = "stable evidence".into();
+        node.metadata.insert("body_node_id".into(), "body".into());
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "25".into());
+        let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+        let mut first = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        first.evidence = vec![evidence_for(&node, hash.clone())];
+        first.evidence[0].selectors[0].file_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"chapter-\x80.md".to_vec()));
+        let mut second = first.clone();
+        second.evidence[0].selectors[0].file_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"chapter-\x81.md".to_vec()));
+
+        assert_ne!(
+            first.stable_id(),
+            second.stable_id(),
+            "distinct non-UTF-8 paths must remain distinct evidence identities"
+        );
+    }
+
+    #[test]
+    fn editing_body_downgrades_confirmed_edge_to_stale() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "current evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "26".into());
+        let old_hash = blake3::hash(b"old evidence").to_hex().to_string();
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(&node, old_hash)];
+        edge.revalidate_evidence(&[node]);
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].confidence,
+            Confidence::Confirmed,
+            "source-declared confidence must survive lifecycle downgrades"
+        );
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
+        assert!(
+            edge.evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "content.stale_verification")
+        );
+    }
+
+    #[test]
+    fn valid_evidence_refreshes_untrusted_display_snippet() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "current source-backed evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "40".into());
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        edge.evidence[0].selectors[0].snippet = "untrusted producer text".into();
+        let stable_id_before_refresh = edge.stable_id();
+
+        edge.revalidate_evidence(&[node.clone()]);
+
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Valid);
+        assert_eq!(edge.evidence[0].selectors[0].snippet, node.body);
+        assert_eq!(
+            edge.stable_id(),
+            stable_id_before_refresh,
+            "refreshing display-only snippet text must not churn durable edge identity"
+        );
+    }
+
+    #[test]
+    fn evidence_rejects_inconsistent_byte_and_line_ranges() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "1234567890".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "19".into());
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        edge.revalidate_evidence(std::slice::from_ref(&node));
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid,
+            "a copied byte range that does not span the exact body bytes is malformed"
+        );
+
+        node.metadata.insert("byte_end".into(), "20".into());
+        node.line_end = 4;
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence[0].selectors[0].byte_end = 20;
+        edge.evidence[0].selectors[0].line_end = 4;
+        edge.revalidate_evidence(std::slice::from_ref(&node));
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid,
+            "line ranges must span the same current bytes as the body selector"
+        );
+    }
+
+    #[test]
+    fn custom_evidence_requires_nonblank_provenance_but_generic_evidence_does_not_require_pack() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "source-backed evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "32".into());
+        let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+
+        let mut custom = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        custom.confidence = Confidence::Confirmed;
+        custom.evidence = vec![evidence_for(&node, hash.clone())];
+        custom.evidence[0].extractor_id = " ".into();
+        custom.evidence[0].rule_id.clear();
+        custom.evidence[0].pack_id = Some(" ".into());
+        custom.revalidate_evidence(&[node.clone()]);
+        assert_eq!(custom.confidence, Confidence::Detected);
+        assert_eq!(
+            custom.evidence[0].validation_status,
+            ValidationStatus::Invalid
+        );
+
+        let mut generic = make_edge("claim", "fact", EdgeKind::Calls);
+        generic.confidence = Confidence::Confirmed;
+        generic.evidence = vec![evidence_for(&node, hash)];
+        generic.evidence[0].pack_id = None;
+        generic.revalidate_evidence(&[node]);
+        assert_eq!(generic.confidence, Confidence::Confirmed);
+        assert_eq!(
+            generic.evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+    }
+
+    #[test]
+    fn evidence_validation_is_scoped_to_workspace_root() {
+        let mut first = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        first.id.root = "first-root".into();
+        first.id.file = PathBuf::from("chapter.md");
+        first.body = "first root evidence".into();
+        first.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        first.metadata.insert("byte_start".into(), "10".into());
+        first.metadata.insert("byte_end".into(), "29".into());
+
+        let mut second = first.clone();
+        second.id.root = "second-root".into();
+        second.body = "second root changed".into();
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &first,
+            blake3::hash(first.body.as_bytes()).to_hex().to_string(),
+        )];
+
+        let changed = revalidate_edge_evidence(&mut [edge.clone()], &[second, first]);
+        assert!(
+            changed.is_empty(),
+            "same relative selector in another root must not invalidate exact-root evidence"
+        );
+
+        edge.evidence[0].selectors[0].root_id.clear();
+        edge.revalidate_evidence(&[{
+            let mut node = make_node(
+                "chapter.md",
+                "body",
+                NodeKind::Other("paragraph".into()),
+                3,
+                3,
+            );
+            node.id.root = "first-root".into();
+            node.id.file = PathBuf::from("chapter.md");
+            node.body = "first root evidence".into();
+            node.metadata.insert(
+                "body_node_id".into(),
+                "chapter.md::body::ast:paragraph[0]".into(),
+            );
+            node.metadata.insert("byte_start".into(), "10".into());
+            node.metadata.insert("byte_end".into(), "29".into());
+            node
+        }]);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid,
+            "missing required root identity must fail closed even when a file is unique"
+        );
+        assert_eq!(edge.confidence, Confidence::Detected);
+    }
+
+    #[test]
+    fn duplicate_or_invalid_body_identity_cannot_validate_evidence() {
+        let mut first = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        first.id.root = "repo".into();
+        first.id.file = PathBuf::from("chapter.md");
+        first.body = "duplicate evidence".into();
+        first.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::explicit:duplicate".into(),
+        );
+        first.metadata.insert("byte_start".into(), "10".into());
+        first.metadata.insert("byte_end".into(), "28".into());
+        let second = first.clone();
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &first,
+            blake3::hash(first.body.as_bytes()).to_hex().to_string(),
+        )];
+        edge.revalidate_evidence(&[first, second]);
+
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid
+        );
+        assert!(
+            edge.evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "content.duplicate_body_id")
+        );
     }
 
     // -- Macro tests --

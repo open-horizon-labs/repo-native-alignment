@@ -1473,6 +1473,7 @@ mod tests {
             kind,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         }
     }
 

@@ -146,6 +146,7 @@ fn extract_import(
         kind: EdgeKind::DependsOn,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 }
 
@@ -279,6 +280,7 @@ fn emit_field(
         kind: EdgeKind::HasField,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 }
 
@@ -412,6 +414,7 @@ fn extract_rpc(
         kind: EdgeKind::Defines,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 
     edges.push(Edge {
@@ -425,6 +428,7 @@ fn extract_rpc(
         kind: EdgeKind::DependsOn,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 
     edges.push(Edge {
@@ -438,6 +442,7 @@ fn extract_rpc(
         kind: EdgeKind::DependsOn,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 }
 

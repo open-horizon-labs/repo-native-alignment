@@ -157,6 +157,7 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
             kind: EdgeKind::BelongsTo,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 

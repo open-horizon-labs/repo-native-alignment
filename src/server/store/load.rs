@@ -562,6 +562,9 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let edge_confidences = batch
                 .column_by_name("edge_confidence")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let edge_evidence = batch
+                .column_by_name("edge_evidence_json")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let root_ids = batch
                 .column_by_name("root_id")
                 .unwrap()
@@ -578,9 +581,20 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 let extraction_source = edge_sources
                     .map(|a| parse_extraction_source(a.value(i)))
                     .unwrap_or(ExtractionSource::TreeSitter);
-                let confidence = edge_confidences
+                let mut confidence = edge_confidences
                     .map(|a| parse_confidence(a.value(i)))
                     .unwrap_or(Confidence::Detected);
+                let evidence = match edge_evidence.filter(|array| !array.is_null(i)) {
+                    Some(array) => match serde_json::from_str(array.value(i)) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            tracing::warn!("invalid persisted edge evidence: {error}");
+                            confidence = Confidence::Detected;
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                };
 
                 // Parse NodeId from stable_id format: "root:file:name:kind"
                 let from = parse_node_id_from_stable(
@@ -600,9 +614,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     kind: edge_kind,
                     source: extraction_source,
                     confidence,
+                    evidence,
                 });
             }
         }
+        let _ = crate::graph::revalidate_edge_evidence(&mut edges, &nodes);
         edges
     };
 

@@ -136,6 +136,7 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
         };
 
         let package_dep = Edge {
@@ -144,10 +145,221 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
         };
 
         assert!(!is_manifest_package_edge(&openapi_dep));
         assert!(is_manifest_package_edge(&package_dep));
+    }
+
+    #[tokio::test]
+    async fn third_file_evidence_edit_updates_live_edge_and_persist_delta() {
+        use crate::graph::{
+            Confidence, EdgeEvidence, EdgeKind, EvidenceSelector, ExtractionSource,
+            ValidationStatus,
+        };
+
+        let mut evidence_node = node(NodeKind::Other("paragraph".into()), "body");
+        evidence_node.id.root = "repo".into();
+        evidence_node.id.file = PathBuf::from("chapter.md");
+        evidence_node.body = "original evidence".into();
+        evidence_node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        evidence_node
+            .metadata
+            .insert("byte_start".into(), "10".into());
+        evidence_node
+            .metadata
+            .insert("byte_end".into(), "27".into());
+
+        let mut edge = Edge {
+            from: crate::graph::NodeId {
+                root: "repo".into(),
+                file: PathBuf::from("claims.md"),
+                name: "claim".into(),
+                kind: NodeKind::Other("claim".into()),
+            },
+            to: crate::graph::NodeId {
+                root: "repo".into(),
+                file: PathBuf::from("facts.md"),
+                name: "fact".into(),
+                kind: NodeKind::Other("fact".into()),
+            },
+            kind: EdgeKind::Other("supports".into()),
+            source: ExtractionSource::Markdown,
+            confidence: Confidence::Confirmed,
+            evidence: vec![EdgeEvidence {
+                selectors: vec![EvidenceSelector {
+                    root_id: "repo".into(),
+                    file_path: PathBuf::from("chapter.md"),
+                    line_start: 1,
+                    line_end: 1,
+                    byte_start: 10,
+                    byte_end: 27,
+                    body_node_id: "chapter.md::body::ast:paragraph[0]".into(),
+                    snippet_hash: blake3::hash(b"original evidence").to_hex().to_string(),
+                    snippet: "original evidence".into(),
+                }],
+                extractor_id: "markdown-ast@1".into(),
+                pack_id: Some("test-pack@1".into()),
+                rule_id: "supports@1".into(),
+                confidence: Confidence::Confirmed,
+                validation_status: ValidationStatus::Valid,
+                diagnostics: Vec::new(),
+            }],
+        };
+        let stable_id = edge.stable_id();
+        let dir = tempfile::tempdir().expect("tempdir");
+        persist_graph_to_lance(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            std::slice::from_ref(&edge),
+        )
+        .await
+        .expect("persist initial valid graph");
+
+        evidence_node.body = "edited evidence".into();
+        let mut upsert_edges = vec![edge.clone()];
+
+        let changed = revalidate_incremental_edge_evidence(
+            std::slice::from_ref(&evidence_node),
+            std::slice::from_mut(&mut edge),
+        );
+        replace_edge_upserts(&mut upsert_edges, changed);
+
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
+        assert_eq!(upsert_edges.len(), 1);
+        assert_eq!(upsert_edges[0].stable_id(), stable_id);
+        assert_eq!(upsert_edges[0].confidence, Confidence::Detected);
+        assert_eq!(
+            upsert_edges[0].evidence[0].confidence,
+            Confidence::Confirmed,
+            "incremental invalidation must preserve declared confidence"
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            &upsert_edges,
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist stale incremental state");
+        assert!(!migrated);
+
+        let mut stale_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load stale graph");
+        assert_eq!(stale_state.edges[0].confidence, Confidence::Detected);
+        assert_eq!(
+            stale_state.edges[0].evidence[0].confidence,
+            Confidence::Confirmed
+        );
+        assert_eq!(
+            stale_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Stale
+        );
+        assert!(
+            stale_state.edges[0].evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "content.stale_verification")
+        );
+
+        evidence_node.body = "original evidence".into();
+        let restored_edges = revalidate_incremental_edge_evidence(
+            std::slice::from_ref(&evidence_node),
+            &mut stale_state.edges,
+        );
+        assert_eq!(restored_edges.len(), 1);
+        assert_eq!(restored_edges[0].stable_id(), stable_id);
+        assert_eq!(restored_edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            restored_edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&evidence_node),
+            &restored_edges,
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist restored incremental state");
+        assert!(!migrated);
+
+        let restored_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load restored graph");
+        assert_eq!(restored_state.edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            restored_state.edges[0].evidence[0].confidence,
+            Confidence::Confirmed
+        );
+        assert_eq!(
+            restored_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
+        assert!(restored_state.edges[0].evidence[0].diagnostics.is_empty());
+
+        let mut shifted_node = evidence_node.clone();
+        shifted_node.line_start = 30;
+        shifted_node.line_end = 30;
+        shifted_node
+            .metadata
+            .insert("byte_start".into(), "410".into());
+        shifted_node
+            .metadata
+            .insert("byte_end".into(), "427".into());
+        let mut shifted_edge = restored_state.edges[0].clone();
+        shifted_edge.evidence[0].selectors[0].line_start = 30;
+        shifted_edge.evidence[0].selectors[0].line_end = 30;
+        shifted_edge.evidence[0].selectors[0].byte_start = 410;
+        shifted_edge.evidence[0].selectors[0].byte_end = 427;
+        assert_eq!(
+            shifted_edge.stable_id(),
+            stable_id,
+            "offset-only evidence movement must preserve durable edge identity"
+        );
+
+        let migrated = persist_graph_incremental(
+            dir.path(),
+            std::slice::from_ref(&shifted_node),
+            std::slice::from_ref(&shifted_edge),
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist shifted evidence coordinates");
+        assert!(!migrated);
+
+        let shifted_state = load_graph_from_lance(dir.path())
+            .await
+            .expect("load shifted evidence graph");
+        assert_eq!(
+            shifted_state.edges.len(),
+            1,
+            "same-ID coordinate shift must update rather than duplicate the edge"
+        );
+        assert_eq!(shifted_state.edges[0].stable_id(), stable_id);
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].selectors[0].line_start,
+            30
+        );
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].selectors[0].byte_start,
+            410
+        );
+        assert_eq!(
+            shifted_state.edges[0].evidence[0].validation_status,
+            ValidationStatus::Valid
+        );
     }
 
     #[test]
@@ -177,6 +389,7 @@ mod tests {
                 kind: crate::graph::EdgeKind::Calls,
                 source: crate::graph::ExtractionSource::Lsp,
                 confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
             },
             Edge {
                 from: unrelated,
@@ -184,6 +397,7 @@ mod tests {
                 kind: crate::graph::EdgeKind::Calls,
                 source: crate::graph::ExtractionSource::Lsp,
                 confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
             },
         ];
         let planned = std::collections::HashSet::from([changed.to_stable_id()]);
@@ -206,6 +420,23 @@ fn collect_post_pass_node_upserts(
             upsert_node_ids.insert(sid);
         }
     }
+}
+
+pub(super) fn revalidate_incremental_edge_evidence(
+    nodes: &[Node],
+    edges: &mut [Edge],
+) -> Vec<Edge> {
+    crate::graph::revalidate_edge_evidence(edges, nodes)
+}
+
+pub(super) fn replace_edge_upserts(upsert_edges: &mut Vec<Edge>, changed_edges: Vec<Edge>) {
+    if changed_edges.is_empty() {
+        return;
+    }
+    let changed_ids: std::collections::HashSet<String> =
+        changed_edges.iter().map(|edge| edge.stable_id()).collect();
+    upsert_edges.retain(|edge| !changed_ids.contains(&edge.stable_id()));
+    upsert_edges.extend(changed_edges);
 }
 
 impl RnaHandler {
@@ -354,6 +585,10 @@ impl RnaHandler {
             }
             fast_state.nodes.extend(extraction.nodes);
             fast_state.edges.extend(extraction.edges);
+            // Evidence may come from a third file that is neither edge endpoint.
+            // Revalidate immediately so the fast MCP snapshot never exposes stale
+            // evidence as confirmed while the background pipeline catches up.
+            let _ = revalidate_incremental_edge_evidence(&fast_state.nodes, &mut fast_state.edges);
 
             // Rebuild petgraph index for the fast graph
             fast_state.index = crate::graph::index::GraphIndex::new();
@@ -629,6 +864,11 @@ impl RnaHandler {
                             .edges
                             .retain(|e| seen_edges.insert(e.stable_id()));
                     }
+                    let changed_evidence_edges = revalidate_incremental_edge_evidence(
+                        &full_state.nodes,
+                        &mut full_state.edges,
+                    );
+                    replace_edge_upserts(&mut upsert_edges, changed_evidence_edges);
 
                     // Rebuild index
                     full_state.index = GraphIndex::new();
@@ -1790,6 +2030,11 @@ impl RnaHandler {
             }
         }
 
+        // Evidence emitted during a full build must be validated before the first
+        // published snapshot and full persist. Waiting for a later cache load would
+        // expose stale or producer-supplied evidence as confirmed on cold start.
+        let _ = revalidate_incremental_edge_evidence(&all_nodes, &mut all_edges);
+
         // 6z. Deduplicate all_edges before persistence.
         //
         // Post-extraction passes (api_link, tested_by, import_calls, directory_module)
@@ -2304,6 +2549,9 @@ impl RnaHandler {
             let mut seen_edges = std::collections::HashSet::new();
             graph.edges.retain(|e| seen_edges.insert(e.stable_id()));
         }
+        let changed_evidence_edges =
+            revalidate_incremental_edge_evidence(&graph.nodes, &mut graph.edges);
+        replace_edge_upserts(&mut upsert_edges, changed_evidence_edges);
 
         // Rebuild petgraph index
         graph.index = GraphIndex::new();

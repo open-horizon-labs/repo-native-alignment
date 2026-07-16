@@ -338,6 +338,7 @@ fn extract_fields(
             kind: EdgeKind::HasField,
             source: ExtractionSource::Schema,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
 
         // If field type references a custom (non-scalar) type, add DependsOn edge
@@ -355,6 +356,7 @@ fn extract_fields(
                     kind: EdgeKind::DependsOn,
                     source: ExtractionSource::Schema,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
         }
@@ -423,6 +425,7 @@ fn extract_enum_values(
             kind: EdgeKind::HasField,
             source: ExtractionSource::Schema,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 }
@@ -471,6 +474,7 @@ fn extract_implements(
             kind: EdgeKind::Implements,
             source: ExtractionSource::Schema,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 }
@@ -515,6 +519,7 @@ fn extract_selection_type_refs(
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::Schema,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 }

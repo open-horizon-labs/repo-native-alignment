@@ -17,7 +17,10 @@ use anyhow::Result;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+use crate::graph::{
+    Confidence, Edge, EdgeEvidence, EdgeKind, EvidenceDiagnostic, ExtractionSource, Node, NodeId,
+    NodeKind, ValidationStatus,
+};
 
 use super::{ExtractionResult, Extractor};
 
@@ -726,6 +729,7 @@ pub fn markdown_anchor_pass(all_nodes: &mut [Node]) -> Vec<Edge> {
                 kind: EdgeKind::References,
                 source: ExtractionSource::Markdown,
                 confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
             });
         } else {
             node.metadata
@@ -772,6 +776,7 @@ fn emit_hierarchy_edges(nodes: &[Node], edges: &mut Vec<Edge>) {
                 kind: EdgeKind::Defines,
                 source: ExtractionSource::Markdown,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -837,6 +842,7 @@ fn emit_frontmatter_ref_edges(
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::Markdown,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 }
@@ -917,6 +923,7 @@ fn emit_link_edges(
                 kind: EdgeKind::References,
                 source: ExtractionSource::Markdown,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -1002,6 +1009,7 @@ pub fn adr_validation_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 kind: EdgeKind::References,
                 source: ExtractionSource::Markdown,
                 confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
             });
         }
     }
@@ -1062,6 +1070,7 @@ pub fn adr_backreference_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 kind: EdgeKind::References,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -1124,8 +1133,6 @@ struct LocalKnowledgeNodeSpec {
 struct LocalKnowledgeRelationship {
     kind: String,
     target: LocalKnowledgeTarget,
-    #[serde(default)]
-    confidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1232,13 +1239,32 @@ fn emit_local_knowledge_graph(
         };
         let target_node =
             local_knowledge_node_id(&target_file, relationship.target.kind.trim(), target_id);
-        let confidence = parse_local_knowledge_confidence(relationship.confidence.as_deref());
+        // Frontmatter nominates a candidate but is never relationship truth.
+        // #715's pack rules may attach validated body evidence later.
+        let confidence = Confidence::Detected;
         edges.push(Edge {
             from: node_id.clone(),
             to: target_node,
             kind,
             source: ExtractionSource::Markdown,
             confidence,
+            evidence: vec![EdgeEvidence {
+                selectors: Vec::new(),
+                extractor_id: MARKDOWN_EXTRACTOR_ID.into(),
+                pack_id: None,
+                rule_id: "frontmatter-candidate@1".into(),
+                confidence: Confidence::Detected,
+                validation_status: ValidationStatus::Invalid,
+                diagnostics: vec![EvidenceDiagnostic {
+                    code: "content.metadata_without_body_evidence".into(),
+                    severity: "error".into(),
+                    file_path: path.to_path_buf(),
+                    selector: None,
+                    message:
+                        "frontmatter nominates a relationship without supporting body evidence"
+                            .into(),
+                }],
+            }],
         });
     }
 }
@@ -1249,13 +1275,6 @@ fn local_knowledge_node_id(path: &Path, kind: &str, id: &str) -> NodeId {
         file: path.to_path_buf(),
         name: id.to_string(),
         kind: NodeKind::Other(kind.to_string()),
-    }
-}
-
-fn parse_local_knowledge_confidence(value: Option<&str>) -> Confidence {
-    match value.map(str::trim) {
-        Some("confirmed") => Confidence::Confirmed,
-        _ => Confidence::Detected,
     }
 }
 
@@ -1554,7 +1573,17 @@ When a measure becomes a target, it ceases to be a good measure.
         assert_eq!(edge.to.name, "claim.proxy-risk");
         assert_eq!(edge.to.file, PathBuf::from(".oh/knowledge/proxy-risk.md"));
         assert!(matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "claim"));
-        assert_eq!(edge.confidence, Confidence::Confirmed);
+        assert_eq!(
+            edge.confidence,
+            Confidence::Detected,
+            "frontmatter-only relationships nominate candidates but cannot confirm them"
+        );
+        assert_eq!(edge.evidence.len(), 1);
+        assert!(edge.evidence[0].selectors.is_empty());
+        assert_eq!(
+            edge.evidence[0].diagnostics[0].code,
+            "content.metadata_without_body_evidence"
+        );
         assert!(
             !edges_by_kind.contains_key("escapes_repo"),
             "repo-local relationship targets must not escape the repository"
@@ -1674,6 +1703,15 @@ The manuscript uses the proxy-risk claim in the opening argument.
             supports,
             vec![quote.stable_id()],
             "claim support must be a real incoming custom edge, not metadata or a generic reference"
+        );
+        let supports_edge = loaded
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Other("supports".into()))
+            .expect("persisted supports edge");
+        assert_eq!(
+            supports_edge.evidence[0].diagnostics[0].code,
+            "content.metadata_without_body_evidence"
         );
 
         let ctx = SearchContext {

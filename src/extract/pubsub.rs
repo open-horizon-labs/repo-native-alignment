@@ -336,6 +336,7 @@ pub fn pubsub_pass(
                 kind: edge_kind,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }

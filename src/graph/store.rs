@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 23; // persist node extraction provenance
+pub const SCHEMA_VERSION: u32 = 24; // persist content-derived edge evidence
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -187,6 +187,7 @@ pub fn edges_schema() -> Schema {
         Field::new("edge_type", DataType::Utf8, false),
         Field::new("edge_source", DataType::Utf8, false),
         Field::new("edge_confidence", DataType::Utf8, false),
+        Field::new("edge_evidence_json", DataType::Utf8, true),
         Field::new("root_id", DataType::Utf8, false),
         Field::new("updated_at", DataType::Int64, false),
         // Append-only versioning: each full rebuild writes with an incrementing scan_version.

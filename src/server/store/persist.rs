@@ -1300,6 +1300,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         };
         let edge_id = edge.stable_id();
 
@@ -1413,6 +1414,7 @@ mod tests {
             kind: EdgeKind::ReferencedBy,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         };
 
         persist_graph_to_lance(
@@ -1479,6 +1481,7 @@ mod tests {
             kind: EdgeKind::References,
             source: ExtractionSource::Markdown,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         };
         let custom_edge = Edge {
             from: claimant.id.clone(),
@@ -1486,6 +1489,7 @@ mod tests {
             kind: supports_kind.clone(),
             source: ExtractionSource::Markdown,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         };
 
         persist_graph_to_lance(

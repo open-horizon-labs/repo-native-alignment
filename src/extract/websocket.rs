@@ -248,6 +248,7 @@ pub fn websocket_pass(
                     kind: edge_kind.clone(),
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
         }

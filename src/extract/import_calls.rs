@@ -212,6 +212,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::Calls,
                     source: ExtractionSource::TreeSitter,
                     confidence: confidence.clone(),
+                    evidence: Vec::new(),
                 });
             }
         }
@@ -289,6 +290,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::ReferencedBy,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
                 ref_count += 1;
             }
@@ -354,6 +356,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 kind: EdgeKind::ReferencedBy,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
             attr_ref_count += 1;
         }

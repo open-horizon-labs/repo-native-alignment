@@ -342,6 +342,7 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::Implements,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
             continue; // strategy 1 matched (or was ambiguous) — skip strategy 2
@@ -384,6 +385,7 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::Implements,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             } else if matched_ep_ids.len() > 1 {
                 tracing::debug!(

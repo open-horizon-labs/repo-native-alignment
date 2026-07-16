@@ -751,6 +751,7 @@ fn collect_nodes(
                         } else {
                             crate::graph::Confidence::Detected
                         },
+                        evidence: Vec::new(),
                     })
                 } else {
                     None
@@ -819,6 +820,7 @@ fn collect_nodes(
                                         kind: EdgeKind::DependsOn,
                                         source: ExtractionSource::TreeSitter,
                                         confidence: Confidence::Detected,
+                                        evidence: Vec::new(),
                                     });
                                 }
                             }
@@ -843,6 +845,7 @@ fn collect_nodes(
                                 kind: EdgeKind::DependsOn,
                                 source: ExtractionSource::TreeSitter,
                                 confidence: Confidence::Detected,
+                                evidence: Vec::new(),
                             });
                         }
                     }
@@ -872,6 +875,7 @@ fn collect_nodes(
                     kind: EdgeKind::Defines,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
 
@@ -899,6 +903,7 @@ fn collect_nodes(
                     kind: edge_kind,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
 
@@ -925,6 +930,7 @@ fn collect_nodes(
                         kind: EdgeKind::Implements,
                         source: ExtractionSource::TreeSitter,
                         confidence: Confidence::Detected,
+                        evidence: Vec::new(),
                     });
                 }
             }
@@ -1973,6 +1979,7 @@ fn run_route_queries(
                     kind: crate::graph::EdgeKind::Implements,
                     source: ExtractionSource::TreeSitter,
                     confidence: crate::graph::Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
 
@@ -2144,6 +2151,7 @@ fn emit_decorator_implements_edges(nodes: &[Node], _path: &Path) -> Vec<Edge> {
                         kind: EdgeKind::Implements,
                         source: ExtractionSource::TreeSitter,
                         confidence: Confidence::Detected,
+                        evidence: Vec::new(),
                     });
                 }
             }
@@ -2464,6 +2472,7 @@ fn collect_calls(
                             kind: EdgeKind::Calls,
                             source: ExtractionSource::TreeSitter,
                             confidence: Confidence::Detected,
+                            evidence: Vec::new(),
                         });
                     }
                 }
@@ -2566,6 +2575,7 @@ fn detect_pub_use_with_modifier(
             kind: EdgeKind::ReExports,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         });
     }
 }
@@ -2731,6 +2741,7 @@ fn detect_export_ts(
         kind: EdgeKind::ReExports,
         source: ExtractionSource::TreeSitter,
         confidence: Confidence::Detected,
+        evidence: Vec::new(),
     });
 }
 

@@ -17,7 +17,8 @@ use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
-    format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
+    EdgeEvidenceIndex, format_capability_readiness, format_freshness_full,
+    format_indexed_edge_evidence_for_groups, format_neighbors_grouped_with_root,
     format_node_entry_with_root, strip_root_prefix,
 };
 use crate::server::state::{CapabilityReadinessState, GraphState, LspEnrichmentStatus};
@@ -1988,7 +1989,7 @@ async fn search_traversal(
                 _ => String::new(),
             };
 
-            let md = format_neighbors_grouped_with_root(
+            let mut md = format_neighbors_grouped_with_root(
                 &gs.nodes,
                 &merged_groups,
                 &gs.index,
@@ -1997,6 +1998,20 @@ async fn search_traversal(
                 params.include_body,
                 params.minify_body,
             );
+            let evidence_index = EdgeEvidenceIndex::new(&gs.edges);
+            for origin in &valid_entry_ids {
+                let evidence_direction = match mode {
+                    "impact" | "tests_for" => "incoming",
+                    "reachable" => "outgoing",
+                    _ => params.direction.as_deref().unwrap_or("outgoing"),
+                };
+                md.push_str(&format_indexed_edge_evidence_for_groups(
+                    &evidence_index,
+                    origin,
+                    &merged_groups,
+                    evidence_direction,
+                ));
+            }
 
             // For impact mode, append a subsystem breakdown showing which subsystems
             // are affected and through which interface function the impact propagates.
@@ -2136,6 +2151,7 @@ fn search_batch(
         let edge_filter_slice = edge_filter.as_deref();
         let mut sections: Vec<String> = Vec::new();
         let strip = ctx.root_filter.as_deref();
+        let evidence_index = EdgeEvidenceIndex::new(&gs.edges);
         for &nid in node_ids {
             // Resolve short IDs (without root prefix) to full stable IDs.
             let resolved_nid = GraphState::resolve_node_id_fast(nid, node_index_map, &roots);
@@ -2186,7 +2202,7 @@ fn search_batch(
                     if total == 0 {
                         sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode));
                     } else {
-                        let md = format_neighbors_grouped_with_root(
+                        let mut md = format_neighbors_grouped_with_root(
                             &gs.nodes,
                             &groups,
                             &gs.index,
@@ -2195,6 +2211,16 @@ fn search_batch(
                             params.include_body,
                             params.minify_body,
                         );
+                        md.push_str(&format_indexed_edge_evidence_for_groups(
+                            &evidence_index,
+                            &resolved_nid,
+                            &groups,
+                            match mode {
+                                "impact" | "tests_for" => "incoming",
+                                "reachable" => "outgoing",
+                                _ => params.direction.as_deref().unwrap_or("outgoing"),
+                            },
+                        ));
                         sections.push(format!(
                             "### `{}`\n\n{} result(s)\n\n{}",
                             display_nid, total, md
@@ -2628,6 +2654,7 @@ mod tests {
             kind,
             source: ExtractionSource::TreeSitter,
             confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
         }
     }
 

@@ -157,6 +157,7 @@ fn collect_kotlin_specials(
                     kind: EdgeKind::DependsOn,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                    evidence: Vec::new(),
                 });
             }
 

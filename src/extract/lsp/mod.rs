@@ -1871,6 +1871,7 @@ impl LspEnricher {
                                 kind: EdgeKind::Implements,
                                 source: ExtractionSource::Lsp,
                                 confidence: Confidence::Confirmed,
+                                evidence: Vec::new(),
                             });
                         }
                     }
@@ -2382,6 +2383,7 @@ impl LspEnricher {
                 kind: EdgeKind::DependsOn,
                 source: ExtractionSource::Lsp,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -2544,6 +2546,7 @@ impl LspEnricher {
                 kind: EdgeKind::BelongsTo,
                 source: ExtractionSource::Lsp,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -4606,6 +4609,7 @@ mod tests {
             kind: EdgeKind::ReferencedBy,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
         };
 
         assert_eq!(format!("{}", edge.kind), "referenced_by");

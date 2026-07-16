@@ -22,6 +22,7 @@ Every evidence-bearing fact carries one or more selectors with these fields:
 
 | Field | Requirement | Meaning |
 |---|---|---|
+| `root_id` | required | Workspace root slug containing the selected file; prevents equal relative paths in different roots from sharing evidence identity. |
 | `file_path` | required | Normalized, repository-relative path; no absolute paths or `..`. |
 | `line_start`, `line_end` | required | One-indexed, inclusive range in the current file. |
 | `byte_start`, `byte_end` | required for content-native Markdown | Zero-indexed, half-open UTF-8 byte range. A Markdown fact without both cannot be `valid` or `confirmed`. |
@@ -60,8 +61,10 @@ Changing only the selected text also preserves identity but invalidates its hash
 
 For multi-span evidence, store an ordered, non-empty selector list. Edge identity
 MUST distinguish equal source/target/kind triples supported by materially
-different evidence. A display snippet is derived from the selected bytes and is
-not itself authoritative.
+different evidence. Its selector projection uses ordered root/file/body-node
+identity and content hash; mutable line/byte coordinates, display snippets,
+confidence, and validation status do not participate. A display snippet is
+derived from the selected bytes and is not itself authoritative.
 
 ## Validation states and transitions
 
