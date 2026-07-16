@@ -197,6 +197,7 @@ struct OpenBodyNode {
     parent_path: String,
     explicit_id: Option<String>,
     anchor: Option<String>,
+    target: Option<String>,
 }
 
 fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>) {
@@ -220,7 +221,7 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 sibling_counts.truncate(depth + 1);
                 sibling_counts.push(BTreeMap::new());
                 let parent_path = stack.last().map(|open| ast_path(open)).unwrap_or_default();
-                let (explicit_id, anchor) = tag_identity(&tag, content, range.clone());
+                let (explicit_id, anchor, target) = tag_identity(&tag, content, range.clone());
                 stack.push(OpenBodyNode {
                     kind,
                     start: range.start,
@@ -228,6 +229,7 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                     parent_path,
                     explicit_id,
                     anchor,
+                    target,
                 });
             }
             Event::End(end) => {
@@ -238,6 +240,18 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 let open = stack.remove(index);
                 let end = range.end.max(open.start).min(content.len());
                 let node = make_body_node(path, content, &open, end, &mut explicit_ids);
+                if open.kind == "image" {
+                    emit_leaf_body_node(
+                        path,
+                        content,
+                        "caption",
+                        open.start..end,
+                        None,
+                        ast_path(&open),
+                        0,
+                        nodes,
+                    );
+                }
                 nodes.push(node);
             }
             Event::FootnoteReference(label) => {
@@ -251,7 +265,7 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                     path,
                     content,
                     "citation",
-                    range,
+                    range.clone(),
                     Some(label.to_string()),
                     stack.last().map(ast_path).unwrap_or_default(),
                     ordinal,
@@ -274,12 +288,40 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                     path,
                     content,
                     kind,
-                    range,
+                    range.clone(),
                     None,
                     stack.last().map(ast_path).unwrap_or_default(),
                     ordinal,
                     nodes,
                 );
+                let directive = html
+                    .trim()
+                    .trim_start_matches("<!--")
+                    .trim_start_matches('<')
+                    .trim()
+                    .split(|c: char| c == ':' || c == '>' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(directive.as_str(), "prompt" | "exercise") {
+                    let semantic_kind = if directive == "prompt" {
+                        "prompt"
+                    } else {
+                        "exercise"
+                    };
+                    let ordinal = *sibling_counts[depth].entry(semantic_kind).or_insert(0);
+                    *sibling_counts[depth].entry(semantic_kind).or_insert(0) += 1;
+                    emit_leaf_body_node(
+                        path,
+                        content,
+                        semantic_kind,
+                        range,
+                        None,
+                        stack.last().map(ast_path).unwrap_or_default(),
+                        ordinal,
+                        nodes,
+                    );
+                }
             }
             _ => {}
         }
@@ -339,7 +381,7 @@ fn tag_identity(
     tag: &Tag<'_>,
     content: &str,
     range: std::ops::Range<usize>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
     if let Tag::Heading { id, .. } = tag {
         let explicit = id
             .as_ref()
@@ -348,9 +390,11 @@ fn tag_identity(
         let anchor = explicit
             .clone()
             .or_else(|| Some(slugify_heading(&content[range])));
-        (explicit, anchor)
+        (explicit, anchor, None)
+    } else if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = tag {
+        (None, None, Some(dest_url.to_string()))
     } else {
-        (None, None)
+        (None, None, None)
     }
 }
 
@@ -382,9 +426,12 @@ fn ast_path(open: &OpenBodyNode) -> String {
 }
 
 fn body_node_id(path: &Path, open: &OpenBodyNode) -> NodeId {
+    let contract_file = contract_path(path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| path.display().to_string());
     let stable = match &open.explicit_id {
-        Some(id) => format!("{}::body::explicit:{}", path.display(), percent_encode(id)),
-        None => format!("{}::body::ast:{}", path.display(), ast_path(open)),
+        Some(id) => format!("{contract_file}::body::explicit:{}", percent_encode(id)),
+        None => format!("{contract_file}::body::ast:{}", ast_path(open)),
     };
     NodeId {
         root: String::new(),
@@ -436,10 +483,7 @@ fn make_body_node(
         metadata.insert("caption".into(), caption.to_string());
     }
     if open.kind == "link"
-        && let Some(destination) = selected
-            .split_once("](")
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .map(|(destination, _)| destination.split_whitespace().next().unwrap_or(""))
+        && let Some(destination) = open.target.as_deref()
         && let Some((file, anchor)) = destination.split_once('#')
         && !anchor.is_empty()
     {
@@ -457,6 +501,7 @@ fn make_body_node(
             .trim()
             .trim_start_matches("<!--")
             .trim_start_matches('<')
+            .trim()
             .split(|c: char| c == ':' || c == '>' || c.is_whitespace())
             .next()
             .unwrap_or("");
@@ -493,6 +538,7 @@ fn emit_leaf_body_node(
         parent_path,
         explicit_id: explicit,
         anchor: None,
+        target: None,
     };
     nodes.push(make_body_node(
         path,
@@ -514,7 +560,21 @@ fn selector_metadata(
     let end = end.min(content.len());
     let mut metadata = BTreeMap::new();
     metadata.insert("markdown_kind".into(), kind.into());
-    metadata.insert("file_path".into(), path.display().to_string());
+    if let Some(contract_path) = contract_path(path) {
+        metadata.insert("file_path".into(), contract_path.display().to_string());
+    } else {
+        metadata.insert("file_path".into(), path.display().to_string());
+        metadata.insert("validation_status".into(), "invalid".into());
+        metadata.insert(
+            "diagnostic_code".into(),
+            "content.invalid_selector_path".into(),
+        );
+        metadata.insert("diagnostic_severity".into(), "error".into());
+        metadata.insert(
+            "diagnostic_message".into(),
+            "selector file_path must be normalized and repository-relative".into(),
+        );
+    }
     metadata.insert("line_start".into(), line_at(content, start).to_string());
     metadata.insert(
         "line_end".into(),
@@ -530,7 +590,9 @@ fn selector_metadata(
     );
     metadata.insert("extractor_id".into(), MARKDOWN_EXTRACTOR_ID.into());
     metadata.insert("confidence".into(), "detected".into());
-    metadata.insert("validation_status".into(), "valid".into());
+    metadata
+        .entry("validation_status".into())
+        .or_insert_with(|| "valid".into());
     if let Some(id) = explicit {
         metadata.insert("explicit_id".into(), id.into());
     }
@@ -560,6 +622,21 @@ fn percent_encode(value: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+fn contract_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+    let normalized = normalize_path(path);
+    if matches!(
+        normalized.components().next(),
+        Some(std::path::Component::ParentDir)
+    ) {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 /// Resolve exact Markdown anchors after all files have been extracted. Unresolved
@@ -611,6 +688,14 @@ pub fn markdown_anchor_pass(all_nodes: &mut [Node]) -> Vec<Edge> {
                 .insert("diagnostic_code".into(), "content.unresolved_anchor".into());
             node.metadata
                 .insert("diagnostic_severity".into(), "error".into());
+            node.metadata.insert(
+                "diagnostic_message".into(),
+                format!(
+                    "Markdown anchor #{} does not resolve in {}",
+                    key.2,
+                    key.1.display()
+                ),
+            );
         }
     }
     edges
@@ -2764,7 +2849,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
 
     #[test]
     fn body_ast_emits_required_source_backed_constructs() {
-        let source = "# Title {#stable-title}\n\nParagraph with [link](#stable-title), ![caption](image.png), and note[^1].\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n[^1]: citation\n\n<!-- prompt: explain the result -->\n";
+        let source = "# Title {#stable-title}\n\nParagraph with [link](#stable-title), ![caption](image.png), and note[^1].\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n[^1]: citation\n\n<!-- prompt: explain the result -->\n<!-- exercise: try another input -->\n";
         let mut result = MarkdownExtractor::new()
             .extract(Path::new("docs/example.md"), source)
             .unwrap();
@@ -2788,6 +2873,9 @@ The manuscript uses the proxy-risk claim in the opening argument.
             "table_row",
             "table_cell",
             "html_comment",
+            "prompt",
+            "exercise",
+            "caption",
         ] {
             assert!(kinds.contains(required), "missing {required}: {kinds:?}");
         }
@@ -2893,6 +2981,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
             .expect("unresolved anchor diagnostic");
         assert_eq!(diagnostic.metadata["validation_status"], "unresolved");
         assert_eq!(diagnostic.metadata["diagnostic_severity"], "error");
+        assert!(diagnostic.metadata["diagnostic_message"].contains("does not resolve"));
     }
 
     #[test]
@@ -2917,6 +3006,71 @@ The manuscript uses the proxy-risk claim in the opening argument.
             .unwrap();
         assert_eq!(link.metadata["validation_status"], "valid");
         assert!(!link.metadata.contains_key("diagnostic_code"));
+    }
+
+    #[test]
+    fn reference_style_anchor_uses_parser_resolved_destination() {
+        let extractor = MarkdownExtractor::new();
+        let mut nodes = extractor
+            .extract(
+                Path::new("docs/source.md"),
+                "[target][ref]\n\n[ref]: target.md#exact\n",
+            )
+            .unwrap()
+            .nodes;
+        nodes.extend(
+            extractor
+                .extract(Path::new("docs/target.md"), "# Target {#exact}\n")
+                .unwrap()
+                .nodes,
+        );
+        assert_eq!(markdown_anchor_pass(&mut nodes).len(), 1);
+    }
+
+    #[test]
+    fn selector_paths_reject_absolute_and_repo_escape_paths() {
+        for path in [Path::new("/tmp/doc.md"), Path::new("../doc.md")] {
+            let result = MarkdownExtractor::new().extract(path, "Body.\n").unwrap();
+            let body = result
+                .nodes
+                .iter()
+                .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+                .unwrap();
+            assert_eq!(body.metadata["validation_status"], "invalid");
+            assert_eq!(
+                body.metadata["diagnostic_code"],
+                "content.invalid_selector_path"
+            );
+            assert!(body.metadata.contains_key("diagnostic_message"));
+        }
+    }
+
+    #[test]
+    fn merged_contract_fixtures_drive_extractor_validation() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/content_source_contract");
+        let positive = std::fs::read_to_string(root.join("body-backed-control.md")).unwrap();
+        let mut positive_nodes = MarkdownExtractor::new()
+            .extract(Path::new("body-backed-control.md"), &positive)
+            .unwrap()
+            .nodes;
+        assert!(positive_nodes.iter().any(|node| {
+            node.metadata.get("markdown_kind") == Some(&"paragraph".to_string())
+                && node.metadata.get("validation_status") == Some(&"valid".to_string())
+                && node.metadata.contains_key("snippet_hash")
+        }));
+        let broken = std::fs::read_to_string(root.join("broken-anchor.md")).unwrap();
+        let mut broken_nodes = MarkdownExtractor::new()
+            .extract(Path::new("broken-anchor.md"), &broken)
+            .unwrap()
+            .nodes;
+        markdown_anchor_pass(&mut broken_nodes);
+        assert!(broken_nodes.iter().any(|node| {
+            node.metadata.get("diagnostic_code") == Some(&"content.unresolved_anchor".to_string())
+        }));
+        // Keep the mutable binding used above meaningful: the positive corpus
+        // must not acquire an unresolved selector when it has no broken link.
+        assert!(markdown_anchor_pass(&mut positive_nodes).is_empty());
     }
 
     #[test]
