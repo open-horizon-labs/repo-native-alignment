@@ -130,6 +130,7 @@ pub enum EnrichmentJobState {
     Running,
     Persisting,
     Completed,
+    Degraded,
     Failed,
     Cancelled,
     Superseded,
@@ -139,7 +140,7 @@ impl EnrichmentJobState {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Superseded
+            Self::Completed | Self::Degraded | Self::Failed | Self::Cancelled | Self::Superseded
         )
     }
 }
@@ -178,6 +179,8 @@ pub struct EnrichmentJobRecord {
     pub counters: EnrichmentCounters,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<u64>,
     pub completed_at: Option<u64>,
@@ -249,7 +252,7 @@ impl EnrichmentJobLedger {
 
         let now = unix_now();
         let owner_id = process_owner_id();
-        let job = EnrichmentJobRecord {
+        let mut job = EnrichmentJobRecord {
             job_id: format!("{}-{}", capability.as_str(), uuid::Uuid::new_v4()),
             repo,
             root,
@@ -261,6 +264,7 @@ impl EnrichmentJobLedger {
             counters: EnrichmentCounters::empty(),
             created_at: now,
             updated_at: now,
+            revision: 0,
             last_progress_at: Some(now),
             completed_at: None,
             failure: None,
@@ -336,6 +340,7 @@ impl EnrichmentJobLedger {
                 });
             }
             store.events.extend(superseded_events);
+            job.revision = store.events.len() as u64 + 1;
             store.jobs.push(job.clone());
             store.events.push(EnrichmentJobEvent {
                 job_id: job.job_id.clone(),
@@ -441,6 +446,32 @@ impl EnrichmentJobLedger {
         );
     }
 
+    pub fn mark_degraded(
+        &self,
+        repo_root: &Path,
+        job_id: &str,
+        node_count: usize,
+        edge_count: usize,
+        detail: impl Into<String>,
+    ) {
+        self.update_job(
+            repo_root,
+            job_id,
+            JobUpdate {
+                state: EnrichmentJobState::Degraded,
+                phase: Some("degraded".to_string()),
+                counters: Some(EnrichmentCounters {
+                    current: edge_count,
+                    total: None,
+                    node_count: Some(node_count),
+                    edge_count: Some(edge_count),
+                }),
+                failure: Some(detail.into()),
+                superseded_by: None,
+            },
+        );
+    }
+
     pub fn mark_failed(&self, repo_root: &Path, job_id: &str, error: impl Into<String>) {
         self.update_job(
             repo_root,
@@ -511,7 +542,7 @@ impl EnrichmentJobLedger {
             .retain(|job| job.schema_version == SCHEMA_VERSION);
         store
             .jobs
-            .sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+            .sort_by_key(|job| std::cmp::Reverse((job.updated_at, job.revision)));
         store.jobs.truncate(limit);
         store.jobs
     }
@@ -548,6 +579,7 @@ impl EnrichmentJobLedger {
         let mut event_counters = EnrichmentCounters::empty();
         let mut key_to_clear = None;
 
+        let next_revision = store.events.len() as u64 + 1;
         if let Some(job) = store.jobs.iter_mut().find(|job| job.job_id == job_id) {
             job.state = update.state;
             job.phase = update.phase.clone();
@@ -562,6 +594,7 @@ impl EnrichmentJobLedger {
                 job.superseded_by = Some(superseded_by);
             }
             job.updated_at = now;
+            job.revision = next_revision;
             job.last_progress_at = Some(now);
             if update.state.is_terminal() {
                 job.lease_expires_at = None;

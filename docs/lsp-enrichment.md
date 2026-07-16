@@ -56,6 +56,8 @@ Plus 32 more: Ruby (solargraph), Java (jdtls), C# (omnisharp), Kotlin, Lua, Zig,
 
 MCP output distinguishes freshness from readiness. Freshness says when the index last changed; readiness says which workflow metadata is currently trustworthy: exact extracted graph search, embeddings/semantic search, LSP call/reference coverage, and dead-code prerequisites. Dead-code workflows require complete, persisted, non-zero LSP call/reference coverage; if LSP is still running, failed, or unavailable, the readiness block reports that instead of implying the graph is complete.
 
+If a language server stops making progress and RNA aborts the pass, graph finalization still completes and preserves every node and edge produced before the abort. CLI and MCP readiness report this terminal result as `partial/degraded` with the original abort diagnostic. RNA does not write the full-LSP completion sentinel for a degraded run, so a later scan can retry instead of treating partial coverage as complete.
+
 ## Type Hierarchy Enrichment
 
 When a language server advertises `typeHierarchyProvider`, RNA queries supertypes for each Trait, Struct, and Enum node to create compiler-accurate `Implements` edges (e.g., `MyStruct -> MyTrait`).

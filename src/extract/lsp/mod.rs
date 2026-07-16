@@ -2472,6 +2472,15 @@ impl LspEnricher {
     }
 }
 
+fn lsp_job_timeout() -> std::time::Duration {
+    std::env::var("RNA_LSP_JOB_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30 * 60))
+}
+
 #[async_trait::async_trait]
 impl Enricher for LspEnricher {
     fn languages(&self) -> &[&str] {
@@ -2590,6 +2599,12 @@ impl Enricher for LspEnricher {
                 "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) -- skipped (not quiescent)",
                 self.language,
             );
+            result.aborted = true;
+            result.error_count = 1;
+            result.diagnostic = Some(format!(
+                "LSP enrichment aborted for {}: server did not reach quiescent state during initialization",
+                self.server_command
+            ));
             return Ok(result);
         }
 
@@ -2605,8 +2620,7 @@ impl Enricher for LspEnricher {
         };
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
-        let (attempted, errors, aborted, abort_diagnostic) = self
-            .run_pass1_references(
+        let pass1 = self.run_pass1_references(
                 &transport,
                 &root,
                 &matching_nodes,
@@ -2615,20 +2629,33 @@ impl Enricher for LspEnricher {
                 has_references,
                 has_call_hierarchy,
                 &mut result,
-            )
-            .await;
+            );
+        let (attempted, errors, aborted, abort_diagnostic) =
+            match tokio::time::timeout(lsp_job_timeout(), pass1).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    result.aborted = true;
+                    result.error_count = result.error_count.saturating_add(1);
+                    result.diagnostic = Some(format!(
+                        "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
+                        self.server_command,
+                        lsp_job_timeout().as_secs()
+                    ));
+                    tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                    return Ok(result);
+                }
+            };
         if aborted {
             result.error_count = errors as usize;
             result.aborted = true;
             let detail = abort_diagnostic
                 .unwrap_or_else(|| "Pass 1 aborted without a diagnostic snapshot".to_string());
-            anyhow::bail!(
+            result.diagnostic = Some(format!(
                 "LSP Pass 1 aborted for {} after {} attempted nodes and {} errors: {}",
-                self.server_command,
-                attempted,
-                errors,
-                detail
-            );
+                self.server_command, attempted, errors, detail
+            ));
+            tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+            return Ok(result);
         }
 
 

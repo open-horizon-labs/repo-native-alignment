@@ -143,7 +143,7 @@ fn build_pipeline_operation_report(
     report
 }
 
-type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>);
+type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>, Vec<String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrichmentContinuation {
@@ -261,25 +261,17 @@ fn scoped_lsp_persistence_delta(
 }
 
 #[derive(Debug)]
-enum LspPipelineFailure {
-    TimedOut(Duration),
-    Failed(anyhow::Error),
-}
+struct LspPipelineFailure(anyhow::Error);
 
 impl LspPipelineFailure {
     fn is_timeout(&self) -> bool {
-        matches!(self, Self::TimedOut(_))
+        false
     }
 }
 
 impl std::fmt::Display for LspPipelineFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TimedOut(duration) => {
-                write!(f, "LSP enrichment timed out after {}s", duration.as_secs())
-            }
-            Self::Failed(err) => write!(f, "{:#}", err),
-        }
+        write!(f, "{:#}", self.0)
     }
 }
 
@@ -317,14 +309,13 @@ async fn emit_lsp_pipeline_with_budget(
     );
 
     if input.skip_lsp {
-        return fut.await.map_err(LspPipelineFailure::Failed);
+        return fut.await.map_err(LspPipelineFailure);
     }
 
-    let budget = LspBudget::from_env();
-    match tokio::time::timeout(budget.max_duration, fut).await {
-        Ok(result) => result.map_err(LspPipelineFailure::Failed),
-        Err(_) => Err(LspPipelineFailure::TimedOut(budget.max_duration)),
-    }
+    // The LSP work-item/pass layer owns its timeout and abort diagnostics. Wrapping the
+    // entire event bus in `timeout` drops the future before AllEnrichmentsDone and
+    // PassesComplete can preserve partial output, violating the finalization contract.
+    fut.await.map_err(LspPipelineFailure)
 }
 
 impl RnaHandler {
@@ -339,6 +330,8 @@ impl RnaHandler {
         let repo_root = self.repo_root.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
         let scan_stats = Arc::clone(&self.scan_stats);
+        let lsp_status = Arc::clone(&self.lsp_status);
+        let enrichment_jobs = Arc::clone(&self.enrichment_jobs);
         tokio::spawn(async move {
             // Seed from the current resolved roots so the first tick doesn't
             // misidentify every root as "new".
@@ -407,7 +400,7 @@ impl RnaHandler {
                 if let Some(ref current_gs) = *current_snap {
                     let mut graph_state = (**current_gs).clone();
 
-                    let lance_deltas = super::bg_scanner::update_graph(
+                    let (lance_deltas, diagnostics) = super::bg_scanner::update_graph(
                         &mut graph_state,
                         &mut scan_result,
                         &repo_root,
@@ -415,11 +408,41 @@ impl RnaHandler {
                     )
                     .await;
 
+                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    let degraded_job_id = if degraded_detail.is_some() {
+                        match enrichment_jobs.begin_job(
+                            &repo_root,
+                            EnrichmentCapability::CallReferences,
+                            EnrichmentScope::ChangedFiles,
+                            EnrichmentTrigger::BackgroundScan,
+                            None,
+                        ) {
+                            Ok(JobStart::Started(job)) => Some(job.job_id),
+                            Ok(JobStart::Joined { existing_job_id }) => Some(existing_job_id),
+                            Err(error) => {
+                                tracing::error!(
+                                    "Background scan: failed to begin durable degraded LSP job: {error:#}"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(job_id) = degraded_job_id.as_deref() {
+                        enrichment_jobs.mark_persisting(
+                            &repo_root,
+                            job_id,
+                            graph_state.nodes.len(),
+                            graph_state.edges.len(),
+                        );
+                    }
+
                     // Atomic swap: publish the new graph state.
                     graph.store(Arc::new(Some(Arc::new(graph_state))));
 
                     // Stage 3: persist deltas to LanceDB.
-                    super::bg_scanner::persist_deltas(
+                    let persist_succeeded = super::bg_scanner::persist_deltas(
                         lance_deltas,
                         &scan_result.per_root_scans,
                         &scan_result.removed_slugs,
@@ -428,6 +451,60 @@ impl RnaHandler {
                         &lance_write_lock,
                     )
                     .await;
+
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        let persisted_snapshot = graph.load_full();
+                        let (node_count, edge_count, lsp_edge_count) = persisted_snapshot
+                            .as_ref()
+                            .as_ref()
+                            .map(|graph_state| {
+                                (
+                                    graph_state.nodes.len(),
+                                    graph_state.edges.len(),
+                                    graph_state
+                                        .edges
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.source == crate::graph::ExtractionSource::Lsp
+                                                && matches!(
+                                                    edge.kind,
+                                                    crate::graph::EdgeKind::Calls
+                                                )
+                                        })
+                                        .count(),
+                                )
+                            })
+                            .unwrap_or((0, 0, 0));
+                        if persist_succeeded && degraded_job_id.is_some() {
+                            lsp_status.set_degraded(lsp_edge_count, detail);
+                            super::sentinel::clear_lsp_sentinel(&repo_root);
+                            if let Some(job_id) = degraded_job_id.as_deref() {
+                                enrichment_jobs.mark_degraded(
+                                    &repo_root,
+                                    job_id,
+                                    node_count,
+                                    edge_count,
+                                    detail,
+                                );
+                            }
+                        } else if !persist_succeeded
+                            && let Some(job_id) = degraded_job_id.as_deref()
+                        {
+                            enrichment_jobs.mark_failed(
+                                &repo_root,
+                                job_id,
+                                "degraded LSP output was not durably persisted",
+                            );
+                        } else if persist_succeeded {
+                            // The graph is durable, but readiness cannot be claimed without a
+                            // matching durable job record. Keep the sentinel absent so a later
+                            // process retries enrichment instead of trusting process-local state.
+                            super::sentinel::clear_lsp_sentinel(&repo_root);
+                            tracing::error!(
+                                "Background scan: degraded LSP output persisted without a durable job record; readiness left unchanged"
+                            );
+                        }
+                    }
                 }
 
                 prev_root_slugs = scan_result.current_root_slugs;
@@ -517,7 +594,7 @@ impl RnaHandler {
             .await;
 
             match result {
-                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks)) => {
+                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks, diagnostics)) => {
                     // Update LSP status
                     let lsp_edge_count = enriched_edges
                         .iter()
@@ -537,7 +614,12 @@ impl RnaHandler {
                         lsp_call_edge_count,
                         Some(lsp_edge_count),
                     );
-                    lsp_status.set_complete(lsp_call_edge_count);
+                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        lsp_status.set_degraded(lsp_call_edge_count, detail);
+                    } else {
+                        lsp_status.set_complete(lsp_call_edge_count);
+                    }
                     if lsp_edge_count > 0 {
                         tracing::info!(
                             "[background-lsp] LSP enrichment complete: {} LSP call edges, {} total LSP edges in {:.2}s",
@@ -706,24 +788,36 @@ impl RnaHandler {
                             let has_lsp_edges = enriched_edges
                                 .iter()
                                 .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
-                            if has_lsp_edges {
+                            if has_lsp_edges && diagnostics.is_empty() {
                                 super::sentinel::write_lsp_sentinel(
                                     &repo_root,
                                     enriched_nodes.len(),
                                     enriched_edges.len(),
                                 );
+                            } else if !diagnostics.is_empty() {
+                                super::sentinel::clear_lsp_sentinel(&repo_root);
                             }
                             tracing::info!(
                                 "[background-lsp] LanceDB re-persisted with LSP edges: {} nodes, {} edges",
                                 enriched_nodes.len(),
                                 enriched_edges.len()
                             );
-                            jobs.mark_completed(
-                                &repo_root,
-                                &job_id,
-                                enriched_nodes.len(),
-                                enriched_edges.len(),
-                            );
+                            if let Some(detail) = degraded_detail.as_deref() {
+                                jobs.mark_degraded(
+                                    &repo_root,
+                                    &job_id,
+                                    enriched_nodes.len(),
+                                    enriched_edges.len(),
+                                    detail,
+                                );
+                            } else {
+                                jobs.mark_completed(
+                                    &repo_root,
+                                    &job_id,
+                                    enriched_nodes.len(),
+                                    enriched_edges.len(),
+                                );
+                            }
                         }
                     }
 
@@ -956,20 +1050,24 @@ impl RnaHandler {
             })
             .await;
 
-            let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
-                    if e.is_timeout() {
-                        bg_lsp_status.set_timed_out(&format!("{}", e));
-                        bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
-                    } else {
-                        bg_lsp_status.set_failed(&format!("{}", e));
-                        bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
+            let (mut enriched_nodes, mut enriched_edges, _detected_frameworks, diagnostics) =
+                match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            "[cache-hit bus] emit_enrichment_pipeline failed: {:#}",
+                            e
+                        );
+                        if e.is_timeout() {
+                            bg_lsp_status.set_timed_out(&format!("{}", e));
+                            bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
+                        } else {
+                            bg_lsp_status.set_failed(&format!("{}", e));
+                            bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
 
             // Dedup: PassesComplete can re-emit cached entries when the cached graph already
             // contains output from a previous pass run. Dedup avoids duplicate rows in LanceDB
@@ -1045,11 +1143,15 @@ impl RnaHandler {
                 let result =
                     persist_graph_to_lance(&bg_repo_root, &enriched_nodes, &enriched_edges).await;
                 if result.is_ok() {
-                    super::sentinel::write_lsp_sentinel(
-                        &bg_repo_root,
-                        enriched_nodes.len(),
-                        enriched_edges.len(),
-                    );
+                    if diagnostics.is_empty() {
+                        super::sentinel::write_lsp_sentinel(
+                            &bg_repo_root,
+                            enriched_nodes.len(),
+                            enriched_edges.len(),
+                        );
+                    } else {
+                        super::sentinel::clear_lsp_sentinel(&bg_repo_root);
+                    }
                 }
                 result
             };
@@ -1064,13 +1166,28 @@ impl RnaHandler {
                     // Mirror other LSP paths: set_complete(0) when no edges (enricher ran but found
                     // nothing), not set_unavailable(). The sentinel is written to prevent repeated
                     // re-enrichment on repos that legitimately produce zero LSP edges.
-                    bg_lsp_status.set_complete(lsp_call_edge_count);
-                    bg_jobs.mark_completed(
-                        &bg_repo_root,
-                        &job_id,
-                        enriched_nodes.len(),
-                        enriched_edges.len(),
-                    );
+                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        bg_lsp_status.set_degraded(lsp_call_edge_count, detail);
+                    } else {
+                        bg_lsp_status.set_complete(lsp_call_edge_count);
+                    }
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        bg_jobs.mark_degraded(
+                            &bg_repo_root,
+                            &job_id,
+                            enriched_nodes.len(),
+                            enriched_edges.len(),
+                            detail,
+                        );
+                    } else {
+                        bg_jobs.mark_completed(
+                            &bg_repo_root,
+                            &job_id,
+                            enriched_nodes.len(),
+                            enriched_edges.len(),
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!("[cache-hit bus] LSP persist failed: {:#}", e);
@@ -1313,6 +1430,7 @@ impl RnaHandler {
             let (lsp_state, lsp_detail) = lsp_capability_from_status(
                 enrichment,
                 self.lsp_status.current_state(),
+                self.lsp_status.diagnostic().as_deref(),
                 lsp_edge_count,
                 !related_job_ids.is_empty(),
             );
@@ -1439,6 +1557,7 @@ impl RnaHandler {
             Some(std::iter::once(primary_slug.clone()).collect());
 
         let mut lsp_stage_completed = false;
+        let mut lsp_degraded_detail = None;
         let t2 = std::time::Instant::now();
         let bus_result = emit_lsp_pipeline_with_budget(LspPipelineInput {
             nodes: all_nodes,
@@ -1456,7 +1575,7 @@ impl RnaHandler {
 
         let lsp_edge_count;
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -1501,7 +1620,13 @@ impl RnaHandler {
                     }
                 }
                 if enrichment.runs_lsp() {
-                    self.lsp_status.set_complete(lsp_edge_count);
+                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    if let Some(detail) = degraded_detail.as_deref() {
+                        self.lsp_status.set_degraded(lsp_edge_count, detail);
+                        lsp_degraded_detail = Some(detail.to_string());
+                    } else {
+                        self.lsp_status.set_complete(lsp_edge_count);
+                    }
                     lsp_stage_completed = true;
                 }
             }
@@ -1551,7 +1676,7 @@ impl RnaHandler {
                 // is valid only when this invocation completed LSP and persisted
                 // the resulting graph in this block.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                if lsp_stage_completed {
+                if lsp_stage_completed && lsp_degraded_detail.is_none() {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
@@ -1608,6 +1733,7 @@ impl RnaHandler {
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
+            self.lsp_status.diagnostic().as_deref(),
             lsp_edge_count,
             !related_job_ids.is_empty(),
         );
@@ -1673,7 +1799,13 @@ impl RnaHandler {
     {
         // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
         let t0 = std::time::Instant::now();
-        let graph_state = self.build_full_graph_inner(false, enrichment).await?;
+        // Phase 2 below owns foreground LSP execution and its durable job/status
+        // contract. Keep the initial full build extraction-only for LSP so one
+        // invocation cannot abort here and then have a second successful/empty
+        // pass overwrite the degraded result.
+        let graph_state = self
+            .build_full_graph_inner(false, enrichment.without_lsp())
+            .await?;
         let scan_extract_time = t0.elapsed();
 
         let file_count = graph_state
@@ -1843,6 +1975,7 @@ impl RnaHandler {
         };
 
         let mut lsp_stage_completed = false;
+        let mut lsp_degraded_detail = None;
         let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
@@ -1854,7 +1987,7 @@ impl RnaHandler {
         let lsp_edge_count;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -1882,29 +2015,29 @@ impl RnaHandler {
                         None,
                     );
                 }
-                if run_lsp_in_bus {
-                    let lsp_failures = self
-                        .scan_stats
-                        .read()
-                        .map(|stats| lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs))
-                        .unwrap_or_else(|_| {
-                            vec!["scan stats unavailable: lock poisoned".to_string()]
-                        });
-                    if !lsp_failures.is_empty() {
-                        let detail = format!(
+                let lsp_abort_detail = if run_lsp_in_bus {
+                    (!diagnostics.is_empty()).then(|| diagnostics.join("; ")).or_else(|| {
+                        let lsp_failures = self
+                            .scan_stats
+                            .read()
+                            .map(|stats| {
+                                lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                            })
+                            .unwrap_or_else(|_| {
+                                vec!["scan stats unavailable: lock poisoned".to_string()]
+                            });
+                        (!lsp_failures.is_empty()).then(|| format!(
                             "LSP call-reference enrichment aborted: {}",
                             lsp_failures.join("; ")
-                        );
-                        self.lsp_status.set_unavailable();
-                        if let Some(job_id) = lsp_job_id.as_deref() {
-                            self.enrichment_jobs.mark_failed(
-                                &self.repo_root,
-                                job_id,
-                                detail.clone(),
-                            );
-                        }
-                        return Err(anyhow::anyhow!(detail));
-                    }
+                        ))
+                    })
+                } else {
+                    None
+                };
+                if let Some(detail) = lsp_abort_detail.as_deref() {
+                    on_progress(&format!(
+                        "Enrichment: finalized with degraded LSP output: {detail}"
+                    ));
                 }
 
                 on_progress(&format!(
@@ -1932,7 +2065,12 @@ impl RnaHandler {
                     }
                 }
                 if run_lsp_in_bus {
-                    self.lsp_status.set_complete(lsp_edge_count);
+                    if let Some(detail) = lsp_abort_detail.as_deref() {
+                        self.lsp_status.set_degraded(lsp_edge_count, detail);
+                        lsp_degraded_detail = Some(detail.to_string());
+                    } else {
+                        self.lsp_status.set_complete(lsp_edge_count);
+                    }
                     lsp_stage_completed = true;
                 }
             }
@@ -2009,18 +2147,28 @@ impl RnaHandler {
                 // is valid only when this invocation completed LSP and persisted
                 // the resulting graph in this block.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
-                if lsp_stage_completed {
+                if lsp_stage_completed && lsp_degraded_detail.is_none() {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
                 if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
-                    self.enrichment_jobs.mark_completed(
-                        &self.repo_root,
-                        job_id,
-                        nodes.len(),
-                        edges.len(),
-                    );
+                    if let Some(detail) = lsp_degraded_detail.as_deref() {
+                        self.enrichment_jobs.mark_degraded(
+                            &self.repo_root,
+                            job_id,
+                            nodes.len(),
+                            edges.len(),
+                            detail,
+                        );
+                    } else {
+                        self.enrichment_jobs.mark_completed(
+                            &self.repo_root,
+                            job_id,
+                            nodes.len(),
+                            edges.len(),
+                        );
+                    }
                 }
             }
         }
@@ -2049,6 +2197,7 @@ impl RnaHandler {
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
+            self.lsp_status.diagnostic().as_deref(),
             lsp_edge_count,
             !related_job_ids.is_empty(),
         );
@@ -2226,7 +2375,7 @@ impl RnaHandler {
         .await;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2267,25 +2416,15 @@ impl RnaHandler {
                             .count()
                     });
 
-                let lsp_abort_detail = {
+                let lsp_abort_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; ")).or_else(|| {
                     let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
                     lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
                         .into_iter()
                         .next()
                         .map(|failure| format!("LSP enrichment aborted for {failure}"))
-                };
-                if let Some(detail) = lsp_abort_detail {
+                });
+                if let Some(detail) = lsp_abort_detail.as_deref() {
                     on_progress(&format!("Enrichment: {detail}"));
-                    self.lsp_status.set_failed(&detail);
-                    self.enrichment_jobs
-                        .mark_failed(&self.repo_root, &job_id, detail.clone());
-                    if fail_on_lsp_error {
-                        return Err(anyhow::anyhow!("LSP enrichment failed: {detail}"));
-                    }
-                    return Ok(LspEnrichmentRun {
-                        edge_count: 0,
-                        job_id,
-                    });
                 }
 
                 on_progress(&format!(
@@ -2311,7 +2450,9 @@ impl RnaHandler {
                         self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-                if repo_wide_lsp {
+                if let Some(detail) = lsp_abort_detail.as_deref() {
+                    self.lsp_status.set_degraded(lsp_edge_count, detail);
+                } else if repo_wide_lsp {
                     self.lsp_status.set_complete(lsp_edge_count);
                 } else {
                     let existing_coverage = self.lsp_status.coverage_edge_count();
@@ -2381,19 +2522,37 @@ impl RnaHandler {
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
                 // LSP enrichment is durable and can skip re-enrichment (#477).
-                if repo_wide_lsp {
+                if repo_wide_lsp && lsp_abort_detail.is_none() {
                     super::sentinel::write_lsp_sentinel(
                         &self.repo_root,
                         enriched_nodes.len(),
                         enriched_edges.len(),
                     );
+                } else if lsp_abort_detail.is_some() {
+                    super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
-                self.enrichment_jobs.mark_completed(
-                    &self.repo_root,
-                    &job_id,
-                    persisted_node_count,
-                    persisted_edge_count,
-                );
+                if let Some(detail) = lsp_abort_detail.as_deref() {
+                    self.enrichment_jobs.mark_degraded(
+                        &self.repo_root,
+                        &job_id,
+                        persisted_node_count,
+                        persisted_edge_count,
+                        detail,
+                    );
+                } else {
+                    self.enrichment_jobs.mark_completed(
+                        &self.repo_root,
+                        &job_id,
+                        persisted_node_count,
+                        persisted_edge_count,
+                    );
+                }
+
+                if fail_on_lsp_error && let Some(detail) = lsp_abort_detail {
+                    return Err(anyhow::anyhow!(
+                        "LSP enrichment finalized with degraded output: {detail}"
+                    ));
+                }
 
                 Ok(LspEnrichmentRun {
                     edge_count: lsp_edge_count,
@@ -2698,6 +2857,12 @@ impl RnaHandler {
                             return Ok(progress.counters.current);
                         }
                         return Ok(job.counters.current);
+                    }
+                    EnrichmentJobState::Degraded => {
+                        let detail = job.failure.unwrap_or_else(|| {
+                            "call-reference enrichment finalized with degraded output".to_string()
+                        });
+                        anyhow::bail!("joined enrichment job {} degraded: {}", job_id, detail);
                     }
                     EnrichmentJobState::Failed => {
                         let detail = job.failure.unwrap_or_else(|| "unknown failure".to_string());
