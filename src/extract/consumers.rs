@@ -273,9 +273,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             if !node_is_in_lsp_scope(node, dirty_set, self.planned_node_ids.as_deref()) {
                 continue;
             }
-            if self.planned_node_ids.is_some()
-                && !emitted_planned_ids.insert(node.stable_id())
-            {
+            if self.planned_node_ids.is_some() && !emitted_planned_ids.insert(node.stable_id()) {
                 continue;
             }
             by_lang
@@ -1510,19 +1508,27 @@ impl ExtractionConsumer for LspConsumer {
                     enrichment.new_nodes.len(),
                     enrichment.updated_nodes.len(),
                 );
-                Ok(vec![ExtractionEvent::EnrichmentComplete {
-                    slug: slug.clone(),
-                    language: language.clone(),
-                    added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
-                    new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
-                    updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
-                    server_name: Some(self.enricher.name().to_string()),
-                    error_count: enrichment.error_count,
-                    server_missing,
-                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
-                    aborted: enrichment.aborted,
-                    diagnostic: enrichment.diagnostic,
-                }])
+                let metrics = Arc::from(enrichment.lsp_query_metrics.into_boxed_slice());
+                Ok(vec![
+                    ExtractionEvent::EnrichmentComplete {
+                        slug: slug.clone(),
+                        language: language.clone(),
+                        added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
+                        new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                        updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
+                        server_name: Some(self.enricher.name().to_string()),
+                        error_count: enrichment.error_count,
+                        server_missing,
+                        remediation: self.enricher.toolchain_remediation().map(str::to_string),
+                        aborted: enrichment.aborted,
+                        diagnostic: enrichment.diagnostic,
+                    },
+                    ExtractionEvent::LspQueryMetrics {
+                        slug: slug.clone(),
+                        language: language.clone(),
+                        metrics,
+                    },
+                ])
             }
             Err(e) => {
                 // LSP enrichment failure is non-fatal: emit EnrichmentComplete with
@@ -1728,11 +1734,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
                         if !n.language.is_empty()
-                            && node_is_in_lsp_scope(
-                                n,
-                                dirty_set,
-                                self.planned_node_ids.as_deref(),
-                            )
+                            && node_is_in_lsp_scope(n, dirty_set, self.planned_node_ids.as_deref())
                         {
                             seen.insert(n.language.clone());
                         }
@@ -1755,11 +1757,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     for n in nodes.iter() {
                         if !n.language.is_empty()
                             && supported.contains(&n.language)
-                            && node_is_in_lsp_scope(
-                                n,
-                                dirty_set,
-                                self.planned_node_ids.as_deref(),
-                            )
+                            && node_is_in_lsp_scope(n, dirty_set, self.planned_node_ids.as_deref())
                         {
                             seen.insert(n.language.clone());
                         }
@@ -3364,16 +3362,23 @@ mod tests {
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&matching).await.unwrap();
-        // No tokio runtime in sync test context: the consumer falls back to the no-op path
-        // and still emits EnrichmentComplete (with empty edges).
+        // Successful LSP enrichment emits both graph completion and query-yield telemetry.
         assert_eq!(
             result.len(),
-            1,
-            "LspConsumer must emit EnrichmentComplete for its language"
+            2,
+            "LspConsumer must emit completion and query metrics for its language"
         );
         assert!(
-            matches!(result[0], ExtractionEvent::EnrichmentComplete { .. }),
+            result
+                .iter()
+                .any(|event| matches!(event, ExtractionEvent::EnrichmentComplete { .. })),
             "LspConsumer must emit EnrichmentComplete"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|event| matches!(event, ExtractionEvent::LspQueryMetrics { .. })),
+            "LspConsumer must emit LspQueryMetrics"
         );
     }
 

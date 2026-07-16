@@ -20,6 +20,9 @@
 
 mod passes;
 pub(crate) use passes::requested_operations_for_node;
+mod policy;
+pub use policy::LspQueryMetric;
+use policy::{LspQueryProfile, LspServerCapabilities};
 mod transport;
 pub(crate) mod work_items;
 use transport::{LspTransport, PipelinedTransport, path_to_uri};
@@ -45,17 +48,6 @@ pub const CSHARP_TOOLCHAIN_REMEDIATION: &str = "C# LSP needs dotnet, csharp-ls, 
 
 type InitSettingsFactory = fn() -> serde_json::Value;
 
-#[derive(Clone, Copy)]
-enum LspEligibilityPolicy {
-    /// Resolve language-specific request-target kinds from the extractor's
-    /// [`LangConfig`](crate::extract::generic::LangConfig).
-    LangConfig {
-        /// Declared constants stay default-off until a measured server/language
-        /// profile explicitly earns reference enrichment (#768).
-        declared_const_references: bool,
-    },
-}
-
 /// Complete construction profile for a built-in language server.
 ///
 /// Keeping process configuration and admission policy in one descriptor means
@@ -69,7 +61,6 @@ pub(crate) struct BuiltinLspDescriptor {
     init_settings: Option<InitSettingsFactory>,
     config_file: Option<&'static str>,
     toolchain_remediation: Option<&'static str>,
-    eligibility: LspEligibilityPolicy,
 }
 
 impl BuiltinLspDescriptor {
@@ -89,17 +80,10 @@ impl BuiltinLspDescriptor {
         if let Some(remediation) = self.toolchain_remediation {
             enricher = enricher.with_toolchain_remediation(remediation);
         }
-        match self.eligibility {
-            LspEligibilityPolicy::LangConfig {
-                declared_const_references,
-            } => {
-                enricher.allow_declared_const_references = declared_const_references;
-                if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
-                    .and_then(|config| config.lsp_enrichable_kinds)
-                {
-                    enricher = enricher.with_enrichable_kinds(kinds);
-                }
-            }
+        if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
+            .and_then(|config| config.lsp_enrichable_kinds)
+        {
+            enricher = enricher.with_enrichable_kinds(kinds);
         }
         enricher
     }
@@ -121,9 +105,6 @@ macro_rules! builtin_lsp {
             init_settings: None,
             config_file: None,
             toolchain_remediation: None,
-            eligibility: LspEligibilityPolicy::LangConfig {
-                declared_const_references: false,
-            },
         }
     };
 }
@@ -295,12 +276,8 @@ pub struct LspEnricher {
     /// always uses `repo_root` (passed to `enrich()`), which ensures file URIs point to
     /// the correct absolute paths.
     startup_root_override: std::sync::OnceLock<PathBuf>,
-    /// Which node kinds to enrich via LSP. None = all enrichable kinds.
-    /// Configured per-language via LangConfig::lsp_enrichable_kinds.
-    lsp_enrichable_kinds: Option<Vec<NodeKind>>,
-    /// Whether declared constants may produce Pass 1 reference work.
-    /// Built-ins default to false until #768 measures a useful bounded profile.
-    allow_declared_const_references: bool,
+    /// Shared operation/declaration/server admission policy and budget factory.
+    query_profile: LspQueryProfile,
 }
 
 struct LspState {
@@ -321,6 +298,10 @@ struct LspState {
     /// When false, fall back to `textDocument/references` for function edges.
     /// Pyright supports references but not callHierarchy.
     has_call_hierarchy: bool,
+    /// Whether the language server supports textDocument/implementation.
+    has_implementation: bool,
+    /// Whether the language server supports textDocument/documentLink.
+    has_document_links: bool,
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
@@ -396,6 +377,8 @@ impl LspEnricher {
                 has_type_hierarchy: false,
                 has_references: false,
                 has_call_hierarchy: false,
+                has_implementation: false,
+                has_document_links: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
                 was_quiescent: false,
@@ -403,8 +386,7 @@ impl LspEnricher {
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
             startup_root_override: std::sync::OnceLock::new(),
-            lsp_enrichable_kinds: None,
-            allow_declared_const_references: false,
+            query_profile: LspQueryProfile::new(language, command),
         }
     }
 
@@ -449,24 +431,43 @@ impl LspEnricher {
     /// Restrict which node kinds are enriched via LSP.
     /// When set, only nodes matching these kinds are sent for enrichment.
     pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
-        self.lsp_enrichable_kinds = Some(kinds.to_vec());
+        self.query_profile = self.query_profile.with_allowed_kinds(kinds);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn enrichable_kinds(&self) -> Option<&[NodeKind]> {
-        self.lsp_enrichable_kinds.as_deref()
+        self.query_profile.allowed_kinds()
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_declared_const_references(&self) -> bool {
-        self.allow_declared_const_references
+        self.query_profile.allows_declared_const_references()
     }
 
+    #[cfg(test)]
     pub(crate) fn admits_pass1_node(&self, node: &Node) -> bool {
-        if node.id.kind == NodeKind::Const && !self.allows_declared_const_references() {
-            return false;
-        }
-        self.enrichable_kinds()
-            .is_none_or(|kinds| kinds.contains(&node.id.kind))
+        let operation = match node.id.kind {
+            NodeKind::Function => policy::LspQueryOperation::CallHierarchy,
+            NodeKind::Trait => policy::LspQueryOperation::Implementations,
+            NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                policy::LspQueryOperation::References
+            }
+            NodeKind::Other(_) => policy::LspQueryOperation::DocumentLinks,
+            _ => return false,
+        };
+        self.query_profile.admits(
+            node,
+            operation,
+            LspServerCapabilities {
+                references: true,
+                call_hierarchy: true,
+                implementations: true,
+                type_hierarchy: true,
+                document_links: true,
+            },
+            &mut self.query_profile.budget(),
+        )
     }
 
     /// Common admission boundary for every LSP pass.
@@ -475,9 +476,7 @@ impl LspEnricher {
     /// Rejecting them before `matching_nodes` is shared with any pass prevents
     /// them from becoming per-node or file-derived LSP work targets.
     pub(crate) fn admits_node(&self, node: &Node) -> bool {
-        node.language == self.language
-            && !matches!(&node.id.kind, NodeKind::Other(kind) if kind == "crate")
-            && node.metadata.get("synthetic").map(String::as_str) != Some("true")
+        self.query_profile.accepts_declaration(node)
     }
 
     /// Check if an `experimental/serverStatus` notification indicates readiness.
@@ -531,10 +530,12 @@ impl LspEnricher {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') || matches!(
-                    name_str.as_ref(),
-                    "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
-                ) {
+                if name_str.starts_with('.')
+                    || matches!(
+                        name_str.as_ref(),
+                        "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
+                    )
+                {
                     continue;
                 }
                 let ft = match entry.file_type() {
@@ -590,7 +591,6 @@ impl LspEnricher {
         walk(root, &extensions, 0)
     }
 
-
     fn lsp_language_id_for_path(&self, path: &Path) -> &'static str {
         match path.extension().and_then(|e| e.to_str()) {
             Some("py") => "python",
@@ -638,7 +638,6 @@ impl LspEnricher {
             .map(|hint| format!("\n  Fix: {hint}"))
             .unwrap_or_default()
     }
-
 
     /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
@@ -764,53 +763,54 @@ impl LspEnricher {
         // at startup_root and inject venvPath + venv so the LSP server can resolve
         // installed packages.
         let lang_config = crate::extract::configs::config_for_language(&self.language);
-        let effective_settings = if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
-            let found_venv = venv_dirs
-                .iter()
-                .find(|&&name| startup_root.join(name).is_dir());
-            if let Some(venv_name) = found_venv {
-                let venv_path_str = startup_root.to_string_lossy().to_string();
-                let mut merged = self
-                    .init_settings
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let python_obj = merged.as_object_mut().and_then(|root| {
-                    if !root.contains_key("python") {
-                        root.insert("python".into(), serde_json::json!({}));
-                    }
-                    root.get_mut("python")
-                });
-                if let Some(python_val) = python_obj {
-                    let analysis_obj = python_val.as_object_mut().and_then(|p| {
-                        if !p.contains_key("analysis") {
-                            p.insert("analysis".into(), serde_json::json!({}));
+        let effective_settings =
+            if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
+                let found_venv = venv_dirs
+                    .iter()
+                    .find(|&&name| startup_root.join(name).is_dir());
+                if let Some(venv_name) = found_venv {
+                    let venv_path_str = startup_root.to_string_lossy().to_string();
+                    let mut merged = self
+                        .init_settings
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let python_obj = merged.as_object_mut().and_then(|root| {
+                        if !root.contains_key("python") {
+                            root.insert("python".into(), serde_json::json!({}));
                         }
-                        p.get_mut("analysis")
+                        root.get_mut("python")
                     });
-                    if let Some(analysis_val) = analysis_obj
-                        && let Some(obj) = analysis_val.as_object_mut()
-                    {
-                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                        obj.insert(
-                            "venv".into(),
-                            serde_json::Value::String(venv_name.to_string()),
-                        );
+                    if let Some(python_val) = python_obj {
+                        let analysis_obj = python_val.as_object_mut().and_then(|p| {
+                            if !p.contains_key("analysis") {
+                                p.insert("analysis".into(), serde_json::json!({}));
+                            }
+                            p.get_mut("analysis")
+                        });
+                        if let Some(analysis_val) = analysis_obj
+                            && let Some(obj) = analysis_val.as_object_mut()
+                        {
+                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                            obj.insert(
+                                "venv".into(),
+                                serde_json::Value::String(venv_name.to_string()),
+                            );
+                        }
                     }
+                    tracing::info!(
+                        "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                        self.server_command,
+                        venv_name,
+                        startup_root.display()
+                    );
+                    Some(merged)
+                } else {
+                    self.init_settings.clone()
                 }
-                tracing::info!(
-                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
-                    self.server_command,
-                    venv_name,
-                    startup_root.display()
-                );
-                Some(merged)
             } else {
                 self.init_settings.clone()
-            }
-        } else {
-            self.init_settings.clone()
-        };
+            };
         if let Some(ref settings) = effective_settings {
             init_params.initialization_options = Some(settings.clone());
         }
@@ -860,19 +860,26 @@ impl LspEnricher {
             .capabilities
             .implementation_provider
             .is_some();
+        let has_document_links = init_result_parsed
+            .capabilities
+            .document_link_provider
+            .is_some();
         tracing::info!(
-            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
+            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}",
             self.server_command,
             has_references,
             has_call_hierarchy,
             has_implementation,
             has_type_hierarchy,
+            has_document_links,
             has_pull_diagnostics,
             has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
         state.has_call_hierarchy = has_call_hierarchy;
+        state.has_implementation = has_implementation;
+        state.has_document_links = has_document_links;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
         state.has_inlay_hints = has_inlay_hints;
@@ -887,24 +894,25 @@ impl LspEnricher {
         // context. tsserver requires at least one open file before it creates
         // a project; pyright uses it to trigger import-graph indexing.
         // Save the URI for use as a documentSymbol validation fallback.
-        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
-            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
-            match self.send_did_open(transport, &warmup_path).await {
-                Ok(()) => tracing::info!(
-                    "{} sent didOpen for '{}'",
-                    self.server_command,
-                    warmup_path.display()
-                ),
-                Err(e) => tracing::debug!(
-                    "{} didOpen warmup failed (non-fatal): {}",
-                    self.server_command,
-                    e
-                ),
-            }
-            uri_str
-        } else {
-            None
-        };
+        let warmup_uri: Option<String> =
+            if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
+                let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
+                match self.send_did_open(transport, &warmup_path).await {
+                    Ok(()) => tracing::info!(
+                        "{} sent didOpen for '{}'",
+                        self.server_command,
+                        warmup_path.display()
+                    ),
+                    Err(e) => tracing::debug!(
+                        "{} didOpen warmup failed (non-fatal): {}",
+                        self.server_command,
+                        e
+                    ),
+                }
+                uri_str
+            } else {
+                None
+            };
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
@@ -1282,9 +1290,12 @@ impl LspEnricher {
                         if let Some(ref uri) = warmup_uri {
                             let doc_result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(10),
-                                transport.request("textDocument/documentSymbol", serde_json::json!({
-                                    "textDocument": { "uri": uri }
-                                })),
+                                transport.request(
+                                    "textDocument/documentSymbol",
+                                    serde_json::json!({
+                                        "textDocument": { "uri": uri }
+                                    }),
+                                ),
                             )
                             .await;
                             if let Ok(Ok(ref resp)) = doc_result {
@@ -1654,21 +1665,29 @@ impl LspEnricher {
         matching_nodes: &[&Node],
         root: &Path,
         result: &mut EnrichmentResult,
-    ) -> bool {
+    ) -> (bool, passes::QueryObservation) {
+        let mut observation = passes::QueryObservation::default();
+        observation.scheduled_requests += 1;
         let items = match Self::prepare_type_hierarchy_p(transport, file_uri, line, character).await
         {
-            Ok(items) if !items.is_empty() => items,
-            Ok(_) => return true, // No type hierarchy item — not a failure
+            Ok(items) if !items.is_empty() => {
+                observation.non_empty_responses += 1;
+                items
+            }
+            Ok(_) => return (true, observation), // No type hierarchy item — not a failure
             Err(e) => {
+                observation.record_error(&e);
                 tracing::debug!("prepareTypeHierarchy failed for {}: {}", node.id.name, e);
-                return false;
+                return (false, observation);
             }
         };
 
         for item in &items {
+            observation.scheduled_requests += 1;
             // Supertypes: this node implements/inherits from each supertype
             match Self::type_hierarchy_supertypes_p(transport, item).await {
                 Ok(supertypes) => {
+                    observation.non_empty_responses += usize::from(!supertypes.is_empty());
                     for supertype in &supertypes {
                         if let Some(target_id) =
                             Self::resolve_type_hierarchy_item(supertype, matching_nodes, root)
@@ -1693,6 +1712,7 @@ impl LspEnricher {
                     }
                 }
                 Err(e) => {
+                    observation.record_error(&e);
                     tracing::debug!(
                         "typeHierarchy/supertypes failed for {}: {}",
                         node.id.name,
@@ -1702,7 +1722,7 @@ impl LspEnricher {
             }
         }
 
-        true // prepare succeeded
+        (true, observation) // prepare succeeded
     }
 
     /// Resolve a TypeHierarchyItem (JSON) to a NodeId in the graph.
@@ -2555,6 +2575,8 @@ impl Enricher for LspEnricher {
             type_hierarchy_strikes,
             has_references,
             has_call_hierarchy,
+            has_implementation,
+            has_document_links,
             has_pull_diagnostics,
             has_inlay_hints,
             was_quiescent,
@@ -2578,6 +2600,8 @@ impl Enricher for LspEnricher {
                 state.type_hierarchy_strikes,
                 state.has_references,
                 state.has_call_hierarchy,
+                state.has_implementation,
+                state.has_document_links,
                 state.has_pull_diagnostics,
                 state.has_inlay_hints,
                 was_quiescent,
@@ -2618,33 +2642,48 @@ impl Enricher for LspEnricher {
             }
             Arc::new(map)
         };
+        let capabilities = LspServerCapabilities {
+            references: has_references,
+            call_hierarchy: has_call_hierarchy,
+            implementations: has_implementation,
+            type_hierarchy: has_type_hierarchy,
+            document_links: has_document_links,
+        };
+        let mut query_budget = self.query_profile.budget();
+        let query_telemetry = Arc::new(policy::LspQueryTelemetry::new(&self.query_profile));
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
         let pass1 = self.run_pass1_references(
-                &transport,
-                &root,
-                &matching_nodes,
-                &matching_nodes_owned,
-                &refs_by_file_shared,
-                has_references,
-                has_call_hierarchy,
-                &mut result,
-            );
-        let (attempted, errors, aborted, abort_diagnostic) =
-            match tokio::time::timeout(lsp_job_timeout(), pass1).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    result.aborted = true;
-                    result.error_count = result.error_count.saturating_add(1);
-                    result.diagnostic = Some(format!(
-                        "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
-                        self.server_command,
-                        lsp_job_timeout().as_secs()
-                    ));
-                    tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
-                    return Ok(result);
-                }
-            };
+            &transport,
+            &root,
+            &matching_nodes,
+            &matching_nodes_owned,
+            &refs_by_file_shared,
+            capabilities,
+            &mut query_budget,
+            &query_telemetry,
+            &mut result,
+        );
+        let (attempted, errors, aborted, abort_diagnostic) = match tokio::time::timeout(
+            lsp_job_timeout(),
+            pass1,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
+                    self.server_command,
+                    lsp_job_timeout().as_secs()
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                result.lsp_query_metrics = query_telemetry.snapshot();
+                return Ok(result);
+            }
+        };
         if aborted {
             result.error_count = errors as usize;
             result.aborted = true;
@@ -2655,9 +2694,9 @@ impl Enricher for LspEnricher {
                 self.server_command, attempted, errors, detail
             ));
             tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+            result.lsp_query_metrics = query_telemetry.snapshot();
             return Ok(result);
         }
-
 
         // Pass 2: type hierarchy (sequential -- strike counting needs order)
         let (has_type_hierarchy, type_hierarchy_strikes) = self
@@ -2665,7 +2704,9 @@ impl Enricher for LspEnricher {
                 &transport,
                 &root,
                 &matching_nodes,
-                has_type_hierarchy,
+                capabilities,
+                &mut query_budget,
+                &query_telemetry,
                 type_hierarchy_strikes,
                 &mut result,
             )
@@ -2728,6 +2769,7 @@ impl Enricher for LspEnricher {
 
         result.error_count = errors as usize;
         result.aborted = aborted;
+        result.lsp_query_metrics = query_telemetry.snapshot();
         Ok(result)
     }
 }

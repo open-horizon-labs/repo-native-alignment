@@ -271,6 +271,24 @@ pub fn list_roots_from_slugs(
                         lang,
                         detail_parts.join(", ")
                     ));
+                    let mut query_metrics = ls.query_metrics.iter().collect::<Vec<_>>();
+                    query_metrics.sort_by(|left, right| {
+                        (&left.operation, &left.declaration_class)
+                            .cmp(&(&right.operation, &right.declaration_class))
+                    });
+                    for metric in query_metrics {
+                        line.push_str(&format!(
+                            "\n    query: {}/{} scheduled={} non_empty={} edges={} latency_ms={} timeouts={} errors={}",
+                            metric.operation,
+                            metric.declaration_class,
+                            metric.scheduled_requests,
+                            metric.non_empty_responses,
+                            metric.emitted_edges,
+                            metric.latency_ms,
+                            metric.timeouts,
+                            metric.errors,
+                        ));
+                    }
                 }
                 true
             } else {
@@ -1315,6 +1333,18 @@ mod tests {
                 aborted: false,
                 server_missing: false,
                 remediation: None,
+                query_metrics: vec![crate::extract::lsp::LspQueryMetric {
+                    language: "rust".to_string(),
+                    server: "rust-analyzer".to_string(),
+                    operation: "call_hierarchy".to_string(),
+                    declaration_class: "function".to_string(),
+                    scheduled_requests: 12,
+                    non_empty_responses: 8,
+                    emitted_edges: 703,
+                    latency_ms: 45_000,
+                    timeouts: 1,
+                    errors: 2,
+                }],
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1323,6 +1353,11 @@ mod tests {
         assert!(
             result.contains("LSP: rust-analyzer -> rust"),
             "should show per-language LSP line, got: {}",
+            result
+        );
+        assert!(
+            result.contains("query: call_hierarchy/function scheduled=12 non_empty=8 edges=703 latency_ms=45000 timeouts=1 errors=2"),
+            "should expose operation/declaration query yield through list_roots, got: {}",
             result
         );
         assert!(
@@ -1341,8 +1376,8 @@ mod tests {
             result
         );
         assert!(
-            !result.contains("errors"),
-            "should not show errors when 0, got: {}",
+            !result.contains("LSP: rust-analyzer -> rust (703 edges, 150 nodes, 45s, errors"),
+            "should not show language-level errors when 0, got: {}",
             result
         );
         assert!(
@@ -1388,6 +1423,7 @@ mod tests {
                 aborted: true,
                 server_missing: false,
                 remediation: Some("install pyright".to_string()),
+                query_metrics: Vec::new(),
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1462,6 +1498,7 @@ mod tests {
                 aborted: false,
                 server_missing: false,
                 remediation: None,
+                query_metrics: Vec::new(),
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
