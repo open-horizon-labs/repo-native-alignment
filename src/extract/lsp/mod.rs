@@ -1871,7 +1871,7 @@ impl LspEnricher {
                                 kind: EdgeKind::Implements,
                                 source: ExtractionSource::Lsp,
                                 confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+                                evidence: Vec::new(),
                             });
                         }
                     }
@@ -4609,7 +4609,7 @@ mod tests {
             kind: EdgeKind::ReferencedBy,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
 
         assert_eq!(format!("{}", edge.kind), "referenced_by");

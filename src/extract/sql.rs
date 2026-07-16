@@ -111,7 +111,7 @@ impl Extractor for SqlExtractor {
                             kind: EdgeKind::HasField,
                             source: ExtractionSource::Schema,
                             confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                            evidence: Vec::new(),
                         });
 
                         // Check for REFERENCES (foreign key on column)
@@ -129,7 +129,7 @@ impl Extractor for SqlExtractor {
                                     kind: EdgeKind::DependsOn,
                                     source: ExtractionSource::Schema,
                                     confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                                    evidence: Vec::new(),
                                 });
                             }
                         }
@@ -150,7 +150,7 @@ impl Extractor for SqlExtractor {
                                 kind: EdgeKind::DependsOn,
                                 source: ExtractionSource::Schema,
                                 confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                                evidence: Vec::new(),
                             });
                         }
                     }
@@ -188,7 +188,7 @@ impl Extractor for SqlExtractor {
                         kind: EdgeKind::Evolves,
                         source: ExtractionSource::Schema,
                         confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                        evidence: Vec::new(),
                     });
 
                     // Extract added columns from ALTER TABLE operations
@@ -226,7 +226,7 @@ impl Extractor for SqlExtractor {
                                 kind: EdgeKind::HasField,
                                 source: ExtractionSource::Schema,
                                 confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                                evidence: Vec::new(),
                             });
                         }
                     }

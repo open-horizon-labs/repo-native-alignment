@@ -136,7 +136,7 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
 
         let package_dep = Edge {
@@ -145,7 +145,7 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
 
         assert!(!is_manifest_package_edge(&openapi_dep));
@@ -580,10 +580,7 @@ impl RnaHandler {
             // Evidence may come from a third file that is neither edge endpoint.
             // Revalidate immediately so the fast MCP snapshot never exposes stale
             // evidence as confirmed while the background pipeline catches up.
-            let _ = revalidate_incremental_edge_evidence(
-                &fast_state.nodes,
-                &mut fast_state.edges,
-            );
+            let _ = revalidate_incremental_edge_evidence(&fast_state.nodes, &mut fast_state.edges);
 
             // Rebuild petgraph index for the fast graph
             fast_state.index = crate::graph::index::GraphIndex::new();

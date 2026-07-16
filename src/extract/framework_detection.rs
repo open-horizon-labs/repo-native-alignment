@@ -1278,7 +1278,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
                     kind: EdgeKind::UsesFramework,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                    evidence: Vec::new(),
                 });
                 tracing::debug!(
                     "Subsystem '{}' uses framework '{}' ({:.0}% of {} members)",

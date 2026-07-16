@@ -325,7 +325,7 @@ fn extract_schemas(
                     kind: EdgeKind::HasField,
                     source: ExtractionSource::Schema,
                     confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                    evidence: Vec::new(),
                 });
 
                 // If property has a $ref, create a DependsOn edge
@@ -342,7 +342,7 @@ fn extract_schemas(
                         kind: EdgeKind::DependsOn,
                         source: ExtractionSource::Schema,
                         confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                        evidence: Vec::new(),
                     });
                 }
             }

@@ -767,7 +767,7 @@ fn make_topology_edge(path: &Path, from_name: &str, to_name: &str, pattern: &str
         kind: EdgeKind::TopologyBoundary,
         source: ExtractionSource::TreeSitter,
         confidence: Confidence::Detected,
-                evidence: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 

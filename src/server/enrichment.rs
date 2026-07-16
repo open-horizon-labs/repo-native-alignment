@@ -3409,7 +3409,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
         let unrelated_edge = Edge {
             from: unrelated.id.clone(),
@@ -3417,7 +3417,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
         let fresh_scoped_edge = Edge {
             from: planned.id.clone(),
@@ -3425,7 +3425,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
         let new_non_lsp_edge = Edge {
             from: new_non_lsp_node.id.clone(),
@@ -3433,7 +3433,7 @@ mod tests {
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         };
         let node_filter = HashSet::from([planned.stable_id()]);
         let mut cached_edges = vec![stale_scoped_edge.clone(), unrelated_edge.clone()];

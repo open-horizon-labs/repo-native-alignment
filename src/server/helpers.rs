@@ -685,10 +685,8 @@ pub(crate) fn format_edge_evidence_for_groups(
 ) -> String {
     let include_outgoing = matches!(direction, "outgoing" | "both");
     let include_incoming = matches!(direction, "incoming" | "both");
-    let mut edge_index: std::collections::HashMap<
-        (graph::EdgeKind, String),
-        Vec<&graph::Edge>,
-    > = std::collections::HashMap::new();
+    let mut edge_index: std::collections::HashMap<(graph::EdgeKind, String), Vec<&graph::Edge>> =
+        std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
     for edge in edges {
         if !matches!(edge.kind, graph::EdgeKind::Other(_)) || !seen.insert(edge.stable_id()) {
@@ -723,11 +721,7 @@ pub(crate) fn format_edge_evidence_for_groups(
                         let location = if selector.root_id.is_empty() {
                             selector.file_path.display().to_string()
                         } else {
-                            format!(
-                                "{}/{}",
-                                selector.root_id,
-                                selector.file_path.display()
-                            )
+                            format!("{}/{}", selector.root_id, selector.file_path.display())
                         };
                         rendered.push(format!(
                             "- **{}** evidence: `{}:{}-{}` — {}\n  - rule: `{}`; extractor: `{}`{}; confidence: `{}`; validation: `{:?}`",
@@ -1100,21 +1094,13 @@ mod tests {
             vec![peer.stable_id()],
         )]);
 
-        let outgoing = format_edge_evidence_for_groups(
-            &edges,
-            &origin.stable_id(),
-            &groups,
-            "outgoing",
-        );
+        let outgoing =
+            format_edge_evidence_for_groups(&edges, &origin.stable_id(), &groups, "outgoing");
         assert!(outgoing.contains("outgoing evidence"));
         assert!(!outgoing.contains("incoming evidence"));
 
-        let incoming = format_edge_evidence_for_groups(
-            &edges,
-            &origin.stable_id(),
-            &groups,
-            "incoming",
-        );
+        let incoming =
+            format_edge_evidence_for_groups(&edges, &origin.stable_id(), &groups, "incoming");
         assert!(incoming.contains("incoming evidence"));
         assert!(!incoming.contains("outgoing evidence"));
     }

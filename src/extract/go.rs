@@ -560,7 +560,7 @@ fn extract_import_spec(
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
-                evidence: Vec::new(),
+            evidence: Vec::new(),
         });
 
         nodes.push(import_node);

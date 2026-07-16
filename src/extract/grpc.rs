@@ -200,7 +200,7 @@ pub fn grpc_client_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::Calls,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                    evidence: Vec::new(),
                 });
             }
         }

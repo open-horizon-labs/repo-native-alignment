@@ -187,7 +187,7 @@ pub fn link_pr_to_symbols(pr_nodes: &[Node], symbol_nodes: &[Node]) -> Vec<Edge>
                     kind: EdgeKind::Modified,
                     source: ExtractionSource::Git,
                     confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                    evidence: Vec::new(),
                 });
             }
         }

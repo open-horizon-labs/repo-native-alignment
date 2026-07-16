@@ -205,7 +205,7 @@ fn extract_from(
         kind: EdgeKind::DependsOn,
         source: ExtractionSource::TreeSitter,
         confidence: Confidence::Detected,
-                evidence: Vec::new(),
+        evidence: Vec::new(),
     });
 }
 
