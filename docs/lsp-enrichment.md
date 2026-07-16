@@ -43,6 +43,16 @@ Every LSP request is admitted through one shared query profile. The profile comb
 
 RNA records scheduled requests, non-empty responses, emitted edges, latency, timeouts, and errors for each language/server, operation, and declaration class. `list_roots` exposes these query-yield rows beneath each language's LSP summary so operators can compare request cost with agent-visible graph value.
 
+Broad `textDocument/references` requests for structs/classes, enums, aliases, and declared constants are not part of default warm-up. They require one of three explicit bounded scopes:
+
+- `--scope changed` maps the current `HEAD` → working-tree change set to cached stable node IDs;
+- `--scope targets --target-symbol <stable-id-or-unique-name>` resolves only the named symbols;
+- `--scope task --task-file <repo-relative-path> [--target-symbol ...]` uses the exact union of declared files and symbols.
+
+Every explicit broad-reference request carries `--max-requests` and `--max-duration-ms`. One shared circuit breaker spans every participating language server, so adding a server cannot multiply the declared budget. Empty, ambiguous, or unmapped declarations fail closed; planning and runtime may narrow the declaration but never widen it or fall back to a repository scan.
+
+The durable enrichment ledger records `default_profile` when repo warm-up completed with broad references intentionally omitted, and reserves evidence readiness `full` for genuinely repository-complete evidence. Explicit work records `scoped`, `partial`, or `unavailable` together with the declared node count, request/time limits, actual request count, elapsed time, and circuit state. Verbose `search` and `list_roots` render that evidence so agents can distinguish default high-signal coverage, complete repository coverage, useful scoped evidence, and budget-limited or missing LSP output.
+
 The reproducible probe is:
 
 ```bash

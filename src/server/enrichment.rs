@@ -16,10 +16,10 @@ use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
-use super::changed_file_plan::discover_and_plan_changed_files;
+use super::changed_file_plan::discover_and_plan_changed_files_with_broad_references;
 use super::enrichment_jobs::{
-    EnrichmentCapability, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,
-    ScanEnrichmentOptions,
+    BroadReferenceBudget, EnrichmentCapability, EnrichmentJobState, EnrichmentScope,
+    EnrichmentTrigger, JobStart, LspEvidenceCoverage, LspEvidenceReadiness, ScanEnrichmentOptions,
 };
 use super::operation_report::{
     CapabilityState, OperationKind, OperationReport, OperationTrigger, OutputReport, PhaseKind,
@@ -163,7 +163,13 @@ fn should_continue_lsp_enrichment(
     continuation: EnrichmentContinuation,
 ) -> bool {
     continuation.enabled()
-        && !matches!(scope, EnrichmentScope::Repo | EnrichmentScope::ChangedFiles)
+        && !matches!(
+            scope,
+            EnrichmentScope::Repo
+                | EnrichmentScope::ChangedFiles
+                | EnrichmentScope::TargetSymbols(_)
+                | EnrichmentScope::TaskRelevant { .. }
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +193,16 @@ impl LspBudget {
 struct LspEnrichmentRun {
     edge_count: usize,
     job_id: String,
+}
+
+struct ForegroundLspRequest {
+    scope: EnrichmentScope,
+    trigger: EnrichmentTrigger,
+    dirty_slugs: Option<HashSet<String>>,
+    node_filter: Option<Arc<HashSet<String>>>,
+    fail_on_lsp_error: bool,
+    broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+    declared_node_count: usize,
 }
 
 #[derive(Debug)]
@@ -287,6 +303,103 @@ struct LspPipelineInput {
     skip_lsp: bool,
     dirty_slugs: Option<HashSet<String>>,
     lsp_node_filter: Option<Arc<HashSet<String>>>,
+    broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+}
+
+fn lsp_evidence(
+    readiness: LspEvidenceReadiness,
+    scope: &str,
+    declared_node_count: usize,
+    budget: Option<&crate::extract::lsp::LspBroadReferenceBudgetSnapshot>,
+    detail: Option<String>,
+) -> LspEvidenceCoverage {
+    LspEvidenceCoverage {
+        readiness,
+        scope: scope.to_string(),
+        declared_node_count,
+        max_requests: budget.map(|snapshot| snapshot.max_requests),
+        max_duration_ms: budget.map(|snapshot| snapshot.max_duration_ms),
+        scheduled_requests: budget.map_or(0, |snapshot| snapshot.scheduled_requests),
+        elapsed_ms: budget.map_or(0, |snapshot| snapshot.elapsed_ms),
+        circuit_open: budget.is_some_and(|snapshot| snapshot.circuit_open),
+        detail,
+    }
+}
+
+fn normalized_scope_path(value: &str) -> String {
+    value.trim().trim_start_matches("./").replace('\\', "/")
+}
+
+fn resolve_symbol_selector(all_nodes: &[Node], selector: &str) -> anyhow::Result<String> {
+    let mut exact = all_nodes
+        .iter()
+        .filter(|node| node.id.root != "external" && node.stable_id() == selector)
+        .map(Node::stable_id)
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Ok(exact.remove(0));
+    }
+
+    let mut by_name = all_nodes
+        .iter()
+        .filter(|node| node.id.root != "external" && node.id.name == selector)
+        .map(Node::stable_id)
+        .collect::<Vec<_>>();
+    by_name.sort();
+    by_name.dedup();
+    match by_name.as_slice() {
+        [stable_id] => Ok(stable_id.clone()),
+        [] => anyhow::bail!("target symbol `{selector}` did not match a cached node"),
+        _ => anyhow::bail!(
+            "target symbol `{selector}` is ambiguous across {} cached nodes; pass a stable node ID",
+            by_name.len()
+        ),
+    }
+}
+
+fn plan_explicit_lsp_scope(
+    all_nodes: &[Node],
+    scope: &EnrichmentScope,
+) -> anyhow::Result<Arc<HashSet<String>>> {
+    let mut planned = std::collections::BTreeSet::new();
+    match scope {
+        EnrichmentScope::TargetSymbols(symbols) => {
+            anyhow::ensure!(!symbols.is_empty(), "target-symbol scope cannot be empty");
+            for selector in symbols {
+                planned.insert(resolve_symbol_selector(all_nodes, selector)?);
+            }
+        }
+        EnrichmentScope::TaskRelevant { files, symbols } => {
+            anyhow::ensure!(
+                !files.is_empty() || !symbols.is_empty(),
+                "task-relevant scope requires at least one file or symbol"
+            );
+            for file in files {
+                let normalized = normalized_scope_path(file);
+                let matching = all_nodes
+                    .iter()
+                    .filter(|node| {
+                        node.id.root != "external"
+                            && normalized_scope_path(&node.id.file.to_string_lossy()) == normalized
+                    })
+                    .map(Node::stable_id)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    !matching.is_empty(),
+                    "task-relevant file `{file}` did not match a cached node"
+                );
+                planned.extend(matching);
+            }
+            for selector in symbols {
+                planned.insert(resolve_symbol_selector(all_nodes, selector)?);
+            }
+        }
+        _ => anyhow::bail!(
+            "scope {} is not an explicit target/task LSP scope",
+            scope.stable_key()
+        ),
+    }
+    Ok(Arc::new(planned.into_iter().collect()))
 }
 
 async fn emit_lsp_pipeline_with_budget(
@@ -304,6 +417,7 @@ async fn emit_lsp_pipeline_with_budget(
             lance_repo_root: None,
             skip_lsp: input.skip_lsp,
             lsp_node_filter: input.lsp_node_filter,
+            broad_reference_budget: input.broad_reference_budget,
         },
         input.dirty_slugs,
     );
@@ -476,7 +590,13 @@ impl RnaHandler {
                             })
                             .unwrap_or((0, 0, 0));
                         if persist_succeeded && degraded_job_id.is_some() {
-                            lsp_status.set_degraded(lsp_edge_count, detail);
+                            let existing_coverage = lsp_status.coverage_edge_count();
+                            lsp_status.set_degraded_scoped(
+                                lsp_edge_count,
+                                existing_coverage,
+                                EnrichmentScope::ChangedFiles.stable_key(),
+                                detail,
+                            );
                             super::sentinel::clear_lsp_sentinel(&repo_root);
                             if let Some(job_id) = degraded_job_id.as_deref() {
                                 enrichment_jobs.mark_degraded(
@@ -586,6 +706,7 @@ impl RnaHandler {
                 skip_lsp: false,
                 dirty_slugs: Some(dirty_slugs),
                 lsp_node_filter: None,
+                broad_reference_budget: None,
             })
             .await;
 
@@ -612,9 +733,20 @@ impl RnaHandler {
                     );
                     let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                     if let Some(detail) = degraded_detail.as_deref() {
-                        lsp_status.set_degraded(lsp_call_edge_count, detail);
+                        let existing_coverage = lsp_status.coverage_edge_count();
+                        lsp_status.set_degraded_scoped(
+                            lsp_call_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                            detail,
+                        );
                     } else {
-                        lsp_status.set_complete(lsp_call_edge_count);
+                        let existing_coverage = lsp_status.coverage_edge_count();
+                        lsp_status.set_complete_scoped(
+                            lsp_call_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                        );
                     }
                     if lsp_edge_count > 0 {
                         tracing::info!(
@@ -1043,6 +1175,7 @@ impl RnaHandler {
                 skip_lsp: false,
                 dirty_slugs: None,
                 lsp_node_filter: None,
+                broad_reference_budget: None,
             })
             .await;
 
@@ -1163,7 +1296,7 @@ impl RnaHandler {
                     if let Some(detail) = degraded_detail.as_deref() {
                         bg_lsp_status.set_degraded(lsp_call_edge_count, detail);
                     } else {
-                        bg_lsp_status.set_complete(lsp_call_edge_count);
+                        bg_lsp_status.set_complete_default_profile_for_warmup(lsp_call_edge_count);
                     }
                     if let Some(detail) = degraded_detail.as_deref() {
                         bg_jobs.mark_degraded(
@@ -1359,7 +1492,8 @@ impl RnaHandler {
                         .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                         .count()
                 };
-                self.lsp_status.set_complete(call_count);
+                self.lsp_status
+                    .set_complete_default_profile_for_warmup(call_count);
                 on_progress(&format!(
                     "LSP: {} cached call edges (sentinel present)",
                     call_count
@@ -1371,11 +1505,15 @@ impl RnaHandler {
                 let run = self
                     .run_foreground_lsp_and_persist(
                         &on_progress,
-                        EnrichmentScope::Repo,
-                        EnrichmentTrigger::ForegroundScan,
-                        None,
-                        None,
-                        true,
+                        ForegroundLspRequest {
+                            scope: EnrichmentScope::Repo,
+                            trigger: EnrichmentTrigger::ForegroundScan,
+                            dirty_slugs: None,
+                            node_filter: None,
+                            fail_on_lsp_error: true,
+                            broad_reference_budget: None,
+                            declared_node_count: 0,
+                        },
                     )
                     .await?;
                 (run.edge_count, Some(run.job_id))
@@ -1545,6 +1683,15 @@ impl RnaHandler {
         ));
 
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let touched_files: std::collections::HashSet<(String, PathBuf)> = changed_file_set
+            .iter()
+            .cloned()
+            .map(|file| (primary_slug.clone(), file))
+            .collect();
+        let lsp_node_filter = super::changed_file_plan::plan_lsp_node_ids_for_touched_files(
+            &touched_files,
+            &all_nodes,
+        )?;
         // Only the primary root has changes in the incremental path.
         let dirty_slugs: Option<std::collections::HashSet<String>> =
             Some(std::iter::once(primary_slug.clone()).collect());
@@ -1561,7 +1708,8 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: !enrichment.runs_lsp(),
             dirty_slugs,
-            lsp_node_filter: None,
+            lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+            broad_reference_budget: None,
         })
         .await;
         let bus_time = t2.elapsed();
@@ -1585,6 +1733,8 @@ impl RnaHandler {
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                            && (lsp_node_filter.contains(&e.from.to_stable_id())
+                                || lsp_node_filter.contains(&e.to.to_stable_id()))
                     })
                     .count();
 
@@ -1615,10 +1765,21 @@ impl RnaHandler {
                 if enrichment.runs_lsp() {
                     let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                     if let Some(detail) = degraded_detail.as_deref() {
-                        self.lsp_status.set_degraded(lsp_edge_count, detail);
+                        let existing_coverage = self.lsp_status.coverage_edge_count();
+                        self.lsp_status.set_degraded_scoped(
+                            lsp_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                            detail,
+                        );
                         lsp_degraded_detail = Some(detail.to_string());
                     } else {
-                        self.lsp_status.set_complete(lsp_edge_count);
+                        let existing_coverage = self.lsp_status.coverage_edge_count();
+                        self.lsp_status.set_complete_scoped(
+                            lsp_edge_count,
+                            existing_coverage,
+                            EnrichmentScope::ChangedFiles.stable_key(),
+                        );
                     }
                     lsp_stage_completed = true;
                 }
@@ -1961,6 +2122,7 @@ impl RnaHandler {
                 skip_lsp: !run_lsp_in_bus,
                 dirty_slugs: None,
                 lsp_node_filter: None,
+                broad_reference_budget: None,
             })
             .await;
             let elapsed = t2.elapsed();
@@ -2066,7 +2228,8 @@ impl RnaHandler {
                         self.lsp_status.set_degraded(lsp_edge_count, detail);
                         lsp_degraded_detail = Some(detail.to_string());
                     } else {
-                        self.lsp_status.set_complete(lsp_edge_count);
+                        self.lsp_status
+                            .set_complete_default_profile_for_warmup(lsp_edge_count);
                     }
                     lsp_stage_completed = true;
                 }
@@ -2274,15 +2437,20 @@ impl RnaHandler {
     async fn run_foreground_lsp_and_persist<F>(
         &self,
         on_progress: &F,
-        scope: EnrichmentScope,
-        trigger: EnrichmentTrigger,
-        dirty_slugs: Option<HashSet<String>>,
-        lsp_node_filter: Option<Arc<HashSet<String>>>,
-        fail_on_lsp_error: bool,
+        request: ForegroundLspRequest,
     ) -> anyhow::Result<LspEnrichmentRun>
     where
         F: Fn(&str) + Send + Sync,
     {
+        let ForegroundLspRequest {
+            scope,
+            trigger,
+            dirty_slugs,
+            node_filter: lsp_node_filter,
+            fail_on_lsp_error,
+            broad_reference_budget,
+            declared_node_count,
+        } = request;
         let (all_nodes, mut all_edges) = {
             let snap = self.graph.load_full();
             let gs = snap.as_ref().as_ref().unwrap();
@@ -2311,7 +2479,7 @@ impl RnaHandler {
             .map(|node_filter| remove_existing_scoped_lsp_edges(&mut all_edges, node_filter))
             .unwrap_or_default();
         let persistence_node_filter = lsp_node_filter.clone();
-        let repo_wide_lsp = dirty_slugs.is_none();
+        let repo_wide_lsp = matches!(scope, EnrichmentScope::Repo);
         let scope_detail = scope.stable_key();
 
         let server_name = self.lsp_status.server_name();
@@ -2368,6 +2536,7 @@ impl RnaHandler {
             skip_lsp: false,
             dirty_slugs,
             lsp_node_filter,
+            broad_reference_budget: broad_reference_budget.clone(),
         })
         .await;
 
@@ -2413,8 +2582,16 @@ impl RnaHandler {
                             .count()
                     });
 
+                let budget_snapshot = broad_reference_budget
+                    .as_ref()
+                    .map(|budget| budget.snapshot());
+                let budget_abort_detail = budget_snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.circuit_open)
+                    .and_then(|snapshot| snapshot.circuit_reason.clone());
                 let lsp_abort_detail = (!diagnostics.is_empty())
                     .then(|| diagnostics.join("; "))
+                    .or(budget_abort_detail)
                     .or_else(|| {
                         let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
                         lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
@@ -2450,15 +2627,29 @@ impl RnaHandler {
                     }
                 }
                 if let Some(detail) = lsp_abort_detail.as_deref() {
-                    self.lsp_status.set_degraded(lsp_edge_count, detail);
+                    if repo_wide_lsp {
+                        self.lsp_status.set_degraded(lsp_edge_count, detail);
+                    } else {
+                        let existing_coverage = self.lsp_status.coverage_edge_count();
+                        self.lsp_status.set_degraded_scoped(
+                            lsp_edge_count,
+                            existing_coverage,
+                            scope_detail.clone(),
+                            detail,
+                        );
+                    }
                 } else if repo_wide_lsp {
-                    self.lsp_status.set_complete(lsp_edge_count);
+                    self.lsp_status.set_complete_default_profile(
+                        lsp_edge_count,
+                        lsp_edge_count,
+                        "broad references were omitted; request changed, targets, or task scope for broad evidence",
+                    );
                 } else {
                     let existing_coverage = self.lsp_status.coverage_edge_count();
                     self.lsp_status.set_complete_scoped(
                         lsp_edge_count,
                         existing_coverage,
-                        scope_detail,
+                        scope_detail.clone(),
                     );
                 }
 
@@ -2517,6 +2708,17 @@ impl RnaHandler {
                     tracing::error!("Foreground LSP persist failed: {}", e);
                     self.enrichment_jobs
                         .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                    self.enrichment_jobs.record_lsp_evidence(
+                        &self.repo_root,
+                        &job_id,
+                        lsp_evidence(
+                            LspEvidenceReadiness::Partial,
+                            &scope_detail,
+                            declared_node_count,
+                            budget_snapshot.as_ref(),
+                            Some(format!("persistence failed: {e}")),
+                        ),
+                    );
                     return Err(e.context("LSP persist failed during foreground pipeline"));
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
@@ -2546,6 +2748,28 @@ impl RnaHandler {
                         persisted_edge_count,
                     );
                 }
+                self.enrichment_jobs.record_lsp_evidence(
+                    &self.repo_root,
+                    &job_id,
+                    lsp_evidence(
+                        if lsp_abort_detail.is_some() {
+                            LspEvidenceReadiness::Partial
+                        } else if repo_wide_lsp {
+                            LspEvidenceReadiness::DefaultProfile
+                        } else {
+                            LspEvidenceReadiness::Scoped
+                        },
+                        &scope_detail,
+                        declared_node_count,
+                        budget_snapshot.as_ref(),
+                        lsp_abort_detail.clone().or_else(|| {
+                            repo_wide_lsp.then(|| {
+                                "repo-wide default query profile completed; broad references were omitted"
+                                    .to_string()
+                            })
+                        }),
+                    ),
+                );
 
                 if fail_on_lsp_error && let Some(detail) = lsp_abort_detail {
                     return Err(anyhow::anyhow!(
@@ -2573,6 +2797,20 @@ impl RnaHandler {
                     self.enrichment_jobs
                         .mark_failed(&self.repo_root, &job_id, format!("{}", e));
                 }
+                let budget_snapshot = broad_reference_budget
+                    .as_ref()
+                    .map(|budget| budget.snapshot());
+                self.enrichment_jobs.record_lsp_evidence(
+                    &self.repo_root,
+                    &job_id,
+                    lsp_evidence(
+                        LspEvidenceReadiness::Unavailable,
+                        &scope_detail,
+                        declared_node_count,
+                        budget_snapshot.as_ref(),
+                        Some(e.to_string()),
+                    ),
+                );
                 if fail_on_lsp_error {
                     return Err(anyhow::anyhow!("LSP enrichment failed: {}", e));
                 }
@@ -2589,6 +2827,27 @@ impl RnaHandler {
         capability: EnrichmentCapability,
         scope: EnrichmentScope,
         continuation: EnrichmentContinuation,
+        on_progress: F,
+    ) -> anyhow::Result<Vec<String>>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        self.run_explicit_enrichment_with_broad_reference_budget(
+            capability,
+            scope,
+            continuation,
+            None,
+            on_progress,
+        )
+        .await
+    }
+
+    pub async fn run_explicit_enrichment_with_broad_reference_budget<F>(
+        &self,
+        capability: EnrichmentCapability,
+        scope: EnrichmentScope,
+        continuation: EnrichmentContinuation,
+        broad_reference_budget: Option<BroadReferenceBudget>,
         on_progress: F,
     ) -> anyhow::Result<Vec<String>>
     where
@@ -2619,26 +2878,69 @@ impl RnaHandler {
                 );
             }
             EnrichmentCapability::CallReferences => {
-                let lsp_node_filter = if matches!(scope, EnrichmentScope::ChangedFiles) {
-                    let root_slug = RootConfig::code_project(self.repo_root.clone()).slug();
-                    let plan =
-                        discover_and_plan_changed_files(&self.repo_root, &root_slug, &all_nodes)?;
-                    for line in plan.render_progress() {
-                        on_progress(&line);
-                    }
-                    Some(plan.planned_node_ids())
+                let is_broad_scope = matches!(
+                    scope,
+                    EnrichmentScope::ChangedFiles
+                        | EnrichmentScope::TargetSymbols(_)
+                        | EnrichmentScope::TaskRelevant { .. }
+                );
+                let runtime_budget = if is_broad_scope {
+                    let budget = broad_reference_budget
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "explicit broad-reference scope requires a visible request/time budget"
+                            )
+                        })?
+                        .validate()?;
+                    Some(Arc::new(crate::extract::lsp::LspBroadReferenceBudget::new(
+                        budget.max_requests,
+                        Duration::from_millis(budget.max_duration_ms),
+                    )))
                 } else {
                     None
                 };
+                let lsp_node_filter = match &scope {
+                    EnrichmentScope::ChangedFiles => {
+                        let root_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+                        let plan = discover_and_plan_changed_files_with_broad_references(
+                            &self.repo_root,
+                            &root_slug,
+                            &all_nodes,
+                        )?;
+                        for line in plan.render_progress() {
+                            on_progress(&line);
+                        }
+                        Some(plan.planned_node_ids())
+                    }
+                    EnrichmentScope::TargetSymbols(_) | EnrichmentScope::TaskRelevant { .. } => {
+                        Some(plan_explicit_lsp_scope(&all_nodes, &scope)?)
+                    }
+                    _ => None,
+                };
+                let declared_node_count = lsp_node_filter.as_ref().map_or(0, |filter| filter.len());
+                if let Some(budget) = runtime_budget.as_ref() {
+                    let snapshot = budget.snapshot();
+                    on_progress(&format!(
+                        "Broad-reference contract: scope={} nodes={} max_requests={} max_duration_ms={}",
+                        scope.stable_key(),
+                        declared_node_count,
+                        snapshot.max_requests,
+                        snapshot.max_duration_ms
+                    ));
+                }
                 let dirty_slugs = self.dirty_slugs_for_scope(&scope);
                 let run = self
                     .run_foreground_lsp_and_persist(
                         &on_progress,
-                        scope.clone(),
-                        EnrichmentTrigger::Explicit,
-                        dirty_slugs,
-                        lsp_node_filter,
-                        true,
+                        ForegroundLspRequest {
+                            scope: scope.clone(),
+                            trigger: EnrichmentTrigger::Explicit,
+                            dirty_slugs,
+                            node_filter: lsp_node_filter,
+                            fail_on_lsp_error: true,
+                            broad_reference_budget: runtime_budget,
+                            declared_node_count,
+                        },
                     )
                     .await?;
                 related_job_ids.push(run.job_id);
@@ -2671,11 +2973,15 @@ impl RnaHandler {
                             let continuation_run = self
                                 .run_foreground_lsp_and_persist(
                                     &on_progress,
-                                    EnrichmentScope::Repo,
-                                    EnrichmentTrigger::Explicit,
-                                    None,
-                                    None,
-                                    true,
+                                    ForegroundLspRequest {
+                                        scope: EnrichmentScope::Repo,
+                                        trigger: EnrichmentTrigger::Explicit,
+                                        dirty_slugs: None,
+                                        node_filter: None,
+                                        fail_on_lsp_error: true,
+                                        broad_reference_budget: None,
+                                        declared_node_count: 0,
+                                    },
                                 )
                                 .await?;
                             related_job_ids.push(continuation_run.job_id);
@@ -2921,6 +3227,14 @@ impl RnaHandler {
                     .cloned()
                     .collect()
             }
+            EnrichmentScope::TargetSymbols(_) | EnrichmentScope::TaskRelevant { .. } => {
+                let planned = plan_explicit_lsp_scope(all_nodes, scope)?;
+                all_nodes
+                    .iter()
+                    .filter(|node| planned.contains(&node.stable_id()))
+                    .cloned()
+                    .collect()
+            }
             EnrichmentScope::Explicit(value) => {
                 anyhow::bail!("unsupported explicit enrichment scope: {}", value);
             }
@@ -2936,6 +3250,7 @@ impl RnaHandler {
                 let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
                 Some(std::iter::once(primary_slug).collect())
             }
+            EnrichmentScope::TargetSymbols(_) | EnrichmentScope::TaskRelevant { .. } => None,
             EnrichmentScope::Explicit(value) => Some(std::iter::once(value.clone()).collect()),
         }
     }
@@ -2949,10 +3264,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_node(name: &str, kind: NodeKind) -> Node {
+        make_node_in_file("src/test.rs", name, kind)
+    }
+
+    fn make_node_in_file(file: &str, name: &str, kind: NodeKind) -> Node {
         Node {
             id: NodeId {
                 root: "test".to_string(),
-                file: PathBuf::from("src/test.rs"),
+                file: PathBuf::from(file),
                 name: name.to_string(),
                 kind,
             },
@@ -2964,6 +3283,65 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         }
+    }
+
+    #[test]
+    fn target_symbol_scope_is_exact_and_rejects_ambiguity() {
+        let nodes = vec![
+            make_node_in_file("src/one.rs", "Target", NodeKind::Struct),
+            make_node_in_file("src/two.rs", "Other", NodeKind::Struct),
+        ];
+        let target_id = nodes[0].stable_id();
+        let planned = plan_explicit_lsp_scope(
+            &nodes,
+            &EnrichmentScope::TargetSymbols(vec![target_id.clone()]),
+        )
+        .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert!(planned.contains(&target_id));
+        assert!(!planned.contains(&nodes[1].stable_id()));
+
+        let ambiguous = vec![
+            make_node_in_file("src/one.rs", "Target", NodeKind::Struct),
+            make_node_in_file("src/two.rs", "Target", NodeKind::Struct),
+        ];
+        let error = plan_explicit_lsp_scope(
+            &ambiguous,
+            &EnrichmentScope::TargetSymbols(vec!["Target".to_string()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn task_relevant_scope_is_union_only_and_rejects_unmapped_files() {
+        let nodes = vec![
+            make_node_in_file("src/task.rs", "InTask", NodeKind::Struct),
+            make_node_in_file("src/target.rs", "NamedTarget", NodeKind::Struct),
+            make_node_in_file("src/unrelated.rs", "Unrelated", NodeKind::Struct),
+        ];
+        let planned = plan_explicit_lsp_scope(
+            &nodes,
+            &EnrichmentScope::TaskRelevant {
+                files: vec!["./src/task.rs".to_string()],
+                symbols: vec![nodes[1].stable_id()],
+            },
+        )
+        .unwrap();
+        assert_eq!(planned.len(), 2);
+        assert!(planned.contains(&nodes[0].stable_id()));
+        assert!(planned.contains(&nodes[1].stable_id()));
+        assert!(!planned.contains(&nodes[2].stable_id()));
+
+        let error = plan_explicit_lsp_scope(
+            &nodes,
+            &EnrichmentScope::TaskRelevant {
+                files: vec!["src/missing.rs".to_string()],
+                symbols: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not match a cached node"));
     }
 
     #[test]
