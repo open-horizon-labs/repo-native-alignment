@@ -670,7 +670,6 @@ def collect_usage_and_fallbacks(
             or event_time < first_edit_monotonic
             else "after"
         )
-        bucket = before if bucket_name == "before" else after
         event_type = event.get("type")
         if event_type == "result":
             total_usage = event.get("usage")
