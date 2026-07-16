@@ -313,6 +313,7 @@ mod tests {
                 rule_id: "supports@1".into(),
                 confidence: Confidence::Confirmed,
                 validation_status: ValidationStatus::Valid,
+                diagnostics: Vec::new(),
             }],
         };
 

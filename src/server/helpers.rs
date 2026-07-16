@@ -719,6 +719,25 @@ fn append_indexed_edge_evidence(
             continue;
         }
         for evidence in &edge.evidence {
+            for diagnostic in &evidence.diagnostics {
+                let location = diagnostic
+                    .selector
+                    .as_ref()
+                    .map(|selector| {
+                        format!(
+                            "{}/{}:{}-{}",
+                            selector.root_id,
+                            selector.file_path.display(),
+                            selector.line_start,
+                            selector.line_end
+                        )
+                    })
+                    .unwrap_or_else(|| diagnostic.file_path.display().to_string());
+                rendered.push(format!(
+                    "- **{}** diagnostic: `[{}] {}` at `{}` — {}",
+                    kind, diagnostic.severity, diagnostic.code, location, diagnostic.message
+                ));
+            }
             for selector in &evidence.selectors {
                 let location = if selector.root_id.is_empty() {
                     selector.file_path.display().to_string()
@@ -1129,9 +1148,19 @@ mod tests {
             rule_id: "supports@1".into(),
             confidence: Confidence::Confirmed,
             validation_status: ValidationStatus::Valid,
+            diagnostics: Vec::new(),
         };
         let mut stale_evidence = evidence("stale evidence must stay hidden");
         stale_evidence.validation_status = ValidationStatus::Stale;
+        stale_evidence
+            .diagnostics
+            .push(crate::graph::EvidenceDiagnostic {
+                code: "content.stale_verification".into(),
+                severity: "error".into(),
+                file_path: std::path::PathBuf::from("chapter.md"),
+                selector: stale_evidence.selectors.first().cloned(),
+                message: "stored evidence is stale".into(),
+            });
         let edges = vec![
             Edge {
                 from: origin.id.clone(),
@@ -1160,6 +1189,7 @@ mod tests {
         assert!(outgoing.contains("outgoing evidence"));
         assert!(!outgoing.contains("incoming evidence"));
         assert!(outgoing.contains("Stale"));
+        assert!(outgoing.contains("content.stale_verification"));
         assert!(!outgoing.contains("stale evidence must stay hidden"));
 
         let incoming =

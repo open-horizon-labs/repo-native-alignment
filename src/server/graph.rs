@@ -207,6 +207,7 @@ mod tests {
                 rule_id: "supports@1".into(),
                 confidence: Confidence::Confirmed,
                 validation_status: ValidationStatus::Valid,
+                diagnostics: Vec::new(),
             }],
         };
         let stable_id = edge.stable_id();
@@ -262,6 +263,12 @@ mod tests {
             stale_state.edges[0].evidence[0].validation_status,
             ValidationStatus::Stale
         );
+        assert!(
+            stale_state.edges[0].evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "content.stale_verification")
+        );
 
         evidence_node.body = "original evidence".into();
         let restored_edges = revalidate_incremental_edge_evidence(
@@ -299,6 +306,7 @@ mod tests {
             restored_state.edges[0].evidence[0].validation_status,
             ValidationStatus::Valid
         );
+        assert!(restored_state.edges[0].evidence[0].diagnostics.is_empty());
 
         let mut shifted_node = evidence_node.clone();
         shifted_node.line_start = 30;
