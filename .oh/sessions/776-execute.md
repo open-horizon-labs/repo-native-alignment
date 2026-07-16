@@ -99,3 +99,24 @@ Verification:
   exact fixture dataset snapshot, six-stage ledger, prediction, manifest, and
   official evaluator command.
 - `git diff --check`: pass.
+
+## Manual run finding — UTF-8 diagnostic panic
+
+Two full `django__django-13279` attempts were preserved before executor start:
+
+- Installed RNA 0.2.10, SHA-256 `bc209139…`.
+- Exact-head CI artifact for `c0575b40`, SHA-256 `877ba440…`.
+
+Both extracted roughly 100,977 symbols in 3.2 seconds, ran bounded Pyright
+enrichment for more than six minutes, then panicked while forming an LSP
+diagnostic node name because `message[..77]` split a non-breaking space. No
+model tokens were spent and the gold-bearing dataset snapshot was never
+written.
+
+The current fix truncates diagnostic display names by Unicode character while
+preserving the full message in metadata. Verification:
+
+- `cargo check --lib --no-default-features`: pass.
+- Focused multibyte regression: pass.
+- All 19 `build_diagnostic_nodes` tests: pass.
+- Scoped Rustfmt check and `git diff --check`: pass.
