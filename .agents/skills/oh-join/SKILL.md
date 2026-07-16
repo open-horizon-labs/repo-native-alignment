@@ -66,7 +66,9 @@ For target issue `#X`:
    - CI checks must pass
    - Review decision must not be `CHANGES_REQUESTED`
    - The complete repository `/ship` pipeline must be evidenced on the final commit
-   - Every code-changing PR must have an explicit clean/approved CodeRabbit review of that final diff; skipped, pending, or status-only results do not qualify
+   - Every PR must have an explicit `APPROVE` from a fresh, separate repo-local `/review` sub-agent for the exact final commit
+   - Any diff change after that approval invalidates it and requires a new fresh reviewer
+   - CodeRabbit is optional supplemental feedback: never trigger or wait for it, but verify any actionable comments already present were addressed
    If any fail: stop with `blocked` and report specific PR reasons.
 
 5. **Merge dependency PRs in deterministic order and close their issues**

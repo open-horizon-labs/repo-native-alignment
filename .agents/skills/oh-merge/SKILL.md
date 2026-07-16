@@ -66,7 +66,7 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
       - Fetch, check out, and rebase onto the current target branch.
       - Resolve conflicts, run repo-local `/review`, and force-push with lease.
       - For a child whose parent has merged, retarget it to `main`, rebase, and force-push before any validation.
-      - Any later rewrite or retarget invalidates all prior ship, CodeRabbit, and CI evidence.
+      - Any later rewrite or retarget invalidates all prior ship, independent final-diff approval, and CI evidence.
 
    a. **Verify the full RNA ship gate completed on the final pushed commit:**
       - The PR is ready for review, not draft.
@@ -74,7 +74,8 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
         independent review, regression oracle, merit assessment, manual verification,
         delivery verification, and final comment sweep.
       - The final acceptance-criteria gate passed.
-      - For a code-changing PR, CodeRabbit posted an explicit clean/approved review of the final diff. A skipped draft review or green status alone is insufficient.
+      - A fresh, separate repo-local `/review` sub-agent posted explicit `APPROVE` for the exact final commit.
+      - CodeRabbit is optional supplemental feedback: never trigger or wait for it, but all actionable comments already present are addressed.
       If any evidence is missing, stop and run `/ship <pr-number>`; do not merge directly.
 
    b. **Verify CI is passing on that same final commit:**
@@ -106,7 +107,7 @@ Holistically review pending GitHub issue PRs from `oh-task`, then squash-merge t
         git push --force-with-lease
         ```
 
-      - The rewrite invalidates prior validation. Return to step 0 and rerun the full ship gate, explicit CodeRabbit final-diff review, and CI before merging.
+      - The rewrite invalidates prior validation. Return to step 0 and rerun the full ship gate, fresh independent final-diff review, and CI before merging.
 
    e. **On merge failure** - If any PR in the stack fails to merge:
       - Stop processing the stack
@@ -178,7 +179,9 @@ The holistic review checks what individual PR reviews can't:
 - PRs must have the `oh-merge` label (human approval gate)
 - Each PR must have completed the repository-specific `/ship` pipeline
 - PRs must be ready for review, not draft
-- Every code-changing PR must have an explicit clean/approved CodeRabbit review
+- Every PR must have an explicit `APPROVE` from a fresh, separate repo-local `/review` sub-agent on the exact final commit
+- Any later diff change invalidates that approval and requires a new fresh reviewer
+- CodeRabbit is optional supplemental feedback: never trigger or wait for it, but address actionable comments already present
 - PRs must have CI passing
 - PRs should have "Closes #N" in body for auto-close (created by oh-task)
 - Batch review must pass (or human override)

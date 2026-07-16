@@ -9,6 +9,8 @@ A second opinion before committing. Review checks alignment between intent and e
 
 This is part of the **Intent > Execution > Review** loop that runs at every scale--from a single commit to a multi-week project. Review closes the loop.
 
+The same skill also provides an **independent review mode** for `/ship`. A fresh, separate sub-agent returns an explicit `APPROVE` or `REQUEST CHANGES`; when invoked for the final-diff gate, it reviews the exact commit proposed for merge.
+
 ## When to Use
 
 Invoke `/review` when:
@@ -20,6 +22,54 @@ Invoke `/review` when:
 - **Before PRs** - final check before requesting review from humans
 
 **Do not use when:** You're in deep flow and making progress. Don't interrupt productive work. Review at natural breaks, not arbitrary intervals.
+
+## Independent Review Mode
+
+Use this mode only when invoked by `/ship` as a fresh, separate reviewer sub-agent. Step 2 uses it for early adversarial feedback; step 10c invokes a different fresh reviewer for the binding final-diff gate.
+
+### Isolation contract
+
+- The reviewer must be a distinct sub-agent, not the implementer and not a reused earlier reviewer.
+- Start with fresh context.
+- Inputs are limited to:
+  - the exact final diff and reviewed commit SHA;
+  - the linked issue acceptance criteria;
+  - relevant guardrails and metis;
+  - RNA graph impact for the changed areas.
+- Do not read or request the implementation session, implementation reasoning, prior conversation, or a summary defending the chosen solution.
+
+### Review contract
+
+1. Verify every acceptance criterion against the diff.
+2. Check relevant hard and soft guardrails.
+3. Check changed-area impact and likely regressions using the provided RNA context.
+4. Identify concrete correctness, security, maintainability, testing, delivery, and policy-consistency findings.
+5. Return exactly one binding verdict:
+   - `APPROVE` — no unresolved actionable findings.
+   - `REQUEST CHANGES` — one or more actionable findings must be fixed.
+
+`COMMENT`, conditional approval, and approval with unresolved findings do not satisfy the merge gate.
+
+### Required output
+
+```text
+## Ship Step [2 or 10c]: [Independent Code Review or Independent Final-Diff Review]
+
+**Reviewer:** [fresh sub-agent task identifier]
+**Reviewed commit:** [exact SHA]
+**Verdict:** [APPROVE/REQUEST CHANGES]
+
+### Acceptance Criteria
+- [x/blank] ...
+
+### Guardrails and RNA Impact
+[what was checked]
+
+### Findings
+[actionable findings, or "No unresolved actionable findings."]
+```
+
+`REQUEST CHANGES` must be fixed. For the step 10c final-diff gate, fixes must be reviewed by another fresh sub-agent, and any diff change after `APPROVE` invalidates the approval and requires a new fresh reviewer on the new head commit.
 
 ## The Review Process
 
@@ -331,7 +381,7 @@ When the user or agent claims work is complete, verify:
 2. **Changes Reviewed?** - Has the branch diff been reviewed against intent?
 3. **CI Passing?** - Have automated checks been run and passed?
 4. **Feedback Addressed?** - Have reviewer comments been resolved?
-5. **CodeRabbit Approved?** - For every code-changing PR, did CodeRabbit explicitly post a clean or approved review of the final diff? Skipped or pending reviews block completion.
+5. **Final Diff Approved?** - Did a fresh, separate repo-local `/review` sub-agent explicitly approve the exact final commit? Any later diff change invalidates approval and blocks completion until another fresh review.
 
 If incomplete:
 > "Completion gate: [missing step]. Run the check before marking complete."
