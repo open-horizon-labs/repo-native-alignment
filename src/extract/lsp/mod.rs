@@ -2181,8 +2181,8 @@ impl LspEnricher {
             // Name: truncated message + line number for human readability in search results.
             // Including the start line ensures that identical messages at different positions
             // produce distinct NodeIds (preventing silent overwrites in LanceDB).
-            let name_snippet = if message.len() > 80 {
-                format!("{}...", &message[..77])
+            let name_snippet = if message.chars().count() > 80 {
+                format!("{}...", message.chars().take(77).collect::<String>())
             } else {
                 message.clone()
             };
@@ -5226,6 +5226,42 @@ mod tests {
             node.metadata.get("diagnostic_message").unwrap().len(),
             200,
             "full message preserved in metadata"
+        );
+    }
+
+    #[test]
+    fn test_build_diagnostic_nodes_truncates_multibyte_message_on_char_boundary() {
+        let root = PathBuf::from("/project");
+        let message = format!("{}\u{00a0}{}", "a".repeat(76), "b".repeat(20));
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": message,
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 5 }
+            }
+        })];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "pyright-langserver",
+            "python",
+            "1700000000",
+            2,
+        );
+
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            nodes[0].id.name.ends_with("..."),
+            "multibyte diagnostic name should be truncated safely"
+        );
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_message"),
+            Some(&message),
+            "full multibyte message should remain in metadata"
         );
     }
 
