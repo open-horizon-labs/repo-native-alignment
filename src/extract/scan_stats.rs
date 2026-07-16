@@ -617,6 +617,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -684,6 +685,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -737,6 +739,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -745,6 +748,7 @@ mod tests {
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             detected_frameworks: std::collections::HashSet::new(),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         })
         .await
         .unwrap();
@@ -816,6 +820,7 @@ mod tests {
                 server_missing: false,
                 remediation: None,
                 aborted: false,
+                diagnostic: None,
             })
             .await;
         assert!(
@@ -840,6 +845,7 @@ mod tests {
                 nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
                 edges: std::sync::Arc::from(vec![].into_boxed_slice()),
                 detected_frameworks: std::collections::HashSet::new(),
+                enrichment_diagnostics: std::sync::Arc::from([]),
             })
             .await;
         assert!(
@@ -880,6 +886,7 @@ mod tests {
             server_missing: false,
             remediation: Some("fix rust".to_string()),
             aborted: true,
+            diagnostic: Some("forced abort".to_string()),
         })
         .await
         .unwrap();
@@ -916,6 +923,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();

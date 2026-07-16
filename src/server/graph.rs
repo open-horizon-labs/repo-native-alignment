@@ -488,7 +488,12 @@ impl RnaHandler {
                         )
                         .await
                         {
-                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                            Ok((
+                                enriched_nodes,
+                                enriched_edges,
+                                detected_frameworks,
+                                diagnostics,
+                            )) => {
                                 full_state.nodes = enriched_nodes;
                                 full_state.edges = enriched_edges;
                                 full_state.detected_frameworks = detected_frameworks;
@@ -507,7 +512,11 @@ impl RnaHandler {
                                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
                                     })
                                     .count();
-                                if lsp_edge_count > 0 {
+                                let degraded_detail =
+                                    (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                                if let Some(detail) = degraded_detail.as_deref() {
+                                    lsp_status.set_degraded(lsp_call_edge_count, detail);
+                                } else if lsp_edge_count > 0 {
                                     lsp_status.set_complete(lsp_call_edge_count);
                                 } else {
                                     lsp_status.set_unavailable();
@@ -1480,7 +1489,7 @@ impl RnaHandler {
             );
             let dirty_slugs = Some(freshly_extracted_slugs);
 
-            let (enriched_nodes, enriched_edges, detected_frameworks) =
+            let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics) =
                 crate::extract::consumers::emit_enrichment_pipeline(
                     all_nodes,
                     all_edges,
@@ -1515,7 +1524,11 @@ impl RnaHandler {
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
                     })
                     .count();
-                if lsp_edge_count > 0 {
+                let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                if let Some(detail) = degraded_detail.as_deref() {
+                    self.lsp_status.set_degraded(lsp_call_edge_count, detail);
+                    tracing::warn!("LSP enrichment finalized as degraded: {}", detail);
+                } else if lsp_edge_count > 0 {
                     self.lsp_status.set_complete(lsp_call_edge_count);
                     tracing::info!(
                         "LSP enrichment complete (via bus): {} LSP call edges, {} total LSP edges",
@@ -2108,7 +2121,7 @@ impl RnaHandler {
             let dirty_slugs: Option<std::collections::HashSet<String>> =
                 Some(std::iter::once(primary_slug.clone()).collect());
 
-            let (enriched_nodes, enriched_edges, detected_frameworks) =
+            let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics) =
                 crate::extract::consumers::emit_enrichment_pipeline(
                     std::mem::take(&mut graph.nodes),
                     std::mem::take(&mut graph.edges),
@@ -2134,6 +2147,18 @@ impl RnaHandler {
             graph.nodes = enriched_nodes;
             graph.edges = enriched_edges;
             graph.detected_frameworks = detected_frameworks;
+            let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+            if let Some(detail) = degraded_detail.as_deref() {
+                let lsp_call_edge_count = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.source == crate::graph::ExtractionSource::Lsp
+                            && matches!(edge.kind, crate::graph::EdgeKind::Calls)
+                    })
+                    .count();
+                self.lsp_status.set_degraded(lsp_call_edge_count, detail);
+            }
         }
 
         // Auto-collect delta: everything added by post-extraction passes since

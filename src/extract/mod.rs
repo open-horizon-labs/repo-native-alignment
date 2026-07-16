@@ -207,6 +207,9 @@ pub struct EnrichmentResult {
     /// Whether enrichment was aborted early (e.g., zero-edge threshold, timeout).
     /// Set by individual enrichers; used by `LspConsumer` to propagate to `EnrichmentComplete`.
     pub aborted: bool,
+    /// Actionable diagnostic explaining why enrichment was aborted or degraded.
+    /// Partial edges/nodes remain valid and are returned alongside this detail.
+    pub diagnostic: Option<String>,
     /// Per-language LSP enrichment stats for the scan summary.
     /// Populated by `enrich_all()` from individual enricher results.
     pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,

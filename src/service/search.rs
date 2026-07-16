@@ -401,15 +401,36 @@ fn format_verbose_readiness(
                     && matches!(edge.kind, EdgeKind::Calls | EdgeKind::ReferencedBy)
             })
             .count();
-        let completed_repo_job = ctx.enrichment_jobs.iter().any(|job| {
+        let completed_repo_order = ctx.enrichment_jobs.iter().filter(|job| {
             job.capability == EnrichmentCapability::CallReferences
                 && job.scope == EnrichmentScope::Repo
                 && job.state == EnrichmentJobState::Completed
                 && job.completed_at.is_some()
                 && job.failure.is_none()
                 && job.counters.edge_count.unwrap_or(0) > 0
-        });
-        if completed_repo_job && persisted_lsp_edges > 0 {
+        }).map(|job| (job.updated_at, job.revision)).max();
+        if let Some(degraded_job) = ctx
+            .enrichment_jobs
+            .iter()
+            .filter(|job| {
+                job.capability == EnrichmentCapability::CallReferences
+                    && job.state == EnrichmentJobState::Degraded
+                    && completed_repo_order.is_none_or(|completed| {
+                        (job.updated_at, job.revision) > completed
+                    })
+            })
+            .max_by_key(|job| job.updated_at)
+        {
+            let status = LspEnrichmentStatus::default();
+            status.set_degraded(
+                persisted_lsp_edges,
+                degraded_job
+                    .failure
+                    .as_deref()
+                    .unwrap_or("call-reference enrichment finalized with degraded output"),
+            );
+            Some(status)
+        } else if completed_repo_order.is_some() && persisted_lsp_edges > 0 {
             let status = LspEnrichmentStatus::default();
             status.set_complete(persisted_lsp_edges);
             Some(status)
@@ -441,6 +462,7 @@ fn format_verbose_readiness(
                     && !matches!(
                         job.state,
                         EnrichmentJobState::Completed
+                            | EnrichmentJobState::Degraded
                             | EnrichmentJobState::Cancelled
                             | EnrichmentJobState::Superseded
                     )
@@ -458,6 +480,7 @@ fn format_verbose_readiness(
                 | EnrichmentJobState::Running
                 | EnrichmentJobState::Persisting => status.set_running(),
                 EnrichmentJobState::Completed
+                | EnrichmentJobState::Degraded
                 | EnrichmentJobState::Cancelled
                 | EnrichmentJobState::Superseded => unreachable!("terminal states filtered above"),
             }
@@ -3087,6 +3110,154 @@ mod tests {
             result.contains("review-readiness scoped context**: partial/degraded"),
             "got: {}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_reports_live_degraded_lsp_diagnostic() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state(vec![caller]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let status = crate::server::state::LspEnrichmentStatus::default();
+        status.set_degraded(4, "forced no-progress abort after 7 attempted nodes");
+        let mut ctx = make_search_context(&gs, tmp.path());
+        ctx.lsp_status = Some(&status);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: partial/degraded"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("degraded after finalization with 4 partial call/reference edges"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("forced no-progress abort after 7 attempted nodes"),
+            "got: {result}"
+        );
+        assert!(!result.contains("LSP call/reference coverage**: ready"));
+        assert!(!result.contains("no supported language server detected"));
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_restores_degraded_lsp_diagnostic_from_job_ledger() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_degraded(
+            tmp.path(),
+            &job_id,
+            2,
+            1,
+            "forced no-progress abort after 7 attempted nodes",
+        );
+        let mut ctx = make_search_context(&gs, tmp.path());
+        ctx.enrichment_jobs = ledger.recent_jobs(tmp.path(), 5);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: partial/degraded"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("forced no-progress abort after 7 attempted nodes"),
+            "got: {result}"
+        );
+        assert!(!result.contains("LSP call/reference coverage**: ready"));
+    }
+
+    #[tokio::test]
+    async fn test_newer_repo_success_supersedes_historical_degraded_job() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let degraded = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::ChangedFiles,
+                crate::server::EnrichmentTrigger::BackgroundScan,
+                None,
+            )
+            .expect("begin degraded job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_degraded(tmp.path(), &degraded, 2, 1, "historical abort");
+        let completed = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin successful repo job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(tmp.path(), &completed, 2, 1);
+        let mut ctx = make_search_context(&gs, tmp.path());
+        ctx.enrichment_jobs = ledger.recent_jobs(tmp.path(), 5);
+        let result = search(
+            &SearchParams {
+                query: Some("caller".into()),
+                verbose: true,
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            result.contains("LSP call/reference coverage**: ready"),
+            "got: {result}"
+        );
+        assert!(
+            !result.contains("LSP call/reference coverage**: partial/degraded"),
+            "got: {result}"
         );
     }
 

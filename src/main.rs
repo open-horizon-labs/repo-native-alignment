@@ -655,6 +655,7 @@ async fn async_main() -> anyhow::Result<()> {
                 let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                     enrichment,
                     handler.lsp_status.current_state(),
+                    handler.lsp_status.diagnostic().as_deref(),
                     lsp_edge_count,
                     !related_job_ids.is_empty(),
                 );
@@ -693,6 +694,7 @@ async fn async_main() -> anyhow::Result<()> {
                         server::operation_report::lsp_capability_from_status(
                             enrichment,
                             handler.lsp_status.current_state(),
+                            handler.lsp_status.diagnostic().as_deref(),
                             lsp_edge_count,
                             !related_job_ids.is_empty(),
                         );
@@ -731,6 +733,7 @@ async fn async_main() -> anyhow::Result<()> {
             let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                 enrichment,
                 handler.lsp_status.current_state(),
+                handler.lsp_status.diagnostic().as_deref(),
                 lsp_edge_count,
                 !related_job_ids.is_empty(),
             );

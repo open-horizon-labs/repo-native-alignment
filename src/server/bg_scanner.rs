@@ -122,8 +122,9 @@ pub(super) async fn update_graph(
     scan_result: &mut ScanResult,
     repo_root: &std::path::Path,
     scan_stats: &Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
-) -> Vec<LanceDelta> {
+) -> (Vec<LanceDelta>, Vec<String>) {
     let mut lance_deltas: Vec<LanceDelta> = Vec::new();
+    let mut enrichment_diagnostics = Vec::new();
     let registry = ExtractorRegistry::with_builtins();
 
     // Drop in-memory nodes/edges for removed worktrees.
@@ -263,10 +264,11 @@ pub(super) async fn update_graph(
         )
         .await
         {
-            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+            Ok((enriched_nodes, enriched_edges, detected_frameworks, diagnostics)) => {
                 graph_state.nodes = enriched_nodes;
                 graph_state.edges = enriched_edges;
                 graph_state.detected_frameworks = detected_frameworks;
+                enrichment_diagnostics = diagnostics;
             }
             Err(e) => {
                 tracing::error!(
@@ -349,7 +351,7 @@ pub(super) async fn update_graph(
         graph_state.edges.len()
     );
 
-    lance_deltas
+    (lance_deltas, enrichment_diagnostics)
 }
 
 /// Persist incremental deltas to LanceDB and commit scanner state.
