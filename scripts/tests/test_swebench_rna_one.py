@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -49,6 +51,31 @@ class SwebenchRnaOneTests(unittest.TestCase):
                     ["git", "remote", "-v"], cwd=checkout, text=True
                 ).strip(),
                 "",
+            )
+
+    def test_meaningful_changes_preserves_both_rename_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=checkout, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "old.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "old.py"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "base"], cwd=checkout, check=True
+            )
+            subprocess.run(
+                ["git", "mv", "old.py", "new.py"], cwd=checkout, check=True
+            )
+            self.assertEqual(
+                HARNESS.meaningful_checkout_changes(checkout),
+                ["new.py", "old.py"],
             )
 
     def test_evaluator_command_uses_official_entrypoint_and_single_instance(self) -> None:
@@ -170,6 +197,22 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 pending,
             )
             self.assertTrue(mcp_error["is_error"])
+
+            pending = {}
+            PROXY.trace_row(
+                "client_to_server",
+                b'{"jsonrpc":"2.0","id":9,"method":"tools/call","params":'
+                b'{"name":"search","arguments":{"query":"pending"}}}\n',
+                pending,
+            )
+            nonterminal = PROXY.trace_row(
+                "server_to_client",
+                b'{"jsonrpc":"2.0","id":9,"method":"notifications/progress"}\n',
+                pending,
+            )
+            self.assertFalse(nonterminal["is_response"])
+            self.assertIsNone(nonterminal["response_to_method"])
+            self.assertIn(9, pending)
 
     def test_proxy_trace_correlates_arguments_and_response_hash(self) -> None:
         pending = {}
@@ -301,6 +344,57 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 ]["input_tokens"]["value"],
                 7,
             )
+
+    def test_collect_patch_includes_untracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=checkout, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "base"], cwd=checkout, check=True
+            )
+            (checkout / "created.txt").write_text("new content\n", encoding="utf-8")
+            patch = HARNESS.collect_patch(checkout)
+            self.assertIn("diff --git a/created.txt b/created.txt", patch)
+            self.assertIn("+new content", patch)
+
+    def test_executor_timeout_terminates_descendant_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            marker = checkout / "descendant-survived"
+            child = (
+                "import pathlib,time; time.sleep(0.8); "
+                f"pathlib.Path({str(marker)!r}).write_text('survived')"
+            )
+            parent = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+                "time.sleep(60)"
+            )
+            monitor = HARNESS.FirstEditMonitor(checkout)
+            result = HARNESS.run_executor(
+                [sys.executable, "-c", parent],
+                cwd=checkout,
+                env={**dict(os.environ)},
+                stdout_path=checkout / "stdout.log",
+                stderr_path=checkout / "stderr.log",
+                timed_trace_path=checkout / "trace.jsonl",
+                timeout=0.1,
+                monitor=monitor,
+            )
+            monitor.stop()
+            self.assertEqual(result.exit_code, 124)
+            time.sleep(1)
+            self.assertFalse(marker.exists())
 
     def test_enrichment_state_includes_embedding_capability_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

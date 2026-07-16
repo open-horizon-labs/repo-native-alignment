@@ -34,8 +34,9 @@ variables:
 
 The generated MCP configuration points to a logging proxy which launches the
 selected RNA binary directly with `--repo <isolated-checkout>`. The wrapper
-fails a live run if the executor produces no observable MCP initialization,
-tool-list, or tool-call traffic.
+fails a live run unless it observes at least one successful, correlated
+`tools/call` response before the first edit. Initialization or tool-list traffic
+alone is not accepted as RNA use.
 
 ## One command
 

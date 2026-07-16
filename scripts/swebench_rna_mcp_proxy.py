@@ -45,6 +45,11 @@ def trace_row(
     response_to_tool = None
     request_params = None
     response_to_params = None
+    is_response = (
+        direction == "server_to_client"
+        and message_id is not None
+        and ("result" in message or "error" in message)
+    )
     if direction == "client_to_server" and method and message_id is not None:
         params = message.get("params")
         tool_name = (
@@ -58,7 +63,7 @@ def trace_row(
             "tool_name": tool_name,
             "request_params": request_params,
         }
-    elif direction == "server_to_client" and message_id is not None:
+    elif is_response:
         request = pending.pop(message_id, None)
         if request:
             response_to_method = request["method"]
@@ -82,6 +87,7 @@ def trace_row(
         "response_to_tool": response_to_tool,
         "response_to_params": response_to_params,
         "tool_name": tool_name,
+        "is_response": is_response,
         "is_error": "error" in message or tool_result_error,
     }
 

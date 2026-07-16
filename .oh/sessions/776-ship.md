@@ -91,7 +91,10 @@ than a one-off patch or leaderboard claim.
 ## Step 6: Resolve TODOs
 
 All findings and static-analysis comments fixed and replied to. No product TODO
-remains.
+remains. The ready-review CodeRabbit pass found five additional issues, all
+fixed with regressions: stale MCP docs, non-terminal response correlation,
+rename/copy path parsing, descendant process cleanup on timeout, and untracked
+file omission from prediction patches.
 
 ## Step 7a: Manual Verification
 
@@ -110,7 +113,7 @@ README links the new one-instance harness documentation.
 
 ## Step 9: Smoke Test
 
-Ten Python tests pass. The ready-PR clean CI full test job passes. Local
+Thirteen Python tests pass. The ready-PR clean CI full test job passes. Local
 `cargo test --no-fail-fast` passed every test binary except the known
 checkout-history-sensitive roots assertion that reads persisted degraded scan
 text from this stateful checkout; #775 independently documented the same local

@@ -12,6 +12,7 @@ import importlib.util
 import importlib.metadata
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -472,13 +473,21 @@ def meaningful_checkout_changes(root: Path) -> list[str]:
         "target",
     }
     paths: list[str] = []
-    for entry in completed.stdout.decode("utf-8", errors="replace").split("\0"):
+    entries = iter(
+        completed.stdout.decode("utf-8", errors="replace").split("\0")
+    )
+    for entry in entries:
         if not entry:
             continue
-        path = entry[3:] if len(entry) > 3 else entry
-        if not path or ignored_parts.intersection(Path(path).parts):
-            continue
-        paths.append(path)
+        status = entry[:2]
+        changed_paths = [entry[3:] if len(entry) > 3 else ""]
+        if "R" in status or "C" in status:
+            original_path = next(entries, "")
+            if original_path:
+                changed_paths.append(original_path)
+        for path in changed_paths:
+            if path and not ignored_parts.intersection(Path(path).parts):
+                paths.append(path)
     return sorted(set(paths))
 
 
@@ -548,6 +557,7 @@ def run_executor(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        start_new_session=True,
     )
     trace_lock = threading.Lock()
 
@@ -586,15 +596,21 @@ def run_executor(
     try:
         exit_code = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        process.terminate()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait()
         exit_code = 124
-    stdout_thread.join(timeout=5)
-    stderr_thread.join(timeout=5)
+    stdout_thread.join()
+    stderr_thread.join()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
     return CommandResult(
         command=list(command),
         exit_code=exit_code,
@@ -1031,6 +1047,8 @@ def prewarm_rna(
 
 
 def collect_patch(checkout: Path) -> str:
+    # Intent-to-add exposes untracked content to diff without staging it.
+    git_output(checkout, "add", "--intent-to-add", "--all")
     completed = subprocess.run(
         ["git", "diff", "--binary", "--no-ext-diff", "HEAD"],
         cwd=checkout,
