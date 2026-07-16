@@ -3006,6 +3006,15 @@ mod tests {
             "Python must retain Function/Trait eligibility in the EventBus path"
         );
         assert_eq!(
+            event_bus_path.allows_declared_const_references(),
+            registry_path.allows_declared_const_references(),
+            "both construction paths must share declared-Const policy"
+        );
+        assert!(
+            !event_bus_path.allows_declared_const_references(),
+            "built-in declared-Const references remain disabled pending #768"
+        );
+        assert_eq!(
             crate::extract::Enricher::name(&event_bus_path),
             crate::extract::Enricher::name(&registry_path)
         );

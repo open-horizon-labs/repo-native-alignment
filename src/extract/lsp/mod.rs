@@ -49,7 +49,11 @@ type InitSettingsFactory = fn() -> serde_json::Value;
 enum LspEligibilityPolicy {
     /// Resolve language-specific request-target kinds from the extractor's
     /// [`LangConfig`](crate::extract::generic::LangConfig).
-    LangConfig,
+    LangConfig {
+        /// Declared constants stay default-off until a measured server/language
+        /// profile explicitly earns reference enrichment (#768).
+        declared_const_references: bool,
+    },
 }
 
 /// Complete construction profile for a built-in language server.
@@ -86,7 +90,10 @@ impl BuiltinLspDescriptor {
             enricher = enricher.with_toolchain_remediation(remediation);
         }
         match self.eligibility {
-            LspEligibilityPolicy::LangConfig => {
+            LspEligibilityPolicy::LangConfig {
+                declared_const_references,
+            } => {
+                enricher.allow_declared_const_references = declared_const_references;
                 if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
                     .and_then(|config| config.lsp_enrichable_kinds)
                 {
@@ -114,7 +121,9 @@ macro_rules! builtin_lsp {
             init_settings: None,
             config_file: None,
             toolchain_remediation: None,
-            eligibility: LspEligibilityPolicy::LangConfig,
+            eligibility: LspEligibilityPolicy::LangConfig {
+                declared_const_references: false,
+            },
         }
     };
 }
@@ -289,6 +298,9 @@ pub struct LspEnricher {
     /// Which node kinds to enrich via LSP. None = all enrichable kinds.
     /// Configured per-language via LangConfig::lsp_enrichable_kinds.
     lsp_enrichable_kinds: Option<Vec<NodeKind>>,
+    /// Whether declared constants may produce Pass 1 reference work.
+    /// Built-ins default to false until #768 measures a useful bounded profile.
+    allow_declared_const_references: bool,
 }
 
 struct LspState {
@@ -392,6 +404,7 @@ impl LspEnricher {
             }),
             startup_root_override: std::sync::OnceLock::new(),
             lsp_enrichable_kinds: None,
+            allow_declared_const_references: false,
         }
     }
 
@@ -442,6 +455,18 @@ impl LspEnricher {
 
     pub(crate) fn enrichable_kinds(&self) -> Option<&[NodeKind]> {
         self.lsp_enrichable_kinds.as_deref()
+    }
+
+    pub(crate) fn allows_declared_const_references(&self) -> bool {
+        self.allow_declared_const_references
+    }
+
+    pub(crate) fn admits_pass1_node(&self, node: &Node) -> bool {
+        if node.id.kind == NodeKind::Const && !self.allows_declared_const_references() {
+            return false;
+        }
+        self.enrichable_kinds()
+            .is_none_or(|kinds| kinds.contains(&node.id.kind))
     }
 
     /// Common admission boundary for every LSP pass.
@@ -2759,6 +2784,10 @@ mod tests {
             Some([NodeKind::Function, NodeKind::Trait].as_slice()),
             "the shared factory must retain Python's Function/Trait admission policy"
         );
+        assert!(
+            !python.allows_declared_const_references(),
+            "built-in profiles must keep declared-Const references default-off"
+        );
         assert_eq!(
             python.init_settings,
             Some(serde_json::json!({
@@ -2801,6 +2830,10 @@ mod tests {
         assert!(
             enricher.admits_node(&declared_const),
             "the common boundary must distinguish declared constants from synthetic values"
+        );
+        assert!(
+            !enricher.admits_pass1_node(&declared_const),
+            "declared constants must not produce default Pass 1 reference work"
         );
         let result = enricher
             .enrich(&[synthetic_const], &GraphIndex::new(), Path::new("."))
