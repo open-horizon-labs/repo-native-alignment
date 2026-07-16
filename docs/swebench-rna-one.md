@@ -1,10 +1,9 @@
 # One-instance SWE-bench RNA harness
 
-This harness runs one SWE-bench Verified task through an isolated checkout, an
-explicitly configured executor, and the official Docker evaluator. The default
-RNA arm uses RNA's real stdio MCP server; `--arm baseline` supplies the same
-executor and task prompt with an empty MCP configuration and skips RNA
-preparation. A single run is a case study, **not a benchmark score**.
+This harness runs one SWE-bench Verified task through an isolated checkout,
+RNA's real stdio MCP server, an explicitly configured executor, and the
+official Docker evaluator. It produces an auditable run bundle for later
+paired experiments. A single run is a case study, **not a benchmark score**.
 
 ## Prerequisites
 
@@ -38,13 +37,6 @@ selected RNA binary directly with `--repo <isolated-checkout>`. The wrapper
 fails a live run unless it observes at least one successful, correlated
 `tools/call` response before the first edit. Initialization or tool-list traffic
 alone is not accepted as RNA use.
-
-For controlled comparisons, `scripts/swebench_rna_pair.py` runs both arms from
-one frozen task spec and executor config, verifies the downloaded RNA artifact
-digest, retains every child bundle, checks that task prompt hashes match, and
-emits paired per-instance and aggregate reports. See
-`benchmarks/swebench-paired/779/` for the first pilot's immutable inputs and
-reproduction command.
 
 ## One command
 

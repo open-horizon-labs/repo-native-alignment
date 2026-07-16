@@ -102,23 +102,6 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 self.assertEqual(ledger["stages"][stage][field]["status"], "unknown")
                 self.assertIsNone(ledger["stages"][stage][field]["value"])
 
-    def test_baseline_stage_ledger_marks_rna_metrics_not_applicable(self) -> None:
-        ledger = HARNESS.stage_ledger_skeleton(arm="baseline")
-        stage = ledger["stages"]["rna_tool_results_orientation_and_planning"]
-        self.assertEqual(stage["mcp_calls"]["status"], "not_applicable")
-        self.assertEqual(stage["delivered_bytes"]["status"], "not_applicable")
-
-    def test_task_prompt_is_identical_without_rna_specific_instruction(self) -> None:
-        instance = json.loads(
-            (FIXTURES / "swebench_instance.json").read_text(encoding="utf-8")
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            prompt = Path(temporary) / "task.md"
-            HARNESS.make_task_prompt(instance, prompt)
-            text = prompt.read_text(encoding="utf-8")
-            self.assertIn("repository tools available in this run", text)
-            self.assertNotIn("rna-server", text)
-
     def test_mcp_summary_counts_only_tool_results_before_first_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary) / "mcp.jsonl"
@@ -483,42 +466,6 @@ class SwebenchRnaOneTests(unittest.TestCase):
             self.assertIn("swebench.harness.run_evaluation", evaluator["argv"])
             self.assertFalse((output / "executor.stdout.log").exists())
             self.assertFalse((output / "evaluation" / "stdout.log").exists())
-
-    def test_baseline_dry_run_records_rna_unavailable(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "baseline"
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "fixture__repo-1",
-                    "--arm",
-                    "baseline",
-                    "--executor-command",
-                    "exit 99",
-                    "--output-dir",
-                    str(output),
-                    "--instance-json",
-                    str(FIXTURES / "swebench_instance.json"),
-                    "--fixture-source",
-                    str(FIXTURES / "repo"),
-                    "--dry-run",
-                ],
-                cwd=ROOT,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            manifest = json.loads(
-                (output / "manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["arm"], "baseline")
-            self.assertEqual(manifest["rna"]["availability"], "unavailable")
-            mcp_config = json.loads(
-                (output / "mcp-config.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(mcp_config, {"mcpServers": {}})
 
 
 if __name__ == "__main__":
