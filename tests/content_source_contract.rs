@@ -133,6 +133,15 @@ fn assert_expected_selector(case: &toml::Value, source_text: &str, snippet: &str
     );
     assert_eq!(selector["line_start"].as_integer(), Some(3));
     assert_eq!(selector["line_end"].as_integer(), Some(3));
+    assert_eq!(
+        selector["body_node_id"].as_str(),
+        Some(
+            "tests/fixtures/content_source_contract/body-backed-control.md::body::ast:paragraph[0]"
+        )
+    );
+    assert_eq!(selector["extractor_id"].as_str(), Some("rna.markdown@1"));
+    assert_eq!(selector["pack_id"].as_str(), Some("fixture.reliability@1"));
+    assert_eq!(selector["rule_id"].as_str(), Some("supports-claim@1"));
     assert_eq!(selector["confidence"].as_str(), Some("confirmed"));
     assert_eq!(selector["validation_status"].as_str(), Some("valid"));
     for field in [
