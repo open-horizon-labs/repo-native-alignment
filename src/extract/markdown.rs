@@ -241,16 +241,22 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 let end = range.end.max(open.start).min(content.len());
                 let node = make_body_node(path, content, &open, end, &mut explicit_ids);
                 if open.kind == "image" {
-                    emit_leaf_body_node(
-                        path,
-                        content,
-                        "caption",
-                        open.start..end,
-                        None,
-                        ast_path(&open),
-                        0,
-                        nodes,
-                    );
+                    let selected = &content[open.start..end];
+                    if let Some(close) = selected.strip_prefix("![").and_then(|rest| rest.find(']'))
+                        && close > 0
+                    {
+                        let caption_start = open.start + 2;
+                        emit_leaf_body_node(
+                            path,
+                            content,
+                            "caption",
+                            caption_start..caption_start + close,
+                            None,
+                            ast_path(&open),
+                            0,
+                            nodes,
+                        );
+                    }
                 }
                 nodes.push(node);
             }
@@ -261,16 +267,20 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 }
                 let ordinal = *sibling_counts[depth].entry("citation").or_insert(0);
                 *sibling_counts[depth].entry("citation").or_insert(0) += 1;
-                emit_leaf_body_node(
-                    path,
-                    content,
-                    "citation",
-                    range.clone(),
-                    Some(label.to_string()),
-                    stack.last().map(ast_path).unwrap_or_default(),
+                let open = OpenBodyNode {
+                    kind: "citation",
+                    start: range.start,
                     ordinal,
-                    nodes,
-                );
+                    parent_path: stack.last().map(ast_path).unwrap_or_default(),
+                    explicit_id: None,
+                    anchor: None,
+                    target: None,
+                };
+                let mut node =
+                    make_body_node(path, content, &open, range.end, &mut BTreeMap::new());
+                node.metadata
+                    .insert("citation_label".into(), label.to_string());
+                nodes.push(node);
             }
             Event::Html(html) | Event::InlineHtml(html) => {
                 let kind = if html.trim_start().starts_with("<!--") {
@@ -337,6 +347,10 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 .insert("diagnostic_code".into(), "content.duplicate_body_id".into());
             node.metadata
                 .insert("diagnostic_severity".into(), "error".into());
+            node.metadata.insert(
+                "diagnostic_message".into(),
+                format!("duplicate explicit Markdown body ID: {explicit_id}"),
+            );
         }
     }
 }
@@ -486,6 +500,11 @@ fn make_body_node(
         && let Some(destination) = open.target.as_deref()
         && let Some((file, anchor)) = destination.split_once('#')
         && !anchor.is_empty()
+        && !destination.starts_with("http://")
+        && !destination.starts_with("https://")
+        && !destination.starts_with("mailto:")
+        && !destination.starts_with("data:")
+        && !Path::new(file).is_absolute()
     {
         let target_file = if file.is_empty() {
             path.to_path_buf()
@@ -494,7 +513,9 @@ fn make_body_node(
         };
         metadata.insert("target_file".into(), target_file.display().to_string());
         metadata.insert("target_anchor".into(), anchor.to_string());
-        metadata.insert("validation_status".into(), "unresolved".into());
+        if metadata.get("validation_status").map(String::as_str) == Some("valid") {
+            metadata.insert("validation_status".into(), "unresolved".into());
+        }
     }
     if matches!(open.kind, "html_comment" | "html_directive") {
         let directive = selected
@@ -643,19 +664,42 @@ fn contract_path(path: &Path) -> Option<PathBuf> {
 /// Resolve exact Markdown anchors after all files have been extracted. Unresolved
 /// candidates remain visible on their source link node with the contract diagnostic.
 pub fn markdown_anchor_pass(all_nodes: &mut [Node]) -> Vec<Edge> {
-    let anchors: BTreeMap<(String, PathBuf, String), NodeId> = all_nodes
+    let mut candidates: BTreeMap<(String, PathBuf, String), Vec<NodeId>> = BTreeMap::new();
+    for node in all_nodes
         .iter()
-        .filter_map(|node| {
-            if node.metadata.get("validation_status").map(String::as_str) != Some("valid") {
-                return None;
-            }
-            node.metadata.get("anchor").map(|anchor| {
-                (
-                    (node.id.root.clone(), node.id.file.clone(), anchor.clone()),
-                    node.id.clone(),
-                )
-            })
-        })
+        .filter(|node| node.metadata.get("validation_status").map(String::as_str) == Some("valid"))
+    {
+        if let Some(anchor) = node.metadata.get("anchor") {
+            candidates
+                .entry((node.id.root.clone(), node.id.file.clone(), anchor.clone()))
+                .or_default()
+                .push(node.id.clone());
+        }
+    }
+    let duplicate_ids: std::collections::HashSet<NodeId> = candidates
+        .values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .cloned()
+        .collect();
+    for node in all_nodes
+        .iter_mut()
+        .filter(|node| duplicate_ids.contains(&node.id))
+    {
+        node.metadata
+            .insert("validation_status".into(), "invalid".into());
+        node.metadata
+            .insert("diagnostic_code".into(), "content.duplicate_anchor".into());
+        node.metadata
+            .insert("diagnostic_severity".into(), "error".into());
+        node.metadata.insert(
+            "diagnostic_message".into(),
+            "duplicate generated Markdown anchor".into(),
+        );
+    }
+    let anchors: BTreeMap<_, _> = candidates
+        .into_iter()
+        .filter_map(|(key, ids)| (ids.len() == 1).then(|| (key, ids[0].clone())))
         .collect();
     let mut edges = Vec::new();
     for node in all_nodes.iter_mut() {
@@ -675,6 +719,7 @@ pub fn markdown_anchor_pass(all_nodes: &mut [Node]) -> Vec<Edge> {
                 .insert("validation_status".into(), "valid".into());
             node.metadata.remove("diagnostic_code");
             node.metadata.remove("diagnostic_severity");
+            node.metadata.remove("diagnostic_message");
             edges.push(Edge {
                 from: node.id.clone(),
                 to: target.clone(),
@@ -3083,5 +3128,106 @@ The manuscript uses the proxy-risk claim in the opening argument.
             node.metadata.get("diagnostic_code") == Some(&"content.duplicate_body_id".to_string())
                 && node.metadata.get("validation_status") == Some(&"invalid".to_string())
         }));
+    }
+
+    #[test]
+    fn captions_use_exact_nonempty_alt_text_span() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "![caption](image.png) ![](empty.png)\n",
+            )
+            .unwrap();
+        let captions: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| node.metadata.get("markdown_kind") == Some(&"caption".to_string()))
+            .collect();
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0].body, "caption");
+        assert_eq!(captions[0].line_start, 1);
+    }
+
+    #[test]
+    fn duplicate_generated_anchors_are_diagnosed_not_resolved() {
+        let mut nodes = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "# Same\n\n# Same\n\n[link](#same)\n")
+            .unwrap()
+            .nodes;
+        assert!(markdown_anchor_pass(&mut nodes).is_empty());
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.metadata.get("diagnostic_code")
+                        == Some(&"content.duplicate_anchor".to_string())
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn external_fragment_links_do_not_become_repository_targets() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "[external](https://example.com/doc#part)\n",
+            )
+            .unwrap();
+        let link = result
+            .nodes
+            .iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"link".to_string()))
+            .unwrap();
+        assert!(!link.metadata.contains_key("target_anchor"));
+    }
+
+    #[test]
+    fn repeated_citations_have_occurrence_identity_and_label_metadata() {
+        let result = MarkdownExtractor::new()
+            .extract(
+                Path::new("doc.md"),
+                "First[^n], second[^n].\n\n[^n]: note\n",
+            )
+            .unwrap();
+        let citations: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| node.metadata.get("markdown_kind") == Some(&"citation".to_string()))
+            .collect();
+        assert_eq!(citations.len(), 2);
+        assert_ne!(citations[0].id, citations[1].id);
+        assert!(
+            citations
+                .iter()
+                .all(|node| node.metadata.get("citation_label") == Some(&"n".to_string()))
+        );
+    }
+
+    #[test]
+    fn markdown_anchor_pass_timing_smoke_100k_nodes() {
+        use std::time::Instant;
+        let template = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "Body.\n")
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"paragraph".to_string()))
+            .unwrap();
+        let mut nodes = Vec::with_capacity(100_000);
+        for index in 0..100_000 {
+            let mut node = template.clone();
+            node.id.name = format!("paragraph-{index}");
+            nodes.push(node);
+        }
+        let started = Instant::now();
+        let edges = markdown_anchor_pass(&mut nodes);
+        println!(
+            "markdown_anchor_pass on 100k nodes: {:?}",
+            started.elapsed()
+        );
+        assert!(edges.is_empty());
+        assert_eq!(nodes.len(), 100_000);
     }
 }

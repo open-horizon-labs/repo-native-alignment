@@ -12,7 +12,7 @@ updated: "2026-07-15"
 
 - Extended the existing registered Markdown extractor with an offset-aware body AST pass.
 - Preserved legacy heading sections while adding canonical source selectors.
-- Focused Markdown suite: 67 passed.
+- Final focused Markdown suite: 71 passed.
 
 ### Step 1: RNA-Grounded Review
 

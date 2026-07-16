@@ -217,8 +217,9 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 Markdown is source-addressable beyond headings: body nodes for paragraphs, blockquotes,
 links, footnotes, tables, images, code fences, and HTML directives carry stable structural
-or explicit IDs, exact line/byte spans, and content hashes. Exact same-file anchors become
-graph references; unresolved anchors are exposed as diagnostics.
+or explicit IDs, exact line/byte spans, and content hashes. Exact same-file and
+repository-relative cross-file anchors such as `target.md#anchor` become graph
+references; unresolved anchors are exposed as diagnostics.
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root.
 
