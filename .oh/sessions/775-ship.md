@@ -31,12 +31,19 @@ updated: 2026-07-16
 - Verbose search/list-roots readiness renders the durable evidence.
 - Deterministic extraction and normal search remain independent of LSP state.
 
-## Verification in progress
+## Verification
 
 - `cargo check`: pass.
 - `cargo test --no-run`: pass.
 - Focused policy, scope, persistence, readiness, and LSP tests: pass.
-- Remaining gates: full suite, independent review, CodeRabbit, exact-head CI
+- `cargo clippy --lib -- -D warnings`: pass.
+- Manual explicit target-symbol enrichment: stable-ID scope resolved to one
+  node, scheduled exactly `1/1` request, stayed within `30000ms`, and persisted
+  `scoped` evidence rendered by verbose search.
+- The first ready-state CI run exposed five stale legacy assertions that still
+  expected default warm-up to mean full broad-reference readiness. The
+  assertions now enforce the new `default_profile`/partial contract.
+- Remaining gates: clean ready-state CI, CodeRabbit approval, exact-head CI
   artifact MCP delivery, final comment sweep, merge, and post-merge audit.
 
 ## Independent review
@@ -62,4 +69,4 @@ Findings and fixes:
    fields.
 
 Focused fixes, `cargo check --lib`, and `cargo clippy --lib -- -D warnings`
-pass. Independent re-review is pending.
+pass. Independent re-review verdict: **APPROVE**.

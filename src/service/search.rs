@@ -3031,15 +3031,16 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         assert!(
-            result.contains("LSP call/reference coverage**: ready"),
+            result.contains("LSP call/reference coverage**: partial/degraded"),
             "got: {}",
             result
         );
         assert!(
-            result.contains("global dead-code prerequisites**: ready"),
+            result.contains("global dead-code prerequisites**: partial/degraded"),
             "got: {}",
             result
         );
+        assert!(result.contains("default query profile"), "got: {}", result);
     }
 
     #[tokio::test]
@@ -3315,7 +3316,7 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         assert!(
-            result.contains("LSP call/reference coverage**: failed"),
+            result.contains("LSP call/reference coverage**: unavailable"),
             "got: {}",
             result
         );
@@ -3466,13 +3467,10 @@ mod tests {
         .await;
 
         assert!(
-            result.contains("LSP call/reference coverage**: ready"),
+            result.contains("LSP call/reference coverage**: partial/degraded"),
             "got: {result}"
         );
-        assert!(
-            !result.contains("LSP call/reference coverage**: partial/degraded"),
-            "got: {result}"
-        );
+        assert!(result.contains("default query profile"), "got: {result}");
     }
 
     #[tokio::test]
@@ -3576,15 +3574,16 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         assert!(
-            result.contains("LSP call/reference coverage**: ready"),
+            result.contains("LSP call/reference coverage**: partial/degraded"),
             "got: {}",
             result
         );
         assert!(
-            result.contains("global dead-code prerequisites**: ready"),
+            result.contains("global dead-code prerequisites**: partial/degraded"),
             "got: {}",
             result
         );
+        assert!(result.contains("default query profile"), "got: {}", result);
     }
 
     #[tokio::test]
@@ -3649,15 +3648,16 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         assert!(
-            result.contains("LSP call/reference coverage**: ready"),
+            result.contains("LSP call/reference coverage**: partial/degraded"),
             "got: {}",
             result
         );
         assert!(
-            result.contains("global dead-code prerequisites**: ready"),
+            result.contains("global dead-code prerequisites**: partial/degraded"),
             "got: {}",
             result
         );
+        assert!(result.contains("default query profile"), "got: {}", result);
     }
 
     #[tokio::test]
