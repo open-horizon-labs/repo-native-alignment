@@ -480,11 +480,7 @@ impl RnaHandler {
                             super::sentinel::clear_lsp_sentinel(&repo_root);
                             if let Some(job_id) = degraded_job_id.as_deref() {
                                 enrichment_jobs.mark_degraded(
-                                    &repo_root,
-                                    job_id,
-                                    node_count,
-                                    edge_count,
-                                    detail,
+                                    &repo_root, job_id, node_count, edge_count, detail,
                                 );
                             }
                         } else if !persist_succeeded
@@ -1054,10 +1050,7 @@ impl RnaHandler {
                 match result {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::error!(
-                            "[cache-hit bus] emit_enrichment_pipeline failed: {:#}",
-                            e
-                        );
+                        tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
                         if e.is_timeout() {
                             bg_lsp_status.set_timed_out(&format!("{}", e));
                             bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
@@ -2016,21 +2009,25 @@ impl RnaHandler {
                     );
                 }
                 let lsp_abort_detail = if run_lsp_in_bus {
-                    (!diagnostics.is_empty()).then(|| diagnostics.join("; ")).or_else(|| {
-                        let lsp_failures = self
-                            .scan_stats
-                            .read()
-                            .map(|stats| {
-                                lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                    (!diagnostics.is_empty())
+                        .then(|| diagnostics.join("; "))
+                        .or_else(|| {
+                            let lsp_failures = self
+                                .scan_stats
+                                .read()
+                                .map(|stats| {
+                                    lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                                })
+                                .unwrap_or_else(|_| {
+                                    vec!["scan stats unavailable: lock poisoned".to_string()]
+                                });
+                            (!lsp_failures.is_empty()).then(|| {
+                                format!(
+                                    "LSP call-reference enrichment aborted: {}",
+                                    lsp_failures.join("; ")
+                                )
                             })
-                            .unwrap_or_else(|_| {
-                                vec!["scan stats unavailable: lock poisoned".to_string()]
-                            });
-                        (!lsp_failures.is_empty()).then(|| format!(
-                            "LSP call-reference enrichment aborted: {}",
-                            lsp_failures.join("; ")
-                        ))
-                    })
+                        })
                 } else {
                     None
                 };
@@ -2416,13 +2413,15 @@ impl RnaHandler {
                             .count()
                     });
 
-                let lsp_abort_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; ")).or_else(|| {
-                    let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
-                    lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
-                        .into_iter()
-                        .next()
-                        .map(|failure| format!("LSP enrichment aborted for {failure}"))
-                });
+                let lsp_abort_detail = (!diagnostics.is_empty())
+                    .then(|| diagnostics.join("; "))
+                    .or_else(|| {
+                        let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+                        lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                            .into_iter()
+                            .next()
+                            .map(|failure| format!("LSP enrichment aborted for {failure}"))
+                    });
                 if let Some(detail) = lsp_abort_detail.as_deref() {
                     on_progress(&format!("Enrichment: {detail}"));
                 }
@@ -3164,6 +3163,7 @@ mod tests {
                     aborted: true,
                     server_missing: false,
                     remediation: None,
+                    query_metrics: Vec::new(),
                 },
             )]
             .into_iter()
@@ -3182,6 +3182,7 @@ mod tests {
                     aborted: true,
                     server_missing: false,
                     remediation: None,
+                    query_metrics: Vec::new(),
                 },
             )]
             .into_iter()

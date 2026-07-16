@@ -127,6 +127,13 @@ pub enum ExtractionEvent {
         diagnostic: Option<String>,
     },
 
+    /// Query-yield measurements emitted separately from graph enrichment output.
+    LspQueryMetrics {
+        slug: String,
+        language: String,
+        metrics: Arc<[crate::extract::lsp::LspQueryMetric]>,
+    },
+
     /// A framework has been detected during post-extraction passes.
     /// Consumers that gate on a specific framework check `framework` here.
     FrameworkDetected {
@@ -226,6 +233,7 @@ pub enum ExtractionEventKind {
     RootExtracted,
     LanguageDetected,
     EnrichmentComplete,
+    LspQueryMetrics,
     FrameworkDetected,
     PassComplete,
     PassesComplete,
@@ -242,6 +250,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => ExtractionEventKind::RootExtracted,
             ExtractionEvent::LanguageDetected { .. } => ExtractionEventKind::LanguageDetected,
             ExtractionEvent::EnrichmentComplete { .. } => ExtractionEventKind::EnrichmentComplete,
+            ExtractionEvent::LspQueryMetrics { .. } => ExtractionEventKind::LspQueryMetrics,
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
             ExtractionEvent::PassComplete { .. } => ExtractionEventKind::PassComplete,
             ExtractionEvent::PassesComplete { .. } => ExtractionEventKind::PassesComplete,
@@ -391,6 +400,38 @@ impl ExtractionEvent {
                 if let Some(diagnostic) = diagnostic {
                     buf.push(b'\n');
                     buf.extend_from_slice(diagnostic.as_bytes());
+                }
+            }
+            ExtractionEvent::LspQueryMetrics {
+                slug,
+                language,
+                metrics,
+            } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(language.as_bytes());
+                let mut rows = metrics
+                    .iter()
+                    .map(|metric| {
+                        format!(
+                            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                            metric.language,
+                            metric.server,
+                            metric.operation,
+                            metric.declaration_class,
+                            metric.scheduled_requests,
+                            metric.non_empty_responses,
+                            metric.emitted_edges,
+                            metric.latency_ms,
+                            metric.timeouts,
+                            metric.errors
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                for row in rows {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(row.as_bytes());
                 }
             }
             ExtractionEvent::FrameworkDetected {
@@ -584,6 +625,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => "root_extracted",
             ExtractionEvent::LanguageDetected { .. } => "language_detected",
             ExtractionEvent::EnrichmentComplete { .. } => "enrichment_complete",
+            ExtractionEvent::LspQueryMetrics { .. } => "lsp_query_metrics",
             ExtractionEvent::FrameworkDetected { .. } => "framework_detected",
             ExtractionEvent::PassComplete { .. } => "pass_complete",
             ExtractionEvent::PassesComplete { .. } => "passes_complete",

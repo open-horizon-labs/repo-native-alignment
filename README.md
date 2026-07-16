@@ -58,6 +58,8 @@ When a compiler or test runner already provides a location, `search(file="src/se
 **Know which capabilities are ready**
 `scan`, `enrich`, and `list_roots` surface OperationReport summaries: ready capabilities, degraded query classes, recent enrichment jobs, and the exact follow-up command when embeddings or call/reference enrichment is missing.
 
+For LSP enrichment, `list_roots` also reports query yield by language/server, operation, and declaration class: scheduled requests, non-empty responses, emitted edges, latency, timeouts, and errors. This makes the cost and agent-visible value of each compiler query profile inspectable.
+
 **Connect code to business outcomes**
 `outcome_progress("agent-alignment")` follows tagged commits to changed files to affected symbols. Outcomes, signals, and guardrails in `.oh/` are full graph nodes — searchable, linkable, tracked.
 

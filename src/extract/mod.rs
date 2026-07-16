@@ -213,6 +213,8 @@ pub struct EnrichmentResult {
     /// Per-language LSP enrichment stats for the scan summary.
     /// Populated by `enrich_all()` from individual enricher results.
     pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,
+    /// Operation/declaration query-yield measurements from LSP enrichers.
+    pub lsp_query_metrics: Vec<lsp::LspQueryMetric>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -720,6 +722,7 @@ impl EnricherRegistry {
                     let edge_count = enrichment.added_edges.len();
                     let node_count = enrichment.new_nodes.len();
                     let error_count = enrichment.error_count;
+                    let query_metrics = enrichment.lsp_query_metrics;
                     let status = if enrichment.aborted {
                         scan_stats::LspStatus::Aborted
                     } else {
@@ -728,6 +731,7 @@ impl EnricherRegistry {
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
+                    result.lsp_query_metrics.extend(query_metrics.clone());
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
                         language: lang,
                         server_name: server,
@@ -738,6 +742,7 @@ impl EnricherRegistry {
                         duration: dur,
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
+                        query_metrics,
                     });
                 }
                 Err(e) => {
@@ -764,6 +769,7 @@ impl EnricherRegistry {
                         duration: dur,
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
+                        query_metrics: Vec::new(),
                     });
                 }
             }

@@ -37,6 +37,12 @@ The `RootExtracted` event carries `dirty_slugs: Option<HashSet<String>>`. The `L
 
 Before requesting call hierarchy or references for a symbol, RNA sends `textDocument/didOpen` for that file once per enrichment pass. Files are marked opened only after the source read and notification succeed, so transient failures can be retried. This keeps language servers that require open documents from returning empty or stale reference results during warmup.
 
+### Operation-aware query admission
+
+Every LSP request is admitted through one shared query profile. The profile combines the requested operation, declaration class, language/server configuration, negotiated server capabilities, and the operation's runtime budget. Synthetic values are always rejected, and declared constants are default-denied for reference queries. High-signal function call hierarchy and trait implementation requests remain enabled when the server advertises those capabilities.
+
+RNA records scheduled requests, non-empty responses, emitted edges, latency, timeouts, and errors for each language/server, operation, and declaration class. `list_roots` exposes these query-yield rows beneath each language's LSP summary so operators can compare request cost with agent-visible graph value.
+
 ## Auto-detected Language Servers
 
 ### Common Servers (install for richer graphs)
