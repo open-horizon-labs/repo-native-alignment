@@ -24,7 +24,7 @@ Every evidence-bearing fact carries one or more selectors with these fields:
 |---|---|---|
 | `file_path` | required | Normalized, repository-relative path; no absolute paths or `..`. |
 | `line_start`, `line_end` | required | One-indexed, inclusive range in the current file. |
-| `byte_start`, `byte_end` | required when the parser exposes bytes | Zero-indexed, half-open UTF-8 byte range. Both are absent when bytes are unavailable. |
+| `byte_start`, `byte_end` | required for content-native Markdown | Zero-indexed, half-open UTF-8 byte range. A Markdown fact without both cannot be `valid` or `confirmed`. |
 | `body_node_id` | required | Stable AST body-node identity, never a frontmatter/sidecar node ID. |
 | `snippet_hash` | required | Lowercase BLAKE3 digest of the exact bytes in the selected half-open range. |
 | `extractor_id` | required | Versioned generic extractor identity. |
@@ -33,11 +33,27 @@ Every evidence-bearing fact carries one or more selectors with these fields:
 | `confidence` | required | `detected` or `confirmed`; only validated body evidence can be `confirmed`. |
 | `validation_status` | required | One of the states below. |
 
-Line and byte ranges identify the same content. An implementation MUST verify
-their agreement when bytes are available. `body_node_id` provides identity;
+Line and byte ranges identify the same content. Content-native Markdown is read
+from repository bytes, so its extractor MUST preserve byte offsets even if its
+parser API reports only lines. An implementation MUST verify line/byte agreement.
+`snippet_hash` always hashes the unmodified bytes in `[byte_start, byte_end)`;
+there is no line-normalized or platform-normalized fallback.
+
+`body_node_id` provides identity;
 location may change after an edit, but identity alone never validates evidence.
-An explicit inline ID may preserve body-node identity across a move. Otherwise,
-identity derives from the normalized AST path and changes when that path changes.
+Its canonical UTF-8 encoding is:
+
+```text
+<file_path>::body::explicit:<percent-encoded-inline-id>
+<file_path>::body::ast:<kind>[<zero-based-sibling-ordinal>]/...
+```
+
+An explicit inline ID takes precedence and may preserve identity across a move;
+duplicate explicit IDs are invalid. Otherwise, each AST segment uses the generic
+Markdown node kind plus its ordinal among same-kind siblings under its parent.
+RFC 3986 percent encoding is uppercase and applies to bytes outside the unreserved
+set. The root document is omitted from the AST path. Moving a node without an
+explicit ID changes its identity; changing only text or source location does not.
 
 For multi-span evidence, store an ordered, non-empty selector list. Edge identity
 MUST distinguish equal source/target/kind triples supported by materially
@@ -73,6 +89,7 @@ selector, and human-readable message. The corpus locks these codes:
 | `content.visual_not_evidence` | error | A screenshot/image is accepted by presence, count, filename, or broad topical fit rather than an anchored body claim/caption. |
 | `content.stale_verification` | error | Stored verification/hash no longer matches current selected bytes. |
 | `content.public_vocabulary_leak` | error | Public chapter prose exposes pack-internal worksheet/taxonomy headings as authored content. |
+| `content.duplicate_body_id` | error | More than one body node declares the same explicit inline ID in a file. |
 
 Pack-specific diagnostics MAY add namespaced codes. The generic runtime owns the
 diagnostic shape and lifecycle; a pack supplies domain-specific detection (for

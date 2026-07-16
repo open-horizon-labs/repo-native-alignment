@@ -8,6 +8,21 @@ expected_status = "valid"
 expected_edges = 1
 expected_diagnostics = []
 evidence_snippet = "The retry budget supports graceful recovery after a transient outage."
+required_fragments = ["# Recovery", "The retry budget supports graceful recovery after a transient outage."]
+
+[case.expected_selector]
+file_path = "tests/fixtures/content_source_contract/body-backed-control.md"
+line_start = 3
+line_end = 3
+byte_start = 12
+byte_end = 81
+body_node_id = "tests/fixtures/content_source_contract/body-backed-control.md::body::ast:paragraph[0]"
+snippet_hash = "819bb7268f648a2a5edf6edeaabb2d3ffc7ee940513d1528a7c78b92e31ad4fa"
+extractor_id = "rna.markdown@1"
+pack_id = "fixture.reliability@1"
+rule_id = "supports-claim@1"
+confidence = "confirmed"
+validation_status = "valid"
 
 [[case]]
 id = "metadata-only"
@@ -16,6 +31,7 @@ candidate = "supports"
 expected_status = "invalid"
 expected_edges = 0
 expected_diagnostics = ["content.metadata_without_body_evidence"]
+required_fragments = ["relationships:", "kind: supports", "Retries are limited to three attempts."]
 
 [[case]]
 id = "sidecar-only"
@@ -25,6 +41,8 @@ candidate = "supports"
 expected_status = "invalid"
 expected_edges = 0
 expected_diagnostics = ["content.sidecar_without_body_evidence"]
+required_fragments = ["Retries are limited to three attempts."]
+sidecar_required_fragments = ["kind = \"supports\"", "target = \"graceful-recovery\""]
 
 [[case]]
 id = "missing-body-evidence"
@@ -33,6 +51,7 @@ candidate = "supports"
 expected_status = "unresolved"
 expected_edges = 0
 expected_diagnostics = ["content.missing_body_evidence"]
+required_fragments = ["pack:relationship", "intentionally contains no supporting claim"]
 
 [[case]]
 id = "broken-anchor"
@@ -41,6 +60,7 @@ candidate = "references"
 expected_status = "unresolved"
 expected_edges = 0
 expected_diagnostics = ["content.unresolved_anchor"]
+required_fragments = ["](#recovery-policy)", "exact body anchor does not exist"]
 
 [[case]]
 id = "orphan-quote"
@@ -50,6 +70,8 @@ candidate = "quotes"
 expected_status = "unresolved"
 expected_edges = 0
 expected_diagnostics = ["content.orphan_quote"]
+required_fragments = ["contains no quotation matching"]
+sidecar_required_fragments = ["Systems recover when feedback remains visible.", "Field Notes, page 17"]
 
 [[case]]
 id = "chart-screenshot"
@@ -58,6 +80,8 @@ candidate = "visualizes"
 expected_status = "invalid"
 expected_edges = 0
 expected_diagnostics = ["content.visual_not_evidence"]
+asset = "assets/reliability-chart.ppm"
+required_fragments = ["assets/reliability-chart.ppm", "no body claim or caption interprets its data"]
 
 [[case]]
 id = "stale-verification"
@@ -67,11 +91,16 @@ candidate = "supports"
 expected_status = "stale"
 expected_edges = 0
 expected_diagnostics = ["content.stale_verification"]
+required_fragments = ["limits cascading load"]
+sidecar_required_fragments = ["body_node_id", "0000000000000000", "supports graceful recovery"]
 
 [[case]]
 id = "public-worksheet-prose"
 source = "public-worksheet-prose.md"
+sidecar = "public-worksheet.pack.toml"
 candidate = "classifies"
 expected_status = "invalid"
 expected_edges = 0
 expected_diagnostics = ["content.public_vocabulary_leak"]
+required_fragments = ["# Strategy Worksheet", "## Tactic Classification", "## Evidence Registry"]
+sidecar_required_fragments = ["private_heading = \"Strategy Worksheet\"", "private_heading = \"Tactic Classification\"", "private_heading = \"Evidence Registry\""]

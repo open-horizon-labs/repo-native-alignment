@@ -63,10 +63,32 @@ fn adversarial_content_source_contract_is_complete_and_source_backed() {
             .unwrap_or_else(|error| panic!("{id}: cannot read {source}: {error}"));
         assert!(!source_text.trim().is_empty(), "{id}: empty source fixture");
 
-        if let Some(sidecar) = case.get("sidecar").and_then(toml::Value::as_str) {
+        for fragment in case["required_fragments"].as_array().unwrap() {
+            let fragment = fragment.as_str().unwrap();
             assert!(
-                root.join(sidecar).is_file(),
-                "{id}: missing sidecar {sidecar}"
+                source_text.contains(fragment),
+                "{id}: source no longer represents trigger {fragment:?}"
+            );
+        }
+
+        if let Some(sidecar) = case.get("sidecar").and_then(toml::Value::as_str) {
+            let sidecar_text = fs::read_to_string(root.join(sidecar))
+                .unwrap_or_else(|error| panic!("{id}: cannot read sidecar {sidecar}: {error}"));
+            for fragment in case["sidecar_required_fragments"].as_array().unwrap() {
+                let fragment = fragment.as_str().unwrap();
+                assert!(
+                    sidecar_text.contains(fragment),
+                    "{id}: sidecar no longer represents trigger {fragment:?}"
+                );
+            }
+        }
+
+        if let Some(asset) = case.get("asset").and_then(toml::Value::as_str) {
+            let asset_bytes = fs::read(root.join(asset))
+                .unwrap_or_else(|error| panic!("{id}: cannot read asset {asset}: {error}"));
+            assert!(
+                asset_bytes.starts_with(b"P3\n"),
+                "{id}: asset is not a PPM bitmap"
             );
         }
 
@@ -84,6 +106,7 @@ fn adversarial_content_source_contract_is_complete_and_source_backed() {
                 source_text.contains(snippet),
                 "{id}: evidence is not in body"
             );
+            assert_expected_selector(case, &source_text, snippet);
         } else {
             assert_eq!(edge_count, 0, "{id}: invalid evidence emits an edge");
             let (_, required_status, required_diagnostic) = REQUIRED_FAILURES
@@ -98,4 +121,34 @@ fn adversarial_content_source_contract_is_complete_and_source_backed() {
             );
         }
     }
+}
+
+fn assert_expected_selector(case: &toml::Value, source_text: &str, snippet: &str) {
+    let selector = &case["expected_selector"];
+    let byte_start = selector["byte_start"].as_integer().unwrap() as usize;
+    let byte_end = selector["byte_end"].as_integer().unwrap() as usize;
+    assert_eq!(
+        &source_text.as_bytes()[byte_start..byte_end],
+        snippet.as_bytes()
+    );
+    assert_eq!(selector["line_start"].as_integer(), Some(3));
+    assert_eq!(selector["line_end"].as_integer(), Some(3));
+    assert_eq!(selector["confidence"].as_str(), Some("confirmed"));
+    assert_eq!(selector["validation_status"].as_str(), Some("valid"));
+    for field in [
+        "file_path",
+        "body_node_id",
+        "extractor_id",
+        "pack_id",
+        "rule_id",
+    ] {
+        assert!(
+            !selector[field].as_str().unwrap().is_empty(),
+            "empty {field}"
+        );
+    }
+    assert_eq!(
+        selector["snippet_hash"].as_str().unwrap(),
+        blake3::hash(snippet.as_bytes()).to_hex().as_str()
+    );
 }
