@@ -328,6 +328,7 @@ mod tests {
             &state.edges,
             &source.stable_id(),
             &groups,
+            "outgoing",
         );
         assert!(rendered.contains("chapter.md:4-4"));
         assert!(rendered.contains("Retries cap cascading load."));

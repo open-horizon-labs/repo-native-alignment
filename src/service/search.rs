@@ -1903,10 +1903,16 @@ async fn search_traversal(
                 params.minify_body,
             );
             for origin in &valid_entry_ids {
+                let evidence_direction = match mode {
+                    "impact" | "tests_for" => "incoming",
+                    "reachable" => "outgoing",
+                    _ => params.direction.as_deref().unwrap_or("outgoing"),
+                };
                 md.push_str(&crate::server::helpers::format_edge_evidence_for_groups(
                     &gs.edges,
                     origin,
                     &merged_groups,
+                    evidence_direction,
                 ));
             }
 
@@ -2111,6 +2117,11 @@ fn search_batch(
                             &gs.edges,
                             &resolved_nid,
                             &groups,
+                            match mode {
+                                "impact" | "tests_for" => "incoming",
+                                "reachable" => "outgoing",
+                                _ => params.direction.as_deref().unwrap_or("outgoing"),
+                            },
                         ));
                         sections.push(format!(
                             "### `{}`\n\n{} result(s)\n\n{}",
