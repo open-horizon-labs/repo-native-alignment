@@ -123,6 +123,15 @@ pub enum ExtractionEvent {
         remediation: Option<String>,
         /// Whether enrichment was aborted early (e.g., error threshold exceeded).
         aborted: bool,
+        /// Actionable failure detail for a degraded/aborted completion.
+        diagnostic: Option<String>,
+    },
+
+    /// Query-yield measurements emitted separately from graph enrichment output.
+    LspQueryMetrics {
+        slug: String,
+        language: String,
+        metrics: Arc<[crate::extract::lsp::LspQueryMetric]>,
     },
 
     /// A framework has been detected during post-extraction passes.
@@ -150,6 +159,8 @@ pub enum ExtractionEvent {
         /// Full enriched edge set after all passes ran.
         edges: Arc<[Edge]>,
         detected_frameworks: HashSet<String>,
+        /// Diagnostics from enrichers that completed with degraded output.
+        enrichment_diagnostics: Arc<[String]>,
     },
 
     /// All LSP enrichments for a root are done.
@@ -175,6 +186,8 @@ pub enum ExtractionEvent {
         /// Applied to base nodes before post-extraction passes run so passes see
         /// LSP-enriched metadata (e.g., inferred types from inlay hints).
         updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]>,
+        /// Diagnostics from enrichers that completed with degraded output.
+        enrichment_diagnostics: Arc<[String]>,
     },
 
     /// PageRank computation and Louvain community detection are complete.
@@ -220,6 +233,7 @@ pub enum ExtractionEventKind {
     RootExtracted,
     LanguageDetected,
     EnrichmentComplete,
+    LspQueryMetrics,
     FrameworkDetected,
     PassComplete,
     PassesComplete,
@@ -236,6 +250,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => ExtractionEventKind::RootExtracted,
             ExtractionEvent::LanguageDetected { .. } => ExtractionEventKind::LanguageDetected,
             ExtractionEvent::EnrichmentComplete { .. } => ExtractionEventKind::EnrichmentComplete,
+            ExtractionEvent::LspQueryMetrics { .. } => ExtractionEventKind::LspQueryMetrics,
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
             ExtractionEvent::PassComplete { .. } => ExtractionEventKind::PassComplete,
             ExtractionEvent::PassesComplete { .. } => ExtractionEventKind::PassesComplete,
@@ -341,6 +356,7 @@ impl ExtractionEvent {
                 added_edges,
                 new_nodes,
                 updated_nodes,
+                diagnostic,
                 ..
             } => {
                 buf.extend_from_slice(slug.as_bytes());
@@ -381,6 +397,42 @@ impl ExtractionEvent {
                     buf.push(b':');
                     buf.extend_from_slice(values.as_bytes());
                 }
+                if let Some(diagnostic) = diagnostic {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(diagnostic.as_bytes());
+                }
+            }
+            ExtractionEvent::LspQueryMetrics {
+                slug,
+                language,
+                metrics,
+            } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(language.as_bytes());
+                let mut rows = metrics
+                    .iter()
+                    .map(|metric| {
+                        format!(
+                            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                            metric.language,
+                            metric.server,
+                            metric.operation,
+                            metric.declaration_class,
+                            metric.scheduled_requests,
+                            metric.non_empty_responses,
+                            metric.emitted_edges,
+                            metric.latency_ms,
+                            metric.timeouts,
+                            metric.errors
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                for row in rows {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(row.as_bytes());
+                }
             }
             ExtractionEvent::FrameworkDetected {
                 slug,
@@ -413,6 +465,7 @@ impl ExtractionEvent {
                 nodes,
                 edges,
                 detected_frameworks,
+                enrichment_diagnostics,
             } => {
                 buf.extend_from_slice(slug.as_bytes());
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
@@ -434,6 +487,13 @@ impl ExtractionEvent {
                     buf.push(b'\t');
                     buf.extend_from_slice(f.as_bytes());
                 }
+                let mut diagnostics: Vec<&str> =
+                    enrichment_diagnostics.iter().map(String::as_str).collect();
+                diagnostics.sort_unstable();
+                for diagnostic in diagnostics {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(diagnostic.as_bytes());
+                }
             }
             ExtractionEvent::AllEnrichmentsDone {
                 slug,
@@ -442,6 +502,7 @@ impl ExtractionEvent {
                 lsp_edges,
                 lsp_nodes,
                 updated_nodes,
+                enrichment_diagnostics,
             } => {
                 buf.extend_from_slice(slug.as_bytes());
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
@@ -489,6 +550,13 @@ impl ExtractionEvent {
                     buf.extend_from_slice(id.as_bytes());
                     buf.push(b':');
                     buf.extend_from_slice(values.as_bytes());
+                }
+                let mut diagnostics: Vec<&str> =
+                    enrichment_diagnostics.iter().map(String::as_str).collect();
+                diagnostics.sort_unstable();
+                for diagnostic in diagnostics {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(diagnostic.as_bytes());
                 }
             }
             ExtractionEvent::CommunityDetectionComplete {
@@ -557,6 +625,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => "root_extracted",
             ExtractionEvent::LanguageDetected { .. } => "language_detected",
             ExtractionEvent::EnrichmentComplete { .. } => "enrichment_complete",
+            ExtractionEvent::LspQueryMetrics { .. } => "lsp_query_metrics",
             ExtractionEvent::FrameworkDetected { .. } => "framework_detected",
             ExtractionEvent::PassComplete { .. } => "pass_complete",
             ExtractionEvent::PassesComplete { .. } => "passes_complete",
@@ -1049,6 +1118,7 @@ mod tests {
                     nodes: Arc::from(vec![].into_boxed_slice()),
                     edges: Arc::from(vec![].into_boxed_slice()),
                     detected_frameworks: HashSet::new(),
+                    enrichment_diagnostics: Arc::from([]),
                 },
             ],
         }));
@@ -1350,6 +1420,7 @@ mod tests {
                 aborted: false,
                 server_missing: false,
                 remediation: None,
+                diagnostic: None,
             }
         };
 
@@ -1378,6 +1449,7 @@ mod tests {
                 lsp_edges: Arc::from(vec![].into_boxed_slice()),
                 lsp_nodes: Arc::from(vec![].into_boxed_slice()),
                 updated_nodes: Arc::from(vec![("node::bar".to_string(), patch)].into_boxed_slice()),
+                enrichment_diagnostics: Arc::from([]),
             }
         };
 

@@ -1,0 +1,7 @@
+[project]
+name = "rna-lsp-const-yield-python"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.pyright]
+include = ["."]

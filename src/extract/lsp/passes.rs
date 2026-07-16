@@ -4,7 +4,7 @@
 //! appends results to the `EnrichmentResult`. The top-level `enrich()` orchestrates
 //! them in sequence: Pass 0 -> Pass 1 -> Pass 2 -> Pass 4 -> Pass 5 -> Pass 3.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -15,6 +15,10 @@ use tokio::sync::Mutex;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
+use super::policy::{
+    LspDeclarationClass, LspQueryBudget, LspQueryOperation, LspQueryTelemetry,
+    LspServerCapabilities,
+};
 use super::transport::{
     PipelinedTransport, find_enclosing_symbol, path_to_uri, uri_to_relative_path,
 };
@@ -171,7 +175,7 @@ impl DidOpenCoordinator {
 struct LspPass1WorkItem {
     id: usize,
     node: Node,
-    requested_operations: Vec<&'static str>,
+    requested_operations: Vec<LspQueryOperation>,
     attempt_count: u32,
 }
 
@@ -180,6 +184,53 @@ struct Pass1TaskResult {
     edges: Vec<Edge>,
     new_nodes: Vec<Node>,
     had_error: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct QueryObservation {
+    pub(super) scheduled_requests: usize,
+    pub(super) non_empty_responses: usize,
+    pub(super) errors: usize,
+    pub(super) timeouts: usize,
+}
+
+impl QueryObservation {
+    pub(super) fn record_error(&mut self, error: &anyhow::Error) {
+        self.errors += 1;
+        let text = error.to_string().to_ascii_lowercase();
+        if text.contains("timed out") || text.contains("timeout") {
+            self.timeouts += 1;
+        }
+    }
+}
+
+fn record_type_hierarchy_observation(
+    telemetry: &LspQueryTelemetry,
+    node: &Node,
+    observation: QueryObservation,
+    emitted_edges: usize,
+    latency: Duration,
+) {
+    if let Some(declaration) = LspDeclarationClass::from_kind(&node.id.kind) {
+        telemetry.record(
+            LspQueryOperation::TypeHierarchy,
+            declaration,
+            observation.scheduled_requests,
+            observation.non_empty_responses,
+            emitted_edges,
+            latency,
+            observation.errors,
+            observation.timeouts,
+        );
+    }
+}
+
+fn retain_unique_document_link_file(
+    node: &Node,
+    operation: LspQueryOperation,
+    seen_files: &mut HashSet<PathBuf>,
+) -> bool {
+    operation != LspQueryOperation::DocumentLinks || seen_files.insert(node.id.file.clone())
 }
 
 fn runnable_pass1_work_items(
@@ -510,29 +561,6 @@ fn language_id_for_path(path: &Path) -> &'static str {
     }
 }
 
-pub(crate) fn requested_operations_for_node(
-    kind: &NodeKind,
-    has_references: bool,
-    has_call_hierarchy: bool,
-) -> Vec<&'static str> {
-    match kind {
-        NodeKind::Function if has_call_hierarchy => vec![
-            "requesting_call_hierarchy_prepare",
-            "requesting_call_hierarchy_incoming",
-            "requesting_call_hierarchy_outgoing",
-        ],
-        NodeKind::Function if has_references => vec!["requesting_references"],
-        NodeKind::Trait => vec!["requesting_implementations"],
-        NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
-            if has_references =>
-        {
-            vec!["requesting_references"]
-        }
-        NodeKind::Other(_) => vec!["requesting_document_links"],
-        _ => vec!["skipped_no_supported_operation"],
-    }
-}
-
 fn did_open_timeout() -> Duration {
     duration_from_env("RNA_LSP_DID_OPEN_TIMEOUT_MS", DID_OPEN_DEFAULT_TIMEOUT)
 }
@@ -611,8 +639,9 @@ impl LspEnricher {
         matching_nodes: &[&Node],
         matching_nodes_owned: &Arc<Vec<Node>>,
         refs_by_file_shared: &Arc<HashMap<PathBuf, Vec<Node>>>,
-        has_references: bool,
-        has_call_hierarchy: bool,
+        capabilities: LspServerCapabilities,
+        budget: &mut LspQueryBudget,
+        telemetry: &Arc<LspQueryTelemetry>,
         result: &mut EnrichmentResult,
     ) -> (u32, u32, bool, Option<String>) {
         let pass1_start = std::time::Instant::now();
@@ -625,7 +654,7 @@ impl LspEnricher {
         // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
         // re-enriched via the generic Other/documentLink path on subsequent passes --
         // which would generate spurious DependsOn edges from diagnostics.
-        let enrichable_nodes: Vec<&Node> = matching_nodes
+        let candidate_nodes: Vec<&Node> = matching_nodes
             .iter()
             .filter(|n| {
                 matches!(
@@ -640,16 +669,6 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            // When lsp_enrichable_kinds is set, restrict to those kinds only.
-            // This is configured per-language via LangConfig (e.g., Python restricts
-            // to Function+Trait because pyright's textDocument/references hangs on
-            // class/enum/const lookups).
-            .filter(|n| {
-                if let Some(ref kinds) = self.lsp_enrichable_kinds {
-                    return kinds.contains(&n.id.kind);
-                }
-                true
-            })
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -668,9 +687,34 @@ impl LspEnricher {
             .copied()
             .collect();
 
-        let ref_eligible = enrichable_nodes
+        let mut document_link_files = HashSet::new();
+        let admitted_nodes: Vec<(&Node, LspQueryOperation)> = candidate_nodes
+            .into_iter()
+            .filter_map(|node| {
+                let operation = match node.id.kind {
+                    NodeKind::Function if capabilities.call_hierarchy => {
+                        Some(LspQueryOperation::CallHierarchy)
+                    }
+                    NodeKind::Function => Some(LspQueryOperation::References),
+                    NodeKind::Trait => Some(LspQueryOperation::Implementations),
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                        Some(LspQueryOperation::References)
+                    }
+                    NodeKind::Other(_) => Some(LspQueryOperation::DocumentLinks),
+                    _ => None,
+                }?;
+                if !retain_unique_document_link_file(node, operation, &mut document_link_files) {
+                    return None;
+                }
+                self.query_profile
+                    .admits(node, operation, capabilities, budget)
+                    .then_some((node, operation))
+            })
+            .collect();
+
+        let ref_eligible = admitted_nodes
             .iter()
-            .filter(|n| {
+            .filter(|(n, _)| {
                 matches!(
                     n.id.kind,
                     NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
@@ -679,40 +723,36 @@ impl LspEnricher {
             .count();
         tracing::info!(
             "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}, call_hierarchy={}]",
-            enrichable_nodes.len(),
+            admitted_nodes.len(),
             matching_nodes.len(),
-            enrichable_nodes
+            admitted_nodes
                 .iter()
-                .filter(|n| n.id.kind == NodeKind::Function)
+                .filter(|(n, _)| n.id.kind == NodeKind::Function)
                 .count(),
-            enrichable_nodes
+            admitted_nodes
                 .iter()
-                .filter(|n| n.id.kind == NodeKind::Trait)
+                .filter(|(n, _)| n.id.kind == NodeKind::Trait)
                 .count(),
             ref_eligible,
-            enrichable_nodes
+            admitted_nodes
                 .iter()
-                .filter(|n| matches!(n.id.kind, NodeKind::Other(_)))
+                .filter(|(n, _)| matches!(n.id.kind, NodeKind::Other(_)))
                 .count(),
-            has_references,
-            has_call_hierarchy,
+            capabilities.references,
+            capabilities.call_hierarchy,
         );
 
         // Bounded queue substrate: materialize inspectable work items, then let a
         // fixed worker pool drain them. This avoids spawning one opaque task per
         // symbol and gives diagnostics a stable queue/in-flight model.
         const PIPELINE_MAX_CONCURRENCY: usize = 64;
-        let work_items: Vec<LspPass1WorkItem> = enrichable_nodes
+        let work_items: Vec<LspPass1WorkItem> = admitted_nodes
             .iter()
             .enumerate()
-            .map(|(id, node)| LspPass1WorkItem {
+            .map(|(id, (node, operation))| LspPass1WorkItem {
                 id,
                 node: (*node).clone(),
-                requested_operations: requested_operations_for_node(
-                    &node.id.kind,
-                    has_references,
-                    has_call_hierarchy,
-                ),
+                requested_operations: vec![*operation],
                 attempt_count: 1,
             })
             .collect();
@@ -724,7 +764,7 @@ impl LspEnricher {
                 requested_operations: item
                     .requested_operations
                     .iter()
-                    .map(|operation| (*operation).to_string())
+                    .map(|operation| operation.to_string())
                     .collect(),
                 attempt_count: item.attempt_count,
             })
@@ -759,12 +799,14 @@ impl LspEnricher {
         let pass1_edge_baseline = result.added_edges.len();
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
+        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
         let matching_owned = Arc::clone(matching_nodes_owned);
         let refs_by_file = Arc::clone(refs_by_file_shared);
+        let worker_telemetry = Arc::clone(telemetry);
         let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
@@ -777,7 +819,23 @@ impl LspEnricher {
                 let language = language.clone();
                 let error_count = Arc::clone(&error_count);
                 let did_open = Arc::clone(&did_open);
+                let telemetry = Arc::clone(&worker_telemetry);
                 async move {
+                    let registered = if let (Some(operation), Some(declaration)) = (
+                        item.requested_operations.first().copied(),
+                        LspDeclarationClass::from_kind(&item.node.id.kind),
+                    ) {
+                        telemetry.register_work_item(item.id, operation, declaration)
+                    } else {
+                        false
+                    };
+                    if !registered {
+                        return Pass1TaskResult {
+                            edges: Vec::new(),
+                            new_nodes: Vec::new(),
+                            had_error: false,
+                        };
+                    }
                     Self::run_pass1_work_item(
                         &item,
                         &transport,
@@ -785,11 +843,10 @@ impl LspEnricher {
                         &matching_owned,
                         &refs_by_file,
                         &language,
-                        has_references,
-                        has_call_hierarchy,
                         &did_open,
                         &diagnostics,
                         &error_count,
+                        &telemetry,
                     )
                     .await
                 }
@@ -939,6 +996,9 @@ impl LspEnricher {
                 abort_diagnostic = recovery_diagnostic;
             }
         }
+        if aborted {
+            telemetry.record_job_timeout();
+        }
 
         tracing::info!(
             "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
@@ -963,12 +1023,13 @@ impl LspEnricher {
         matching_owned: &Arc<Vec<Node>>,
         refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
         language: &str,
-        has_references: bool,
-        has_call_hierarchy: bool,
         did_open: &DidOpenCoordinator,
         diagnostics: &LspPass1Diagnostics,
         error_count: &AtomicI64,
+        telemetry: &LspQueryTelemetry,
     ) -> Pass1TaskResult {
+        let started_at = Instant::now();
+        let operation = item.requested_operations.first().copied();
         diagnostics.set_phase(item, "resolving_file_uri").await;
         let node = &item.node;
         let abs_path = root.join(&node.id.file);
@@ -983,6 +1044,7 @@ impl LspEnricher {
                 diagnostics
                     .finish_failed(item, format!("failed to resolve file URI: {e}"))
                     .await;
+                telemetry.record_work_item(item.id, 0, 0, started_at.elapsed(), 1, 0);
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -1001,6 +1063,16 @@ impl LspEnricher {
             diagnostics
                 .finish_failed(item, format!("failed to send textDocument/didOpen: {e}"))
                 .await;
+            let mut observation = QueryObservation::default();
+            observation.record_error(&e);
+            telemetry.record_work_item(
+                item.id,
+                0,
+                0,
+                started_at.elapsed(),
+                observation.errors,
+                observation.timeouts,
+            );
             return Pass1TaskResult {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
@@ -1011,7 +1083,7 @@ impl LspEnricher {
         let phase = item
             .requested_operations
             .first()
-            .copied()
+            .map(|operation| operation.phase())
             .unwrap_or("requesting_lsp_operation");
         diagnostics.set_phase(item, phase).await;
 
@@ -1019,8 +1091,7 @@ impl LspEnricher {
         let mut edges = Vec::new();
         let mut new_nodes = Vec::new();
         let mut had_error = false;
-
-        match node.id.kind {
+        let observation = match node.id.kind {
             NodeKind::Function => {
                 Self::enrich_function_node(
                     transport,
@@ -1032,14 +1103,16 @@ impl LspEnricher {
                     refs_by_file,
                     root,
                     language,
-                    has_references,
-                    has_call_hierarchy,
+                    operation == Some(LspQueryOperation::References),
+                    operation == Some(LspQueryOperation::CallHierarchy),
+                    item.id,
+                    telemetry,
                     &mut edges,
                     &mut new_nodes,
                     &mut had_error,
                     error_count,
                 )
-                .await;
+                .await
             }
             NodeKind::Trait => {
                 Self::enrich_trait_node(
@@ -1050,12 +1123,14 @@ impl LspEnricher {
                     node,
                     matching_owned,
                     root,
+                    item.id,
+                    telemetry,
                     &mut edges,
                 )
-                .await;
+                .await
             }
             NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                if has_references {
+                if operation == Some(LspQueryOperation::References) {
                     Self::enrich_type_references(
                         transport,
                         &file_uri,
@@ -1064,19 +1139,46 @@ impl LspEnricher {
                         node,
                         matching_owned,
                         root,
+                        item.id,
+                        telemetry,
                         &mut edges,
                         &mut had_error,
                         error_count,
                     )
-                    .await;
+                    .await
+                } else {
+                    QueryObservation::default()
                 }
             }
             _ => {
-                if matches!(node.id.kind, NodeKind::Other(_)) {
-                    Self::enrich_document_links(transport, &file_uri, node, root, &mut edges).await;
+                if matches!(node.id.kind, NodeKind::Other(_))
+                    && operation == Some(LspQueryOperation::DocumentLinks)
+                {
+                    Self::enrich_document_links(
+                        transport,
+                        &file_uri,
+                        node,
+                        root,
+                        item.id,
+                        telemetry,
+                        &mut edges,
+                    )
+                    .await
+                } else {
+                    QueryObservation::default()
                 }
             }
-        }
+        };
+        had_error |= observation.errors > 0;
+
+        telemetry.record_work_item(
+            item.id,
+            observation.non_empty_responses,
+            edges.len(),
+            started_at.elapsed(),
+            observation.errors,
+            observation.timeouts,
+        );
 
         diagnostics
             .finish(item, !had_error, &edges, &new_nodes)
@@ -1101,14 +1203,20 @@ impl LspEnricher {
         language: &str,
         has_references: bool,
         has_call_hierarchy: bool,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
         new_nodes: &mut Vec<Node>,
         had_error: &mut bool,
         error_count: &AtomicI64,
-    ) {
+    ) -> QueryObservation {
+        let mut observation = QueryObservation::default();
         if !has_call_hierarchy && has_references {
+            observation.scheduled_requests += 1;
+            telemetry.note_requests_started(work_item_id, 1);
             match Self::find_references_p(transport, file_uri, line, col).await {
                 Ok(locations) => {
+                    observation.non_empty_responses += usize::from(!locations.is_empty());
                     for loc in &locations {
                         let ref_path = uri_to_relative_path(&loc.uri, root);
                         let ref_line = loc.range.start.line as usize + 1;
@@ -1142,7 +1250,7 @@ impl LspEnricher {
                                 kind: EdgeKind::Calls,
                                 source: ExtractionSource::Lsp,
                                 confidence: Confidence::Detected,
-                evidence: Vec::new(),
+                                evidence: Vec::new(),
                             });
                         }
                     }
@@ -1150,12 +1258,18 @@ impl LspEnricher {
                 Err(e) => {
                     *had_error = true;
                     error_count.fetch_add(1, Ordering::Relaxed);
+                    observation.record_error(&e);
                     tracing::debug!("references lookup failed for {}: {}", node.id.name, e);
                 }
             }
         } else if has_call_hierarchy {
+            observation.scheduled_requests += 1;
+            telemetry.note_requests_started(work_item_id, 1);
             match Self::prepare_call_hierarchy_p(transport, file_uri, line, col).await {
                 Ok(Some(item)) => {
+                    observation.non_empty_responses += 1;
+                    observation.scheduled_requests += 2;
+                    telemetry.note_requests_started(work_item_id, 2);
                     let (incoming_result, outgoing_result) = tokio::join!(
                         Self::incoming_calls_p(transport, &item),
                         Self::outgoing_calls_p(transport, &item),
@@ -1174,149 +1288,175 @@ impl LspEnricher {
                     }
 
                     // Process incoming calls
-                    if let Ok(calls) = incoming_result {
-                        for call in &calls {
-                            let caller_uri = &call["from"]["uri"];
-                            let caller_name = call["from"]["name"].as_str().unwrap_or("");
-                            let caller_line =
-                                call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0)
-                                    as usize
-                                    + 1;
+                    match incoming_result {
+                        Ok(calls) => {
+                            observation.non_empty_responses += usize::from(!calls.is_empty());
+                            for call in &calls {
+                                let caller_uri = &call["from"]["uri"];
+                                let caller_name = call["from"]["name"].as_str().unwrap_or("");
+                                let caller_line =
+                                    call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0)
+                                        as usize
+                                        + 1;
 
-                            if let Some(uri_str) = caller_uri.as_str() {
-                                let caller_path = if let Some(p) = uri_str.strip_prefix("file://") {
-                                    let abs = PathBuf::from(p);
-                                    abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                } else {
-                                    continue;
-                                };
+                                if let Some(uri_str) = caller_uri.as_str() {
+                                    let caller_path =
+                                        if let Some(p) = uri_str.strip_prefix("file://") {
+                                            let abs = PathBuf::from(p);
+                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
+                                        } else {
+                                            continue;
+                                        };
 
-                                if caller_path.to_string_lossy().contains(".cargo") {
-                                    continue;
-                                }
-
-                                let key = (caller_path.clone(), caller_name.to_string());
-                                let caller_id = match refs_by_file_name.get(&key) {
-                                    Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                    Some(_) => find_enclosing_symbol(
-                                        &matching_refs,
-                                        &caller_path,
-                                        caller_line,
-                                    ),
-                                    None => find_enclosing_symbol(
-                                        &matching_refs,
-                                        &caller_path,
-                                        caller_line,
-                                    ),
-                                };
-
-                                if let Some(caller) = caller_id {
-                                    if caller.name == node.id.name && caller.file == node.id.file {
+                                    if caller_path.to_string_lossy().contains(".cargo") {
                                         continue;
                                     }
-                                    edges.push(Edge {
-                                        from: caller,
-                                        to: node.id.clone(),
-                                        kind: EdgeKind::Calls,
-                                        source: ExtractionSource::Lsp,
-                                        confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
-                                    });
+
+                                    let key = (caller_path.clone(), caller_name.to_string());
+                                    let caller_id = match refs_by_file_name.get(&key) {
+                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+                                        Some(_) => find_enclosing_symbol(
+                                            &matching_refs,
+                                            &caller_path,
+                                            caller_line,
+                                        ),
+                                        None => find_enclosing_symbol(
+                                            &matching_refs,
+                                            &caller_path,
+                                            caller_line,
+                                        ),
+                                    };
+
+                                    if let Some(caller) = caller_id {
+                                        if caller.name == node.id.name
+                                            && caller.file == node.id.file
+                                        {
+                                            continue;
+                                        }
+                                        edges.push(Edge {
+                                            from: caller,
+                                            to: node.id.clone(),
+                                            kind: EdgeKind::Calls,
+                                            source: ExtractionSource::Lsp,
+                                            confidence: Confidence::Confirmed,
+                                            evidence: Vec::new(),
+                                        });
+                                    }
                                 }
                             }
+                        }
+                        Err(e) => {
+                            *had_error = true;
+                            error_count.fetch_add(1, Ordering::Relaxed);
+                            observation.record_error(&e);
+                            tracing::debug!("incomingCalls failed for {}: {}", node.id.name, e);
                         }
                     }
 
                     // Process outgoing calls
-                    if let Ok(calls) = outgoing_result {
-                        for call in &calls {
-                            let callee_uri = &call["to"]["uri"];
-                            let callee_name = call["to"]["name"].as_str().unwrap_or("");
-                            let callee_line =
-                                call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize
-                                    + 1;
+                    match outgoing_result {
+                        Ok(calls) => {
+                            observation.non_empty_responses += usize::from(!calls.is_empty());
+                            for call in &calls {
+                                let callee_uri = &call["to"]["uri"];
+                                let callee_name = call["to"]["name"].as_str().unwrap_or("");
+                                let callee_line =
+                                    call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0)
+                                        as usize
+                                        + 1;
 
-                            if let Some(uri_str) = callee_uri.as_str() {
-                                let callee_path = if let Some(p) = uri_str.strip_prefix("file://") {
-                                    let abs = PathBuf::from(p);
-                                    abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                } else {
-                                    continue;
-                                };
+                                if let Some(uri_str) = callee_uri.as_str() {
+                                    let callee_path =
+                                        if let Some(p) = uri_str.strip_prefix("file://") {
+                                            let abs = PathBuf::from(p);
+                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
+                                        } else {
+                                            continue;
+                                        };
 
-                                if callee_path.to_string_lossy().contains(".cargo") {
-                                    let fqn = call["to"]["detail"]
-                                        .as_str()
-                                        .filter(|s| !s.is_empty())
-                                        .unwrap_or(callee_name);
+                                    if callee_path.to_string_lossy().contains(".cargo") {
+                                        let fqn = call["to"]["detail"]
+                                            .as_str()
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or(callee_name);
 
-                                    if fqn.is_empty() {
+                                        if fqn.is_empty() {
+                                            continue;
+                                        }
+
+                                        let package =
+                                            fqn.split("::").next().unwrap_or(fqn).to_string();
+
+                                        let virtual_id = NodeId {
+                                            root: "external".to_string(),
+                                            file: PathBuf::new(),
+                                            name: fqn.to_string(),
+                                            kind: NodeKind::Function,
+                                        };
+
+                                        let mut meta = std::collections::BTreeMap::new();
+                                        meta.insert("package".to_string(), package.clone());
+                                        meta.insert("virtual".to_string(), "true".to_string());
+                                        new_nodes.push(Node {
+                                            id: virtual_id.clone(),
+                                            language: language.to_string(),
+                                            line_start: 0,
+                                            line_end: 0,
+                                            signature: fqn.to_string(),
+                                            body: String::new(),
+                                            metadata: meta,
+                                            source: ExtractionSource::Lsp,
+                                        });
+
+                                        edges.push(Edge {
+                                            from: node.id.clone(),
+                                            to: virtual_id,
+                                            kind: EdgeKind::Calls,
+                                            source: ExtractionSource::Lsp,
+                                            confidence: Confidence::Detected,
+                                            evidence: Vec::new(),
+                                        });
                                         continue;
                                     }
 
-                                    let package = fqn.split("::").next().unwrap_or(fqn).to_string();
-
-                                    let virtual_id = NodeId {
-                                        root: "external".to_string(),
-                                        file: PathBuf::new(),
-                                        name: fqn.to_string(),
-                                        kind: NodeKind::Function,
+                                    let key = (callee_path.clone(), callee_name.to_string());
+                                    let callee_id = match refs_by_file_name.get(&key) {
+                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+                                        Some(_) => find_enclosing_symbol(
+                                            &matching_refs,
+                                            &callee_path,
+                                            callee_line,
+                                        ),
+                                        None => find_enclosing_symbol(
+                                            &matching_refs,
+                                            &callee_path,
+                                            callee_line,
+                                        ),
                                     };
 
-                                    let mut meta = std::collections::BTreeMap::new();
-                                    meta.insert("package".to_string(), package.clone());
-                                    meta.insert("virtual".to_string(), "true".to_string());
-                                    new_nodes.push(Node {
-                                        id: virtual_id.clone(),
-                                        language: language.to_string(),
-                                        line_start: 0,
-                                        line_end: 0,
-                                        signature: fqn.to_string(),
-                                        body: String::new(),
-                                        metadata: meta,
-                                        source: ExtractionSource::Lsp,
-                                    });
-
-                                    edges.push(Edge {
-                                        from: node.id.clone(),
-                                        to: virtual_id,
-                                        kind: EdgeKind::Calls,
-                                        source: ExtractionSource::Lsp,
-                                        confidence: Confidence::Detected,
-                evidence: Vec::new(),
-                                    });
-                                    continue;
-                                }
-
-                                let key = (callee_path.clone(), callee_name.to_string());
-                                let callee_id = match refs_by_file_name.get(&key) {
-                                    Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                    Some(_) => find_enclosing_symbol(
-                                        &matching_refs,
-                                        &callee_path,
-                                        callee_line,
-                                    ),
-                                    None => find_enclosing_symbol(
-                                        &matching_refs,
-                                        &callee_path,
-                                        callee_line,
-                                    ),
-                                };
-
-                                if let Some(callee) = callee_id {
-                                    if callee.name == node.id.name && callee.file == node.id.file {
-                                        continue;
+                                    if let Some(callee) = callee_id {
+                                        if callee.name == node.id.name
+                                            && callee.file == node.id.file
+                                        {
+                                            continue;
+                                        }
+                                        edges.push(Edge {
+                                            from: node.id.clone(),
+                                            to: callee,
+                                            kind: EdgeKind::Calls,
+                                            source: ExtractionSource::Lsp,
+                                            confidence: Confidence::Confirmed,
+                                            evidence: Vec::new(),
+                                        });
                                     }
-                                    edges.push(Edge {
-                                        from: node.id.clone(),
-                                        to: callee,
-                                        kind: EdgeKind::Calls,
-                                        source: ExtractionSource::Lsp,
-                                        confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
-                                    });
                                 }
                             }
+                        }
+                        Err(e) => {
+                            *had_error = true;
+                            error_count.fetch_add(1, Ordering::Relaxed);
+                            observation.record_error(&e);
+                            tracing::debug!("outgoingCalls failed for {}: {}", node.id.name, e);
                         }
                     }
                 }
@@ -1324,10 +1464,12 @@ impl LspEnricher {
                 Err(e) => {
                     *had_error = true;
                     error_count.fetch_add(1, Ordering::Relaxed);
+                    observation.record_error(&e);
                     tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
                 }
             }
         }
+        observation
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1339,10 +1481,18 @@ impl LspEnricher {
         node: &Node,
         matching_owned: &Arc<Vec<Node>>,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
-    ) {
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
         match Self::find_implementations_p(transport, file_uri, line, col).await {
             Ok(locations) => {
+                observation.non_empty_responses += usize::from(!locations.is_empty());
                 let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                 for loc in locations {
                     let impl_path = uri_to_relative_path(&loc.uri, root);
@@ -1367,15 +1517,17 @@ impl LspEnricher {
                             kind: EdgeKind::Implements,
                             source: ExtractionSource::Lsp,
                             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+                            evidence: Vec::new(),
                         });
                     }
                 }
             }
             Err(e) => {
+                observation.record_error(&e);
                 tracing::debug!("Implementation lookup failed for {}: {}", node.id.name, e);
             }
         }
+        observation
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1387,12 +1539,20 @@ impl LspEnricher {
         node: &Node,
         matching_owned: &Arc<Vec<Node>>,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
         had_error: &mut bool,
         error_count: &AtomicI64,
-    ) {
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
         match Self::find_references_p(transport, file_uri, line, col).await {
             Ok(locations) => {
+                observation.non_empty_responses += usize::from(!locations.is_empty());
                 let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                 let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
                 for n in &matching_refs {
@@ -1430,7 +1590,7 @@ impl LspEnricher {
                             kind: EdgeKind::ReferencedBy,
                             source: ExtractionSource::Lsp,
                             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
+                            evidence: Vec::new(),
                         });
                     }
                 }
@@ -1438,9 +1598,11 @@ impl LspEnricher {
             Err(e) => {
                 *had_error = true;
                 error_count.fetch_add(1, Ordering::Relaxed);
+                observation.record_error(&e);
                 tracing::debug!("textDocument/references failed for {}: {}", node.id.name, e);
             }
         }
+        observation
     }
 
     async fn enrich_document_links(
@@ -1448,59 +1610,75 @@ impl LspEnricher {
         file_uri: &lsp_types::Uri,
         node: &Node,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
-    ) {
-        if let Ok(links) = Self::document_links_p(transport, file_uri).await {
-            for link in &links {
-                if let Some(target) = link.get("target").and_then(|t| t.as_str())
-                    && let Some(target_path) = target.strip_prefix("file://")
-                {
-                    let rel_target = PathBuf::from(target_path);
-                    let rel_target = rel_target
-                        .strip_prefix(root)
-                        .unwrap_or(&rel_target)
-                        .to_path_buf();
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
+        match Self::document_links_p(transport, file_uri).await {
+            Ok(links) => {
+                observation.non_empty_responses += usize::from(!links.is_empty());
+                for link in &links {
+                    if let Some(target) = link.get("target").and_then(|t| t.as_str())
+                        && let Some(target_path) = target.strip_prefix("file://")
+                    {
+                        let rel_target = PathBuf::from(target_path);
+                        let rel_target = rel_target
+                            .strip_prefix(root)
+                            .unwrap_or(&rel_target)
+                            .to_path_buf();
 
-                    if rel_target.to_string_lossy().starts_with("http") {
-                        continue;
+                        if rel_target.to_string_lossy().starts_with("http") {
+                            continue;
+                        }
+
+                        let target_id = NodeId {
+                            root: node.id.root.clone(),
+                            file: rel_target.clone(),
+                            name: rel_target
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            kind: NodeKind::Module,
+                        };
+
+                        edges.push(Edge {
+                            from: node.id.clone(),
+                            to: target_id,
+                            kind: EdgeKind::DependsOn,
+                            source: ExtractionSource::Lsp,
+                            confidence: Confidence::Confirmed,
+                            evidence: Vec::new(),
+                        });
                     }
-
-                    let target_id = NodeId {
-                        root: node.id.root.clone(),
-                        file: rel_target.clone(),
-                        name: rel_target
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        kind: NodeKind::Module,
-                    };
-
-                    edges.push(Edge {
-                        from: node.id.clone(),
-                        to: target_id,
-                        kind: EdgeKind::DependsOn,
-                        source: ExtractionSource::Lsp,
-                        confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
-                    });
                 }
             }
+            Err(e) => observation.record_error(&e),
         }
+        observation
     }
 
     // ------------------------------------------------------------------
     // Pass 2: type hierarchy (sequential -- strike counting needs order)
     // ------------------------------------------------------------------
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_pass2_type_hierarchy(
         &self,
         transport: &Arc<PipelinedTransport>,
         root: &Path,
         matching_nodes: &[&Node],
-        mut has_type_hierarchy: bool,
+        capabilities: LspServerCapabilities,
+        budget: &mut LspQueryBudget,
+        telemetry: &LspQueryTelemetry,
         mut type_hierarchy_strikes: u32,
         result: &mut EnrichmentResult,
     ) -> (bool, u32) {
+        let mut has_type_hierarchy = capabilities.type_hierarchy;
         if !has_type_hierarchy {
             return (has_type_hierarchy, type_hierarchy_strikes);
         }
@@ -1511,6 +1689,14 @@ impl LspEnricher {
                 matches!(
                     n.id.kind,
                     NodeKind::Trait | NodeKind::Struct | NodeKind::Enum
+                )
+            })
+            .filter(|node| {
+                self.query_profile.admits(
+                    node,
+                    LspQueryOperation::TypeHierarchy,
+                    capabilities,
+                    budget,
                 )
             })
             .copied()
@@ -1528,6 +1714,8 @@ impl LspEnricher {
         let mut pass2_last_count = 0u64;
 
         for node in &type_nodes {
+            let query_started = Instant::now();
+            let edges_before_query = result.added_edges.len();
             let abs_path = root.join(&node.id.file);
             let file_uri = match path_to_uri(&abs_path) {
                 Ok(u) => u,
@@ -1535,7 +1723,7 @@ impl LspEnricher {
             };
             let (line, col) = Self::node_lsp_position(node);
 
-            let ok = Self::enrich_type_hierarchy_p(
+            let (ok, observation) = Self::enrich_type_hierarchy_p(
                 transport,
                 &file_uri,
                 line,
@@ -1546,6 +1734,15 @@ impl LspEnricher {
                 result,
             )
             .await;
+
+            let emitted_edges = result.added_edges.len() - edges_before_query;
+            record_type_hierarchy_observation(
+                telemetry,
+                node,
+                observation,
+                emitted_edges,
+                query_started.elapsed(),
+            );
 
             Self::update_type_hierarchy_strikes(
                 ok,
@@ -1887,6 +2084,80 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn type_hierarchy_telemetry_uses_all_observed_requests() {
+        let profile = super::super::policy::LspQueryProfile::new("rust", "rust-analyzer");
+        let telemetry = LspQueryTelemetry::new(&profile);
+        let node = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "Child".to_string(),
+                kind: NodeKind::Struct,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 2,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        record_type_hierarchy_observation(
+            &telemetry,
+            &node,
+            QueryObservation {
+                scheduled_requests: 2,
+                non_empty_responses: 2,
+                ..Default::default()
+            },
+            1,
+            Duration::from_millis(5),
+        );
+
+        let metrics = telemetry.snapshot();
+        assert_eq!(metrics[0].scheduled_requests, 2);
+        assert_eq!(metrics[0].non_empty_responses, 2);
+        assert_eq!(metrics[0].emitted_edges, 1);
+    }
+
+    #[test]
+    fn document_link_work_is_deduplicated_by_file() {
+        let make_node = |name: &str, file: &str| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 2,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut seen = HashSet::new();
+
+        assert!(retain_unique_document_link_file(
+            &make_node("first", "docs/one.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
+        assert!(!retain_unique_document_link_file(
+            &make_node("second", "docs/one.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
+        assert!(retain_unique_document_link_file(
+            &make_node("third", "docs/two.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
+    }
+
     #[tokio::test]
     async fn did_open_coordinator_dedupes_concurrent_same_file() {
         let coordinator = Arc::new(DidOpenCoordinator::new("test-lsp".to_string()));
@@ -1989,7 +2260,7 @@ mod tests {
                     metadata: BTreeMap::new(),
                     source: ExtractionSource::Lsp,
                 },
-                requested_operations: vec!["requesting_references"],
+                requested_operations: vec![LspQueryOperation::References],
                 attempt_count: 1,
             };
             diagnostics.set_phase(&item, "requesting_references").await;
@@ -2021,7 +2292,6 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
         };
         let mut edges = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -2054,7 +2324,7 @@ mod tests {
             .map(|id| LspPass1WorkItem {
                 id,
                 node: make_node(id),
-                requested_operations: vec!["textDocument/references"],
+                requested_operations: vec![LspQueryOperation::References],
                 attempt_count: 1,
             })
             .collect::<Vec<_>>();
@@ -2084,7 +2354,6 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
         };
         initial
             .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
@@ -2170,7 +2439,7 @@ mod tests {
         let work_items = vec![LspPass1WorkItem {
             id: 0,
             node,
-            requested_operations: vec!["textDocument/references"],
+            requested_operations: vec![LspQueryOperation::References],
             attempt_count: 3,
         }];
 

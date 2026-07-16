@@ -273,9 +273,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             if !node_is_in_lsp_scope(node, dirty_set, self.planned_node_ids.as_deref()) {
                 continue;
             }
-            if self.planned_node_ids.is_some()
-                && !emitted_planned_ids.insert(node.stable_id())
-            {
+            if self.planned_node_ids.is_some() && !emitted_planned_ids.insert(node.stable_id()) {
                 continue;
             }
             by_lang
@@ -573,6 +571,7 @@ impl ExtractionConsumer for EnrichmentFinalizer {
             lsp_edges,
             lsp_nodes,
             updated_nodes,
+            enrichment_diagnostics,
         } = event
         else {
             return Ok(vec![]);
@@ -607,7 +606,12 @@ impl ExtractionConsumer for EnrichmentFinalizer {
             );
         }
 
-        self.run_passes(slug, all_nodes, all_edges)
+        self.run_passes(
+            slug,
+            all_nodes,
+            all_edges,
+            Arc::clone(enrichment_diagnostics),
+        )
     }
 
     /// `EnrichmentFinalizer` reads the filesystem (api_link, manifest, etc.).
@@ -623,6 +627,7 @@ impl EnrichmentFinalizer {
         slug: &str,
         mut all_nodes: Vec<Node>,
         mut all_edges: Vec<crate::graph::Edge>,
+        enrichment_diagnostics: Arc<[String]>,
     ) -> anyhow::Result<Vec<ExtractionEvent>> {
         let nodes_before = all_nodes.len();
         let edges_before = all_edges.len();
@@ -899,6 +904,7 @@ impl EnrichmentFinalizer {
             nodes: nodes_arc,
             edges: edges_arc,
             detected_frameworks,
+            enrichment_diagnostics,
         });
 
         Ok(follow_ons)
@@ -1502,18 +1508,27 @@ impl ExtractionConsumer for LspConsumer {
                     enrichment.new_nodes.len(),
                     enrichment.updated_nodes.len(),
                 );
-                Ok(vec![ExtractionEvent::EnrichmentComplete {
-                    slug: slug.clone(),
-                    language: language.clone(),
-                    added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
-                    new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
-                    updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
-                    server_name: Some(self.enricher.name().to_string()),
-                    error_count: enrichment.error_count,
-                    server_missing,
-                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
-                    aborted: enrichment.aborted,
-                }])
+                let metrics = Arc::from(enrichment.lsp_query_metrics.into_boxed_slice());
+                Ok(vec![
+                    ExtractionEvent::EnrichmentComplete {
+                        slug: slug.clone(),
+                        language: language.clone(),
+                        added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
+                        new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                        updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
+                        server_name: Some(self.enricher.name().to_string()),
+                        error_count: enrichment.error_count,
+                        server_missing,
+                        remediation: self.enricher.toolchain_remediation().map(str::to_string),
+                        aborted: enrichment.aborted,
+                        diagnostic: enrichment.diagnostic,
+                    },
+                    ExtractionEvent::LspQueryMetrics {
+                        slug: slug.clone(),
+                        language: language.clone(),
+                        metrics,
+                    },
+                ])
             }
             Err(e) => {
                 // LSP enrichment failure is non-fatal: emit EnrichmentComplete with
@@ -1526,20 +1541,16 @@ impl ExtractionConsumer for LspConsumer {
                     e,
                 );
                 let err_text = e.to_string();
-                let aborted = err_text.contains("aborted")
+                let abort_like = err_text.contains("aborted")
                     || err_text.contains("no progress")
                     || err_text.contains("timed out")
                     || err_text.contains("zero LSP edges");
                 let server_missing = is_lsp_server_not_found_error(&err_text);
+                // Every server failure other than a genuinely missing optional server is a
+                // terminal degraded completion. Do not let message wording decide whether the
+                // failure remains visible to readiness and foreground exit contracts.
+                let aborted = !server_missing;
                 let error_count = usize::from(!server_missing);
-                if aborted {
-                    anyhow::bail!(
-                        "LSP enrichment aborted for {} root {}: {}",
-                        self.language,
-                        slug,
-                        err_text
-                    );
-                }
                 Ok(vec![ExtractionEvent::EnrichmentComplete {
                     slug: slug.clone(),
                     language: language.clone(),
@@ -1551,6 +1562,13 @@ impl ExtractionConsumer for LspConsumer {
                     server_missing,
                     remediation: self.enricher.toolchain_remediation().map(str::to_string),
                     aborted,
+                    diagnostic: aborted.then_some(format!(
+                        "LSP enrichment {} for {} root {}: {}",
+                        if abort_like { "aborted" } else { "failed" },
+                        self.language,
+                        slug,
+                        err_text
+                    )),
                 }])
             }
         }
@@ -1612,6 +1630,8 @@ struct GateState {
     /// Accumulated metadata patches from all `EnrichmentComplete` events.
     /// Each patch is `(node_stable_id, key-value map)`.
     updated_nodes: Vec<(String, std::collections::BTreeMap<String, String>)>,
+    /// Actionable diagnostics from degraded enrichments.
+    enrichment_diagnostics: Vec<String>,
     /// Whether `AllEnrichmentsDone` has already been emitted (guards against double-emit).
     fired: bool,
 }
@@ -1632,6 +1652,7 @@ impl AllEnrichmentsGate {
                 lsp_edges: Vec::new(),
                 lsp_nodes: Vec::new(),
                 updated_nodes: Vec::new(),
+                enrichment_diagnostics: Vec::new(),
                 fired: false,
             }),
             skip_lsp: false,
@@ -1656,6 +1677,7 @@ impl AllEnrichmentsGate {
                 lsp_edges: Vec::new(),
                 lsp_nodes: Vec::new(),
                 updated_nodes: Vec::new(),
+                enrichment_diagnostics: Vec::new(),
                 fired: false,
             }),
             skip_lsp: true,
@@ -1712,11 +1734,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
                         if !n.language.is_empty()
-                            && node_is_in_lsp_scope(
-                                n,
-                                dirty_set,
-                                self.planned_node_ids.as_deref(),
-                            )
+                            && node_is_in_lsp_scope(n, dirty_set, self.planned_node_ids.as_deref())
                         {
                             seen.insert(n.language.clone());
                         }
@@ -1739,11 +1757,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     for n in nodes.iter() {
                         if !n.language.is_empty()
                             && supported.contains(&n.language)
-                            && node_is_in_lsp_scope(
-                                n,
-                                dirty_set,
-                                self.planned_node_ids.as_deref(),
-                            )
+                            && node_is_in_lsp_scope(n, dirty_set, self.planned_node_ids.as_deref())
                         {
                             seen.insert(n.language.clone());
                         }
@@ -1768,6 +1782,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 state.lsp_edges.clear();
                 state.lsp_nodes.clear();
                 state.updated_nodes.clear();
+                state.enrichment_diagnostics.clear();
                 state.fired = false;
 
                 // If there are no supported languages, emit AllEnrichmentsDone immediately
@@ -1785,6 +1800,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         lsp_edges: Arc::from([]),
                         lsp_nodes: Arc::from([]),
                         updated_nodes: Arc::from([]),
+                        enrichment_diagnostics: Arc::from([]),
                     }]);
                 }
 
@@ -1796,6 +1812,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 added_edges,
                 new_nodes,
                 updated_nodes,
+                diagnostic,
                 ..
             } => {
                 // Guard: only process if we have state initialised for this slug.
@@ -1816,6 +1833,9 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 state.lsp_edges.extend_from_slice(added_edges);
                 state.lsp_nodes.extend_from_slice(new_nodes);
                 state.updated_nodes.extend_from_slice(updated_nodes);
+                if let Some(diagnostic) = diagnostic {
+                    state.enrichment_diagnostics.push(diagnostic.clone());
+                }
 
                 tracing::debug!(
                     "AllEnrichmentsGate: root '{}' — {}/{} enrichments complete",
@@ -1835,6 +1855,9 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         Arc::from(std::mem::take(&mut state.lsp_nodes).into_boxed_slice());
                     let updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]> =
                         Arc::from(std::mem::take(&mut state.updated_nodes).into_boxed_slice());
+                    let enrichment_diagnostics: Arc<[String]> = Arc::from(
+                        std::mem::take(&mut state.enrichment_diagnostics).into_boxed_slice(),
+                    );
                     tracing::info!(
                         "AllEnrichmentsGate: root '{}' — all {} enrichment(s) done, \
                          {} LSP edges, {} LSP nodes, {} metadata patches",
@@ -1851,6 +1874,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         lsp_edges,
                         lsp_nodes,
                         updated_nodes,
+                        enrichment_diagnostics,
                     }]);
                 }
 
@@ -2333,26 +2357,15 @@ pub fn build_builtin_bus(
     // completes without waiting for LSP servers. The caller spawns LSP enrichment
     // in background and ArcSwaps the enriched graph when it finishes.
     if !skip_lsp {
-        // Build the enricher registry once and extract individual enrichers per language.
-        // Each `LspConsumer` owns an `Arc<dyn Enricher>` so it doesn't re-instantiate.
-        let enricher_registry = crate::extract::EnricherRegistry::with_builtins();
         let lsp_roots: Arc<Vec<(String, PathBuf)>> = Arc::new(root_pairs.clone());
 
-        // Build enrichers indexed by language for O(1) lookup.
-        // EnricherRegistry does not expose individual enrichers, so we rebuild
-        // per-language enrichers via LspEnricher::new (same as EnricherRegistry internals).
-        // This avoids exposing registry internals and keeps consumers self-contained.
-        let mut supported_languages: Vec<String> = enricher_registry
-            .supported_languages()
-            .into_iter()
+        let mut supported_languages: Vec<String> = crate::extract::lsp::builtin_lsp_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.language().to_string())
             .collect();
         supported_languages.sort(); // deterministic registration order
 
         for lang in &supported_languages {
-            // Build a single-language enricher for this consumer.
-            // The enricher is the same type as what EnricherRegistry uses internally.
-            // We use `EnricherRegistry::with_builtins()` filtered to this language
-            // rather than duplicating the language-server config table.
             let single_lang_enricher = build_single_language_enricher(lang);
             bus.register(Box::new(LspConsumer {
                 language: lang.clone(),
@@ -2404,120 +2417,11 @@ pub fn build_builtin_bus(
 
 /// Build a single-language `Arc<dyn Enricher>` for use in `LspConsumer`.
 ///
-/// Constructs an `LspEnricher` with the same configuration as `EnricherRegistry::with_builtins()`
-/// for the given language. Returns a no-op enricher if the language is not recognised.
+/// Construct a built-in enricher through the same descriptor factory used by
+/// [`crate::extract::EnricherRegistry`].
 fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enricher> {
-    use crate::extract::lsp::LspEnricher;
-
-    // Mirror the server table from EnricherRegistry::with_builtins().
-    // Keep this in sync with that table — a test in consumers::tests verifies parity.
-    let servers: &[(&str, &str, &[&str], &[&str])] = &[
-        ("rust", "rust-analyzer", &[], &["rs"]),
-        ("python", "pyright-langserver", &["--stdio"], &["py"]),
-        (
-            "typescript",
-            "typescript-language-server",
-            &["--stdio"],
-            &["ts", "tsx", "js", "jsx"],
-        ),
-        ("go", "gopls", &["serve"], &["go"]),
-        ("markdown", "marksman", &["server"], &["md"]),
-        (
-            "c-cpp",
-            "clangd",
-            &[],
-            &["c", "cc", "cpp", "cxx", "h", "hpp"],
-        ),
-        ("java", "jdtls", &[], &["java"]),
-        ("ruby", "solargraph", &["stdio"], &["rb"]),
-        ("csharp", "csharp-ls", &[], &["cs"]),
-        ("swift", "sourcekit-lsp", &[], &["swift"]),
-        ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
-        ("lua", "lua-language-server", &[], &["lua"]),
-        ("zig", "zls", &[], &["zig"]),
-        ("elixir", "elixir-ls", &[], &["ex", "exs"]),
-        ("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
-        ("ocaml", "ocamllsp", &[], &["ml", "mli"]),
-        ("scala", "metals", &[], &["scala", "sc"]),
-        ("dart", "dart", &["language-server"], &["dart"]),
-        (
-            "r",
-            "R",
-            &["--no-echo", "-e", "languageserver::run()"],
-            &["r", "R"],
-        ),
-        (
-            "julia",
-            "julia",
-            &[
-                "--startup-file=no",
-                "-e",
-                "using LanguageServer; runserver()",
-            ],
-            &["jl"],
-        ),
-        ("php", "intelephense", &["--stdio"], &["php"]),
-        (
-            "css",
-            "vscode-css-languageserver",
-            &["--stdio"],
-            &["css", "scss", "less"],
-        ),
-        (
-            "html",
-            "vscode-html-languageserver",
-            &["--stdio"],
-            &["html", "htm"],
-        ),
-        (
-            "yaml",
-            "yaml-language-server",
-            &["--stdio"],
-            &["yaml", "yml"],
-        ),
-        (
-            "json",
-            "vscode-json-languageserver",
-            &["--stdio"],
-            &["json"],
-        ),
-        ("toml", "taplo", &["lsp", "stdio"], &["toml"]),
-        ("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
-        ("nix", "nil", &[], &["nix"]),
-        ("vue", "vue-language-server", &["--stdio"], &["vue"]),
-        ("svelte", "svelteserver", &["--stdio"], &["svelte"]),
-        ("erlang", "erlang_ls", &[], &["erl", "hrl"]),
-        ("gleam", "gleam", &["lsp"], &["gleam"]),
-        ("nim", "nimlsp", &[], &["nim"]),
-        ("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
-        ("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"]),
-        ("protobuf", "buf", &["lsp"], &["proto"]),
-        ("latex", "texlab", &[], &["tex", "bib"]),
-        ("typst", "tinymist", &[], &["typ"]),
-    ];
-
-    for &(lang, cmd, args, exts) in servers {
-        if lang == language {
-            let enricher = LspEnricher::new(lang, cmd, args, exts);
-            let enricher = match lang {
-                "python" => enricher.with_settings(serde_json::json!({
-                    "python": { "analysis": { "autoSearchPaths": true } }
-                })),
-                "csharp" => enricher
-                    .with_toolchain_remediation(crate::extract::lsp::CSHARP_TOOLCHAIN_REMEDIATION),
-                _ => enricher,
-            };
-            let enricher = match lang {
-                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
-                "python" => enricher.with_config_file("pyproject.toml"),
-                "go" => enricher.with_config_file("go.mod"),
-                "rust" => enricher.with_config_file("Cargo.toml"),
-                "java" => enricher.with_config_file("pom.xml"),
-                "kotlin" => enricher.with_config_file("build.gradle.kts"),
-                _ => enricher,
-            };
-            return Arc::new(enricher);
-        }
+    if let Some(enricher) = build_single_language_lsp_enricher(language) {
+        return Arc::new(enricher);
     }
 
     // Fallback: no-op enricher for unrecognised languages.
@@ -2529,6 +2433,10 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
     Arc::new(NoopEnricher {
         language: language.to_string(),
     })
+}
+
+fn build_single_language_lsp_enricher(language: &str) -> Option<crate::extract::lsp::LspEnricher> {
+    crate::extract::lsp::builtin_lsp_enricher(language)
 }
 
 /// No-op enricher used as a fallback when a language is not in the server table.
@@ -2586,7 +2494,8 @@ impl crate::extract::Enricher for NoopEnricher {
 ///   `BusOptions::default()` for stub/test mode (all fields `None`).
 ///
 /// # Returns
-/// `Ok((nodes, edges, detected_frameworks))` — the enriched graph and framework set.
+/// `Ok((nodes, edges, detected_frameworks, enrichment_diagnostics))` — the enriched
+/// graph, framework set, and any explicit degraded-enrichment diagnostics.
 ///
 /// # Errors
 /// Returns `Err` if the bus does not produce a `PassesComplete` event.
@@ -2604,6 +2513,7 @@ pub async fn emit_enrichment_pipeline(
     Vec<crate::graph::Node>,
     Vec<crate::graph::Edge>,
     std::collections::HashSet<String>,
+    Vec<String>,
 )> {
     use crate::extract::event_bus::ExtractionEvent;
 
@@ -2635,8 +2545,14 @@ pub async fn emit_enrichment_pipeline(
             nodes,
             edges,
             detected_frameworks,
+            enrichment_diagnostics,
             ..
-        }) => Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks)),
+        }) => Ok((
+            nodes.to_vec(),
+            edges.to_vec(),
+            detected_frameworks,
+            enrichment_diagnostics.to_vec(),
+        )),
         _ => {
             anyhow::bail!(
                 "EventBus enrichment pipeline: PassesComplete event absent — \
@@ -2932,6 +2848,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         };
         let finished = gate.on_event(&complete).await.unwrap();
         assert_eq!(finished.len(), 1);
@@ -3095,6 +3012,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_event_bus_and_registry_factory_policy_parity() {
+        let descriptor = crate::extract::lsp::builtin_lsp_descriptors()
+            .iter()
+            .find(|descriptor| descriptor.language() == "python")
+            .expect("python descriptor");
+        let registry_path = descriptor.build();
+        let event_bus_path =
+            build_single_language_lsp_enricher("python").expect("python EventBus enricher");
+
+        assert_eq!(
+            event_bus_path.enrichable_kinds(),
+            registry_path.enrichable_kinds(),
+            "both construction paths must apply the descriptor's eligibility policy"
+        );
+        let python_kinds = event_bus_path
+            .enrichable_kinds()
+            .expect("Python must have an eligibility filter");
+        assert_eq!(python_kinds.len(), 2);
+        assert!(python_kinds.contains(&crate::graph::NodeKind::Function));
+        assert!(python_kinds.contains(&crate::graph::NodeKind::Trait));
+        assert_eq!(
+            event_bus_path.allows_declared_const_references(),
+            registry_path.allows_declared_const_references(),
+            "both construction paths must share declared-Const policy"
+        );
+        assert!(
+            !event_bus_path.allows_declared_const_references(),
+            "Pyright declared-Const references remain disabled after the #768 probe"
+        );
+        assert_eq!(
+            crate::extract::Enricher::name(&event_bus_path),
+            crate::extract::Enricher::name(&registry_path)
+        );
+        assert_eq!(
+            crate::extract::Enricher::config_file_hint(&event_bus_path),
+            crate::extract::Enricher::config_file_hint(&registry_path)
+        );
+        assert_eq!(
+            crate::extract::Enricher::toolchain_remediation(&event_bus_path),
+            crate::extract::Enricher::toolchain_remediation(&registry_path)
+        );
+    }
+
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
     #[tokio::test]
     async fn test_builtin_bus_returns_scan_stats_handle() {
@@ -3116,6 +3077,7 @@ mod tests {
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
             detected_frameworks: std::collections::HashSet::new(),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         })
         .await;
         assert!(
@@ -3135,6 +3097,7 @@ mod tests {
             lsp_edges: std::sync::Arc::from([]),
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         };
         let follow_ons = consumer.on_event(&event).await.unwrap();
         assert!(
@@ -3164,6 +3127,7 @@ mod tests {
             lsp_edges: std::sync::Arc::from([]),
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert!(
@@ -3191,6 +3155,7 @@ mod tests {
             lsp_edges: std::sync::Arc::from([]),
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert!(
@@ -3392,17 +3357,178 @@ mod tests {
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&matching).await.unwrap();
-        // No tokio runtime in sync test context: the consumer falls back to the no-op path
-        // and still emits EnrichmentComplete (with empty edges).
+        // Successful LSP enrichment emits both graph completion and query-yield telemetry.
         assert_eq!(
             result.len(),
-            1,
-            "LspConsumer must emit EnrichmentComplete for its language"
+            2,
+            "LspConsumer must emit completion and query metrics for its language"
         );
         assert!(
-            matches!(result[0], ExtractionEvent::EnrichmentComplete { .. }),
+            result
+                .iter()
+                .any(|event| matches!(event, ExtractionEvent::EnrichmentComplete { .. })),
             "LspConsumer must emit EnrichmentComplete"
         );
+        assert!(
+            result
+                .iter()
+                .any(|event| matches!(event, ExtractionEvent::LspQueryMetrics { .. })),
+            "LspConsumer must emit LspQueryMetrics"
+        );
+    }
+
+    /// Regression for #766: an aborted enricher is a degraded completion, not a
+    /// missing pipeline event. Safely produced output and the original diagnostic
+    /// must survive the gate and finalizer.
+    #[tokio::test]
+    async fn aborted_lsp_completion_preserves_partial_output_and_finalizes_graph() {
+        use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        struct AbortingEnricher {
+            edge: Edge,
+            virtual_node: Node,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::extract::Enricher for AbortingEnricher {
+            fn languages(&self) -> &[&str] {
+                &["rust"]
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            async fn enrich(
+                &self,
+                _nodes: &[Node],
+                _index: &crate::graph::index::GraphIndex,
+                _repo_root: &std::path::Path,
+            ) -> anyhow::Result<crate::extract::EnrichmentResult> {
+                Ok(crate::extract::EnrichmentResult {
+                    added_edges: vec![self.edge.clone()],
+                    new_nodes: vec![self.virtual_node.clone()],
+                    any_enricher_ran: true,
+                    error_count: 3,
+                    aborted: true,
+                    diagnostic: Some(
+                        "forced no-progress abort after 7 attempted nodes".to_string(),
+                    ),
+                    ..Default::default()
+                })
+            }
+
+            fn name(&self) -> &str {
+                "test-lsp"
+            }
+        }
+
+        let base = Node {
+            id: NodeId {
+                root: "fixture".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "caller".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn caller()".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let virtual_node = Node {
+            id: NodeId {
+                root: "external".into(),
+                file: PathBuf::new(),
+                name: "partial_target".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 0,
+            line_end: 0,
+            signature: "partial_target".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Lsp,
+        };
+        let partial_edge = Edge {
+            from: base.id.clone(),
+            to: virtual_node.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+        let root_event = ExtractionEvent::RootExtracted {
+            slug: "fixture".into(),
+            path: PathBuf::from("."),
+            nodes: Arc::from(vec![base.clone()].into_boxed_slice()),
+            edges: Arc::from([]),
+            dirty_slugs: None,
+        };
+        assert!(gate.on_event(&root_event).await.unwrap().is_empty());
+
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(AbortingEnricher {
+                edge: partial_edge.clone(),
+                virtual_node: virtual_node.clone(),
+            }),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+        };
+        let completions = consumer
+            .on_event(&ExtractionEvent::LanguageDetected {
+                slug: "fixture".into(),
+                language: "rust".into(),
+                nodes: Arc::from(vec![base].into_boxed_slice()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            &completions[0],
+            ExtractionEvent::EnrichmentComplete {
+                aborted: true,
+                diagnostic: Some(detail),
+                added_edges,
+                new_nodes,
+                ..
+            } if detail == "forced no-progress abort after 7 attempted nodes"
+                && added_edges.len() == 1 && new_nodes.len() == 1
+        ));
+
+        let all_done = gate.on_event(&completions[0]).await.unwrap();
+        assert_eq!(all_done.len(), 1, "gate must complete after degraded abort");
+        let finalizer = EnrichmentFinalizer::new(vec![], "fixture".into());
+        let finalized = finalizer.on_event(&all_done[0]).await.unwrap();
+        let passes = finalized
+            .iter()
+            .find(|event| matches!(event, ExtractionEvent::PassesComplete { .. }))
+            .expect("finalizer must emit PassesComplete after degraded abort");
+        match passes {
+            ExtractionEvent::PassesComplete {
+                nodes,
+                edges,
+                enrichment_diagnostics,
+                ..
+            } => {
+                assert!(nodes.iter().any(|node| node.id.name == "partial_target"));
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.stable_id() == partial_edge.stable_id())
+                );
+                assert_eq!(
+                    enrichment_diagnostics.as_ref(),
+                    ["forced no-progress abort after 7 attempted nodes"]
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]
@@ -3503,6 +3629,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         assert_eq!(
@@ -3585,6 +3712,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         // Should fire now: expected=1 (rust), received=1 (rust).
@@ -3665,6 +3793,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
         assert!(
@@ -3684,6 +3813,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         };
         let result = gate.on_event(&python_done).await.unwrap();
         assert_eq!(
@@ -3735,6 +3865,7 @@ mod tests {
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
             detected_frameworks: HashSet::new(),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "LanceDBConsumer stub emits nothing");
@@ -3768,7 +3899,7 @@ mod tests {
     /// Verify emit_enrichment_pipeline returns Ok(PassesComplete data) on empty input.
     #[tokio::test]
     async fn test_emit_enrichment_pipeline_empty_input() {
-        let (nodes, edges, frameworks) = super::emit_enrichment_pipeline(
+        let (nodes, edges, frameworks, _diagnostics) = super::emit_enrichment_pipeline(
             vec![],
             vec![],
             vec![],
@@ -3807,7 +3938,7 @@ mod tests {
         };
 
         let input_nodes = vec![node];
-        let (out_nodes, _out_edges, _frameworks) = super::emit_enrichment_pipeline(
+        let (out_nodes, _out_edges, _frameworks, _diagnostics) = super::emit_enrichment_pipeline(
             input_nodes,
             vec![],
             vec![],
@@ -3903,7 +4034,7 @@ mod tests {
             source: ExtractionSource::TreeSitter,
         };
 
-        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+        let (out_nodes, _edges, _frameworks, _diagnostics) = super::emit_enrichment_pipeline(
             vec![import_node],
             vec![],
             vec![("client".into(), PathBuf::from("."))],
@@ -3966,7 +4097,7 @@ mod tests {
         };
 
         let root_path = dir.path().to_path_buf();
-        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+        let (out_nodes, _edges, _frameworks, _diagnostics) = super::emit_enrichment_pipeline(
             vec![fn_node],
             vec![],
             vec![("client".into(), root_path)],
@@ -4026,7 +4157,7 @@ mod tests {
         // they would scan all nodes looking for Python ApiEndpoint nodes.
         // They produce no output on this input, but verifying `(_frameworks)` does
         // not contain "fastapi" is the structural proof that the gate worked.
-        let (_out_nodes, _edges, frameworks) = super::emit_enrichment_pipeline(
+        let (_out_nodes, _edges, frameworks, _diagnostics) = super::emit_enrichment_pipeline(
             vec![import_node],
             vec![],
             vec![("app".into(), PathBuf::from("."))],

@@ -1,0 +1,40 @@
+---
+title: Ship Pipeline — PR #773
+date: 2026-07-16
+pr: 773
+issue: 767
+outcome: context-assembly
+---
+
+# Ship Pipeline — PR #773
+
+**Started:** 2026-07-16
+
+## Pre-flight
+
+- PR #773 on `issue/767`, closing #767.
+- Branch index was stale despite current freshness metadata; a full scan was started.
+- No CodeRabbit inline comments existed while the PR remained draft.
+- The ship document's missing metis reference was resolved to the canonical computed-but-not-delivered guardrail.
+
+## Step 1: RNA-Grounded Review
+
+**Verdict:** CONTINUE
+
+- Acceptance criteria are implemented and covered by policy, event-delivery, and rendering tests.
+- Review adjustments fixed before shipping: distinguish query-level errors in rendering assertions; update the LSP consumer event contract test; resolve new clippy findings.
+- Full library suite: 2,010 passed, 3 ignored, 0 failed.
+
+## Step 2: Independent Code Review
+
+**Verdict:** REQUEST CHANGES
+
+The reviewer found three correctness gaps: changed-file planning bypassed the shared profile, outer Pass 1 deadlines omitted cancelled work from timeout metrics, and Pass 2 recorded one scheduled request instead of the observation's actual request count. All three were fixed with planner, timeout, and type-hierarchy regression tests before the PR was marked ready.
+
+The first follow-up found a cancellation race in aggregate timeout ownership. Telemetry now registers only started work by item ID; completion and deadline attribution atomically remove that ID, so late completions are ignored and queued work that never issued a request is not labeled timed out. The regression explicitly exercises a completion arriving after timeout attribution.
+
+The second follow-up found that registration could race after the deadline drain. Deadline closure now occurs under the same mutex as registration; late registration returns false and the worker exits before issuing an LSP request. The timeout regression also asserts registration is rejected after closure.
+
+CodeRabbit reviewed the ready PR and requested six changes. The final fix batch projects all cross-pass planner operations, retains the warmup URI only after successful `didOpen`, deduplicates document-link work by file, uses set membership for allowed kinds, retains per-item request count/start time for cancellation metrics, and drains registered work on internal watchdog aborts. Focused regressions and library clippy pass after the fixes.
+
+Formatting-only changes are confined to files materially edited by #767 and result from applying the repository toolchain's formatter to those files. They are acknowledged as review noise but do not alter unrelated behavior.

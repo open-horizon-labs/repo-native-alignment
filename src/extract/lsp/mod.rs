@@ -19,7 +19,9 @@
 //!   [`PipelinedTransport`] (concurrent, enrichment-phase), plus URI helpers.
 
 mod passes;
-pub(crate) use passes::requested_operations_for_node;
+mod policy;
+pub use policy::LspQueryMetric;
+use policy::{LspQueryProfile, LspServerCapabilities};
 mod transport;
 pub(crate) mod work_items;
 use transport::{LspTransport, PipelinedTransport, path_to_uri};
@@ -42,6 +44,243 @@ use crate::graph::index::GraphIndex;
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 pub const CSHARP_TOOLCHAIN_REMEDIATION: &str = "C# LSP needs dotnet, csharp-ls, and a visible .NET root. Install .NET (brew install --cask dotnet-sdk, mise use dotnet@latest, asdf install dotnet latest, or Microsoft installer), install csharp-ls with `dotnet tool install -g csharp-ls`, add `$HOME/.dotnet/tools` to PATH, and set DOTNET_ROOT/DOTNET_ROOT_ARM64 to the installed .NET root for MCP stdio env.";
+
+type InitSettingsFactory = fn() -> serde_json::Value;
+
+/// Complete construction profile for a built-in language server.
+///
+/// Keeping process configuration and admission policy in one descriptor means
+/// every scan path can construct an identical enricher without mirroring tables.
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinLspDescriptor {
+    language: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    extensions: &'static [&'static str],
+    init_settings: Option<InitSettingsFactory>,
+    config_file: Option<&'static str>,
+    toolchain_remediation: Option<&'static str>,
+    allow_declared_const_references: bool,
+}
+
+impl BuiltinLspDescriptor {
+    pub(crate) fn language(&self) -> &'static str {
+        self.language
+    }
+
+    pub(crate) fn build(&self) -> LspEnricher {
+        let mut enricher =
+            LspEnricher::new(self.language, self.command, self.args, self.extensions);
+        if let Some(settings) = self.init_settings {
+            enricher = enricher.with_settings(settings());
+        }
+        if let Some(config_file) = self.config_file {
+            enricher = enricher.with_config_file(config_file);
+        }
+        if let Some(remediation) = self.toolchain_remediation {
+            enricher = enricher.with_toolchain_remediation(remediation);
+        }
+        if self.allow_declared_const_references {
+            enricher = enricher.with_declared_const_references(true);
+        }
+        if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
+            .and_then(|config| config.lsp_enrichable_kinds)
+        {
+            enricher = enricher.with_enrichable_kinds(kinds);
+        }
+        enricher
+    }
+}
+
+fn python_init_settings() -> serde_json::Value {
+    serde_json::json!({
+        "python": { "analysis": { "autoSearchPaths": true } }
+    })
+}
+
+macro_rules! builtin_lsp {
+    ($language:literal, $command:literal, $args:expr, $extensions:expr) => {
+        BuiltinLspDescriptor {
+            language: $language,
+            command: $command,
+            args: $args,
+            extensions: $extensions,
+            init_settings: None,
+            config_file: None,
+            toolchain_remediation: None,
+            allow_declared_const_references: false,
+        }
+    };
+}
+
+static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
+    BuiltinLspDescriptor {
+        init_settings: None,
+        config_file: Some("Cargo.toml"),
+        allow_declared_const_references: true,
+        ..builtin_lsp!("rust", "rust-analyzer", &[], &["rs"])
+    },
+    BuiltinLspDescriptor {
+        init_settings: Some(python_init_settings),
+        config_file: Some("pyproject.toml"),
+        ..builtin_lsp!("python", "pyright-langserver", &["--stdio"], &["py"])
+    },
+    BuiltinLspDescriptor {
+        config_file: Some("tsconfig.json"),
+        ..builtin_lsp!(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"]
+        )
+    },
+    BuiltinLspDescriptor {
+        config_file: Some("go.mod"),
+        ..builtin_lsp!("go", "gopls", &["serve"], &["go"])
+    },
+    builtin_lsp!("markdown", "marksman", &["server"], &["md"]),
+    builtin_lsp!(
+        "c-cpp",
+        "clangd",
+        &[],
+        &["c", "cc", "cpp", "cxx", "h", "hpp"]
+    ),
+    BuiltinLspDescriptor {
+        config_file: Some("pom.xml"),
+        ..builtin_lsp!("java", "jdtls", &[], &["java"])
+    },
+    builtin_lsp!("ruby", "solargraph", &["stdio"], &["rb"]),
+    BuiltinLspDescriptor {
+        toolchain_remediation: Some(CSHARP_TOOLCHAIN_REMEDIATION),
+        ..builtin_lsp!("csharp", "csharp-ls", &[], &["cs"])
+    },
+    builtin_lsp!("swift", "sourcekit-lsp", &[], &["swift"]),
+    BuiltinLspDescriptor {
+        config_file: Some("build.gradle.kts"),
+        ..builtin_lsp!("kotlin", "kotlin-language-server", &[], &["kt", "kts"])
+    },
+    builtin_lsp!("lua", "lua-language-server", &[], &["lua"]),
+    builtin_lsp!("zig", "zls", &[], &["zig"]),
+    builtin_lsp!("elixir", "elixir-ls", &[], &["ex", "exs"]),
+    builtin_lsp!("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
+    builtin_lsp!("ocaml", "ocamllsp", &[], &["ml", "mli"]),
+    builtin_lsp!("scala", "metals", &[], &["scala", "sc"]),
+    builtin_lsp!("dart", "dart", &["language-server"], &["dart"]),
+    builtin_lsp!(
+        "r",
+        "R",
+        &["--no-echo", "-e", "languageserver::run()"],
+        &["r", "R"]
+    ),
+    builtin_lsp!(
+        "julia",
+        "julia",
+        &[
+            "--startup-file=no",
+            "-e",
+            "using LanguageServer; runserver()"
+        ],
+        &["jl"]
+    ),
+    builtin_lsp!("php", "intelephense", &["--stdio"], &["php"]),
+    builtin_lsp!(
+        "css",
+        "vscode-css-languageserver",
+        &["--stdio"],
+        &["css", "scss", "less"]
+    ),
+    builtin_lsp!(
+        "html",
+        "vscode-html-languageserver",
+        &["--stdio"],
+        &["html", "htm"]
+    ),
+    builtin_lsp!(
+        "yaml",
+        "yaml-language-server",
+        &["--stdio"],
+        &["yaml", "yml"]
+    ),
+    builtin_lsp!(
+        "json",
+        "vscode-json-languageserver",
+        &["--stdio"],
+        &["json"]
+    ),
+    builtin_lsp!("toml", "taplo", &["lsp", "stdio"], &["toml"]),
+    builtin_lsp!("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
+    builtin_lsp!("nix", "nil", &[], &["nix"]),
+    builtin_lsp!("vue", "vue-language-server", &["--stdio"], &["vue"]),
+    builtin_lsp!("svelte", "svelteserver", &["--stdio"], &["svelte"]),
+    builtin_lsp!("erlang", "erlang_ls", &[], &["erl", "hrl"]),
+    builtin_lsp!("gleam", "gleam", &["lsp"], &["gleam"]),
+    builtin_lsp!("nim", "nimlsp", &[], &["nim"]),
+    builtin_lsp!("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
+    BuiltinLspDescriptor {
+        config_file: Some("tsconfig.json"),
+        ..builtin_lsp!("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"])
+    },
+    builtin_lsp!("protobuf", "buf", &["lsp"], &["proto"]),
+    builtin_lsp!("latex", "texlab", &[], &["tex", "bib"]),
+    builtin_lsp!("typst", "tinymist", &[], &["typ"]),
+];
+
+pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
+    BUILTIN_LSP_DESCRIPTORS
+}
+
+/// Planner-safe projection of the shared query profile. Changed-file planning
+/// does not have negotiated server capabilities yet, so it assumes advertised
+/// support while preserving declaration, language/server, and default-deny
+/// policy. Runtime scheduling rechecks against negotiated capabilities.
+pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
+    let Some(descriptor) = BUILTIN_LSP_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.language == node.language)
+    else {
+        return Vec::new();
+    };
+    let enricher = descriptor.build();
+    let operations: &[policy::LspQueryOperation] = match node.id.kind {
+        NodeKind::Function => &[policy::LspQueryOperation::CallHierarchy],
+        NodeKind::Trait => &[
+            policy::LspQueryOperation::Implementations,
+            policy::LspQueryOperation::TypeHierarchy,
+        ],
+        NodeKind::Struct | NodeKind::Enum => &[
+            policy::LspQueryOperation::References,
+            policy::LspQueryOperation::TypeHierarchy,
+        ],
+        NodeKind::TypeAlias | NodeKind::Const => &[policy::LspQueryOperation::References],
+        NodeKind::Other(_) => &[policy::LspQueryOperation::DocumentLinks],
+        _ => return Vec::new(),
+    };
+    let capabilities = LspServerCapabilities {
+        references: true,
+        call_hierarchy: true,
+        implementations: true,
+        type_hierarchy: true,
+        document_links: true,
+    };
+    let mut budget = enricher.query_profile.budget();
+    operations
+        .iter()
+        .copied()
+        .filter(|operation| {
+            enricher
+                .query_profile
+                .admits(node, *operation, capabilities, &mut budget)
+        })
+        .map(|operation| operation.to_string())
+        .collect()
+}
+
+pub(crate) fn builtin_lsp_enricher(language: &str) -> Option<LspEnricher> {
+    BUILTIN_LSP_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.language == language)
+        .map(BuiltinLspDescriptor::build)
+}
 
 // ---------------------------------------------------------------------------
 // LspEnricher
@@ -88,9 +327,8 @@ pub struct LspEnricher {
     /// always uses `repo_root` (passed to `enrich()`), which ensures file URIs point to
     /// the correct absolute paths.
     startup_root_override: std::sync::OnceLock<PathBuf>,
-    /// Which node kinds to enrich via LSP. None = all enrichable kinds.
-    /// Configured per-language via LangConfig::lsp_enrichable_kinds.
-    lsp_enrichable_kinds: Option<Vec<NodeKind>>,
+    /// Shared operation/declaration/server admission policy and budget factory.
+    query_profile: LspQueryProfile,
 }
 
 struct LspState {
@@ -111,6 +349,10 @@ struct LspState {
     /// When false, fall back to `textDocument/references` for function edges.
     /// Pyright supports references but not callHierarchy.
     has_call_hierarchy: bool,
+    /// Whether the language server supports textDocument/implementation.
+    has_implementation: bool,
+    /// Whether the language server supports textDocument/documentLink.
+    has_document_links: bool,
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
@@ -186,6 +428,8 @@ impl LspEnricher {
                 has_type_hierarchy: false,
                 has_references: false,
                 has_call_hierarchy: false,
+                has_implementation: false,
+                has_document_links: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
                 was_quiescent: false,
@@ -193,7 +437,7 @@ impl LspEnricher {
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
             startup_root_override: std::sync::OnceLock::new(),
-            lsp_enrichable_kinds: None,
+            query_profile: LspQueryProfile::new(language, command),
         }
     }
 
@@ -238,8 +482,57 @@ impl LspEnricher {
     /// Restrict which node kinds are enriched via LSP.
     /// When set, only nodes matching these kinds are sent for enrichment.
     pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
-        self.lsp_enrichable_kinds = Some(kinds.to_vec());
+        self.query_profile = self.query_profile.with_allowed_kinds(kinds);
         self
+    }
+
+    fn with_declared_const_references(mut self, allow: bool) -> Self {
+        self.query_profile = self.query_profile.with_declared_const_references(allow);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enrichable_kinds(&self) -> Option<&std::collections::HashSet<NodeKind>> {
+        self.query_profile.allowed_kinds()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allows_declared_const_references(&self) -> bool {
+        self.query_profile.allows_declared_const_references()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admits_pass1_node(&self, node: &Node) -> bool {
+        let operation = match node.id.kind {
+            NodeKind::Function => policy::LspQueryOperation::CallHierarchy,
+            NodeKind::Trait => policy::LspQueryOperation::Implementations,
+            NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                policy::LspQueryOperation::References
+            }
+            NodeKind::Other(_) => policy::LspQueryOperation::DocumentLinks,
+            _ => return false,
+        };
+        self.query_profile.admits(
+            node,
+            operation,
+            LspServerCapabilities {
+                references: true,
+                call_hierarchy: true,
+                implementations: true,
+                type_hierarchy: true,
+                document_links: true,
+            },
+            &mut self.query_profile.budget(),
+        )
+    }
+
+    /// Common admission boundary for every LSP pass.
+    ///
+    /// Synthetic graph values are searchable evidence, not compiler symbols.
+    /// Rejecting them before `matching_nodes` is shared with any pass prevents
+    /// them from becoming per-node or file-derived LSP work targets.
+    pub(crate) fn admits_node(&self, node: &Node) -> bool {
+        self.query_profile.accepts_declaration(node)
     }
 
     /// Check if an `experimental/serverStatus` notification indicates readiness.
@@ -293,10 +586,12 @@ impl LspEnricher {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') || matches!(
-                    name_str.as_ref(),
-                    "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
-                ) {
+                if name_str.starts_with('.')
+                    || matches!(
+                        name_str.as_ref(),
+                        "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
+                    )
+                {
                     continue;
                 }
                 let ft = match entry.file_type() {
@@ -352,7 +647,6 @@ impl LspEnricher {
         walk(root, &extensions, 0)
     }
 
-
     fn lsp_language_id_for_path(&self, path: &Path) -> &'static str {
         match path.extension().and_then(|e| e.to_str()) {
             Some("py") => "python",
@@ -400,7 +694,6 @@ impl LspEnricher {
             .map(|hint| format!("\n  Fix: {hint}"))
             .unwrap_or_default()
     }
-
 
     /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
@@ -526,53 +819,54 @@ impl LspEnricher {
         // at startup_root and inject venvPath + venv so the LSP server can resolve
         // installed packages.
         let lang_config = crate::extract::configs::config_for_language(&self.language);
-        let effective_settings = if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
-            let found_venv = venv_dirs
-                .iter()
-                .find(|&&name| startup_root.join(name).is_dir());
-            if let Some(venv_name) = found_venv {
-                let venv_path_str = startup_root.to_string_lossy().to_string();
-                let mut merged = self
-                    .init_settings
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let python_obj = merged.as_object_mut().and_then(|root| {
-                    if !root.contains_key("python") {
-                        root.insert("python".into(), serde_json::json!({}));
-                    }
-                    root.get_mut("python")
-                });
-                if let Some(python_val) = python_obj {
-                    let analysis_obj = python_val.as_object_mut().and_then(|p| {
-                        if !p.contains_key("analysis") {
-                            p.insert("analysis".into(), serde_json::json!({}));
+        let effective_settings =
+            if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
+                let found_venv = venv_dirs
+                    .iter()
+                    .find(|&&name| startup_root.join(name).is_dir());
+                if let Some(venv_name) = found_venv {
+                    let venv_path_str = startup_root.to_string_lossy().to_string();
+                    let mut merged = self
+                        .init_settings
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let python_obj = merged.as_object_mut().and_then(|root| {
+                        if !root.contains_key("python") {
+                            root.insert("python".into(), serde_json::json!({}));
                         }
-                        p.get_mut("analysis")
+                        root.get_mut("python")
                     });
-                    if let Some(analysis_val) = analysis_obj
-                        && let Some(obj) = analysis_val.as_object_mut()
-                    {
-                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                        obj.insert(
-                            "venv".into(),
-                            serde_json::Value::String(venv_name.to_string()),
-                        );
+                    if let Some(python_val) = python_obj {
+                        let analysis_obj = python_val.as_object_mut().and_then(|p| {
+                            if !p.contains_key("analysis") {
+                                p.insert("analysis".into(), serde_json::json!({}));
+                            }
+                            p.get_mut("analysis")
+                        });
+                        if let Some(analysis_val) = analysis_obj
+                            && let Some(obj) = analysis_val.as_object_mut()
+                        {
+                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                            obj.insert(
+                                "venv".into(),
+                                serde_json::Value::String(venv_name.to_string()),
+                            );
+                        }
                     }
+                    tracing::info!(
+                        "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                        self.server_command,
+                        venv_name,
+                        startup_root.display()
+                    );
+                    Some(merged)
+                } else {
+                    self.init_settings.clone()
                 }
-                tracing::info!(
-                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
-                    self.server_command,
-                    venv_name,
-                    startup_root.display()
-                );
-                Some(merged)
             } else {
                 self.init_settings.clone()
-            }
-        } else {
-            self.init_settings.clone()
-        };
+            };
         if let Some(ref settings) = effective_settings {
             init_params.initialization_options = Some(settings.clone());
         }
@@ -622,19 +916,26 @@ impl LspEnricher {
             .capabilities
             .implementation_provider
             .is_some();
+        let has_document_links = init_result_parsed
+            .capabilities
+            .document_link_provider
+            .is_some();
         tracing::info!(
-            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
+            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}",
             self.server_command,
             has_references,
             has_call_hierarchy,
             has_implementation,
             has_type_hierarchy,
+            has_document_links,
             has_pull_diagnostics,
             has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
         state.has_call_hierarchy = has_call_hierarchy;
+        state.has_implementation = has_implementation;
+        state.has_document_links = has_document_links;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
         state.has_inlay_hints = has_inlay_hints;
@@ -649,24 +950,30 @@ impl LspEnricher {
         // context. tsserver requires at least one open file before it creates
         // a project; pyright uses it to trigger import-graph indexing.
         // Save the URI for use as a documentSymbol validation fallback.
-        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
-            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
-            match self.send_did_open(transport, &warmup_path).await {
-                Ok(()) => tracing::info!(
-                    "{} sent didOpen for '{}'",
-                    self.server_command,
-                    warmup_path.display()
-                ),
-                Err(e) => tracing::debug!(
-                    "{} didOpen warmup failed (non-fatal): {}",
-                    self.server_command,
-                    e
-                ),
-            }
-            uri_str
-        } else {
-            None
-        };
+        let warmup_uri: Option<String> =
+            if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
+                let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
+                match self.send_did_open(transport, &warmup_path).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "{} sent didOpen for '{}'",
+                            self.server_command,
+                            warmup_path.display()
+                        );
+                        uri_str
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "{} didOpen warmup failed (non-fatal): {}",
+                            self.server_command,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
@@ -1044,9 +1351,12 @@ impl LspEnricher {
                         if let Some(ref uri) = warmup_uri {
                             let doc_result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(10),
-                                transport.request("textDocument/documentSymbol", serde_json::json!({
-                                    "textDocument": { "uri": uri }
-                                })),
+                                transport.request(
+                                    "textDocument/documentSymbol",
+                                    serde_json::json!({
+                                        "textDocument": { "uri": uri }
+                                    }),
+                                ),
                             )
                             .await;
                             if let Ok(Ok(ref resp)) = doc_result {
@@ -1416,21 +1726,29 @@ impl LspEnricher {
         matching_nodes: &[&Node],
         root: &Path,
         result: &mut EnrichmentResult,
-    ) -> bool {
+    ) -> (bool, passes::QueryObservation) {
+        let mut observation = passes::QueryObservation::default();
+        observation.scheduled_requests += 1;
         let items = match Self::prepare_type_hierarchy_p(transport, file_uri, line, character).await
         {
-            Ok(items) if !items.is_empty() => items,
-            Ok(_) => return true, // No type hierarchy item — not a failure
+            Ok(items) if !items.is_empty() => {
+                observation.non_empty_responses += 1;
+                items
+            }
+            Ok(_) => return (true, observation), // No type hierarchy item — not a failure
             Err(e) => {
+                observation.record_error(&e);
                 tracing::debug!("prepareTypeHierarchy failed for {}: {}", node.id.name, e);
-                return false;
+                return (false, observation);
             }
         };
 
         for item in &items {
+            observation.scheduled_requests += 1;
             // Supertypes: this node implements/inherits from each supertype
             match Self::type_hierarchy_supertypes_p(transport, item).await {
                 Ok(supertypes) => {
+                    observation.non_empty_responses += usize::from(!supertypes.is_empty());
                     for supertype in &supertypes {
                         if let Some(target_id) =
                             Self::resolve_type_hierarchy_item(supertype, matching_nodes, root)
@@ -1456,6 +1774,7 @@ impl LspEnricher {
                     }
                 }
                 Err(e) => {
+                    observation.record_error(&e);
                     tracing::debug!(
                         "typeHierarchy/supertypes failed for {}: {}",
                         node.id.name,
@@ -1465,7 +1784,7 @@ impl LspEnricher {
             }
         }
 
-        true // prepare succeeded
+        (true, observation) // prepare succeeded
     }
 
     /// Resolve a TypeHierarchyItem (JSON) to a NodeId in the graph.
@@ -2237,6 +2556,15 @@ impl LspEnricher {
     }
 }
 
+fn lsp_job_timeout() -> std::time::Duration {
+    std::env::var("RNA_LSP_JOB_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30 * 60))
+}
+
 #[async_trait::async_trait]
 impl Enricher for LspEnricher {
     fn languages(&self) -> &[&str] {
@@ -2273,13 +2601,9 @@ impl Enricher for LspEnricher {
     ) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
-        // Filter to nodes matching this enricher's language.
-        // Skip virtual crate nodes emitted by Pass 0 and diagnostic nodes.
-        let matching_nodes: Vec<&Node> = nodes
-            .iter()
-            .filter(|n| n.language == self.language)
-            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
-            .collect();
+        // Establish one admitted input set before any pass derives work from it.
+        let matching_nodes: Vec<&Node> =
+            nodes.iter().filter(|node| self.admits_node(node)).collect();
 
         let fn_count = matching_nodes
             .iter()
@@ -2315,6 +2639,8 @@ impl Enricher for LspEnricher {
             type_hierarchy_strikes,
             has_references,
             has_call_hierarchy,
+            has_implementation,
+            has_document_links,
             has_pull_diagnostics,
             has_inlay_hints,
             was_quiescent,
@@ -2338,6 +2664,8 @@ impl Enricher for LspEnricher {
                 state.type_hierarchy_strikes,
                 state.has_references,
                 state.has_call_hierarchy,
+                state.has_implementation,
+                state.has_document_links,
                 state.has_pull_diagnostics,
                 state.has_inlay_hints,
                 was_quiescent,
@@ -2359,6 +2687,12 @@ impl Enricher for LspEnricher {
                 "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) -- skipped (not quiescent)",
                 self.language,
             );
+            result.aborted = true;
+            result.error_count = 1;
+            result.diagnostic = Some(format!(
+                "LSP enrichment aborted for {}: server did not reach quiescent state during initialization",
+                self.server_command
+            ));
             return Ok(result);
         }
 
@@ -2372,34 +2706,62 @@ impl Enricher for LspEnricher {
             }
             Arc::new(map)
         };
+        let capabilities = LspServerCapabilities {
+            references: has_references,
+            call_hierarchy: has_call_hierarchy,
+            implementations: has_implementation,
+            type_hierarchy: has_type_hierarchy,
+            document_links: has_document_links,
+        };
+        let mut query_budget = self.query_profile.budget();
+        let query_telemetry = Arc::new(policy::LspQueryTelemetry::new(&self.query_profile));
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
-        let (attempted, errors, aborted, abort_diagnostic) = self
-            .run_pass1_references(
-                &transport,
-                &root,
-                &matching_nodes,
-                &matching_nodes_owned,
-                &refs_by_file_shared,
-                has_references,
-                has_call_hierarchy,
-                &mut result,
-            )
-            .await;
+        let pass1 = self.run_pass1_references(
+            &transport,
+            &root,
+            &matching_nodes,
+            &matching_nodes_owned,
+            &refs_by_file_shared,
+            capabilities,
+            &mut query_budget,
+            &query_telemetry,
+            &mut result,
+        );
+        let (attempted, errors, aborted, abort_diagnostic) = match tokio::time::timeout(
+            lsp_job_timeout(),
+            pass1,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                query_telemetry.record_job_timeout();
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "LSP enrichment timed out for {} after {}s; safely produced partial output was preserved",
+                    self.server_command,
+                    lsp_job_timeout().as_secs()
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                result.lsp_query_metrics = query_telemetry.snapshot();
+                return Ok(result);
+            }
+        };
         if aborted {
             result.error_count = errors as usize;
             result.aborted = true;
             let detail = abort_diagnostic
                 .unwrap_or_else(|| "Pass 1 aborted without a diagnostic snapshot".to_string());
-            anyhow::bail!(
+            result.diagnostic = Some(format!(
                 "LSP Pass 1 aborted for {} after {} attempted nodes and {} errors: {}",
-                self.server_command,
-                attempted,
-                errors,
-                detail
-            );
+                self.server_command, attempted, errors, detail
+            ));
+            tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+            result.lsp_query_metrics = query_telemetry.snapshot();
+            return Ok(result);
         }
-
 
         // Pass 2: type hierarchy (sequential -- strike counting needs order)
         let (has_type_hierarchy, type_hierarchy_strikes) = self
@@ -2407,7 +2769,9 @@ impl Enricher for LspEnricher {
                 &transport,
                 &root,
                 &matching_nodes,
-                has_type_hierarchy,
+                capabilities,
+                &mut query_budget,
+                &query_telemetry,
                 type_hierarchy_strikes,
                 &mut result,
             )
@@ -2470,6 +2834,7 @@ impl Enricher for LspEnricher {
 
         result.error_count = errors as usize;
         result.aborted = aborted;
+        result.lsp_query_metrics = query_telemetry.snapshot();
         Ok(result)
     }
 }
@@ -2539,6 +2904,84 @@ mod tests {
         assert_eq!(enricher.server_command, "rust-analyzer");
         assert!(enricher.server_args.is_empty());
         assert_eq!(enricher.extensions, vec!["rs"]);
+    }
+
+    #[test]
+    fn test_builtin_python_factory_applies_lang_config_policy() {
+        let python = builtin_lsp_enricher("python").expect("python is a built-in LSP profile");
+
+        assert_eq!(python.server_command, "pyright-langserver");
+        assert_eq!(python.server_args, vec!["--stdio"]);
+        assert_eq!(python.config_file_hint(), Some("pyproject.toml"));
+        let python_kinds = python
+            .enrichable_kinds()
+            .expect("the shared factory must retain Python's admission policy");
+        assert_eq!(python_kinds.len(), 2);
+        assert!(python_kinds.contains(&NodeKind::Function));
+        assert!(python_kinds.contains(&NodeKind::Trait));
+        assert!(
+            !python.allows_declared_const_references(),
+            "Pyright must keep declared-Const references disabled after the #768 probe"
+        );
+        let rust = builtin_lsp_enricher("rust").expect("rust is a built-in LSP profile");
+        assert!(
+            rust.allows_declared_const_references(),
+            "rust-analyzer cleared the #768 declared-Const yield threshold"
+        );
+        assert_eq!(
+            python.init_settings,
+            Some(serde_json::json!({
+                "python": { "analysis": { "autoSearchPaths": true } }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthetic_const_produces_no_lsp_work_item() {
+        let enricher = LspEnricher::new(
+            "python",
+            "rna-test-server-must-not-be-started",
+            &[],
+            &["py"],
+        );
+        let mut metadata = BTreeMap::new();
+        metadata.insert("synthetic".to_string(), "true".to_string());
+        let synthetic_const = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("app.py"),
+                name: "application/json".into(),
+                kind: NodeKind::Const,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "application/json".into(),
+            body: "application/json".into(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        };
+
+        assert!(!enricher.admits_node(&synthetic_const));
+        let mut declared_const = synthetic_const.clone();
+        declared_const
+            .metadata
+            .insert("synthetic".to_string(), "false".to_string());
+        assert!(
+            enricher.admits_node(&declared_const),
+            "the common boundary must distinguish declared constants from synthetic values"
+        );
+        assert!(
+            !enricher.admits_pass1_node(&declared_const),
+            "declared constants must not produce default Pass 1 reference work"
+        );
+        let result = enricher
+            .enrich(&[synthetic_const], &GraphIndex::new(), Path::new("."))
+            .await
+            .expect("an empty admitted set must return before starting an LSP server");
+        assert!(result.added_edges.is_empty());
+        assert!(result.updated_nodes.is_empty());
+        assert!(result.new_nodes.is_empty());
     }
 
     /// Verify enrichers for each language have correct properties.
@@ -3369,6 +3812,322 @@ mod tests {
         let _result = enricher
             .enrich(&nodes, &index, std::path::Path::new("."))
             .await;
+    }
+
+    /// Reproducible, opt-in probe for issue #768. This intentionally exercises
+    /// RNA's real LSP scheduling, telemetry, and edge rendering against maintained
+    /// fixtures. Production opt-ins remain separately encoded in built-in profiles.
+    #[tokio::test]
+    #[ignore = "requires installed rust-analyzer and pyright-langserver"]
+    async fn measure_declared_const_reference_yield() {
+        use crate::extract::{Extractor, python::PythonExtractor, rust::RustExtractor};
+
+        struct FixtureCase {
+            language: &'static str,
+            server: &'static str,
+            args: &'static [&'static str],
+            version_command: &'static str,
+            version_args: &'static [&'static str],
+            extension: &'static str,
+            config_name: &'static str,
+            config: &'static str,
+            sources: &'static [(&'static str, &'static str)],
+            expected_const_requests: usize,
+            expected_const_edges:
+                &'static [(&'static str, &'static str, &'static str, &'static str)],
+            expect_enable: bool,
+        }
+
+        const RUST_CONST_EDGES: &[(&str, &str, &str, &str)] = &[
+            (
+                "src/lib.rs",
+                "local_retry_limit",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            ("src/lib.rs", "make_config", "src/lib.rs", "RETRY_LIMIT"),
+            (
+                "src/worker.rs",
+                "worker_retry_limit",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_config",
+                "src/lib.rs",
+                "RETRY_LIMIT",
+            ),
+            ("src/lib.rs", "local_timeout", "src/lib.rs", "TIMEOUT_MS"),
+            (
+                "src/worker.rs",
+                "worker_timeout",
+                "src/lib.rs",
+                "TIMEOUT_MS",
+            ),
+            ("src/lib.rs", "local_port", "src/lib.rs", "DEFAULT_PORT"),
+            ("src/worker.rs", "worker_port", "src/lib.rs", "DEFAULT_PORT"),
+            ("src/lib.rs", "local_feature", "src/lib.rs", "FEATURE_FLAG"),
+            (
+                "src/worker.rs",
+                "worker_feature",
+                "src/lib.rs",
+                "FEATURE_FLAG",
+            ),
+            (
+                "src/lib.rs",
+                "local_static_timeout",
+                "src/lib.rs",
+                "STATIC_TIMEOUT_MS",
+            ),
+            (
+                "src/worker.rs",
+                "worker_static_timeout",
+                "src/lib.rs",
+                "STATIC_TIMEOUT_MS",
+            ),
+            (
+                "src/lib.rs",
+                "local_mutable_limit",
+                "src/lib.rs",
+                "MUTABLE_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_mutable_limit",
+                "src/lib.rs",
+                "MUTABLE_LIMIT",
+            ),
+            (
+                "src/lib.rs",
+                "local_associated_limit",
+                "src/lib.rs",
+                "ASSOCIATED_LIMIT",
+            ),
+            (
+                "src/worker.rs",
+                "worker_associated_limit",
+                "src/lib.rs",
+                "ASSOCIATED_LIMIT",
+            ),
+        ];
+
+        let cases = [
+            FixtureCase {
+                language: "rust",
+                server: "rust-analyzer",
+                args: &[],
+                version_command: "rust-analyzer",
+                version_args: &["--version"],
+                extension: "rs",
+                config_name: "Cargo.toml",
+                config: include_str!("../../../tests/fixtures/lsp_const_yield/rust/Cargo.toml"),
+                sources: &[
+                    (
+                        "src/lib.rs",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/rust/src/lib.rs"),
+                    ),
+                    (
+                        "src/worker.rs",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/rust/src/worker.rs"),
+                    ),
+                ],
+                expected_const_requests: 8,
+                expected_const_edges: RUST_CONST_EDGES,
+                expect_enable: true,
+            },
+            FixtureCase {
+                language: "python",
+                server: "pyright-langserver",
+                args: &["--stdio"],
+                version_command: "pyright",
+                version_args: &["--version"],
+                extension: "py",
+                config_name: "pyproject.toml",
+                config: include_str!(
+                    "../../../tests/fixtures/lsp_const_yield/python/pyproject.toml"
+                ),
+                sources: &[
+                    (
+                        "constants.py",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/python/constants.py"),
+                    ),
+                    (
+                        "consumer.py",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/python/consumer.py"),
+                    ),
+                ],
+                expected_const_requests: 5,
+                expected_const_edges: &[],
+                expect_enable: false,
+            },
+        ];
+
+        for case in cases {
+            let version = tokio::process::Command::new(case.version_command)
+                .args(case.version_args)
+                .output()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} is required for the #768 measurement probe: {error}",
+                        case.version_command
+                    )
+                });
+            assert!(
+                version.status.success(),
+                "{} version command failed: {}",
+                case.version_command,
+                String::from_utf8_lossy(&version.stderr)
+            );
+            let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+            let fixture = tempfile::tempdir().expect("create measurement fixture");
+            std::fs::write(fixture.path().join(case.config_name), case.config)
+                .expect("write fixture config");
+
+            let mut nodes = Vec::new();
+            for (relative_path, content) in case.sources {
+                let absolute_path = fixture.path().join(relative_path);
+                std::fs::create_dir_all(
+                    absolute_path
+                        .parent()
+                        .expect("fixture source has a parent directory"),
+                )
+                .expect("create fixture source directory");
+                std::fs::write(&absolute_path, content).expect("write fixture source");
+
+                let extracted = match case.language {
+                    "rust" => RustExtractor::new()
+                        .extract(std::path::Path::new(relative_path), content)
+                        .expect("extract Rust fixture"),
+                    "python" => PythonExtractor::new()
+                        .extract(std::path::Path::new(relative_path), content)
+                        .expect("extract Python fixture"),
+                    other => panic!("unsupported measurement fixture language: {other}"),
+                };
+                nodes.extend(extracted.nodes);
+            }
+
+            let mut enricher =
+                LspEnricher::new(case.language, case.server, case.args, &[case.extension])
+                    .with_declared_const_references(true);
+            enricher = match case.language {
+                "rust" => enricher.with_config_file("Cargo.toml"),
+                "python" => enricher
+                    .with_settings(python_init_settings())
+                    .with_config_file("pyproject.toml"),
+                _ => enricher,
+            };
+            let result = enricher
+                .enrich(&nodes, &GraphIndex::new(), fixture.path())
+                .await
+                .unwrap_or_else(|error| panic!("{} enrichment failed: {error}", case.server));
+
+            assert!(
+                !result.aborted,
+                "{} aborted: {:?}",
+                case.server, result.diagnostic
+            );
+            let const_metric = result
+                .lsp_query_metrics
+                .iter()
+                .find(|metric| {
+                    metric.operation == "references" && metric.declaration_class == "const"
+                })
+                .unwrap_or_else(|| panic!("{} emitted no Const telemetry", case.server));
+            let type_metric = result
+                .lsp_query_metrics
+                .iter()
+                .find(|metric| {
+                    metric.operation == "references" && metric.declaration_class == "struct"
+                })
+                .unwrap_or_else(|| panic!("{} emitted no Struct telemetry", case.server));
+
+            let const_edges = result
+                .added_edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::ReferencedBy && edge.to.kind == NodeKind::Const
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                const_metric.scheduled_requests, case.expected_const_requests,
+                "{} measured an unexpected declared-constant surface",
+                case.server
+            );
+            let const_average_ms =
+                const_metric.latency_ms.max(1) / const_metric.scheduled_requests.max(1) as u64;
+            let type_average_ms =
+                type_metric.latency_ms.max(1) / type_metric.scheduled_requests.max(1) as u64;
+            let clears_threshold = const_metric.non_empty_responses * 100
+                >= const_metric.scheduled_requests * 80
+                && const_metric.emitted_edges >= const_metric.scheduled_requests
+                && const_metric.timeouts == 0
+                && const_metric.errors == 0
+                && const_average_ms <= type_average_ms.saturating_mul(2).max(2);
+            assert_eq!(
+                clears_threshold, case.expect_enable,
+                "{} eligibility decision changed: Const={const_metric:?}, Struct={type_metric:?}",
+                case.server
+            );
+
+            assert!(
+                const_edges
+                    .iter()
+                    .all(|edge| edge.to.name != "UNUSED_SENTINEL"),
+                "{} emitted a spurious edge to the unused control constant",
+                case.server
+            );
+            if case.expect_enable {
+                let actual_pairs = const_edges
+                    .iter()
+                    .map(|edge| {
+                        (
+                            edge.from.file.to_string_lossy().to_string(),
+                            edge.from.name.clone(),
+                            edge.to.file.to_string_lossy().to_string(),
+                            edge.to.name.clone(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected_pairs = case
+                    .expected_const_edges
+                    .iter()
+                    .map(|(from_file, from_name, to_file, to_name)| {
+                        (
+                            (*from_file).to_string(),
+                            (*from_name).to_string(),
+                            (*to_file).to_string(),
+                            (*to_name).to_string(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    const_edges.len(),
+                    expected_pairs.len(),
+                    "{} emitted duplicate or extra Const edges: {const_edges:#?}",
+                    case.server
+                );
+                assert_eq!(
+                    actual_pairs, expected_pairs,
+                    "{} Const edge mapping was not exactly correct",
+                    case.server
+                );
+            }
+
+            eprintln!(
+                "CONST_YIELD_RESULT language={} server={} version={:?} eligible={} result_errors={} metrics={:#?} const_edges={:#?}",
+                case.language,
+                case.server,
+                version,
+                clears_threshold,
+                result.error_count,
+                result.lsp_query_metrics,
+                const_edges
+            );
+        }
     }
 
     /// Verify that the quiescent readiness condition matches the rust-analyzer

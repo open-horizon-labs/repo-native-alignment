@@ -9,8 +9,8 @@ use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities}
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
-    self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentScope,
-    RnaHandler, ScanEnrichmentOptions,
+    self, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger, EnrichmentJobState,
+    EnrichmentScope, RnaHandler, ScanEnrichmentOptions,
 };
 use repo_native_alignment::service::{
     self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext,
@@ -366,6 +366,69 @@ async fn try_load_cached_graph(
     }
 }
 
+/// Restore process-local LSP readiness from the durable job ledger.
+///
+/// Cache-only and incremental CLI scans run in a fresh process, so the live atomic
+/// status starts empty even when the previous process durably recorded a degraded
+/// or completed call-reference job. The newest non-superseded ledger record is the
+/// authoritative readiness state for these summaries.
+fn hydrate_lsp_status_from_ledger(
+    handler: &RnaHandler,
+    repo_root: &std::path::Path,
+    persisted_lsp_edges: usize,
+    hydrate_probe_unavailable: bool,
+) -> Vec<String> {
+    let jobs = handler.enrichment_jobs.recent_jobs(repo_root, 100);
+    let Some(job) = jobs
+        .iter()
+        .filter(|job| {
+            job.capability == EnrichmentCapability::CallReferences
+                && !matches!(
+                    job.state,
+                    EnrichmentJobState::Cancelled | EnrichmentJobState::Superseded
+                )
+        })
+        .max_by_key(|job| (job.updated_at, job.revision))
+    else {
+        return Vec::new();
+    };
+
+    let should_hydrate = matches!(
+        handler.lsp_status.current_state(),
+        server::LspState::NotStarted | server::LspState::ServerFound
+    ) || (hydrate_probe_unavailable
+        && handler.lsp_status.current_state() == server::LspState::Unavailable);
+    if should_hydrate {
+        match job.state {
+            EnrichmentJobState::Completed if job.scope == EnrichmentScope::Repo => {
+                handler.lsp_status.set_complete(persisted_lsp_edges);
+            }
+            EnrichmentJobState::Completed => handler.lsp_status.set_complete_scoped(
+                job.counters.edge_count.unwrap_or(0),
+                persisted_lsp_edges,
+                format!("{} scope", job.scope.stable_key()),
+            ),
+            EnrichmentJobState::Degraded => handler.lsp_status.set_degraded(
+                persisted_lsp_edges,
+                job.failure
+                    .as_deref()
+                    .unwrap_or("call-reference enrichment finalized with degraded output"),
+            ),
+            EnrichmentJobState::Failed => handler.lsp_status.set_failed(
+                job.failure
+                    .as_deref()
+                    .unwrap_or("call-reference enrichment failed"),
+            ),
+            EnrichmentJobState::Queued
+            | EnrichmentJobState::Running
+            | EnrichmentJobState::Persisting => handler.lsp_status.set_running(),
+            EnrichmentJobState::Cancelled | EnrichmentJobState::Superseded => unreachable!(),
+        }
+    }
+
+    vec![job.job_id.clone()]
+}
+
 async fn load_existing_embedding_index(
     repo_root: &std::path::Path,
     warn: impl FnOnce(String),
@@ -597,6 +660,19 @@ async fn async_main() -> anyhow::Result<()> {
                     eprintln!();
                     eprintln!("{}", result.report.render_cli(true));
                 }
+                if let Some(degraded) = result.report.capabilities.iter().find(|capability| {
+                    capability.capability == EnrichmentCapability::CallReferences
+                        && capability.requested
+                        && capability.state == server::operation_report::CapabilityState::Degraded
+                }) {
+                    anyhow::bail!(
+                        "LSP call-reference enrichment finalized with degraded output: {}",
+                        degraded
+                            .detail
+                            .as_deref()
+                            .unwrap_or("degraded without an actionable diagnostic")
+                    );
+                }
                 return Ok(());
             }
             eprintln!("Scanning: {}", repo_root.display());
@@ -651,10 +727,17 @@ async fn async_main() -> anyhow::Result<()> {
                 };
                 let elapsed = t0.elapsed();
                 let lsp_edge_count = lsp_call_edge_count(&graph);
-                let related_job_ids = Vec::new();
+                let related_job_ids =
+                    hydrate_lsp_status_from_ledger(
+                        &handler,
+                        &repo_root,
+                        lsp_edge_count,
+                        operation == server::operation_report::OperationKind::CacheLoad,
+                    );
                 let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                     enrichment,
                     handler.lsp_status.current_state(),
+                    handler.lsp_status.diagnostic().as_deref(),
                     lsp_edge_count,
                     !related_job_ids.is_empty(),
                 );
@@ -688,11 +771,18 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                     let elapsed = t0.elapsed();
                     let lsp_edge_count = lsp_call_edge_count(&graph);
-                    let related_job_ids = Vec::new();
+                    let related_job_ids =
+                        hydrate_lsp_status_from_ledger(
+                            &handler,
+                            &repo_root,
+                            lsp_edge_count,
+                            false,
+                        );
                     let (lsp_state, lsp_detail) =
                         server::operation_report::lsp_capability_from_status(
                             enrichment,
                             handler.lsp_status.current_state(),
+                            handler.lsp_status.diagnostic().as_deref(),
                             lsp_edge_count,
                             !related_job_ids.is_empty(),
                         );
@@ -727,10 +817,12 @@ async fn async_main() -> anyhow::Result<()> {
             }
             let elapsed = t0.elapsed();
             let lsp_edge_count = lsp_call_edge_count(&graph);
-            let related_job_ids = Vec::new();
+            let related_job_ids =
+                hydrate_lsp_status_from_ledger(&handler, &repo_root, lsp_edge_count, false);
             let (lsp_state, lsp_detail) = server::operation_report::lsp_capability_from_status(
                 enrichment,
                 handler.lsp_status.current_state(),
+                handler.lsp_status.diagnostic().as_deref(),
                 lsp_edge_count,
                 !related_job_ids.is_empty(),
             );
@@ -1254,4 +1346,85 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
+
+    #[test]
+    fn ledger_hydration_does_not_overwrite_current_terminal_lsp_result() {
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let handler = RnaHandler {
+            repo_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let historical_job = match handler
+            .enrichment_jobs
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin historical job")
+        {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        handler.enrichment_jobs.mark_degraded(
+            tmp.path(),
+            &historical_job,
+            2,
+            1,
+            "historical abort",
+        );
+        handler.lsp_status.set_complete(3);
+
+        let related = hydrate_lsp_status_from_ledger(&handler, tmp.path(), 3, false);
+
+        assert_eq!(handler.lsp_status.current_state(), LspState::Complete);
+        assert_eq!(related, vec![historical_job]);
+    }
+
+    #[test]
+    fn cache_only_hydration_overrides_fresh_probe_unavailable_with_durable_degraded_job() {
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let handler = RnaHandler {
+            repo_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let job_id = match handler
+            .enrichment_jobs
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin durable degraded job")
+        {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        handler.enrichment_jobs.mark_degraded(
+            tmp.path(),
+            &job_id,
+            2,
+            1,
+            "durable no-progress abort",
+        );
+        handler.lsp_status.set_unavailable();
+
+        hydrate_lsp_status_from_ledger(&handler, tmp.path(), 1, true);
+
+        assert_eq!(handler.lsp_status.current_state(), LspState::Degraded);
+        assert_eq!(
+            handler.lsp_status.diagnostic().as_deref(),
+            Some("durable no-progress abort")
+        );
+    }
 }

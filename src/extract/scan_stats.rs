@@ -84,6 +84,7 @@ pub struct LspEnrichmentEntry {
     pub duration: Duration,
     pub status: LspStatus,
     pub remediation: Option<String>,
+    pub query_metrics: Vec<crate::extract::lsp::LspQueryMetric>,
 }
 
 impl LspEnrichmentEntry {
@@ -128,6 +129,21 @@ impl LspEnrichmentEntry {
             line.push_str(" -- ");
             line.push_str(remediation);
         }
+        if !self.query_metrics.is_empty() {
+            let scheduled = self
+                .query_metrics
+                .iter()
+                .map(|metric| metric.scheduled_requests)
+                .sum::<usize>();
+            let non_empty = self
+                .query_metrics
+                .iter()
+                .map(|metric| metric.non_empty_responses)
+                .sum::<usize>();
+            line.push_str(&format!(
+                " -- query yield {non_empty}/{scheduled} non-empty"
+            ));
+        }
         line
     }
 }
@@ -158,6 +174,8 @@ pub struct LspLanguageStats {
     pub server_missing: bool,
     /// Optional actionable setup guidance for this language server.
     pub remediation: Option<String>,
+    /// Query-yield measurements grouped by operation and declaration class.
+    pub query_metrics: Vec<crate::extract::lsp::LspQueryMetric>,
 }
 
 /// Per-root stats populated after `RootExtracted`.
@@ -312,6 +330,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
             ExtractionEventKind::RootExtracted,
             ExtractionEventKind::LanguageDetected,
             ExtractionEventKind::EnrichmentComplete,
+            ExtractionEventKind::LspQueryMetrics,
             ExtractionEventKind::PassesComplete,
         ]
     }
@@ -423,6 +442,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
                             aborted: *aborted,
                             server_missing: *server_missing,
                             remediation: remediation.clone(),
+                            query_metrics: Vec::new(),
                         },
                     );
                 }
@@ -432,6 +452,20 @@ impl ExtractionConsumer for ScanStatsConsumer {
                     slug,
                     added_edges.len(),
                 );
+            }
+
+            ExtractionEvent::LspQueryMetrics {
+                slug,
+                language,
+                metrics,
+            } => {
+                if let Some(language_stats) = stats
+                    .lsp_stats
+                    .get_mut(slug)
+                    .and_then(|by_language| by_language.get_mut(language))
+                {
+                    language_stats.query_metrics = metrics.to_vec();
+                }
             }
 
             ExtractionEvent::PassesComplete {
@@ -617,6 +651,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -685,6 +720,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -738,6 +774,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -746,6 +783,7 @@ mod tests {
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             detected_frameworks: std::collections::HashSet::new(),
+            enrichment_diagnostics: std::sync::Arc::from([]),
         })
         .await
         .unwrap();
@@ -817,6 +855,7 @@ mod tests {
                 server_missing: false,
                 remediation: None,
                 aborted: false,
+                diagnostic: None,
             })
             .await;
         assert!(
@@ -841,6 +880,7 @@ mod tests {
                 nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
                 edges: std::sync::Arc::from(vec![].into_boxed_slice()),
                 detected_frameworks: std::collections::HashSet::new(),
+                enrichment_diagnostics: std::sync::Arc::from([]),
             })
             .await;
         assert!(
@@ -881,6 +921,7 @@ mod tests {
             server_missing: false,
             remediation: Some("fix rust".to_string()),
             aborted: true,
+            diagnostic: Some("forced abort".to_string()),
         })
         .await
         .unwrap();
@@ -902,6 +943,53 @@ mod tests {
         let _ = lsp.duration;
     }
 
+    #[tokio::test]
+    async fn test_lsp_query_metrics_are_delivered_to_language_stats() {
+        let c = make_consumer();
+        c.on_event(&ExtractionEvent::EnrichmentComplete {
+            slug: slug("api"),
+            language: "rust".into(),
+            added_edges: empty_arc_edges(),
+            new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
+            server_name: Some("rust-analyzer".to_string()),
+            error_count: 0,
+            server_missing: false,
+            remediation: None,
+            aborted: false,
+            diagnostic: None,
+        })
+        .await
+        .unwrap();
+        c.on_event(&ExtractionEvent::LspQueryMetrics {
+            slug: slug("api"),
+            language: "rust".into(),
+            metrics: std::sync::Arc::from(
+                vec![crate::extract::lsp::LspQueryMetric {
+                    language: "rust".to_string(),
+                    server: "rust-analyzer".to_string(),
+                    operation: "call_hierarchy".to_string(),
+                    declaration_class: "function".to_string(),
+                    scheduled_requests: 3,
+                    non_empty_responses: 2,
+                    emitted_edges: 4,
+                    latency_ms: 17,
+                    timeouts: 0,
+                    errors: 0,
+                }]
+                .into_boxed_slice(),
+            ),
+        })
+        .await
+        .unwrap();
+
+        let stats = c.stats.read().unwrap();
+        let metrics = &stats.lsp_stats["api"]["rust"].query_metrics;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].scheduled_requests, 3);
+        assert_eq!(metrics[0].emitted_edges, 4);
+    }
+
     /// EnrichmentComplete without server_name does NOT populate lsp_stats.
     #[tokio::test]
     async fn test_enrichment_complete_without_server_name_no_lsp_stats() {
@@ -917,6 +1005,7 @@ mod tests {
             server_missing: false,
             remediation: None,
             aborted: false,
+            diagnostic: None,
         })
         .await
         .unwrap();
@@ -940,6 +1029,7 @@ mod tests {
             duration: Duration::from_secs_f64(3.5),
             status: LspStatus::Ok,
             remediation: None,
+            query_metrics: Vec::new(),
         };
         let l = e.summary_line();
         assert!(l.contains("rust (rust-analyzer)"));
@@ -959,6 +1049,7 @@ mod tests {
             duration: Duration::from_millis(5),
             status: LspStatus::NotFound,
             remediation: Some("install json ls".to_string()),
+            query_metrics: Vec::new(),
         };
         let line = e.summary_line();
         assert!(line.contains("not found"));

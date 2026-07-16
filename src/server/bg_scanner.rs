@@ -122,8 +122,9 @@ pub(super) async fn update_graph(
     scan_result: &mut ScanResult,
     repo_root: &std::path::Path,
     scan_stats: &Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
-) -> Vec<LanceDelta> {
+) -> (Vec<LanceDelta>, Vec<String>) {
     let mut lance_deltas: Vec<LanceDelta> = Vec::new();
+    let mut enrichment_diagnostics = Vec::new();
     let registry = ExtractorRegistry::with_builtins();
 
     // Drop in-memory nodes/edges for removed worktrees.
@@ -263,10 +264,11 @@ pub(super) async fn update_graph(
         )
         .await
         {
-            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+            Ok((enriched_nodes, enriched_edges, detected_frameworks, diagnostics)) => {
                 graph_state.nodes = enriched_nodes;
                 graph_state.edges = enriched_edges;
                 graph_state.detected_frameworks = detected_frameworks;
+                enrichment_diagnostics = diagnostics;
             }
             Err(e) => {
                 tracing::error!(
@@ -349,7 +351,7 @@ pub(super) async fn update_graph(
         graph_state.edges.len()
     );
 
-    lance_deltas
+    (lance_deltas, enrichment_diagnostics)
 }
 
 /// Persist incremental deltas to LanceDB and commit scanner state.
@@ -364,7 +366,9 @@ pub(super) async fn persist_deltas(
     repo_root: &std::path::Path,
     graph: &arc_swap::ArcSwap<Option<Arc<GraphState>>>,
     lance_write_lock: &tokio::sync::Mutex<()>,
-) {
+) -> bool {
+    let expected_slugs: HashSet<String> =
+        lance_deltas.iter().map(|(slug, ..)| slug.clone()).collect();
     let mut persisted_slugs: HashSet<String> = HashSet::new();
     for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in
         lance_deltas
@@ -444,4 +448,6 @@ pub(super) async fn persist_deltas(
             tracing::warn!("Failed to delete LanceDB rows for removed worktrees: {}", e);
         }
     }
+
+    expected_slugs.is_subset(&persisted_slugs)
 }

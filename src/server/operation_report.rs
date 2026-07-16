@@ -484,6 +484,7 @@ pub enum CapabilityState {
     Skipped,
     Running,
     Completed,
+    Degraded,
     Failed,
     Unavailable,
     Stale,
@@ -497,6 +498,7 @@ impl CapabilityState {
             Self::Skipped => "skipped",
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Degraded => "degraded",
             Self::Failed => "failed",
             Self::Unavailable => "unavailable",
             Self::Stale => "stale",
@@ -747,6 +749,7 @@ pub fn render_recent_reports_markdown(repo_root: &Path, limit: usize) -> String 
 pub fn lsp_capability_from_status(
     enrichment: super::enrichment_jobs::ScanEnrichmentOptions,
     state: super::state::LspState,
+    diagnostic: Option<&str>,
     lsp_edge_count: usize,
     has_related_job: bool,
 ) -> (CapabilityState, Option<String>) {
@@ -774,6 +777,14 @@ pub fn lsp_capability_from_status(
         super::state::LspState::Failed => (
             CapabilityState::Failed,
             Some("call-reference enrichment failed; inspect enrichment job history".to_string()),
+        ),
+        super::state::LspState::Degraded => (
+            CapabilityState::Degraded,
+            Some(format!(
+                "call-reference enrichment finalized with {} partial edges: {}",
+                lsp_edge_count,
+                diagnostic.unwrap_or("degraded without a diagnostic")
+            )),
         ),
         super::state::LspState::Unavailable => (
             CapabilityState::Unavailable,
@@ -874,6 +885,7 @@ pub fn add_scan_degradation_and_next_steps(
         CapabilityState::Requested
             | CapabilityState::Running
             | CapabilityState::Failed
+            | CapabilityState::Degraded
             | CapabilityState::Unavailable
             | CapabilityState::Stale
             | CapabilityState::Superseded
@@ -882,6 +894,7 @@ pub fn add_scan_degradation_and_next_steps(
     if embedding_degraded {
         let reason = match embedding_state {
             CapabilityState::Completed => "embedding capability is ready",
+            CapabilityState::Degraded => "embedding enrichment completed with degraded output",
             CapabilityState::Running => "embedding enrichment is still running",
             CapabilityState::Failed => "embedding enrichment failed",
             CapabilityState::Unavailable => "embedding capability is unavailable",
@@ -908,6 +921,7 @@ pub fn add_scan_degradation_and_next_steps(
             CapabilityState::Requested
                 | CapabilityState::Running
                 | CapabilityState::Failed
+                | CapabilityState::Degraded
                 | CapabilityState::Unavailable
                 | CapabilityState::Stale
                 | CapabilityState::Superseded
@@ -916,6 +930,9 @@ pub fn add_scan_degradation_and_next_steps(
         let reason = match lsp_state {
             CapabilityState::Running => "call-reference enrichment is still running",
             CapabilityState::Failed => "call-reference enrichment failed",
+            CapabilityState::Degraded => {
+                "call-reference enrichment finalized with partial/degraded coverage"
+            }
             CapabilityState::Unavailable => "call-reference enrichment is unavailable",
             CapabilityState::Requested => "call-reference enrichment has not completed yet",
             CapabilityState::Stale => "call-reference enrichment is stale",
@@ -1212,6 +1229,7 @@ mod tests {
         let (state, detail) = lsp_capability_from_status(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
             super::super::state::LspState::Complete,
+            None,
             0,
             false,
         );
@@ -1232,6 +1250,7 @@ mod tests {
         let (state, detail) = lsp_capability_from_status(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
             super::super::state::LspState::NotStarted,
+            None,
             12,
             false,
         );
@@ -1252,6 +1271,7 @@ mod tests {
         let (state, detail) = lsp_capability_from_status(
             super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
             super::super::state::LspState::NotStarted,
+            None,
             12,
             true,
         );
@@ -1262,6 +1282,22 @@ mod tests {
             "got: {:?}",
             detail
         );
+    }
+
+    #[test]
+    fn lsp_capability_preserves_degraded_coverage_and_diagnostic() {
+        let (state, detail) = lsp_capability_from_status(
+            super::super::enrichment_jobs::ScanEnrichmentOptions::all(),
+            super::super::state::LspState::Degraded,
+            Some("forced no-progress abort after 11 attempted nodes"),
+            7,
+            true,
+        );
+
+        assert_eq!(state, CapabilityState::Degraded);
+        let detail = detail.expect("degraded capability has actionable detail");
+        assert!(detail.contains("7 partial edges"), "got: {detail}");
+        assert!(detail.contains("forced no-progress abort"), "got: {detail}");
     }
 
     #[test]

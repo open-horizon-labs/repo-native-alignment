@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, Repository};
 
-use crate::extract::lsp::requested_operations_for_node;
-use crate::graph::{Node, NodeKind};
+use crate::extract::lsp::planned_operations_for_node;
+use crate::graph::Node;
 
 pub(crate) const MAX_CHANGED_LSP_NODES: usize = 4_096;
 pub(crate) const MAX_CHANGED_LSP_OPERATIONS: usize = 12_288;
@@ -222,14 +222,7 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
         if let Some(nodes) = nodes_by_file.get_mut(&file) {
             nodes.sort_by_key(|node| node.stable_id());
             for node in nodes.iter() {
-                if matches!(&node.id.kind, NodeKind::Other(kind) if kind == "diagnostic") {
-                    continue;
-                }
-                let requested_operations = requested_operations_for_node(&node.id.kind, true, true)
-                    .into_iter()
-                    .filter(|operation| *operation != "skipped_no_supported_operation")
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
+                let requested_operations = planned_operations_for_node(node);
                 if requested_operations.is_empty() {
                     continue;
                 }
@@ -416,7 +409,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::graph::{ExtractionSource, NodeId};
+    use crate::graph::{ExtractionSource, NodeId, NodeKind};
 
     fn node(file: &str, name: &str, kind: NodeKind) -> Node {
         Node {
@@ -470,7 +463,54 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
-        assert_eq!(plan.operation_count, 4);
+        assert_eq!(plan.operation_count, 3);
+    }
+
+    #[test]
+    fn planner_uses_shared_profile_for_synthetic_const_and_language_restrictions() {
+        let mut synthetic = node("src/changed.rs", "literal", NodeKind::Const);
+        synthetic
+            .metadata
+            .insert("synthetic".to_string(), "true".to_string());
+        let declared_const = node("src/changed.rs", "DECLARED", NodeKind::Const);
+        let mut python_struct = node("src/changed.rs", "Model", NodeKind::Struct);
+        python_struct.language = "python".to_string();
+        let mut python_function = node("src/changed.rs", "handler", NodeKind::Function);
+        python_function.language = "python".to_string();
+        let nodes = vec![synthetic, declared_const, python_struct, python_function];
+
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: None,
+                new_path: Some(PathBuf::from("src/changed.rs")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: 16,
+            max_operations: 16,
+        })
+        .unwrap();
+
+        assert_eq!(plan.planned_nodes.len(), 2);
+        let declared = plan
+            .planned_nodes
+            .iter()
+            .find(|node| node.stable_id.contains("DECLARED"))
+            .expect("measured rust-analyzer profile should admit declared constants");
+        assert_eq!(declared.requested_operations, vec!["references"]);
+        let handler = plan
+            .planned_nodes
+            .iter()
+            .find(|node| node.stable_id.contains("handler"))
+            .expect("Python function remains admitted");
+        assert_eq!(handler.requested_operations, vec!["call_hierarchy"]);
+        assert!(
+            plan.planned_nodes.iter().all(
+                |node| !node.stable_id.contains("literal") && !node.stable_id.contains("Model")
+            )
+        );
     }
 
     #[test]

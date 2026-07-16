@@ -37,6 +37,21 @@ The `RootExtracted` event carries `dirty_slugs: Option<HashSet<String>>`. The `L
 
 Before requesting call hierarchy or references for a symbol, RNA sends `textDocument/didOpen` for that file once per enrichment pass. Files are marked opened only after the source read and notification succeed, so transient failures can be retried. This keeps language servers that require open documents from returning empty or stale reference results during warmup.
 
+### Operation-aware query admission
+
+Every LSP request is admitted through one shared query profile. The profile combines the requested operation, declaration class, language/server configuration, negotiated server capabilities, and the operation's runtime budget. Synthetic values are always rejected, and declared constants are default-denied for reference queries unless a language/server profile has cleared a measured yield, correctness, latency, and reliability threshold. Rust-analyzer is currently the only built-in declared-constant opt-in; Pyright remains disabled because the maintained probe produced only timeouts and no edges. High-signal function call hierarchy and trait implementation requests remain enabled when the server advertises those capabilities.
+
+RNA records scheduled requests, non-empty responses, emitted edges, latency, timeouts, and errors for each language/server, operation, and declaration class. `list_roots` exposes these query-yield rows beneath each language's LSP summary so operators can compare request cost with agent-visible graph value.
+
+The reproducible probe is:
+
+```bash
+cargo check --lib
+cargo test measure_declared_const_reference_yield -- --ignored --nocapture --test-threads=1
+```
+
+It runs maintained Rust and Python fixtures sequentially through RNA's actual LSP enricher and asserts the current per-server decision.
+
 ## Auto-detected Language Servers
 
 ### Common Servers (install for richer graphs)
@@ -55,6 +70,8 @@ Plus 32 more: Ruby (solargraph), Java (jdtls), C# (omnisharp), Kotlin, Lua, Zig,
 ## Capability Readiness
 
 MCP output distinguishes freshness from readiness. Freshness says when the index last changed; readiness says which workflow metadata is currently trustworthy: exact extracted graph search, embeddings/semantic search, LSP call/reference coverage, and dead-code prerequisites. Dead-code workflows require complete, persisted, non-zero LSP call/reference coverage; if LSP is still running, failed, or unavailable, the readiness block reports that instead of implying the graph is complete.
+
+If a language server stops making progress and RNA aborts the pass, graph finalization still completes and preserves every node and edge produced before the abort. CLI and MCP readiness report this terminal result as `partial/degraded` with the original abort diagnostic. RNA does not write the full-LSP completion sentinel for a degraded run, so a later scan can retry instead of treating partial coverage as complete.
 
 ## Type Hierarchy Enrichment
 

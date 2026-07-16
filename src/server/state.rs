@@ -529,6 +529,8 @@ pub enum LspState {
     /// Server binary found on PATH but enrichment hasn't started yet.
     ServerFound = 4,
     Failed = 5,
+    /// Enrichment finalized with usable partial output and an actionable diagnostic.
+    Degraded = 6,
 }
 
 impl LspState {
@@ -540,6 +542,7 @@ impl LspState {
             3 => Self::Unavailable,
             4 => Self::ServerFound,
             5 => Self::Failed,
+            6 => Self::Degraded,
             _ => Self::NotStarted,
         }
     }
@@ -552,6 +555,7 @@ impl LspState {
             Self::Unavailable => "UNAVAILABLE",
             Self::ServerFound => "SERVER_FOUND",
             Self::Failed => "FAILED",
+            Self::Degraded => "DEGRADED",
         }
     }
 }
@@ -635,6 +639,7 @@ impl LspEnrichmentStatus {
     const UNAVAILABLE: u8 = LspState::Unavailable as u8;
     const SERVER_FOUND: u8 = LspState::ServerFound as u8;
     const FAILED: u8 = LspState::Failed as u8;
+    const DEGRADED: u8 = LspState::Degraded as u8;
 
     /// Log a state transition with elapsed time.
     fn log_transition(&self, from: LspState, to: LspState, detail: &str) {
@@ -668,6 +673,10 @@ impl LspEnrichmentStatus {
         LspState::from_u8(self.state.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    pub fn diagnostic(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
+
     /// Elapsed time since the status was created.
     pub fn elapsed(&self) -> std::time::Duration {
         self.created_at.elapsed()
@@ -688,6 +697,27 @@ impl LspEnrichmentStatus {
 
     pub fn set_complete(&self, edge_count: usize) {
         self.set_complete_with_coverage(edge_count, edge_count);
+    }
+
+    /// Mark enrichment as finalized with usable partial output.
+    ///
+    /// Unlike `Failed`, this state preserves known coverage and tells callers that
+    /// exact search/graph finalization succeeded while LSP-derived relationships
+    /// may be incomplete.
+    pub fn set_degraded(&self, edge_count: usize, detail: &str) {
+        self.edge_count
+            .store(edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count
+            .fetch_max(edge_count, std::sync::atomic::Ordering::AcqRel);
+        self.persist_failed
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.last_error.lock().unwrap() = Some(detail.to_string());
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        let prev = LspState::from_u8(
+            self.state
+                .swap(Self::DEGRADED, std::sync::atomic::Ordering::AcqRel),
+        );
+        self.log_transition(prev, LspState::Degraded, detail);
     }
 
     pub fn set_complete_with_coverage(&self, latest_edge_count: usize, coverage_edge_count: usize) {
@@ -898,6 +928,18 @@ impl LspEnrichmentStatus {
                     "LSP call/reference coverage",
                     CapabilityReadinessState::Failed,
                     err.as_deref().unwrap_or("enrichment failed"),
+                )
+            }
+            LspState::Degraded => {
+                let err = self.last_error.lock().unwrap();
+                CapabilityReadiness::new(
+                    "LSP call/reference coverage",
+                    CapabilityReadinessState::Partial,
+                    format!(
+                        "degraded after finalization with {} partial call/reference edges: {}",
+                        self.edge_count(),
+                        err.as_deref().unwrap_or("enrichment aborted")
+                    ),
                 )
             }
         }
@@ -1160,6 +1202,14 @@ impl LspEnrichmentStatus {
                     None => Some("LSP: enrichment failed".to_string()),
                 }
             }
+            Self::DEGRADED => {
+                let err = self.last_error.lock().unwrap();
+                Some(format!(
+                    "LSP: degraded ({} partial edges): {}",
+                    self.edge_count(),
+                    err.as_deref().unwrap_or("enrichment aborted")
+                ))
+            }
             _ => None,
         }
     }
@@ -1186,6 +1236,7 @@ mod tests {
         assert_eq!(LspState::Unavailable.label(), "UNAVAILABLE");
         assert_eq!(LspState::ServerFound.label(), "SERVER_FOUND");
         assert_eq!(LspState::Failed.label(), "FAILED");
+        assert_eq!(LspState::Degraded.label(), "DEGRADED");
     }
 
     #[test]
@@ -1197,6 +1248,7 @@ mod tests {
             LspState::Unavailable,
             LspState::ServerFound,
             LspState::Failed,
+            LspState::Degraded,
         ] {
             assert_eq!(LspState::from_u8(state as u8), state);
         }
@@ -1262,6 +1314,28 @@ mod tests {
         status.set_complete(0);
         let footer = status.footer_segment().unwrap();
         assert!(footer.contains("0 edges"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_lsp_status_degraded_is_distinct_and_actionable() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_degraded(7, "forced no-progress abort after 11 attempted nodes");
+
+        assert_eq!(status.current_state(), LspState::Degraded);
+        let readiness = status.call_reference_readiness();
+        assert_eq!(readiness.state, CapabilityReadinessState::Partial);
+        assert!(readiness.detail.contains("degraded after finalization"));
+        assert!(readiness.detail.contains("forced no-progress abort"));
+
+        let footer = status
+            .footer_segment()
+            .expect("degraded status stays visible");
+        assert!(footer.contains("LSP: degraded"), "got: {footer}");
+        assert!(footer.contains("7 partial edges"), "got: {footer}");
+        assert!(footer.contains("forced no-progress abort"), "got: {footer}");
+        assert_ne!(footer, "LSP: no server detected");
+        assert!(!footer.contains("enriched ("));
     }
 
     #[test]
@@ -1722,7 +1796,7 @@ mod tests {
     fn test_adversarial_invalid_state_u8() {
         // Values beyond the enum range should fall back to NotStarted
         assert_eq!(LspState::from_u8(255), LspState::NotStarted);
-        assert_eq!(LspState::from_u8(6), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(7), LspState::NotStarted);
         assert_eq!(LspState::from_u8(100), LspState::NotStarted);
     }
 

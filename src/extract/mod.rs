@@ -207,9 +207,14 @@ pub struct EnrichmentResult {
     /// Whether enrichment was aborted early (e.g., zero-edge threshold, timeout).
     /// Set by individual enrichers; used by `LspConsumer` to propagate to `EnrichmentComplete`.
     pub aborted: bool,
+    /// Actionable diagnostic explaining why enrichment was aborted or degraded.
+    /// Partial edges/nodes remain valid and are returned alongside this detail.
+    pub diagnostic: Option<String>,
     /// Per-language LSP enrichment stats for the scan summary.
     /// Populated by `enrich_all()` from individual enricher results.
     pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,
+    /// Operation/declaration query-yield measurements from LSP enrichers.
+    pub lsp_query_metrics: Vec<lsp::LspQueryMetric>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -630,129 +635,8 @@ impl EnricherRegistry {
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
 
-        // Known LSP servers: (language, binary, args, extensions)
-        // Ordered by popularity. All are optional — only used if installed.
-        let servers: &[(&str, &str, &[&str], &[&str])] = &[
-            // Tier 1: most common
-            ("rust", "rust-analyzer", &[], &["rs"]),
-            ("python", "pyright-langserver", &["--stdio"], &["py"]),
-            (
-                "typescript",
-                "typescript-language-server",
-                &["--stdio"],
-                &["ts", "tsx", "js", "jsx"],
-            ),
-            ("go", "gopls", &["serve"], &["go"]),
-            ("markdown", "marksman", &["server"], &["md"]),
-            // Tier 2: widely used
-            (
-                "c-cpp",
-                "clangd",
-                &[],
-                &["c", "cc", "cpp", "cxx", "h", "hpp"],
-            ),
-            ("java", "jdtls", &[], &["java"]),
-            ("ruby", "solargraph", &["stdio"], &["rb"]),
-            ("csharp", "csharp-ls", &[], &["cs"]),
-            ("swift", "sourcekit-lsp", &[], &["swift"]),
-            ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
-            ("lua", "lua-language-server", &[], &["lua"]),
-            ("zig", "zls", &[], &["zig"]),
-            ("elixir", "elixir-ls", &[], &["ex", "exs"]),
-            ("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
-            ("ocaml", "ocamllsp", &[], &["ml", "mli"]),
-            ("scala", "metals", &[], &["scala", "sc"]),
-            // Tier 3: common in specific ecosystems
-            ("dart", "dart", &["language-server"], &["dart"]),
-            (
-                "r",
-                "R",
-                &["--no-echo", "-e", "languageserver::run()"],
-                &["r", "R"],
-            ),
-            (
-                "julia",
-                "julia",
-                &[
-                    "--startup-file=no",
-                    "-e",
-                    "using LanguageServer; runserver()",
-                ],
-                &["jl"],
-            ),
-            ("php", "intelephense", &["--stdio"], &["php"]),
-            (
-                "css",
-                "vscode-css-languageserver",
-                &["--stdio"],
-                &["css", "scss", "less"],
-            ),
-            (
-                "html",
-                "vscode-html-languageserver",
-                &["--stdio"],
-                &["html", "htm"],
-            ),
-            (
-                "yaml",
-                "yaml-language-server",
-                &["--stdio"],
-                &["yaml", "yml"],
-            ),
-            (
-                "json",
-                "vscode-json-languageserver",
-                &["--stdio"],
-                &["json"],
-            ),
-            ("toml", "taplo", &["lsp", "stdio"], &["toml"]),
-            ("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
-            ("nix", "nil", &[], &["nix"]),
-            ("vue", "vue-language-server", &["--stdio"], &["vue"]),
-            ("svelte", "svelteserver", &["--stdio"], &["svelte"]),
-            ("erlang", "erlang_ls", &[], &["erl", "hrl"]),
-            ("gleam", "gleam", &["lsp"], &["gleam"]),
-            ("nim", "nimlsp", &[], &["nim"]),
-            ("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
-            ("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"]),
-            ("protobuf", "buf", &["lsp"], &["proto"]),
-            ("latex", "texlab", &[], &["tex", "bib"]),
-            ("typst", "tinymist", &[], &["typ"]),
-        ];
-
-        for &(lang, cmd, args, exts) in servers {
-            let enricher = lsp::LspEnricher::new(lang, cmd, args, exts);
-            // Add language-specific startup settings and remediation at the LSP config boundary.
-            let enricher = match lang {
-                "python" => enricher.with_settings(serde_json::json!({
-                    "python": { "analysis": { "autoSearchPaths": true } }
-                })),
-                "csharp" => enricher.with_toolchain_remediation(lsp::CSHARP_TOOLCHAIN_REMEDIATION),
-                _ => enricher,
-            };
-            // Add config file hints for lsp_root selection in monorepos.
-            // When a monorepo has multiple subdirectory roots, the enricher prefers
-            // the root that contains this file over the raw node-count heuristic.
-            let enricher = match lang {
-                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
-                "python" => enricher.with_config_file("pyproject.toml"),
-                "go" => enricher.with_config_file("go.mod"),
-                "rust" => enricher.with_config_file("Cargo.toml"),
-                "java" => enricher.with_config_file("pom.xml"),
-                "kotlin" => enricher.with_config_file("build.gradle.kts"),
-                _ => enricher,
-            };
-            // Apply per-language LSP enrichable kind restrictions from LangConfig.
-            let enricher = if let Some(config) = configs::config_for_language(lang) {
-                if let Some(kinds) = config.lsp_enrichable_kinds {
-                    enricher.with_enrichable_kinds(kinds)
-                } else {
-                    enricher
-                }
-            } else {
-                enricher
-            };
-            registry.register(Box::new(enricher));
+        for descriptor in lsp::builtin_lsp_descriptors() {
+            registry.register(Box::new(descriptor.build()));
         }
 
         registry
@@ -838,6 +722,7 @@ impl EnricherRegistry {
                     let edge_count = enrichment.added_edges.len();
                     let node_count = enrichment.new_nodes.len();
                     let error_count = enrichment.error_count;
+                    let query_metrics = enrichment.lsp_query_metrics;
                     let status = if enrichment.aborted {
                         scan_stats::LspStatus::Aborted
                     } else {
@@ -846,6 +731,7 @@ impl EnricherRegistry {
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
+                    result.lsp_query_metrics.extend(query_metrics.clone());
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
                         language: lang,
                         server_name: server,
@@ -856,6 +742,7 @@ impl EnricherRegistry {
                         duration: dur,
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
+                        query_metrics,
                     });
                 }
                 Err(e) => {
@@ -882,6 +769,7 @@ impl EnricherRegistry {
                         duration: dur,
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
+                        query_metrics: Vec::new(),
                     });
                 }
             }
