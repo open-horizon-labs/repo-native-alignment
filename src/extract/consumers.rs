@@ -713,7 +713,8 @@ impl EnrichmentFinalizer {
         // - ADR frontmatter points directly at exact Rust cargo test names.
         // - extracted test functions can reference ADRs back via doc comments.
         {
-            let mut new_edges = crate::extract::markdown::adr_validation_pass(&all_nodes);
+            let mut new_edges = crate::extract::markdown::markdown_anchor_pass(&mut all_nodes);
+            new_edges.extend(crate::extract::markdown::adr_validation_pass(&all_nodes));
             new_edges.extend(crate::extract::markdown::adr_backreference_pass(&all_nodes));
             if !new_edges.is_empty() {
                 all_edges.extend(new_edges);
