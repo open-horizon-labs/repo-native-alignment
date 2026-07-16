@@ -117,6 +117,7 @@ class SwebenchRnaOneTests(unittest.TestCase):
             HARNESS.make_task_prompt(instance, prompt)
             text = prompt.read_text(encoding="utf-8")
             self.assertIn("repository tools available in this run", text)
+            self.assertIn("complete at least one successful call before", text)
             self.assertNotIn("rna-server", text)
 
     def test_mcp_summary_counts_only_tool_results_before_first_edit(self) -> None:
@@ -384,6 +385,31 @@ class SwebenchRnaOneTests(unittest.TestCase):
             self.assertIn("diff --git a/created.txt b/created.txt", patch)
             self.assertIn("+new content", patch)
 
+    def test_collect_patch_excludes_generated_binary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=checkout, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "base"], cwd=checkout, check=True
+            )
+            cache = checkout / "__pycache__"
+            cache.mkdir()
+            (cache / "bad.pyc").write_bytes(b"\xb2\x00\xff")
+            (checkout / "solution.py").write_text("fixed = True\n", encoding="utf-8")
+            patch = HARNESS.collect_patch(checkout)
+            self.assertIn("solution.py", patch)
+            self.assertNotIn("bad.pyc", patch)
+
     def test_executor_timeout_terminates_descendant_processes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)
@@ -433,7 +459,12 @@ class SwebenchRnaOneTests(unittest.TestCase):
             )
             embedding = HARNESS.dataclasses.replace(command, exit_code=1)
             state = HARNESS.parse_enrichment_state(
-                command, scan_stdout, scan_stderr, embedding, command
+                command,
+                scan_stdout,
+                scan_stderr,
+                embedding,
+                command,
+                condition="full",
             )
             self.assertEqual(state["observed"], "degraded")
             self.assertIn(
@@ -441,6 +472,33 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 state["degraded_evidence"],
             )
             self.assertIn("embedding_stderr", state["raw_logs"])
+
+    def test_call_references_is_ready_when_embeddings_are_intentionally_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            scan_stdout = logs / "scan.stdout.log"
+            scan_stderr = logs / "scan.stderr.log"
+            scan_stdout.write_text(
+                "call_references: completed\nDegraded queries: semantic search\n",
+                encoding="utf-8",
+            )
+            scan_stderr.write_text("", encoding="utf-8")
+            command = HARNESS.CommandResult(
+                command=["rna"],
+                exit_code=0,
+                started_at="start",
+                finished_at="finish",
+                duration_seconds=1.0,
+            )
+            state = HARNESS.parse_enrichment_state(
+                command,
+                scan_stdout,
+                scan_stderr,
+                None,
+                command,
+                condition="call-references",
+            )
+            self.assertEqual(state["observed"], "ready")
 
     def test_dry_run_builds_auditable_bundle_without_executor_or_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
