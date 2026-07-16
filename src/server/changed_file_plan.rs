@@ -477,12 +477,7 @@ mod tests {
         python_struct.language = "python".to_string();
         let mut python_function = node("src/changed.rs", "handler", NodeKind::Function);
         python_function.language = "python".to_string();
-        let nodes = vec![
-            synthetic,
-            declared_const,
-            python_struct,
-            python_function,
-        ];
+        let nodes = vec![synthetic, declared_const, python_struct, python_function];
 
         let plan = plan_changed_files(ChangedFilePlanInput {
             provenance: provenance(),
@@ -498,11 +493,23 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(plan.planned_nodes.len(), 1);
-        assert!(plan.planned_nodes[0].stable_id.contains("handler"));
-        assert_eq!(
-            plan.planned_nodes[0].requested_operations,
-            vec!["call_hierarchy"]
+        assert_eq!(plan.planned_nodes.len(), 2);
+        let declared = plan
+            .planned_nodes
+            .iter()
+            .find(|node| node.stable_id.contains("DECLARED"))
+            .expect("measured rust-analyzer profile should admit declared constants");
+        assert_eq!(declared.requested_operations, vec!["references"]);
+        let handler = plan
+            .planned_nodes
+            .iter()
+            .find(|node| node.stable_id.contains("handler"))
+            .expect("Python function remains admitted");
+        assert_eq!(handler.requested_operations, vec!["call_hierarchy"]);
+        assert!(
+            plan.planned_nodes.iter().all(
+                |node| !node.stable_id.contains("literal") && !node.stable_id.contains("Model")
+            )
         );
     }
 

@@ -39,9 +39,17 @@ Before requesting call hierarchy or references for a symbol, RNA sends `textDocu
 
 ### Operation-aware query admission
 
-Every LSP request is admitted through one shared query profile. The profile combines the requested operation, declaration class, language/server configuration, negotiated server capabilities, and the operation's runtime budget. Synthetic values are always rejected, and declared constants are default-denied for reference queries. High-signal function call hierarchy and trait implementation requests remain enabled when the server advertises those capabilities.
+Every LSP request is admitted through one shared query profile. The profile combines the requested operation, declaration class, language/server configuration, negotiated server capabilities, and the operation's runtime budget. Synthetic values are always rejected, and declared constants are default-denied for reference queries unless a language/server profile has cleared a measured yield, correctness, latency, and reliability threshold. Rust-analyzer is currently the only built-in declared-constant opt-in; Pyright remains disabled because the maintained probe produced only timeouts and no edges. High-signal function call hierarchy and trait implementation requests remain enabled when the server advertises those capabilities.
 
 RNA records scheduled requests, non-empty responses, emitted edges, latency, timeouts, and errors for each language/server, operation, and declaration class. `list_roots` exposes these query-yield rows beneath each language's LSP summary so operators can compare request cost with agent-visible graph value.
+
+The reproducible probe is:
+
+```bash
+cargo test measure_declared_const_reference_yield -- --ignored --nocapture --test-threads=1
+```
+
+It runs maintained Rust and Python fixtures sequentially through RNA's actual LSP enricher and asserts the current per-server decision.
 
 ## Auto-detected Language Servers
 

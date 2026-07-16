@@ -60,6 +60,7 @@ pub(crate) struct BuiltinLspDescriptor {
     init_settings: Option<InitSettingsFactory>,
     config_file: Option<&'static str>,
     toolchain_remediation: Option<&'static str>,
+    allow_declared_const_references: bool,
 }
 
 impl BuiltinLspDescriptor {
@@ -78,6 +79,9 @@ impl BuiltinLspDescriptor {
         }
         if let Some(remediation) = self.toolchain_remediation {
             enricher = enricher.with_toolchain_remediation(remediation);
+        }
+        if self.allow_declared_const_references {
+            enricher = enricher.with_declared_const_references(true);
         }
         if let Some(kinds) = crate::extract::configs::config_for_language(self.language)
             .and_then(|config| config.lsp_enrichable_kinds)
@@ -104,6 +108,7 @@ macro_rules! builtin_lsp {
             init_settings: None,
             config_file: None,
             toolchain_remediation: None,
+            allow_declared_const_references: false,
         }
     };
 }
@@ -112,6 +117,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
     BuiltinLspDescriptor {
         init_settings: None,
         config_file: Some("Cargo.toml"),
+        allow_declared_const_references: true,
         ..builtin_lsp!("rust", "rust-analyzer", &[], &["rs"])
     },
     BuiltinLspDescriptor {
@@ -477,6 +483,11 @@ impl LspEnricher {
     /// When set, only nodes matching these kinds are sent for enrichment.
     pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
         self.query_profile = self.query_profile.with_allowed_kinds(kinds);
+        self
+    }
+
+    fn with_declared_const_references(mut self, allow: bool) -> Self {
+        self.query_profile = self.query_profile.with_declared_const_references(allow);
         self
     }
 
@@ -2907,7 +2918,12 @@ mod tests {
         assert!(python_kinds.contains(&NodeKind::Trait));
         assert!(
             !python.allows_declared_const_references(),
-            "built-in profiles must keep declared-Const references default-off"
+            "Pyright must keep declared-Const references disabled after the #768 probe"
+        );
+        let rust = builtin_lsp_enricher("rust").expect("rust is a built-in LSP profile");
+        assert!(
+            rust.allows_declared_const_references(),
+            "rust-analyzer cleared the #768 declared-Const yield threshold"
         );
         assert_eq!(
             python.init_settings,
@@ -3793,6 +3809,225 @@ mod tests {
         let _result = enricher
             .enrich(&nodes, &index, std::path::Path::new("."))
             .await;
+    }
+
+    /// Reproducible, opt-in probe for issue #768. This intentionally exercises
+    /// RNA's real LSP scheduling, telemetry, and edge rendering against maintained
+    /// fixtures. Production opt-ins remain separately encoded in built-in profiles.
+    #[tokio::test]
+    #[ignore = "requires installed rust-analyzer and pyright-langserver"]
+    async fn measure_declared_const_reference_yield() {
+        use crate::extract::{Extractor, python::PythonExtractor, rust::RustExtractor};
+
+        struct FixtureCase {
+            language: &'static str,
+            server: &'static str,
+            args: &'static [&'static str],
+            extension: &'static str,
+            config_name: &'static str,
+            config: &'static str,
+            sources: &'static [(&'static str, &'static str)],
+            expect_enable: bool,
+        }
+
+        let cases = [
+            FixtureCase {
+                language: "rust",
+                server: "rust-analyzer",
+                args: &[],
+                extension: "rs",
+                config_name: "Cargo.toml",
+                config: include_str!("../../../tests/fixtures/lsp_const_yield/rust/Cargo.toml"),
+                sources: &[
+                    (
+                        "src/lib.rs",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/rust/src/lib.rs"),
+                    ),
+                    (
+                        "src/worker.rs",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/rust/src/worker.rs"),
+                    ),
+                ],
+                expect_enable: true,
+            },
+            FixtureCase {
+                language: "python",
+                server: "pyright-langserver",
+                args: &["--stdio"],
+                extension: "py",
+                config_name: "pyproject.toml",
+                config: include_str!(
+                    "../../../tests/fixtures/lsp_const_yield/python/pyproject.toml"
+                ),
+                sources: &[
+                    (
+                        "constants.py",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/python/constants.py"),
+                    ),
+                    (
+                        "consumer.py",
+                        include_str!("../../../tests/fixtures/lsp_const_yield/python/consumer.py"),
+                    ),
+                ],
+                expect_enable: false,
+            },
+        ];
+
+        for case in cases {
+            if tokio::process::Command::new(case.server)
+                .arg("--version")
+                .output()
+                .await
+                .is_err()
+            {
+                panic!("{} is required for the #768 measurement probe", case.server);
+            }
+
+            let fixture = tempfile::tempdir().expect("create measurement fixture");
+            std::fs::write(fixture.path().join(case.config_name), case.config)
+                .expect("write fixture config");
+
+            let mut nodes = Vec::new();
+            for (relative_path, content) in case.sources {
+                let absolute_path = fixture.path().join(relative_path);
+                std::fs::create_dir_all(
+                    absolute_path
+                        .parent()
+                        .expect("fixture source has a parent directory"),
+                )
+                .expect("create fixture source directory");
+                std::fs::write(&absolute_path, content).expect("write fixture source");
+
+                let extracted = match case.language {
+                    "rust" => RustExtractor::new()
+                        .extract(std::path::Path::new(relative_path), content)
+                        .expect("extract Rust fixture"),
+                    "python" => PythonExtractor::new()
+                        .extract(std::path::Path::new(relative_path), content)
+                        .expect("extract Python fixture"),
+                    other => panic!("unsupported measurement fixture language: {other}"),
+                };
+                nodes.extend(extracted.nodes);
+            }
+
+            let mut enricher =
+                LspEnricher::new(case.language, case.server, case.args, &[case.extension])
+                    .with_declared_const_references(true);
+            enricher = match case.language {
+                "rust" => enricher.with_config_file("Cargo.toml"),
+                "python" => enricher
+                    .with_settings(python_init_settings())
+                    .with_config_file("pyproject.toml"),
+                _ => enricher,
+            };
+            let result = enricher
+                .enrich(&nodes, &GraphIndex::new(), fixture.path())
+                .await
+                .unwrap_or_else(|error| panic!("{} enrichment failed: {error}", case.server));
+
+            assert!(
+                !result.aborted,
+                "{} aborted: {:?}",
+                case.server, result.diagnostic
+            );
+            let const_metric = result
+                .lsp_query_metrics
+                .iter()
+                .find(|metric| {
+                    metric.operation == "references" && metric.declaration_class == "const"
+                })
+                .unwrap_or_else(|| panic!("{} emitted no Const telemetry", case.server));
+            let type_metric = result
+                .lsp_query_metrics
+                .iter()
+                .find(|metric| {
+                    metric.operation == "references" && metric.declaration_class == "struct"
+                })
+                .unwrap_or_else(|| panic!("{} emitted no Struct telemetry", case.server));
+
+            let const_edges = result
+                .added_edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::ReferencedBy && edge.to.kind == NodeKind::Const
+                })
+                .collect::<Vec<_>>();
+            let expected_constants = ["RETRY_LIMIT", "TIMEOUT_MS", "DEFAULT_PORT", "FEATURE_FLAG"];
+            let expected_referrers = [
+                "local_retry_limit",
+                "local_timeout",
+                "local_port",
+                "local_feature",
+                "worker_retry_limit",
+                "worker_timeout",
+                "worker_port",
+                "worker_feature",
+                "make_config",
+                "worker_config",
+            ];
+
+            assert_eq!(
+                const_metric.scheduled_requests, 5,
+                "{} should measure exactly five declared constants",
+                case.server
+            );
+            let const_average_ms =
+                const_metric.latency_ms.max(1) / const_metric.scheduled_requests.max(1) as u64;
+            let type_average_ms =
+                type_metric.latency_ms.max(1) / type_metric.scheduled_requests.max(1) as u64;
+            let clears_threshold = const_metric.non_empty_responses * 100
+                >= const_metric.scheduled_requests * 80
+                && const_metric.emitted_edges >= const_metric.scheduled_requests
+                && const_metric.timeouts == 0
+                && const_metric.errors == 0
+                && const_average_ms <= type_average_ms.saturating_mul(2).max(2);
+            assert_eq!(
+                clears_threshold, case.expect_enable,
+                "{} eligibility decision changed: Const={const_metric:?}, Struct={type_metric:?}",
+                case.server
+            );
+
+            assert!(
+                const_edges
+                    .iter()
+                    .all(|edge| expected_constants.contains(&edge.to.name.as_str())),
+                "{} emitted a Const edge to an unexpected declaration: {const_edges:#?}",
+                case.server
+            );
+            assert!(
+                const_edges
+                    .iter()
+                    .all(|edge| expected_referrers.contains(&edge.from.name.as_str())),
+                "{} emitted a Const edge from an unexpected referrer: {const_edges:#?}",
+                case.server
+            );
+            assert!(
+                const_edges
+                    .iter()
+                    .all(|edge| edge.to.name != "UNUSED_SENTINEL"),
+                "{} emitted a spurious edge to the unused control constant",
+                case.server
+            );
+            if case.expect_enable {
+                for constant in expected_constants {
+                    assert!(
+                        const_edges.iter().any(|edge| edge.to.name == constant),
+                        "{} failed to emit a correct sampled edge for {constant}",
+                        case.server
+                    );
+                }
+            }
+
+            eprintln!(
+                "CONST_YIELD_RESULT language={} server={} eligible={} result_errors={} metrics={:#?} const_edges={:#?}",
+                case.language,
+                case.server,
+                clears_threshold,
+                result.error_count,
+                result.lsp_query_metrics,
+                const_edges
+            );
+        }
     }
 
     /// Verify that the quiescent readiness condition matches the rust-analyzer

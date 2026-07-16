@@ -3040,7 +3040,7 @@ mod tests {
         );
         assert!(
             !event_bus_path.allows_declared_const_references(),
-            "built-in declared-Const references remain disabled pending #768"
+            "Pyright declared-Const references remain disabled after the #768 probe"
         );
         assert_eq!(
             crate::extract::Enricher::name(&event_bus_path),
