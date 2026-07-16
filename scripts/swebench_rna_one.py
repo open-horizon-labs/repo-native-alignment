@@ -364,10 +364,7 @@ def make_task_prompt(instance: Mapping[str, Any], path: Path) -> None:
                     [
                         "Solve the issue in the current isolated checkout.",
                         "Use the repository tools available in this run for",
-                        "orientation before editing. If an MCP repository tool is",
-                        "available, complete at least one successful call before",
-                        "editing; if none is available, continue without MCP.",
-                        "Do not search the network for",
+                        "orientation before editing. Do not search the network for",
                         "the upstream patch or commit history. Make the smallest",
                         "correct implementation and run focused verification.",
                     ]
@@ -950,8 +947,6 @@ def parse_enrichment_state(
     scan_stderr: Path,
     embedding: CommandResult | None,
     readiness: CommandResult,
-    *,
-    condition: str,
 ) -> dict[str, Any]:
     log_paths = {
         "scan_stdout": scan_stdout,
@@ -966,9 +961,7 @@ def parse_enrichment_state(
         if path.exists()
     )
     lower = combined.lower()
-    if condition == "full" and (
-        "degraded" in lower or embedding is None or embedding.exit_code != 0
-    ):
+    if "degraded" in lower or (embedding is not None and embedding.exit_code != 0):
         observed = "degraded"
     elif scan.exit_code == 0 and readiness.exit_code == 0:
         observed = "ready"
@@ -1054,12 +1047,7 @@ def prewarm_rna(
     )
     commands.append(readiness)
     state = parse_enrichment_state(
-        scan,
-        scan_stdout,
-        scan_stderr,
-        embedding,
-        readiness,
-        condition=condition,
+        scan, scan_stdout, scan_stderr, embedding, readiness
     )
     state["selected_condition"] = condition
     if readiness.exit_code != 0:
@@ -1070,59 +1058,18 @@ def prewarm_rna(
 
 
 def collect_patch(checkout: Path) -> str:
-    # Intent-to-add exposes relevant untracked source to diff without including
-    # executor caches or bytecode that are not part of a solution.
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=checkout,
-        check=False,
-        capture_output=True,
-    )
-    if untracked.returncode != 0:
-        raise HarnessError(
-            "unable to enumerate untracked files: "
-            + untracked.stderr.decode("utf-8", errors="replace").strip()
-        )
-    ignored_parts = {
-        ".oh",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "node_modules",
-        "target",
-    }
-    candidates = [
-        path
-        for path in untracked.stdout.decode("utf-8", errors="surrogateescape").split("\0")
-        if path
-        and not ignored_parts.intersection(Path(path).parts)
-        and Path(path).suffix not in {".pyc", ".pyo"}
-    ]
-    if candidates:
-        completed = subprocess.run(
-            ["git", "add", "--intent-to-add", "--", *candidates],
-            cwd=checkout,
-            check=False,
-            capture_output=True,
-        )
-        if completed.returncode != 0:
-            raise HarnessError(
-                "unable to expose untracked patch content: "
-                + completed.stderr.decode("utf-8", errors="replace").strip()
-            )
+    # Intent-to-add exposes untracked content to diff without staging it.
+    git_output(checkout, "add", "--intent-to-add", "--all")
     completed = subprocess.run(
         ["git", "diff", "--binary", "--no-ext-diff", "HEAD"],
         cwd=checkout,
         check=False,
         capture_output=True,
+        text=True,
     )
     if completed.returncode != 0:
-        raise HarnessError(
-            "unable to collect patch: "
-            + completed.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return completed.stdout.decode("utf-8", errors="replace")
+        raise HarnessError(f"unable to collect patch: {completed.stderr.strip()}")
+    return completed.stdout
 
 
 def evaluator_result(evaluation_dir: Path, instance_id: str) -> dict[str, Any]:
