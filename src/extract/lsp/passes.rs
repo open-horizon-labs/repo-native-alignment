@@ -809,11 +809,20 @@ impl LspEnricher {
                 let did_open = Arc::clone(&did_open);
                 let telemetry = Arc::clone(&telemetry);
                 async move {
-                    if let (Some(operation), Some(declaration)) = (
+                    let registered = if let (Some(operation), Some(declaration)) = (
                         item.requested_operations.first().copied(),
                         LspDeclarationClass::from_kind(&item.node.id.kind),
                     ) {
-                        telemetry.register_work_item(item.id, operation, declaration);
+                        telemetry.register_work_item(item.id, operation, declaration)
+                    } else {
+                        false
+                    };
+                    if !registered {
+                        return Pass1TaskResult {
+                            edges: Vec::new(),
+                            new_nodes: Vec::new(),
+                            had_error: false,
+                        };
                     }
                     Self::run_pass1_work_item(
                         &item,

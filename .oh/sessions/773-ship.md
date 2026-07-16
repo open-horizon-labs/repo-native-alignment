@@ -33,4 +33,6 @@ The reviewer found three correctness gaps: changed-file planning bypassed the sh
 
 The first follow-up found a cancellation race in aggregate timeout ownership. Telemetry now registers only started work by item ID; completion and deadline attribution atomically remove that ID, so late completions are ignored and queued work that never issued a request is not labeled timed out. The regression explicitly exercises a completion arriving after timeout attribution.
 
+The second follow-up found that registration could race after the deadline drain. Deadline closure now occurs under the same mutex as registration; late registration returns false and the worker exits before issuing an LSP request. The timeout regression also asserts registration is rejected after closure.
+
 Formatting-only changes are confined to files materially edited by #767 and result from applying the repository toolchain's formatter to those files. They are acknowledged as review noise but do not alter unrelated behavior.

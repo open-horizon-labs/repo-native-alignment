@@ -284,6 +284,7 @@ pub(crate) struct LspQueryTelemetry {
 struct LspQueryTelemetryState {
     metrics: BTreeMap<LspQueryMetricKey, LspQueryMetric>,
     pending_work: BTreeMap<usize, LspQueryMetricKey>,
+    deadline_closed: bool,
 }
 
 impl LspQueryTelemetry {
@@ -300,7 +301,7 @@ impl LspQueryTelemetry {
         work_item_id: usize,
         operation: LspQueryOperation,
         declaration: LspDeclarationClass,
-    ) {
+    ) -> bool {
         let key = LspQueryMetricKey {
             operation,
             declaration,
@@ -309,7 +310,11 @@ impl LspQueryTelemetry {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if state.deadline_closed {
+            return false;
+        }
         state.pending_work.insert(work_item_id, key);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -420,6 +425,7 @@ impl LspQueryTelemetry {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        state.deadline_closed = true;
         let pending = std::mem::take(&mut state.pending_work);
         for (_, key) in pending {
             self.record_locked(&mut state, key, 0, 0, 0, latency, 1, 1);
@@ -616,16 +622,16 @@ mod tests {
     fn job_timeout_attributes_only_unfinished_work_items() {
         let profile = LspQueryProfile::new("rust", "rust-analyzer");
         let telemetry = LspQueryTelemetry::new(&profile);
-        telemetry.register_work_item(
+        assert!(telemetry.register_work_item(
             1,
             LspQueryOperation::CallHierarchy,
             LspDeclarationClass::Function,
-        );
-        telemetry.register_work_item(
+        ));
+        assert!(telemetry.register_work_item(
             2,
             LspQueryOperation::CallHierarchy,
             LspDeclarationClass::Function,
-        );
+        ));
         assert!(telemetry.record_work_item(
             1,
             3,
@@ -637,6 +643,11 @@ mod tests {
         ));
 
         telemetry.record_job_timeout(Duration::from_millis(50));
+        assert!(!telemetry.register_work_item(
+            3,
+            LspQueryOperation::References,
+            LspDeclarationClass::Struct,
+        ));
         assert!(!telemetry.record_work_item(
             2,
             2,
