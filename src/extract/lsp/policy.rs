@@ -192,7 +192,6 @@ impl LspQueryProfile {
         self.allowed_kinds.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn with_declared_const_references(mut self, allow: bool) -> Self {
         self.allow_declared_const_references = allow;
         self
@@ -666,14 +665,7 @@ mod tests {
         ));
         telemetry.note_requests_started(1, 3);
         telemetry.note_requests_started(2, 2);
-        assert!(telemetry.record_work_item(
-            1,
-            1,
-            2,
-            Duration::from_millis(10),
-            0,
-            0,
-        ));
+        assert!(telemetry.record_work_item(1, 1, 2, Duration::from_millis(10), 0, 0,));
 
         telemetry.record_job_timeout();
         assert!(!telemetry.register_work_item(
@@ -681,14 +673,7 @@ mod tests {
             LspQueryOperation::References,
             LspDeclarationClass::Struct,
         ));
-        assert!(!telemetry.record_work_item(
-            2,
-            1,
-            1,
-            Duration::from_millis(60),
-            0,
-            0,
-        ));
+        assert!(!telemetry.record_work_item(2, 1, 1, Duration::from_millis(60), 0, 0,));
 
         let metrics = telemetry.snapshot();
         assert_eq!(metrics.len(), 1);
