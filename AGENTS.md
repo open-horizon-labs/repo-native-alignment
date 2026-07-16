@@ -30,13 +30,13 @@ This ensures every piece of work has a PR home before implementation begins. No 
 
 ## /ship Definition (for this project)
 
-`/ship` = the full quality gate before merge. **12 steps, defined in `.claude/agents/ship.md`.**
+`/ship` = the full quality gate before merge, defined in `.claude/agents/ship.md`.
 
-Summary: review → dissent → fix → **mark ready** → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
+Summary: review → dissent → fix → **mark ready** → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → final comment sweep → **fresh final-diff approval** → merge.
 
-Step 3b (mark ready) converts the draft PR to ready-for-review, which triggers smoke tests and CodeRabbit review in CI. Both are gated behind `draft == false` so they skip during the draft phase when code is still being iterated on.
+Step 3b (mark ready) converts the draft PR to ready-for-review, which triggers smoke tests gated behind `draft == false` so they skip during the draft phase when code is still being iterated on.
 
-Every PR that changes code must explicitly trigger CodeRabbit review and receive a clean/approved CodeRabbit verdict before merge. A skipped draft review, a pending review, or a green status without an actual CodeRabbit review is not sufficient.
+Every PR must receive an explicit `APPROVE` on its final commit from a fresh, separate sub-agent using the repo-local `/review` skill. The reviewer receives the final diff, issue acceptance criteria, relevant guardrails/metis, and RNA impact context—but not implementation reasoning or session context. A later diff change invalidates approval and requires another fresh reviewer. CodeRabbit is optional supplemental feedback: never trigger or wait for it, but address any actionable comments already present.
 
 No step is optional. "Merge when green" is not ship. Steps answer different questions — don't collapse them:
 - Review/dissent: "Is the code correct?"
@@ -117,7 +117,7 @@ RNA compiles the fractal, repo-local knowledge absent from model training data�
 - **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
 - **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
 - **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use the successful GitHub Actions artifact for the target commit, not a local cargo install from source. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
-- **coderabbit-approval-for-code-prs**: Every code-changing PR must receive an explicit clean/approved CodeRabbit review before merge. [Details](.oh/guardrails/coderabbit-approval-for-code-prs.md)
+- **independent-final-review-for-prs**: Every PR must receive explicit approval from a fresh, separate repo-local `/review` sub-agent on the final diff before merge. [Details](.oh/guardrails/independent-final-review-for-prs.md)
 
 ### Soft guardrails
 - **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)

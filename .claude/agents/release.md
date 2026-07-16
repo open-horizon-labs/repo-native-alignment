@@ -71,27 +71,27 @@ For each merged PR since last tag:
 
 **This step is BLOCKING. Unaddressed Critical/Major findings = NO-GO.**
 
-For every PR merged since last tag, check CodeRabbit inline comments AND issue comments:
+For every PR merged since last tag, check all inline review comments and issue comments. CodeRabbit is optional supplemental feedback; never trigger or wait for it, but include any comments it already posted:
 
 ```bash
 # Get all merged PRs since last tag
 git log <last-tag>..HEAD --merges --oneline | grep -o '#[0-9]*' | sort -u | while read pr; do
   echo "=== PR $pr ==="
-  # CodeRabbit inline comments
+  # All inline review comments, including optional CodeRabbit feedback
   gh api repos/{owner}/{repo}/pulls/${pr#\#}/comments --paginate 2>/dev/null | \
     python3 -c "
 import json,sys
-cs = [c for c in json.load(sys.stdin) if 'coderabbit' in c.get('user',{}).get('login','').lower()]
+cs = json.load(sys.stdin)
 for c in cs:
     sev = '🔴CRITICAL' if '🔴' in c.get('body','') else ('🟠MAJOR' if '🟠' in c.get('body','') else '🟡MINOR')
-    print(f'  [{sev}] {c.get(\"path\",\"\")}:{c.get(\"line\",\"\")}')
+    print(f'  [{sev}] {c.get(\"user\",{}).get(\"login\",\"\")} {c.get(\"path\",\"\")}:{c.get(\"line\",\"\")}')
     print(f'    {c.get(\"body\",\"\")[:150]}')
 " 2>/dev/null
   # Issue comments
   gh api repos/{owner}/{repo}/issues/${pr#\#}/comments --paginate 2>/dev/null | \
     python3 -c "
 import json,sys
-cs = [c for c in json.load(sys.stdin) if 'coderabbit' not in c.get('user',{}).get('login','').lower() and 'github-actions' not in c.get('user',{}).get('login','').lower()]
+cs = [c for c in json.load(sys.stdin) if 'github-actions' not in c.get('user',{}).get('login','').lower()]
 for c in cs[:3]:
     print(f'  [HUMAN] {c.get(\"user\",{}).get(\"login\",\"\")}')
     print(f'    {c.get(\"body\",\"\")[:150]}')

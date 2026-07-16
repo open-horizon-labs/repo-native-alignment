@@ -1,6 +1,6 @@
 ---
 name: ship
-description: RNA delivery pipeline. 13-step quality gate from implementation to merge, with delivery verification and final comment sweep.
+description: RNA delivery pipeline from implementation to merge, with delivery verification, final comment sweep, and independent final-diff approval.
 tools: Read, Write, Edit, Grep, Glob, Bash, Agent
 mcpServers:
   - rna-mcp
@@ -8,7 +8,7 @@ mcpServers:
 
 # RNA /ship Pipeline
 
-The full quality gate for this project. 13 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
+The full quality gate for this project. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
 > **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?"
 >
@@ -42,7 +42,7 @@ Before starting:
 2. Read `.oh/metis/computed-but-not-delivered.md` — the metis that created step 7b
 3. Identify the PR, branch, and issue being closed
 4. Read the PR description and issue acceptance criteria
-5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`). Note: CodeRabbit only reviews non-draft PRs, so comments may not exist yet during pre-flight if the PR is still a draft.
+5. Check for existing external review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`). CodeRabbit is optional supplemental feedback: never trigger or wait for it, but include any actionable comments already present in the normal review-finding audit.
 6. **MANDATORY RNA scan gate** — before reading any source file, verify the worktree index is live:
    ```bash
    # Check if already indexed
@@ -56,7 +56,7 @@ Before starting:
    ```
    You CANNOT do code review or regression testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
 
-## The 12 Steps
+## The Steps
 
 ### 1. RNA-Grounded Code Review
 
@@ -120,41 +120,62 @@ EOF
 
 ### 2. Independent Code Review
 
-Spawn an independent `code-reviewer` agent that sees ONLY the diff and RNA artifacts — NOT the session file or implementation reasoning. The reviewer forms its own assessment with genuine adversarial pressure.
+Spawn a fresh, separate reviewer sub-agent using the repo-local `/review` skill. It sees ONLY the diff, issue acceptance criteria, and relevant RNA artifacts — NOT the session file, implementation reasoning, or implementer conversation. The reviewer forms its own assessment with genuine adversarial pressure.
 
-**How:** Spawn the code-reviewer agent with the diff and RNA context gathered in step 1:
+**How:** Spawn the reviewer with no inherited conversation context and the diff plus RNA context gathered in step 1:
 ```
-Agent(subagent_type="code-reviewer", prompt="Review PR #<number>\n\nDIFF:\n<gh pr diff output or reference>\n\nACCEPTANCE CRITERIA:\n<from issue>\n\nGUARDRAILS:\n<relevant guardrails from step 1>\n\nMETIS:\n<relevant metis from step 1>\n\nGRAPH IMPACT:\n<callers/dependents of changed symbols>\n\nPost your findings as a PR comment.")
+Agent(
+  fresh_context=true,
+  prompt="Run the repo-local /review skill in independent review mode for Ship Step 2 on PR #<number>.
+
+REVIEWED COMMIT:
+<head SHA>
+
+DIFF:
+<gh pr diff output or reference>
+
+ACCEPTANCE CRITERIA:
+<from issue>
+
+GUARDRAILS:
+<relevant guardrails from step 1>
+
+METIS:
+<relevant metis from step 1>
+
+RNA IMPACT:
+<callers/dependents of changed symbols>
+
+Do not inspect or request implementation reasoning, session context, or the implementer's conversation.
+Return a PR-ready review comment with reviewer identifier, reviewed commit, findings, and explicit verdict APPROVE or REQUEST CHANGES.")
 ```
 
 **Critical:** The reviewer gets the diff + RNA artifacts but NOT the session file or implementation reasoning. It must form its own independent assessment.
 
 The reviewer posts its own PR comment titled `## Ship Step 2: Independent Code Review`.
 
-Reviewer verdict: APPROVE / REQUEST CHANGES / COMMENT
+Reviewer verdict: `APPROVE` / `REQUEST CHANGES`. `REQUEST CHANGES` must be fixed. This early review supplements the mandatory fresh final-diff approval in step 10c.
 
 ### 3. Fix
 
-Address and plausibly fix ALL findings from RNA-grounded review, independent code review, AND CodeRabbit. No deferred items.
+Address and plausibly fix ALL findings from RNA-grounded review, independent code review, and existing external review comments. No deferred items.
 
 **Sources to check:**
 - Step 1 RNA-grounded review findings — every metis violation, guardrail violation, and concern
 - Step 2 independent code reviewer findings — every REQUEST CHANGES item must be addressed
-- **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review findings: fix, or explicitly mark N/A with reasoning.
+- **Existing external review comments** — read all comments with `gh pr view <PR> --comments` and `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. Treat actionable CodeRabbit comments already present exactly like any other external finding: fix, or explicitly mark N/A with reasoning. Never trigger or wait for CodeRabbit.
 
-If nothing to fix across all three sources, skip. Otherwise commit with descriptive messages.
+If nothing to fix across these sources, skip. Otherwise commit with descriptive messages.
 
 ### 3b. Mark PR ready for review
 
-After fixing all findings, mark the PR as ready for review. This triggers smoke tests and CodeRabbit review in CI (both are gated behind `draft == false`).
+After fixing all findings, mark the PR as ready for review. This triggers smoke tests gated behind `draft == false`.
 
 ```bash
 gh pr ready <PR>
 ```
 
-Wait briefly for CodeRabbit to start its review, then continue with the remaining steps. CodeRabbit findings will be addressed in step 6 (Resolve TODOs) if any arrive during the pipeline run.
-
-**Code PR requirement:** If the PR changes executable code, libraries, tests, build scripts, or runtime configuration, explicitly trigger CodeRabbit review after marking ready (for example, comment `@coderabbitai review` when no review starts automatically). Before merge, CodeRabbit must post an actual clean/approved review verdict. A skipped draft notice, pending run, or status check without review content does not satisfy this gate.
+Continue immediately with the remaining steps. Do not trigger or wait for CodeRabbit. If optional automated or human review comments arrive, address them in step 6 and the final comment sweep.
 
 ### 4. Regression Oracle
 
@@ -294,7 +315,7 @@ If CI is pending, wait. If CI fails, fix and re-run from step 9.
 
 **Pre-merge gate: verify ALL PR comments are addressed.**
 
-External reviewers (CodeRabbit, humans) post findings after step 3b (mark ready). The fix step (3) only catches findings that existed *before* marking ready. This step catches everything that arrived since.
+External reviewers (automated tools or humans) may post findings after step 3b (mark ready). The fix step (3) only catches findings that existed *before* marking ready. This step catches everything that arrived since.
 
 **How:**
 1. Fetch all PR comments:
@@ -302,12 +323,12 @@ External reviewers (CodeRabbit, humans) post findings after step 3b (mark ready)
    gh api repos/{owner}/{repo}/pulls/<PR>/comments --paginate
    gh api repos/{owner}/{repo}/issues/<PR>/comments --paginate
    ```
-2. For each comment from a non-ship-agent source (CodeRabbit, humans, review skill):
+2. For each comment from a non-ship-agent source (optional CodeRabbit, humans, review skill, or other automation):
    - Is there a commit that addresses it? → OK
    - Is there an explicit reply explaining why it's N/A? → OK
    - Neither? → **Fix it now** or explicitly mark N/A with reasoning
 3. If any fixes were made, push and re-run step 9 (smoke test) and step 10 (CI green).
-4. For every code-changing PR, verify that CodeRabbit posted an explicit review on the final diff and that its verdict is clean/approved. If no final review exists, trigger one and wait. If CodeRabbit requests changes, return to step 3.
+4. Do not trigger or wait for CodeRabbit. Any actionable CodeRabbit comment already present is covered by the same fix-or-N/A rule as every other external comment.
 
 **Severity rules:**
 - **Critical/Major findings** — must be fixed, no exceptions
@@ -327,13 +348,33 @@ EOF
 )"
 ```
 
+### 10c. Independent final-diff approval
+
+After the final comment sweep and after every change to the PR branch, spawn a **new, distinct reviewer sub-agent** using the repo-local `/review` skill in independent review mode for the final-diff gate.
+
+**Isolation requirements:**
+- Start with fresh context; do not reuse the implementer or the step 2 reviewer.
+- Provide only the final diff, linked issue acceptance criteria, relevant guardrails/metis, and RNA impact context.
+- Do not provide implementation reasoning, session files, prior conversation, or a summary of why the implementation chose its approach.
+
+**Required evidence:**
+- PR comment titled `## Ship Step 10c: Independent Final-Diff Review`
+- Reviewer task identifier
+- Exact reviewed head commit SHA
+- Findings, if any
+- Explicit verdict: `APPROVE` or `REQUEST CHANGES`
+
+`REQUEST CHANGES` blocks merge. Fix every finding, push, rerun the affected validation steps (at minimum steps 9, 10, and 10b), then spawn another fresh reviewer. **Any change to the diff after `APPROVE` invalidates that approval**, even a documentation-only or formatting change; repeat this step with a new reviewer on the new head SHA.
+
+The approval is valid only when its reviewed commit equals the current PR head commit.
+
 ### 11. Merge
 
 **Pre-merge gate: acceptance criteria.**
 
 Before merging, re-read the linked issue's acceptance criteria. Every checkbox must be checked off — either verified done or explicitly filed as a follow-up issue with a link. If any criterion is unmet and not deferred, **do not merge**. Go back to step 3 (fix).
 
-For code-changing PRs, also re-check the explicit CodeRabbit approval requirement. **Do not merge** without a clean/approved CodeRabbit review of the final diff.
+Re-check the independent final-diff approval. **Do not merge** unless a fresh, separate repo-local `/review` sub-agent posted explicit `APPROVE` for the current PR head commit. CodeRabbit is not a merge requirement.
 
 ```bash
 # Check off acceptance criteria on the issue
@@ -353,7 +394,7 @@ git worktree prune
 |------|----------|
 | RNA-grounded review | Does the code respect metis, guardrails, and callers? |
 | Independent code review | What does a fresh pair of eyes find? |
-| Mark ready | Trigger smoke tests + CodeRabbit review |
+| Mark ready | Trigger non-draft smoke tests |
 | Regression oracle | Do tests from acceptance criteria + findings pass? |
 | Merit assessment | Does this deliver outcome value? |
 | Resolve TODOs | Is everything accounted for? |
@@ -361,13 +402,14 @@ git worktree prune
 | **Delivery verification** | **Can an agent actually see this through MCP tools?** |
 | Smoke test + CI | Does the build pass? |
 | **Final comment sweep** | **Are ALL external review comments addressed?** |
+| **Independent final-diff approval** | **Did a fresh reviewer explicitly approve the exact commit being merged?** |
 | **Merge gate** | **Are all acceptance criteria checked off?** |
 
 ## Automation Rules
 
 - **Do not wait** for user prompts between steps. The whole point of having a pipeline is that it runs autonomously.
-- **Post to PR** after each substantive step (RNA-grounded review, independent review, regression oracle, merit, manual verify, delivery verify).
-- **Stop and ask** only if: a step produces ABANDON/RECONSIDER/SALVAGE verdict, or the independent reviewer returns REQUEST CHANGES with critical findings, or CI fails after 2 fix attempts.
+- **Post to PR** after each substantive step (RNA-grounded review, independent review, regression oracle, merit, manual verify, delivery verify, final comment sweep, final-diff approval).
+- **Stop and ask** only if: a step produces ABANDON/RECONSIDER/SALVAGE verdict, a reviewer identifies a critical issue that cannot be safely resolved, or CI fails after 2 fix attempts.
 - **Record metis** if the pipeline surfaces a new learning: write to `.oh/metis/<slug>.md`.
 
 ## Session Persistence
@@ -385,8 +427,14 @@ Write pipeline progress to `.oh/sessions/<pr-number>-ship.md`:
 **Findings:** N (minimum 3 required)
 
 ### Step 2: Independent Code Review
-**Verdict:** [APPROVE/REQUEST CHANGES/COMMENT]
+**Verdict:** [APPROVE/REQUEST CHANGES]
 [findings from code-reviewer agent]
 
 ...
+
+### Step 10c: Independent Final-Diff Review
+**Reviewer:** [fresh sub-agent task identifier]
+**Reviewed commit:** [exact PR head SHA]
+**Verdict:** [APPROVE/REQUEST CHANGES]
+[findings from final reviewer]
 ```
