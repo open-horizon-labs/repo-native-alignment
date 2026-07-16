@@ -2022,6 +2022,11 @@ impl RnaHandler {
             }
         }
 
+        // Evidence emitted during a full build must be validated before the first
+        // published snapshot and full persist. Waiting for a later cache load would
+        // expose stale or producer-supplied evidence as confirmed on cold start.
+        let _ = revalidate_incremental_edge_evidence(&all_nodes, &mut all_edges);
+
         // 6z. Deduplicate all_edges before persistence.
         //
         // Post-extraction passes (api_link, tested_by, import_calls, directory_module)

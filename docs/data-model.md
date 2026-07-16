@@ -1,6 +1,6 @@
 # RNA Data Model
 
-This document describes the actual data model in RNA as of schema version 23. It covers the LanceDB column store, the in-memory graph structure, operation reports, and how data flows from extraction through to MCP tool rendering.
+This document describes the actual data model in RNA as of schema version 24. It covers the LanceDB column store, the in-memory graph structure, operation reports, and how data flows from extraction through to MCP tool rendering.
 
 Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/server/operation_report.rs`, `src/server/enrichment_jobs.rs`, `src/graph/index.rs`, `src/extract/event_bus.rs`, `src/extract/consumers.rs`, `src/extract/scan_stats.rs`, `src/extract/cache.rs`.
 
@@ -10,7 +10,7 @@ Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/sto
 
 ## 1. LanceDB Column Store
 
-RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `23`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
+RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `24`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
 
 The `extraction_version` file that used to live alongside `schema_version` has been removed as of v0.2.x (#620). Per-consumer content-addressed cache keys (see [Section 7](#7-content-addressed-consumer-cache)) replaced the single global sentinel in v0.1.15 (#526). Legacy `extraction_version` files on disk are no longer read or written and will be cleaned up by the next schema migration.
 

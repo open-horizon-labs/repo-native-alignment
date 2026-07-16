@@ -676,72 +676,119 @@ pub(crate) fn format_neighbors_grouped_with_root(
     sections.join("\n\n")
 }
 
-/// Render source provenance for the custom edges represented in traversal groups.
-pub(crate) fn format_edge_evidence_for_groups(
-    edges: &[graph::Edge],
+type EdgeEvidenceKey = (String, graph::EdgeKind, String);
+
+/// Direction-aware custom-edge lookup built once per search response.
+pub(crate) struct EdgeEvidenceIndex<'a> {
+    outgoing: std::collections::HashMap<EdgeEvidenceKey, Vec<&'a graph::Edge>>,
+    incoming: std::collections::HashMap<EdgeEvidenceKey, Vec<&'a graph::Edge>>,
+}
+
+impl<'a> EdgeEvidenceIndex<'a> {
+    pub(crate) fn new(edges: &'a [graph::Edge]) -> Self {
+        let mut outgoing = std::collections::HashMap::new();
+        let mut incoming = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for edge in edges {
+            if !matches!(edge.kind, graph::EdgeKind::Other(_)) || !seen.insert(edge.stable_id()) {
+                continue;
+            }
+            let from = edge.from.to_stable_id();
+            let to = edge.to.to_stable_id();
+            outgoing
+                .entry((from.clone(), edge.kind.clone(), to.clone()))
+                .or_insert_with(Vec::new)
+                .push(edge);
+            incoming
+                .entry((to, edge.kind.clone(), from))
+                .or_insert_with(Vec::new)
+                .push(edge);
+        }
+        Self { outgoing, incoming }
+    }
+}
+
+fn append_indexed_edge_evidence(
+    matches: Option<&Vec<&graph::Edge>>,
+    kind: &graph::EdgeKind,
+    rendered: &mut Vec<String>,
+    rendered_edge_ids: &mut std::collections::HashSet<String>,
+) {
+    for edge in matches.into_iter().flatten() {
+        if !rendered_edge_ids.insert(edge.stable_id()) {
+            continue;
+        }
+        for evidence in &edge.evidence {
+            for selector in &evidence.selectors {
+                let location = if selector.root_id.is_empty() {
+                    selector.file_path.display().to_string()
+                } else {
+                    format!("{}/{}", selector.root_id, selector.file_path.display())
+                };
+                let snippet = if evidence.validation_status == graph::ValidationStatus::Valid
+                    && !selector.snippet.trim().is_empty()
+                {
+                    format!(" — {}", selector.snippet.trim())
+                } else {
+                    String::new()
+                };
+                rendered.push(format!(
+                    "- **{}** evidence: `{}:{}-{}`{}\n  - rule: `{}`; extractor: `{}`{}; confidence: `{}`; validation: `{:?}`",
+                    kind,
+                    location,
+                    selector.line_start,
+                    selector.line_end,
+                    snippet,
+                    evidence.rule_id,
+                    evidence.extractor_id,
+                    evidence
+                        .pack_id
+                        .as_ref()
+                        .map(|id| format!("; pack: `{id}`"))
+                        .unwrap_or_default(),
+                    evidence.confidence,
+                    evidence.validation_status,
+                ));
+            }
+        }
+    }
+}
+
+/// Render source provenance from a response-scoped custom-edge index.
+pub(crate) fn format_indexed_edge_evidence_for_groups(
+    index: &EdgeEvidenceIndex<'_>,
     origin: &str,
     groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
     direction: &str,
 ) -> String {
     let include_outgoing = matches!(direction, "outgoing" | "both");
     let include_incoming = matches!(direction, "incoming" | "both");
-    let mut edge_index: std::collections::HashMap<(graph::EdgeKind, String), Vec<&graph::Edge>> =
-        std::collections::HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    for edge in edges {
-        if !matches!(edge.kind, graph::EdgeKind::Other(_)) || !seen.insert(edge.stable_id()) {
-            continue;
-        }
-        if include_outgoing && edge.from.to_stable_id() == origin {
-            edge_index
-                .entry((edge.kind.clone(), edge.to.to_stable_id()))
-                .or_default()
-                .push(edge);
-        }
-        if include_incoming && edge.to.to_stable_id() == origin {
-            edge_index
-                .entry((edge.kind.clone(), edge.from.to_stable_id()))
-                .or_default()
-                .push(edge);
-        }
-    }
     let mut rendered = Vec::new();
+    let mut rendered_edge_ids = std::collections::HashSet::new();
     for (kind, ids) in groups {
         if !matches!(kind, graph::EdgeKind::Other(_)) {
             continue;
         }
         for id in ids {
-            for edge in edge_index
-                .get(&(kind.clone(), id.clone()))
-                .into_iter()
-                .flatten()
-            {
-                for evidence in &edge.evidence {
-                    for selector in &evidence.selectors {
-                        let location = if selector.root_id.is_empty() {
-                            selector.file_path.display().to_string()
-                        } else {
-                            format!("{}/{}", selector.root_id, selector.file_path.display())
-                        };
-                        rendered.push(format!(
-                            "- **{}** evidence: `{}:{}-{}` — {}\n  - rule: `{}`; extractor: `{}`{}; confidence: `{}`; validation: `{:?}`",
-                            kind,
-                            location,
-                            selector.line_start,
-                            selector.line_end,
-                            selector.snippet.trim(),
-                            evidence.rule_id,
-                            evidence.extractor_id,
-                            evidence
-                                .pack_id
-                                .as_ref()
-                                .map(|id| format!("; pack: `{id}`"))
-                                .unwrap_or_default(),
-                            evidence.confidence,
-                            evidence.validation_status,
-                        ));
-                    }
-                }
+            if include_outgoing {
+                append_indexed_edge_evidence(
+                    index
+                        .outgoing
+                        .get(&(origin.to_owned(), kind.clone(), id.clone())),
+                    kind,
+                    &mut rendered,
+                    &mut rendered_edge_ids,
+                );
+            }
+            if include_incoming {
+                append_indexed_edge_evidence(
+                    index
+                        .incoming
+                        .get(&(origin.to_owned(), kind.clone(), id.clone())),
+                    kind,
+                    &mut rendered,
+                    &mut rendered_edge_ids,
+                );
             }
         }
     }
@@ -750,6 +797,18 @@ pub(crate) fn format_edge_evidence_for_groups(
     } else {
         format!("\n\n#### Edge evidence\n\n{}", rendered.join("\n"))
     }
+}
+
+/// Render source provenance for one-off callers.
+#[cfg(test)]
+pub(crate) fn format_edge_evidence_for_groups(
+    edges: &[graph::Edge],
+    origin: &str,
+    groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
+    direction: &str,
+) -> String {
+    let index = EdgeEvidenceIndex::new(edges);
+    format_indexed_edge_evidence_for_groups(&index, origin, groups, direction)
 }
 
 /// Capitalize the first character of a string and replace underscores with spaces.
@@ -1071,6 +1130,8 @@ mod tests {
             confidence: Confidence::Confirmed,
             validation_status: ValidationStatus::Valid,
         };
+        let mut stale_evidence = evidence("stale evidence must stay hidden");
+        stale_evidence.validation_status = ValidationStatus::Stale;
         let edges = vec![
             Edge {
                 from: origin.id.clone(),
@@ -1078,7 +1139,7 @@ mod tests {
                 kind: EdgeKind::Other("supports".into()),
                 source: ExtractionSource::Markdown,
                 confidence: Confidence::Confirmed,
-                evidence: vec![evidence("outgoing evidence")],
+                evidence: vec![evidence("outgoing evidence"), stale_evidence],
             },
             Edge {
                 from: peer.id.clone(),
@@ -1098,6 +1159,8 @@ mod tests {
             format_edge_evidence_for_groups(&edges, &origin.stable_id(), &groups, "outgoing");
         assert!(outgoing.contains("outgoing evidence"));
         assert!(!outgoing.contains("incoming evidence"));
+        assert!(outgoing.contains("Stale"));
+        assert!(!outgoing.contains("stale evidence must stay hidden"));
 
         let incoming =
             format_edge_evidence_for_groups(&edges, &origin.stable_id(), &groups, "incoming");

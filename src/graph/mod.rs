@@ -475,6 +475,11 @@ pub struct Edge {
     pub evidence: Vec<EdgeEvidence>,
 }
 
+fn hash_identity_component(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 impl Edge {
     /// Deterministic string ID for storage.
     pub fn stable_id(&self) -> String {
@@ -493,27 +498,32 @@ impl Edge {
             // while line/byte coordinates may shift without changing the body
             // node. Identity therefore uses stable body identity/content plus
             // source/rule provenance.
-            let identity: Vec<_> = self
-                .evidence
-                .iter()
-                .map(|e| {
-                    let selectors: Vec<_> = e
-                        .selectors
-                        .iter()
-                        .map(|selector| {
-                            (
-                                &selector.root_id,
-                                &selector.file_path,
-                                &selector.body_node_id,
-                                &selector.snippet_hash,
-                            )
-                        })
-                        .collect();
-                    (selectors, &e.extractor_id, &e.pack_id, &e.rule_id)
-                })
-                .collect();
-            let encoded = serde_json::to_vec(&identity).unwrap_or_default();
-            format!("{base}->evidence:{}", blake3::hash(&encoded).to_hex())
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&(self.evidence.len() as u64).to_le_bytes());
+            for evidence in &self.evidence {
+                hasher.update(&(evidence.selectors.len() as u64).to_le_bytes());
+                for selector in &evidence.selectors {
+                    hash_identity_component(&mut hasher, selector.root_id.as_bytes());
+                    hash_identity_component(
+                        &mut hasher,
+                        selector.file_path.as_os_str().as_encoded_bytes(),
+                    );
+                    hash_identity_component(&mut hasher, selector.body_node_id.as_bytes());
+                    hash_identity_component(&mut hasher, selector.snippet_hash.as_bytes());
+                }
+                hash_identity_component(&mut hasher, evidence.extractor_id.as_bytes());
+                match evidence.pack_id.as_deref() {
+                    Some(pack_id) => {
+                        hasher.update(&[1]);
+                        hash_identity_component(&mut hasher, pack_id.as_bytes());
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+                hash_identity_component(&mut hasher, evidence.rule_id.as_bytes());
+            }
+            format!("{base}->evidence:{}", hasher.finalize().to_hex())
         }
     }
 
@@ -904,6 +914,38 @@ mod tests {
             edge.stable_id(),
             original_id,
             "offset-only source movement must remain a same-ID edge update"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_identity_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.body = "stable evidence".into();
+        node.metadata.insert("body_node_id".into(), "body".into());
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "25".into());
+        let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+        let mut first = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        first.evidence = vec![evidence_for(&node, hash.clone())];
+        first.evidence[0].selectors[0].file_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"chapter-\x80.md".to_vec()));
+        let mut second = first.clone();
+        second.evidence[0].selectors[0].file_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"chapter-\x81.md".to_vec()));
+
+        assert_ne!(
+            first.stable_id(),
+            second.stable_id(),
+            "distinct non-UTF-8 paths must remain distinct evidence identities"
         );
     }
 
