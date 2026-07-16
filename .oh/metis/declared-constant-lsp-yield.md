@@ -45,6 +45,7 @@ adds a trait/implementation.
 Run the real-server probe sequentially:
 
 ```bash
+cargo check --lib
 cargo test measure_declared_const_reference_yield -- --ignored --nocapture --test-threads=1
 ```
 

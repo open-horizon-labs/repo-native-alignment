@@ -46,6 +46,7 @@ RNA records scheduled requests, non-empty responses, emitted edges, latency, tim
 The reproducible probe is:
 
 ```bash
+cargo check --lib
 cargo test measure_declared_const_reference_yield -- --ignored --nocapture --test-threads=1
 ```
 

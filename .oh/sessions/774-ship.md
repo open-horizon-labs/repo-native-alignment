@@ -59,3 +59,39 @@ requires the exact sixteen expected file/name edge pairs and exact
 multiplicity. The probe also records successful `rust-analyzer --version` and
 `pyright --version` output. Two complete expanded-corpus trials pass with Rust
 eligible and Pyright ineligible.
+
+The independent reviewer re-reviewed the fixes and approved the PR.
+
+## Step 3: Fix Review Findings
+
+The fixture and correctness-oracle fixes were committed and pushed. Focused
+unit tests, `cargo check --lib`, clippy, formatting, and two sequential
+real-server probe trials passed.
+
+## Step 3b: Mark Ready
+
+PR #774 was marked ready for review and CodeRabbit review was explicitly
+requested.
+
+## Step 4: Regression Oracle
+
+**Verdict:** PASS
+
+The regression oracle confirmed default-deny behavior, Rust-only opt-in,
+synthetic-constant exclusion, exact edge correctness, maintained two-server
+fixtures, and production-path planner coverage.
+
+## Step 5: Merit Assessment
+
+**Verdict:** MERGE
+
+The change converts a speculative global constant allow-list into measured,
+per-server policy. Rust gains useful constant references while Pyright and
+unmeasured profiles avoid known timeout/error cost.
+
+## CodeRabbit Review
+
+CodeRabbit requested one documentation correction: the reproducible probe
+instructions must run `cargo check --lib` before the ignored real-server test.
+The metis and operational LSP documentation now show that required sequential
+preflight.
