@@ -33,6 +33,9 @@ jobs:
               - '.github/workflows/**'
               - '.github/scripts/**'
               - '.github/fixtures/**'
+              - 'scripts/swebench_rna_one.py'
+              - 'scripts/swebench_rna_mcp_proxy.py'
+              - 'scripts/tests/**'
               - 'security/rustsec-policy.json'
 
   audit:
@@ -185,6 +188,10 @@ jobs:
         env:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --no-default-features
+
+      - name: SWE-bench RNA wrapper fixture tests
+        if: needs.changes.outputs.rust == 'true'
+        run: python3 -m unittest scripts/tests/test_swebench_rna_one.py
 
   smoke:
     needs: changes
