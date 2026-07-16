@@ -76,35 +76,45 @@ aggregate totals.
 
 ## Step 3b: Mark Ready
 
-Pending.
+PR marked ready; CodeRabbit explicitly triggered.
 
 ## Step 4: Regression Oracle
 
-Pending.
+Ten Python harness tests and the Rust multibyte regression cover the acceptance
+criteria and review findings. Clean GitHub Actions full test job passed.
 
 ## Step 5: Merit Assessment
 
-Pending.
+**Verdict:** MERGE. The harness provides reproducible causal evidence rather
+than a one-off patch or leaderboard claim.
 
 ## Step 6: Resolve TODOs
 
-Pending.
+All findings and static-analysis comments fixed and replied to. No product TODO
+remains.
 
 ## Step 7a: Manual Verification
 
-Pending.
+Official evaluator resolved `django__django-13279`: one submitted, one
+completed, one resolved, zero errors. Exact isolation, telemetry, MCP, timing,
+cost, and degraded-capability evidence are posted on the PR.
 
 ## Step 7b: Delivery Verification
 
-Pending.
+Real Claude MCP use and a final proxy protocol smoke both delivered successful
+correlated RNA search results through stdio. Node persistence checklist is N/A.
 
 ## Step 8: README
 
-Pending.
+README links the new one-instance harness documentation.
 
 ## Step 9: Smoke Test
 
-Pending.
+Ten Python tests pass. The ready-PR clean CI full test job passes. Local
+`cargo test --no-fail-fast` passed every test binary except the known
+checkout-history-sensitive roots assertion that reads persisted degraded scan
+text from this stateful checkout; #775 independently documented the same local
+condition and clean-CI pass.
 
 ## Step 10: CI Green
 
