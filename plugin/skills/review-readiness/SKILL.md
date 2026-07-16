@@ -131,4 +131,4 @@ The walking skeleton is the **agent process**. If repeated use exposes a hard me
 - Do not run global dead-code analysis from this skill.
 - Do not require full-repo LSP before first-pass review.
 - Do not hide when RNA adds no value; that is a valid readiness result.
-- Do not replace tests, compiler checks, or CodeRabbit review.
+- Do not replace tests, compiler checks, or the mandatory independent final-diff `/review` approval.

@@ -37,7 +37,7 @@ The base defaults to `main`. Use another branch only for an intentional stacked 
 8. Run project checks and the repo-local `/review` skill. Fix every actionable finding.
 9. Commit focused changes tagged with the relevant `[outcome:X]` and push them to the draft PR.
 10. Complete any descendant issues created during execution before declaring the implementation complete.
-11. Invoke repo-local `/ship <PR-number>`. That pipeline alone marks the PR ready, obtains explicit CodeRabbit review and approval for code changes, handles CI, verifies delivery, and merges.
+11. Invoke repo-local `/ship <PR-number>`. That pipeline alone marks the PR ready, handles CI, verifies delivery, obtains explicit approval of the final diff from a fresh, separate repo-local `/review` sub-agent, and merges.
 12. Clean up the worktree only after `/ship` completes or reports a blocker.
 
 ## Guardrails
@@ -45,7 +45,8 @@ The base defaults to `main`. Use another branch only for an intentional stacked 
 - Never implement before the draft PR exists.
 - Never mark the PR ready or merge directly from this skill.
 - Never substitute a lightweight review for the full RNA `/ship` pipeline.
-- Never merge a code-changing PR without an explicit clean/approved CodeRabbit review of its final diff.
+- Never merge without an explicit `APPROVE` from a fresh, separate repo-local `/review` sub-agent on the current final diff. Any later diff change invalidates approval and requires a new fresh reviewer.
+- Never trigger or wait for CodeRabbit. If actionable CodeRabbit comments already exist, address them like any other external review feedback.
 - Use `AGENTS.md`, `.oh/`, and RNA for context; do not depend on external task-memory tools.
 - If completion signaling is unavailable, report `COMPLETION: status=<status> pr=<url>`.
 

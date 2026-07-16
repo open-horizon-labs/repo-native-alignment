@@ -1,6 +1,6 @@
 ---
 name: dev-pipeline-oversight
-description: Wraps dev-pipeline with post-merge oversight — verifies ALL PR comments (CodeRabbit, review skill, manual) are addressed, not just the ship agent's own findings.
+description: Wraps dev-pipeline with post-merge oversight — verifies the independent final-diff approval and ALL PR comments are addressed, not just the ship agent's own findings.
 tools: Read, Write, Edit, Grep, Glob, Bash, Agent, WebFetch, WebSearch
 mcpServers:
   - rna-mcp
@@ -41,6 +41,13 @@ Runs AFTER Phase 4 merges. Skip if Phase 4 did not merge.
 3. Priority: Critical=must fix. Major=must fix or document why not. Minor=fix if easy.
 
 4. If anything unaddressed: fix in a new branch `fix: address review findings from #<PR>`, push PR.
+
+5. Verify the mandatory independent final-diff review evidence:
+   - A fresh, separate repo-local `/review` sub-agent posted explicit `APPROVE`
+   - The comment identifies the reviewer task and exact reviewed commit SHA
+   - The reviewed SHA equals the PR's final `headRefOid` at merge time; record the resulting squash merge commit separately
+   - No diff change occurred after approval
+   - CodeRabbit was not triggered or awaited; if it commented anyway, any actionable finding was handled under step 2
 
 ### Delivery spot-check
 

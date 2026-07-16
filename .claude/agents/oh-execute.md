@@ -303,7 +303,7 @@ Works anywhere. Manual pre-flight checklist, drift detection by reasoning. No pe
 - Updates task status as work progresses
 - Links commits to tasks
 
-### With code review (sg, CodeRabbit)
+### With code review (repo-local `/review`, optional external feedback)
 - Runs automated review on staged changes
 - Triages findings by severity
 - Iterates until review passes
