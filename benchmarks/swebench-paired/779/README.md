@@ -49,6 +49,13 @@ child bundle retains predictions, official evaluation output, traces, fallback
 events, time to first edit, token categories, and cost. Missing provider
 telemetry remains `null`/unknown.
 
+Both arms execute `scripts/swebench_claude_executor.py`. The baseline sees an
+empty MCP configuration and starts Claude without extra context. The RNA arm
+uses the same wrapper to make a real stdio `search` call through the traced
+proxy, saves the returned context, and appends it to Claude's runtime prompt
+before Claude can edit. This makes the delivered context difference a direct
+consequence of RNA availability while enforcing the pre-edit MCP gate.
+
 Before interpreting an RNA child as valid, confirm
 `real_mcp_use_before_edit: true`. An MCP handshake or a successful call after
 the first edit does not satisfy the experiment.

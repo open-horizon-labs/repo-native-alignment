@@ -1,5 +1,5 @@
 {
-  "command": "claude -p --verbose --output-format stream-json --strict-mcp-config --mcp-config \"$SWEBENCH_MCP_CONFIG\" --permission-mode bypassPermissions --model claude-haiku-4-5-20251001 --effort high --max-budget-usd 2 --no-session-persistence \"$(cat \"$SWEBENCH_TASK_PROMPT\")\"",
+  "command": "python3 \"$SWEBENCH_HARNESS_ROOT/scripts/swebench_claude_executor.py\" --model claude-haiku-4-5-20251001 --effort high --max-budget-usd 2",
   "model": {
     "budget_usd": 2,
     "effort": "high",
@@ -12,6 +12,7 @@
   },
   "parity": {
     "command_shared_across_arms": true,
+    "executor_preflight_shared_across_arms": true,
     "prompt_shared_across_arms": true,
     "sampling_shared_across_arms": true,
     "only_mcp_config_differs": true
