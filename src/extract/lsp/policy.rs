@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -139,7 +139,7 @@ impl LspQueryBudget {
 pub(crate) struct LspQueryProfile {
     language: String,
     server: String,
-    allowed_kinds: Option<Vec<NodeKind>>,
+    allowed_kinds: Option<HashSet<NodeKind>>,
     allow_declared_const_references: bool,
     operation_limits: BTreeMap<LspQueryOperation, usize>,
 }
@@ -156,7 +156,7 @@ impl LspQueryProfile {
     }
 
     pub(crate) fn with_allowed_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
-        self.allowed_kinds = Some(kinds.to_vec());
+        self.allowed_kinds = Some(kinds.iter().cloned().collect());
         self
     }
 
@@ -188,8 +188,8 @@ impl LspQueryProfile {
     }
 
     #[cfg(test)]
-    pub(crate) fn allowed_kinds(&self) -> Option<&[NodeKind]> {
-        self.allowed_kinds.as_deref()
+    pub(crate) fn allowed_kinds(&self) -> Option<&HashSet<NodeKind>> {
+        self.allowed_kinds.as_ref()
     }
 
     #[cfg(test)]
@@ -211,7 +211,7 @@ impl LspQueryProfile {
 
         if self
             .allowed_kinds
-            .as_deref()
+            .as_ref()
             .is_some_and(|kinds| !kinds.contains(&node.id.kind))
         {
             return false;
@@ -283,8 +283,15 @@ pub(crate) struct LspQueryTelemetry {
 #[derive(Debug, Default)]
 struct LspQueryTelemetryState {
     metrics: BTreeMap<LspQueryMetricKey, LspQueryMetric>,
-    pending_work: BTreeMap<usize, LspQueryMetricKey>,
+    pending_work: BTreeMap<usize, PendingLspQuery>,
     deadline_closed: bool,
+}
+
+#[derive(Debug)]
+struct PendingLspQuery {
+    key: LspQueryMetricKey,
+    scheduled_requests: usize,
+    started_at: std::time::Instant,
 }
 
 impl LspQueryTelemetry {
@@ -313,8 +320,25 @@ impl LspQueryTelemetry {
         if state.deadline_closed {
             return false;
         }
-        state.pending_work.insert(work_item_id, key);
+        state.pending_work.insert(
+            work_item_id,
+            PendingLspQuery {
+                key,
+                scheduled_requests: 0,
+                started_at: std::time::Instant::now(),
+            },
+        );
         true
+    }
+
+    pub(crate) fn note_requests_started(&self, work_item_id: usize, count: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(pending) = state.pending_work.get_mut(&work_item_id) {
+            pending.scheduled_requests = pending.scheduled_requests.saturating_add(count);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -354,7 +378,6 @@ impl LspQueryTelemetry {
     pub(crate) fn record_work_item(
         &self,
         work_item_id: usize,
-        scheduled_requests: usize,
         non_empty_responses: usize,
         emitted_edges: usize,
         latency: Duration,
@@ -365,13 +388,13 @@ impl LspQueryTelemetry {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some(key) = state.pending_work.remove(&work_item_id) else {
+        let Some(pending) = state.pending_work.remove(&work_item_id) else {
             return false;
         };
         self.record_locked(
             &mut state,
-            key,
-            scheduled_requests,
+            pending.key,
+            pending.scheduled_requests,
             non_empty_responses,
             emitted_edges,
             latency,
@@ -420,15 +443,24 @@ impl LspQueryTelemetry {
     /// Attribute work items cancelled by the outer job deadline. Completed
     /// items have already atomically removed their IDs, so this drains only
     /// in-flight operations and owns their terminal outcome.
-    pub(crate) fn record_job_timeout(&self, latency: Duration) {
+    pub(crate) fn record_job_timeout(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         state.deadline_closed = true;
         let pending = std::mem::take(&mut state.pending_work);
-        for (_, key) in pending {
-            self.record_locked(&mut state, key, 0, 0, 0, latency, 1, 1);
+        for (_, pending) in pending {
+            self.record_locked(
+                &mut state,
+                pending.key,
+                pending.scheduled_requests,
+                0,
+                0,
+                pending.started_at.elapsed(),
+                1,
+                1,
+            );
         }
     }
 
@@ -632,9 +664,10 @@ mod tests {
             LspQueryOperation::CallHierarchy,
             LspDeclarationClass::Function,
         ));
+        telemetry.note_requests_started(1, 3);
+        telemetry.note_requests_started(2, 2);
         assert!(telemetry.record_work_item(
             1,
-            3,
             1,
             2,
             Duration::from_millis(10),
@@ -642,14 +675,13 @@ mod tests {
             0,
         ));
 
-        telemetry.record_job_timeout(Duration::from_millis(50));
+        telemetry.record_job_timeout();
         assert!(!telemetry.register_work_item(
             3,
             LspQueryOperation::References,
             LspDeclarationClass::Struct,
         ));
         assert!(!telemetry.record_work_item(
-            2,
             2,
             1,
             1,
@@ -660,9 +692,9 @@ mod tests {
 
         let metrics = telemetry.snapshot();
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].scheduled_requests, 3);
+        assert_eq!(metrics[0].scheduled_requests, 5);
         assert_eq!(metrics[0].timeouts, 1);
         assert_eq!(metrics[0].errors, 1);
-        assert_eq!(metrics[0].latency_ms, 60);
+        assert!(metrics[0].latency_ms >= 10);
     }
 }

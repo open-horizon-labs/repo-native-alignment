@@ -235,13 +235,18 @@ pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
         return Vec::new();
     };
     let enricher = descriptor.build();
-    let operation = match node.id.kind {
-        NodeKind::Function => policy::LspQueryOperation::CallHierarchy,
-        NodeKind::Trait => policy::LspQueryOperation::Implementations,
-        NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-            policy::LspQueryOperation::References
-        }
-        NodeKind::Other(_) => policy::LspQueryOperation::DocumentLinks,
+    let operations: &[policy::LspQueryOperation] = match node.id.kind {
+        NodeKind::Function => &[policy::LspQueryOperation::CallHierarchy],
+        NodeKind::Trait => &[
+            policy::LspQueryOperation::Implementations,
+            policy::LspQueryOperation::TypeHierarchy,
+        ],
+        NodeKind::Struct | NodeKind::Enum => &[
+            policy::LspQueryOperation::References,
+            policy::LspQueryOperation::TypeHierarchy,
+        ],
+        NodeKind::TypeAlias | NodeKind::Const => &[policy::LspQueryOperation::References],
+        NodeKind::Other(_) => &[policy::LspQueryOperation::DocumentLinks],
         _ => return Vec::new(),
     };
     let capabilities = LspServerCapabilities {
@@ -252,11 +257,15 @@ pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
         document_links: true,
     };
     let mut budget = enricher.query_profile.budget();
-    enricher
-        .query_profile
-        .admits(node, operation, capabilities, &mut budget)
-        .then(|| operation.to_string())
-        .into_iter()
+    operations
+        .iter()
+        .copied()
+        .filter(|operation| {
+            enricher
+                .query_profile
+                .admits(node, *operation, capabilities, &mut budget)
+        })
+        .map(|operation| operation.to_string())
         .collect()
 }
 
@@ -472,7 +481,7 @@ impl LspEnricher {
     }
 
     #[cfg(test)]
-    pub(crate) fn enrichable_kinds(&self) -> Option<&[NodeKind]> {
+    pub(crate) fn enrichable_kinds(&self) -> Option<&std::collections::HashSet<NodeKind>> {
         self.query_profile.allowed_kinds()
     }
 
@@ -934,18 +943,23 @@ impl LspEnricher {
             if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
                 let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
                 match self.send_did_open(transport, &warmup_path).await {
-                    Ok(()) => tracing::info!(
-                        "{} sent didOpen for '{}'",
-                        self.server_command,
-                        warmup_path.display()
-                    ),
-                    Err(e) => tracing::debug!(
-                        "{} didOpen warmup failed (non-fatal): {}",
-                        self.server_command,
-                        e
-                    ),
+                    Ok(()) => {
+                        tracing::info!(
+                            "{} sent didOpen for '{}'",
+                            self.server_command,
+                            warmup_path.display()
+                        );
+                        uri_str
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "{} didOpen warmup failed (non-fatal): {}",
+                            self.server_command,
+                            e
+                        );
+                        None
+                    }
                 }
-                uri_str
             } else {
                 None
             };
@@ -2708,7 +2722,7 @@ impl Enricher for LspEnricher {
         {
             Ok(outcome) => outcome,
             Err(_) => {
-                query_telemetry.record_job_timeout(lsp_job_timeout());
+                query_telemetry.record_job_timeout();
                 result.aborted = true;
                 result.error_count = result.error_count.saturating_add(1);
                 result.diagnostic = Some(format!(
@@ -2885,11 +2899,12 @@ mod tests {
         assert_eq!(python.server_command, "pyright-langserver");
         assert_eq!(python.server_args, vec!["--stdio"]);
         assert_eq!(python.config_file_hint(), Some("pyproject.toml"));
-        assert_eq!(
-            python.enrichable_kinds(),
-            Some([NodeKind::Function, NodeKind::Trait].as_slice()),
-            "the shared factory must retain Python's Function/Trait admission policy"
-        );
+        let python_kinds = python
+            .enrichable_kinds()
+            .expect("the shared factory must retain Python's admission policy");
+        assert_eq!(python_kinds.len(), 2);
+        assert!(python_kinds.contains(&NodeKind::Function));
+        assert!(python_kinds.contains(&NodeKind::Trait));
         assert!(
             !python.allows_declared_const_references(),
             "built-in profiles must keep declared-Const references default-off"

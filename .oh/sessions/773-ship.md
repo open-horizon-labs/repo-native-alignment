@@ -35,4 +35,6 @@ The first follow-up found a cancellation race in aggregate timeout ownership. Te
 
 The second follow-up found that registration could race after the deadline drain. Deadline closure now occurs under the same mutex as registration; late registration returns false and the worker exits before issuing an LSP request. The timeout regression also asserts registration is rejected after closure.
 
+CodeRabbit reviewed the ready PR and requested six changes. The final fix batch projects all cross-pass planner operations, retains the warmup URI only after successful `didOpen`, deduplicates document-link work by file, uses set membership for allowed kinds, retains per-item request count/start time for cancellation metrics, and drains registered work on internal watchdog aborts. Focused regressions and library clippy pass after the fixes.
+
 Formatting-only changes are confined to files materially edited by #767 and result from applying the repository toolchain's formatter to those files. They are acknowledged as review noise but do not alter unrelated behavior.

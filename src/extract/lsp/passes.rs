@@ -4,7 +4,7 @@
 //! appends results to the `EnrichmentResult`. The top-level `enrich()` orchestrates
 //! them in sequence: Pass 0 -> Pass 1 -> Pass 2 -> Pass 4 -> Pass 5 -> Pass 3.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -223,6 +223,14 @@ fn record_type_hierarchy_observation(
             observation.timeouts,
         );
     }
+}
+
+fn retain_unique_document_link_file(
+    node: &Node,
+    operation: LspQueryOperation,
+    seen_files: &mut HashSet<PathBuf>,
+) -> bool {
+    operation != LspQueryOperation::DocumentLinks || seen_files.insert(node.id.file.clone())
 }
 
 fn runnable_pass1_work_items(
@@ -679,6 +687,7 @@ impl LspEnricher {
             .copied()
             .collect();
 
+        let mut document_link_files = HashSet::new();
         let admitted_nodes: Vec<(&Node, LspQueryOperation)> = candidate_nodes
             .into_iter()
             .filter_map(|node| {
@@ -694,6 +703,9 @@ impl LspEnricher {
                     NodeKind::Other(_) => Some(LspQueryOperation::DocumentLinks),
                     _ => None,
                 }?;
+                if !retain_unique_document_link_file(node, operation, &mut document_link_files) {
+                    return None;
+                }
                 self.query_profile
                     .admits(node, operation, capabilities, budget)
                     .then_some((node, operation))
@@ -794,7 +806,7 @@ impl LspEnricher {
         let root = root.to_path_buf();
         let matching_owned = Arc::clone(matching_nodes_owned);
         let refs_by_file = Arc::clone(refs_by_file_shared);
-        let telemetry = Arc::clone(telemetry);
+        let worker_telemetry = Arc::clone(telemetry);
         let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
@@ -807,7 +819,7 @@ impl LspEnricher {
                 let language = language.clone();
                 let error_count = Arc::clone(&error_count);
                 let did_open = Arc::clone(&did_open);
-                let telemetry = Arc::clone(&telemetry);
+                let telemetry = Arc::clone(&worker_telemetry);
                 async move {
                     let registered = if let (Some(operation), Some(declaration)) = (
                         item.requested_operations.first().copied(),
@@ -984,6 +996,9 @@ impl LspEnricher {
                 abort_diagnostic = recovery_diagnostic;
             }
         }
+        if aborted {
+            telemetry.record_job_timeout();
+        }
 
         tracing::info!(
             "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
@@ -1029,7 +1044,7 @@ impl LspEnricher {
                 diagnostics
                     .finish_failed(item, format!("failed to resolve file URI: {e}"))
                     .await;
-                telemetry.record_work_item(item.id, 0, 0, 0, started_at.elapsed(), 1, 0);
+                telemetry.record_work_item(item.id, 0, 0, started_at.elapsed(), 1, 0);
                 return Pass1TaskResult {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
@@ -1052,7 +1067,6 @@ impl LspEnricher {
             observation.record_error(&e);
             telemetry.record_work_item(
                 item.id,
-                0,
                 0,
                 0,
                 started_at.elapsed(),
@@ -1091,6 +1105,8 @@ impl LspEnricher {
                     language,
                     operation == Some(LspQueryOperation::References),
                     operation == Some(LspQueryOperation::CallHierarchy),
+                    item.id,
+                    telemetry,
                     &mut edges,
                     &mut new_nodes,
                     &mut had_error,
@@ -1107,6 +1123,8 @@ impl LspEnricher {
                     node,
                     matching_owned,
                     root,
+                    item.id,
+                    telemetry,
                     &mut edges,
                 )
                 .await
@@ -1121,6 +1139,8 @@ impl LspEnricher {
                         node,
                         matching_owned,
                         root,
+                        item.id,
+                        telemetry,
                         &mut edges,
                         &mut had_error,
                         error_count,
@@ -1134,7 +1154,16 @@ impl LspEnricher {
                 if matches!(node.id.kind, NodeKind::Other(_))
                     && operation == Some(LspQueryOperation::DocumentLinks)
                 {
-                    Self::enrich_document_links(transport, &file_uri, node, root, &mut edges).await
+                    Self::enrich_document_links(
+                        transport,
+                        &file_uri,
+                        node,
+                        root,
+                        item.id,
+                        telemetry,
+                        &mut edges,
+                    )
+                    .await
                 } else {
                     QueryObservation::default()
                 }
@@ -1144,7 +1173,6 @@ impl LspEnricher {
 
         telemetry.record_work_item(
             item.id,
-            observation.scheduled_requests,
             observation.non_empty_responses,
             edges.len(),
             started_at.elapsed(),
@@ -1175,6 +1203,8 @@ impl LspEnricher {
         language: &str,
         has_references: bool,
         has_call_hierarchy: bool,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
         new_nodes: &mut Vec<Node>,
         had_error: &mut bool,
@@ -1183,6 +1213,7 @@ impl LspEnricher {
         let mut observation = QueryObservation::default();
         if !has_call_hierarchy && has_references {
             observation.scheduled_requests += 1;
+            telemetry.note_requests_started(work_item_id, 1);
             match Self::find_references_p(transport, file_uri, line, col).await {
                 Ok(locations) => {
                     observation.non_empty_responses += usize::from(!locations.is_empty());
@@ -1232,10 +1263,12 @@ impl LspEnricher {
             }
         } else if has_call_hierarchy {
             observation.scheduled_requests += 1;
+            telemetry.note_requests_started(work_item_id, 1);
             match Self::prepare_call_hierarchy_p(transport, file_uri, line, col).await {
                 Ok(Some(item)) => {
                     observation.non_empty_responses += 1;
                     observation.scheduled_requests += 2;
+                    telemetry.note_requests_started(work_item_id, 2);
                     let (incoming_result, outgoing_result) = tokio::join!(
                         Self::incoming_calls_p(transport, &item),
                         Self::outgoing_calls_p(transport, &item),
@@ -1444,12 +1477,15 @@ impl LspEnricher {
         node: &Node,
         matching_owned: &Arc<Vec<Node>>,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
     ) -> QueryObservation {
         let mut observation = QueryObservation {
             scheduled_requests: 1,
             ..Default::default()
         };
+        telemetry.note_requests_started(work_item_id, 1);
         match Self::find_implementations_p(transport, file_uri, line, col).await {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
@@ -1498,6 +1534,8 @@ impl LspEnricher {
         node: &Node,
         matching_owned: &Arc<Vec<Node>>,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
         had_error: &mut bool,
         error_count: &AtomicI64,
@@ -1506,6 +1544,7 @@ impl LspEnricher {
             scheduled_requests: 1,
             ..Default::default()
         };
+        telemetry.note_requests_started(work_item_id, 1);
         match Self::find_references_p(transport, file_uri, line, col).await {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
@@ -1565,12 +1604,15 @@ impl LspEnricher {
         file_uri: &lsp_types::Uri,
         node: &Node,
         root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
     ) -> QueryObservation {
         let mut observation = QueryObservation {
             scheduled_requests: 1,
             ..Default::default()
         };
+        telemetry.note_requests_started(work_item_id, 1);
         match Self::document_links_p(transport, file_uri).await {
             Ok(links) => {
                 observation.non_empty_responses += usize::from(!links.is_empty());
@@ -2071,6 +2113,42 @@ mod tests {
         assert_eq!(metrics[0].scheduled_requests, 2);
         assert_eq!(metrics[0].non_empty_responses, 2);
         assert_eq!(metrics[0].emitted_edges, 1);
+    }
+
+    #[test]
+    fn document_link_work_is_deduplicated_by_file() {
+        let make_node = |name: &str, file: &str| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 2,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut seen = HashSet::new();
+
+        assert!(retain_unique_document_link_file(
+            &make_node("first", "docs/one.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
+        assert!(!retain_unique_document_link_file(
+            &make_node("second", "docs/one.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
+        assert!(retain_unique_document_link_file(
+            &make_node("third", "docs/two.md"),
+            LspQueryOperation::DocumentLinks,
+            &mut seen,
+        ));
     }
 
     #[tokio::test]

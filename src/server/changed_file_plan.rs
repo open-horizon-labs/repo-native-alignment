@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
-        assert_eq!(plan.operation_count, 2);
+        assert_eq!(plan.operation_count, 3);
     }
 
     #[test]

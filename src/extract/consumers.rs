@@ -3027,17 +3027,12 @@ mod tests {
             registry_path.enrichable_kinds(),
             "both construction paths must apply the descriptor's eligibility policy"
         );
-        assert_eq!(
-            event_bus_path.enrichable_kinds(),
-            Some(
-                [
-                    crate::graph::NodeKind::Function,
-                    crate::graph::NodeKind::Trait
-                ]
-                .as_slice()
-            ),
-            "Python must retain Function/Trait eligibility in the EventBus path"
-        );
+        let python_kinds = event_bus_path
+            .enrichable_kinds()
+            .expect("Python must have an eligibility filter");
+        assert_eq!(python_kinds.len(), 2);
+        assert!(python_kinds.contains(&crate::graph::NodeKind::Function));
+        assert!(python_kinds.contains(&crate::graph::NodeKind::Trait));
         assert_eq!(
             event_bus_path.allows_declared_const_references(),
             registry_path.allows_declared_const_references(),
