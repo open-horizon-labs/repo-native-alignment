@@ -52,8 +52,11 @@ An explicit inline ID takes precedence and may preserve identity across a move;
 duplicate explicit IDs are invalid. Otherwise, each AST segment uses the generic
 Markdown node kind plus its ordinal among same-kind siblings under its parent.
 RFC 3986 percent encoding is uppercase and applies to bytes outside the unreserved
-set. The root document is omitted from the AST path. Moving a node without an
-explicit ID changes its identity; changing only text or source location does not.
+set. The root document is omitted from the AST path. Reparenting a node, moving it
+to a different structural AST path, or changing its same-kind sibling ordinal
+changes its identity unless an explicit ID preserves it. Line or byte offsets may
+shift without changing identity when the structural AST path remains identical.
+Changing only the selected text also preserves identity but invalidates its hash.
 
 For multi-span evidence, store an ordered, non-empty selector list. Edge identity
 MUST distinguish equal source/target/kind triples supported by materially

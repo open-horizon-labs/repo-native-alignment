@@ -86,10 +86,7 @@ fn adversarial_content_source_contract_is_complete_and_source_backed() {
         if let Some(asset) = case.get("asset").and_then(toml::Value::as_str) {
             let asset_bytes = fs::read(root.join(asset))
                 .unwrap_or_else(|error| panic!("{id}: cannot read asset {asset}: {error}"));
-            assert!(
-                asset_bytes.starts_with(b"P3\n"),
-                "{id}: asset is not a PPM bitmap"
-            );
+            assert_valid_ppm(id, asset, &asset_bytes);
         }
 
         let status = case["expected_status"].as_str().unwrap();
@@ -127,12 +124,28 @@ fn assert_expected_selector(case: &toml::Value, source_text: &str, snippet: &str
     let selector = &case["expected_selector"];
     let byte_start = selector["byte_start"].as_integer().unwrap() as usize;
     let byte_end = selector["byte_end"].as_integer().unwrap() as usize;
+    assert_eq!(byte_start, 12);
+    assert_eq!(byte_end, 81);
     assert_eq!(
         &source_text.as_bytes()[byte_start..byte_end],
         snippet.as_bytes()
     );
+    assert_eq!(
+        selector["file_path"].as_str(),
+        Some("tests/fixtures/content_source_contract/body-backed-control.md")
+    );
     assert_eq!(selector["line_start"].as_integer(), Some(3));
     assert_eq!(selector["line_end"].as_integer(), Some(3));
+    let line_three = source_text.lines().nth(2).unwrap();
+    assert_eq!(line_three, snippet);
+    assert_eq!(
+        source_text[..byte_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+        3
+    );
     assert_eq!(
         selector["body_node_id"].as_str(),
         Some(
@@ -159,5 +172,34 @@ fn assert_expected_selector(case: &toml::Value, source_text: &str, snippet: &str
     assert_eq!(
         selector["snippet_hash"].as_str().unwrap(),
         blake3::hash(snippet.as_bytes()).to_hex().as_str()
+    );
+}
+
+fn assert_valid_ppm(case_id: &str, asset: &str, bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes)
+        .unwrap_or_else(|error| panic!("{case_id}: asset {asset} is not UTF-8 PPM: {error}"));
+    let mut tokens = text.split_whitespace();
+    assert_eq!(
+        tokens.next(),
+        Some("P3"),
+        "{case_id}: {asset} is not P3 PPM"
+    );
+    let width: usize = tokens.next().unwrap().parse().unwrap();
+    let height: usize = tokens.next().unwrap().parse().unwrap();
+    let max: u16 = tokens.next().unwrap().parse().unwrap();
+    assert_eq!(
+        (width, height, max),
+        (4, 3, 255),
+        "{case_id}: bad PPM header"
+    );
+    let samples: Vec<u16> = tokens.map(|token| token.parse().unwrap()).collect();
+    assert_eq!(
+        samples.len(),
+        width * height * 3,
+        "{case_id}: truncated PPM asset {asset}"
+    );
+    assert!(
+        samples.iter().all(|sample| *sample <= max),
+        "{case_id}: PPM sample exceeds max value in {asset}"
     );
 }
