@@ -645,7 +645,7 @@ impl LspEnricher {
             // to Function+Trait because pyright's textDocument/references hangs on
             // class/enum/const lookups).
             .filter(|n| {
-                if let Some(ref kinds) = self.lsp_enrichable_kinds {
+                if let Some(kinds) = self.enrichable_kinds() {
                     return kinds.contains(&n.id.kind);
                 }
                 true
