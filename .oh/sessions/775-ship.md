@@ -110,3 +110,36 @@ Verification after these fixes:
   unbudgeted phase deadline and zero fresh scoped coverage). Both were fixed
   with one absolute job deadline plus `max(existing, latest)` scoped coverage.
   Final verdict: **APPROVE**, no blocking findings.
+
+## Superseding CodeRabbit review follow-up
+
+A later CodeRabbit review on the same `3ff1b95e` head superseded the earlier
+approval with three additional findings:
+
+1. Initialization cancellation could leave a pre-handshake transport in state,
+   causing later calls to mistake a partial initialization for a usable server.
+   Initialization now short-circuits only on a pipelined transport, drops stale
+   pre-handshake state before retry, and explicitly resets incomplete state
+   when initialization errors or the caller-owned deadline interrupts it.
+2. Pass 1 error accounting was assigned only after all later passes completed.
+   The partial error count is now stored immediately after Pass 1 so a later
+   deadline abort increments rather than replaces it.
+3. Automatic changed-file paths labeled evidence as scoped while scheduling the
+   full primary root. Scanner touched-file tuples now resolve to bounded stable
+   node IDs and flow through `lsp_node_filter` in background, graph-update, and
+   foreground incremental pipelines. Scoped readiness counts only LSP call
+   edges incident to those planned IDs, including valid clean zero-edge runs.
+
+Focused regressions cover pre-handshake cleanup, scanner-path exclusion of
+unrelated stable IDs, and scoped call-edge counting.
+
+Verification after the superseding review fixes:
+
+- `cargo check --lib`: pass.
+- `cargo clippy --lib -- -D warnings`: pass.
+- Three focused new regressions: pass.
+- Foreground incremental pipeline regression: pass after excluding empty
+  virtual-node paths before changed-file normalization.
+- Full library suite excluding the checkout-history-sensitive roots test:
+  2,034 passed, 4 ignored, 0 failed.
+- Independent re-review, including the empty-path follow-up: **APPROVE**.

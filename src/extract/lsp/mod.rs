@@ -778,13 +778,33 @@ impl LspEnricher {
             .unwrap_or_default()
     }
 
-    /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
+        let result = self.ensure_initialized_inner(repo_root).await;
+        if result.is_err() {
+            self.reset_incomplete_initialization().await;
+        }
+        result
+    }
+
+    async fn reset_incomplete_initialization(&self) {
+        let mut state = self.state.lock().await;
+        if state.pipelined.is_none() {
+            state.transport.take();
+            state.root_path = None;
+        }
+    }
+
+    /// Initialize the language server if not already running.
+    async fn ensure_initialized_inner(&self, repo_root: &Path) -> Result<()> {
         let mut state = self.state.lock().await;
 
-        if state.pipelined.is_some() || state.transport.is_some() {
+        if state.pipelined.is_some() {
             return Ok(());
         }
+        // A cancelled initialization can leave the pre-handshake transport in
+        // state. It is not usable by enrichment and must not suppress a retry.
+        state.transport.take();
+        state.root_path = None;
 
         if state.init_failed {
             return Err(anyhow::anyhow!(
@@ -2729,6 +2749,7 @@ impl Enricher for LspEnricher {
                 return Err(e);
             }
             Err(detail) => {
+                self.reset_incomplete_initialization().await;
                 self.mark_broad_reference_deadline(&mut result, detail);
                 return Ok(result);
             }
@@ -2843,8 +2864,8 @@ impl Enricher for LspEnricher {
                 job_deadline,
             )
             .await;
+        result.error_count = errors as usize;
         if aborted {
-            result.error_count = errors as usize;
             result.aborted = true;
             let detail = abort_diagnostic
                 .unwrap_or_else(|| "Pass 1 aborted without a diagnostic snapshot".to_string());
@@ -3943,6 +3964,25 @@ mod tests {
             !state.has_type_hierarchy,
             "should default to false until init confirms"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_incomplete_initialization_drops_pre_handshake_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let enricher = LspEnricher::new("rust", "cat", &[], &["rs"]);
+        let transport = LspTransport::spawn("cat", &[], root.path()).await.unwrap();
+        {
+            let mut state = enricher.state.lock().await;
+            state.transport = Some(transport);
+            state.root_path = Some(root.path().to_path_buf());
+            assert!(state.pipelined.is_none());
+        }
+
+        enricher.reset_incomplete_initialization().await;
+
+        let state = enricher.state.lock().await;
+        assert!(state.transport.is_none());
+        assert!(state.root_path.is_none());
     }
 
     /// If LspState has type hierarchy disabled (has_type_hierarchy = false),

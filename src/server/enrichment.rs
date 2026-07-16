@@ -1683,6 +1683,15 @@ impl RnaHandler {
         ));
 
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let touched_files: std::collections::HashSet<(String, PathBuf)> = changed_file_set
+            .iter()
+            .cloned()
+            .map(|file| (primary_slug.clone(), file))
+            .collect();
+        let lsp_node_filter = super::changed_file_plan::plan_lsp_node_ids_for_touched_files(
+            &touched_files,
+            &all_nodes,
+        )?;
         // Only the primary root has changes in the incremental path.
         let dirty_slugs: Option<std::collections::HashSet<String>> =
             Some(std::iter::once(primary_slug.clone()).collect());
@@ -1699,7 +1708,7 @@ impl RnaHandler {
             scan_stats: Arc::clone(&self.scan_stats),
             skip_lsp: !enrichment.runs_lsp(),
             dirty_slugs,
-            lsp_node_filter: None,
+            lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
             broad_reference_budget: None,
         })
         .await;
@@ -1724,6 +1733,8 @@ impl RnaHandler {
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                            && (lsp_node_filter.contains(&e.from.to_stable_id())
+                                || lsp_node_filter.contains(&e.to.to_stable_id()))
                     })
                     .count();
 

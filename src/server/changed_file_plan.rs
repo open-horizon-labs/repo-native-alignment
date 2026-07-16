@@ -293,6 +293,53 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
     })
 }
 
+pub(crate) fn plan_lsp_node_ids_for_touched_files(
+    touched_files: &HashSet<(String, PathBuf)>,
+    cached_nodes: &[Node],
+) -> Result<Arc<HashSet<String>>> {
+    let supported_languages =
+        crate::extract::EnricherRegistry::with_builtins().supported_languages();
+    let touched_roots: HashSet<&str> = touched_files
+        .iter()
+        .map(|(root, _)| root.as_str())
+        .collect();
+    let mut planned_node_ids = HashSet::new();
+    let mut operation_count = 0usize;
+
+    for node in cached_nodes {
+        if !touched_roots.contains(node.id.root.as_str())
+            || node.id.file.as_os_str().is_empty()
+            || node.language.is_empty()
+            || !supported_languages.contains(&node.language)
+        {
+            continue;
+        }
+        let file = normalize_relative(&node.id.file)?;
+        if !touched_files.contains(&(node.id.root.clone(), file)) {
+            continue;
+        }
+
+        let requested_operations = planned_operations_for_node(node);
+        if requested_operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
+            continue;
+        }
+        operation_count = operation_count
+            .checked_add(requested_operations.len())
+            .context("changed-file LSP operation count overflowed")?;
+        if planned_node_ids.len() > MAX_CHANGED_LSP_NODES
+            || operation_count > MAX_CHANGED_LSP_OPERATIONS
+        {
+            anyhow::bail!(
+                "changed-file LSP plan exceeds its bound (max {} nodes / {} operations); {SCOPE_HELP}",
+                MAX_CHANGED_LSP_NODES,
+                MAX_CHANGED_LSP_OPERATIONS
+            );
+        }
+    }
+
+    Ok(Arc::new(planned_node_ids))
+}
+
 fn discover_git_worktree_changes(
     repo_root: &Path,
 ) -> Result<(ChangedFileProvenance, Vec<ChangedFile>)> {
@@ -497,6 +544,23 @@ mod tests {
             .find(|node| node.stable_id.contains("Thing"))
             .expect("type hierarchy remains high-signal default work");
         assert_eq!(broad_type.requested_operations, vec!["type_hierarchy"]);
+    }
+
+    #[test]
+    fn scanner_touched_files_plan_only_stable_ids_from_touched_paths() {
+        let nodes = vec![
+            node("src/changed.rs", "changed", NodeKind::Function),
+            node("src/unrelated.rs", "unrelated", NodeKind::Function),
+            node("src/changed.rs", "Thing", NodeKind::Struct),
+        ];
+        let touched_files =
+            HashSet::from([("fixture".to_string(), PathBuf::from("src/changed.rs"))]);
+
+        let ids = plan_lsp_node_ids_for_touched_files(&touched_files, &nodes).unwrap();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
+        assert!(!ids.iter().any(|id| id.contains("unrelated")));
     }
 
     #[test]
