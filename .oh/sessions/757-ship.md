@@ -30,3 +30,4 @@ updated: 2026-07-15
 - `cargo check --lib`: pass.
 - `cargo test --lib`: 1998 passed, 3 ignored.
 - Targeted identity, stale-on-edit, persistence/load/render, frontmatter-only, and reciprocal-direction tests: pass.
+- Local optimized candidate passed the real TypeScript MCP smoke client (all four tools visible; all assertions passed).
