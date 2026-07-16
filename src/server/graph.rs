@@ -172,7 +172,7 @@ mod tests {
             .insert("byte_start".into(), "10".into());
         evidence_node
             .metadata
-            .insert("byte_end".into(), "25".into());
+            .insert("byte_end".into(), "27".into());
 
         let mut edge = Edge {
             from: crate::graph::NodeId {
@@ -197,7 +197,7 @@ mod tests {
                     line_start: 1,
                     line_end: 1,
                     byte_start: 10,
-                    byte_end: 25,
+                    byte_end: 27,
                     body_node_id: "chapter.md::body::ast:paragraph[0]".into(),
                     snippet_hash: blake3::hash(b"original evidence").to_hex().to_string(),
                     snippet: "original evidence".into(),
@@ -308,12 +308,12 @@ mod tests {
             .insert("byte_start".into(), "410".into());
         shifted_node
             .metadata
-            .insert("byte_end".into(), "425".into());
+            .insert("byte_end".into(), "427".into());
         let mut shifted_edge = restored_state.edges[0].clone();
         shifted_edge.evidence[0].selectors[0].line_start = 30;
         shifted_edge.evidence[0].selectors[0].line_end = 30;
         shifted_edge.evidence[0].selectors[0].byte_start = 410;
-        shifted_edge.evidence[0].selectors[0].byte_end = 425;
+        shifted_edge.evidence[0].selectors[0].byte_end = 427;
         assert_eq!(
             shifted_edge.stable_id(),
             stable_id,

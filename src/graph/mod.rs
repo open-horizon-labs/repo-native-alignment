@@ -329,10 +329,7 @@ pub enum ValidationStatus {
 /// An exact repository body span that supports an edge.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EvidenceSelector {
-    /// Workspace root slug for the selected file. Legacy persisted selectors
-    /// may omit this; they are accepted only when their file/body identity is
-    /// unique across the loaded graph.
-    #[serde(default)]
+    /// Required workspace root slug for the selected file.
     pub root_id: String,
     pub file_path: PathBuf,
     pub line_start: usize,
@@ -567,20 +564,55 @@ impl Edge {
             };
             if custom_provenance_is_valid {
                 for selector in &mut evidence.selectors {
+                    let selector_is_well_formed = !selector.root_id.trim().is_empty()
+                        && !selector.file_path.as_os_str().is_empty()
+                        && !selector.file_path.is_absolute()
+                        && !selector.file_path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::CurDir
+                                    | std::path::Component::ParentDir
+                                    | std::path::Component::RootDir
+                                    | std::path::Component::Prefix(_)
+                            )
+                        })
+                        && selector.line_start > 0
+                        && selector.line_start <= selector.line_end
+                        && selector.byte_start < selector.byte_end
+                        && !selector.body_node_id.trim().is_empty()
+                        && selector.snippet_hash.len() == 64
+                        && selector
+                            .snippet_hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                    if !selector_is_well_formed {
+                        status = ValidationStatus::Invalid;
+                        break;
+                    }
                     let matching = index.get(selector);
                     let Some(node) = matching else {
                         status = ValidationStatus::Unresolved;
                         break;
                     };
                     let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
-                    let ranges_match = node.line_start == selector.line_start
+                    let selected_byte_len = selector.byte_end - selector.byte_start;
+                    let selected_line_count = selector.line_end - selector.line_start + 1;
+                    let body_line_count = node.body.lines().count();
+                    let location_matches = node.line_start == selector.line_start
                         && node.line_end == selector.line_end
                         && node.metadata.get("byte_start").and_then(|v| v.parse().ok())
                             == Some(selector.byte_start)
                         && node.metadata.get("byte_end").and_then(|v| v.parse().ok())
                             == Some(selector.byte_end);
-                    if hash != selector.snippet_hash || !ranges_match {
+                    if !location_matches || hash != selector.snippet_hash {
                         status = ValidationStatus::Stale;
+                        break;
+                    }
+                    if selected_byte_len != node.body.len()
+                        || body_line_count == 0
+                        || selected_line_count != body_line_count
+                    {
+                        status = ValidationStatus::Invalid;
                         break;
                     }
                     // The snippet is display data, not authority. Refresh it only
@@ -614,13 +646,11 @@ impl Edge {
 
 struct EvidenceNodeIndex<'a> {
     scoped: HashMap<(String, PathBuf, String), &'a Node>,
-    legacy_unique: HashMap<(PathBuf, String), Option<&'a Node>>,
 }
 
 impl<'a> EvidenceNodeIndex<'a> {
     fn new(nodes: &'a [Node]) -> Self {
         let mut scoped = HashMap::new();
-        let mut legacy_unique = HashMap::new();
         for node in nodes {
             let Some(body_node_id) = node.metadata.get("body_node_id") else {
                 continue;
@@ -633,32 +663,18 @@ impl<'a> EvidenceNodeIndex<'a> {
                 ),
                 node,
             );
-            legacy_unique
-                .entry((node.id.file.clone(), body_node_id.clone()))
-                .and_modify(|candidate| *candidate = None)
-                .or_insert(Some(node));
         }
-        Self {
-            scoped,
-            legacy_unique,
-        }
+        Self { scoped }
     }
 
     fn get(&self, selector: &EvidenceSelector) -> Option<&'a Node> {
-        if selector.root_id.is_empty() {
-            self.legacy_unique
-                .get(&(selector.file_path.clone(), selector.body_node_id.clone()))
-                .copied()
-                .flatten()
-        } else {
-            self.scoped
-                .get(&(
-                    selector.root_id.clone(),
-                    selector.file_path.clone(),
-                    selector.body_node_id.clone(),
-                ))
-                .copied()
-        }
+        self.scoped
+            .get(&(
+                selector.root_id.clone(),
+                selector.file_path.clone(),
+                selector.body_node_id.clone(),
+            ))
+            .copied()
     }
 }
 
@@ -868,6 +884,7 @@ mod tests {
             3,
             3,
         );
+        node.id.root = "repo".into();
         node.id.file = PathBuf::from("chapter.md");
         node.body = "first span".into();
         node.metadata.insert(
@@ -897,6 +914,7 @@ mod tests {
             3,
             3,
         );
+        node.id.root = "repo".into();
         node.id.file = PathBuf::from("chapter.md");
         node.body = "stable evidence".into();
         node.metadata.insert(
@@ -965,6 +983,7 @@ mod tests {
             3,
             3,
         );
+        node.id.root = "repo".into();
         node.id.file = PathBuf::from("chapter.md");
         node.body = "current evidence".into();
         node.metadata.insert(
@@ -996,6 +1015,7 @@ mod tests {
             3,
             3,
         );
+        node.id.root = "repo".into();
         node.id.file = PathBuf::from("chapter.md");
         node.body = "current source-backed evidence".into();
         node.metadata.insert(
@@ -1027,6 +1047,53 @@ mod tests {
     }
 
     #[test]
+    fn evidence_rejects_inconsistent_byte_and_line_ranges() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.root = "repo".into();
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "1234567890".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "19".into());
+
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        edge.revalidate_evidence(std::slice::from_ref(&node));
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid,
+            "a copied byte range that does not span the exact body bytes is malformed"
+        );
+
+        node.metadata.insert("byte_end".into(), "20".into());
+        node.line_end = 4;
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence[0].selectors[0].byte_end = 20;
+        edge.evidence[0].selectors[0].line_end = 4;
+        edge.revalidate_evidence(std::slice::from_ref(&node));
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(
+            edge.evidence[0].validation_status,
+            ValidationStatus::Invalid,
+            "line ranges must span the same current bytes as the body selector"
+        );
+    }
+
+    #[test]
     fn custom_evidence_requires_nonblank_provenance_but_generic_evidence_does_not_require_pack() {
         let mut node = make_node(
             "chapter.md",
@@ -1035,6 +1102,7 @@ mod tests {
             3,
             3,
         );
+        node.id.root = "repo".into();
         node.id.file = PathBuf::from("chapter.md");
         node.body = "source-backed evidence".into();
         node.metadata.insert(
@@ -1107,50 +1175,29 @@ mod tests {
         );
 
         edge.evidence[0].selectors[0].root_id.clear();
-        edge.revalidate_evidence(&[
-            {
-                let mut node = make_node(
-                    "chapter.md",
-                    "body",
-                    NodeKind::Other("paragraph".into()),
-                    3,
-                    3,
-                );
-                node.id.root = "first-root".into();
-                node.id.file = PathBuf::from("chapter.md");
-                node.body = "first root evidence".into();
-                node.metadata.insert(
-                    "body_node_id".into(),
-                    "chapter.md::body::ast:paragraph[0]".into(),
-                );
-                node.metadata.insert("byte_start".into(), "10".into());
-                node.metadata.insert("byte_end".into(), "29".into());
-                node
-            },
-            {
-                let mut node = make_node(
-                    "chapter.md",
-                    "body",
-                    NodeKind::Other("paragraph".into()),
-                    3,
-                    3,
-                );
-                node.id.root = "second-root".into();
-                node.id.file = PathBuf::from("chapter.md");
-                node.body = "second root changed".into();
-                node.metadata.insert(
-                    "body_node_id".into(),
-                    "chapter.md::body::ast:paragraph[0]".into(),
-                );
-                node.metadata.insert("byte_start".into(), "10".into());
-                node.metadata.insert("byte_end".into(), "29".into());
-                node
-            },
-        ]);
+        edge.revalidate_evidence(&[{
+            let mut node = make_node(
+                "chapter.md",
+                "body",
+                NodeKind::Other("paragraph".into()),
+                3,
+                3,
+            );
+            node.id.root = "first-root".into();
+            node.id.file = PathBuf::from("chapter.md");
+            node.body = "first root evidence".into();
+            node.metadata.insert(
+                "body_node_id".into(),
+                "chapter.md::body::ast:paragraph[0]".into(),
+            );
+            node.metadata.insert("byte_start".into(), "10".into());
+            node.metadata.insert("byte_end".into(), "29".into());
+            node
+        }]);
         assert_eq!(
             edge.evidence[0].validation_status,
-            ValidationStatus::Unresolved,
-            "legacy unscoped selectors must fail closed when multiple roots match"
+            ValidationStatus::Invalid,
+            "missing required root identity must fail closed even when a file is unique"
         );
         assert_eq!(edge.confidence, Confidence::Detected);
     }
