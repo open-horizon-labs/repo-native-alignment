@@ -1431,6 +1431,10 @@ pub struct LspConsumer {
     pub repo_root: PathBuf,
     /// Per-root LSP root overrides for monorepo setups.
     pub lsp_roots: Arc<Vec<(String, PathBuf)>>,
+    /// Shared deadline for an explicit broad-reference request. Kept on the
+    /// consumer as well as the enricher so initialization and every pass are
+    /// bounded, not only Pass 1 scheduling.
+    pub(crate) broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
 }
 
 #[async_trait]
@@ -1486,7 +1490,7 @@ impl ExtractionConsumer for LspConsumer {
 
         // Run LSP enrichment natively async — the bus is async so we can await
         // directly without block_in_place.
-        let enrichment_result = {
+        let enrichment_future = async {
             // Build an index from the nodes visible to this enricher so that
             // enrichers that resolve or deduplicate through the index see a
             // populated graph rather than an empty one.
@@ -1495,6 +1499,39 @@ impl ExtractionConsumer for LspConsumer {
                 index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
             enricher.enrich(&nodes_vec, &index, &repo_root).await
+        };
+        let enrichment_result = if self.enricher.manages_broad_reference_deadline() {
+            enrichment_future.await
+        } else if let Some(budget) = self.broad_reference_budget.as_ref() {
+            match budget.remaining_duration() {
+                Some(remaining) => match tokio::time::timeout(remaining, enrichment_future).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        budget.open_time_circuit();
+                        let snapshot = budget.snapshot();
+                        Ok(crate::extract::EnrichmentResult {
+                            any_enricher_ran: true,
+                            aborted: true,
+                            error_count: 1,
+                            diagnostic: snapshot.circuit_reason,
+                            ..Default::default()
+                        })
+                    }
+                },
+                None => {
+                    budget.open_time_circuit();
+                    let snapshot = budget.snapshot();
+                    Ok(crate::extract::EnrichmentResult {
+                        any_enricher_ran: true,
+                        aborted: true,
+                        error_count: 1,
+                        diagnostic: snapshot.circuit_reason,
+                        ..Default::default()
+                    })
+                }
+            }
+        } else {
+            enrichment_future.await
         };
 
         match enrichment_result {
@@ -2254,6 +2291,9 @@ pub struct BusOptions {
     /// When present, only these stable node IDs may emit LSP work. The full graph
     /// still flows through finalization and persistence.
     pub lsp_node_filter: Option<Arc<HashSet<String>>>,
+    /// Enables otherwise default-denied broad reference operations and enforces
+    /// one global request/time circuit across every language server.
+    pub(crate) broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
 }
 
 /// Build an `EventBus` pre-loaded with all built-in consumers.
@@ -2303,6 +2343,7 @@ pub fn build_builtin_bus(
         lance_repo_root,
         skip_lsp,
         lsp_node_filter,
+        broad_reference_budget,
     } = opts;
     use crate::extract::event_bus::EventBus;
 
@@ -2366,12 +2407,14 @@ pub fn build_builtin_bus(
         supported_languages.sort(); // deterministic registration order
 
         for lang in &supported_languages {
-            let single_lang_enricher = build_single_language_enricher(lang);
+            let single_lang_enricher =
+                build_single_language_enricher(lang, broad_reference_budget.clone());
             bus.register(Box::new(LspConsumer {
                 language: lang.clone(),
                 enricher: single_lang_enricher,
                 repo_root: repo_root.clone(),
                 lsp_roots: Arc::clone(&lsp_roots),
+                broad_reference_budget: broad_reference_budget.clone(),
             }));
         }
     } else {
@@ -2419,8 +2462,11 @@ pub fn build_builtin_bus(
 ///
 /// Construct a built-in enricher through the same descriptor factory used by
 /// [`crate::extract::EnricherRegistry`].
-fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enricher> {
-    if let Some(enricher) = build_single_language_lsp_enricher(language) {
+fn build_single_language_enricher(
+    language: &str,
+    broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+) -> Arc<dyn crate::extract::Enricher> {
+    if let Some(enricher) = build_single_language_lsp_enricher(language, broad_reference_budget) {
         return Arc::new(enricher);
     }
 
@@ -2435,8 +2481,15 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
     })
 }
 
-fn build_single_language_lsp_enricher(language: &str) -> Option<crate::extract::lsp::LspEnricher> {
-    crate::extract::lsp::builtin_lsp_enricher(language)
+fn build_single_language_lsp_enricher(
+    language: &str,
+    broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+) -> Option<crate::extract::lsp::LspEnricher> {
+    crate::extract::lsp::builtin_lsp_enricher(language).map(|enricher| match broad_reference_budget
+    {
+        Some(budget) => enricher.with_broad_references(budget),
+        None => enricher,
+    })
 }
 
 /// No-op enricher used as a fallback when a language is not in the server table.
@@ -3020,7 +3073,7 @@ mod tests {
             .expect("python descriptor");
         let registry_path = descriptor.build();
         let event_bus_path =
-            build_single_language_lsp_enricher("python").expect("python EventBus enricher");
+            build_single_language_lsp_enricher("python", None).expect("python EventBus enricher");
 
         assert_eq!(
             event_bus_path.enrichable_kinds(),
@@ -3350,6 +3403,7 @@ mod tests {
             }),
             repo_root: PathBuf::from("."),
             lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: None,
         };
         let matching = ExtractionEvent::LanguageDetected {
             slug: "test".into(),
@@ -3375,6 +3429,152 @@ mod tests {
                 .any(|event| matches!(event, ExtractionEvent::LspQueryMetrics { .. })),
             "LspConsumer must emit LspQueryMetrics"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_deadline_bounds_enricher_before_pass_one_and_finalizes_degraded() {
+        struct SlowEnricher;
+
+        #[async_trait::async_trait]
+        impl crate::extract::Enricher for SlowEnricher {
+            fn languages(&self) -> &[&str] {
+                &["rust"]
+            }
+
+            fn is_ready(&self) -> bool {
+                false
+            }
+
+            fn name(&self) -> &str {
+                "slow-test-enricher"
+            }
+
+            async fn enrich(
+                &self,
+                _nodes: &[Node],
+                _index: &crate::graph::index::GraphIndex,
+                _repo_root: &std::path::Path,
+            ) -> anyhow::Result<crate::extract::EnrichmentResult> {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(crate::extract::EnrichmentResult::default())
+            }
+        }
+
+        let budget = Arc::new(crate::extract::lsp::LspBroadReferenceBudget::new(
+            10,
+            std::time::Duration::from_millis(5),
+        ));
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(SlowEnricher),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: Some(budget.clone()),
+        };
+        let started = std::time::Instant::now();
+        let events = consumer
+            .on_event(&ExtractionEvent::LanguageDetected {
+                slug: "fixture".into(),
+                language: "rust".into(),
+                nodes: Arc::from([]),
+            })
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(matches!(
+            &events[0],
+            ExtractionEvent::EnrichmentComplete {
+                aborted: true,
+                error_count: 1,
+                diagnostic: Some(detail),
+                ..
+            } if detail.contains("time budget exhausted")
+        ));
+        let snapshot = budget.snapshot();
+        assert!(snapshot.circuit_open);
+        assert_eq!(snapshot.scheduled_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn internally_managed_deadline_preserves_partial_enrichment_output() {
+        struct InternallyManagedEnricher;
+
+        #[async_trait::async_trait]
+        impl crate::extract::Enricher for InternallyManagedEnricher {
+            fn languages(&self) -> &[&str] {
+                &["rust"]
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn name(&self) -> &str {
+                "internally-managed-test-enricher"
+            }
+
+            fn manages_broad_reference_deadline(&self) -> bool {
+                true
+            }
+
+            async fn enrich(
+                &self,
+                _nodes: &[Node],
+                _index: &crate::graph::index::GraphIndex,
+                _repo_root: &std::path::Path,
+            ) -> anyhow::Result<crate::extract::EnrichmentResult> {
+                Ok(crate::extract::EnrichmentResult {
+                    updated_nodes: vec![(
+                        "fixture:src/lib.rs:caller:function".to_string(),
+                        std::collections::BTreeMap::from([(
+                            "partial".to_string(),
+                            "preserved".to_string(),
+                        )]),
+                    )],
+                    any_enricher_ran: true,
+                    aborted: true,
+                    error_count: 1,
+                    diagnostic: Some(
+                        "broad-reference time budget exhausted; partial output preserved"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let budget = Arc::new(crate::extract::lsp::LspBroadReferenceBudget::new(
+            10,
+            std::time::Duration::from_millis(1),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(InternallyManagedEnricher),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: Some(budget),
+        };
+
+        let events = consumer
+            .on_event(&ExtractionEvent::LanguageDetected {
+                slug: "fixture".into(),
+                language: "rust".into(),
+                nodes: Arc::from([]),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &events[0],
+            ExtractionEvent::EnrichmentComplete {
+                aborted: true,
+                updated_nodes,
+                diagnostic: Some(detail),
+                ..
+            } if updated_nodes.len() == 1 && detail.contains("partial output preserved")
+        ));
     }
 
     /// Regression for #766: an aborted enricher is a degraded completion, not a
@@ -3480,6 +3680,7 @@ mod tests {
             }),
             repo_root: PathBuf::from("."),
             lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: None,
         };
         let completions = consumer
             .on_event(&ExtractionEvent::LanguageDetected {
@@ -3540,6 +3741,7 @@ mod tests {
             }),
             repo_root: PathBuf::from("."),
             lsp_roots: Arc::new(vec![]),
+            broad_reference_budget: None,
         };
         let other_lang = ExtractionEvent::LanguageDetected {
             slug: "test".into(),

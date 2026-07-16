@@ -18,6 +18,7 @@ use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
 use super::RnaHandler;
+use super::changed_file_plan::plan_lsp_node_ids_for_touched_files;
 use super::enrichment_jobs::{
     EnrichmentCapability, EnrichmentScope, EnrichmentTrigger, JobStart, ScanEnrichmentOptions,
 };
@@ -80,6 +81,21 @@ fn is_manifest_package_edge(edge: &Edge) -> bool {
             || matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "package"))
 }
 
+fn scoped_lsp_call_edge_count(
+    edges: &[Edge],
+    planned_node_ids: &std::collections::HashSet<String>,
+) -> usize {
+    edges
+        .iter()
+        .filter(|edge| {
+            edge.source == crate::graph::ExtractionSource::Lsp
+                && matches!(edge.kind, crate::graph::EdgeKind::Calls)
+                && (planned_node_ids.contains(&edge.from.to_stable_id())
+                    || planned_node_ids.contains(&edge.to.to_stable_id()))
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +148,47 @@ mod tests {
 
         assert!(!is_manifest_package_edge(&openapi_dep));
         assert!(is_manifest_package_edge(&package_dep));
+    }
+
+    #[test]
+    fn scoped_lsp_count_excludes_unrelated_call_edges() {
+        let changed = crate::graph::NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/changed.rs"),
+            name: "changed".to_string(),
+            kind: NodeKind::Function,
+        };
+        let related = crate::graph::NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/related.rs"),
+            name: "related".to_string(),
+            kind: NodeKind::Function,
+        };
+        let unrelated = crate::graph::NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/unrelated.rs"),
+            name: "unrelated".to_string(),
+            kind: NodeKind::Function,
+        };
+        let edges = vec![
+            Edge {
+                from: changed.clone(),
+                to: related.clone(),
+                kind: crate::graph::EdgeKind::Calls,
+                source: crate::graph::ExtractionSource::Lsp,
+                confidence: crate::graph::Confidence::Detected,
+            },
+            Edge {
+                from: unrelated,
+                to: related,
+                kind: crate::graph::EdgeKind::Calls,
+                source: crate::graph::ExtractionSource::Lsp,
+                confidence: crate::graph::Confidence::Detected,
+            },
+        ];
+        let planned = std::collections::HashSet::from([changed.to_stable_id()]);
+
+        assert_eq!(scoped_lsp_call_edge_count(&edges, &planned), 1);
     }
 }
 
@@ -383,6 +440,7 @@ impl RnaHandler {
                         primary_touched_files
                             .chain(missing_graph_files.iter().cloned())
                             .collect();
+                    let lsp_touched_files = files_to_remove.clone();
                     let deleted_edge_ids: Vec<String> = full_state
                         .edges
                         .iter()
@@ -473,6 +531,18 @@ impl RnaHandler {
                         .collect();
                     {
                         lsp_status.set_running();
+                        let lsp_node_filter = match plan_lsp_node_ids_for_touched_files(
+                            &lsp_touched_files,
+                            &full_state.nodes,
+                        ) {
+                            Ok(filter) => filter,
+                            Err(error) => {
+                                tracing::error!(
+                                    "Background incremental pipeline: changed-file LSP planning failed: {error:#}"
+                                );
+                                return;
+                            }
+                        };
                         let dirty_slugs: Option<std::collections::HashSet<String>> =
                             Some(std::iter::once(primary_slug.clone()).collect());
                         match crate::extract::consumers::emit_enrichment_pipeline(
@@ -486,7 +556,8 @@ impl RnaHandler {
                                 embed_idx: None,
                                 lance_repo_root: None,
                                 skip_lsp: false, // incremental background path: LSP runs inline
-                                lsp_node_filter: None,
+                                lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                                broad_reference_budget: None,
                             },
                             dirty_slugs,
                         )
@@ -503,27 +574,27 @@ impl RnaHandler {
                                 full_state.detected_frameworks = detected_frameworks;
 
                                 // Update LSP status
-                                let lsp_edge_count = full_state
-                                    .edges
-                                    .iter()
-                                    .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
-                                    .count();
-                                let lsp_call_edge_count = full_state
-                                    .edges
-                                    .iter()
-                                    .filter(|e| {
-                                        e.source == crate::graph::ExtractionSource::Lsp
-                                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
-                                    })
-                                    .count();
+                                let lsp_call_edge_count = scoped_lsp_call_edge_count(
+                                    &full_state.edges,
+                                    &lsp_node_filter,
+                                );
                                 let degraded_detail =
                                     (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                                 if let Some(detail) = degraded_detail.as_deref() {
-                                    lsp_status.set_degraded(lsp_call_edge_count, detail);
-                                } else if lsp_edge_count > 0 {
-                                    lsp_status.set_complete(lsp_call_edge_count);
+                                    let existing_coverage = lsp_status.coverage_edge_count();
+                                    lsp_status.set_degraded_scoped(
+                                        lsp_call_edge_count,
+                                        existing_coverage,
+                                        EnrichmentScope::ChangedFiles.stable_key(),
+                                        detail,
+                                    );
                                 } else {
-                                    lsp_status.set_unavailable();
+                                    let existing_coverage = lsp_status.coverage_edge_count();
+                                    lsp_status.set_complete_scoped(
+                                        lsp_call_edge_count,
+                                        existing_coverage,
+                                        EnrichmentScope::ChangedFiles.stable_key(),
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1200,7 +1271,8 @@ impl RnaHandler {
                                     .iter()
                                     .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                                     .count();
-                                self.lsp_status.set_complete(call_count);
+                                self.lsp_status
+                                    .set_complete_default_profile_for_warmup(call_count);
                             }
                         } else if spawn_background {
                             tracing::info!("LSP enrichment skipped by scan options");
@@ -1506,6 +1578,7 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                         skip_lsp: spawn_background || !enrichment.runs_lsp(),
                         lsp_node_filter: None,
+                        broad_reference_budget: None,
                     },
                     dirty_slugs,
                 )
@@ -1533,7 +1606,8 @@ impl RnaHandler {
                     self.lsp_status.set_degraded(lsp_call_edge_count, detail);
                     tracing::warn!("LSP enrichment finalized as degraded: {}", detail);
                 } else if lsp_edge_count > 0 {
-                    self.lsp_status.set_complete(lsp_call_edge_count);
+                    self.lsp_status
+                        .set_complete_default_profile_for_warmup(lsp_call_edge_count);
                     tracing::info!(
                         "LSP enrichment complete (via bus): {} LSP call edges, {} total LSP edges",
                         lsp_call_edge_count,
@@ -2149,23 +2223,27 @@ impl RnaHandler {
             // when there are changed/new/deleted files in the primary root).
             let dirty_slugs: Option<std::collections::HashSet<String>> =
                 Some(std::iter::once(primary_slug.clone()).collect());
+            let lsp_node_filter =
+                plan_lsp_node_ids_for_touched_files(&files_to_remove, &graph.nodes)
+                    .context("failed to plan changed-file LSP nodes")?;
 
             let pipeline_result = crate::extract::consumers::emit_enrichment_pipeline(
-                    std::mem::take(&mut graph.nodes),
-                    std::mem::take(&mut graph.edges),
-                    root_pairs_incremental,
-                    primary_slug.clone(),
-                    self.repo_root.clone(),
-                    crate::extract::consumers::BusOptions {
-                        scan_stats: Some(Arc::clone(&self.scan_stats)),
-                        embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
-                        lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
-                        skip_lsp: !enrichment.runs_lsp(),
-                        lsp_node_filter: None,
-                    },
-                    dirty_slugs,
-                )
-                .await;
+                std::mem::take(&mut graph.nodes),
+                std::mem::take(&mut graph.edges),
+                root_pairs_incremental,
+                primary_slug.clone(),
+                self.repo_root.clone(),
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(Arc::clone(&self.scan_stats)),
+                    embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
+                    lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                    skip_lsp: !enrichment.runs_lsp(),
+                    lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                    broad_reference_budget: None,
+                },
+                dirty_slugs,
+            )
+            .await;
             let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics) =
                 match pipeline_result {
                     Ok(result) => result,
@@ -2177,9 +2255,9 @@ impl RnaHandler {
                                 format!("incremental enrichment pipeline failed: {error:#}"),
                             );
                         }
-                    // Pipeline invariant violated — abort the incremental update so the
-                    // partial graph is not persisted. Scanner state is not committed on
-                    // Err return, so the next scan will retry the full pass sequence.
+                        // Pipeline invariant violated — abort the incremental update so the
+                        // partial graph is not persisted. Scanner state is not committed on
+                        // Err return, so the next scan will retry the full pass sequence.
                         return Err(error.context(
                             "incremental update aborted: post-extraction passes did not complete",
                         ));
@@ -2188,14 +2266,8 @@ impl RnaHandler {
             graph.nodes = enriched_nodes;
             graph.edges = enriched_edges;
             graph.detected_frameworks = detected_frameworks;
-            let lsp_call_edge_count = graph
-                .edges
-                .iter()
-                .filter(|edge| {
-                    edge.source == crate::graph::ExtractionSource::Lsp
-                        && matches!(edge.kind, crate::graph::EdgeKind::Calls)
-                })
-                .count();
+            let lsp_call_edge_count =
+                scoped_lsp_call_edge_count(&graph.edges, &lsp_node_filter);
             let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
             if enrichment.runs_lsp() {
                 incremental_lsp_outcome = Some((lsp_call_edge_count, degraded_detail));
@@ -2505,7 +2577,13 @@ impl RnaHandler {
             && let Some((lsp_call_edge_count, degraded_detail)) = incremental_lsp_outcome
         {
             if let Some(detail) = degraded_detail.as_deref() {
-                self.lsp_status.set_degraded(lsp_call_edge_count, detail);
+                let existing_coverage = self.lsp_status.coverage_edge_count();
+                self.lsp_status.set_degraded_scoped(
+                    lsp_call_edge_count,
+                    existing_coverage,
+                    EnrichmentScope::ChangedFiles.stable_key(),
+                    detail,
+                );
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_degraded(
                         &self.repo_root,
@@ -2515,19 +2593,15 @@ impl RnaHandler {
                         detail,
                     );
                 }
-            } else if self.lsp_status.current_state() == super::state::LspState::Unavailable {
-                self.lsp_status.set_unavailable();
-                if let Some(job_id) = incremental_lsp_job_id.as_deref() {
-                    self.enrichment_jobs.mark_failed(
-                        &self.repo_root,
-                        job_id,
-                        "no call-reference LSP server was available for incremental enrichment",
-                    );
-                }
             } else {
                 // A clean, durable incremental pass supersedes any prior
                 // degraded/running state, including the valid zero-edge case.
-                self.lsp_status.set_complete(lsp_call_edge_count);
+                let existing_coverage = self.lsp_status.coverage_edge_count();
+                self.lsp_status.set_complete_scoped(
+                    lsp_call_edge_count,
+                    existing_coverage,
+                    EnrichmentScope::ChangedFiles.stable_key(),
+                );
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_completed(
                         &self.repo_root,
@@ -2537,9 +2611,7 @@ impl RnaHandler {
                     );
                 }
             }
-        } else if !persist_succeeded
-            && let Some(job_id) = incremental_lsp_job_id.as_deref()
-        {
+        } else if !persist_succeeded && let Some(job_id) = incremental_lsp_job_id.as_deref() {
             self.enrichment_jobs.mark_failed(
                 &self.repo_root,
                 job_id,
