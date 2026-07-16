@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "purpose": "embedding",
+      "repository": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+      "cache": "huggingface",
+      "files": [
+        {
+          "path": "config.json",
+          "sha256": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+          "size": 612
+        },
+        {
+          "path": "model.safetensors",
+          "sha256": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db",
+          "size": 90868376
+        },
+        {
+          "path": "tokenizer.json",
+          "sha256": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+          "size": 466247
+        }
+      ]
+    },
+    {
+      "purpose": "rerank",
+      "repository": "jinaai/jina-reranker-v1-turbo-en",
+      "revision": "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2",
+      "cache": "fastembed",
+      "files": [
+        {
+          "path": "config.json",
+          "sha256": "e050ff6a15ae9295e84882fa0e98051bd8754856cd5201395ebf00ce9f2d609b",
+          "size": 1206
+        },
+        {
+          "path": "onnx/model.onnx",
+          "sha256": "c1296c66c119de645fa9cdee536d8637740efe85224cfa270281e50f213aa565",
+          "size": 151296975
+        },
+        {
+          "path": "special_tokens_map.json",
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+          "size": 280
+        },
+        {
+          "path": "tokenizer.json",
+          "sha256": "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902",
+          "size": 2030772
+        },
+        {
+          "path": "tokenizer_config.json",
+          "sha256": "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa",
+          "size": 1215
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,8 @@ pub mod rerank;
 pub mod rerank {
     use anyhow::{Result, anyhow};
 
+    pub const RERANK_MODEL_NAME: &str = "jinaai/jina-reranker-v1-turbo-en";
+
     #[derive(Debug)]
     pub struct RerankCandidate {
         pub text: String,
@@ -34,6 +36,12 @@ pub mod rerank {
         _query: &str,
         _candidates: &[RerankCandidate],
     ) -> Result<Vec<RerankedResult>> {
+        Err(anyhow!(
+            "rerank support is not compiled in; rebuild with --features embeddings"
+        ))
+    }
+
+    pub fn probe_rerank_runtime() -> Result<()> {
         Err(anyhow!(
             "rerank support is not compiled in; rebuild with --features embeddings"
         ))

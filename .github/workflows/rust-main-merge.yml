@@ -33,6 +33,7 @@ jobs:
               - '.github/workflows/**'
               - '.github/scripts/**'
               - '.github/fixtures/**'
+              - 'models/**'
               - 'scripts/swebench_rna_one.py'
               - 'scripts/swebench_rna_mcp_proxy.py'
               - 'scripts/tests/**'
@@ -193,6 +194,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: python3 -m unittest scripts/tests/test_swebench_rna_one.py
 
+      - name: Semantic artifact script tests
+        if: needs.changes.outputs.rust == 'true'
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*.py'
+
   smoke:
     needs: changes
     if: needs.changes.outputs.rust == 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
@@ -311,3 +316,170 @@ jobs:
           name: repo-native-alignment-darwin-arm64-fast
           path: repo-native-alignment-darwin-arm64-fast.tar.gz
           retention-days: 30
+
+  semantic-artifact:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: namespace-profile-tahoe
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ env.QUALIFICATION_SHA }}
+
+      - name: Install protoc
+        run: bash .github/scripts/install-protoc.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+
+      - name: Build M4 Metal semantic binary
+        env:
+          CANDLE_METAL_FORCE_RELEASE: "1"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-C target-cpu=apple-m4 -C link-arg=-Wl,-dead_strip"
+        run: cargo build --release --target aarch64-apple-darwin --features metal
+
+      - name: Attest required runtime capabilities
+        env:
+          RNA_REQUIRE_METAL: "1"
+        run: |
+          target/aarch64-apple-darwin/release/repo-native-alignment \
+            capabilities --json --require metal
+
+      - name: Package qualification payload
+        run: |
+          strip target/aarch64-apple-darwin/release/repo-native-alignment
+          python3 .github/scripts/package-semantic-artifact.py \
+            --binary target/aarch64-apple-darwin/release/repo-native-alignment \
+            --model-lock models/model-lock.json \
+            --output semantic-payload \
+            --archive repo-native-alignment-darwin-arm64-m4-semantic.tar.gz \
+            --git-sha "$QUALIFICATION_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload semantic qualification artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: repo-native-alignment-darwin-arm64-m4-semantic
+          path: |
+            repo-native-alignment-darwin-arm64-m4-semantic.tar.gz
+            repo-native-alignment-darwin-arm64-m4-semantic.tar.gz.sha256
+          retention-days: 30
+
+  semantic-artifact-qualification:
+    needs: [changes, semantic-artifact]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: namespace-profile-tahoe
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.model-cache/fastembed
+      QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ env.QUALIFICATION_SHA }}
+
+      - name: Download exact semantic artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: repo-native-alignment-darwin-arm64-m4-semantic
+          path: semantic-download
+
+      - name: Verify and extract exact semantic archive
+        working-directory: semantic-download
+        run: |
+          shasum -a 256 -c repo-native-alignment-darwin-arm64-m4-semantic.tar.gz.sha256
+          mkdir ../semantic-artifact
+          tar xzf repo-native-alignment-darwin-arm64-m4-semantic.tar.gz \
+            -C ../semantic-artifact
+          cd ../semantic-artifact
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Prepare immutable model cache
+        run: |
+          python3 .github/scripts/prepare-semantic-models.py \
+            --lock semantic-artifact/model-lock.json \
+            --home "$GITHUB_WORKSPACE/.model-home"
+          python3 .github/scripts/prepare-semantic-models.py \
+            --lock semantic-artifact/model-lock.json \
+            --home "$GITHUB_WORKSPACE/.model-home" \
+            --verify-only
+
+      - name: Attest locked offline runtime capabilities
+        env:
+          HOME: ${{ github.workspace }}/.model-home
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          CANDLE_METAL_FORCE_RELEASE: "1"
+          RNA_REQUIRE_METAL: "1"
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          chmod +x semantic-artifact/repo-native-alignment
+          semantic-artifact/repo-native-alignment \
+            capabilities --json --require embeddings,rerank,metal
+
+      - name: Build persisted semantic fixture index
+        env:
+          HOME: ${{ github.workspace }}/.model-home
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          CANDLE_METAL_FORCE_RELEASE: "1"
+          RNA_REQUIRE_METAL: "1"
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          rm -rf .github/fixtures/smoke/.oh/.cache
+          semantic-artifact/repo-native-alignment scan \
+            --path .github/fixtures/smoke --no-lsp
+
+      - name: Qualify hybrid, rerank, traversal, and offline reopen
+        env:
+          HOME: ${{ github.workspace }}/.model-home
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          CANDLE_METAL_FORCE_RELEASE: "1"
+          RNA_REQUIRE_METAL: "1"
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          python3 .github/scripts/qualify-semantic-artifact.py \
+            --artifact semantic-artifact \
+            --repo .github/fixtures/smoke \
+            --expected-sha "$QUALIFICATION_SHA"
+
+      - name: Reject unattested model cache mutations
+        run: |
+          python3 .github/scripts/prepare-semantic-models.py \
+            --lock semantic-artifact/model-lock.json \
+            --home "$GITHUB_WORKSPACE/.model-home" \
+            --verify-only \
+            --reject-extra

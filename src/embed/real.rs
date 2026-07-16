@@ -76,7 +76,8 @@ impl SearchFilters {
 }
 
 /// Search mode for the embedding index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     /// Combine keyword (BM25) + vector scoring via LanceDB hybrid search with RRF.
     #[default]
@@ -365,14 +366,38 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+pub fn runtime_acceleration() -> Result<&'static str> {
+    #[cfg(feature = "metal")]
+    {
+        candle_core::Device::new_metal(0)
+            .map(|_| "metal")
+            .map_err(|error| anyhow::anyhow!("Metal GPU device 0 is required: {error}"))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        Ok("cpu")
+    }
+}
+
+#[cfg(feature = "metal")]
+fn qualification_requires_metal() -> bool {
+    std::env::var("RNA_REQUIRE_METAL").as_deref() == Ok("1")
+}
+
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
-    let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
-        tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
-        candle_core::Device::Cpu
-    });
+    let device = match candle_core::Device::new_metal(0) {
+        Ok(device) => device,
+        Err(error) if qualification_requires_metal() => {
+            return Err(anyhow::anyhow!("Metal GPU device 0 is required: {error}"));
+        }
+        Err(error) => {
+            tracing::info!("EmbeddingIndex: Metal GPU unavailable ({error}), using CPU");
+            candle_core::Device::Cpu
+        }
+    };
     #[cfg(not(feature = "metal"))]
     let device = candle_core::Device::Cpu;
 
@@ -411,6 +436,17 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     let model = new_model()?;
     embed_texts_with_model(&model, texts).await
+}
+
+pub async fn probe_embedding_runtime() -> Result<()> {
+    let embeddings = embed_texts(vec!["runtime capability probe".to_string()]).await?;
+    let embedding = embeddings
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("embedding probe returned no vector"))?;
+    if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("embedding probe returned an empty or non-finite vector");
+    }
+    Ok(())
 }
 
 /// Embed texts using a pre-loaded model. Avoids repeated model initialization
@@ -556,6 +592,7 @@ fn required_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a 
 }
 
 /// A search result with the artifact and its relevance score.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub id: String,
     pub kind: String,
@@ -1544,6 +1581,35 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
+        self.search_with_filters_policy(query, artifact_types, limit, mode, filters, true)
+            .await
+    }
+
+    /// Search while rejecting any scorer fallback.
+    ///
+    /// Qualification uses this path to prove that the requested retrieval
+    /// mechanism actually executed. Ordinary search remains best-effort.
+    pub async fn search_with_filters_strict(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
+        self.search_with_filters_policy(query, artifact_types, limit, mode, filters, false)
+            .await
+    }
+
+    async fn search_with_filters_policy(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+        allow_hybrid_fallback: bool,
+    ) -> Result<SearchOutcome> {
         let table = match self.db.open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
@@ -1629,6 +1695,11 @@ impl EmbeddingIndex {
                 match hybrid_result {
                     Ok(stream) => stream.try_collect().await?,
                     Err(e) => {
+                        if !allow_hybrid_fallback {
+                            return Err(e).context(
+                                "Hybrid search failed and strict mode forbids vector fallback",
+                            );
+                        }
                         // FTS index may not exist yet (first run before index_all
                         // completes, or old cache). Fall back to pure vector search.
                         tracing::warn!("Hybrid search failed ({}), falling back to vector-only", e);

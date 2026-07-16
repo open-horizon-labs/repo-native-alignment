@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::ToMcpServerHandler;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
+use serde::Serialize;
 
 use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
@@ -44,6 +45,8 @@ enum Commands {
     Scan(ScanArgs),
     Enrich(EnrichArgs),
     Search(SearchArgs),
+    /// Report build and runtime capabilities
+    Capabilities(CapabilitiesArgs),
     Graph(GraphArgs),
     Stats(StatsArgs),
     /// Track progress on a business outcome
@@ -199,6 +202,17 @@ struct SearchArgs {
     /// Show index stats (default: true for CLI, false for MCP)
     #[arg(long, default_value_t = true)]
     verbose: bool,
+    /// Emit fail-closed semantic qualification evidence as JSON.
+    #[arg(long)]
+    diagnostics_json: bool,
+}
+#[derive(clap::Args, Debug)]
+struct CapabilitiesArgs {
+    #[arg(long)]
+    json: bool,
+    /// Comma-separated capabilities that must be available.
+    #[arg(long)]
+    require: Option<String>,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -651,6 +665,305 @@ fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> O
         .unwrap_or_else(|| Some(root_slug))
 }
 
+#[derive(Serialize)]
+struct CapabilityReport {
+    version: &'static str,
+    embeddings_compiled: bool,
+    rerank_compiled: bool,
+    embeddings: bool,
+    rerank: bool,
+    metal: bool,
+    acceleration: String,
+    embedding_model: &'static str,
+    rerank_model: &'static str,
+    embedding_error: Option<String>,
+    rerank_error: Option<String>,
+}
+
+async fn capability_report(required: Option<&str>) -> CapabilityReport {
+    let required: std::collections::HashSet<&str> = required
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    let acceleration = repo_native_alignment::embed::runtime_acceleration()
+        .map(str::to_string)
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let embeddings_compiled = cfg!(feature = "embeddings");
+    let (embeddings, embedding_error) = if embeddings_compiled && required.contains("embeddings") {
+        match repo_native_alignment::embed::probe_embedding_runtime().await {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        }
+    } else {
+        (false, None)
+    };
+    let (rerank, rerank_error) = if embeddings_compiled && required.contains("rerank") {
+        match tokio::task::spawn_blocking(repo_native_alignment::rerank::probe_rerank_runtime).await
+        {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(error)) => (false, Some(error.to_string())),
+            Err(error) => (false, Some(format!("reranker probe task failed: {error}"))),
+        }
+    } else {
+        (false, None)
+    };
+    CapabilityReport {
+        version: env!("CARGO_PKG_VERSION"),
+        embeddings_compiled,
+        rerank_compiled: embeddings_compiled,
+        embeddings,
+        rerank,
+        metal: cfg!(feature = "metal") && acceleration == "metal",
+        acceleration,
+        embedding_model: repo_native_alignment::embed::EMBEDDING_MODEL_REPOSITORY,
+        rerank_model: repo_native_alignment::rerank::RERANK_MODEL_NAME,
+        embedding_error,
+        rerank_error,
+    }
+}
+
+fn verify_required_capabilities(
+    report: &CapabilityReport,
+    required: Option<&str>,
+) -> anyhow::Result<()> {
+    for capability in required
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let available = match capability {
+            "embeddings" => report.embeddings,
+            "rerank" => report.rerank,
+            "metal" => report.metal,
+            unknown => anyhow::bail!("unknown required capability `{unknown}`"),
+        };
+        if !available {
+            let detail = match capability {
+                "embeddings" => report.embedding_error.as_deref(),
+                "rerank" => report.rerank_error.as_deref(),
+                _ => None,
+            }
+            .unwrap_or(&report.acceleration);
+            anyhow::bail!("required capability `{capability}` is unavailable ({detail})");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct QualifiedResult {
+    id: String,
+    kind: String,
+    title: String,
+    retrieval_rank: usize,
+    retrieval_score: f32,
+    rerank_score: f32,
+    final_rank: usize,
+}
+
+#[derive(Serialize)]
+struct SearchQualificationReport {
+    requested_mode: repo_native_alignment::embed::SearchMode,
+    effective_mode: repo_native_alignment::embed::SearchMode,
+    keyword_candidates: usize,
+    vector_candidates: usize,
+    fusion_candidates: usize,
+    fusion: &'static str,
+    rerank_candidates: usize,
+    rerank_applied: bool,
+    degradations: Vec<String>,
+    embedding_model: &'static str,
+    rerank_model: &'static str,
+    acceleration: &'static str,
+    index_generation_unix_ms: u128,
+    index_blake3: String,
+    index_hash_scope: &'static str,
+    results: Vec<QualifiedResult>,
+}
+
+fn fingerprint_index(repo_root: &std::path::Path) -> anyhow::Result<(u128, String)> {
+    fn collect_active_manifests(
+        dir: &std::path::Path,
+        files: &mut Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect_active_manifests(&path, files)?;
+            } else if path.file_name().and_then(|name| name.to_str())
+                == Some("latest_version_hint.json")
+            {
+                #[derive(serde::Deserialize)]
+                struct VersionHint {
+                    version: u64,
+                }
+                let hint: VersionHint = serde_json::from_slice(&std::fs::read(&path)?)?;
+                if hint.version == 0 {
+                    anyhow::bail!("invalid Lance version 0 in {}", path.display());
+                }
+                let encoded_version = u64::MAX - (hint.version - 1);
+                let manifest = path
+                    .parent()
+                    .expect("version hint has parent")
+                    .join(format!("{encoded_version}.manifest"));
+                if !manifest.is_file() {
+                    anyhow::bail!(
+                        "active Lance manifest for version {} is missing: {}",
+                        hint.version,
+                        manifest.display()
+                    );
+                }
+                files.push(path);
+                files.push(manifest);
+            }
+        }
+        Ok(())
+    }
+
+    let root = repo_root.join(".oh").join(".cache").join("lance");
+    let mut files = vec![root.join("scan_version")];
+    collect_active_manifests(&root, &mut files)?;
+    files.sort();
+    let mut hasher = blake3::Hasher::new();
+    let mut latest = std::time::UNIX_EPOCH;
+    for path in files {
+        let relative = path.strip_prefix(&root)?;
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(&std::fs::read(&path)?);
+        if let Ok(modified) = std::fs::metadata(&path)?.modified() {
+            latest = latest.max(modified);
+        }
+    }
+    Ok((
+        latest.duration_since(std::time::UNIX_EPOCH)?.as_millis(),
+        hasher.finalize().to_hex().to_string(),
+    ))
+}
+
+async fn qualified_search(
+    args: &SearchArgs,
+    repo_root: &std::path::Path,
+    index: &repo_native_alignment::embed::EmbeddingIndex,
+) -> anyhow::Result<SearchQualificationReport> {
+    use repo_native_alignment::embed::{SearchFilters, SearchMode, SearchOutcome};
+    use repo_native_alignment::rerank::{RerankCandidate, rerank_results};
+
+    if args.search_mode.as_deref() != Some("hybrid") || !args.rerank {
+        anyhow::bail!("--diagnostics-json requires --search-mode hybrid --rerank");
+    }
+    let word_count = args.query.split_whitespace().count();
+    if !(8..=40).contains(&word_count) {
+        anyhow::bail!("qualification query must contain 8-40 words, received {word_count}");
+    }
+    let filters = SearchFilters {
+        subsystem: args.subsystem.clone(),
+        file: args.file.clone(),
+        language: args.language.clone(),
+        min_complexity: args.min_complexity,
+    };
+    let fetch_limit = args.limit.max(20);
+    let extract = |outcome| match outcome {
+        SearchOutcome::Results(results) => Ok(results),
+        SearchOutcome::NotReady => anyhow::bail!("embedding index is not ready"),
+    };
+    let keyword = extract(
+        index
+            .search_with_filters_strict(
+                &args.query,
+                None,
+                fetch_limit,
+                SearchMode::Keyword,
+                &filters,
+            )
+            .await?,
+    )?;
+    let vector = extract(
+        index
+            .search_with_filters_strict(
+                &args.query,
+                None,
+                fetch_limit,
+                SearchMode::Semantic,
+                &filters,
+            )
+            .await?,
+    )?;
+    let fused = extract(
+        index
+            .search_with_filters_strict(
+                &args.query,
+                None,
+                fetch_limit,
+                SearchMode::Hybrid,
+                &filters,
+            )
+            .await?,
+    )?;
+    if keyword.is_empty() || vector.is_empty() || fused.is_empty() {
+        anyhow::bail!("qualification requires non-empty keyword, vector, and fusion candidates");
+    }
+    let candidates: Vec<RerankCandidate> = fused
+        .iter()
+        .enumerate()
+        .map(|(original_index, result)| RerankCandidate {
+            text: format!("{}\n{}", result.title, result.body),
+            original_index,
+        })
+        .collect();
+    let reranked = tokio::task::spawn_blocking({
+        let query = args.query.clone();
+        move || rerank_results(&query, &candidates)
+    })
+    .await??;
+    if reranked.is_empty() {
+        anyhow::bail!("reranker returned no candidates");
+    }
+    let results = reranked
+        .iter()
+        .take(args.limit)
+        .enumerate()
+        .filter_map(|(final_index, reranked)| {
+            fused
+                .get(reranked.original_index)
+                .map(|retrieved| QualifiedResult {
+                    id: retrieved.id.clone(),
+                    kind: retrieved.kind.clone(),
+                    title: retrieved.title.clone(),
+                    retrieval_rank: reranked.original_index + 1,
+                    retrieval_score: retrieved.score,
+                    rerank_score: reranked.score,
+                    final_rank: final_index + 1,
+                })
+        })
+        .collect();
+    let acceleration = repo_native_alignment::embed::runtime_acceleration()?;
+    if acceleration != "metal" {
+        anyhow::bail!("qualification requires Metal acceleration, got {acceleration}");
+    }
+    let (index_generation_unix_ms, index_blake3) = fingerprint_index(repo_root)?;
+    Ok(SearchQualificationReport {
+        requested_mode: SearchMode::Hybrid,
+        effective_mode: SearchMode::Hybrid,
+        keyword_candidates: keyword.len(),
+        vector_candidates: vector.len(),
+        fusion_candidates: fused.len(),
+        fusion: "reciprocal_rank_fusion",
+        rerank_candidates: reranked.len(),
+        rerank_applied: true,
+        degradations: Vec::new(),
+        embedding_model: repo_native_alignment::embed::EMBEDDING_MODEL_REPOSITORY,
+        rerank_model: repo_native_alignment::rerank::RERANK_MODEL_NAME,
+        acceleration,
+        index_generation_unix_ms,
+        index_blake3,
+        index_hash_scope: "active_lance_manifests",
+        results,
+    })
+}
+
 fn main() {
     // Set fastembed model cache to ~/.cache/rna/models/ instead of .fastembed_cache/
     // in the current directory. Must be set before Tokio runtime and any fastembed
@@ -680,6 +993,25 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let log_path = cli.log_path.clone();
     match cli.command {
+        Some(Commands::Capabilities(args)) => {
+            let report = capability_report(args.require.as_deref()).await;
+            verify_required_capabilities(&report, args.require.as_deref())?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "embeddings_compiled={} rerank_compiled={} embeddings_ready={} \
+                     rerank_ready={} metal={} acceleration={}",
+                    report.embeddings_compiled,
+                    report.rerank_compiled,
+                    report.embeddings,
+                    report.rerank,
+                    report.metal,
+                    report.acceleration
+                );
+            }
+            return Ok(());
+        }
         Some(Commands::Setup(args)) => return setup::run(&args),
         Some(Commands::Test(args)) => {
             init_tracing("info", log_path.as_deref());
@@ -1134,6 +1466,16 @@ async fn async_main() -> anyhow::Result<()> {
                     None
                 }
             };
+            if args.diagnostics_json {
+                let index = embed_idx.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "qualification requires a ready embedding index; no fallback is allowed"
+                    )
+                })?;
+                let report = qualified_search(&args, &repo_root, index).await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
             // Validate: --include-body requires --node or --nodes
             if args.include_body
                 && args.node.is_none()
@@ -1454,6 +1796,84 @@ async fn async_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
+
+    #[test]
+    fn qualification_cli_requires_explicit_diagnostics_flag() {
+        let cli = Cli::try_parse_from([
+            "repo-native-alignment",
+            "search",
+            "find greeting function behavior and related helper call relationships",
+            "--search-mode",
+            "hybrid",
+            "--rerank",
+            "--compact",
+            "--limit",
+            "5",
+            "--diagnostics-json",
+        ])
+        .expect("qualification CLI should parse");
+        let Some(Commands::Search(args)) = cli.command else {
+            panic!("expected search command");
+        };
+        assert!(args.diagnostics_json);
+        assert!(args.rerank);
+        assert_eq!(args.search_mode.as_deref(), Some("hybrid"));
+        assert_eq!(args.limit, 5);
+    }
+
+    #[test]
+    fn unavailable_required_capability_fails_closed() {
+        let report = CapabilityReport {
+            version: "test",
+            embeddings_compiled: true,
+            rerank_compiled: true,
+            embeddings: true,
+            rerank: true,
+            metal: false,
+            acceleration: "cpu".to_string(),
+            embedding_model: "embedding",
+            rerank_model: "rerank",
+            embedding_error: None,
+            rerank_error: None,
+        };
+        let error = verify_required_capabilities(&report, Some("embeddings,rerank,metal"))
+            .expect_err("missing Metal must fail");
+        assert!(error.to_string().contains("`metal` is unavailable"));
+    }
+
+    #[test]
+    fn index_fingerprint_hashes_only_active_lance_manifests() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        let lance = repo.path().join(".oh/.cache/lance");
+        let versions = lance.join("symbols.lance/_versions");
+        std::fs::create_dir_all(&versions).expect("create versions");
+        std::fs::write(lance.join("scan_version"), "23").expect("scan version");
+        std::fs::write(
+            versions.join("latest_version_hint.json"),
+            r#"{"version":2}"#,
+        )
+        .expect("version hint");
+        std::fs::write(
+            versions.join(format!("{}.manifest", u64::MAX - 1)),
+            "active manifest",
+        )
+        .expect("active manifest");
+        std::fs::write(
+            versions.join(format!("{}.manifest", u64::MAX)),
+            "stale manifest",
+        )
+        .expect("stale manifest");
+
+        let first = fingerprint_index(repo.path()).expect("fingerprint");
+        std::fs::write(
+            versions.join(format!("{}.manifest", u64::MAX)),
+            "changed stale manifest",
+        )
+        .expect("change stale");
+        let second = fingerprint_index(repo.path()).expect("fingerprint");
+
+        assert_eq!(first.1, second.1);
+    }
 
     #[test]
     fn enrich_cli_exposes_target_scope_and_visible_budget() {

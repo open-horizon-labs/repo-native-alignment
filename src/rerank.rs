@@ -42,6 +42,7 @@ fn rna_cache_dir() -> std::path::PathBuf {
 /// Default model: Jina Reranker V1 Turbo (English).
 /// Smaller and faster than BGE-Reranker-Base while maintaining good quality.
 const DEFAULT_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
+pub const RERANK_MODEL_NAME: &str = "jinaai/jina-reranker-v1-turbo-en";
 
 /// A document to be reranked, carrying its original index so we can map
 /// reranked scores back to the original result set.
@@ -152,6 +153,26 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
     });
 
     Ok(results)
+}
+
+pub fn probe_rerank_runtime() -> Result<()> {
+    let results = rerank_results(
+        "runtime capability probe",
+        &[
+            RerankCandidate {
+                text: "runtime capability probe".to_string(),
+                original_index: 0,
+            },
+            RerankCandidate {
+                text: "unrelated document".to_string(),
+                original_index: 1,
+            },
+        ],
+    )?;
+    if results.len() != 2 || results.iter().any(|result| !result.score.is_finite()) {
+        anyhow::bail!("reranker probe returned incomplete or non-finite scores");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ mod real;
 pub use real::*;
 
 pub const EMBEDDING_MODEL_NAME: &str = "MiniLM-L6-v2";
+pub const EMBEDDING_MODEL_REPOSITORY: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
 #[cfg(not(feature = "embeddings"))]
 use std::path::Path;
@@ -66,7 +67,8 @@ impl SearchFilters {
 }
 
 #[cfg(not(feature = "embeddings"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     /// Combine keyword (BM25) + vector scoring when embeddings are enabled.
     #[default]
@@ -86,6 +88,7 @@ pub enum SearchOutcome {
 }
 
 #[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub id: String,
     pub kind: String,
@@ -188,6 +191,29 @@ impl EmbeddingIndex {
     ) -> Result<SearchOutcome> {
         Ok(SearchOutcome::NotReady)
     }
+
+    pub async fn search_with_filters_strict(
+        &self,
+        _query: &str,
+        _artifact_types: Option<&[String]>,
+        _limit: usize,
+        _mode: SearchMode,
+        _filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
+        Err(anyhow!(
+            "strict semantic search requires an embeddings-enabled build"
+        ))
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+pub fn runtime_acceleration() -> Result<&'static str> {
+    Err(anyhow!("embeddings support is not compiled in"))
+}
+
+#[cfg(not(feature = "embeddings"))]
+pub async fn probe_embedding_runtime() -> Result<()> {
+    Err(anyhow!("embeddings support is not compiled in"))
 }
 
 #[cfg(not(feature = "embeddings"))]
