@@ -1893,7 +1893,7 @@ async fn search_traversal(
                 _ => String::new(),
             };
 
-            let md = format_neighbors_grouped_with_root(
+            let mut md = format_neighbors_grouped_with_root(
                 &gs.nodes,
                 &merged_groups,
                 &gs.index,
@@ -1902,6 +1902,13 @@ async fn search_traversal(
                 params.include_body,
                 params.minify_body,
             );
+            for origin in &valid_entry_ids {
+                md.push_str(&crate::server::helpers::format_edge_evidence_for_groups(
+                    &gs.edges,
+                    origin,
+                    &merged_groups,
+                ));
+            }
 
             // For impact mode, append a subsystem breakdown showing which subsystems
             // are affected and through which interface function the impact propagates.
