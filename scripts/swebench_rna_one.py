@@ -34,7 +34,14 @@ STAGE_NAMES = (
     "executor_after_handoff",
     "verification_and_debugging_after_patch",
 )
-TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cost_usd")
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cost_usd",
+)
 
 
 class HarnessError(RuntimeError):
@@ -321,7 +328,7 @@ def stage_ledger_skeleton() -> dict[str, Any]:
         "reason": None,
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": utc_now(),
         "rule": (
             "Token counts are recorded only when reported by the executor/provider; "
@@ -620,11 +627,20 @@ def collect_usage_and_fallbacks(
     *,
     first_edit_monotonic: float | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    before = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
-    after = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+    usage_fields = (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+    )
+    before = {field: 0 for field in usage_fields}
+    after = {field: 0 for field in usage_fields}
     observed = {"before": False, "after": False}
     totals: dict[str, float | int | None] = {
         "input_tokens": None,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": None,
         "output_tokens": None,
         "reasoning_tokens": None,
         "cost_usd": None,
@@ -656,6 +672,14 @@ def collect_usage_and_fallbacks(
                 totals["input_tokens"] = number_from(
                     total_usage, ("input_tokens", "inputTokens", "prompt_tokens")
                 )
+                totals["cache_creation_input_tokens"] = number_from(
+                    total_usage,
+                    ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+                )
+                totals["cache_read_input_tokens"] = number_from(
+                    total_usage,
+                    ("cache_read_input_tokens", "cacheReadInputTokens"),
+                )
                 totals["output_tokens"] = number_from(
                     total_usage,
                     ("output_tokens", "outputTokens", "completion_tokens"),
@@ -680,6 +704,14 @@ def collect_usage_and_fallbacks(
             values = {
                 "input_tokens": number_from(
                     usage, ("input_tokens", "inputTokens", "prompt_tokens")
+                ),
+                "cache_creation_input_tokens": number_from(
+                    usage,
+                    ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+                ),
+                "cache_read_input_tokens": number_from(
+                    usage,
+                    ("cache_read_input_tokens", "cacheReadInputTokens"),
                 ),
                 "output_tokens": number_from(
                     usage, ("output_tokens", "outputTokens", "completion_tokens")
@@ -855,11 +887,17 @@ def parse_enrichment_state(
     embedding: CommandResult | None,
     readiness: CommandResult,
 ) -> dict[str, Any]:
+    log_paths = {
+        "scan_stdout": scan_stdout,
+        "scan_stderr": scan_stderr,
+    }
+    if embedding is not None:
+        log_paths["embedding_stdout"] = scan_stdout.parent / "embeddings.stdout.log"
+        log_paths["embedding_stderr"] = scan_stdout.parent / "embeddings.stderr.log"
     combined = "\n".join(
-        [
-            scan_stdout.read_text(encoding="utf-8", errors="replace"),
-            scan_stderr.read_text(encoding="utf-8", errors="replace"),
-        ]
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in log_paths.values()
+        if path.exists()
     )
     lower = combined.lower()
     if "degraded" in lower or (embedding is not None and embedding.exit_code != 0):
@@ -876,12 +914,11 @@ def parse_enrichment_state(
         "degraded_evidence": [
             line.strip()
             for line in combined.splitlines()
-            if "degraded" in line.lower() or "skipped" in line.lower()
+            if "degraded" in line.lower()
+            or "skipped" in line.lower()
+            or "not compiled in" in line.lower()
         ],
-        "raw_logs": {
-            "scan_stdout": str(scan_stdout),
-            "scan_stderr": str(scan_stderr),
-        },
+        "raw_logs": {name: str(path) for name, path in log_paths.items()},
     }
 
 

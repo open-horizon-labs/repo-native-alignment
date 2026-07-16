@@ -129,6 +129,8 @@ JSON to `SWEBENCH_EXECUTOR_REPORT`:
   "stages": {
     "frontier_before_first_edit": {
       "input_tokens": 1200,
+      "cache_creation_input_tokens": 4000,
+      "cache_read_input_tokens": 18000,
       "output_tokens": 300,
       "reasoning_tokens": 80,
       "cost_usd": 0.04
@@ -162,10 +164,29 @@ python3 -m unittest scripts/tests/test_swebench_rna_one.py
 
 ## Manual Verified run
 
-The committed implementation was manually exercised on
-`django__django-13279`. Record the final run-bundle path, executor/model and
-budget, observed enrichment condition, patch status, and official evaluator
-outcome here before marking the issue complete. If model authorization, Docker,
-or evaluator setup prevents completion, retain the failed bundle and state the
-exact external blocker rather than presenting the dry run as an end-to-end
-result.
+The harness was manually exercised on SWE-bench Verified instance
+`django__django-13279` at dataset revision
+`c104f840cc67f8b6eec6f759ebc8b2693d585d4a` and repository base
+`6e9c5ee88fc948e05b4a7d9f82a8861ed2b0343d`.
+
+- Executor: Claude Sonnet with high effort and a USD 8 maximum budget.
+- Actual executor cost: USD 0.40624545.
+- RNA artifact: CI-built commit `b0fabc95`, SHA-256
+  `af4f4e9561a77dbf3a4db45d0f36fb087e34a0b0d205cde43e74e139d27df667`.
+- Requested enrichment: `full`. Observed enrichment: `degraded`, because the
+  fast-release CI artifact was not compiled with the `embeddings` feature.
+  Full call/reference enrichment completed and the readiness query succeeded;
+  the manifest retains the exact embedding capability error.
+- Orientation: two real RNA `search` calls before the first edit, delivering
+  13,973 response bytes. Bytes remain separate from token accounting.
+- First meaningful edit: 91.269 seconds after executor start.
+- Provider totals: 30 uncached input tokens, 28,313 cache-creation input
+  tokens, 651,309 cache-read input tokens, and 6,929 output tokens. Reasoning
+  tokens were not reported and remain unknown.
+- Verification: the executor reported 404 focused Django tests passing.
+- Official evaluator: one submitted, one completed, one resolved, zero errors.
+
+The successful local audit bundle was retained at
+`/tmp/swebench-rna-770-django-13279-b0fabc95`. Earlier failed bundles are also
+retained: they spent no model tokens and exposed the UTF-8 diagnostic
+truncation defect fixed by this PR.

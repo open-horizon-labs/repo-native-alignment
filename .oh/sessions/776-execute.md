@@ -120,3 +120,25 @@ preserving the full message in metadata. Verification:
 - Focused multibyte regression: pass.
 - All 19 `build_diagnostic_nodes` tests: pass.
 - Scoped Rustfmt check and `git diff --check`: pass.
+
+## Successful Verified run
+
+The exact-head `b0fabc95` CI artifact completed
+`django__django-13279` end to end:
+
+- isolated checkout proof: one local commit and no remotes;
+- full call/reference scan completed and the readiness probe succeeded;
+- embeddings were honestly recorded as degraded because the fast-release
+  artifact was built without the `embeddings` feature;
+- two real RNA searches occurred before the first edit and delivered 13,973
+  response bytes;
+- first meaningful edit occurred after 91.269 seconds;
+- Claude Sonnet cost USD 0.40624545 and reported 30 uncached input, 28,313
+  cache-creation input, 651,309 cache-read input, and 6,929 output tokens;
+- 404 focused Django tests passed;
+- the official SWE-bench evaluator reported one submitted, one completed, one
+  resolved, and zero errors.
+
+The successful bundle is
+`/tmp/swebench-rna-770-django-13279-b0fabc95`. The exact dataset row remained
+withheld until after executor exit.
