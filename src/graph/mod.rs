@@ -535,6 +535,13 @@ impl Edge {
     }
 
     fn revalidate_evidence_with_index(&mut self, index: &EvidenceNodeIndex<'_>) {
+        if matches!(self.kind, EdgeKind::Other(_)) && self.evidence.is_empty() {
+            // Repo-local/custom relationship labels are content claims. Without
+            // material body evidence they may remain discoverable, but must fail
+            // closed rather than retaining producer-supplied confirmation.
+            self.confidence = Confidence::Detected;
+            return;
+        }
         let was_lifecycle_downgraded = self.confidence == Confidence::Detected
             && self.evidence.iter().any(|evidence| {
                 evidence.confidence == Confidence::Confirmed

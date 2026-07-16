@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_edge_kind_survives_persist_load_and_traversal() {
+    async fn evidenceless_custom_edge_survives_persist_load_but_is_not_confirmed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = node("quote", "quote.goodhart", ".oh/sources/goodhart.md");
         let claim = node("claim", "claim.proxy-risk", ".oh/knowledge/proxy-risk.md");
@@ -261,7 +261,11 @@ mod tests {
             "custom edge must not be dropped on load"
         );
         assert_eq!(state.edges[0].kind, EdgeKind::Other("supports".to_string()));
-        assert_eq!(state.edges[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            state.edges[0].confidence,
+            Confidence::Detected,
+            "custom relationships without body evidence must fail closed on load"
+        );
 
         let neighbors = state.index.neighbors(
             &source.stable_id(),
