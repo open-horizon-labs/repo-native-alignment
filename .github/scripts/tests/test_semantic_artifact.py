@@ -207,18 +207,44 @@ class SemanticArtifactScriptsTest(unittest.TestCase):
     def test_traversal_requires_resolved_non_empty_context(self) -> None:
         qualifier = load_qualifier()
         node = "src/lib.rs:hello:function"
+        self.assertEqual(
+            qualifier.traversal_command(Path("/artifact/rna"), Path("/repo"), node),
+            [
+                "/artifact/rna",
+                "search",
+                "--repo",
+                "/repo",
+                "--root",
+                "all",
+                "--node",
+                node,
+                "--mode",
+                "neighbors",
+                "--direction",
+                "incoming",
+                "--compact",
+            ],
+        )
         output = (
-            f"## Graph neighbors (outgoing) of `{node}`\n\n"
+            f"## Graph neighbors (incoming) of `{node}`\n\n"
             "2 result(s)\n\n- neighbor"
         )
-        self.assertEqual(qualifier.traversal_result_count(output, node), 2)
+        self.assertEqual(qualifier.traversal_result_count(output, node, "incoming"), 2)
         with self.assertRaisesRegex(RuntimeError, "did not resolve"):
             qualifier.traversal_result_count(
-                "No graph nodes found for `missing`.", node
+                "No graph nodes found for `missing`.", node, "incoming"
             )
         with self.assertRaisesRegex(RuntimeError, "no graph context"):
             qualifier.traversal_result_count(
-                f"## Graph neighbors (outgoing) of `{node}`\n\n0 result(s)", node
+                f"## Graph neighbors (incoming) of `{node}`\n\n0 result(s)",
+                node,
+                "incoming",
+            )
+        with self.assertRaisesRegex(RuntimeError, "did not resolve"):
+            qualifier.traversal_result_count(
+                f"## Graph neighbors (outgoing) of `{node}`\n\n2 result(s)",
+                node,
+                "incoming",
             )
 
 

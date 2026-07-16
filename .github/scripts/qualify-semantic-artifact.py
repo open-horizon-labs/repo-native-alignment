@@ -115,14 +115,31 @@ def compare_reopened_report(first: dict, reopened: dict, tolerance: float = 1e-6
                 raise RuntimeError(f"fresh-process reopen changed result {score}")
 
 
-def traversal_result_count(output: str, node: str) -> int:
-    header = f"## Graph neighbors (outgoing) of `{node}`"
+def traversal_result_count(output: str, node: str, direction: str) -> int:
+    header = f"## Graph neighbors ({direction}) of `{node}`"
     if header not in output:
         raise RuntimeError(f"traversal did not resolve selected stable ID `{node}`")
     match = re.search(r"(?m)^(\d+) result\(s\)$", output)
     if not match or int(match.group(1)) < 1:
         raise RuntimeError(f"traversal returned no graph context for `{node}`")
     return int(match.group(1))
+
+def traversal_command(binary: Path, repo: Path, node: str) -> list[str]:
+    return [
+        str(binary),
+        "search",
+        "--repo",
+        str(repo),
+        "--root",
+        "all",
+        "--node",
+        node,
+        "--mode",
+        "neighbors",
+        "--direction",
+        "incoming",
+        "--compact",
+    ]
 
 
 def main() -> None:
@@ -220,23 +237,13 @@ def main() -> None:
     for result in report["results"]:
         node = result["id"]
         completed = subprocess.run(
-            [
-                str(binary),
-                "search",
-                "--repo",
-                str(args.repo),
-                "--node",
-                node,
-                "--mode",
-                "neighbors",
-                "--compact",
-            ],
+            traversal_command(binary, args.repo, node),
             check=True,
             text=True,
             capture_output=True,
         )
         try:
-            traversal_count = traversal_result_count(completed.stdout, node)
+            traversal_count = traversal_result_count(completed.stdout, node, "incoming")
             selected_node = node
             break
         except RuntimeError:
@@ -256,6 +263,7 @@ def main() -> None:
                 "traversal": {
                     "node": selected_node,
                     "mode": "neighbors",
+                    "direction": "incoming",
                     "result_count": traversal_count,
                 },
             },
