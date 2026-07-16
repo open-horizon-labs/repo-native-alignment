@@ -597,6 +597,19 @@ async fn async_main() -> anyhow::Result<()> {
                     eprintln!();
                     eprintln!("{}", result.report.render_cli(true));
                 }
+                if let Some(degraded) = result.report.capabilities.iter().find(|capability| {
+                    capability.capability == EnrichmentCapability::CallReferences
+                        && capability.requested
+                        && capability.state == server::operation_report::CapabilityState::Degraded
+                }) {
+                    anyhow::bail!(
+                        "LSP call-reference enrichment finalized with degraded output: {}",
+                        degraded
+                            .detail
+                            .as_deref()
+                            .unwrap_or("degraded without an actionable diagnostic")
+                    );
+                }
                 return Ok(());
             }
             eprintln!("Scanning: {}", repo_root.display());

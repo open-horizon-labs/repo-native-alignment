@@ -23,4 +23,6 @@ An LSP no-progress abort must preserve partial graph output, finish the event-bu
 - `cargo check --lib` passes.
 - `cargo check --all-targets` passes.
 - `cargo test --all-targets` passes: 2003 library tests passed, 3 ignored, plus integration contracts.
-- Independent review findings were addressed in two rounds; final re-review, CI-artifact MCP verification, and CodeRabbit gates remain pending.
+- Independent review findings were addressed in two rounds.
+- Exact CI artifact run `29470612974` exposed a real delivery regression: the full foreground pipeline ran LSP once during its nominal extract phase and again during its owned enrichment phase, allowing an empty second pass to overwrite an observed degraded abort as stale/successful. The follow-up fix makes Phase 2 the sole foreground LSP owner and makes the CLI exit non-zero after persisting/rendering a degraded report.
+- Final-head CI-artifact MCP verification and CodeRabbit gates remain pending.

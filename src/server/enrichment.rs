@@ -1744,7 +1744,13 @@ impl RnaHandler {
     {
         // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
         let t0 = std::time::Instant::now();
-        let graph_state = self.build_full_graph_inner(false, enrichment).await?;
+        // Phase 2 below owns foreground LSP execution and its durable job/status
+        // contract. Keep the initial full build extraction-only for LSP so one
+        // invocation cannot abort here and then have a second successful/empty
+        // pass overwrite the degraded result.
+        let graph_state = self
+            .build_full_graph_inner(false, enrichment.without_lsp())
+            .await?;
         let scan_extract_time = t0.elapsed();
 
         let file_count = graph_state
