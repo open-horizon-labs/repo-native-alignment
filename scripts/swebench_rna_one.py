@@ -1456,7 +1456,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "SWEBENCH_EXECUTOR_REPORT": str(executor_report),
                 "SWEBENCH_STAGE_LEDGER": str(ledger_path),
                 "SWEBENCH_MCP_TRACE": str(mcp_trace),
-                "SWEBENCH_HARNESS_ROOT": str(Path(__file__).resolve().parents[1]),
             }
         )
         monitor = FirstEditMonitor(checkout)
