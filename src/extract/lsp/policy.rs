@@ -277,7 +277,13 @@ struct LspQueryMetricKey {
 pub(crate) struct LspQueryTelemetry {
     language: String,
     server: String,
-    metrics: Mutex<BTreeMap<LspQueryMetricKey, LspQueryMetric>>,
+    state: Mutex<LspQueryTelemetryState>,
+}
+
+#[derive(Debug, Default)]
+struct LspQueryTelemetryState {
+    metrics: BTreeMap<LspQueryMetricKey, LspQueryMetric>,
+    pending_work: BTreeMap<LspQueryMetricKey, usize>,
 }
 
 impl LspQueryTelemetry {
@@ -285,8 +291,24 @@ impl LspQueryTelemetry {
         Self {
             language: profile.language().to_string(),
             server: profile.server().to_string(),
-            metrics: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(LspQueryTelemetryState::default()),
         }
+    }
+
+    pub(crate) fn register_work_item(
+        &self,
+        operation: LspQueryOperation,
+        declaration: LspDeclarationClass,
+    ) {
+        let key = LspQueryMetricKey {
+            operation,
+            declaration,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *state.pending_work.entry(key).or_default() += 1;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -305,11 +327,14 @@ impl LspQueryTelemetry {
             operation,
             declaration,
         };
-        let mut metrics = self
-            .metrics
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let metric = metrics.entry(key).or_insert_with(|| LspQueryMetric {
+        if let Some(pending) = state.pending_work.get_mut(&key) {
+            *pending = pending.saturating_sub(1);
+        }
+        let metric = state.metrics.entry(key).or_insert_with(|| LspQueryMetric {
             language: self.language.clone(),
             server: self.server.clone(),
             operation: operation.as_str().to_string(),
@@ -331,10 +356,47 @@ impl LspQueryTelemetry {
         metric.timeouts += timeouts;
     }
 
+    /// Attribute work items cancelled by the outer job deadline. Completed
+    /// items have already decremented their pending count in `record`, so this
+    /// drains only queued or in-flight operations and cannot double count them.
+    pub(crate) fn record_job_timeout(&self, latency: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let pending = std::mem::take(&mut state.pending_work);
+        for (key, count) in pending {
+            if count == 0 {
+                continue;
+            }
+            let metric = state.metrics.entry(key.clone()).or_insert_with(|| LspQueryMetric {
+                language: self.language.clone(),
+                server: self.server.clone(),
+                operation: key.operation.as_str().to_string(),
+                declaration_class: key.declaration.as_str().to_string(),
+                scheduled_requests: 0,
+                non_empty_responses: 0,
+                emitted_edges: 0,
+                latency_ms: 0,
+                timeouts: 0,
+                errors: 0,
+            });
+            metric.latency_ms = metric.latency_ms.saturating_add(
+                latency
+                    .as_millis()
+                    .saturating_mul(count as u128)
+                    .min(u64::MAX as u128) as u64,
+            );
+            metric.timeouts = metric.timeouts.saturating_add(count);
+            metric.errors = metric.errors.saturating_add(count);
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<LspQueryMetric> {
-        self.metrics
+        self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+            .metrics
             .values()
             .cloned()
             .collect()
@@ -514,5 +576,38 @@ mod tests {
                 errors: 1,
             }]
         );
+    }
+
+    #[test]
+    fn job_timeout_attributes_only_unfinished_work_items() {
+        let profile = LspQueryProfile::new("rust", "rust-analyzer");
+        let telemetry = LspQueryTelemetry::new(&profile);
+        telemetry.register_work_item(
+            LspQueryOperation::CallHierarchy,
+            LspDeclarationClass::Function,
+        );
+        telemetry.register_work_item(
+            LspQueryOperation::CallHierarchy,
+            LspDeclarationClass::Function,
+        );
+        telemetry.record(
+            LspQueryOperation::CallHierarchy,
+            LspDeclarationClass::Function,
+            3,
+            1,
+            2,
+            Duration::from_millis(10),
+            0,
+            0,
+        );
+
+        telemetry.record_job_timeout(Duration::from_millis(50));
+
+        let metrics = telemetry.snapshot();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].scheduled_requests, 3);
+        assert_eq!(metrics[0].timeouts, 1);
+        assert_eq!(metrics[0].errors, 1);
+        assert_eq!(metrics[0].latency_ms, 60);
     }
 }

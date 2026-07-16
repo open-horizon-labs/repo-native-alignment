@@ -19,7 +19,6 @@
 //!   [`PipelinedTransport`] (concurrent, enrichment-phase), plus URI helpers.
 
 mod passes;
-pub(crate) use passes::requested_operations_for_node;
 mod policy;
 pub use policy::LspQueryMetric;
 use policy::{LspQueryProfile, LspServerCapabilities};
@@ -222,6 +221,43 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
 
 pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
     BUILTIN_LSP_DESCRIPTORS
+}
+
+/// Planner-safe projection of the shared query profile. Changed-file planning
+/// does not have negotiated server capabilities yet, so it assumes advertised
+/// support while preserving declaration, language/server, and default-deny
+/// policy. Runtime scheduling rechecks against negotiated capabilities.
+pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
+    let Some(descriptor) = BUILTIN_LSP_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.language == node.language)
+    else {
+        return Vec::new();
+    };
+    let enricher = descriptor.build();
+    let operation = match node.id.kind {
+        NodeKind::Function => policy::LspQueryOperation::CallHierarchy,
+        NodeKind::Trait => policy::LspQueryOperation::Implementations,
+        NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+            policy::LspQueryOperation::References
+        }
+        NodeKind::Other(_) => policy::LspQueryOperation::DocumentLinks,
+        _ => return Vec::new(),
+    };
+    let capabilities = LspServerCapabilities {
+        references: true,
+        call_hierarchy: true,
+        implementations: true,
+        type_hierarchy: true,
+        document_links: true,
+    };
+    let mut budget = enricher.query_profile.budget();
+    enricher
+        .query_profile
+        .admits(node, operation, capabilities, &mut budget)
+        .then(|| operation.to_string())
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn builtin_lsp_enricher(language: &str) -> Option<LspEnricher> {
@@ -2672,6 +2708,7 @@ impl Enricher for LspEnricher {
         {
             Ok(outcome) => outcome,
             Err(_) => {
+                query_telemetry.record_job_timeout(lsp_job_timeout());
                 result.aborted = true;
                 result.error_count = result.error_count.saturating_add(1);
                 result.diagnostic = Some(format!(

@@ -204,6 +204,27 @@ impl QueryObservation {
     }
 }
 
+fn record_type_hierarchy_observation(
+    telemetry: &LspQueryTelemetry,
+    node: &Node,
+    observation: QueryObservation,
+    emitted_edges: usize,
+    latency: Duration,
+) {
+    if let Some(declaration) = LspDeclarationClass::from_kind(&node.id.kind) {
+        telemetry.record(
+            LspQueryOperation::TypeHierarchy,
+            declaration,
+            observation.scheduled_requests,
+            observation.non_empty_responses,
+            emitted_edges,
+            latency,
+            observation.errors,
+            observation.timeouts,
+        );
+    }
+}
+
 fn runnable_pass1_work_items(
     work_items: Vec<LspPass1WorkItem>,
     ledger: &LspWorkItemLedger,
@@ -532,29 +553,6 @@ fn language_id_for_path(path: &Path) -> &'static str {
     }
 }
 
-pub(crate) fn requested_operations_for_node(
-    kind: &NodeKind,
-    has_references: bool,
-    has_call_hierarchy: bool,
-) -> Vec<&'static str> {
-    match kind {
-        NodeKind::Function if has_call_hierarchy => vec![
-            "requesting_call_hierarchy_prepare",
-            "requesting_call_hierarchy_incoming",
-            "requesting_call_hierarchy_outgoing",
-        ],
-        NodeKind::Function if has_references => vec!["requesting_references"],
-        NodeKind::Trait => vec!["requesting_implementations"],
-        NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
-            if has_references =>
-        {
-            vec!["requesting_references"]
-        }
-        NodeKind::Other(_) => vec!["requesting_document_links"],
-        _ => vec!["skipped_no_supported_operation"],
-    }
-}
-
 fn did_open_timeout() -> Duration {
     duration_from_env("RNA_LSP_DID_OPEN_TIMEOUT_MS", DID_OPEN_DEFAULT_TIMEOUT)
 }
@@ -789,6 +787,15 @@ impl LspEnricher {
         let pass1_edge_baseline = result.added_edges.len();
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
+        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        for item in &work_items {
+            if let (Some(operation), Some(declaration)) = (
+                item.requested_operations.first().copied(),
+                LspDeclarationClass::from_kind(&item.node.id.kind),
+            ) {
+                telemetry.register_work_item(operation, declaration);
+            }
+        }
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
@@ -1686,19 +1693,14 @@ impl LspEnricher {
             )
             .await;
 
-            if let Some(declaration) = LspDeclarationClass::from_kind(&node.id.kind) {
-                let emitted_edges = result.added_edges.len() - edges_before_query;
-                telemetry.record(
-                    LspQueryOperation::TypeHierarchy,
-                    declaration,
-                    1,
-                    observation.non_empty_responses,
-                    emitted_edges,
-                    query_started.elapsed(),
-                    observation.errors,
-                    observation.timeouts,
-                );
-            }
+            let emitted_edges = result.added_edges.len() - edges_before_query;
+            record_type_hierarchy_observation(
+                telemetry,
+                node,
+                observation,
+                emitted_edges,
+                query_started.elapsed(),
+            );
 
             Self::update_type_hierarchy_strikes(
                 ok,
@@ -2039,6 +2041,44 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn type_hierarchy_telemetry_uses_all_observed_requests() {
+        let profile = super::super::policy::LspQueryProfile::new("rust", "rust-analyzer");
+        let telemetry = LspQueryTelemetry::new(&profile);
+        let node = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "Child".to_string(),
+                kind: NodeKind::Struct,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 2,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        record_type_hierarchy_observation(
+            &telemetry,
+            &node,
+            QueryObservation {
+                scheduled_requests: 2,
+                non_empty_responses: 2,
+                ..Default::default()
+            },
+            1,
+            Duration::from_millis(5),
+        );
+
+        let metrics = telemetry.snapshot();
+        assert_eq!(metrics[0].scheduled_requests, 2);
+        assert_eq!(metrics[0].non_empty_responses, 2);
+        assert_eq!(metrics[0].emitted_edges, 1);
+    }
 
     #[tokio::test]
     async fn did_open_coordinator_dedupes_concurrent_same_file() {
