@@ -126,6 +126,7 @@ fn emit_module_defines_edge(path: &Path, name: &str, kind: NodeKind, edges: &mut
         kind: EdgeKind::Defines,
         source: ExtractionSource::TreeSitter,
         confidence: Confidence::Detected,
+                evidence: Vec::new(),
     });
 }
 
@@ -158,6 +159,7 @@ fn emit_class_defines_edge(
         kind: EdgeKind::Defines,
         source: ExtractionSource::TreeSitter,
         confidence: Confidence::Detected,
+                evidence: Vec::new(),
     });
 }
 
@@ -344,6 +346,7 @@ fn collect_js_specials(
                     kind: EdgeKind::DependsOn,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 });
             }
 

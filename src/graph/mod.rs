@@ -316,6 +316,40 @@ pub enum Confidence {
     Confirmed,
 }
 
+/// Lifecycle state for source evidence backing a content-derived edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationStatus {
+    Valid,
+    Stale,
+    Unresolved,
+    Invalid,
+}
+
+/// An exact repository body span that supports an edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceSelector {
+    pub file_path: PathBuf,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub body_node_id: String,
+    pub snippet_hash: String,
+    pub snippet: String,
+}
+
+/// Generic, domain-neutral provenance for a content-derived relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EdgeEvidence {
+    pub selectors: Vec<EvidenceSelector>,
+    pub extractor_id: String,
+    pub pack_id: Option<String>,
+    pub rule_id: String,
+    pub confidence: Confidence,
+    pub validation_status: ValidationStatus,
+}
+
 impl fmt::Display for Confidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -426,17 +460,101 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub source: ExtractionSource,
     pub confidence: Confidence,
+    /// Ordered source evidence. Ordinary code edges leave this empty.
+    #[serde(default)]
+    pub evidence: Vec<EdgeEvidence>,
 }
 
 impl Edge {
     /// Deterministic string ID for storage.
     pub fn stable_id(&self) -> String {
-        format!(
+        let base = format!(
             "{}->{}->{}",
             self.from.to_stable_id(),
             self.kind,
             self.to.to_stable_id()
-        )
+        );
+        if self.evidence.is_empty() {
+            base
+        } else {
+            // Lifecycle state and confidence may change after revalidation; they
+            // are deliberately excluded from identity. Material source/rule
+            // differences remain identity-bearing.
+            let identity: Vec<_> = self
+                .evidence
+                .iter()
+                .map(|e| (&e.selectors, &e.extractor_id, &e.pack_id, &e.rule_id))
+                .collect();
+            let encoded = serde_json::to_vec(&identity).unwrap_or_default();
+            format!("{base}->evidence:{}", blake3::hash(&encoded).to_hex())
+        }
+    }
+
+    /// Revalidate content evidence against the current extracted Markdown body nodes.
+    /// Any non-valid selector synchronously removes confirmed confidence.
+    pub fn revalidate_evidence(&mut self, nodes: &[Node]) {
+        let index: HashMap<(PathBuf, String), &Node> = nodes
+            .iter()
+            .filter_map(|node| {
+                node.metadata
+                    .get("body_node_id")
+                    .map(|id| ((node.id.file.clone(), id.clone()), node))
+            })
+            .collect();
+        self.revalidate_evidence_with_index(&index);
+    }
+
+    fn revalidate_evidence_with_index(
+        &mut self,
+        index: &HashMap<(PathBuf, String), &Node>,
+    ) {
+        for evidence in &mut self.evidence {
+            let mut status = ValidationStatus::Valid;
+            for selector in &evidence.selectors {
+                let matching = index.get(&(
+                    selector.file_path.clone(),
+                    selector.body_node_id.clone(),
+                ));
+                let Some(node) = matching else {
+                    status = ValidationStatus::Unresolved;
+                    break;
+                };
+                let hash = blake3::hash(node.body.as_bytes()).to_hex().to_string();
+                let ranges_match = node.line_start == selector.line_start
+                    && node.line_end == selector.line_end
+                    && node.metadata.get("byte_start").and_then(|v| v.parse().ok())
+                        == Some(selector.byte_start)
+                    && node.metadata.get("byte_end").and_then(|v| v.parse().ok())
+                        == Some(selector.byte_end);
+                if hash != selector.snippet_hash || !ranges_match {
+                    status = ValidationStatus::Stale;
+                    break;
+                }
+            }
+            if evidence.selectors.is_empty() {
+                status = ValidationStatus::Invalid;
+            }
+            evidence.validation_status = status;
+            if evidence.validation_status != ValidationStatus::Valid {
+                evidence.confidence = Confidence::Detected;
+                self.confidence = Confidence::Detected;
+            }
+        }
+    }
+}
+
+/// Revalidate a graph's evidence in O(nodes + selectors), avoiding an edge×node scan.
+pub fn revalidate_edge_evidence(edges: &mut [Edge], nodes: &[Node]) {
+    let index: HashMap<(PathBuf, String), &Node> = nodes
+        .iter()
+        .filter_map(|node| {
+            node.metadata
+                .get("body_node_id")
+                .map(|id| ((node.id.file.clone(), id.clone()), node))
+        })
+        .collect();
+    for edge in edges {
+        edge.revalidate_evidence_with_index(&index);
     }
 }
 
@@ -592,7 +710,85 @@ mod tests {
             kind,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
+            evidence: Vec::new(),
         }
+        }
+
+    fn evidence_for(node: &Node, hash: String) -> EdgeEvidence {
+        EdgeEvidence {
+            selectors: vec![EvidenceSelector {
+                file_path: node.id.file.clone(),
+                line_start: node.line_start,
+                line_end: node.line_end,
+                byte_start: node.metadata["byte_start"].parse().unwrap(),
+                byte_end: node.metadata["byte_end"].parse().unwrap(),
+                body_node_id: node.metadata["body_node_id"].clone(),
+                snippet_hash: hash,
+                snippet: node.body.clone(),
+            }],
+            extractor_id: "markdown-ast@1".into(),
+            pack_id: Some("test-pack@1".into()),
+            rule_id: "supports-body@1".into(),
+            confidence: Confidence::Confirmed,
+            validation_status: ValidationStatus::Valid,
+        }
+    }
+
+    #[test]
+    fn evidence_distinguishes_otherwise_identical_edges() {
+        let mut first = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        let mut second = first.clone();
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "first span".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "20".into());
+        first.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        node.body = "other span".into();
+        second.evidence = vec![evidence_for(
+            &node,
+            blake3::hash(node.body.as_bytes()).to_hex().to_string(),
+        )];
+        assert_ne!(first.stable_id(), second.stable_id());
+    }
+
+    #[test]
+    fn editing_body_downgrades_confirmed_edge_to_stale() {
+        let mut node = make_node(
+            "chapter.md",
+            "body",
+            NodeKind::Other("paragraph".into()),
+            3,
+            3,
+        );
+        node.id.file = PathBuf::from("chapter.md");
+        node.body = "current evidence".into();
+        node.metadata.insert(
+            "body_node_id".into(),
+            "chapter.md::body::ast:paragraph[0]".into(),
+        );
+        node.metadata.insert("byte_start".into(), "10".into());
+        node.metadata.insert("byte_end".into(), "26".into());
+        let old_hash = blake3::hash(b"old evidence").to_hex().to_string();
+        let mut edge = make_edge("claim", "fact", EdgeKind::Other("supports".into()));
+        edge.confidence = Confidence::Confirmed;
+        edge.evidence = vec![evidence_for(&node, old_hash)];
+        edge.revalidate_evidence(&[node]);
+        assert_eq!(edge.confidence, Confidence::Detected);
+        assert_eq!(edge.evidence[0].validation_status, ValidationStatus::Stale);
     }
 
     // -- Macro tests --

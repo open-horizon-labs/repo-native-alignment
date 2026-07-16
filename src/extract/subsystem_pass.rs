@@ -154,6 +154,7 @@ pub fn subsystem_node_pass(
                     kind: EdgeKind::BelongsTo,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 });
             }
         }

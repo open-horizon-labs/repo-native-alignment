@@ -138,6 +138,7 @@ pub fn api_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     kind: EdgeKind::DependsOn,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 });
             }
         }

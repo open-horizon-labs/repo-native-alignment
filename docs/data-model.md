@@ -88,6 +88,7 @@ Stores directed relationships between nodes. This is the source of truth for the
 | `edge_type` | UTF8 | no | EdgeKind string (e.g., `"calls"`, `"implements"`) |
 | `edge_source` | UTF8 | no | ExtractionSource string (e.g., `"tree_sitter"`, `"lsp"`) |
 | `edge_confidence` | UTF8 | no | `"detected"` or `"confirmed"` |
+| `edge_evidence_json` | UTF8 | yes | Ordered content evidence selectors plus extractor/pack/rule IDs, confidence, and validation status. |
 | `root_id` | UTF8 | no | Root slug (from the source node's root) |
 | `updated_at` | Int64 | no | Unix timestamp (seconds) of last write |
 | `scan_version` | UInt64 | no | Append-only graph write version. Queries filter to the latest committed version; stale rows are compacted separately. |
@@ -264,10 +265,14 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub source: ExtractionSource,
     pub confidence: Confidence,
+    pub evidence: Vec<EdgeEvidence>,
 }
 ```
 
-The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directional: A→B and B→A are distinct.
+Edges without evidence retain the stable ID `from_stable_id->kind->to_stable_id`.
+Evidence-bearing edges append a deterministic evidence hash so equal endpoint/kind
+triples backed by materially different spans remain distinct. Edges are directional:
+A→B and B→A are distinct.
 
 ### EdgeKind
 

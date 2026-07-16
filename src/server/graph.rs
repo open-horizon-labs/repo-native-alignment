@@ -116,6 +116,7 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
         };
 
         let package_dep = Edge {
@@ -124,6 +125,7 @@ mod tests {
             kind: crate::graph::EdgeKind::DependsOn,
             source: crate::graph::ExtractionSource::Schema,
             confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
         };
 
         assert!(!is_manifest_package_edge(&openapi_dep));

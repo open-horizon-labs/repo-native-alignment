@@ -2091,7 +2091,7 @@ fn search_batch(
                     if total == 0 {
                         sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode));
                     } else {
-                        let md = format_neighbors_grouped_with_root(
+                        let mut md = format_neighbors_grouped_with_root(
                             &gs.nodes,
                             &groups,
                             &gs.index,
@@ -2100,6 +2100,11 @@ fn search_batch(
                             params.include_body,
                             params.minify_body,
                         );
+                        md.push_str(&crate::server::helpers::format_edge_evidence_for_groups(
+                            &gs.edges,
+                            &resolved_nid,
+                            &groups,
+                        ));
                         sections.push(format!(
                             "### `{}`\n\n{} result(s)\n\n{}",
                             display_nid, total, md
@@ -2533,6 +2538,7 @@ mod tests {
             kind,
             source: ExtractionSource::TreeSitter,
             confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
         }
     }
 

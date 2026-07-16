@@ -663,6 +663,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
         };
         let edges: Vec<Edge> = (0..3).map(|i| make_edge(&format!("fn{}", i))).collect();
 

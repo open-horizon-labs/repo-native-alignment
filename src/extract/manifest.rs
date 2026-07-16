@@ -308,6 +308,7 @@ fn add_explicit_package_host_edges(
             kind: EdgeKind::DependsOn,
             source: ExtractionSource::Schema,
             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
         });
     }
 }
@@ -449,6 +450,7 @@ fn make_dep_edge(from_name: &str, to_name: &str, manifest_file: &Path, root_slug
         kind: EdgeKind::DependsOn,
         source: ExtractionSource::Schema,
         confidence: Confidence::Detected,
+                evidence: Vec::new(),
     }
 }
 

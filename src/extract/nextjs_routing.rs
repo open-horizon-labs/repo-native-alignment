@@ -371,6 +371,7 @@ fn process_app_router_file(
                 kind: EdgeKind::Implements,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
 
@@ -496,6 +497,7 @@ fn process_pages_router_file(
                 kind: EdgeKind::Implements,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
             break; // only link one handler
         }

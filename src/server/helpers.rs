@@ -676,6 +676,54 @@ pub(crate) fn format_neighbors_grouped_with_root(
     sections.join("\n\n")
 }
 
+/// Render source provenance for the custom edges represented in traversal groups.
+pub(crate) fn format_edge_evidence_for_groups(
+    edges: &[graph::Edge],
+    origin: &str,
+    groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
+) -> String {
+    let mut rendered = Vec::new();
+    for (kind, ids) in groups {
+        if !matches!(kind, graph::EdgeKind::Other(_)) {
+            continue;
+        }
+        for id in ids {
+            for edge in edges.iter().filter(|edge| {
+                edge.kind == *kind
+                    && ((edge.from.to_stable_id() == origin && edge.to.to_stable_id() == *id)
+                        || (edge.to.to_stable_id() == origin && edge.from.to_stable_id() == *id))
+            }) {
+                for evidence in &edge.evidence {
+                    for selector in &evidence.selectors {
+                        rendered.push(format!(
+                            "- **{}** evidence: `{}:{}-{}` — {}\n  - rule: `{}`; extractor: `{}`{}; confidence: `{}`; validation: `{:?}`",
+                            kind,
+                            selector.file_path.display(),
+                            selector.line_start,
+                            selector.line_end,
+                            selector.snippet.trim(),
+                            evidence.rule_id,
+                            evidence.extractor_id,
+                            evidence
+                                .pack_id
+                                .as_ref()
+                                .map(|id| format!("; pack: `{id}`"))
+                                .unwrap_or_default(),
+                            evidence.confidence,
+                            evidence.validation_status,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if rendered.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n#### Edge evidence\n\n{}", rendered.join("\n"))
+    }
+}
+
 /// Capitalize the first character of a string and replace underscores with spaces.
 ///
 /// Example: `depends_on` -> `Depends on`, `calls` -> `Calls`

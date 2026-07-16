@@ -340,6 +340,7 @@ fn collect_resource_refs(
                             kind: EdgeKind::DependsOn,
                             source: ExtractionSource::TreeSitter,
                             confidence: Confidence::Detected,
+                evidence: Vec::new(),
                         });
                     }
                 }

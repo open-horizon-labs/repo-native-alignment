@@ -221,6 +221,13 @@ or explicit IDs, exact line/byte spans, and content hashes. Exact same-file and
 repository-relative cross-file anchors such as `target.md#anchor` become graph
 references; unresolved anchors are exposed as diagnostics.
 
+Content-derived custom edges can retain ordered body selectors, line references,
+snippets, hashes, pack/rule identity, confidence, and validation state through
+persistence and MCP traversal. Evidence is revalidated against current Markdown
+body nodes on load; edited or missing evidence is downgraded from confirmed.
+Frontmatter-only relationships remain detected candidates until a body-backed
+rule supplies valid evidence.
+
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root.
 
 **Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first.

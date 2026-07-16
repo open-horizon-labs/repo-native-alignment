@@ -1142,6 +1142,7 @@ impl LspEnricher {
                                 kind: EdgeKind::Calls,
                                 source: ExtractionSource::Lsp,
                                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
                             });
                         }
                     }
@@ -1219,6 +1220,7 @@ impl LspEnricher {
                                         kind: EdgeKind::Calls,
                                         source: ExtractionSource::Lsp,
                                         confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
                                     });
                                 }
                             }
@@ -1281,6 +1283,7 @@ impl LspEnricher {
                                         kind: EdgeKind::Calls,
                                         source: ExtractionSource::Lsp,
                                         confidence: Confidence::Detected,
+                evidence: Vec::new(),
                                     });
                                     continue;
                                 }
@@ -1310,6 +1313,7 @@ impl LspEnricher {
                                         kind: EdgeKind::Calls,
                                         source: ExtractionSource::Lsp,
                                         confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
                                     });
                                 }
                             }
@@ -1363,6 +1367,7 @@ impl LspEnricher {
                             kind: EdgeKind::Implements,
                             source: ExtractionSource::Lsp,
                             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
                         });
                     }
                 }
@@ -1425,6 +1430,7 @@ impl LspEnricher {
                             kind: EdgeKind::ReferencedBy,
                             source: ExtractionSource::Lsp,
                             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
                         });
                     }
                 }
@@ -1476,6 +1482,7 @@ impl LspEnricher {
                         kind: EdgeKind::DependsOn,
                         source: ExtractionSource::Lsp,
                         confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
                     });
                 }
             }
@@ -2014,6 +2021,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
         };
         let mut edges = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -2076,6 +2084,7 @@ mod tests {
             kind: EdgeKind::Calls,
             source: ExtractionSource::Lsp,
             confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
         };
         initial
             .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])

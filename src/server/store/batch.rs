@@ -302,6 +302,14 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
     let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
     let edge_sources: Vec<String> = edges.iter().map(|e| e.source.to_string()).collect();
     let edge_confidences: Vec<String> = edges.iter().map(|e| e.confidence.to_string()).collect();
+    let edge_evidence_json: Vec<Option<String>> = edges
+        .iter()
+        .map(|edge| {
+            (!edge.evidence.is_empty())
+                .then(|| serde_json::to_string(&edge.evidence))
+                .transpose()
+        })
+        .collect::<Result<_, _>>()?;
     let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
     let updated_ats: Vec<i64> = vec![now; edges.len()];
     let scan_versions: Vec<u64> = vec![scan_version; edges.len()];
@@ -317,6 +325,7 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
             Arc::new(StringArray::from(edge_types)),
             Arc::new(StringArray::from(edge_sources)),
             Arc::new(StringArray::from(edge_confidences)),
+            Arc::new(StringArray::from(edge_evidence_json)),
             Arc::new(StringArray::from(root_ids)),
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),

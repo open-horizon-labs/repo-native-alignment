@@ -95,6 +95,7 @@ pub fn struct_construction_pass(nodes: &[Node]) -> Vec<Edge> {
                 kind: EdgeKind::Constructs,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             })
         })
         .collect()

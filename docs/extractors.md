@@ -66,11 +66,17 @@ rna:
 When a measure becomes a target, it ceases to be a good measure.
 ```
 
-This emits:
+This nominates:
 
 - one `NodeKind::Other("quote")` node for `quote.goodhart`;
 - one `EdgeKind::Other("supports")` edge from `quote.goodhart` to `claim.proxy-risk`;
 - metadata keys such as `local_knowledge=true`, `rna.kind`, `rna.id`, `rna.name`, and `rna.metadata.public_use`.
+
+The frontmatter relationship is emitted only as a detected candidate. It cannot
+be confirmed until a repo-local pack rule binds it to current Markdown body
+selectors. Validated evidence survives persistence and is shown in traversal
+with its source lines and snippet; edits that invalidate its selector or hash
+downgrade it from confirmed.
 
 The target node does not need to be in the same file, but its `kind`, `id`, and `file` should match the artifact that declares it so traversal/search can join the graph after all files are scanned. A declared `file` is repo-root-relative; RNA normalizes `.` and `..` components and ignores absolute paths or paths that escape the repository. Relationship labels are true edge kinds after reload; do not collapse support/verification/review semantics into `References`, `DependsOn`, or metadata.
 

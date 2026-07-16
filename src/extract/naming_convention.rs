@@ -146,6 +146,7 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 kind: EdgeKind::TestedBy,
                 source: ExtractionSource::TreeSitter,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }

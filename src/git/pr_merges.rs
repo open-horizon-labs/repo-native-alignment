@@ -130,6 +130,7 @@ pub fn extract_pr_merges(repo_root: &Path, limit: Option<usize>) -> Result<(Vec<
                 kind: EdgeKind::Serves,
                 source: ExtractionSource::Git,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
 
@@ -152,6 +153,7 @@ pub fn extract_pr_merges(repo_root: &Path, limit: Option<usize>) -> Result<(Vec<
                 kind: EdgeKind::Serves,
                 source: ExtractionSource::Git,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
             });
         }
     }
@@ -185,6 +187,7 @@ pub fn link_pr_to_symbols(pr_nodes: &[Node], symbol_nodes: &[Node]) -> Vec<Edge>
                     kind: EdgeKind::Modified,
                     source: ExtractionSource::Git,
                     confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 });
             }
         }

@@ -456,6 +456,7 @@ pub fn extractor_config_pass_with_configs(
                         kind: edge_kind.clone(),
                         source: ExtractionSource::TreeSitter,
                         confidence: Confidence::Detected,
+                evidence: Vec::new(),
                     });
                 }
             }

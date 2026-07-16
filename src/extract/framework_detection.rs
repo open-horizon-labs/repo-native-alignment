@@ -1114,6 +1114,7 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
                 to: fw_node_id.clone(),
                 kind: EdgeKind::DependsOn,
                 confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 source: ExtractionSource::TreeSitter,
             });
         }
@@ -1277,6 +1278,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
                     kind: EdgeKind::UsesFramework,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
+                evidence: Vec::new(),
                 });
                 tracing::debug!(
                     "Subsystem '{}' uses framework '{}' ({:.0}% of {} members)",
