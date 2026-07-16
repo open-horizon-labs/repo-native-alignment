@@ -493,9 +493,11 @@ Subsystems are detected automatically via community detection on the in-memory g
 
 Scan and enrichment operations produce durable `OperationReport` records through `src/server/operation_report.rs`. Reports include phases, outputs, capability readiness (`extracted_graph`, `embeddings`, `call_references`), degraded query notices, next steps, diagnostics, and related enrichment job IDs. CLI scan summaries render from the report; `list_roots` includes recent reports from the on-disk store.
 
-`src/server/enrichment_jobs.rs` supplies the scoped enrichment control-plane primitives: LSP and embedding run/skip options, capabilities, scopes (`repo`, `root`, `changed_files`, `explicit`), triggers, job states, and a restart-visible job ledger. It is intentionally a ledger/control plane, not a worker scheduler.
+`src/server/enrichment_jobs.rs` supplies the scoped enrichment control-plane primitives: LSP and embedding run/skip options, capabilities, scopes (`repo`, `root`, `changed_files`, `target_symbols`, `task_relevant`, `explicit`), triggers, job states, and a restart-visible job ledger. It is intentionally a ledger/control plane, not a worker scheduler.
 
 Changed-file call/reference enrichment plans the git `HEAD` → current-worktree state before a job is opened. The plan maps present changed paths to a bounded stable-node-ID and LSP-operation set, records rename/delete/unmapped diagnostics, and filters only LSP scheduling. The complete cached graph still flows through post-passes and in-memory finalization, while LanceDB persistence replaces the scoped LSP delta, includes newly emitted output from other invoked enrichment consumers, and leaves unrelated rows untouched. Changed/root completion is scoped coverage and cannot satisfy repo-wide dead-code readiness.
+
+Broad type/constant reference evidence is explicit-only. Changed-file, target-symbol, and task-relevant scopes resolve to a closed set of stable node IDs before scheduling. One request/time circuit spans all participating servers, and each job persists an `lsp_evidence` summary: `default_profile` for high-signal warm-up with broad references omitted, `full` only for repository-complete evidence, and `scoped`, `partial`, or `unavailable` for explicit work. The record also carries declared node count, limits, actual request count, elapsed time, and circuit state. This is MCP-visible control-plane evidence rather than node metadata, so it does not require an Arrow schema column.
 
 ---
 

@@ -99,6 +99,11 @@ pub enum EnrichmentScope {
     Repo,
     Root(String),
     ChangedFiles,
+    TargetSymbols(Vec<String>),
+    TaskRelevant {
+        files: Vec<String>,
+        symbols: Vec<String>,
+    },
     Explicit(String),
 }
 
@@ -108,8 +113,80 @@ impl EnrichmentScope {
             Self::Repo => "repo".to_string(),
             Self::Root(root) => format!("root:{root}"),
             Self::ChangedFiles => "changed_files".to_string(),
+            Self::TargetSymbols(symbols) => {
+                format!("target_symbols:{}", sorted_unique(symbols).join(","))
+            }
+            Self::TaskRelevant { files, symbols } => {
+                format!(
+                    "task_relevant:files={};symbols={}",
+                    sorted_unique(files).join(","),
+                    sorted_unique(symbols).join(",")
+                )
+            }
             Self::Explicit(value) => format!("explicit:{value}"),
         }
+    }
+}
+
+fn sorted_unique(values: &[String]) -> Vec<&str> {
+    let mut values = values.iter().map(String::as_str).collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspEvidenceReadiness {
+    DefaultProfile,
+    Full,
+    Scoped,
+    Partial,
+    Unavailable,
+}
+
+impl LspEvidenceReadiness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultProfile => "default_profile",
+            Self::Full => "full",
+            Self::Scoped => "scoped",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspEvidenceCoverage {
+    pub readiness: LspEvidenceReadiness,
+    pub scope: String,
+    pub declared_node_count: usize,
+    pub max_requests: Option<usize>,
+    pub max_duration_ms: Option<u64>,
+    pub scheduled_requests: usize,
+    pub elapsed_ms: u64,
+    pub circuit_open: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BroadReferenceBudget {
+    pub max_requests: usize,
+    pub max_duration_ms: u64,
+}
+
+impl BroadReferenceBudget {
+    pub fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.max_requests > 0,
+            "broad-reference max_requests must be > 0"
+        );
+        anyhow::ensure!(
+            self.max_duration_ms > 0,
+            "broad-reference max_duration_ms must be > 0"
+        );
+        Ok(self)
     }
 }
 
@@ -185,6 +262,8 @@ pub struct EnrichmentJobRecord {
     pub last_progress_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_evidence: Option<LspEvidenceCoverage>,
     pub superseded_by: Option<String>,
     pub owner_id: Option<String>,
     pub lease_expires_at: Option<u64>,
@@ -268,6 +347,7 @@ impl EnrichmentJobLedger {
             last_progress_at: Some(now),
             completed_at: None,
             failure: None,
+            lsp_evidence: None,
             superseded_by: None,
             owner_id: Some(owner_id.clone()),
             lease_expires_at: Some(now + JOB_LEASE_SECONDS),
@@ -500,6 +580,33 @@ impl EnrichmentJobLedger {
         );
     }
 
+    pub fn record_lsp_evidence(
+        &self,
+        repo_root: &Path,
+        job_id: &str,
+        evidence: LspEvidenceCoverage,
+    ) {
+        let _guard = self.io_lock.lock().unwrap();
+        let _file_lock = JobFileLock::acquire(repo_root);
+        let mut store = match read_store(repo_root) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!("Failed to read enrichment job ledger for evidence: {error}");
+                return;
+            }
+        };
+        let Some(job) = store.jobs.iter_mut().find(|job| job.job_id == job_id) else {
+            tracing::warn!("Cannot record LSP evidence for unknown job {job_id}");
+            return;
+        };
+        job.lsp_evidence = Some(evidence);
+        job.updated_at = unix_now();
+        job.revision = store.events.len() as u64 + 1;
+        if let Err(error) = write_store(repo_root, &store) {
+            tracing::warn!("Failed to persist LSP evidence for {job_id}: {error}");
+        }
+    }
+
     pub fn mark_superseded(
         &self,
         repo_root: &Path,
@@ -592,6 +699,40 @@ impl EnrichmentJobLedger {
             }
             if let Some(superseded_by) = update.superseded_by.clone() {
                 job.superseded_by = Some(superseded_by);
+            }
+            if job.capability == EnrichmentCapability::CallReferences
+                && matches!(
+                    update.state,
+                    EnrichmentJobState::Completed
+                        | EnrichmentJobState::Degraded
+                        | EnrichmentJobState::Failed
+                )
+            {
+                let readiness = match update.state {
+                    EnrichmentJobState::Completed if job.scope == EnrichmentScope::Repo => {
+                        LspEvidenceReadiness::DefaultProfile
+                    }
+                    EnrichmentJobState::Completed => LspEvidenceReadiness::Scoped,
+                    EnrichmentJobState::Degraded => LspEvidenceReadiness::Partial,
+                    EnrichmentJobState::Failed => LspEvidenceReadiness::Unavailable,
+                    _ => unreachable!(),
+                };
+                job.lsp_evidence = Some(LspEvidenceCoverage {
+                    readiness,
+                    scope: job.scope.stable_key(),
+                    declared_node_count: 0,
+                    max_requests: None,
+                    max_duration_ms: None,
+                    scheduled_requests: 0,
+                    elapsed_ms: 0,
+                    circuit_open: false,
+                    detail: job.failure.clone().or_else(|| {
+                        (readiness == LspEvidenceReadiness::DefaultProfile).then(|| {
+                            "repo-wide default query profile completed; broad references were omitted"
+                                .to_string()
+                        })
+                    }),
+                });
             }
             job.updated_at = now;
             job.revision = next_revision;
@@ -911,10 +1052,95 @@ mod tests {
         assert_eq!(jobs[0].counters.node_count, Some(7));
         assert_eq!(jobs[0].counters.edge_count, Some(11));
         assert!(jobs[0].completed_at.is_some());
+        assert_eq!(
+            jobs[0]
+                .lsp_evidence
+                .as_ref()
+                .map(|evidence| evidence.readiness),
+            Some(LspEvidenceReadiness::DefaultProfile)
+        );
 
         let events = ledger.events_for_job(tmp.path(), &job.job_id);
         assert_eq!(events.len(), 4);
         assert_eq!(events.last().unwrap().state, EnrichmentJobState::Completed);
+    }
+
+    #[test]
+    fn lsp_evidence_persists_scope_budget_and_partial_readiness() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let scope =
+            EnrichmentScope::TargetSymbols(vec!["root:src/lib.rs:Thing:struct".to_string()]);
+        let job = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                scope.clone(),
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("first job should start"),
+        };
+        ledger.mark_degraded(tmp.path(), &job.job_id, 1, 2, "request budget exhausted");
+        ledger.record_lsp_evidence(
+            tmp.path(),
+            &job.job_id,
+            LspEvidenceCoverage {
+                readiness: LspEvidenceReadiness::Partial,
+                scope: scope.stable_key(),
+                declared_node_count: 3,
+                max_requests: Some(2),
+                max_duration_ms: Some(1_000),
+                scheduled_requests: 2,
+                elapsed_ms: 15,
+                circuit_open: true,
+                detail: Some("request budget exhausted".to_string()),
+            },
+        );
+
+        let restored = ledger.recent_jobs(tmp.path(), 1).pop().unwrap();
+        let evidence = restored.lsp_evidence.unwrap();
+        assert_eq!(evidence.readiness, LspEvidenceReadiness::Partial);
+        assert_eq!(evidence.declared_node_count, 3);
+        assert_eq!(evidence.scheduled_requests, 2);
+        assert!(evidence.circuit_open);
+        assert_eq!(evidence.scope, scope.stable_key());
+    }
+
+    #[test]
+    fn broad_reference_budget_rejects_invisible_or_zero_limits() {
+        assert!(
+            BroadReferenceBudget {
+                max_requests: 0,
+                max_duration_ms: 1,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            BroadReferenceBudget {
+                max_requests: 1,
+                max_duration_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_scope_keys_are_order_independent_and_deduplicated() {
+        let left = EnrichmentScope::TaskRelevant {
+            files: vec!["src/b.rs".to_string(), "src/a.rs".to_string()],
+            symbols: vec!["B".to_string(), "A".to_string(), "A".to_string()],
+        };
+        let right = EnrichmentScope::TaskRelevant {
+            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            symbols: vec!["A".to_string(), "B".to_string()],
+        };
+        assert_eq!(left.stable_key(), right.stable_key());
     }
 
     #[test]

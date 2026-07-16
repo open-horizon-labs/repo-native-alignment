@@ -5,7 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, Repository};
 
-use crate::extract::lsp::planned_operations_for_node;
+use crate::extract::lsp::{
+    planned_operations_for_node, planned_operations_for_node_with_broad_references,
+};
 use crate::graph::Node;
 
 pub(crate) const MAX_CHANGED_LSP_NODES: usize = 4_096;
@@ -131,12 +133,31 @@ pub(crate) struct ChangedFilePlanInput<'a> {
     pub cached_nodes: &'a [Node],
     pub max_nodes: usize,
     pub max_operations: usize,
+    pub allow_broad_references: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn discover_and_plan_changed_files(
     repo_root: &Path,
     root_slug: &str,
     cached_nodes: &[Node],
+) -> Result<ChangedFilePlan> {
+    discover_and_plan_changed_files_inner(repo_root, root_slug, cached_nodes, false)
+}
+
+pub(crate) fn discover_and_plan_changed_files_with_broad_references(
+    repo_root: &Path,
+    root_slug: &str,
+    cached_nodes: &[Node],
+) -> Result<ChangedFilePlan> {
+    discover_and_plan_changed_files_inner(repo_root, root_slug, cached_nodes, true)
+}
+
+fn discover_and_plan_changed_files_inner(
+    repo_root: &Path,
+    root_slug: &str,
+    cached_nodes: &[Node],
+    allow_broad_references: bool,
 ) -> Result<ChangedFilePlan> {
     let (provenance, changes) = discover_git_worktree_changes(repo_root)?;
     if changes.is_empty() {
@@ -151,6 +172,7 @@ pub(crate) fn discover_and_plan_changed_files(
         cached_nodes,
         max_nodes: MAX_CHANGED_LSP_NODES,
         max_operations: MAX_CHANGED_LSP_OPERATIONS,
+        allow_broad_references,
     })?
     .require_schedulable()
 }
@@ -222,7 +244,11 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
         if let Some(nodes) = nodes_by_file.get_mut(&file) {
             nodes.sort_by_key(|node| node.stable_id());
             for node in nodes.iter() {
-                let requested_operations = planned_operations_for_node(node);
+                let requested_operations = if input.allow_broad_references {
+                    planned_operations_for_node_with_broad_references(node)
+                } else {
+                    planned_operations_for_node(node)
+                };
                 if requested_operations.is_empty() {
                     continue;
                 }
@@ -456,6 +482,7 @@ mod tests {
             cached_nodes: &nodes,
             max_nodes: 16,
             max_operations: 48,
+            allow_broad_references: false,
         })
         .unwrap();
 
@@ -463,7 +490,13 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
-        assert_eq!(plan.operation_count, 3);
+        assert_eq!(plan.operation_count, 2);
+        let broad_type = plan
+            .planned_nodes
+            .iter()
+            .find(|node| node.stable_id.contains("Thing"))
+            .expect("type hierarchy remains high-signal default work");
+        assert_eq!(broad_type.requested_operations, vec!["type_hierarchy"]);
     }
 
     #[test]
@@ -490,16 +523,11 @@ mod tests {
             cached_nodes: &nodes,
             max_nodes: 16,
             max_operations: 16,
+            allow_broad_references: false,
         })
         .unwrap();
 
-        assert_eq!(plan.planned_nodes.len(), 2);
-        let declared = plan
-            .planned_nodes
-            .iter()
-            .find(|node| node.stable_id.contains("DECLARED"))
-            .expect("measured rust-analyzer profile should admit declared constants");
-        assert_eq!(declared.requested_operations, vec!["references"]);
+        assert_eq!(plan.planned_nodes.len(), 1);
         let handler = plan
             .planned_nodes
             .iter()
@@ -507,9 +535,50 @@ mod tests {
             .expect("Python function remains admitted");
         assert_eq!(handler.requested_operations, vec!["call_hierarchy"]);
         assert!(
-            plan.planned_nodes.iter().all(
-                |node| !node.stable_id.contains("literal") && !node.stable_id.contains("Model")
-            )
+            plan.planned_nodes
+                .iter()
+                .all(|node| !node.stable_id.contains("literal")
+                    && !node.stable_id.contains("DECLARED")
+                    && !node.stable_id.contains("Model"))
+        );
+    }
+
+    #[test]
+    fn explicit_changed_scope_adds_broad_references_without_unrelated_nodes() {
+        let nodes = vec![
+            node("src/changed.rs", "Thing", NodeKind::Struct),
+            node("src/changed.rs", "Alias", NodeKind::TypeAlias),
+            node("src/unrelated.rs", "Elsewhere", NodeKind::Struct),
+        ];
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: None,
+                new_path: Some(PathBuf::from("src/changed.rs")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: 16,
+            max_operations: 48,
+            allow_broad_references: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.planned_nodes.len(), 2);
+        assert!(
+            plan.planned_nodes
+                .iter()
+                .all(|node| node.file == Path::new("src/changed.rs"))
+        );
+        assert!(plan.planned_nodes.iter().all(|node| {
+            node.requested_operations
+                .contains(&"references".to_string())
+        }));
+        assert!(
+            plan.planned_nodes
+                .iter()
+                .all(|node| !node.stable_id.contains("unrelated"))
         );
     }
 
@@ -540,6 +609,7 @@ mod tests {
             cached_nodes: &nodes,
             max_nodes: 16,
             max_operations: 48,
+            allow_broad_references: false,
         })
         .unwrap();
 
@@ -569,6 +639,7 @@ mod tests {
             cached_nodes: &nodes,
             max_nodes: 1,
             max_operations: 3,
+            allow_broad_references: false,
         })
         .unwrap_err();
 
@@ -591,6 +662,7 @@ mod tests {
             cached_nodes: &[unsupported],
             max_nodes: 16,
             max_operations: 48,
+            allow_broad_references: false,
         })
         .unwrap();
 

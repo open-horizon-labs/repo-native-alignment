@@ -401,7 +401,7 @@ fn format_verbose_readiness(
                     && matches!(edge.kind, EdgeKind::Calls | EdgeKind::ReferencedBy)
             })
             .count();
-        let completed_repo_order = ctx
+        let completed_repo_job = ctx
             .enrichment_jobs
             .iter()
             .filter(|job| {
@@ -411,8 +411,8 @@ fn format_verbose_readiness(
                     && job.completed_at.is_some()
                     && job.failure.is_none()
             })
-            .map(|job| (job.updated_at, job.revision))
-            .max();
+            .max_by_key(|job| (job.updated_at, job.revision));
+        let completed_repo_order = completed_repo_job.map(|job| (job.updated_at, job.revision));
         if let Some(degraded_job) = ctx
             .enrichment_jobs
             .iter()
@@ -425,17 +425,44 @@ fn format_verbose_readiness(
             .max_by_key(|job| (job.updated_at, job.revision))
         {
             let status = LspEnrichmentStatus::default();
-            status.set_degraded(
-                persisted_lsp_edges,
-                degraded_job
-                    .failure
-                    .as_deref()
-                    .unwrap_or("call-reference enrichment finalized with degraded output"),
-            );
+            let detail = degraded_job
+                .lsp_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.detail.as_deref())
+                .or(degraded_job.failure.as_deref())
+                .unwrap_or("call-reference enrichment finalized with degraded output");
+            if let Some(evidence) = degraded_job.lsp_evidence.as_ref() {
+                status.set_degraded_scoped(
+                    degraded_job.counters.edge_count.unwrap_or(0),
+                    persisted_lsp_edges,
+                    evidence.scope.clone(),
+                    detail,
+                );
+            } else {
+                status.set_degraded(persisted_lsp_edges, detail);
+            }
             Some(status)
-        } else if completed_repo_order.is_some() {
+        } else if let Some(completed_repo_job) = completed_repo_job {
             let status = LspEnrichmentStatus::default();
-            status.set_complete(persisted_lsp_edges);
+            if completed_repo_job
+                .lsp_evidence
+                .as_ref()
+                .is_some_and(|evidence| {
+                    evidence.readiness == crate::server::LspEvidenceReadiness::DefaultProfile
+                })
+            {
+                status.set_complete_default_profile(
+                    completed_repo_job.counters.edge_count.unwrap_or(0),
+                    persisted_lsp_edges,
+                    completed_repo_job
+                        .lsp_evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.detail.clone())
+                        .unwrap_or_else(|| "broad references were omitted".to_string()),
+                );
+            } else {
+                status.set_complete(persisted_lsp_edges);
+            }
             Some(status)
         } else if let Some(scoped_job) = ctx
             .enrichment_jobs
@@ -474,6 +501,19 @@ fn format_verbose_readiness(
         {
             let status = LspEnrichmentStatus::default();
             match job.state {
+                EnrichmentJobState::Failed
+                    if job.lsp_evidence.as_ref().is_some_and(|evidence| {
+                        evidence.readiness == crate::server::LspEvidenceReadiness::Unavailable
+                    }) =>
+                {
+                    status.set_unavailable_with_detail(
+                        job.lsp_evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.detail.as_deref())
+                            .or(job.failure.as_deref())
+                            .unwrap_or("call-reference evidence unavailable"),
+                    )
+                }
                 EnrichmentJobState::Failed => status.set_failed(
                     job.failure
                         .as_deref()
@@ -529,14 +569,35 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
             .as_ref()
             .map(|msg| format!("; failure: {}", msg))
             .unwrap_or_default();
+        let evidence = job
+            .lsp_evidence
+            .as_ref()
+            .map(|evidence| {
+                format!(
+                    " evidence={} declared_nodes={} requests={}/{} elapsed_ms={}/{} circuit_open={}",
+                    evidence.readiness.as_str(),
+                    evidence.declared_node_count,
+                    evidence.scheduled_requests,
+                    evidence
+                        .max_requests
+                        .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+                    evidence.elapsed_ms,
+                    evidence
+                        .max_duration_ms
+                        .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+                    evidence.circuit_open,
+                )
+            })
+            .unwrap_or_default();
         lines.push(format!(
-            "- `{}` {} {} scope={} phase={} updated={}{}",
+            "- `{}` {} {} scope={} phase={} updated={}{}{}",
             job.job_id,
             job.capability.as_str(),
             state,
             job.scope.stable_key(),
             phase,
             job.updated_at,
+            evidence,
             failure
         ));
     }
@@ -2979,6 +3040,156 @@ mod tests {
             "got: {}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_readiness_reports_default_profile_as_partial_not_full() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
+        let mut edge = make_edge(&caller, &callee, crate::graph::EdgeKind::Calls);
+        edge.source = ExtractionSource::Lsp;
+        let gs = make_graph_state_with_edges(vec![caller, callee], vec![edge]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                &repo_root,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::ForegroundScan,
+                None,
+            )
+            .expect("begin default-profile job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(&repo_root, &job_id, 2, 1);
+        ledger.record_lsp_evidence(
+            &repo_root,
+            &job_id,
+            crate::server::LspEvidenceCoverage {
+                readiness: crate::server::LspEvidenceReadiness::DefaultProfile,
+                scope: "repo".to_string(),
+                declared_node_count: 0,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 0,
+                elapsed_ms: 12,
+                circuit_open: false,
+                detail: Some("broad references were omitted".to_string()),
+            },
+        );
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 5);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+
+        assert!(result.contains("LSP call/reference coverage**: partial/degraded"));
+        assert!(result.contains("default query profile"));
+        assert!(result.contains("broad references were omitted"));
+        assert!(result.contains("evidence=default_profile"));
+        assert!(!result.contains("LSP call/reference coverage**: ready"));
+    }
+
+    #[tokio::test]
+    async fn test_verbose_mcp_readiness_renders_all_persisted_evidence_classes() {
+        let node = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state(vec![node]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let repo_root = tmp.path().to_path_buf();
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let cases = [
+            (
+                crate::server::EnrichmentScope::Repo,
+                crate::server::LspEvidenceReadiness::Full,
+                false,
+            ),
+            (
+                crate::server::EnrichmentScope::ChangedFiles,
+                crate::server::LspEvidenceReadiness::Scoped,
+                false,
+            ),
+            (
+                crate::server::EnrichmentScope::TargetSymbols(vec!["caller".to_string()]),
+                crate::server::LspEvidenceReadiness::Partial,
+                true,
+            ),
+            (
+                crate::server::EnrichmentScope::TaskRelevant {
+                    files: vec!["src/caller.rs".to_string()],
+                    symbols: Vec::new(),
+                },
+                crate::server::LspEvidenceReadiness::Unavailable,
+                false,
+            ),
+        ];
+        for (scope, readiness, circuit_open) in cases {
+            let job_id = match ledger
+                .begin_job(
+                    &repo_root,
+                    crate::server::EnrichmentCapability::CallReferences,
+                    scope.clone(),
+                    crate::server::EnrichmentTrigger::Explicit,
+                    None,
+                )
+                .expect("begin evidence job")
+            {
+                crate::server::JobStart::Started(job) => job.job_id,
+                crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+            };
+            if readiness == crate::server::LspEvidenceReadiness::Unavailable {
+                ledger.mark_failed(&repo_root, &job_id, "server unavailable");
+            } else if readiness == crate::server::LspEvidenceReadiness::Partial {
+                ledger.mark_degraded(&repo_root, &job_id, 1, 1, "budget exhausted");
+            } else {
+                ledger.mark_completed(&repo_root, &job_id, 1, 1);
+            }
+            ledger.record_lsp_evidence(
+                &repo_root,
+                &job_id,
+                crate::server::LspEvidenceCoverage {
+                    readiness,
+                    scope: scope.stable_key(),
+                    declared_node_count: 1,
+                    max_requests: Some(1),
+                    max_duration_ms: Some(100),
+                    scheduled_requests: usize::from(
+                        readiness != crate::server::LspEvidenceReadiness::Unavailable,
+                    ),
+                    elapsed_ms: 10,
+                    circuit_open,
+                    detail: None,
+                },
+            );
+        }
+        let mut ctx = make_search_context(&gs, &repo_root);
+        ctx.enrichment_jobs = ledger.recent_jobs(&repo_root, 10);
+        let params = SearchParams {
+            query: Some("caller".into()),
+            verbose: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        for evidence in ["full", "scoped", "partial", "unavailable"] {
+            assert!(
+                result.contains(&format!("evidence={evidence}")),
+                "missing {evidence}: {result}"
+            );
+        }
+        assert!(result.contains("requests=1/1"));
+        assert!(result.contains("circuit_open=true"));
     }
 
     #[tokio::test]

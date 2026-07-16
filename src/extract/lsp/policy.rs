@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::graph::{Node, NodeKind};
 
@@ -133,6 +134,106 @@ impl LspQueryBudget {
     }
 }
 
+/// Shared hard boundary for one explicit broad-reference request.
+///
+/// The same value is attached to every language enricher in the bus, so the
+/// request limit is global rather than multiplied by the number of servers.
+#[derive(Debug)]
+pub(crate) struct LspBroadReferenceBudget {
+    max_requests: usize,
+    max_duration: Duration,
+    started_at: Instant,
+    scheduled_requests: AtomicUsize,
+    circuit_open: AtomicBool,
+    circuit_reason: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LspBroadReferenceBudgetSnapshot {
+    pub max_requests: usize,
+    pub max_duration_ms: u64,
+    pub scheduled_requests: usize,
+    pub elapsed_ms: u64,
+    pub circuit_open: bool,
+    pub circuit_reason: Option<String>,
+}
+
+impl LspBroadReferenceBudget {
+    pub(crate) fn new(max_requests: usize, max_duration: Duration) -> Self {
+        Self {
+            max_requests,
+            max_duration,
+            started_at: Instant::now(),
+            scheduled_requests: AtomicUsize::new(0),
+            circuit_open: AtomicBool::new(false),
+            circuit_reason: Mutex::new(None),
+        }
+    }
+
+    fn open_circuit(&self, reason: impl Into<String>) {
+        self.circuit_open.store(true, Ordering::Release);
+        let mut stored = self
+            .circuit_reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if stored.is_none() {
+            *stored = Some(reason.into());
+        }
+    }
+
+    fn reserve_reference(&self) -> bool {
+        if self.started_at.elapsed() >= self.max_duration {
+            self.open_circuit(format!(
+                "broad-reference time budget exhausted after {}ms",
+                self.max_duration.as_millis()
+            ));
+            return false;
+        }
+        if self.circuit_open.load(Ordering::Acquire) {
+            return false;
+        }
+        let reserved = self
+            .scheduled_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.max_requests).then_some(current + 1)
+            })
+            .is_ok();
+        if !reserved {
+            self.open_circuit(format!(
+                "broad-reference request budget exhausted at {} requests",
+                self.max_requests
+            ));
+        }
+        reserved
+    }
+
+    pub(crate) fn remaining_duration(&self) -> Option<Duration> {
+        self.max_duration.checked_sub(self.started_at.elapsed())
+    }
+
+    pub(crate) fn open_time_circuit(&self) {
+        self.open_circuit(format!(
+            "broad-reference time budget exhausted after {}ms",
+            self.max_duration.as_millis()
+        ));
+    }
+
+    pub(crate) fn snapshot(&self) -> LspBroadReferenceBudgetSnapshot {
+        LspBroadReferenceBudgetSnapshot {
+            max_requests: self.max_requests,
+            max_duration_ms: self.max_duration.as_millis().min(u64::MAX as u128) as u64,
+            scheduled_requests: self.scheduled_requests.load(Ordering::Acquire),
+            elapsed_ms: self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            circuit_open: self.circuit_open.load(Ordering::Acquire),
+            circuit_reason: self
+                .circuit_reason
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+        }
+    }
+}
+
 /// Shared language/server query profile used by construction and every symbol
 /// scheduling pass.
 #[derive(Debug, Clone)]
@@ -141,6 +242,8 @@ pub(crate) struct LspQueryProfile {
     server: String,
     allowed_kinds: Option<HashSet<NodeKind>>,
     allow_declared_const_references: bool,
+    allow_broad_references: bool,
+    broad_reference_budget: Option<std::sync::Arc<LspBroadReferenceBudget>>,
     operation_limits: BTreeMap<LspQueryOperation, usize>,
 }
 
@@ -151,6 +254,8 @@ impl LspQueryProfile {
             server: server.to_string(),
             allowed_kinds: None,
             allow_declared_const_references: false,
+            allow_broad_references: false,
+            broad_reference_budget: None,
             operation_limits: BTreeMap::new(),
         }
     }
@@ -197,6 +302,26 @@ impl LspQueryProfile {
         self
     }
 
+    pub(crate) fn with_broad_references(
+        mut self,
+        budget: std::sync::Arc<LspBroadReferenceBudget>,
+    ) -> Self {
+        self.allow_broad_references = true;
+        self.broad_reference_budget = Some(budget);
+        self
+    }
+
+    pub(crate) fn with_broad_references_unbudgeted(mut self) -> Self {
+        self.allow_broad_references = true;
+        self
+    }
+
+    pub(crate) fn broad_reference_budget(
+        &self,
+    ) -> Option<&std::sync::Arc<LspBroadReferenceBudget>> {
+        self.broad_reference_budget.as_ref()
+    }
+
     pub(crate) fn admits(
         &self,
         node: &Node,
@@ -219,6 +344,18 @@ impl LspQueryProfile {
         let Some(declaration) = LspDeclarationClass::from_kind(&node.id.kind) else {
             return false;
         };
+        let broad_reference = operation == LspQueryOperation::References
+            && matches!(
+                declaration,
+                LspDeclarationClass::Struct
+                    | LspDeclarationClass::Enum
+                    | LspDeclarationClass::TypeAlias
+                    | LspDeclarationClass::Const
+            );
+        if broad_reference && !self.allow_broad_references {
+            return false;
+        }
+
         let operation_matches = match operation {
             LspQueryOperation::CallHierarchy => declaration == LspDeclarationClass::Function,
             LspQueryOperation::References => {
@@ -242,7 +379,13 @@ impl LspQueryProfile {
             LspQueryOperation::DocumentLinks => declaration == LspDeclarationClass::Other,
         };
 
-        operation_matches && budget.reserve(operation)
+        operation_matches
+            && budget.reserve(operation)
+            && (!broad_reference
+                || self
+                    .broad_reference_budget
+                    .as_ref()
+                    .is_none_or(|budget| budget.reserve_reference()))
     }
 
     pub(crate) fn accepts_declaration(&self, node: &Node) -> bool {
@@ -599,12 +742,111 @@ mod tests {
             capabilities,
             &mut profile.budget()
         ));
-        assert!(profile.clone().with_declared_const_references(true).admits(
-            &node(NodeKind::Const),
+        let broad_budget =
+            std::sync::Arc::new(LspBroadReferenceBudget::new(1, Duration::from_secs(1)));
+        assert!(
+            profile
+                .clone()
+                .with_declared_const_references(true)
+                .with_broad_references(broad_budget)
+                .admits(
+                    &node(NodeKind::Const),
+                    LspQueryOperation::References,
+                    capabilities,
+                    &mut profile.budget()
+                )
+        );
+    }
+
+    #[test]
+    fn broad_references_are_default_denied_and_share_one_request_circuit() {
+        let capabilities = LspServerCapabilities {
+            references: true,
+            ..Default::default()
+        };
+        let budget = std::sync::Arc::new(LspBroadReferenceBudget::new(1, Duration::from_secs(1)));
+        let profile =
+            LspQueryProfile::new("rust", "rust-analyzer").with_broad_references(budget.clone());
+
+        assert!(profile.admits(
+            &node(NodeKind::Struct),
             LspQueryOperation::References,
             capabilities,
             &mut profile.budget()
         ));
+        assert!(!profile.admits(
+            &node(NodeKind::Enum),
+            LspQueryOperation::References,
+            capabilities,
+            &mut profile.budget()
+        ));
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.scheduled_requests, 1);
+        assert!(snapshot.circuit_open);
+        assert!(
+            snapshot
+                .circuit_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("request budget exhausted"))
+        );
+    }
+
+    #[test]
+    fn rejected_profile_work_does_not_consume_the_shared_request_budget() {
+        let capabilities = LspServerCapabilities {
+            references: true,
+            ..Default::default()
+        };
+        let shared = std::sync::Arc::new(LspBroadReferenceBudget::new(1, Duration::from_secs(1)));
+        let rejecting = LspQueryProfile::new("rust", "rust-analyzer")
+            .with_operation_limit(LspQueryOperation::References, 0)
+            .with_broad_references(shared.clone());
+        let accepting =
+            LspQueryProfile::new("rust", "rust-analyzer").with_broad_references(shared.clone());
+
+        assert!(!rejecting.admits(
+            &node(NodeKind::Struct),
+            LspQueryOperation::References,
+            capabilities,
+            &mut rejecting.budget()
+        ));
+        assert_eq!(shared.snapshot().scheduled_requests, 0);
+        assert!(accepting.admits(
+            &node(NodeKind::Enum),
+            LspQueryOperation::References,
+            capabilities,
+            &mut accepting.budget()
+        ));
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.scheduled_requests, 1);
+        assert!(!snapshot.circuit_open);
+    }
+
+    #[test]
+    fn expired_time_budget_opens_circuit_before_scheduling() {
+        let budget = std::sync::Arc::new(LspBroadReferenceBudget::new(10, Duration::ZERO));
+        let profile =
+            LspQueryProfile::new("rust", "rust-analyzer").with_broad_references(budget.clone());
+        let capabilities = LspServerCapabilities {
+            references: true,
+            ..Default::default()
+        };
+
+        assert!(!profile.admits(
+            &node(NodeKind::Struct),
+            LspQueryOperation::References,
+            capabilities,
+            &mut profile.budget()
+        ));
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.scheduled_requests, 0);
+        assert!(snapshot.circuit_open);
+        assert!(
+            snapshot
+                .circuit_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("time budget exhausted"))
+        );
     }
 
     #[test]

@@ -487,6 +487,7 @@ impl RnaHandler {
                                 lance_repo_root: None,
                                 skip_lsp: false, // incremental background path: LSP runs inline
                                 lsp_node_filter: None,
+                                broad_reference_budget: None,
                             },
                             dirty_slugs,
                         )
@@ -521,7 +522,9 @@ impl RnaHandler {
                                 if let Some(detail) = degraded_detail.as_deref() {
                                     lsp_status.set_degraded(lsp_call_edge_count, detail);
                                 } else if lsp_edge_count > 0 {
-                                    lsp_status.set_complete(lsp_call_edge_count);
+                                    lsp_status.set_complete_default_profile_for_warmup(
+                                        lsp_call_edge_count,
+                                    );
                                 } else {
                                     lsp_status.set_unavailable();
                                 }
@@ -1200,7 +1203,8 @@ impl RnaHandler {
                                     .iter()
                                     .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                                     .count();
-                                self.lsp_status.set_complete(call_count);
+                                self.lsp_status
+                                    .set_complete_default_profile_for_warmup(call_count);
                             }
                         } else if spawn_background {
                             tracing::info!("LSP enrichment skipped by scan options");
@@ -1506,6 +1510,7 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                         skip_lsp: spawn_background || !enrichment.runs_lsp(),
                         lsp_node_filter: None,
+                        broad_reference_budget: None,
                     },
                     dirty_slugs,
                 )
@@ -1533,7 +1538,8 @@ impl RnaHandler {
                     self.lsp_status.set_degraded(lsp_call_edge_count, detail);
                     tracing::warn!("LSP enrichment finalized as degraded: {}", detail);
                 } else if lsp_edge_count > 0 {
-                    self.lsp_status.set_complete(lsp_call_edge_count);
+                    self.lsp_status
+                        .set_complete_default_profile_for_warmup(lsp_call_edge_count);
                     tracing::info!(
                         "LSP enrichment complete (via bus): {} LSP call edges, {} total LSP edges",
                         lsp_call_edge_count,
@@ -2162,6 +2168,7 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                         skip_lsp: !enrichment.runs_lsp(),
                         lsp_node_filter: None,
+                        broad_reference_budget: None,
                     },
                     dirty_slugs,
                 )
@@ -2527,7 +2534,8 @@ impl RnaHandler {
             } else {
                 // A clean, durable incremental pass supersedes any prior
                 // degraded/running state, including the valid zero-edge case.
-                self.lsp_status.set_complete(lsp_call_edge_count);
+                self.lsp_status
+                    .set_complete_default_profile_for_warmup(lsp_call_edge_count);
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     self.enrichment_jobs.mark_completed(
                         &self.repo_root,

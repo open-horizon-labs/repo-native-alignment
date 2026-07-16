@@ -863,6 +863,19 @@ impl LspEnricher {
         let mut last_progress_log = std::time::Instant::now();
         let mut last_logged_count = 0u64;
         let mut no_progress_deadline = Box::pin(tokio::time::sleep(pass1_no_progress_timeout()));
+        let broad_reference_budget = self.broad_reference_budget().cloned();
+        let broad_reference_deadline = async {
+            match broad_reference_budget.as_ref() {
+                Some(budget) => {
+                    if let Some(remaining) = budget.remaining_duration() {
+                        tokio::time::sleep(remaining).await;
+                    }
+                    budget.open_time_circuit();
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(broad_reference_deadline);
         const PROGRESS_LOG_INTERVAL_SECS: u64 = 30;
         const PROGRESS_LOG_INTERVAL_NODES: u64 = 1_000;
 
@@ -907,6 +920,18 @@ impl LspEnricher {
                         pass1_no_progress_timeout().as_secs(),
                         rendered_snapshot
                     ));
+                    join_set.abort_all();
+                    break;
+                }
+                _ = &mut broad_reference_deadline => {
+                    let reason = broad_reference_budget
+                        .as_ref()
+                        .and_then(|budget| budget.snapshot().circuit_reason)
+                        .unwrap_or_else(|| "broad-reference time budget exhausted".to_string());
+                    tracing::warn!("LSP: {reason}; opening scoped circuit breaker");
+                    errors += 1;
+                    aborted = true;
+                    abort_diagnostic = Some(reason);
                     join_set.abort_all();
                     break;
                 }

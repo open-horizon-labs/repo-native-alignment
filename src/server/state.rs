@@ -569,6 +569,7 @@ impl std::fmt::Display for LspState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LspCoverageScope {
     Repo,
+    DefaultProfile(String),
     Scoped(String),
 }
 
@@ -705,12 +706,38 @@ impl LspEnrichmentStatus {
     /// exact search/graph finalization succeeded while LSP-derived relationships
     /// may be incomplete.
     pub fn set_degraded(&self, edge_count: usize, detail: &str) {
+        self.set_degraded_with_scope(edge_count, edge_count, LspCoverageScope::Repo, detail);
+    }
+
+    pub fn set_degraded_scoped(
+        &self,
+        latest_edge_count: usize,
+        coverage_edge_count: usize,
+        scope_detail: impl Into<String>,
+        detail: &str,
+    ) {
+        self.set_degraded_with_scope(
+            latest_edge_count,
+            coverage_edge_count,
+            LspCoverageScope::Scoped(scope_detail.into()),
+            detail,
+        );
+    }
+
+    fn set_degraded_with_scope(
+        &self,
+        latest_edge_count: usize,
+        coverage_edge_count: usize,
+        scope: LspCoverageScope,
+        detail: &str,
+    ) {
         self.edge_count
-            .store(edge_count, std::sync::atomic::Ordering::Release);
+            .store(latest_edge_count, std::sync::atomic::Ordering::Release);
         self.coverage_edge_count
-            .fetch_max(edge_count, std::sync::atomic::Ordering::AcqRel);
+            .fetch_max(coverage_edge_count, std::sync::atomic::Ordering::AcqRel);
         self.persist_failed
             .store(false, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = scope;
         *self.last_error.lock().unwrap() = Some(detail.to_string());
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
@@ -737,6 +764,39 @@ impl LspEnrichmentStatus {
             prev,
             LspState::Complete,
             &format!("{} edges", latest_edge_count),
+        );
+    }
+
+    pub fn set_complete_default_profile(
+        &self,
+        latest_edge_count: usize,
+        coverage_edge_count: usize,
+        detail: impl Into<String>,
+    ) {
+        self.edge_count
+            .store(latest_edge_count, std::sync::atomic::Ordering::Release);
+        self.coverage_edge_count
+            .store(coverage_edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.coverage_scope.lock().unwrap() = LspCoverageScope::DefaultProfile(detail.into());
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        let prev = LspState::from_u8(
+            self.state
+                .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
+        );
+        self.log_transition(
+            prev,
+            LspState::Complete,
+            &format!("{} edges, default query profile", latest_edge_count),
+        );
+    }
+
+    pub fn set_complete_default_profile_for_warmup(&self, edge_count: usize) {
+        self.set_complete_default_profile(
+            edge_count,
+            edge_count,
+            "broad references were omitted; request changed, targets, or task scope for broad evidence",
         );
     }
 
@@ -790,15 +850,20 @@ impl LspEnrichmentStatus {
 
     /// Mark that no LSP server was available for any of the detected languages.
     pub fn set_unavailable(&self) {
+        self.set_unavailable_with_detail("no supported language server detected");
+    }
+
+    pub fn set_unavailable_with_detail(&self, detail: &str) {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         self.coverage_edge_count
             .store(0, std::sync::atomic::Ordering::Release);
         *self.coverage_scope.lock().unwrap() = LspCoverageScope::Repo;
+        *self.last_error.lock().unwrap() = Some(detail.to_string());
         let prev = LspState::from_u8(
             self.state
                 .swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel),
         );
-        self.log_transition(prev, LspState::Unavailable, "no server detected");
+        self.log_transition(prev, LspState::Unavailable, detail);
     }
 
     pub fn set_failed(&self, error: &str) {
@@ -885,6 +950,16 @@ impl LspEnrichmentStatus {
                             coverage_edge_count, scope_detail
                         ),
                     ),
+                    (_, false, LspCoverageScope::DefaultProfile(detail)) => {
+                        CapabilityReadiness::new(
+                            "LSP call/reference coverage",
+                            CapabilityReadinessState::Partial,
+                            format!(
+                                "{} persisted call/reference edges available for the default query profile; {}",
+                                coverage_edge_count, detail
+                            ),
+                        )
+                    }
                     (_, false, LspCoverageScope::Repo) => CapabilityReadiness::new(
                         "LSP call/reference coverage",
                         CapabilityReadinessState::Ready,
@@ -920,7 +995,11 @@ impl LspEnrichmentStatus {
             LspState::Unavailable => CapabilityReadiness::new(
                 "LSP call/reference coverage",
                 CapabilityReadinessState::Unavailable,
-                "no supported language server detected",
+                self.last_error
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .unwrap_or("no supported language server detected"),
             ),
             LspState::Failed => {
                 let err = self.last_error.lock().unwrap();
@@ -932,12 +1011,19 @@ impl LspEnrichmentStatus {
             }
             LspState::Degraded => {
                 let err = self.last_error.lock().unwrap();
+                let scope = self.coverage_scope.lock().unwrap().clone();
+                let scope_detail = match scope {
+                    LspCoverageScope::Repo => "repo-wide".to_string(),
+                    LspCoverageScope::DefaultProfile(detail) => detail,
+                    LspCoverageScope::Scoped(detail) => detail,
+                };
                 CapabilityReadiness::new(
                     "LSP call/reference coverage",
                     CapabilityReadinessState::Partial,
                     format!(
-                        "degraded after finalization with {} partial call/reference edges: {}",
+                        "degraded after finalization with {} partial call/reference edges for {}: {}",
                         self.edge_count(),
+                        scope_detail,
                         err.as_deref().unwrap_or("enrichment aborted")
                     ),
                 )
@@ -977,16 +1063,14 @@ impl LspEnrichmentStatus {
                 CapabilityReadinessState::Ready,
                 "repo-wide LSP caller/reference coverage is available; diff-scoped review probes may use graph callers",
             ),
-            CapabilityReadinessState::Partial if has_scoped_coverage => {
-                CapabilityReadiness::new(
-                    "review-readiness scoped context",
-                    CapabilityReadinessState::Partial,
-                    format!(
-                        "review can proceed with explicit scoped/degraded context; {}",
-                        lsp.detail
-                    ),
-                )
-            }
+            CapabilityReadinessState::Partial if has_scoped_coverage => CapabilityReadiness::new(
+                "review-readiness scoped context",
+                CapabilityReadinessState::Partial,
+                format!(
+                    "review can proceed with explicit scoped/degraded context; {}",
+                    lsp.detail
+                ),
+            ),
             CapabilityReadinessState::Running => CapabilityReadiness::new(
                 "review-readiness scoped context",
                 CapabilityReadinessState::Running,
@@ -1530,6 +1614,25 @@ mod tests {
             review.detail.contains("scoped/degraded context"),
             "got: {}",
             review.detail
+        );
+    }
+
+    #[test]
+    fn default_profile_lsp_coverage_is_not_reported_as_full() {
+        let status = LspEnrichmentStatus::default();
+        status.set_complete_default_profile(
+            8,
+            8,
+            "broad references were omitted; request explicit scope",
+        );
+
+        let lsp = status.call_reference_readiness();
+        assert_eq!(lsp.state, CapabilityReadinessState::Partial);
+        assert!(lsp.detail.contains("default query profile"));
+        assert!(lsp.detail.contains("broad references were omitted"));
+        assert_eq!(
+            status.dead_code_readiness().state,
+            CapabilityReadinessState::Partial
         );
     }
 

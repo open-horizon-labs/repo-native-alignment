@@ -21,6 +21,7 @@
 mod passes;
 mod policy;
 pub use policy::LspQueryMetric;
+pub(crate) use policy::{LspBroadReferenceBudget, LspBroadReferenceBudgetSnapshot};
 use policy::{LspQueryProfile, LspServerCapabilities};
 mod transport;
 pub(crate) mod work_items;
@@ -234,13 +235,29 @@ pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
 /// support while preserving declaration, language/server, and default-deny
 /// policy. Runtime scheduling rechecks against negotiated capabilities.
 pub(crate) fn planned_operations_for_node(node: &Node) -> Vec<String> {
+    planned_operations_for_node_inner(node, false)
+}
+
+pub(crate) fn planned_operations_for_node_with_broad_references(
+    node: &Node,
+) -> Vec<String> {
+    planned_operations_for_node_inner(node, true)
+}
+
+fn planned_operations_for_node_inner(node: &Node, allow_broad_references: bool) -> Vec<String> {
     let Some(descriptor) = BUILTIN_LSP_DESCRIPTORS
         .iter()
         .find(|descriptor| descriptor.language == node.language)
     else {
         return Vec::new();
     };
-    let enricher = descriptor.build();
+    let enricher = if allow_broad_references {
+        let mut enricher = descriptor.build();
+        enricher.query_profile = enricher.query_profile.with_broad_references_unbudgeted();
+        enricher
+    } else {
+        descriptor.build()
+    };
     let operations: &[policy::LspQueryOperation] = match node.id.kind {
         NodeKind::Function => &[policy::LspQueryOperation::CallHierarchy],
         NodeKind::Trait => &[
@@ -489,6 +506,18 @@ impl LspEnricher {
     fn with_declared_const_references(mut self, allow: bool) -> Self {
         self.query_profile = self.query_profile.with_declared_const_references(allow);
         self
+    }
+
+    pub(crate) fn with_broad_references(
+        mut self,
+        budget: Arc<LspBroadReferenceBudget>,
+    ) -> Self {
+        self.query_profile = self.query_profile.with_broad_references(budget);
+        self
+    }
+
+    pub(crate) fn broad_reference_budget(&self) -> Option<&Arc<LspBroadReferenceBudget>> {
+        self.query_profile.broad_reference_budget()
     }
 
     #[cfg(test)]
