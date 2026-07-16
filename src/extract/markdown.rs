@@ -220,7 +220,7 @@ fn emit_body_ast(path: &Path, content: &str, nodes: &mut Vec<Node>, _edges: &mut
                 *sibling_counts[depth].entry(kind).or_insert(0) += 1;
                 sibling_counts.truncate(depth + 1);
                 sibling_counts.push(BTreeMap::new());
-                let parent_path = stack.last().map(|open| ast_path(open)).unwrap_or_default();
+                let parent_path = stack.last().map(ast_path).unwrap_or_default();
                 let (explicit_id, anchor, target) = tag_identity(&tag, content, range.clone());
                 stack.push(OpenBodyNode {
                     kind,
@@ -406,7 +406,7 @@ fn explicit_inline_id(text: &str) -> Option<String> {
 fn slugify_heading(text: &str) -> String {
     text.trim_start_matches('#')
         .trim()
-        .trim_end_matches(|c| c == '\r' || c == '\n')
+        .trim_end_matches(['\r', '\n'])
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("-")
@@ -521,6 +521,7 @@ fn make_body_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_leaf_body_node(
     path: &Path,
     content: &str,
@@ -584,7 +585,7 @@ fn selector_metadata(
     metadata.insert("byte_end".into(), end.to_string());
     metadata.insert(
         "snippet_hash".into(),
-        blake3::hash(content[start..end].as_bytes())
+        blake3::hash(&content.as_bytes()[start..end])
             .to_hex()
             .to_string(),
     );
