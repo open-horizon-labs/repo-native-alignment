@@ -13,6 +13,7 @@ pub enum LspQueryOperation {
     Definitions,
     Implementations,
     TypeHierarchy,
+    DocumentSymbols,
     DocumentLinks,
 }
 
@@ -24,6 +25,7 @@ impl LspQueryOperation {
             Self::Definitions => "definitions",
             Self::Implementations => "implementations",
             Self::TypeHierarchy => "type_hierarchy",
+            Self::DocumentSymbols => "document_symbols",
             Self::DocumentLinks => "document_links",
         }
     }
@@ -35,6 +37,7 @@ impl LspQueryOperation {
             Self::Definitions => "requesting_definitions",
             Self::Implementations => "requesting_implementations",
             Self::TypeHierarchy => "requesting_type_hierarchy",
+            Self::DocumentSymbols => "requesting_document_symbols",
             Self::DocumentLinks => "requesting_document_links",
         }
     }
@@ -99,6 +102,7 @@ pub(crate) struct LspServerCapabilities {
     pub definitions: bool,
     pub implementations: bool,
     pub type_hierarchy: bool,
+    pub document_symbols: bool,
     pub document_links: bool,
 }
 
@@ -110,6 +114,7 @@ impl LspServerCapabilities {
             LspQueryOperation::Definitions => self.definitions,
             LspQueryOperation::Implementations => self.implementations,
             LspQueryOperation::TypeHierarchy => self.type_hierarchy,
+            LspQueryOperation::DocumentSymbols => self.document_symbols,
             LspQueryOperation::DocumentLinks => self.document_links,
         }
     }
@@ -338,6 +343,13 @@ impl LspQueryProfile {
             return false;
         }
 
+        // documentSymbol is scoped to a text document, not a declaration.
+        // Any admitted non-synthetic node can represent its file, and the
+        // scheduler deduplicates this operation to one request per file.
+        if operation == LspQueryOperation::DocumentSymbols {
+            return budget.reserve(operation);
+        }
+
         if self
             .allowed_kinds
             .as_ref()
@@ -383,6 +395,7 @@ impl LspQueryProfile {
                     | LspDeclarationClass::Struct
                     | LspDeclarationClass::Enum
             ),
+            LspQueryOperation::DocumentSymbols => unreachable!("handled before declaration policy"),
             LspQueryOperation::DocumentLinks => declaration == LspDeclarationClass::Other,
         };
 

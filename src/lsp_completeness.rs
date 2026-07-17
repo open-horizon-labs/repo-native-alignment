@@ -1456,6 +1456,10 @@ fn evidence_from_work_items(
         insert_negotiated_capabilities(&mut capabilities, validation);
         if validation.status == LspValidationStatus::Processed
             && let Some(method) = validation.method.as_deref()
+            // The one initialization warm-up document is language readiness
+            // evidence. Per-file documentSymbol requests are represented by
+            // their exact file-scoped durable work items below.
+            && method != "textDocument/documentSymbol"
         {
             requests.push(RequestAttempt {
                 method: method.to_string(),
@@ -1534,6 +1538,7 @@ fn lsp_method(operation: &str) -> &'static str {
         "definitions" => "textDocument/definition",
         "implementations" => "textDocument/implementation",
         "type_hierarchy" => "textDocument/prepareTypeHierarchy+typeHierarchy/*",
+        "document_symbols" => "textDocument/documentSymbol",
         "document_links" => "textDocument/documentLink",
         _ => "unknown",
     }
@@ -1684,6 +1689,7 @@ fn expected_evidence_from_work_items(
                     "definitions" | "implementations" | "type_hierarchy" => {
                         Some(ExpectedResultKind::Definition)
                     }
+                    "document_symbols" => Some(ExpectedResultKind::DocumentSymbol),
                     "document_links" => Some(ExpectedResultKind::DocumentLink),
                     _ => None,
                 };
@@ -1814,9 +1820,12 @@ fn terminal_status_for_file(
             return !validation.document_symbols.is_empty();
         }
         let count = validation.symbol_count.unwrap_or_default();
-        validation.document_symbols.len() != count
+        let request_uri = validation.request_uri.as_deref();
+        request_uri.is_none()
+            || validation.document_symbols.len() != count
             || validation.document_symbols.iter().any(|symbol| {
                 symbol.payload_digest.is_empty()
+                    || Some(symbol.uri.as_str()) != request_uri
                     || symbol.file.is_none()
                     || symbol.graph_result_id.is_none()
             })
@@ -2286,7 +2295,8 @@ fn probe_version(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::Extractor;
+    use crate::extract::{Enricher, Extractor};
+    use crate::graph::index::GraphIndex;
     use crate::graph::{Confidence, NodeId, NodeKind};
 
     fn identity(generation: &str) -> ReportIdentity {
@@ -2701,6 +2711,7 @@ mod tests {
             "textDocument/documentSymbol",
             0,
         )
+        .with_request_uri(Some("file:///fixture/src/a.py".to_string()))
         .with_negotiated_capabilities(
             crate::extract::scan_stats::LspNegotiatedCapabilities {
                 references_provider: true,
@@ -2746,7 +2757,8 @@ mod tests {
             "fixture-ls",
             "textDocument/documentSymbol",
             0,
-        );
+        )
+        .with_request_uri(Some("file:///fixture/src/a.py".to_string()));
         let jobs = vec![completed_job(vec![validation])];
         let validations = job_validations_for_language(&jobs, "python");
         let status = terminal_status_for_file(
@@ -2952,6 +2964,7 @@ mod tests {
             "textDocument/documentSymbol",
             1,
         )
+        .with_request_uri(Some("file:///fixture/docs/guide.md".to_string()))
         .with_negotiated_capabilities(crate::extract::scan_stats::LspNegotiatedCapabilities {
             document_symbol_provider: true,
             ..crate::extract::scan_stats::LspNegotiatedCapabilities::default()
@@ -2982,6 +2995,124 @@ mod tests {
 
         file.persisted_results = persisted_results_for_path("docs/guide.md", &[node], &[]);
         assert!(report(vec![file]).is_ready());
+    }
+
+    #[tokio::test]
+    async fn multi_document_mock_requires_exact_file_scoped_symbol_persistence() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["docs", "src", "tests"] {
+            std::fs::create_dir_all(repo.path().join(directory)).unwrap();
+        }
+        for path in [
+            "README.md",
+            "docs/guide.md",
+            "src/app.py",
+            "tests/test_app.py",
+        ] {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lsp_capability_repo")
+                .join(path);
+            std::fs::copy(source, repo.path().join(path)).unwrap();
+        }
+
+        let markdown = crate::extract::markdown::MarkdownExtractor::new();
+        let mut nodes = Vec::new();
+        for path in ["README.md", "docs/guide.md"] {
+            let content = std::fs::read_to_string(repo.path().join(path)).unwrap();
+            nodes.extend(markdown.extract(Path::new(path), &content).unwrap().nodes);
+        }
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = crate::extract::lsp::LspEnricher::new(
+            "markdown",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "document_features",
+            ],
+            &["md"],
+        );
+        let result = enricher
+            .enrich(&nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("two-document mock enrichment succeeds");
+        assert!(!result.aborted, "mock enrichment aborted: {result:?}");
+        let validation = result
+            .lsp_validation
+            .as_ref()
+            .expect("mock retains language readiness evidence");
+        let records = crate::extract::lsp::work_items::load_records_since(repo.path(), 0).unwrap();
+
+        let mut files = Vec::new();
+        for path in ["README.md", "docs/guide.md"] {
+            let file_records = records
+                .iter()
+                .filter(|record| record.file == path)
+                .collect::<Vec<_>>();
+            let symbol_records = file_records
+                .iter()
+                .filter(|record| {
+                    record
+                        .requested_operations
+                        .iter()
+                        .any(|operation| operation == "document_symbols")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                symbol_records.len(),
+                1,
+                "{path} must have one exact request"
+            );
+            assert_eq!(symbol_records[0].output_nodes.len(), 1);
+            assert!(
+                symbol_records[0]
+                    .output_nodes
+                    .iter()
+                    .all(|node| node.id.file == PathBuf::from(path))
+            );
+
+            let (capabilities, requests) =
+                evidence_from_work_items(&file_records, &[], &[validation]);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == "textDocument/documentSymbol")
+                    .count(),
+                1,
+                "warmup validation must not be projected onto {path}"
+            );
+            let (expected, expected_ids) =
+                expected_evidence_from_work_items(&file_records, &[validation], path);
+            let mut file = included(
+                path,
+                FileTerminalStatus::Processed {
+                    result_count: expected_ids.len() as u64,
+                },
+            );
+            file.role = FileRole::Docs;
+            file.advertised_capabilities = capabilities;
+            file.requests_attempted = requests;
+            file.expected_results = expected;
+            file.expected_result_ids = expected_ids;
+            file.persisted_results =
+                persisted_results_for_path(path, &result.new_nodes, &result.added_edges);
+            files.push(file);
+        }
+
+        assert!(report(files.clone()).is_ready());
+        let nested_path = "docs/guide.md";
+        let retained_nodes = result
+            .new_nodes
+            .iter()
+            .filter(|node| node.id.file != PathBuf::from(nested_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        files[1].persisted_results =
+            persisted_results_for_path(nested_path, &retained_nodes, &result.added_edges);
+        assert!(
+            !report(files).is_ready(),
+            "nested document cannot inherit README symbol persistence"
+        );
     }
 
     #[test]
@@ -3039,6 +3170,7 @@ mod tests {
             "textDocument/documentSymbol",
             1,
         )
+        .with_request_uri(Some("file:///fixture/docs/guide.md".to_string()))
         .with_negotiated_capabilities(crate::extract::scan_stats::LspNegotiatedCapabilities {
             references_provider: true,
             definition_provider: true,
@@ -3092,7 +3224,7 @@ mod tests {
                 evidence: Vec::new(),
             },
         ];
-        let doc_records = [
+        let mut doc_records = [
             ("document_links", doc_edges[0].clone()),
             ("definitions", doc_edges[1].clone()),
             ("references", doc_edges[2].clone()),
@@ -3108,6 +3240,15 @@ mod tests {
             ..LspWorkItemRecord::default()
         })
         .collect::<Vec<_>>();
+        doc_records.push(LspWorkItemRecord {
+            file: "docs/guide.md".to_string(),
+            node_kind: "markdown_section".to_string(),
+            requested_operations: vec!["document_symbols".to_string()],
+            state: LspWorkItemState::Completed,
+            output_nodes: vec![doc_node.clone()],
+            observed_result_count: 1,
+            ..LspWorkItemRecord::default()
+        });
         let doc_record_refs = doc_records.iter().collect::<Vec<_>>();
         let (doc_capabilities, doc_requests) =
             evidence_from_work_items(&doc_record_refs, &[], &[&doc_validation]);

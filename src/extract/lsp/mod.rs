@@ -313,6 +313,7 @@ fn planned_operations_for_node_inner(node: &Node, allow_broad_references: bool) 
         definitions: true,
         implementations: true,
         type_hierarchy: true,
+        document_symbols: true,
         document_links: true,
     };
     let mut budget = enricher.query_profile.budget();
@@ -644,8 +645,22 @@ fn materialize_document_symbol_nodes(
     repo_root: &Path,
     matching_nodes: &[&Node],
 ) -> Result<Vec<Node>> {
-    let mut nodes = Vec::with_capacity(validation.document_symbols.len());
-    for symbol in &mut validation.document_symbols {
+    materialize_document_symbols(
+        &validation.language,
+        &mut validation.document_symbols,
+        repo_root,
+        matching_nodes,
+    )
+}
+
+fn materialize_document_symbols(
+    language: &str,
+    symbols: &mut [LspDocumentSymbolEvidence],
+    repo_root: &Path,
+    matching_nodes: &[&Node],
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
         let uri = Uri::from_str(&symbol.uri)
             .with_context(|| format!("invalid documentSymbol URI {}", symbol.uri))?;
         let file = uri_to_relative_path(&uri, repo_root);
@@ -692,7 +707,7 @@ fn materialize_document_symbol_nodes(
                 ),
                 kind: NodeKind::Other("lsp_document_symbol".to_string()),
             },
-            language: validation.language.clone(),
+            language: language.to_string(),
             line_start: symbol.start_line as usize + 1,
             line_end: symbol.end_line as usize + 1,
             signature: format!("documentSymbol {} ({})", symbol.name, symbol.kind),
@@ -776,6 +791,7 @@ async fn execute_readiness_validation(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadinessValidationResult {
     method: ReadinessValidationMethod,
+    request_uri: Option<String>,
     symbol_count: usize,
     document_symbols: Vec<LspDocumentSymbolEvidence>,
 }
@@ -798,6 +814,9 @@ async fn execute_indexing_validation_once(
     if primary == ReadinessValidationMethod::DocumentSymbol || primary_response.symbol_count > 0 {
         return Ok(Some(ReadinessValidationResult {
             method: primary,
+            request_uri: (primary == ReadinessValidationMethod::DocumentSymbol)
+                .then(|| warmup_uri.map(str::to_string))
+                .flatten(),
             symbol_count: primary_response.symbol_count,
             document_symbols: primary_response.document_symbols,
         }));
@@ -813,6 +832,7 @@ async fn execute_indexing_validation_once(
         .await?;
         return Ok(Some(ReadinessValidationResult {
             method: ReadinessValidationMethod::DocumentSymbol,
+            request_uri: warmup_uri.map(str::to_string),
             symbol_count: response.symbol_count,
             document_symbols: response.document_symbols,
         }));
@@ -1021,6 +1041,7 @@ impl LspEnricher {
                 definitions: true,
                 implementations: true,
                 type_hierarchy: true,
+                document_symbols: true,
                 document_links: true,
             },
             &mut self.query_profile.budget(),
@@ -1696,6 +1717,7 @@ impl LspEnricher {
                                         readiness_method.method(),
                                         symbol_count,
                                     )
+                                    .with_request_uri(warmup_uri.clone())
                                     .with_document_symbols(response.document_symbols),
                                 );
                                 server_responsive = true;
@@ -1858,6 +1880,7 @@ impl LspEnricher {
                             validation.method.method(),
                             validation.symbol_count,
                         )
+                        .with_request_uri(validation.request_uri)
                         .with_document_symbols(validation.document_symbols),
                     );
                     server_ready = true;
@@ -3270,6 +3293,11 @@ impl Enricher for LspEnricher {
             definitions: has_definition,
             implementations: has_implementation,
             type_hierarchy: has_type_hierarchy,
+            document_symbols: result
+                .lsp_validation
+                .as_ref()
+                .and_then(|evidence| evidence.negotiated_capabilities)
+                .is_some_and(|capabilities| capabilities.document_symbol_provider),
             document_links: has_document_links,
         };
         let mut query_budget = self.query_profile.budget();
@@ -3576,7 +3604,8 @@ mod tests {
             "fixture-server",
             outcome.method.method(),
             outcome.symbol_count,
-        );
+        )
+        .with_request_uri(outcome.request_uri);
         assert_eq!(evidence.symbol_count, Some(0));
         assert!(evidence.summary().contains("processed"));
     }
@@ -3619,6 +3648,7 @@ mod tests {
             outcome.method.method(),
             outcome.symbol_count,
         )
+        .with_request_uri(outcome.request_uri)
         .with_document_symbols(outcome.document_symbols)
         .with_negotiated_capabilities(LspNegotiatedCapabilities {
             document_symbol_provider: true,
@@ -3682,16 +3712,23 @@ mod tests {
         for directory in ["docs", "src", "tests"] {
             std::fs::create_dir_all(repo.path().join(directory)).unwrap();
         }
-        for path in ["docs/guide.md", "src/app.py", "tests/test_app.py"] {
+        for path in [
+            "README.md",
+            "docs/guide.md",
+            "src/app.py",
+            "tests/test_app.py",
+        ] {
             let source = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/lsp_capability_repo")
                 .join(path);
             std::fs::copy(source, repo.path().join(path)).unwrap();
         }
-        let guide = std::fs::read_to_string(repo.path().join("docs/guide.md")).unwrap();
-        let extracted = crate::extract::markdown::MarkdownExtractor::new()
-            .extract(Path::new("docs/guide.md"), &guide)
-            .unwrap();
+        let markdown = crate::extract::markdown::MarkdownExtractor::new();
+        let mut document_nodes = Vec::new();
+        for path in ["README.md", "docs/guide.md"] {
+            let content = std::fs::read_to_string(repo.path().join(path)).unwrap();
+            document_nodes.extend(markdown.extract(Path::new(path), &content).unwrap().nodes);
+        }
         let fixture_server =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
         let enricher = LspEnricher::new(
@@ -3704,7 +3741,7 @@ mod tests {
             &["md"],
         );
         let result = enricher
-            .enrich(&extracted.nodes, &GraphIndex::new(), repo.path())
+            .enrich(&document_nodes, &GraphIndex::new(), repo.path())
             .await
             .expect("mock document enrichment succeeds");
         assert!(
@@ -3725,9 +3762,34 @@ mod tests {
             .iter()
             .flat_map(|record| record.requested_operations.iter().map(String::as_str))
             .collect::<BTreeSet<_>>();
+        assert!(operations.contains("document_symbols"));
         assert!(operations.contains("document_links"));
         assert!(operations.contains("definitions"));
         assert!(operations.contains("references"));
+        let document_symbol_files = records
+            .iter()
+            .filter(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "document_symbols")
+            })
+            .map(|record| record.file.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            document_symbol_files,
+            BTreeSet::from(["README.md", "docs/guide.md"])
+        );
+        let persisted_symbol_files = result
+            .new_nodes
+            .iter()
+            .filter(|node| node.id.kind == NodeKind::Other("lsp_document_symbol".to_string()))
+            .map(|node| node.id.file.to_string_lossy().replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            persisted_symbol_files,
+            BTreeSet::from(["README.md".to_string(), "docs/guide.md".to_string()])
+        );
         assert!(
             result
                 .added_edges

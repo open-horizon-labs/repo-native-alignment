@@ -25,7 +25,8 @@ use super::transport::{
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
-    ZERO_EDGE_TIMEOUT, lsp_job_timeout,
+    ZERO_EDGE_TIMEOUT, lsp_job_timeout, materialize_document_symbols,
+    normalized_document_symbol_evidence,
 };
 use crate::scanner::LspConfig;
 
@@ -705,8 +706,32 @@ impl LspEnricher {
             .copied()
             .collect();
 
-        let mut document_link_files = HashSet::new();
         let mut admitted_nodes: Vec<(&Node, LspQueryOperation)> = Vec::new();
+        if capabilities.document_symbols {
+            let mut document_representatives = BTreeMap::<PathBuf, Vec<&Node>>::new();
+            for node in matching_nodes {
+                document_representatives
+                    .entry(node.id.file.clone())
+                    .or_default()
+                    .push(*node);
+            }
+            for mut candidates in document_representatives.into_values() {
+                candidates.sort_by_key(|node| node.stable_id());
+                for node in candidates {
+                    if self.query_profile.admits(
+                        node,
+                        LspQueryOperation::DocumentSymbols,
+                        capabilities,
+                        budget,
+                    ) {
+                        admitted_nodes.push((node, LspQueryOperation::DocumentSymbols));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut document_link_files = HashSet::new();
         for node in candidate_nodes {
             let operations: &[LspQueryOperation] = match node.id.kind {
                 NodeKind::Function if capabilities.call_hierarchy => {
@@ -850,14 +875,18 @@ impl LspEnricher {
                 let did_open = Arc::clone(&did_open);
                 let telemetry = Arc::clone(&worker_telemetry);
                 async move {
-                    let registered = if let (Some(operation), Some(declaration)) = (
-                        item.requested_operations.first().copied(),
-                        LspDeclarationClass::from_kind(&item.node.id.kind),
-                    ) {
-                        telemetry.register_work_item(item.id, operation, declaration)
-                    } else {
-                        false
-                    };
+                    let operation = item.requested_operations.first().copied();
+                    let declaration =
+                        LspDeclarationClass::from_kind(&item.node.id.kind).or_else(|| {
+                            (operation == Some(LspQueryOperation::DocumentSymbols))
+                                .then_some(LspDeclarationClass::Other)
+                        });
+                    let registered =
+                        if let (Some(operation), Some(declaration)) = (operation, declaration) {
+                            telemetry.register_work_item(item.id, operation, declaration)
+                        } else {
+                            false
+                        };
                     if !registered {
                         return Pass1TaskResult {
                             edges: Vec::new(),
@@ -1159,76 +1188,46 @@ impl LspEnricher {
         let mut edges = Vec::new();
         let mut new_nodes = Vec::new();
         let mut had_error = false;
-        let observation = match node.id.kind {
-            NodeKind::Function => {
-                Self::enrich_function_node(
-                    transport,
-                    &file_uri,
-                    line,
-                    col,
-                    node,
-                    matching_owned,
-                    refs_by_file,
-                    root,
-                    language,
-                    operation == Some(LspQueryOperation::References),
-                    operation == Some(LspQueryOperation::CallHierarchy),
-                    item.id,
-                    telemetry,
-                    &mut edges,
-                    &mut new_nodes,
-                    &mut had_error,
-                    error_count,
-                )
-                .await
-            }
-            NodeKind::Trait => {
-                Self::enrich_trait_node(
-                    transport,
-                    &file_uri,
-                    line,
-                    col,
-                    node,
-                    matching_owned,
-                    root,
-                    item.id,
-                    telemetry,
-                    &mut edges,
-                )
-                .await
-            }
-            NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                if operation == Some(LspQueryOperation::References) {
-                    Self::enrich_type_references(
+        let observation = if operation == Some(LspQueryOperation::DocumentSymbols) {
+            Self::enrich_document_symbols(
+                transport,
+                &file_uri,
+                language,
+                matching_owned,
+                root,
+                item.id,
+                telemetry,
+                &mut new_nodes,
+                &mut had_error,
+                error_count,
+            )
+            .await
+        } else {
+            match node.id.kind {
+                NodeKind::Function => {
+                    Self::enrich_function_node(
                         transport,
                         &file_uri,
                         line,
                         col,
                         node,
                         matching_owned,
+                        refs_by_file,
                         root,
+                        language,
+                        operation == Some(LspQueryOperation::References),
+                        operation == Some(LspQueryOperation::CallHierarchy),
                         item.id,
                         telemetry,
                         &mut edges,
+                        &mut new_nodes,
                         &mut had_error,
                         error_count,
                     )
                     .await
-                } else {
-                    QueryObservation::default()
                 }
-            }
-            NodeKind::MarkdownSection => match operation {
-                Some(LspQueryOperation::DocumentLinks) => {
-                    Self::enrich_document_links(
-                        transport, &file_uri, node, root, item.id, telemetry, &mut edges,
-                    )
-                    .await
-                }
-                Some(
-                    operation @ (LspQueryOperation::Definitions | LspQueryOperation::References),
-                ) => {
-                    Self::enrich_document_locations(
+                NodeKind::Trait => {
+                    Self::enrich_trait_node(
                         transport,
                         &file_uri,
                         line,
@@ -1236,25 +1235,72 @@ impl LspEnricher {
                         node,
                         matching_owned,
                         root,
-                        operation,
                         item.id,
                         telemetry,
                         &mut edges,
                     )
                     .await
                 }
-                _ => QueryObservation::default(),
-            },
-            _ => {
-                if matches!(node.id.kind, NodeKind::Other(_))
-                    && operation == Some(LspQueryOperation::DocumentLinks)
-                {
-                    Self::enrich_document_links(
-                        transport, &file_uri, node, root, item.id, telemetry, &mut edges,
-                    )
-                    .await
-                } else {
-                    QueryObservation::default()
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                    if operation == Some(LspQueryOperation::References) {
+                        Self::enrich_type_references(
+                            transport,
+                            &file_uri,
+                            line,
+                            col,
+                            node,
+                            matching_owned,
+                            root,
+                            item.id,
+                            telemetry,
+                            &mut edges,
+                            &mut had_error,
+                            error_count,
+                        )
+                        .await
+                    } else {
+                        QueryObservation::default()
+                    }
+                }
+                NodeKind::MarkdownSection => match operation {
+                    Some(LspQueryOperation::DocumentLinks) => {
+                        Self::enrich_document_links(
+                            transport, &file_uri, node, root, item.id, telemetry, &mut edges,
+                        )
+                        .await
+                    }
+                    Some(
+                        operation
+                        @ (LspQueryOperation::Definitions | LspQueryOperation::References),
+                    ) => {
+                        Self::enrich_document_locations(
+                            transport,
+                            &file_uri,
+                            line,
+                            col,
+                            node,
+                            matching_owned,
+                            root,
+                            operation,
+                            item.id,
+                            telemetry,
+                            &mut edges,
+                        )
+                        .await
+                    }
+                    _ => QueryObservation::default(),
+                },
+                _ => {
+                    if matches!(node.id.kind, NodeKind::Other(_))
+                        && operation == Some(LspQueryOperation::DocumentLinks)
+                    {
+                        Self::enrich_document_links(
+                            transport, &file_uri, node, root, item.id, telemetry, &mut edges,
+                        )
+                        .await
+                    } else {
+                        QueryObservation::default()
+                    }
                 }
             }
         };
@@ -1766,6 +1812,56 @@ impl LspEnricher {
                 }
             }
             Err(e) => observation.record_error(&e),
+        }
+        observation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enrich_document_symbols(
+        transport: &PipelinedTransport,
+        file_uri: &lsp_types::Uri,
+        language: &str,
+        matching_nodes: &[Node],
+        root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
+        new_nodes: &mut Vec<Node>,
+        had_error: &mut bool,
+        error_count: &AtomicI64,
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
+        let response = transport
+            .request(
+                "textDocument/documentSymbol",
+                serde_json::json!({ "textDocument": { "uri": file_uri.to_string() } }),
+            )
+            .await
+            .and_then(|response| {
+                normalized_document_symbol_evidence(&response, &file_uri.to_string())
+            });
+        match response {
+            Ok(mut symbols) => {
+                observation.non_empty_responses += usize::from(!symbols.is_empty());
+                observation.result_count = symbols.len();
+                let matching_refs = matching_nodes.iter().collect::<Vec<_>>();
+                match materialize_document_symbols(language, &mut symbols, root, &matching_refs) {
+                    Ok(nodes) => new_nodes.extend(nodes),
+                    Err(error) => {
+                        *had_error = true;
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        observation.record_error(&error);
+                    }
+                }
+            }
+            Err(error) => {
+                *had_error = true;
+                error_count.fetch_add(1, Ordering::Relaxed);
+                observation.record_error(&error);
+            }
         }
         observation
     }

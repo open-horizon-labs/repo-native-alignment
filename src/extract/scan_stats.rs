@@ -74,7 +74,7 @@ pub enum LspValidationStatus {
     NotValidated,
 }
 
-pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 3;
+pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 4;
 
 /// Exact per-file operation capabilities negotiated in the initialize response.
 /// Readiness/quiescence methods deliberately do not appear here.
@@ -115,6 +115,11 @@ pub struct LspValidationEvidence {
     pub server_name: String,
     pub status: LspValidationStatus,
     pub method: Option<String>,
+    /// Exact document URI used by a document-scoped readiness probe. This
+    /// probe remains language readiness evidence and is not projected as a
+    /// request against other files of the same language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_uri: Option<String>,
     pub symbol_count: Option<usize>,
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,6 +144,7 @@ impl LspValidationEvidence {
             server_name: server_name.into(),
             status: LspValidationStatus::Processed,
             method: Some(method.into()),
+            request_uri: None,
             symbol_count: Some(symbol_count),
             detail: None,
             negotiated_capabilities: None,
@@ -157,6 +163,7 @@ impl LspValidationEvidence {
             server_name: server_name.into(),
             status: LspValidationStatus::NotValidated,
             method: None,
+            request_uri: None,
             symbol_count: None,
             detail: Some(detail.into()),
             negotiated_capabilities: None,
@@ -175,6 +182,7 @@ impl LspValidationEvidence {
             server_name: server_name.into(),
             status: LspValidationStatus::Quiescent,
             method: Some(method.into()),
+            request_uri: None,
             symbol_count: None,
             detail: None,
             negotiated_capabilities: None,
@@ -184,6 +192,11 @@ impl LspValidationEvidence {
 
     pub fn with_negotiated_capabilities(mut self, capabilities: LspNegotiatedCapabilities) -> Self {
         self.negotiated_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_request_uri(mut self, uri: Option<String>) -> Self {
+        self.request_uri = uri;
         self
     }
 
