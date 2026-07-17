@@ -8,7 +8,9 @@ use petgraph::Direction;
 use repo_native_alignment::business_context::{BusinessContextAdmission, BusinessContextMode};
 use repo_native_alignment::graph::index::GraphIndex;
 use repo_native_alignment::graph::{ExtractionSource, NodeKind};
-use repo_native_alignment::server::{GraphState, RnaHandler, ScanEnrichmentOptions};
+use repo_native_alignment::server::{
+    GraphState, RnaHandler, ScanEnrichmentOptions, load_graph_from_lance,
+};
 use repo_native_alignment::service::{self, SearchContext, SearchParams};
 
 const SENTINEL: &str = "quasar_context_isolation_783";
@@ -181,6 +183,16 @@ fn run_disabled_readme_query(root: &Path) -> std::process::Output {
         .arg("--repo")
         .arg(root)
         .args(["--file", "README.md", "--include-markdown", "--limit", "5"])
+        .output()
+        .unwrap()
+}
+
+fn run_full_scan(root: &Path, mode: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+        .args(["--business-context", mode, "scan"])
+        .arg("--repo")
+        .arg(root)
+        .args(["--full", "--extract-only"])
         .output()
         .unwrap()
 }
@@ -398,4 +410,52 @@ fn direct_disabled_cli_query_builds_or_rebuilds_then_reopens_compatible_cache() 
         assert!(reopened_stdout.contains("README.md"));
         assert!(!reopened_stdout.contains(".oh/outcomes/leak.md"));
     }
+}
+
+#[tokio::test]
+async fn disabled_full_scan_rebuilds_enabled_cache_before_lance_load() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/business_context_isolation");
+    let temp = tempfile::tempdir().unwrap();
+    copy_fixture(&fixture, temp.path());
+    initialize_merge_history(temp.path());
+
+    let enabled = run_full_scan(temp.path(), "enabled");
+    let enabled_stdout = String::from_utf8_lossy(&enabled.stdout);
+    let enabled_stderr = String::from_utf8_lossy(&enabled.stderr);
+    assert!(
+        enabled.status.success(),
+        "enabled full scan failed\nstdout:\n{enabled_stdout}\nstderr:\n{enabled_stderr}"
+    );
+
+    let cache = temp.path().join(".oh/.cache");
+    let marker = cache.join("business-context-mode");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "enabled\n");
+    let enabled_cache_sentinel = cache.join("enabled-full-scan-sentinel");
+    fs::write(&enabled_cache_sentinel, "must be deleted before Lance load").unwrap();
+
+    let disabled = run_full_scan(temp.path(), "disabled");
+    let disabled_stdout = String::from_utf8_lossy(&disabled.stdout);
+    let disabled_stderr = String::from_utf8_lossy(&disabled.stderr);
+    assert!(
+        disabled.status.success(),
+        "disabled full scan failed\nstdout:\n{disabled_stdout}\nstderr:\n{disabled_stderr}"
+    );
+    assert!(
+        !enabled_cache_sentinel.exists(),
+        "disabled full scan reused the enabled cache"
+    );
+    assert!(
+        !disabled_stderr.contains("Loaded cached graph:"),
+        "disabled full scan read Lance before mode validation:\n{disabled_stderr}"
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "disabled\n");
+    assert!(disabled_stderr.contains("business context: disabled"));
+    assert!(
+        disabled_stderr
+            .contains("excluded producer inputs: 1 .oh file(s), 1 Git-history producer(s)")
+    );
+
+    let persisted = load_graph_from_lance(temp.path()).await.unwrap();
+    assert_isolated_graph(&persisted);
 }

@@ -1372,6 +1372,12 @@ impl RnaHandler {
     {
         let pipeline_start = std::time::Instant::now();
 
+        // The foreground pipeline has its own Lance cache-load path instead of
+        // delegating to `build_full_graph_inner`. Validate the requested mode
+        // before even checking that cache so a legacy or mismatched index is
+        // deleted and rebuilt rather than entering the incremental path.
+        self.prepare_business_context_cache()?;
+
         // Try incremental path: load cached graph, apply delta, LSP on changed nodes.
         let lance_path = super::store::graph_lance_path(&self.repo_root);
         let cached = if lance_path.exists() {
