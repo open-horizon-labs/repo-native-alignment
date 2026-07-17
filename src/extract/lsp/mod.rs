@@ -25,10 +25,13 @@ pub(crate) use policy::{LspBroadReferenceBudget, LspBroadReferenceBudgetSnapshot
 use policy::{LspQueryProfile, LspServerCapabilities};
 mod transport;
 pub(crate) mod work_items;
-use transport::{LspTransport, PipelinedTransport, is_method_not_found, path_to_uri};
+use transport::{
+    LspTransport, PipelinedTransport, is_method_not_found, path_to_uri, uri_to_relative_path,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,12 +39,15 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use lsp_types::{
-    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    InitializeResult, Location, OneOf, Position, ServerCapabilities, TextDocumentIdentifier,
-    TextDocumentPositionParams, Uri,
+    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, Location, OneOf,
+    Position, ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
 };
 
 use super::{Enricher, EnrichmentResult};
+use crate::extract::scan_stats::{
+    LspDocumentSymbolEvidence, LspNegotiatedCapabilities, LspValidationEvidence,
+};
 use crate::graph::index::GraphIndex;
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
@@ -479,10 +485,33 @@ impl ReadinessValidationCapabilities {
     }
 }
 
+fn negotiated_operation_capabilities(
+    capabilities: &ServerCapabilities,
+    has_call_hierarchy: bool,
+) -> LspNegotiatedCapabilities {
+    LspNegotiatedCapabilities {
+        references_provider: provider_is_enabled(&capabilities.references_provider),
+        call_hierarchy_provider: has_call_hierarchy,
+        implementation_provider: implementation_provider_is_enabled(
+            &capabilities.implementation_provider,
+        ),
+        document_link_provider: capabilities.document_link_provider.is_some(),
+        document_symbol_provider: provider_is_enabled(&capabilities.document_symbol_provider),
+    }
+}
+
 fn provider_is_enabled<T>(provider: &Option<OneOf<bool, T>>) -> bool {
     match provider {
         Some(OneOf::Left(enabled)) => *enabled,
         Some(OneOf::Right(_)) => true,
+        None => false,
+    }
+}
+
+fn implementation_provider_is_enabled(provider: &Option<ImplementationProviderCapability>) -> bool {
+    match provider {
+        Some(ImplementationProviderCapability::Simple(enabled)) => *enabled,
+        Some(ImplementationProviderCapability::Options(_)) => true,
         None => false,
     }
 }
@@ -507,13 +536,177 @@ impl ReadinessRequester for LspTransport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessValidationResponse {
+    symbol_count: usize,
+    document_symbols: Vec<LspDocumentSymbolEvidence>,
+}
+
+fn normalized_document_symbol_evidence(
+    response: &serde_json::Value,
+    default_uri: &str,
+) -> Result<Vec<LspDocumentSymbolEvidence>> {
+    fn collect(
+        values: &[serde_json::Value],
+        default_uri: &str,
+        output: &mut Vec<LspDocumentSymbolEvidence>,
+    ) -> Result<()> {
+        for value in values {
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("documentSymbol response item has no string name")?;
+            let kind = value
+                .get("kind")
+                .and_then(serde_json::Value::as_u64)
+                .context("documentSymbol response item has no numeric kind")?
+                as u32;
+            let uri = value
+                .pointer("/location/uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(default_uri);
+            let range = value
+                .get("range")
+                .or_else(|| value.pointer("/location/range"))
+                .context("documentSymbol response item has no range")?;
+            let coordinate = |pointer: &str| -> Result<u32> {
+                Ok(range
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_u64)
+                    .with_context(|| {
+                        format!("documentSymbol response range has no numeric {pointer}")
+                    })? as u32)
+            };
+            let start_line = coordinate("/start/line")?;
+            let start_character = coordinate("/start/character")?;
+            let end_line = coordinate("/end/line")?;
+            let end_character = coordinate("/end/character")?;
+            let normalized = serde_json::json!({
+                "uri": uri,
+                "name": name,
+                "kind": kind,
+                "start_line": start_line,
+                "start_character": start_character,
+                "end_line": end_line,
+                "end_character": end_character,
+            });
+            let payload_digest = blake3::hash(&serde_json::to_vec(&normalized)?)
+                .to_hex()
+                .to_string();
+            output.push(LspDocumentSymbolEvidence {
+                uri: uri.to_string(),
+                name: name.to_string(),
+                kind,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                payload_digest,
+                graph_result_id: None,
+                file: None,
+            });
+            if let Some(children) = value.get("children").and_then(serde_json::Value::as_array) {
+                collect(children, uri, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    let Some(values) = response.as_array() else {
+        anyhow::ensure!(
+            response.is_null(),
+            "documentSymbol response must be an array or null"
+        );
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    collect(values, default_uri, &mut output)?;
+    output.sort();
+    Ok(output)
+}
+
+fn materialize_document_symbol_nodes(
+    validation: &mut LspValidationEvidence,
+    repo_root: &Path,
+    matching_nodes: &[&Node],
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::with_capacity(validation.document_symbols.len());
+    for symbol in &mut validation.document_symbols {
+        let uri = Uri::from_str(&symbol.uri)
+            .with_context(|| format!("invalid documentSymbol URI {}", symbol.uri))?;
+        let file = uri_to_relative_path(&uri, repo_root);
+        anyhow::ensure!(
+            !file.is_absolute()
+                && file
+                    .components()
+                    .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
+            "documentSymbol URI {} is outside the repository",
+            symbol.uri
+        );
+        let root = matching_nodes
+            .iter()
+            .find(|node| node.id.file == file)
+            .map(|node| node.id.root.clone())
+            .with_context(|| {
+                format!(
+                    "documentSymbol response for {} has no matching extracted file",
+                    file.display()
+                )
+            })?;
+        let normalized_file = file.to_string_lossy().replace('\\', "/");
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("lsp_document_symbol_name".to_string(), symbol.name.clone());
+        metadata.insert(
+            "lsp_document_symbol_kind".to_string(),
+            symbol.kind.to_string(),
+        );
+        metadata.insert(
+            "lsp_document_symbol_payload_digest".to_string(),
+            symbol.payload_digest.clone(),
+        );
+        let node = Node {
+            id: NodeId {
+                root,
+                file: file.clone(),
+                name: format!(
+                    "{}@{}",
+                    symbol.name,
+                    symbol
+                        .payload_digest
+                        .get(..16)
+                        .unwrap_or(&symbol.payload_digest)
+                ),
+                kind: NodeKind::Other("lsp_document_symbol".to_string()),
+            },
+            language: validation.language.clone(),
+            line_start: symbol.start_line as usize + 1,
+            line_end: symbol.end_line as usize + 1,
+            signature: format!("documentSymbol {} ({})", symbol.name, symbol.kind),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::Lsp,
+        };
+        symbol.file = Some(normalized_file);
+        symbol.graph_result_id = Some(node.stable_id());
+        nodes.push(node);
+    }
+    nodes.sort_by_key(Node::stable_id);
+    anyhow::ensure!(
+        nodes
+            .windows(2)
+            .all(|pair| pair[0].stable_id() != pair[1].stable_id()),
+        "documentSymbol response items do not map to distinct graph identities"
+    );
+    Ok(nodes)
+}
+
 async fn execute_readiness_validation(
     requester: &mut dyn ReadinessRequester,
     method: ReadinessValidationMethod,
     warmup_uri: Option<&str>,
     workspace_query: &str,
     timeout: tokio::time::Duration,
-) -> Result<usize> {
+) -> Result<ReadinessValidationResponse> {
     let params = match method {
         ReadinessValidationMethod::WorkspaceSymbol => {
             serde_json::json!({ "query": workspace_query })
@@ -531,7 +724,24 @@ async fn execute_readiness_validation(
     )
     .await
     {
-        Ok(Ok(response)) => Ok(response.as_array().map_or(0, Vec::len)),
+        Ok(Ok(response)) => {
+            let document_symbols = if method == ReadinessValidationMethod::DocumentSymbol {
+                normalized_document_symbol_evidence(
+                    &response,
+                    warmup_uri.context("documentSymbol validation has no warm-up URI")?,
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok(ReadinessValidationResponse {
+                symbol_count: if method == ReadinessValidationMethod::DocumentSymbol {
+                    document_symbols.len()
+                } else {
+                    response.as_array().map_or(0, Vec::len)
+                },
+                document_symbols,
+            })
+        }
         Ok(Err(error)) if is_method_not_found(&error) => Err(anyhow::anyhow!(
             "server advertised {} but returned unsupported method (-32601)",
             method.method()
@@ -549,10 +759,11 @@ async fn execute_readiness_validation(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadinessValidationResult {
     method: ReadinessValidationMethod,
     symbol_count: usize,
+    document_symbols: Vec<LspDocumentSymbolEvidence>,
 }
 
 async fn execute_indexing_validation_once(
@@ -567,22 +778,18 @@ async fn execute_indexing_validation_once(
             "server advertises neither workspace/symbol nor textDocument/documentSymbol"
         ));
     };
-    let primary_count = execute_readiness_validation(
-        requester,
-        primary,
-        warmup_uri,
-        workspace_query,
-        timeout,
-    )
-    .await?;
-    if primary == ReadinessValidationMethod::DocumentSymbol || primary_count > 0 {
+    let primary_response =
+        execute_readiness_validation(requester, primary, warmup_uri, workspace_query, timeout)
+            .await?;
+    if primary == ReadinessValidationMethod::DocumentSymbol || primary_response.symbol_count > 0 {
         return Ok(Some(ReadinessValidationResult {
             method: primary,
-            symbol_count: primary_count,
+            symbol_count: primary_response.symbol_count,
+            document_symbols: primary_response.document_symbols,
         }));
     }
     if capabilities.document_symbols {
-        let symbol_count = execute_readiness_validation(
+        let response = execute_readiness_validation(
             requester,
             ReadinessValidationMethod::DocumentSymbol,
             warmup_uri,
@@ -592,7 +799,8 @@ async fn execute_indexing_validation_once(
         .await?;
         return Ok(Some(ReadinessValidationResult {
             method: ReadinessValidationMethod::DocumentSymbol,
-            symbol_count,
+            symbol_count: response.symbol_count,
+            document_symbols: response.document_symbols,
         }));
     }
     Ok(None)
@@ -1144,18 +1352,17 @@ impl LspEnricher {
         let validation_capabilities =
             ReadinessValidationCapabilities::from_server_capabilities(&server_capabilities);
 
-        let has_references = init_result_parsed
-            .capabilities
-            .references_provider
-            .is_some();
-        let has_implementation = init_result_parsed
-            .capabilities
-            .implementation_provider
-            .is_some();
+        let has_references =
+            provider_is_enabled(&init_result_parsed.capabilities.references_provider);
+        let has_implementation = implementation_provider_is_enabled(
+            &init_result_parsed.capabilities.implementation_provider,
+        );
         let has_document_links = init_result_parsed
             .capabilities
             .document_link_provider
             .is_some();
+        let negotiated_capabilities =
+            negotiated_operation_capabilities(&init_result_parsed.capabilities, has_call_hierarchy);
         tracing::info!(
             "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}, workspace_symbols={}, document_symbols={}",
             self.server_command,
@@ -1441,7 +1648,7 @@ impl LspEnricher {
                                 self.server_command
                             )
                         })?;
-                        let symbol_count = execute_readiness_validation(
+                        let response = execute_readiness_validation(
                             transport,
                             readiness_method,
                             warmup_uri.as_deref(),
@@ -1452,16 +1659,18 @@ impl LspEnricher {
                         .with_context(|| {
                             format!("{} readiness probe failed", self.server_command)
                         })?;
+                        let symbol_count = response.symbol_count;
 
                         match readiness_method {
                             ReadinessValidationMethod::DocumentSymbol => {
                                 validation_evidence = Some(
-                                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                                    LspValidationEvidence::processed(
                                         self.language.clone(),
                                         self.server_command.clone(),
                                         readiness_method.method(),
                                         symbol_count,
-                                    ),
+                                    )
+                                    .with_document_symbols(response.document_symbols),
                                 );
                                 server_responsive = true;
                                 server_ready = true;
@@ -1607,9 +1816,8 @@ impl LspEnricher {
                     READINESS_REQUEST_TIMEOUT,
                 )
                 .await
-                .with_context(|| {
-                    format!("{} indexing validation failed", self.server_command)
-                })? {
+                .with_context(|| format!("{} indexing validation failed", self.server_command))?
+                {
                     tracing::info!(
                         "{} indexing validated via {}: {} symbols ({}s elapsed)",
                         self.server_command,
@@ -1618,12 +1826,13 @@ impl LspEnricher {
                         elapsed
                     );
                     validation_evidence = Some(
-                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                        LspValidationEvidence::processed(
                             self.language.clone(),
                             self.server_command.clone(),
                             validation.method.method(),
                             validation.symbol_count,
-                        ),
+                        )
+                        .with_document_symbols(validation.document_symbols),
                     );
                     server_ready = true;
                     saw_quiescent = true;
@@ -1701,13 +1910,17 @@ impl LspEnricher {
         // on validation (e.g., pyright before indexing completes) is NOT treated
         // as quiescent — Pass 1 and Pass 3 would produce 0 edges.
         state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-        state.validation_evidence = Some(validation_evidence.unwrap_or_else(|| {
-            crate::extract::scan_stats::LspValidationEvidence::not_validated(
-                self.language.clone(),
-                self.server_command.clone(),
-                "server did not complete an advertised readiness validation method",
-            )
-        }));
+        state.validation_evidence = Some(
+            validation_evidence
+                .unwrap_or_else(|| {
+                    LspValidationEvidence::not_validated(
+                        self.language.clone(),
+                        self.server_command.clone(),
+                        "server did not complete an advertised readiness validation method",
+                    )
+                })
+                .with_negotiated_capabilities(negotiated_capabilities),
+        );
         if !state.was_quiescent {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
@@ -2903,7 +3116,7 @@ impl Enricher for LspEnricher {
             has_pull_diagnostics,
             has_inlay_hints,
             was_quiescent,
-            validation_evidence,
+            mut validation_evidence,
             diag_sink,
         ) = {
             let state = self.state.lock().await;
@@ -2933,6 +3146,13 @@ impl Enricher for LspEnricher {
                 diag_sink,
             )
         };
+        if let Some(validation) = validation_evidence.as_mut() {
+            result.new_nodes.extend(materialize_document_symbol_nodes(
+                validation,
+                repo_root,
+                &matching_nodes,
+            )?);
+        }
         result.lsp_validation = validation_evidence;
         if let Some(validation) = result.lsp_validation.as_ref() {
             tracing::info!(
@@ -3148,7 +3368,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::str::FromStr;
 
-    use super::transport::{LspRpcError, find_enclosing_symbol, uri_to_relative_path};
+    use super::transport::{LspRpcError, find_enclosing_symbol};
     use super::*;
 
     enum ValidationFixtureResponse {
@@ -3211,26 +3431,45 @@ mod tests {
         ReadinessValidationCapabilities::from_server_capabilities(&result.capabilities)
     }
 
+    #[test]
+    fn negotiated_capabilities_report_initialize_providers_not_readiness_methods() {
+        let result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "referencesProvider": true,
+                "implementationProvider": false,
+                "documentLinkProvider": {"resolveProvider": false},
+                "documentSymbolProvider": {"label": "outline"}
+            }
+        }))
+        .expect("valid initialize fixture");
+        let negotiated = negotiated_operation_capabilities(&result.capabilities, true);
+        assert!(negotiated.references_provider);
+        assert!(negotiated.call_hierarchy_provider);
+        assert!(!negotiated.implementation_provider);
+        assert!(negotiated.document_link_provider);
+        assert!(negotiated.document_symbol_provider);
+    }
+
     #[tokio::test]
     async fn readiness_absent_or_false_workspace_capability_uses_only_document_symbols() {
         let absent = parsed_validation_capabilities(
             serde_json::json!({"capabilities": {"documentSymbolProvider": true}}),
         );
-        let explicit_false = parsed_validation_capabilities(
-            serde_json::json!({"capabilities": {
-                "workspaceSymbolProvider": false,
-                "documentSymbolProvider": {"label": "supported"}
-            }}),
+        let explicit_false = parsed_validation_capabilities(serde_json::json!({"capabilities": {
+            "workspaceSymbolProvider": false,
+            "documentSymbolProvider": {"label": "supported"}
+        }}));
+        assert_eq!(
+            absent.primary(),
+            Some(ReadinessValidationMethod::DocumentSymbol)
         );
-        assert_eq!(absent.primary(), Some(ReadinessValidationMethod::DocumentSymbol));
         assert_eq!(
             explicit_false.primary(),
             Some(ReadinessValidationMethod::DocumentSymbol)
         );
 
-        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(
-            serde_json::json!([]),
-        )]);
+        let mut fixture =
+            ValidationFixture::new([ValidationFixtureResponse::Success(serde_json::json!([]))]);
         let outcome = execute_indexing_validation_once(
             &mut fixture,
             explicit_false,
@@ -3276,6 +3515,80 @@ mod tests {
         );
         assert_eq!(evidence.symbol_count, Some(0));
         assert!(evidence.summary().contains("processed"));
+    }
+
+    #[tokio::test]
+    async fn document_symbol_payload_materializes_deterministic_graph_evidence() {
+        let response = serde_json::json!([{
+            "name": "Guide",
+            "kind": 3,
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 4, "character": 0}
+            },
+            "children": [{
+                "name": "Usage",
+                "kind": 3,
+                "range": {
+                    "start": {"line": 2, "character": 0},
+                    "end": {"line": 4, "character": 0}
+                }
+            }]
+        }]);
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(response)]);
+        let outcome = execute_indexing_validation_once(
+            &mut fixture,
+            validation_capabilities(false, true),
+            Some("file:///fixture/docs/guide.md"),
+            "",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("document validation should succeed")
+        .expect("document validation should be terminal");
+        assert_eq!(outcome.symbol_count, 2);
+        assert_eq!(outcome.document_symbols.len(), 2);
+
+        let mut validation = LspValidationEvidence::processed(
+            "markdown",
+            "fixture-server",
+            outcome.method.method(),
+            outcome.symbol_count,
+        )
+        .with_document_symbols(outcome.document_symbols)
+        .with_negotiated_capabilities(LspNegotiatedCapabilities {
+            document_symbol_provider: true,
+            ..LspNegotiatedCapabilities::default()
+        });
+        let extracted = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let nodes = materialize_document_symbol_nodes(
+            &mut validation,
+            Path::new("/fixture"),
+            &[&extracted],
+        )
+        .expect("response evidence should map to graph nodes");
+        assert_eq!(nodes.len(), 2);
+        assert!(validation.document_symbols.iter().all(|symbol| {
+            symbol.file.as_deref() == Some("docs/guide.md")
+                && symbol
+                    .graph_result_id
+                    .as_deref()
+                    .is_some_and(|result_id| nodes.iter().any(|node| node.stable_id() == result_id))
+        }));
     }
 
     #[tokio::test]

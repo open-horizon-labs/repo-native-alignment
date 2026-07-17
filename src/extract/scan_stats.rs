@@ -74,14 +74,51 @@ pub enum LspValidationStatus {
     NotValidated,
 }
 
+pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+
+/// Exact per-file operation capabilities negotiated in the initialize response.
+/// Readiness/quiescence methods deliberately do not appear here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LspNegotiatedCapabilities {
+    pub references_provider: bool,
+    pub call_hierarchy_provider: bool,
+    pub implementation_provider: bool,
+    pub document_link_provider: bool,
+    pub document_symbol_provider: bool,
+}
+
+/// Normalized document-symbol payload retained across the durable job-evidence seam.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct LspDocumentSymbolEvidence {
+    pub uri: String,
+    pub name: String,
+    pub kind: u32,
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    /// Digest of the normalized response item used to derive graph identity.
+    pub payload_digest: String,
+    /// Populated only after the response item is mapped to an emitted graph node.
+    pub graph_result_id: Option<String>,
+    /// Normalized repo-relative file populated alongside `graph_result_id`.
+    pub file: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LspValidationEvidence {
+    #[serde(default)]
+    pub schema_version: u32,
     pub language: String,
     pub server_name: String,
     pub status: LspValidationStatus,
     pub method: Option<String>,
     pub symbol_count: Option<usize>,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_capabilities: Option<LspNegotiatedCapabilities>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_symbols: Vec<LspDocumentSymbolEvidence>,
 }
 
 impl LspValidationEvidence {
@@ -92,12 +129,15 @@ impl LspValidationEvidence {
         symbol_count: usize,
     ) -> Self {
         Self {
+            schema_version: LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION,
             language: language.into(),
             server_name: server_name.into(),
             status: LspValidationStatus::Processed,
             method: Some(method.into()),
             symbol_count: Some(symbol_count),
             detail: None,
+            negotiated_capabilities: None,
+            document_symbols: Vec::new(),
         }
     }
 
@@ -107,12 +147,15 @@ impl LspValidationEvidence {
         detail: impl Into<String>,
     ) -> Self {
         Self {
+            schema_version: LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION,
             language: language.into(),
             server_name: server_name.into(),
             status: LspValidationStatus::NotValidated,
             method: None,
             symbol_count: None,
             detail: Some(detail.into()),
+            negotiated_capabilities: None,
+            document_symbols: Vec::new(),
         }
     }
 
@@ -122,13 +165,27 @@ impl LspValidationEvidence {
         method: impl Into<String>,
     ) -> Self {
         Self {
+            schema_version: LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION,
             language: language.into(),
             server_name: server_name.into(),
             status: LspValidationStatus::Quiescent,
             method: Some(method.into()),
             symbol_count: None,
             detail: None,
+            negotiated_capabilities: None,
+            document_symbols: Vec::new(),
         }
+    }
+
+    pub fn with_negotiated_capabilities(mut self, capabilities: LspNegotiatedCapabilities) -> Self {
+        self.negotiated_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_document_symbols(mut self, mut symbols: Vec<LspDocumentSymbolEvidence>) -> Self {
+        symbols.sort();
+        self.document_symbols = symbols;
+        self
     }
 
     pub fn summary(&self) -> String {

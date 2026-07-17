@@ -17,15 +17,16 @@ use std::time::{Duration, Instant};
 use crate::business_context::BusinessContextMode;
 use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemState};
 use crate::extract::scan_stats::{
-    LspEnrichmentEntry, LspStatus, LspValidationEvidence, LspValidationStatus,
+    LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION, LspEnrichmentEntry, LspStatus, LspValidationEvidence,
+    LspValidationStatus,
 };
-use crate::graph::{Edge, EdgeKind, ExtractionSource, Node};
+use crate::graph::{Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::server::{
     EnrichmentCapability, EnrichmentJobLedger, EnrichmentJobRecord, EnrichmentJobState,
     LspEvidenceReadiness,
 };
 
-pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 2;
+pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 3;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v1";
@@ -601,11 +602,15 @@ fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
             continue;
         }
 
-        if file.advertised_capabilities.is_empty() {
+        if !file
+            .advertised_capabilities
+            .iter()
+            .any(|capability| capability.supported)
+        {
             violations.push(ReadinessViolation {
                 code: ReadinessViolationCode::MissingAdvertisedCapabilities,
                 path: Some(path.clone()),
-                detail: "processed file has no persisted advertised-capability evidence"
+                detail: "processed file has no supported negotiated operation capability"
                     .to_string(),
             });
         }
@@ -1273,7 +1278,8 @@ fn build_report(
         let (advertised_capabilities, requests_attempted) =
             evidence_from_work_items(&records, &language_entries, &validations);
         let persisted_results = persisted_results_for_path(&normalized, nodes, edges);
-        let (expected_results, expected_result_ids) = expected_evidence_from_work_items(&records);
+        let (expected_results, expected_result_ids) =
+            expected_evidence_from_work_items(&records, &validations, &normalized);
         let terminal_status = terminal_status_for_file(
             &normalized,
             &records,
@@ -1308,31 +1314,45 @@ fn evidence_from_work_items(
     language_entries: &[&LspEnrichmentEntry],
     validations: &[&LspValidationEvidence],
 ) -> (Vec<AdvertisedCapability>, Vec<RequestAttempt>) {
-    let mut capabilities = BTreeSet::new();
-    let mut requests = Vec::new();
-    for entry in language_entries {
-        if let Some(validation) = &entry.validation
-            && let Some(method) = validation.method.as_deref()
-        {
+    fn insert_negotiated_capabilities(
+        capabilities: &mut BTreeSet<AdvertisedCapability>,
+        validation: &LspValidationEvidence,
+    ) {
+        let Some(negotiated) = validation.negotiated_capabilities else {
+            return;
+        };
+        for (name, supported) in [
+            ("referencesProvider", negotiated.references_provider),
+            ("callHierarchyProvider", negotiated.call_hierarchy_provider),
+            ("implementationProvider", negotiated.implementation_provider),
+            ("documentLinkProvider", negotiated.document_link_provider),
+            (
+                "documentSymbolProvider",
+                negotiated.document_symbol_provider,
+            ),
+        ] {
             capabilities.insert(AdvertisedCapability {
-                name: method.to_string(),
-                supported: validation.status != LspValidationStatus::NotValidated,
+                name: name.to_string(),
+                supported,
             });
         }
     }
+
+    let mut capabilities = BTreeSet::new();
+    let mut requests = Vec::new();
+    for entry in language_entries {
+        if let Some(validation) = &entry.validation {
+            insert_negotiated_capabilities(&mut capabilities, validation);
+        }
+    }
     for validation in validations {
-        if let Some(method) = validation.method.as_deref() {
-            capabilities.insert(AdvertisedCapability {
-                name: method.to_string(),
-                supported: validation.status != LspValidationStatus::NotValidated,
-            });
+        insert_negotiated_capabilities(&mut capabilities, validation);
+        if validation.status == LspValidationStatus::Processed
+            && let Some(method) = validation.method.as_deref()
+        {
             requests.push(RequestAttempt {
                 method: method.to_string(),
-                outcome: if validation.status == LspValidationStatus::NotValidated {
-                    RequestOutcome::Failed
-                } else {
-                    RequestOutcome::Completed
-                },
+                outcome: RequestOutcome::Completed,
                 result_count: validation.symbol_count.map(|count| count as u64),
                 duration_ms: None,
                 detail: validation.detail.clone(),
@@ -1417,8 +1437,16 @@ fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> Per
         node.source == ExtractionSource::Lsp
             && node.id.file.to_string_lossy().replace('\\', "/") == path
     }) {
-        results.document_symbols += 1;
         results.provenance.insert(node.stable_id());
+        match &node.id.kind {
+            NodeKind::Other(kind) if kind == "lsp_document_symbol" => {
+                results.document_symbols += 1;
+            }
+            NodeKind::Other(kind) if kind == "diagnostic" => {
+                results.diagnostics += 1;
+            }
+            _ => {}
+        }
     }
     for edge in edges
         .iter()
@@ -1500,6 +1528,8 @@ fn runtime_compatibility_violations(
 
 fn expected_evidence_from_work_items(
     records: &[&LspWorkItemRecord],
+    validations: &[&LspValidationEvidence],
+    path: &str,
 ) -> (BTreeSet<ExpectedResultKind>, BTreeSet<String>) {
     let mut expected = BTreeSet::new();
     let mut expected_ids = BTreeSet::new();
@@ -1525,6 +1555,16 @@ fn expected_evidence_from_work_items(
                     expected.insert(kind);
                 }
             }
+        }
+    }
+    for symbol in validations
+        .iter()
+        .flat_map(|validation| validation.document_symbols.iter())
+        .filter(|symbol| symbol.file.as_deref() == Some(path))
+    {
+        expected.insert(ExpectedResultKind::DocumentSymbol);
+        if let Some(result_id) = &symbol.graph_result_id {
+            expected_ids.insert(result_id.clone());
         }
     }
     (expected, expected_ids)
@@ -1621,6 +1661,33 @@ fn terminal_status_for_file(
     if validations.is_empty() {
         return FileTerminalStatus::Degraded {
             detail: "related LSP job has no durable validation for this language".to_string(),
+        };
+    }
+    if validations.iter().any(|validation| {
+        validation.schema_version != LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION
+            || validation.negotiated_capabilities.is_none()
+    }) {
+        return FileTerminalStatus::Degraded {
+            detail:
+                "durable language-server validation lacks current negotiated-capability evidence"
+                    .to_string(),
+        };
+    }
+    if validations.iter().any(|validation| {
+        if validation.method.as_deref() != Some("textDocument/documentSymbol") {
+            return !validation.document_symbols.is_empty();
+        }
+        let count = validation.symbol_count.unwrap_or_default();
+        validation.document_symbols.len() != count
+            || validation.document_symbols.iter().any(|symbol| {
+                symbol.payload_digest.is_empty()
+                    || symbol.file.is_none()
+                    || symbol.graph_result_id.is_none()
+            })
+    }) {
+        return FileTerminalStatus::Degraded {
+            detail: "document-symbol response evidence was not mapped completely to graph results"
+                .to_string(),
         };
     }
     if validations
@@ -2371,7 +2438,7 @@ mod tests {
             FileTerminalStatus::Processed { result_count: 1 },
         );
         (file.expected_results, file.expected_result_ids) =
-            expected_evidence_from_work_items(&records);
+            expected_evidence_from_work_items(&records, &[], "src/a.py");
         file.persisted_results = persisted_results_for_path("src/a.py", &[], &[]);
         let missing = report(vec![file.clone()]);
         assert!(
@@ -2587,35 +2654,150 @@ mod tests {
         let node = Node {
             id: NodeId {
                 root: "root".to_string(),
-                file: PathBuf::from("src/a.py"),
-                name: "symbol".to_string(),
-                kind: NodeKind::Function,
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide@0123456789abcdef".to_string(),
+                kind: NodeKind::Other("lsp_document_symbol".to_string()),
             },
-            language: "python".to_string(),
+            language: "markdown".to_string(),
             line_start: 1,
             line_end: 1,
-            signature: "def symbol():".to_string(),
+            signature: "documentSymbol Guide (3)".to_string(),
             body: String::new(),
             metadata: BTreeMap::new(),
             source: ExtractionSource::Lsp,
         };
-        let record = LspWorkItemRecord {
-            file: "src/a.py".to_string(),
-            state: LspWorkItemState::Completed,
-            output_nodes: vec![node.clone()],
-            ..LspWorkItemRecord::default()
-        };
+        let validation = LspValidationEvidence::processed(
+            "markdown",
+            "marksman",
+            "textDocument/documentSymbol",
+            1,
+        )
+        .with_negotiated_capabilities(crate::extract::scan_stats::LspNegotiatedCapabilities {
+            document_symbol_provider: true,
+            ..crate::extract::scan_stats::LspNegotiatedCapabilities::default()
+        })
+        .with_document_symbols(vec![
+            crate::extract::scan_stats::LspDocumentSymbolEvidence {
+                uri: "file:///fixture/docs/guide.md".to_string(),
+                name: "Guide".to_string(),
+                kind: 3,
+                start_line: 0,
+                start_character: 0,
+                end_line: 0,
+                end_character: 5,
+                payload_digest: "0123456789abcdef".to_string(),
+                graph_result_id: Some(node.stable_id()),
+                file: Some("docs/guide.md".to_string()),
+            },
+        ]);
         let mut file = included(
-            "src/a.py",
+            "docs/guide.md",
             FileTerminalStatus::Processed { result_count: 1 },
         );
+        file.role = FileRole::Docs;
         (file.expected_results, file.expected_result_ids) =
-            expected_evidence_from_work_items(&[&record]);
-        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[]);
+            expected_evidence_from_work_items(&[], &[&validation], "docs/guide.md");
+        file.persisted_results = persisted_results_for_path("docs/guide.md", &[], &[]);
         assert!(!report(vec![file.clone()]).is_ready());
 
-        file.persisted_results = persisted_results_for_path("src/a.py", &[node], &[]);
+        file.persisted_results = persisted_results_for_path("docs/guide.md", &[node], &[]);
         assert!(report(vec![file]).is_ready());
+    }
+
+    #[test]
+    fn mock_fixture_proves_docs_source_and_test_graph_persistence() {
+        assert!(
+            include_str!("../tests/fixtures/lsp_capability_repo/docs/guide.md")
+                .contains("the source")
+        );
+        assert!(
+            include_str!("../tests/fixtures/lsp_capability_repo/src/app.py").contains("def greet")
+        );
+        assert!(
+            include_str!("../tests/fixtures/lsp_capability_repo/tests/test_app.py")
+                .contains("test_greet")
+        );
+
+        let doc_node = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Fixture guide@docproof".to_string(),
+                kind: NodeKind::Other("lsp_document_symbol".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 3,
+            signature: "documentSymbol Fixture guide (3)".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Lsp,
+        };
+        let relation = Edge {
+            from: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("tests/test_app.py"),
+                name: "test_greet".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "greet".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let docs_persisted = persisted_results_for_path(
+            "docs/guide.md",
+            std::slice::from_ref(&doc_node),
+            std::slice::from_ref(&relation),
+        );
+        let source_persisted = persisted_results_for_path(
+            "src/app.py",
+            std::slice::from_ref(&doc_node),
+            std::slice::from_ref(&relation),
+        );
+        let test_persisted = persisted_results_for_path(
+            "tests/test_app.py",
+            std::slice::from_ref(&doc_node),
+            std::slice::from_ref(&relation),
+        );
+        assert_eq!(docs_persisted.document_symbols, 1);
+        assert_eq!(source_persisted.call_hierarchy_edges, 1);
+        assert_eq!(test_persisted.call_hierarchy_edges, 1);
+
+        for (path, role) in [
+            ("docs/guide.md", FileRole::Docs),
+            ("src/app.py", FileRole::Source),
+            ("tests/test_app.py", FileRole::Test),
+        ] {
+            let absolute = Path::new("tests/fixtures/lsp_capability_repo").join(path);
+            assert_eq!(classify_file(Path::new(path), &absolute).0, role);
+        }
+        for path in ["src/app.py", "tests/test_app.py"] {
+            let record = LspWorkItemRecord {
+                file: path.to_string(),
+                node_kind: "function".to_string(),
+                requested_operations: vec!["references".to_string()],
+                state: LspWorkItemState::Completed,
+                output_edges: vec![relation.clone()],
+                observed_result_count: 1,
+                ..LspWorkItemRecord::default()
+            };
+            let (kinds, ids) = expected_evidence_from_work_items(&[&record], &[], path);
+            assert!(kinds.contains(&ExpectedResultKind::CallHierarchy));
+            assert!(ids.contains(&relation.stable_id()));
+            let persisted = if path == "src/app.py" {
+                &source_persisted
+            } else {
+                &test_persisted
+            };
+            assert!(persisted.provenance.contains(&relation.stable_id()));
+        }
     }
 
     #[test]
@@ -2655,16 +2837,31 @@ mod tests {
 
     #[test]
     fn durable_validation_is_request_and_capability_evidence() {
-        let validation = LspValidationEvidence {
-            language: "python".to_string(),
-            server_name: "pyright".to_string(),
-            status: LspValidationStatus::Processed,
-            method: Some("textDocument/documentSymbol".to_string()),
-            symbol_count: Some(2),
-            detail: None,
-        };
+        let validation =
+            LspValidationEvidence::processed("python", "pyright", "workspace/symbol", 2)
+                .with_negotiated_capabilities(
+                    crate::extract::scan_stats::LspNegotiatedCapabilities {
+                        references_provider: true,
+                        call_hierarchy_provider: false,
+                        implementation_provider: true,
+                        document_link_provider: false,
+                        document_symbol_provider: true,
+                    },
+                );
         let (capabilities, requests) = evidence_from_work_items(&[], &[], &[&validation]);
-        assert_eq!(capabilities[0].name, "textDocument/documentSymbol");
+        assert!(
+            capabilities.iter().any(|capability| {
+                capability.name == "referencesProvider" && capability.supported
+            })
+        );
+        assert!(capabilities.iter().any(|capability| {
+            capability.name == "callHierarchyProvider" && !capability.supported
+        }));
+        assert!(
+            capabilities
+                .iter()
+                .all(|capability| capability.name != "workspace/symbol")
+        );
         assert_eq!(requests[0].result_count, Some(2));
         assert_eq!(requests[0].outcome, RequestOutcome::Completed);
     }
@@ -2698,7 +2895,7 @@ mod tests {
             FileTerminalStatus::Processed { result_count: 1 },
         );
         (file.expected_results, file.expected_result_ids) =
-            expected_evidence_from_work_items(&[&record]);
+            expected_evidence_from_work_items(&[&record], &[], "src/a.py");
         assert!(
             file.expected_results
                 .contains(&ExpectedResultKind::CallHierarchy)
