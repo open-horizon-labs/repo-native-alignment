@@ -546,7 +546,7 @@ fn format_verbose_readiness(
     let lsp_status = inferred_lsp_status.as_ref().or(ctx.lsp_status);
 
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         format_freshness_full(
             gs.nodes.len(),
             gs.last_scan_completed_at,
@@ -560,8 +560,42 @@ fn format_verbose_readiness(
             semantic_index_attached,
             semantic_index_available,
         ),
+        format_lsp_completeness(ctx.repo_root),
         format_enrichment_jobs(ctx),
     )
+}
+
+fn format_lsp_completeness(repo_root: &Path) -> String {
+    match crate::lsp_completeness::load_readiness_check(
+        repo_root,
+        crate::business_context::BusinessContextMode::Disabled,
+    ) {
+        Ok(check) => {
+            let blocked_paths = check
+                .report
+                .violations
+                .iter()
+                .filter_map(|violation| violation.path.as_deref())
+                .collect::<std::collections::BTreeSet<_>>();
+            let covered = check
+                .report
+                .files
+                .iter()
+                .filter(|file| {
+                    file.role.is_included() && !blocked_paths.contains(file.path.as_str())
+                })
+                .count();
+            format!(
+                "\n- **benchmark per-file LSP completeness**: {} — {}/{} included files covered; {} violation(s); digest={}",
+                if check.ready { "ready" } else { "partial/degraded" },
+                covered,
+                check.report.summary.included_files,
+                check.report.violations.len() + check.compatibility_violations.len(),
+                check.report.digest,
+            )
+        }
+        Err(_) => "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string(),
+    }
 }
 
 fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
@@ -6007,5 +6041,55 @@ mod tests {
             !result.contains("filtered_fn_b"),
             "fn_b should NOT appear (Calls edge is filtered)"
         );
+    }
+
+    #[test]
+    fn persisted_per_file_lsp_completeness_is_mcp_visible() {
+        use crate::lsp_completeness::{
+            AdvertisedCapability, FileCoverageRecord, FileRole, FileTerminalStatus,
+            LspCompletenessReport, PersistedResults, RequestAttempt, RequestOutcome,
+            ServerIdentity,
+        };
+
+        let repo = tempfile::tempdir().unwrap();
+        let identity = crate::lsp_completeness::current_report_identity(
+            repo.path(),
+            crate::business_context::BusinessContextMode::Disabled,
+        )
+        .unwrap();
+        let report = LspCompletenessReport::new(
+            identity,
+            vec![FileCoverageRecord {
+                path: "src/app.py".to_string(),
+                role: FileRole::Source,
+                language: Some("python".to_string()),
+                expected_server: Some(ServerIdentity {
+                    name: "pyright-langserver".to_string(),
+                    version: Some("1.1.0".to_string()),
+                    executable_digest: Some("blake3:fixture".to_string()),
+                }),
+                advertised_capabilities: vec![AdvertisedCapability {
+                    name: "textDocument/references".to_string(),
+                    supported: true,
+                }],
+                requests_attempted: vec![RequestAttempt {
+                    method: "textDocument/references".to_string(),
+                    outcome: RequestOutcome::Completed,
+                    result_count: Some(0),
+                    duration_ms: Some(1),
+                    detail: None,
+                }],
+                expected_results: Default::default(),
+                expected_result_ids: Default::default(),
+                persisted_results: PersistedResults::default(),
+                terminal_status: FileTerminalStatus::Processed { result_count: 0 },
+                exclusion: None,
+            }],
+        );
+        crate::lsp_completeness::persist_report(repo.path(), &report).unwrap();
+        let rendered = format_lsp_completeness(repo.path());
+        assert!(rendered.contains("benchmark per-file LSP completeness**: ready"));
+        assert!(rendered.contains(&report.digest));
+        assert!(rendered.contains("1/1 included files covered"));
     }
 }

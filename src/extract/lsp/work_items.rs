@@ -751,6 +751,34 @@ pub fn load_queue_snapshots(
     Ok(snapshots_from_store(&store, limit))
 }
 
+/// Load durable work-item evidence updated during the current enrichment run.
+///
+/// The completeness report consumes these records immediately after a full
+/// scan. Filtering at the persistence seam prevents an older successful job
+/// for the same path from being mistaken for evidence produced by this scan.
+pub(crate) fn load_records_since(
+    repo_root: &Path,
+    updated_since_ms: u64,
+) -> Result<Vec<LspWorkItemRecord>> {
+    let store = load_store(repo_root)?;
+    let mut records = store
+        .records
+        .into_values()
+        .filter(|record| record.updated_at_ms >= updated_since_ms)
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    Ok(records)
+}
+
+pub(crate) fn load_all_records(repo_root: &Path) -> Result<Vec<LspWorkItemRecord>> {
+    load_records_since(repo_root, 0)
+}
+
 pub fn load_queue_snapshots_since(
     repo_root: &Path,
     updated_since_ms: u64,

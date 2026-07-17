@@ -46,6 +46,8 @@ enum Commands {
     Setup(SetupArgs),
     Test(TestArgs),
     Scan(ScanArgs),
+    /// Verify persisted per-file LSP completeness before benchmark/model access.
+    LspReadiness(LspReadinessArgs),
     Enrich(EnrichArgs),
     Search(SearchArgs),
     Graph(GraphArgs),
@@ -94,6 +96,24 @@ struct ScanArgs {
     timings: bool,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct LspReadinessArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit the complete machine-readable report and compatibility result.
+    #[arg(long)]
+    json: bool,
+    /// Persisted checkout report to include in a no-spend aggregate gate.
+    #[arg(long = "aggregate-report")]
+    aggregate_reports: Vec<PathBuf>,
+    /// Destination for the deterministic aggregate manifest.
+    #[arg(long, requires = "aggregate_reports")]
+    aggregate_output: Option<PathBuf>,
+    /// Exact number of checkout reports required by the aggregate gate.
+    #[arg(long, default_value_t = 70, requires = "aggregate_reports")]
+    require_checkouts: u64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -743,6 +763,10 @@ async fn async_main() -> anyhow::Result<()> {
             }
             if args.full {
                 eprintln!("Full pipeline scan: {}", repo_root.display());
+                let scan_started_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 let handler = RnaHandler {
                     repo_root: repo_root.clone(),
                     business_context: BusinessContextAdmission::new(business_context_mode),
@@ -765,6 +789,35 @@ async fn async_main() -> anyhow::Result<()> {
                 if args.timings {
                     eprintln!();
                     eprintln!("{}", result.report.render_cli(true));
+                }
+                if business_context_mode.is_disabled() {
+                    let graph_snapshot = handler.graph.load_full();
+                    let graph = graph_snapshot.as_ref().as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("full scan completed without a graph snapshot")
+                    })?;
+                    let completeness =
+                        repo_native_alignment::lsp_completeness::build_and_persist_report(
+                            &repo_root,
+                            business_context_mode,
+                            &graph.nodes,
+                            &graph.edges,
+                            &result.lsp_entries,
+                            scan_started_at_ms,
+                        )?;
+                    eprintln!(
+                        "LSP completeness: {} included file(s), {} violation(s), digest={}",
+                        completeness.summary.included_files,
+                        completeness.violations.len(),
+                        completeness.digest,
+                    );
+                    if !completeness.is_ready() {
+                        anyhow::bail!(
+                            "benchmark LSP completeness blocked by {} per-file violation(s); inspect {}",
+                            completeness.violations.len(),
+                            repo_native_alignment::lsp_completeness::report_path(&repo_root)
+                                .display(),
+                        );
+                    }
                 }
                 if let Some(degraded) = result.report.capabilities.iter().find(|capability| {
                     capability.capability == EnrichmentCapability::CallReferences
@@ -948,6 +1001,73 @@ async fn async_main() -> anyhow::Result<()> {
                 business_context: &handler.business_context,
             });
             return Ok(());
+        }
+        Some(Commands::LspReadiness(args)) => {
+            init_tracing("warn", log_path.as_deref());
+            if !args.aggregate_reports.is_empty() {
+                let reports = args
+                    .aggregate_reports
+                    .iter()
+                    .map(|path| repo_native_alignment::lsp_completeness::load_report_path(path))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let aggregate = repo_native_alignment::lsp_completeness::AggregateCompletenessReport::from_reports(&reports);
+                let output = args.aggregate_output.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--aggregate-output is required with --aggregate-report")
+                })?;
+                repo_native_alignment::lsp_completeness::persist_aggregate_report(
+                    output, &aggregate,
+                )?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+                } else {
+                    println!(
+                        "LSP aggregate readiness: {} ({}/{} ready, {} unique checkouts, {} files, digest={})",
+                        if aggregate.is_ready(args.require_checkouts) {
+                            "READY"
+                        } else {
+                            "BLOCKED"
+                        },
+                        aggregate.counts.ready_checkouts,
+                        aggregate.counts.checkouts,
+                        aggregate.counts.unique_checkouts,
+                        aggregate.counts.files,
+                        aggregate.digest,
+                    );
+                }
+                std::process::exit(if aggregate.is_ready(args.require_checkouts) {
+                    0
+                } else {
+                    2
+                });
+            }
+            let repo_root = args.repo.canonicalize()?;
+            let check = repo_native_alignment::lsp_completeness::load_readiness_check(
+                &repo_root,
+                business_context_mode,
+            )?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&check)?);
+            } else {
+                println!("{}", check.human_summary());
+                for violation in check
+                    .report
+                    .violations
+                    .iter()
+                    .chain(check.compatibility_violations.iter())
+                {
+                    println!(
+                        "- {:?}{}: {}",
+                        violation.code,
+                        violation
+                            .path
+                            .as_deref()
+                            .map(|path| format!(" [{path}]"))
+                            .unwrap_or_default(),
+                        violation.detail,
+                    );
+                }
+            }
+            std::process::exit(if check.ready { 0 } else { 2 });
         }
         Some(Commands::Enrich(args)) => {
             init_tracing("info", log_path.as_deref());
@@ -1499,6 +1619,50 @@ async fn async_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
+
+    #[test]
+    fn lsp_readiness_cli_exposes_checkout_and_aggregate_modes() {
+        let checkout = Cli::try_parse_from([
+            "repo-native-alignment",
+            "--business-context",
+            "disabled",
+            "lsp-readiness",
+            "--repo",
+            "/tmp/checkout",
+            "--json",
+        ])
+        .expect("checkout readiness CLI should parse");
+        let Some(Commands::LspReadiness(args)) = checkout.command else {
+            panic!("expected lsp-readiness command");
+        };
+        assert_eq!(checkout.business_context, BusinessContextMode::Disabled);
+        assert_eq!(args.repo, PathBuf::from("/tmp/checkout"));
+        assert!(args.json);
+        assert!(args.aggregate_reports.is_empty());
+
+        let aggregate = Cli::try_parse_from([
+            "repo-native-alignment",
+            "lsp-readiness",
+            "--aggregate-report",
+            "/tmp/a.json",
+            "--aggregate-report",
+            "/tmp/b.json",
+            "--aggregate-output",
+            "/tmp/aggregate.json",
+            "--require-checkouts",
+            "2",
+        ])
+        .expect("aggregate readiness CLI should parse");
+        let Some(Commands::LspReadiness(args)) = aggregate.command else {
+            panic!("expected lsp-readiness command");
+        };
+        assert_eq!(args.aggregate_reports.len(), 2);
+        assert_eq!(
+            args.aggregate_output,
+            Some(PathBuf::from("/tmp/aggregate.json"))
+        );
+        assert_eq!(args.require_checkouts, 2);
+    }
 
     #[test]
     fn enrich_cli_exposes_target_scope_and_visible_budget() {

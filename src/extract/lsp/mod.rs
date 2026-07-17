@@ -70,6 +70,14 @@ impl BuiltinLspDescriptor {
         self.language
     }
 
+    pub(crate) fn command(&self) -> &'static str {
+        self.command
+    }
+
+    pub(crate) fn extensions(&self) -> &'static [&'static str] {
+        self.extensions
+    }
+
     pub(crate) fn build(&self) -> LspEnricher {
         let mut enricher =
             LspEnricher::new(self.language, self.command, self.args, self.extensions);
@@ -229,6 +237,18 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
 
 pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
     BUILTIN_LSP_DESCRIPTORS
+}
+
+pub(crate) fn builtin_lsp_descriptor_for_path(
+    path: &Path,
+) -> Option<&'static BuiltinLspDescriptor> {
+    let extension = path.extension()?.to_str()?;
+    BUILTIN_LSP_DESCRIPTORS.iter().find(|descriptor| {
+        descriptor
+            .extensions()
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+    })
 }
 
 /// Planner-safe projection of the shared query profile. Changed-file planning
