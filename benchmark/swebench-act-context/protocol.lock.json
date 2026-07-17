@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "material_format": "<sha256> <byte-count> <repo-relative-path> LF, sorted by path",
+  "files": [
+    {
+      "path": "benchmark/swebench-act-context/README.md",
+      "bytes": 9691,
+      "sha256": "a70c41e2d40599c3c3ff63a9dae601459d1a46fc3e909ef8ed5dd50a86664733"
+    },
+    {
+      "path": "benchmark/swebench-act-context/packet-vector.json",
+      "bytes": 12746,
+      "sha256": "a647fd1bbda7350535517f3cdea6bb52b7d156ebbab596a07ac0c199e0c77bfd"
+    },
+    {
+      "path": "benchmark/swebench-act-context/population.json",
+      "bytes": 94248,
+      "sha256": "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
+    },
+    {
+      "path": "benchmark/swebench-act-context/protocol.json",
+      "bytes": 48825,
+      "sha256": "c2fe41f9d7353a9fe2e81d0bfcae1ea7c02074eb63de5dcad0f60d3adf5cc10d"
+    },
+    {
+      "path": "benchmark/swebench-act-context/runtime-config.json",
+      "bytes": 631,
+      "sha256": "906611685de24efcaafc536328557d1d2a826d1252649435714843290153901d"
+    },
+    {
+      "path": "benchmark/swebench-act-context/upstream/LICENSE",
+      "bytes": 1073,
+      "sha256": "d908118fd95dbc8bea42747d1dacfdfe30db655bfb3047b00b8992453a43b969"
+    },
+    {
+      "path": "benchmark/swebench-act-context/upstream/edit_patch_v2.py",
+      "bytes": 6159,
+      "sha256": "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e"
+    },
+    {
+      "path": "scripts/tests/test_swebench_act_context_protocol.py",
+      "bytes": 83671,
+      "sha256": "920e5f096a2d4984462f6be378e7804b37d4b9e044274b4ddbc501d1842dad88"
+    },
+    {
+      "path": "scripts/validate_swebench_act_context_protocol.py",
+      "bytes": 141517,
+      "sha256": "ba3417b342c9b8083ca13be0c212be828173cb44242a2e30a694fd8354bc0c28"
+    }
+  ],
+  "bundle_sha256": "f215e4097c2604cdbcf11bfbf342d8179726de5a489fa1fb6861b214670e84ee"
+}
