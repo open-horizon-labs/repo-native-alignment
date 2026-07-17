@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import shutil
 import sys
@@ -458,6 +460,10 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             "github": "gh" + "p_" + "A" * 36,
             "aws_access_key": "AK" + "IA" + "A" * 16,
             "aws_secret": "aws_" + "secret_access_key=" + "A" * 40,
+            "aws_iam_arn": (
+                "arn:" + "aws:iam::" + "123456" + "789012" + ":role/example"
+            ),
+            "aws_account_id": "123456" + "789012",
             "slack": "xo" + "xb-" + "A" * 20,
             "bearer": "Bear" + "er " + "A" * 24,
             "private_key": "-----BEGIN " + "PRIVATE KEY-----",
@@ -473,6 +479,12 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     "runtime config contains a credential-shaped value", errors
                 )
                 self.assertFalse(any(synthetic_value in error for error in errors))
+        account_digits = "123456" + "789012"
+        self.assertIsNotNone(VALIDATOR.SECRET_VALUE.search("id=" + account_digits))
+        self.assertIsNone(VALIDATOR.SECRET_VALUE.search("0." + account_digits))
+        self.assertIsNone(
+            VALIDATOR.SECRET_VALUE.search("prefixA" + account_digits + "B")
+        )
 
     def test_paired_difference_interval_and_h2_token_vectors_are_frozen(self) -> None:
         interval = self.protocol["statistics"]["paired_difference_interval"]
@@ -582,6 +594,107 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         VALIDATOR.validate_packet_vector(vector, errors)
         self.assertIn("acquisition locus 1 stable_id drift", errors)
 
+    def test_acquisition_relationships_are_bound_to_locus_seeds(self) -> None:
+        vector = copy.deepcopy(self.vector)
+        acquisition = vector["metadata"]["acquisition"]
+        acquisition["relationships"][0]["target"] = "src/oversize.py:oversize:function"
+        for record in vector["records"]:
+            if record["kind"] == "candidate":
+                record["header"]["relationships"] = VALIDATOR._project_relationships(
+                    record["header"]["stable_id"], acquisition["relationships"]
+                )
+        vector["expected_b_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "B")
+        )
+        vector["expected_c_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "C")
+        )
+
+        errors: list[str] = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn(
+            "packet acquisition relationship 1 is not bound to its locus seed",
+            errors,
+        )
+
+    def test_acquisition_admission_and_omissions_are_replayed(self) -> None:
+        candidates = self.vector["metadata"]["acquisition"]["candidates"]
+        decisions, omissions = VALIDATOR._replay_candidate_admission(candidates)
+        self.assertEqual(decisions, [True, False, True])
+        self.assertEqual(
+            omissions,
+            [
+                {
+                    "candidate_stable_id": "src/oversize.py:oversize:function",
+                    "reason": "full_body_budget",
+                    "required_bytes": 70000,
+                    "remaining_budget_bytes": 65354,
+                }
+            ],
+        )
+
+        cap_candidates = [
+            {
+                "stable_id": f"candidate-{ordinal}",
+                "eligibility": "eligible",
+                "full_body_byte_length": 1,
+            }
+            for ordinal in range(1, 26)
+        ]
+        cap_candidates.append(
+            {
+                "stable_id": "ineligible-after-cap",
+                "eligibility": "not_source_backed",
+                "full_body_byte_length": 1,
+            }
+        )
+        decisions, omissions = VALIDATOR._replay_candidate_admission(cap_candidates)
+        self.assertEqual(decisions, [True] * 24 + [False, False])
+        self.assertEqual(
+            omissions,
+            [
+                {
+                    "candidate_stable_id": "candidate-25",
+                    "reason": "maximum_candidates",
+                    "required_bytes": 1,
+                    "remaining_budget_bytes": 65512,
+                },
+                {
+                    "candidate_stable_id": "ineligible-after-cap",
+                    "reason": "not_source_backed",
+                    "required_bytes": None,
+                    "remaining_budget_bytes": None,
+                },
+            ],
+        )
+
+        vector = copy.deepcopy(self.vector)
+        candidates = vector["metadata"]["acquisition"]["candidates"]
+        candidates[0], candidates[1] = candidates[1], candidates[0]
+        for ordinal, candidate in enumerate(candidates, 1):
+            candidate["acquisition_ordinal"] = ordinal
+        vector["expected_b_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "B")
+        )
+        vector["expected_c_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "C")
+        )
+        errors: list[str] = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet acquisition candidate order drift", errors)
+
+        vector = copy.deepcopy(self.vector)
+        vector["metadata"]["acquisition"]["omissions"][0]["remaining_budget_bytes"] += 1
+        vector["expected_b_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "B")
+        )
+        vector["expected_c_sha256"] = VALIDATOR.sha256_bytes(
+            VALIDATOR.assemble_packet_vector(vector, "C")
+        )
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet acquisition omission replay drift", errors)
+
     def test_retry_prompt_vector_freezes_codepoint_slice_and_bytes(self) -> None:
         errors: list[str] = []
         VALIDATOR.validate_retry_prompt_vector(
@@ -618,9 +731,33 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
     def test_duplicate_json_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "duplicate.json"
-            path.write_text('{"a":1,"a":2}\n', encoding="utf-8")
-            with self.assertRaises(VALIDATOR.DuplicateKey):
+            marker = "UNTRUSTED_DUPLICATE_KEY_MARKER"
+            path.write_text(
+                json.dumps({"safe": 1})[:-1] + f',"{marker}":1,"{marker}":2}}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(VALIDATOR.DuplicateKey) as context:
                 VALIDATOR.load_json(path)
+            self.assertNotIn(marker, str(context.exception))
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = VALIDATOR.main(
+                    [
+                        "--root",
+                        str(ROOT),
+                        "--runtime-config",
+                        str(path),
+                    ]
+                )
+            self.assertEqual(result, 1)
+            self.assertNotIn(marker, stdout.getvalue())
+            self.assertNotIn(marker, stderr.getvalue())
+            self.assertEqual(
+                stderr.getvalue().strip(),
+                "INCOMPATIBLE: protocol validation failed",
+            )
 
     def test_locked_file_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -652,38 +789,48 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
     def test_resealed_locked_file_with_common_credential_shape_fails_closed(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            copied_root = Path(temporary)
-            self.copy_locked_bundle(copied_root)
-            synthetic_value = "gh" + "p_" + "A" * 36
-            readme_path = copied_root / "benchmark/swebench-act-context/README.md"
-            readme_path.write_text(
-                readme_path.read_text(encoding="utf-8") + "\n" + synthetic_value + "\n",
-                encoding="utf-8",
-            )
-            lock_path = copied_root / VALIDATOR.LOCK_REL
-            lock = VALIDATOR.load_json(lock_path)
-            for entry in lock["files"]:
-                file_path = copied_root / entry["path"]
-                data = file_path.read_bytes()
-                entry["bytes"] = len(data)
-                entry["sha256"] = VALIDATOR.sha256_bytes(data)
-            digest = VALIDATOR.sha256_bytes(VALIDATOR._lock_material(lock["files"]))
-            lock["bundle_sha256"] = digest
-            lock_path.write_text(
-                json.dumps(lock, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            (copied_root / VALIDATOR.DIGEST_REL).write_text(
-                digest + "\n", encoding="ascii"
-            )
+        synthetic_values = {
+            "github": "gh" + "p_" + "A" * 36,
+            "aws_iam_arn": (
+                "arn:" + "aws:iam::" + "123456" + "789012" + ":role/example"
+            ),
+            "aws_account_id": "123456" + "789012",
+        }
+        for label, synthetic_value in synthetic_values.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                copied_root = Path(temporary)
+                self.copy_locked_bundle(copied_root)
+                readme_path = copied_root / "benchmark/swebench-act-context/README.md"
+                readme_path.write_text(
+                    readme_path.read_text(encoding="utf-8")
+                    + "\n"
+                    + synthetic_value
+                    + "\n",
+                    encoding="utf-8",
+                )
+                lock_path = copied_root / VALIDATOR.LOCK_REL
+                lock = VALIDATOR.load_json(lock_path)
+                for entry in lock["files"]:
+                    file_path = copied_root / entry["path"]
+                    data = file_path.read_bytes()
+                    entry["bytes"] = len(data)
+                    entry["sha256"] = VALIDATOR.sha256_bytes(data)
+                digest = VALIDATOR.sha256_bytes(VALIDATOR._lock_material(lock["files"]))
+                lock["bundle_sha256"] = digest
+                lock_path.write_text(
+                    json.dumps(lock, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                (copied_root / VALIDATOR.DIGEST_REL).write_text(
+                    digest + "\n", encoding="ascii"
+                )
 
-            with self.assertRaisesRegex(
-                ValueError,
-                "credential-shaped value in locked file",
-            ) as context:
-                VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
-            self.assertNotIn(synthetic_value, str(context.exception))
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "credential-shaped value in locked file",
+                ) as context:
+                    VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
+                self.assertNotIn(synthetic_value, str(context.exception))
 
     def test_unlisted_bundle_file_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

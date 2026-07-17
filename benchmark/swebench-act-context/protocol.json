@@ -213,7 +213,7 @@
       "maximum_candidates": 24,
       "full_body_budget_bytes": 65536,
       "budget_basis": "B full UTF-8 body bytes only; framing and loci do not consume this selection budget",
-      "algorithm": "walk scored candidates in order; select an eligible candidate only when its complete full body fits remaining bytes; record oversize/noneligible candidates as omitted and continue",
+      "algorithm": "derive semantic and graph scores from the recorded search ranks and locus-seed-bound relationships; sort by the frozen tie-break; then walk candidates in that order: omit ineligible candidates first, otherwise omit with maximum_candidates when 24 candidates are already selected, otherwise omit with full_body_budget when the complete body exceeds the remaining 65536 bytes, otherwise select and subtract the complete body bytes; continue after every omission; derive omissions in candidate order with required_bytes equal to the full body length and remaining_budget_bytes equal to the budget before that candidate for both budget reasons",
       "body_truncation": "forbidden",
       "empty_selection": "valid only when the candidate pool is empty; otherwise unexplained empty selection stops the run"
     },
@@ -301,7 +301,7 @@
         "full_body_budget"
       ],
       "omission_null_rules": "required_bytes and remaining_budget_bytes are integers only for maximum_candidates/full_body_budget; both are null for eligibility omissions",
-      "consistency": "loci, candidates, relationships, and omissions are ordered arrays; every unselected candidate has exactly one omission; every selected candidate has none; packet candidate records are exactly the selected candidates in candidate order; every locus header has relationships=[]; every selected candidate header relationship array equals the deterministic packet relationship_schema header_projection, including an empty array when no acquisition relationship is incident"
+      "consistency": "loci, candidates, relationships, and omissions are ordered arrays; an incoming relationship target or outgoing relationship source must equal a seed_stable_id of its locus_ordinal; the candidate pool equals the union of semantic-ranked stable IDs and the opposite endpoints of all relationships; scores, order, selected flags, budget state, omission fields, and omission order are replayed rather than trusted; every unselected candidate has exactly one omission; every selected candidate has none; packet candidate records are exactly the selected candidates in candidate order; every locus header has relationships=[]; every selected candidate header relationship array equals the deterministic packet relationship_schema header_projection, including an empty array when no acquisition relationship is incident"
     }
   },
   "packet_serialization": {
@@ -728,7 +728,7 @@
       "guest images",
       "shell history"
     ],
-    "validator_behavior": "reject key-like values and account identifiers; never print secret values"
+    "validator_behavior": "reject key-like values, AWS IAM ARNs containing a 12-digit account ID, and bare 12-digit AWS account identifiers delimited by non-alphanumeric characters and not immediately preceded by a decimal point; no exception, stdout, or stderr text may echo an untrusted key or value"
   },
   "upstream_artifacts": {
     "experiments/resolve/scaled_run.py": {
@@ -808,7 +808,7 @@
       "any paid authorization without closed artifact/budget receipts bound to the external protocol digest",
       "any acquisition/omission or exceptional-locus record outside its exact closed schema",
       "any retry prompt that does not match the frozen codepoint-slice byte vector",
-      "any common GitHub, AWS, Slack, bearer-token, private-key, provider-key, or account-identifier credential shape without printing the value"
+      "any common GitHub, AWS, Slack, bearer-token, private-key, provider-key, AWS IAM ARN with a 12-digit account ID, or bare 12-digit AWS account identifier without printing the value"
     ],
     "success_output": "machine-readable compatibility decision plus bundle digest; no credential values"
   }

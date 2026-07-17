@@ -27,9 +27,10 @@ remain eligible while `.oh` and history-derived business context are disabled.
 - `packet-vector.json` is a byte-level B/C framing vector for independent
   implementations. It includes multiple selected candidates, an omitted
   candidate with an acquisition-only relationship, exact per-record relationship
-  projection, pinned `cl100k_base` token-ID vectors, synthetic locus identity,
-  and a Unicode retry-prompt vector that exercises the upstream 6,000-character
-  previous-response boundary.
+  projection, locus-seed endpoint binding, replayed rank/top-24/65,536-byte
+  admission and omission decisions, pinned `cl100k_base` token-ID vectors,
+  synthetic locus identity, and a Unicode retry-prompt vector that exercises
+  the upstream 6,000-character previous-response boundary.
 - `upstream/edit_patch_v2.py` is Brian's exact parser and deterministic patch
   builder at commit `fd115351d0ab742993aa5d7006f1369fb15b6e74`.
 - `protocol.lock.json` and `protocol.sha256` seal every usable artifact,
@@ -84,7 +85,11 @@ compares them equal to zero or one. Receipt timestamps must parse and round-trip
 as real calendar-valid UTC instants at whole-second precision. Credential
 screening rejects common provider-key, GitHub, AWS, Slack, bearer-token,
 private-key, and account-identifier shapes in both external receipt configs and
-every locked file, and failures never echo the candidate value.
+every locked file. AWS IAM ARNs containing a 12-digit account ID and standalone
+12-digit AWS account IDs are rejected. Standalone means delimited by
+non-alphanumeric characters and not immediately preceded by a decimal point, so
+the frozen 12-place statistical decimals remain valid. Validation exceptions
+and CLI output never echo an untrusted key or value.
 
 Arbitrary strings are rejected. The committed template can never authorize
 paid calls, and an authorized external config is rejected unless
@@ -100,7 +105,12 @@ The acquisition object in every packet preamble has exact nested schemas for
 loci, candidates, relationships, and omissions. Non-node loci use deterministic
 synthetic IDs. A new-file locus uses line bounds `0,0`, language `Unknown`, an
 empty payload/digest, no RNA seed, and no traversal relationship. B and C reuse
-the same canonical acquisition bytes. Locus record headers always carry an empty
+the same canonical acquisition bytes. Every incoming relationship terminates at
+a seed of its declared locus and every outgoing relationship starts at one; the
+opposite endpoints plus semantic-ranked IDs close the candidate pool. The
+validator re-derives graph/semantic scores and order, then replays ineligible,
+top-24, and 65,536-byte admission precedence and the exact budget/omission state
+instead of trusting recorded flags. Locus record headers always carry an empty
 relationship array. Each selected candidate header carries exactly the ordered
 acquisition relationships whose source or target is that candidate's stable ID;
 relationships incident only to omitted candidates remain acquisition-only.

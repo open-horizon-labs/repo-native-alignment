@@ -210,7 +210,7 @@ EDGE_TYPE_ORDINAL = {
 }
 
 EXPECTED_PROTOCOL_SHA256 = (
-    "9884defdd786fed134921a43353379cb24888151d9304cd85891321fe7a3797a"
+    "f2fc5f2df68b0d082174685522638611e5ba6a9907f523766f23eb2e3bd1bb62"
 )
 EXPECTED_POPULATION_SHA256 = (
     "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
@@ -222,6 +222,8 @@ EXPECTED_UPSTREAM_COMMIT = "fd115351d0ab742993aa5d7006f1369fb15b6e74"
 EXPECTED_DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
 EXPECTED_EXCLUSION = "astropy__astropy-8707"
 ORDER_SEED = "rna-act-context-bc-order-v1"
+MAXIMUM_CANDIDATES = 24
+FULL_BODY_BUDGET_BYTES = 65_536
 RETRY_SUFFIX = "\n\nYOUR PREVIOUS EDIT BLOCKS (for reference):\n{prev}\n\nThese edits FAILED to apply:\n{feedback}\n\nThe other edits were applied successfully. Re-emit corrected edit blocks ONLY for the failed edits,\nin the same *** FILE / SEARCH / REPLACE / END format."
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -242,6 +244,8 @@ SECRET_VALUE = re.compile(
     r"|(?i:bearer)[ \t]+[A-Za-z0-9._~+/-]{16,}={0,2}"
     r"|(?i:(?:aws_)?secret_access_key)[\"'\s:=]+[A-Za-z0-9/+=]{40}"
     r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+    r"|arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+"
+    r"|(?<![A-Za-z0-9.])[0-9]{12}(?![A-Za-z0-9])"
     r"|(?:org|acct|account|workspace|wrkspc)_[A-Za-z0-9_-]{8,}"
     r")"
 )
@@ -466,7 +470,7 @@ def _object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise DuplicateKey(f"duplicate JSON key: {key}")
+            raise DuplicateKey("duplicate JSON key")
         result[key] = value
     return result
 
@@ -810,6 +814,35 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         set(acquisition_schema.get("omission_reason_values", [])) == OMISSION_REASONS,
         "candidate omission vocabulary drift",
     )
+    selection = protocol.get("rna_acquisition", {}).get("selection", {})
+    _require(
+        errors,
+        type(selection.get("maximum_candidates")) is int
+        and selection.get("maximum_candidates") == MAXIMUM_CANDIDATES
+        and type(selection.get("full_body_budget_bytes")) is int
+        and selection.get("full_body_budget_bytes") == FULL_BODY_BUDGET_BYTES
+        and selection.get("algorithm")
+        == (
+            "derive semantic and graph scores from the recorded search ranks and "
+            "locus-seed-bound relationships; sort by the frozen tie-break; then walk "
+            "candidates in that order: omit ineligible candidates first, otherwise omit "
+            "with maximum_candidates when 24 candidates are already selected, otherwise "
+            "omit with full_body_budget when the complete body exceeds the remaining 65536 "
+            "bytes, otherwise select and subtract the complete body bytes; continue after "
+            "every omission; derive omissions in candidate order with required_bytes equal "
+            "to the full body length and remaining_budget_bytes equal to the budget before "
+            "that candidate for both budget reasons"
+        ),
+        "candidate admission replay contract drift",
+    )
+    consistency = acquisition_schema.get("consistency", "")
+    _require(
+        errors,
+        "incoming relationship target or outgoing relationship source" in consistency
+        and "candidate pool equals the union" in consistency
+        and "replayed rather than trusted" in consistency,
+        "acquisition linkage/replay consistency drift",
+    )
 
     packet = protocol.get("packet_serialization", {})
     _require(
@@ -1015,9 +1048,28 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         errors,
         all(
             name in rejected
-            for name in ("GitHub", "AWS", "Slack", "bearer-token", "private-key")
+            for name in (
+                "GitHub",
+                "AWS",
+                "Slack",
+                "bearer-token",
+                "private-key",
+                "AWS IAM ARN",
+                "bare 12-digit AWS account identifier",
+            )
         ),
         "validator credential-shape policy drift",
+    )
+    _require(
+        errors,
+        protocol.get("credentials", {}).get("validator_behavior")
+        == (
+            "reject key-like values, AWS IAM ARNs containing a 12-digit account ID, and "
+            "bare 12-digit AWS account identifiers delimited by non-alphanumeric "
+            "characters and not immediately preceded by a decimal point; no exception, "
+            "stdout, or stderr text may echo an untrusted key or value"
+        ),
+        "validator non-echo/account-identifier policy drift",
     )
 
 
@@ -1176,13 +1228,13 @@ def validate_statistics(statistics: Any, errors: list[str]) -> None:
                     calculated = paired_difference_interval(
                         cells["n00"], cells["n01"], cells["n10"], cells["n11"]
                     )
-                except ValueError as error:
-                    errors.append(f"paired-difference vector invalid: {error}")
+                except ValueError:
+                    errors.append("paired-difference vector calculation failed")
                     continue
                 _require(
                     errors,
                     calculated == vector.get("expected"),
-                    f"paired-difference vector result drift: {vector.get('name')}",
+                    "paired-difference vector result drift",
                 )
 
     h2_metrics = statistics.get("h2_metrics")
@@ -1333,12 +1385,11 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     resolved = 0
     initial_total = 0
     feedback_rounds = 0
-    for row in included:
-        iid = row.get("instance_id", "<missing>")
+    for row_ordinal, row in enumerate(included, 1):
         _require(
             errors,
             bool(HEX40.fullmatch(str(row.get("base_commit", "")))),
-            f"{iid}: invalid base commit",
+            f"population row {row_ordinal}: invalid base commit",
         )
         for field in (
             "dataset_row_sha256",
@@ -1349,33 +1400,37 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
             _require(
                 errors,
                 bool(HEX64.fullmatch(str(row.get(field, "")))),
-                f"{iid}: invalid {field}",
+                f"population row {row_ordinal}: invalid {field}",
             )
         _require(
             errors,
             isinstance(row.get("gold_file_count"), int) and row["gold_file_count"] >= 2,
-            f"{iid}: not multi-file",
+            f"population row {row_ordinal}: not multi-file",
         )
         evidence = row.get("upstream_a")
-        _require(errors, isinstance(evidence, dict), f"{iid}: missing A evidence")
+        _require(
+            errors,
+            isinstance(evidence, dict),
+            f"population row {row_ordinal}: missing A evidence",
+        )
         if not isinstance(evidence, dict):
             continue
         _require(
             errors,
             evidence.get("outcome") in {"resolved", "unresolved"},
-            f"{iid}: invalid A outcome",
+            f"population row {row_ordinal}: invalid A outcome",
         )
         _require(
             errors,
             evidence.get("resolved") == (evidence.get("outcome") == "resolved"),
-            f"{iid}: A outcome fields disagree",
+            f"population row {row_ordinal}: A outcome fields disagree",
         )
         resolved += int(evidence.get("resolved") is True)
         count = evidence.get("anthropic_initial_request_input_tokens")
         _require(
             errors,
             isinstance(count, int) and count > 0,
-            f"{iid}: missing A initial-request token count",
+            f"population row {row_ordinal}: missing A initial-request token count",
         )
         if isinstance(count, int):
             initial_total += count
@@ -1383,25 +1438,25 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
         _require(
             errors,
             isinstance(rounds, int) and 0 <= rounds <= 2,
-            f"{iid}: invalid feedback-round count",
+            f"population row {row_ordinal}: invalid feedback-round count",
         )
         if isinstance(rounds, int):
             feedback_rounds += rounds
         _require(
             errors,
             evidence.get("retry_inclusive_input_tokens") is None,
-            f"{iid}: inferred A retry-inclusive tokens are forbidden",
+            f"population row {row_ordinal}: inferred A retry-inclusive tokens are forbidden",
         )
         _require(
             errors,
             evidence.get("retry_inclusive_input_tokens_reason")
             == "upstream_not_measured",
-            f"{iid}: missing A retry-token null reason",
+            f"population row {row_ordinal}: missing A retry-token null reason",
         )
         _require(
             errors,
             evidence.get("wall_clock_seconds") is None,
-            f"{iid}: inferred A wall-clock timing is forbidden",
+            f"population row {row_ordinal}: inferred A wall-clock timing is forbidden",
         )
 
     summary = population.get("upstream_a", {})
@@ -1465,10 +1520,12 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
             _require(
                 errors,
                 episode.get("order_key_sha256") == key,
-                f"{iid}: schedule key drift",
+                f"schedule key drift at ordinal {ordinal}",
             )
             _require(
-                errors, episode.get("arm_order") == arm_order, f"{iid}: arm-order drift"
+                errors,
+                episode.get("arm_order") == arm_order,
+                f"arm-order drift at ordinal {ordinal}",
             )
         _require(
             errors, scheduled_ids == expected_order, "scheduled instance order drift"
@@ -2016,6 +2073,90 @@ def _project_relationships(
     ]
 
 
+def _derived_candidate_score(
+    candidate: dict[str, Any],
+    relationships: list[dict[str, Any]],
+) -> tuple[int, int, int, int | None]:
+    semantic_rank = candidate["semantic_rank"]
+    semantic_component = (
+        0 if semantic_rank is None else 1_000_000_000 - (semantic_rank - 1) * 1_000_000
+    )
+    incident = _project_relationships(candidate["stable_id"], relationships)
+    graph_component = max(
+        (
+            max(
+                1,
+                100_000
+                - relationship["locus_ordinal"] * 1_000
+                - EDGE_TYPE_ORDINAL[relationship["edge_type"]] * 10
+                - relationship["cli_ordinal"],
+            )
+            for relationship in incident
+        ),
+        default=0,
+    )
+    graph_hops = 1 if incident else None
+    return (
+        semantic_component,
+        graph_component,
+        semantic_component + graph_component,
+        graph_hops,
+    )
+
+
+def _replayed_candidate_sort_key(
+    candidate: dict[str, Any],
+    relationships: list[dict[str, Any]],
+) -> tuple[Any, ...]:
+    _, _, total, graph_hops = _derived_candidate_score(candidate, relationships)
+    semantic_rank = candidate["semantic_rank"]
+    return (
+        -total,
+        semantic_rank if semantic_rank is not None else sys.maxsize,
+        graph_hops if graph_hops is not None else sys.maxsize,
+        candidate["stable_id"].encode("utf-8"),
+    )
+
+
+def _replay_candidate_admission(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[bool], list[dict[str, Any]]]:
+    remaining_budget = FULL_BODY_BUDGET_BYTES
+    selected_count = 0
+    decisions: list[bool] = []
+    omissions: list[dict[str, Any]] = []
+    for candidate in candidates:
+        reason: str | None = None
+        required_bytes: int | None = None
+        remaining_budget_bytes: int | None = None
+        if candidate["eligibility"] != "eligible":
+            reason = candidate["eligibility"]
+        elif selected_count >= MAXIMUM_CANDIDATES:
+            reason = "maximum_candidates"
+            required_bytes = candidate["full_body_byte_length"]
+            remaining_budget_bytes = remaining_budget
+        elif candidate["full_body_byte_length"] > remaining_budget:
+            reason = "full_body_budget"
+            required_bytes = candidate["full_body_byte_length"]
+            remaining_budget_bytes = remaining_budget
+
+        selected = reason is None
+        decisions.append(selected)
+        if selected:
+            selected_count += 1
+            remaining_budget -= candidate["full_body_byte_length"]
+        else:
+            omissions.append(
+                {
+                    "candidate_stable_id": candidate["stable_id"],
+                    "reason": reason,
+                    "required_bytes": required_bytes,
+                    "remaining_budget_bytes": remaining_budget_bytes,
+                }
+            )
+    return decisions, omissions
+
+
 def validate_acquisition_vector(
     acquisition: Any,
     records: list[Any],
@@ -2259,16 +2400,22 @@ def validate_acquisition_vector(
                 f"acquisition candidate {ordinal} selected while ineligible",
             )
     if all(isinstance(candidate, dict) for candidate in candidates):
-        _require(
-            errors,
-            candidates == sorted(candidates, key=_candidate_sort_key),
-            "packet acquisition candidate order drift",
-        )
         stable_ids = [candidate.get("stable_id") for candidate in candidates]
         _require(
             errors,
-            len(stable_ids) == len(set(stable_ids)),
+            all(isinstance(stable_id, str) for stable_id in stable_ids)
+            and len(stable_ids) == len(set(stable_ids)),
             "packet acquisition candidate IDs must be unique",
+        )
+        semantic_ranks = [
+            candidate.get("semantic_rank")
+            for candidate in candidates
+            if type(candidate.get("semantic_rank")) is int
+        ]
+        _require(
+            errors,
+            len(semantic_ranks) == len(set(semantic_ranks)),
+            "packet acquisition semantic ranks must be unique",
         )
 
     relationships = acquisition.get("relationships")
@@ -2280,7 +2427,7 @@ def validate_acquisition_vector(
     if not isinstance(relationships, list):
         relationships = []
     relationships_valid = True
-    for relationship in relationships:
+    for relationship_ordinal, relationship in enumerate(relationships, 1):
         valid = (
             isinstance(relationship, dict)
             and set(relationship) == set(PACKET_RELATIONSHIP_FIELDS)
@@ -2298,7 +2445,7 @@ def validate_acquisition_vector(
         _require(
             errors,
             valid,
-            "packet acquisition relationship field set drift",
+            f"packet acquisition relationship {relationship_ordinal} field set drift",
         )
         relationships_valid = relationships_valid and valid
     if relationships_valid:
@@ -2332,32 +2479,76 @@ def validate_acquisition_vector(
     else:
         relationship_tuples = []
 
-    if relationships_valid:
-        for ordinal, candidate in enumerate(candidates, 1):
-            if not isinstance(candidate, dict):
-                continue
-            semantic_rank = candidate.get("semantic_rank")
-            if semantic_rank is None:
-                expected_semantic = 0
-            elif type(semantic_rank) is int:
-                expected_semantic = 1_000_000_000 - (semantic_rank - 1) * 1_000_000
-            else:
-                continue
-            incident = _project_relationships(candidate.get("stable_id"), relationships)
-            expected_graph = max(
-                (
-                    max(
-                        1,
-                        100_000
-                        - relationship["locus_ordinal"] * 1_000
-                        - EDGE_TYPE_ORDINAL[relationship["edge_type"]] * 10
-                        - relationship["cli_ordinal"],
-                    )
-                    for relationship in incident
-                ),
-                default=0,
+    expected_omissions: list[dict[str, Any]] | None = None
+    candidate_replay_ready = relationships_valid and all(
+        isinstance(candidate, dict)
+        and set(candidate) == set(ACQUISITION_CANDIDATE_FIELDS)
+        and isinstance(candidate.get("stable_id"), str)
+        and bool(candidate.get("stable_id"))
+        and (
+            candidate.get("semantic_rank") is None
+            or (
+                type(candidate.get("semantic_rank")) is int
+                and 1 <= candidate["semantic_rank"] <= 20
             )
-            expected_hops = 1 if incident else None
+        )
+        and type(candidate.get("full_body_byte_length")) is int
+        and candidate["full_body_byte_length"] >= 0
+        and candidate.get("eligibility") in CANDIDATE_ELIGIBILITY
+        for candidate in candidates
+    )
+    if candidate_replay_ready:
+        typed_candidates = [
+            candidate for candidate in candidates if isinstance(candidate, dict)
+        ]
+        candidate_ids = {candidate["stable_id"] for candidate in typed_candidates}
+        semantic_candidate_ids = {
+            candidate["stable_id"]
+            for candidate in typed_candidates
+            if candidate["semantic_rank"] is not None
+        }
+        traversal_candidate_ids: set[str] = set()
+        for relationship_ordinal, relationship in enumerate(relationships, 1):
+            locus = loci[relationship["locus_ordinal"] - 1]
+            seeds = locus.get("seed_stable_ids", []) if isinstance(locus, dict) else []
+            if relationship["direction"] == "incoming":
+                seed_endpoint = relationship["target"]
+                candidate_endpoint = relationship["source"]
+            else:
+                seed_endpoint = relationship["source"]
+                candidate_endpoint = relationship["target"]
+            _require(
+                errors,
+                isinstance(seeds, list) and seed_endpoint in seeds,
+                f"packet acquisition relationship {relationship_ordinal} is not bound to its locus seed",
+            )
+            traversal_candidate_ids.add(candidate_endpoint)
+
+        _require(
+            errors,
+            candidate_ids == semantic_candidate_ids | traversal_candidate_ids,
+            "packet acquisition candidate pool does not match search and traversal inputs",
+        )
+
+        replayed_candidates = sorted(
+            typed_candidates,
+            key=lambda candidate: _replayed_candidate_sort_key(
+                candidate, relationships
+            ),
+        )
+        _require(
+            errors,
+            [candidate["stable_id"] for candidate in typed_candidates]
+            == [candidate["stable_id"] for candidate in replayed_candidates],
+            "packet acquisition candidate order drift",
+        )
+        for ordinal, candidate in enumerate(typed_candidates, 1):
+            (
+                expected_semantic,
+                expected_graph,
+                expected_total,
+                expected_hops,
+            ) = _derived_candidate_score(candidate, relationships)
             _require(
                 errors,
                 candidate.get("semantic_component") == expected_semantic,
@@ -2370,8 +2561,24 @@ def validate_acquisition_vector(
             )
             _require(
                 errors,
+                candidate.get("total") == expected_total,
+                f"acquisition candidate {ordinal} total score derivation drift",
+            )
+            _require(
+                errors,
                 candidate.get("graph_hops") == expected_hops,
                 f"acquisition candidate {ordinal} graph_hops derivation drift",
+            )
+        expected_selected, expected_omissions = _replay_candidate_admission(
+            replayed_candidates
+        )
+        for ordinal, (candidate, expected) in enumerate(
+            zip(replayed_candidates, expected_selected), 1
+        ):
+            _require(
+                errors,
+                candidate.get("selected") is expected,
+                f"acquisition candidate {ordinal} selection replay drift",
             )
 
     omissions = acquisition.get("omissions")
@@ -2405,7 +2612,7 @@ def validate_acquisition_vector(
         _require(
             errors,
             candidate_id not in omission_by_id,
-            f"duplicate acquisition omission for {candidate_id}",
+            f"duplicate acquisition omission at ordinal {ordinal}",
         )
         omission_by_id[candidate_id] = omission
         reason = omission.get("reason")
@@ -2431,7 +2638,7 @@ def validate_acquisition_vector(
                 f"acquisition omission {ordinal} eligibility budget fields must be null",
             )
 
-    for candidate in candidates:
+    for candidate_ordinal, candidate in enumerate(candidates, 1):
         if not isinstance(candidate, dict):
             continue
         candidate_id = candidate.get("stable_id")
@@ -2440,26 +2647,26 @@ def validate_acquisition_vector(
             _require(
                 errors,
                 omission is None,
-                f"selected candidate {candidate_id} must not be omitted",
+                f"selected candidate {candidate_ordinal} must not be omitted",
             )
         else:
             _require(
                 errors,
                 omission is not None,
-                f"unselected candidate {candidate_id} requires one omission",
+                f"unselected candidate {candidate_ordinal} requires one omission",
             )
             if omission is not None and candidate.get("eligibility") != "eligible":
                 _require(
                     errors,
                     omission.get("reason") == candidate.get("eligibility"),
-                    f"candidate {candidate_id} omission reason mismatch",
+                    f"candidate {candidate_ordinal} omission reason mismatch",
                 )
             elif omission is not None:
                 _require(
                     errors,
                     omission.get("reason")
                     in {"maximum_candidates", "full_body_budget"},
-                    f"eligible candidate {candidate_id} omission reason mismatch",
+                    f"eligible candidate {candidate_ordinal} omission reason mismatch",
                 )
     _require(
         errors,
@@ -2486,6 +2693,12 @@ def validate_acquisition_vector(
         ],
         "packet acquisition omission order drift",
     )
+    if expected_omissions is not None:
+        _require(
+            errors,
+            omissions == expected_omissions,
+            "packet acquisition omission replay drift",
+        )
 
     packet_loci = [
         record
@@ -2512,7 +2725,7 @@ def validate_acquisition_vector(
         len(packet_candidates) == len(selected_candidates),
         "packet candidate records do not match acquisition selection",
     )
-    for locus, record in zip(loci, packet_loci):
+    for locus_ordinal, (locus, record) in enumerate(zip(loci, packet_loci), 1):
         if not isinstance(locus, dict):
             continue
         header = record.get("header", {})
@@ -2526,12 +2739,12 @@ def validate_acquisition_vector(
             and header.get("start_line") == locus.get("start_line")
             and header.get("end_line") == locus.get("end_line")
             and header.get("language") == locus.get("language"),
-            f"packet locus {locus.get('ordinal')} header does not match acquisition",
+            f"packet locus {locus_ordinal} header does not match acquisition",
         )
         _require(
             errors,
             isinstance(header, dict) and header.get("relationships") == [],
-            f"packet locus {locus.get('ordinal')} relationships must be empty",
+            f"packet locus {locus_ordinal} relationships must be empty",
         )
         if isinstance(payload, str):
             payload_bytes = payload.encode("utf-8")
@@ -2539,9 +2752,11 @@ def validate_acquisition_vector(
                 errors,
                 len(payload_bytes) == locus.get("preimage_byte_length")
                 and sha256_bytes(payload_bytes) == locus.get("preimage_sha256"),
-                f"packet locus {locus.get('ordinal')} payload does not match acquisition",
+                f"packet locus {locus_ordinal} payload does not match acquisition",
             )
-    for candidate, record in zip(selected_candidates, packet_candidates):
+    for candidate_ordinal, (candidate, record) in enumerate(
+        zip(selected_candidates, packet_candidates), 1
+    ):
         header = record.get("header", {})
         _require(
             errors,
@@ -2561,14 +2776,14 @@ def validate_acquisition_vector(
                 "graph_component": candidate.get("graph_component"),
                 "total": candidate.get("total"),
             },
-            f"packet candidate {candidate.get('acquisition_ordinal')} does not match acquisition",
+            f"packet candidate {candidate_ordinal} does not match acquisition",
         )
         _require(
             errors,
             isinstance(header, dict)
             and header.get("relationships")
             == _project_relationships(candidate.get("stable_id"), relationships),
-            f"packet candidate {candidate.get('acquisition_ordinal')} relationship projection mismatch",
+            f"packet candidate {candidate_ordinal} relationship projection mismatch",
         )
 
 
@@ -3051,42 +3266,52 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     _require(errors, paths == sorted(paths), "lock paths must be sorted")
     _require(errors, len(paths) == len(set(paths)), "lock paths must be unique")
     _require(errors, paths == list(EXPECTED_LOCK_PATHS), "lock path set drift")
-    for entry in entries:
+    for entry_ordinal, entry in enumerate(entries, 1):
         _require(errors, isinstance(entry, dict), "lock file entry must be an object")
         if not isinstance(entry, dict):
             continue
         _require(
             errors,
             set(entry) == {"path", "bytes", "sha256"},
-            f"lock entry field set drift: {entry.get('path')}",
+            f"lock entry {entry_ordinal} field set drift",
         )
         _require(
             errors,
             isinstance(entry.get("bytes"), int) and entry["bytes"] >= 0,
-            f"invalid lock byte length: {entry.get('path')}",
+            f"lock entry {entry_ordinal} byte length is invalid",
         )
         _require(
             errors,
             bool(HEX64.fullmatch(str(entry.get("sha256", "")))),
-            f"invalid lock digest: {entry.get('path')}",
+            f"lock entry {entry_ordinal} digest is invalid",
         )
         rel = Path(entry.get("path", ""))
         _require(
             errors,
             not rel.is_absolute() and ".." not in rel.parts,
-            f"unsafe lock path: {rel}",
+            f"lock entry {entry_ordinal} path is unsafe",
         )
         path = root / rel
-        _require(errors, path.is_file(), f"missing locked file: {rel}")
+        _require(
+            errors,
+            path.is_file(),
+            f"lock entry {entry_ordinal} file is missing",
+        )
         if not path.is_file():
             continue
         data = path.read_bytes()
-        _require(errors, len(data) == entry.get("bytes"), f"byte length drift: {rel}")
         _require(
-            errors, sha256_bytes(data) == entry.get("sha256"), f"digest drift: {rel}"
+            errors,
+            len(data) == entry.get("bytes"),
+            f"lock entry {entry_ordinal} byte length drift",
+        )
+        _require(
+            errors,
+            sha256_bytes(data) == entry.get("sha256"),
+            f"lock entry {entry_ordinal} digest drift",
         )
         if SECRET_VALUE.search(data.decode("utf-8", errors="ignore")):
-            errors.append(f"credential-shaped value in locked file: {rel}")
+            errors.append("credential-shaped value in locked file")
     bundle_root = root / "benchmark/swebench-act-context"
     actual_bundle_paths = {
         path.relative_to(root).as_posix()
@@ -3232,8 +3457,8 @@ def main(argv: list[str] | None = None) -> int:
         KeyError,
         TypeError,
         ValueError,
-    ) as error:
-        print(f"INCOMPATIBLE: {error}", file=sys.stderr)
+    ):
+        print("INCOMPATIBLE: protocol validation failed", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
