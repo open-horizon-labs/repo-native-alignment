@@ -1171,8 +1171,8 @@ impl LspEnricher {
         // a project; pyright uses it to trigger import-graph indexing.
         // Save the URI for use as a documentSymbol validation fallback.
         let warmup_uri: Option<String> = if let Some(warmup_path) = warmup_path {
-            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
-            match self.send_did_open(transport, &warmup_path).await {
+            let uri_str = path_to_uri(warmup_path).ok().map(|u| u.to_string());
+            match self.send_did_open(transport, warmup_path).await {
                 Ok(()) => {
                     tracing::info!(
                         "{} sent didOpen for '{}'",
