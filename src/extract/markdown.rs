@@ -501,6 +501,11 @@ fn make_body_node(
     }
     if open.kind == "link"
         && let Some(destination) = open.target.as_deref()
+    {
+        metadata.insert("link_target".into(), destination.to_string());
+    }
+    if open.kind == "link"
+        && let Some(destination) = open.target.as_deref()
         && let Some((file, anchor)) = destination.split_once('#')
         && !anchor.is_empty()
         && !destination.starts_with("http://")
@@ -607,6 +612,10 @@ fn selector_metadata(
     );
     metadata.insert("byte_start".into(), start.to_string());
     metadata.insert("byte_end".into(), end.to_string());
+    let line_start = content[..start.min(content.len())]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    metadata.insert("name_col".into(), (start - line_start).to_string());
     metadata.insert(
         "snippet_hash".into(),
         blake3::hash(&content.as_bytes()[start..end])

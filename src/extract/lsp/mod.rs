@@ -294,12 +294,23 @@ fn planned_operations_for_node_inner(node: &Node, allow_broad_references: bool) 
             policy::LspQueryOperation::TypeHierarchy,
         ],
         NodeKind::TypeAlias | NodeKind::Const => &[policy::LspQueryOperation::References],
+        NodeKind::MarkdownSection
+            if node.metadata.get("markdown_kind").map(String::as_str) == Some("link") =>
+        {
+            &[
+                policy::LspQueryOperation::DocumentLinks,
+                policy::LspQueryOperation::Definitions,
+                policy::LspQueryOperation::References,
+            ]
+        }
+        NodeKind::MarkdownSection => &[policy::LspQueryOperation::DocumentLinks],
         NodeKind::Other(_) => &[policy::LspQueryOperation::DocumentLinks],
         _ => return Vec::new(),
     };
     let capabilities = LspServerCapabilities {
         references: true,
         call_hierarchy: true,
+        definitions: true,
         implementations: true,
         type_hierarchy: true,
         document_links: true,
@@ -393,6 +404,8 @@ struct LspState {
     has_call_hierarchy: bool,
     /// Whether the language server supports textDocument/implementation.
     has_implementation: bool,
+    /// Whether the language server supports textDocument/definition.
+    has_definition: bool,
     /// Whether the language server supports textDocument/documentLink.
     has_document_links: bool,
     /// Whether the language server supports pull-based diagnostics
@@ -492,6 +505,7 @@ fn negotiated_operation_capabilities(
     LspNegotiatedCapabilities {
         references_provider: provider_is_enabled(&capabilities.references_provider),
         call_hierarchy_provider: has_call_hierarchy,
+        definition_provider: provider_is_enabled(&capabilities.definition_provider),
         implementation_provider: implementation_provider_is_enabled(
             &capabilities.implementation_provider,
         ),
@@ -838,6 +852,7 @@ impl LspEnricher {
                 has_references: false,
                 has_call_hierarchy: false,
                 has_implementation: false,
+                has_definition: false,
                 has_document_links: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
@@ -988,6 +1003,12 @@ impl LspEnricher {
             NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
                 policy::LspQueryOperation::References
             }
+            NodeKind::MarkdownSection
+                if node.metadata.get("markdown_kind").map(String::as_str) == Some("link") =>
+            {
+                policy::LspQueryOperation::Definitions
+            }
+            NodeKind::MarkdownSection => policy::LspQueryOperation::DocumentLinks,
             NodeKind::Other(_) => policy::LspQueryOperation::DocumentLinks,
             _ => return false,
         };
@@ -997,6 +1018,7 @@ impl LspEnricher {
             LspServerCapabilities {
                 references: true,
                 call_hierarchy: true,
+                definitions: true,
                 implementations: true,
                 type_hierarchy: true,
                 document_links: true,
@@ -1357,6 +1379,8 @@ impl LspEnricher {
         let has_implementation = implementation_provider_is_enabled(
             &init_result_parsed.capabilities.implementation_provider,
         );
+        let has_definition =
+            provider_is_enabled(&init_result_parsed.capabilities.definition_provider);
         let has_document_links = init_result_parsed
             .capabilities
             .document_link_provider
@@ -1364,10 +1388,11 @@ impl LspEnricher {
         let negotiated_capabilities =
             negotiated_operation_capabilities(&init_result_parsed.capabilities, has_call_hierarchy);
         tracing::info!(
-            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}, workspace_symbols={}, document_symbols={}",
+            "{} capabilities: references={}, call_hierarchy={}, definition={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}, workspace_symbols={}, document_symbols={}",
             self.server_command,
             has_references,
             has_call_hierarchy,
+            has_definition,
             has_implementation,
             has_type_hierarchy,
             has_document_links,
@@ -1380,6 +1405,7 @@ impl LspEnricher {
         state.has_type_hierarchy = has_type_hierarchy;
         state.has_call_hierarchy = has_call_hierarchy;
         state.has_implementation = has_implementation;
+        state.has_definition = has_definition;
         state.has_document_links = has_document_links;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
@@ -2025,9 +2051,9 @@ impl LspEnricher {
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Find implementations of a trait/interface (pipelined).
-    async fn find_implementations_p(
+    async fn goto_locations_p(
         transport: &PipelinedTransport,
+        method: &str,
         file_uri: &Uri,
         line: u32,
         character: u32,
@@ -2043,9 +2069,7 @@ impl LspEnricher {
             partial_result_params: Default::default(),
         };
 
-        let result: serde_json::Value = transport
-            .request("textDocument/implementation", &params)
-            .await?;
+        let result: serde_json::Value = transport.request(method, &params).await?;
 
         if result.is_null() {
             return Ok(Vec::new());
@@ -2066,6 +2090,40 @@ impl LspEnricher {
             };
 
         Ok(locations)
+    }
+
+    /// Find definitions for a documentation link (pipelined).
+    async fn find_definitions_p(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        Self::goto_locations_p(
+            transport,
+            "textDocument/definition",
+            file_uri,
+            line,
+            character,
+        )
+        .await
+    }
+
+    /// Find implementations of a trait/interface (pipelined).
+    async fn find_implementations_p(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        Self::goto_locations_p(
+            transport,
+            "textDocument/implementation",
+            file_uri,
+            line,
+            character,
+        )
+        .await
     }
 
     /// Compute the 0-based LSP line and column for a node.
@@ -3111,6 +3169,7 @@ impl Enricher for LspEnricher {
             type_hierarchy_strikes,
             has_references,
             has_call_hierarchy,
+            has_definition,
             has_implementation,
             has_document_links,
             has_pull_diagnostics,
@@ -3137,6 +3196,7 @@ impl Enricher for LspEnricher {
                 state.type_hierarchy_strikes,
                 state.has_references,
                 state.has_call_hierarchy,
+                state.has_definition,
                 state.has_implementation,
                 state.has_document_links,
                 state.has_pull_diagnostics,
@@ -3207,6 +3267,7 @@ impl Enricher for LspEnricher {
         let capabilities = LspServerCapabilities {
             references: has_references,
             call_hierarchy: has_call_hierarchy,
+            definitions: has_definition,
             implementations: has_implementation,
             type_hierarchy: has_type_hierarchy,
             document_links: has_document_links,
@@ -3365,11 +3426,12 @@ impl Enricher for LspEnricher {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::str::FromStr;
 
     use super::transport::{LspRpcError, find_enclosing_symbol};
     use super::*;
+    use crate::extract::Extractor;
 
     enum ValidationFixtureResponse {
         Success(serde_json::Value),
@@ -3436,6 +3498,7 @@ mod tests {
         let result: InitializeResult = serde_json::from_value(serde_json::json!({
             "capabilities": {
                 "referencesProvider": true,
+                "definitionProvider": true,
                 "implementationProvider": false,
                 "documentLinkProvider": {"resolveProvider": false},
                 "documentSymbolProvider": {"label": "outline"}
@@ -3445,6 +3508,7 @@ mod tests {
         let negotiated = negotiated_operation_capabilities(&result.capabilities, true);
         assert!(negotiated.references_provider);
         assert!(negotiated.call_hierarchy_provider);
+        assert!(negotiated.definition_provider);
         assert!(!negotiated.implementation_provider);
         assert!(negotiated.document_link_provider);
         assert!(negotiated.document_symbol_provider);
@@ -3589,6 +3653,99 @@ mod tests {
                     .as_deref()
                     .is_some_and(|result_id| nodes.iter().any(|node| node.stable_id() == result_id))
         }));
+    }
+
+    #[tokio::test]
+    async fn malformed_document_fixture_fails_closed_at_response_normalization() {
+        assert!(
+            include_str!("../../../tests/fixtures/lsp_capability_repo/docs/malformed.md")
+                .contains("unterminated")
+        );
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(
+            serde_json::json!([{"name": "Malformed", "kind": 3}]),
+        )]);
+        let error = execute_indexing_validation_once(
+            &mut fixture,
+            validation_capabilities(false, true),
+            Some("file:///fixture/docs/malformed.md"),
+            "",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("malformed documentSymbol evidence must block readiness");
+        assert!(error.to_string().contains("has no range"));
+    }
+
+    #[tokio::test]
+    async fn mock_document_server_exercises_link_definition_and_reference_requests() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["docs", "src", "tests"] {
+            std::fs::create_dir_all(repo.path().join(directory)).unwrap();
+        }
+        for path in ["docs/guide.md", "src/app.py", "tests/test_app.py"] {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lsp_capability_repo")
+                .join(path);
+            std::fs::copy(source, repo.path().join(path)).unwrap();
+        }
+        let guide = std::fs::read_to_string(repo.path().join("docs/guide.md")).unwrap();
+        let extracted = crate::extract::markdown::MarkdownExtractor::new()
+            .extract(Path::new("docs/guide.md"), &guide)
+            .unwrap();
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = LspEnricher::new(
+            "markdown",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "document_features",
+            ],
+            &["md"],
+        );
+        let result = enricher
+            .enrich(&extracted.nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("mock document enrichment succeeds");
+        assert!(
+            !result.aborted,
+            "mock document enrichment aborted: {result:?}"
+        );
+        let negotiated = result
+            .lsp_validation
+            .as_ref()
+            .and_then(|validation| validation.negotiated_capabilities)
+            .expect("negotiated document capabilities");
+        assert!(negotiated.document_symbol_provider);
+        assert!(negotiated.document_link_provider);
+        assert!(negotiated.definition_provider);
+        assert!(negotiated.references_provider);
+        let records = work_items::load_records_since(repo.path(), 0).unwrap();
+        let operations = records
+            .iter()
+            .flat_map(|record| record.requested_operations.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        assert!(operations.contains("document_links"));
+        assert!(operations.contains("definitions"));
+        assert!(operations.contains("references"));
+        assert!(
+            result
+                .added_edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::DependsOn)
+        );
+        assert!(
+            result
+                .added_edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Implements)
+        );
+        assert!(
+            result
+                .added_edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::ReferencedBy)
+        );
     }
 
     #[tokio::test]

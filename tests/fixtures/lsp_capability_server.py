@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Deterministic stdio LSP fixture for capability/readiness CLI checks.
 
-Set RNA_LSP_FIXTURE_SCENARIO to document_zero (default), workspace,
-method_not_found, crash, or timeout. The fixture deliberately advertises only
-the readiness capability exercised by the scenario.
+Set RNA_LSP_FIXTURE_SCENARIO (or the first argument) to document_zero
+(default), document_features, workspace, method_not_found, crash, or timeout.
+The document_features scenario exercises Markdown symbol/link/definition/
+reference evidence without provisioning a real server.
 """
 
 import json
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -51,7 +53,11 @@ def rpc_error(request_id, code, message):
 
 
 def main():
-    scenario = os.environ.get("RNA_LSP_FIXTURE_SCENARIO", "document_zero")
+    scenario = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else os.environ.get("RNA_LSP_FIXTURE_SCENARIO", "document_zero")
+    )
     while True:
         message = read_message()
         if message is None:
@@ -60,11 +66,17 @@ def main():
         request_id = message.get("id")
 
         if method == "initialize":
-            capabilities = (
-                {"workspaceSymbolProvider": True}
-                if scenario == "workspace"
-                else {"documentSymbolProvider": True}
-            )
+            if scenario == "workspace":
+                capabilities = {"workspaceSymbolProvider": True}
+            elif scenario == "document_features":
+                capabilities = {
+                    "referencesProvider": True,
+                    "definitionProvider": True,
+                    "documentLinkProvider": {"resolveProvider": False},
+                    "documentSymbolProvider": True,
+                }
+            else:
+                capabilities = {"documentSymbolProvider": True}
             result(request_id, {"capabilities": capabilities})
         elif method in ("workspace/symbol", "textDocument/documentSymbol"):
             if scenario == "method_not_found":
@@ -75,8 +87,37 @@ def main():
                 time.sleep(60)
             elif scenario == "workspace":
                 result(request_id, [{"name": "fixture-symbol"}])
+            elif scenario == "document_features":
+                result(
+                    request_id,
+                    [
+                        {
+                            "name": "Fixture guide",
+                            "kind": 3,
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 2, "character": 68},
+                            },
+                        }
+                    ],
+                )
             else:
                 result(request_id, [])
+        elif method == "textDocument/documentLink" and scenario == "document_features":
+            result(
+                request_id,
+                [{"range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 16}}, "target": (Path.cwd() / "src/app.py").as_uri()}],
+            )
+        elif method == "textDocument/definition" and scenario == "document_features":
+            result(
+                request_id,
+                [{"uri": (Path.cwd() / "src/app.py").as_uri(), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}],
+            )
+        elif method == "textDocument/references" and scenario == "document_features":
+            result(
+                request_id,
+                [{"uri": (Path.cwd() / "tests/test_app.py").as_uri(), "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 10}}}],
+            )
         elif method == "shutdown":
             result(request_id, None)
         elif method == "exit":

@@ -679,6 +679,7 @@ impl LspEnricher {
                     NodeKind::Function
                         | NodeKind::Trait
                         | NodeKind::Other(_)
+                        | NodeKind::MarkdownSection
                         | NodeKind::Struct
                         | NodeKind::Enum
                         | NodeKind::TypeAlias
@@ -705,29 +706,40 @@ impl LspEnricher {
             .collect();
 
         let mut document_link_files = HashSet::new();
-        let admitted_nodes: Vec<(&Node, LspQueryOperation)> = candidate_nodes
-            .into_iter()
-            .filter_map(|node| {
-                let operation = match node.id.kind {
-                    NodeKind::Function if capabilities.call_hierarchy => {
-                        Some(LspQueryOperation::CallHierarchy)
-                    }
-                    NodeKind::Function => Some(LspQueryOperation::References),
-                    NodeKind::Trait => Some(LspQueryOperation::Implementations),
-                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                        Some(LspQueryOperation::References)
-                    }
-                    NodeKind::Other(_) => Some(LspQueryOperation::DocumentLinks),
-                    _ => None,
-                }?;
-                if !retain_unique_document_link_file(node, operation, &mut document_link_files) {
-                    return None;
+        let mut admitted_nodes: Vec<(&Node, LspQueryOperation)> = Vec::new();
+        for node in candidate_nodes {
+            let operations: &[LspQueryOperation] = match node.id.kind {
+                NodeKind::Function if capabilities.call_hierarchy => {
+                    &[LspQueryOperation::CallHierarchy]
                 }
-                self.query_profile
-                    .admits(node, operation, capabilities, budget)
-                    .then_some((node, operation))
-            })
-            .collect();
+                NodeKind::Function => &[LspQueryOperation::References],
+                NodeKind::Trait => &[LspQueryOperation::Implementations],
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                    &[LspQueryOperation::References]
+                }
+                NodeKind::MarkdownSection
+                    if node.metadata.get("markdown_kind").map(String::as_str) == Some("link") =>
+                {
+                    &[
+                        LspQueryOperation::DocumentLinks,
+                        LspQueryOperation::Definitions,
+                        LspQueryOperation::References,
+                    ]
+                }
+                NodeKind::MarkdownSection => &[LspQueryOperation::DocumentLinks],
+                NodeKind::Other(_) => &[LspQueryOperation::DocumentLinks],
+                _ => &[],
+            };
+            for &operation in operations {
+                if retain_unique_document_link_file(node, operation, &mut document_link_files)
+                    && self
+                        .query_profile
+                        .admits(node, operation, capabilities, budget)
+                {
+                    admitted_nodes.push((node, operation));
+                }
+            }
+        }
 
         let ref_eligible = admitted_nodes
             .iter()
@@ -1206,6 +1218,33 @@ impl LspEnricher {
                     QueryObservation::default()
                 }
             }
+            NodeKind::MarkdownSection => match operation {
+                Some(LspQueryOperation::DocumentLinks) => {
+                    Self::enrich_document_links(
+                        transport, &file_uri, node, root, item.id, telemetry, &mut edges,
+                    )
+                    .await
+                }
+                Some(
+                    operation @ (LspQueryOperation::Definitions | LspQueryOperation::References),
+                ) => {
+                    Self::enrich_document_locations(
+                        transport,
+                        &file_uri,
+                        line,
+                        col,
+                        node,
+                        matching_owned,
+                        root,
+                        operation,
+                        item.id,
+                        telemetry,
+                        &mut edges,
+                    )
+                    .await
+                }
+                _ => QueryObservation::default(),
+            },
             _ => {
                 if matches!(node.id.kind, NodeKind::Other(_))
                     && operation == Some(LspQueryOperation::DocumentLinks)
@@ -1727,6 +1766,79 @@ impl LspEnricher {
                 }
             }
             Err(e) => observation.record_error(&e),
+        }
+        observation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enrich_document_locations(
+        transport: &PipelinedTransport,
+        file_uri: &lsp_types::Uri,
+        line: u32,
+        col: u32,
+        node: &Node,
+        matching_nodes: &[Node],
+        root: &Path,
+        operation: LspQueryOperation,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
+        edges: &mut Vec<Edge>,
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
+        let response = match operation {
+            LspQueryOperation::Definitions => {
+                Self::find_definitions_p(transport, file_uri, line, col).await
+            }
+            LspQueryOperation::References => {
+                Self::find_references_p(transport, file_uri, line, col).await
+            }
+            _ => return observation,
+        };
+        match response {
+            Ok(locations) => {
+                observation.non_empty_responses += usize::from(!locations.is_empty());
+                let matching_refs = matching_nodes.iter().collect::<Vec<_>>();
+                for location in locations {
+                    observation.result_count += 1;
+                    let target_path = uri_to_relative_path(&location.uri, root);
+                    let target_line = location.range.start.line as usize + 1;
+                    let target = find_enclosing_symbol(&matching_refs, &target_path, target_line)
+                        .unwrap_or_else(|| NodeId {
+                            root: node.id.root.clone(),
+                            file: target_path.clone(),
+                            name: target_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            kind: NodeKind::Module,
+                        });
+                    let (from, to, kind) = match operation {
+                        LspQueryOperation::Definitions => {
+                            (node.id.clone(), target, EdgeKind::Implements)
+                        }
+                        LspQueryOperation::References => {
+                            (target, node.id.clone(), EdgeKind::ReferencedBy)
+                        }
+                        _ => unreachable!("document location operation checked above"),
+                    };
+                    if from != to {
+                        edges.push(Edge {
+                            from,
+                            to,
+                            kind,
+                            source: ExtractionSource::Lsp,
+                            confidence: Confidence::Confirmed,
+                            evidence: Vec::new(),
+                        });
+                    }
+                }
+            }
+            Err(error) => observation.record_error(&error),
         }
         observation
     }

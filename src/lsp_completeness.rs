@@ -26,7 +26,7 @@ use crate::server::{
     LspEvidenceReadiness,
 };
 
-pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 3;
+pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 4;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v1";
@@ -620,6 +620,46 @@ fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
                 path: Some(path.clone()),
                 detail: "processed file has no persisted LSP request evidence".to_string(),
             });
+        }
+        if file.role == FileRole::Docs
+            && file
+                .expected_results
+                .contains(&ExpectedResultKind::DocumentLink)
+        {
+            for capability_name in [
+                "documentSymbolProvider",
+                "documentLinkProvider",
+                "definitionProvider",
+                "referencesProvider",
+            ] {
+                if !file
+                    .advertised_capabilities
+                    .iter()
+                    .any(|capability| capability.name == capability_name && capability.supported)
+                {
+                    violations.push(ReadinessViolation {
+                        code: ReadinessViolationCode::MissingAdvertisedCapabilities,
+                        path: Some(path.clone()),
+                        detail: format!("documentation link requires negotiated {capability_name}"),
+                    });
+                }
+            }
+            for method in [
+                "textDocument/documentSymbol",
+                "textDocument/documentLink",
+                "textDocument/definition",
+                "textDocument/references",
+            ] {
+                if !file.requests_attempted.iter().any(|request| {
+                    request.method == method && request.outcome == RequestOutcome::Completed
+                }) {
+                    violations.push(ReadinessViolation {
+                        code: ReadinessViolationCode::MissingRequestEvidence,
+                        path: Some(path.clone()),
+                        detail: format!("documentation link requires completed {method}"),
+                    });
+                }
+            }
         }
 
         for expected in &file.expected_results {
@@ -1217,6 +1257,7 @@ fn build_report(
         .iter()
         .filter_map(|node| normalize_repo_relative_path(&node.id.file.to_string_lossy()).ok())
         .collect::<BTreeSet<_>>();
+    let docs_with_applicable_links = applicable_document_link_paths(repo_root, nodes);
     let mut work_by_path: BTreeMap<String, Vec<&LspWorkItemRecord>> = BTreeMap::new();
     for item in work_items {
         if let Ok(path) = normalize_repo_relative_path(&item.file) {
@@ -1297,8 +1338,16 @@ fn build_report(
             .get(&normalized)
             .cloned()
             .unwrap_or_default();
-        let (expected_results, expected_result_ids) =
+        let (mut expected_results, expected_result_ids) =
             expected_evidence_from_work_items(&records, &validations, &normalized);
+        if role == FileRole::Docs && docs_with_applicable_links.contains(&normalized) {
+            expected_results.extend([
+                ExpectedResultKind::DocumentSymbol,
+                ExpectedResultKind::DocumentLink,
+                ExpectedResultKind::Definition,
+                ExpectedResultKind::Reference,
+            ]);
+        }
         let terminal_status = terminal_status_for_file(
             &normalized,
             &records,
@@ -1328,6 +1377,44 @@ fn build_report(
     ))
 }
 
+fn applicable_document_link_paths(repo_root: &Path, nodes: &[Node]) -> BTreeSet<String> {
+    nodes
+        .iter()
+        .filter(|node| node.source == ExtractionSource::Markdown)
+        .filter(|node| node.metadata.get("markdown_kind").map(String::as_str) == Some("link"))
+        .filter_map(|node| {
+            let target = node.metadata.get("link_target")?;
+            let target = target.split('#').next().unwrap_or_default();
+            if target.is_empty()
+                || target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+                || target.starts_with("data:")
+                || Path::new(target).is_absolute()
+            {
+                return None;
+            }
+            let mut resolved = node.id.file.parent().unwrap_or(Path::new("")).to_path_buf();
+            for component in Path::new(target).components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        if !resolved.pop() {
+                            return None;
+                        }
+                    }
+                    Component::Normal(segment) => resolved.push(segment),
+                    Component::RootDir | Component::Prefix(_) => return None,
+                }
+            }
+            if !repo_root.join(resolved).is_file() {
+                return None;
+            }
+            normalize_repo_relative_path(&node.id.file.to_string_lossy()).ok()
+        })
+        .collect()
+}
+
 fn evidence_from_work_items(
     records: &[&LspWorkItemRecord],
     language_entries: &[&LspEnrichmentEntry],
@@ -1343,6 +1430,7 @@ fn evidence_from_work_items(
         for (name, supported) in [
             ("referencesProvider", negotiated.references_provider),
             ("callHierarchyProvider", negotiated.call_hierarchy_provider),
+            ("definitionProvider", negotiated.definition_provider),
             ("implementationProvider", negotiated.implementation_provider),
             ("documentLinkProvider", negotiated.document_link_provider),
             (
@@ -1443,6 +1531,7 @@ fn lsp_method(operation: &str) -> &'static str {
     match operation {
         "call_hierarchy" => "textDocument/prepareCallHierarchy+callHierarchy/*",
         "references" => "textDocument/references",
+        "definitions" => "textDocument/definition",
         "implementations" => "textDocument/implementation",
         "type_hierarchy" => "textDocument/prepareTypeHierarchy+typeHierarchy/*",
         "document_links" => "textDocument/documentLink",
@@ -1592,7 +1681,9 @@ fn expected_evidence_from_work_items(
                         Some(ExpectedResultKind::CallHierarchy)
                     }
                     "references" => Some(ExpectedResultKind::Reference),
-                    "implementations" | "type_hierarchy" => Some(ExpectedResultKind::Definition),
+                    "definitions" | "implementations" | "type_hierarchy" => {
+                        Some(ExpectedResultKind::Definition)
+                    }
                     "document_links" => Some(ExpectedResultKind::DocumentLink),
                     _ => None,
                 };
@@ -2195,6 +2286,7 @@ fn probe_version(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::Extractor;
     use crate::graph::{Confidence, NodeId, NodeKind};
 
     fn identity(generation: &str) -> ReportIdentity {
@@ -2556,10 +2648,32 @@ mod tests {
 
     #[test]
     fn unrelated_fresh_work_item_cannot_satisfy_scan_coverage() {
+        let edge = Edge {
+            from: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/b.py"),
+                name: "callee".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
         let related = LspWorkItemRecord {
-            job_id: "scan-job".to_string(),
+            job_id: "lsp-pass1-scan".to_string(),
             file: "src/a.py".to_string(),
-            state: LspWorkItemState::Skipped,
+            node_kind: "function".to_string(),
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            output_edges: vec![edge.clone()],
+            observed_result_count: 1,
             ..LspWorkItemRecord::default()
         };
         let unrelated = LspWorkItemRecord {
@@ -2571,20 +2685,50 @@ mod tests {
             observed_result_count: 1,
             ..LspWorkItemRecord::default()
         };
-        let related_ids = BTreeSet::from(["scan-job"]);
+        let related_ids = BTreeSet::from(["enrichment-job", "lsp-pass1-scan"]);
         let filtered = filter_work_items_for_related_jobs(vec![unrelated, related], &related_ids);
         let filtered = filtered.iter().collect::<Vec<_>>();
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].job_id, "scan-job");
+        assert_eq!(filtered[0].job_id, "lsp-pass1-scan");
         assert_eq!(
             aggregate_request_outcome(&filtered),
-            RequestOutcome::Unsupported
+            RequestOutcome::Completed
         );
+        let validation = LspValidationEvidence::processed(
+            "python",
+            "fixture-ls",
+            "textDocument/documentSymbol",
+            0,
+        )
+        .with_negotiated_capabilities(
+            crate::extract::scan_stats::LspNegotiatedCapabilities {
+                references_provider: true,
+                document_symbol_provider: true,
+                ..crate::extract::scan_stats::LspNegotiatedCapabilities::default()
+            },
+        );
+        let jobs = vec![completed_job(vec![validation])];
+        let validations = job_validations_for_language(&jobs, "python");
+        let (capabilities, requests) = evidence_from_work_items(&filtered, &[], &validations);
         let (expected, expected_ids) =
             expected_evidence_from_work_items(&filtered, &[], "src/a.py");
-        assert!(expected.is_empty());
-        assert!(expected_ids.is_empty());
+        let status = terminal_status_for_file(
+            "src/a.py",
+            &filtered,
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &validations,
+        );
+        let mut file = included("src/a.py", status);
+        file.advertised_capabilities = capabilities;
+        file.requests_attempted = requests;
+        file.expected_results = expected;
+        file.expected_result_ids = expected_ids;
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge]);
+        assert!(report(vec![file]).is_ready());
     }
 
     #[test]
@@ -2853,6 +2997,26 @@ mod tests {
             include_str!("../tests/fixtures/lsp_capability_repo/tests/test_app.py")
                 .contains("test_greet")
         );
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_repo");
+        let markdown = crate::extract::markdown::MarkdownExtractor::new();
+        let valid_doc = markdown
+            .extract(
+                Path::new("docs/guide.md"),
+                include_str!("../tests/fixtures/lsp_capability_repo/docs/guide.md"),
+            )
+            .unwrap();
+        let malformed_doc = markdown
+            .extract(
+                Path::new("docs/malformed.md"),
+                include_str!("../tests/fixtures/lsp_capability_repo/docs/malformed.md"),
+            )
+            .unwrap();
+        assert!(
+            applicable_document_link_paths(&fixture_root, &valid_doc.nodes)
+                .contains("docs/guide.md")
+        );
+        assert!(applicable_document_link_paths(&fixture_root, &malformed_doc.nodes).is_empty());
 
         let doc_node = Node {
             id: NodeId {
@@ -2869,6 +3033,117 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::Lsp,
         };
+        let doc_validation = LspValidationEvidence::processed(
+            "markdown",
+            "marksman",
+            "textDocument/documentSymbol",
+            1,
+        )
+        .with_negotiated_capabilities(crate::extract::scan_stats::LspNegotiatedCapabilities {
+            references_provider: true,
+            definition_provider: true,
+            document_link_provider: true,
+            document_symbol_provider: true,
+            ..crate::extract::scan_stats::LspNegotiatedCapabilities::default()
+        })
+        .with_document_symbols(vec![
+            crate::extract::scan_stats::LspDocumentSymbolEvidence {
+                uri: "file:///fixture/docs/guide.md".to_string(),
+                name: "Fixture guide".to_string(),
+                kind: 3,
+                start_line: 0,
+                start_character: 0,
+                end_line: 2,
+                end_character: 68,
+                payload_digest: "docproof".to_string(),
+                graph_result_id: Some(doc_node.stable_id()),
+                file: Some("docs/guide.md".to_string()),
+            },
+        ]);
+        let doc_target = NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/app.py"),
+            name: "greet".to_string(),
+            kind: NodeKind::Function,
+        };
+        let doc_edges = [
+            Edge {
+                from: doc_node.id.clone(),
+                to: doc_target.clone(),
+                kind: EdgeKind::DependsOn,
+                source: ExtractionSource::Lsp,
+                confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
+            },
+            Edge {
+                from: doc_node.id.clone(),
+                to: doc_target.clone(),
+                kind: EdgeKind::Implements,
+                source: ExtractionSource::Lsp,
+                confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
+            },
+            Edge {
+                from: doc_target.clone(),
+                to: doc_node.id.clone(),
+                kind: EdgeKind::ReferencedBy,
+                source: ExtractionSource::Lsp,
+                confidence: Confidence::Confirmed,
+                evidence: Vec::new(),
+            },
+        ];
+        let doc_records = [
+            ("document_links", doc_edges[0].clone()),
+            ("definitions", doc_edges[1].clone()),
+            ("references", doc_edges[2].clone()),
+        ]
+        .into_iter()
+        .map(|(operation, edge)| LspWorkItemRecord {
+            file: "docs/guide.md".to_string(),
+            node_kind: "markdown_section".to_string(),
+            requested_operations: vec![operation.to_string()],
+            state: LspWorkItemState::Completed,
+            output_edges: vec![edge],
+            observed_result_count: 1,
+            ..LspWorkItemRecord::default()
+        })
+        .collect::<Vec<_>>();
+        let doc_record_refs = doc_records.iter().collect::<Vec<_>>();
+        let (doc_capabilities, doc_requests) =
+            evidence_from_work_items(&doc_record_refs, &[], &[&doc_validation]);
+        let (doc_expected, doc_expected_ids) = expected_evidence_from_work_items(
+            &doc_record_refs,
+            &[&doc_validation],
+            "docs/guide.md",
+        );
+        let mut docs_file = included(
+            "docs/guide.md",
+            FileTerminalStatus::Processed { result_count: 4 },
+        );
+        docs_file.role = FileRole::Docs;
+        docs_file.advertised_capabilities = doc_capabilities;
+        docs_file.requests_attempted = doc_requests;
+        docs_file.expected_results = doc_expected;
+        docs_file.expected_result_ids = doc_expected_ids;
+        docs_file.persisted_results = persisted_results_for_path(
+            "docs/guide.md",
+            std::slice::from_ref(&doc_node),
+            &doc_edges,
+        );
+        assert!(report(vec![docs_file.clone()]).is_ready());
+
+        let mut missing_definition_capability = docs_file.clone();
+        missing_definition_capability
+            .advertised_capabilities
+            .retain(|capability| capability.name != "definitionProvider");
+        assert!(!report(vec![missing_definition_capability]).is_ready());
+
+        let mut missing_definition_request = docs_file;
+        missing_definition_request
+            .requests_attempted
+            .retain(|request| request.method != "textDocument/definition");
+        assert!(!report(vec![missing_definition_request]).is_ready());
+
         let relation = Edge {
             from: NodeId {
                 root: "fixture".to_string(),
@@ -2887,11 +3162,6 @@ mod tests {
             confidence: Confidence::Confirmed,
             evidence: Vec::new(),
         };
-        let docs_persisted = persisted_results_for_path(
-            "docs/guide.md",
-            std::slice::from_ref(&doc_node),
-            std::slice::from_ref(&relation),
-        );
         let source_persisted = persisted_results_for_path(
             "src/app.py",
             std::slice::from_ref(&doc_node),
@@ -2902,7 +3172,6 @@ mod tests {
             std::slice::from_ref(&doc_node),
             std::slice::from_ref(&relation),
         );
-        assert_eq!(docs_persisted.document_symbols, 1);
         assert_eq!(source_persisted.call_hierarchy_edges, 1);
         assert_eq!(test_persisted.call_hierarchy_edges, 1);
 
@@ -2979,6 +3248,7 @@ mod tests {
                     crate::extract::scan_stats::LspNegotiatedCapabilities {
                         references_provider: true,
                         call_hierarchy_provider: false,
+                        definition_provider: true,
                         implementation_provider: true,
                         document_link_provider: false,
                         document_symbol_provider: true,

@@ -770,7 +770,7 @@ async fn async_main() -> anyhow::Result<()> {
                     lsp_only_roots: Arc::new(lsp_only_roots_scan),
                     ..Default::default()
                 };
-                let result = handler
+                let mut result = handler
                     .run_pipeline_foreground(
                         |msg| {
                             eprintln!("{}", msg);
@@ -778,6 +778,10 @@ async fn async_main() -> anyhow::Result<()> {
                         enrichment,
                     )
                     .await?;
+                server::OperationReportStore::hydrate_lsp_work_item_evidence(
+                    &repo_root,
+                    &mut result.report,
+                );
                 if let Err(err) =
                     server::OperationReportStore::record(&repo_root, result.report.clone())
                 {
@@ -808,7 +812,7 @@ async fn async_main() -> anyhow::Result<()> {
                         completeness.violations.len(),
                         completeness.digest,
                     );
-                    if enrichment.runs_lsp() && !completeness.is_ready() {
+                    if !completeness.is_ready() {
                         anyhow::bail!(
                             "benchmark LSP completeness blocked by {} per-file violation(s); inspect {}",
                             completeness.violations.len(),

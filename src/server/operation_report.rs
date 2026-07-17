@@ -654,11 +654,9 @@ impl OperationReportStore {
         Self::record_with_limit(repo_root, report, DEFAULT_REPORT_LIMIT)
     }
 
-    pub fn record_with_limit(
-        repo_root: &Path,
-        mut report: OperationReport,
-        limit: usize,
-    ) -> Result<()> {
+    /// Attach current-scan durable work-item queues and their exact job IDs to
+    /// the caller-owned report before any downstream evidence consumer uses it.
+    pub fn hydrate_lsp_work_item_evidence(repo_root: &Path, report: &mut OperationReport) {
         if report.lsp_work_item_queues.is_empty() {
             report.lsp_work_item_queues =
                 crate::extract::lsp::work_items::load_queue_snapshots_since(
@@ -686,6 +684,14 @@ impl OperationReportStore {
                 report.related_job_ids.push(snapshot.job_id.clone());
             }
         }
+    }
+
+    pub fn record_with_limit(
+        repo_root: &Path,
+        mut report: OperationReport,
+        limit: usize,
+    ) -> Result<()> {
+        Self::hydrate_lsp_work_item_evidence(repo_root, &mut report);
         let mut store = match Self::read(repo_root) {
             Ok(store) => store,
             Err(err) => {
@@ -1166,6 +1172,12 @@ mod tests {
             OperationReport::new(OperationKind::Enrich, OperationTrigger::Test, repo.path())
                 .complete(Duration::from_millis(10));
         report.started_at = unix_now().saturating_sub(30);
+        OperationReportStore::hydrate_lsp_work_item_evidence(repo.path(), &mut report);
+        assert_eq!(report.lsp_work_item_queues.len(), 1);
+        assert_eq!(
+            report.related_job_ids,
+            [report.lsp_work_item_queues[0].job_id.clone()]
+        );
         OperationReportStore::record(repo.path(), report).unwrap();
 
         let persisted = OperationReportStore::recent(repo.path(), 1);

@@ -74,14 +74,16 @@ pub enum LspValidationStatus {
     NotValidated,
 }
 
-pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 
 /// Exact per-file operation capabilities negotiated in the initialize response.
 /// Readiness/quiescence methods deliberately do not appear here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LspNegotiatedCapabilities {
     pub references_provider: bool,
     pub call_hierarchy_provider: bool,
+    pub definition_provider: bool,
     pub implementation_provider: bool,
     pub document_link_provider: bool,
     pub document_symbol_provider: bool,
