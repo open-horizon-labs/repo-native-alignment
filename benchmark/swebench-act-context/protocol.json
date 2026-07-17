@@ -90,6 +90,12 @@
       "retry_trigger": "one or more edit results not matched/created and at least one edit was parsed",
       "retry_suffix": "\n\nYOUR PREVIOUS EDIT BLOCKS (for reference):\n{prev}\n\nThese edits FAILED to apply:\n{feedback}\n\nThe other edits were applied successfully. Re-emit corrected edit blocks ONLY for the failed edits,\nin the same *** FILE / SEARCH / REPLACE / END format.",
       "retry_suffix_sha256": "16b9a0ddb39d289333b54af4e4199921890c9610ed77d4dc96a90bb95ec981e1",
+      "base_prompt_source": "the exact original initial-request prompt assembled once from the frozen prompt template; every retry appends to this original prompt, never to an earlier retry prompt",
+      "previous_response_slice": "Python (raw or \"\")[-6000:] over Unicode code points from the immediately preceding model response; do not slice UTF-8 bytes, strip, normalize, or reuse an older response",
+      "feedback_source": "failure_feedback(all_results) from the pinned parser after the immediately preceding application round, preserving result order and exact returned text",
+      "request_assembly": "retry_prompt = prompt + retry_suffix.format(prev=(raw or \"\")[-6000:], feedback=failure_feedback(all_results))",
+      "round_state": "after each retry response, replace raw with that response, parse/apply against persistent state, update all_results exactly as scaled_run.py lines 127-133, and use the new raw/all_results if another retry is triggered",
+      "byte_vector": "packet-vector.json retry_prompt_vector; expand its codepoint runs, apply the exact assembly above, encode the complete request as UTF-8, and match its byte length and SHA-256",
       "model/API transport_retry_policy": "the pinned Anthropic SDK default; no harness-level transport retry"
     }
   },
@@ -210,6 +216,92 @@
       "algorithm": "walk scored candidates in order; select an eligible candidate only when its complete full body fits remaining bytes; record oversize/noneligible candidates as omitted and continue",
       "body_truncation": "forbidden",
       "empty_selection": "valid only when the candidate pool is empty; otherwise unexplained empty selection stops the run"
+    },
+    "record_schema": {
+      "exact_fields": [
+        "schema_version",
+        "dataset_row_sha256",
+        "query_sha256",
+        "rna_artifact_receipt_sha256",
+        "loci",
+        "candidates",
+        "relationships",
+        "omissions"
+      ],
+      "schema_version": 1,
+      "dataset_row_sha256": "the population row's frozen dataset_row_sha256",
+      "query_sha256": "SHA-256 of the exact query_bytes",
+      "rna_artifact_receipt_sha256": "SHA-256 of canonical JSON for the validated qualified_artifact_receipt object",
+      "locus_exact_fields": [
+        "ordinal",
+        "source_kind",
+        "stable_id",
+        "path",
+        "start_line",
+        "end_line",
+        "language",
+        "preimage_byte_length",
+        "preimage_sha256",
+        "seed_stable_ids"
+      ],
+      "locus_source_kinds": [
+        "gold_unit",
+        "module_preamble",
+        "whole_non_python_file",
+        "new_file"
+      ],
+      "locus_identity": "stable_id is locus:<source_kind>:<sha256 of canonical JSON [path,start_line,end_line,preimage_sha256]>; gold_unit and module_preamble use language Python; whole_non_python_file uses language Unknown; non-new spans use one-based inclusive lines and exact preimage bytes; seed_stable_ids is the sorted unique UTF-8 list of exact RNA nodes corresponding to the span and traversal visits each nonempty list in locus order",
+      "new_file_locus": "source_kind=new_file; path is the exact gold path; start_line=0; end_line=0; language=Unknown; preimage_byte_length=0; preimage_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855; seed_stable_ids=[]; the packet payload is empty; relationships are empty",
+      "candidate_exact_fields": [
+        "acquisition_ordinal",
+        "stable_id",
+        "path",
+        "start_line",
+        "end_line",
+        "language",
+        "full_body_byte_length",
+        "full_body_sha256",
+        "semantic_rank",
+        "graph_hops",
+        "semantic_component",
+        "graph_component",
+        "total",
+        "eligibility",
+        "selected"
+      ],
+      "candidate_order": "deduplicate by stable_id at first search/traversal occurrence, compute the frozen integer score, then order by the frozen score tie-break; acquisition_ordinal is one-based in that order",
+      "candidate_eligibility_values": [
+        "eligible",
+        "not_source_backed",
+        "incomplete_utf8_body",
+        "locus_overlap",
+        "excluded_record_class"
+      ],
+      "relationship_exact_fields": [
+        "source",
+        "target",
+        "edge_type",
+        "direction",
+        "locus_ordinal",
+        "cli_ordinal"
+      ],
+      "relationship_order": "the packet relationship_schema ordering; include every deduplicated acquired relationship, including relationships for omitted candidates",
+      "omission_exact_fields": [
+        "candidate_stable_id",
+        "reason",
+        "required_bytes",
+        "remaining_budget_bytes"
+      ],
+      "omission_reason_values": [
+        "not_source_backed",
+        "incomplete_utf8_body",
+        "locus_overlap",
+        "excluded_record_class",
+        "maximum_candidates",
+        "full_body_budget"
+      ],
+      "omission_null_rules": "required_bytes and remaining_budget_bytes are integers only for maximum_candidates/full_body_budget; both are null for eligibility omissions",
+      "consistency": "loci, candidates, relationships, and omissions are ordered arrays; every unselected candidate has exactly one omission; every selected candidate has none; packet candidate records are exactly the selected candidates in candidate order"
     }
   },
   "packet_serialization": {
@@ -220,15 +312,18 @@
       "exact_fields": [
         "instance_id",
         "protocol_id",
-        "record_count"
+        "record_count",
+        "acquisition"
       ],
       "instance_id": "exact dataset instance_id string",
       "protocol_id": "exact constant rna-act-context-swebench-v1",
-      "record_count": "integer count of serialized records"
+      "record_count": "integer count of serialized records",
+      "acquisition": "the exact closed rna_acquisition.record_schema object; B and C reuse identical canonical acquisition bytes"
     },
     "header_schema": {
       "base_exact_fields": [
         "kind",
+        "source_kind",
         "ordinal",
         "stable_id",
         "path",
@@ -240,6 +335,7 @@
         "score",
         "relationships"
       ],
+      "source_kind_rules": "candidate records use rna_node; locus records use the acquisition locus source_kind and the frozen synthetic identity/line/language rules; new_file is the empty-payload sentinel defined by rna_acquisition.record_schema",
       "derived_exact_fields": [
         "payload_representation",
         "payload_byte_length",
@@ -329,6 +425,107 @@
       "no_post_hoc_exclusion": "all 70 included rows remain in paired tables"
     }
   },
+  "authorization_receipts": {
+    "qualified_artifact_receipt_schema": {
+      "exact_fields": [
+        "schema_version",
+        "receipt_type",
+        "protocol_id",
+        "protocol_bundle_sha256",
+        "artifact_commit_sha",
+        "artifact_sha256",
+        "ci_repository",
+        "ci_workflow",
+        "ci_run_id",
+        "ci_run_url",
+        "ci_artifact_name",
+        "platform",
+        "capability_evidence",
+        "qualification_issue",
+        "qualification_comment_url",
+        "qualified_at_utc"
+      ],
+      "constants": {
+        "schema_version": 1,
+        "receipt_type": "rna-qualified-artifact-v1",
+        "protocol_id": "rna-act-context-swebench-v1",
+        "ci_repository": "open-horizon-labs/repo-native-alignment",
+        "platform": "darwin-arm64-m4",
+        "qualification_issue": 786
+      },
+      "capability_evidence_exact_fields": [
+        "release_build",
+        "metal",
+        "embeddings",
+        "reranking",
+        "lsp"
+      ],
+      "release_build_exact_fields": [
+        "status",
+        "evidence_sha256"
+      ],
+      "release_build_requirements": "status=passed and evidence_sha256 binds the successful CI artifact/build evidence",
+      "metal_exact_fields": [
+        "required",
+        "observed",
+        "fallback",
+        "evidence_sha256"
+      ],
+      "metal_requirements": "required=true, observed=true, fallback=false",
+      "semantic_capability_exact_fields": [
+        "enabled",
+        "complete",
+        "fallback",
+        "evidence_sha256"
+      ],
+      "semantic_capability_requirements": "embeddings and reranking each require enabled=true, complete=true, fallback=false",
+      "lsp_exact_fields": [
+        "status",
+        "quiescent",
+        "languages",
+        "skipped_files",
+        "partial_jobs",
+        "degraded_jobs",
+        "cancelled_jobs",
+        "crashed_jobs",
+        "timed_out_jobs",
+        "included_file_count",
+        "covered_file_count",
+        "coverage_scope",
+        "coverage_manifest_sha256",
+        "evidence_sha256"
+      ],
+      "lsp_requirements": "status=complete, quiescent=true, Python is present in a sorted unique language list, every failure/partial counter is zero, covered_file_count equals positive included_file_count, and coverage_scope is every included ordinary docs/source/test/config file",
+      "provenance_requirements": "artifact_commit_sha is 40 lowercase hex; every artifact/evidence/protocol/coverage digest is 64 lowercase hex; ci_workflow is a .github/workflows YAML path; ci_run_id is positive and ci_run_url exactly names that GitHub Actions run; qualification_comment_url exactly names an issue #786 comment; qualified_at_utc is second-precision UTC"
+    },
+    "approved_budget_receipt_schema": {
+      "exact_fields": [
+        "schema_version",
+        "receipt_type",
+        "protocol_id",
+        "protocol_bundle_sha256",
+        "authorization_scope",
+        "authorization_issue",
+        "qualification_instance_id",
+        "population_n",
+        "maximum_model_requests",
+        "maximum_total_usd",
+        "approval_comment_url",
+        "approval_evidence_sha256",
+        "approved_at_utc"
+      ],
+      "constants": {
+        "schema_version": 1,
+        "receipt_type": "approved-model-budget-v1",
+        "protocol_id": "rna-act-context-swebench-v1"
+      },
+      "qualification_pair": "authorization_scope=qualification_pair; authorization_issue=789; qualification_instance_id=astropy__astropy-13398; population_n=1; maximum_model_requests is 1..6",
+      "n70_cohort": "authorization_scope=n70_cohort; authorization_issue=790; qualification_instance_id=null; population_n=70; maximum_model_requests is 1..420",
+      "budget_requirements": "maximum_total_usd is a positive fixed two-decimal ASCII string; approval_comment_url exactly names a comment on the matching authorization issue; approval_evidence_sha256 is 64 lowercase hex; approved_at_utc is second-precision UTC; protocol_bundle_sha256 equals the externally anchored bundle"
+    },
+    "external_anchor_requirements": "paid authorization requires three independent CLI trust anchors copied from GitHub: the protocol bundle SHA-256, SHA-256 of canonical JSON for qualified_artifact_receipt, and SHA-256 of canonical JSON for approved_budget_receipt; each must match before model access",
+    "trust_boundary": "the offline validator performs no network or signature lookup; the operator must copy the exact receipt objects and all three digests from their externally anchored GitHub approvals. Closed schemas, independent receipt digests, and cross-bindings reject omission, drift, wrong capability state, wrong issue/run/platform, or receipt reuse across protocol digests."
+  },
   "hypotheses": {
     "H1": {
       "claim": "B uses at least 40% fewer exact comparable initial-request Anthropic input tokens per resolved issue than A, where the quantity is total exact initial-request input tokens across frozen N=70 divided by resolved_count",
@@ -393,6 +590,7 @@
     "offline validator nonzero",
     "protocol/bundle/population digest mismatch",
     "A compatibility mismatch",
+    "missing, malformed, wrong-digest, wrong-scope, or unanchored artifact/budget receipt",
     "credential detected in argv/git/GitHub/log/bundle/guest image",
     "unqualified or wrong CI artifact",
     "Metal/embedding/rerank fallback",
@@ -492,6 +690,9 @@
       "any missing A initial-request token count",
       "any H1 denominator defined as mean only among resolved rows",
       "any protocol, population, source-reference, schedule, count, outcome, or digest drift",
+      "any paid authorization without closed artifact/budget receipts bound to the external protocol digest",
+      "any acquisition/omission or exceptional-locus record outside its exact closed schema",
+      "any retry prompt that does not match the frozen codepoint-slice byte vector",
       "any secret-shaped content"
     ],
     "success_output": "machine-readable compatibility decision plus bundle digest; no credential values"

@@ -99,5 +99,13 @@ Pending on the final checkpoint commit; results will be posted to PR #795.
 
 ### Step 10c: Independent Final-Diff Review
 
-Pending. A fresh reviewer will bind an explicit verdict to the exact final PR
-head in a PR #795 comment. No diff changes are permitted after that approval.
+The first fresh final reviewer, `/root/issue_782/pr795_final_diff_review`, bound
+`REQUEST CHANGES` to commit
+`5d448df1ed9980d58d46b9471e1916d8047c2c65`. It found three P1 gaps: receipt
+strings were not schema-bound evidence, acquisition/omission and exceptional
+locus serialization were incomplete, and retry-request bytes did not freeze
+the upstream 6,000-character state rule. Those findings reopened the diff.
+
+A replacement fresh reviewer remains pending after the fixes and renewed
+verification. Its exact-head verdict will be authoritative in a PR #795
+comment. No diff changes are permitted after that approval.

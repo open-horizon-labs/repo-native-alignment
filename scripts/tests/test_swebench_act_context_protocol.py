@@ -51,6 +51,92 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / rel, destination)
 
+    @staticmethod
+    def qualified_artifact_receipt(bundle_digest: str) -> dict:
+        return {
+            "schema_version": 1,
+            "receipt_type": "rna-qualified-artifact-v1",
+            "protocol_id": "rna-act-context-swebench-v1",
+            "protocol_bundle_sha256": bundle_digest,
+            "artifact_commit_sha": "7" * 40,
+            "artifact_sha256": "8" * 64,
+            "ci_repository": "open-horizon-labs/repo-native-alignment",
+            "ci_workflow": ".github/workflows/release.yml",
+            "ci_run_id": 12345,
+            "ci_run_url": "https://github.com/open-horizon-labs/repo-native-alignment/actions/runs/12345",
+            "ci_artifact_name": "rna-darwin-arm64-m4",
+            "platform": "darwin-arm64-m4",
+            "capability_evidence": {
+                "release_build": {"status": "passed", "evidence_sha256": "1" * 64},
+                "metal": {
+                    "required": True,
+                    "observed": True,
+                    "fallback": False,
+                    "evidence_sha256": "2" * 64,
+                },
+                "embeddings": {
+                    "enabled": True,
+                    "complete": True,
+                    "fallback": False,
+                    "evidence_sha256": "3" * 64,
+                },
+                "reranking": {
+                    "enabled": True,
+                    "complete": True,
+                    "fallback": False,
+                    "evidence_sha256": "4" * 64,
+                },
+                "lsp": {
+                    "status": "complete",
+                    "quiescent": True,
+                    "languages": ["Python"],
+                    "skipped_files": 0,
+                    "partial_jobs": 0,
+                    "degraded_jobs": 0,
+                    "cancelled_jobs": 0,
+                    "crashed_jobs": 0,
+                    "timed_out_jobs": 0,
+                    "included_file_count": 123,
+                    "covered_file_count": 123,
+                    "coverage_scope": "every included ordinary docs/source/test/config file",
+                    "coverage_manifest_sha256": "5" * 64,
+                    "evidence_sha256": "6" * 64,
+                },
+            },
+            "qualification_issue": 786,
+            "qualification_comment_url": "https://github.com/open-horizon-labs/repo-native-alignment/issues/786#issuecomment-12345",
+            "qualified_at_utc": "2026-07-17T00:00:00Z",
+        }
+
+    @staticmethod
+    def approved_budget_receipt(bundle_digest: str) -> dict:
+        return {
+            "schema_version": 1,
+            "receipt_type": "approved-model-budget-v1",
+            "protocol_id": "rna-act-context-swebench-v1",
+            "protocol_bundle_sha256": bundle_digest,
+            "authorization_scope": "n70_cohort",
+            "authorization_issue": 790,
+            "qualification_instance_id": None,
+            "population_n": 70,
+            "maximum_model_requests": 420,
+            "maximum_total_usd": "100.00",
+            "approval_comment_url": "https://github.com/open-horizon-labs/repo-native-alignment/issues/790#issuecomment-12345",
+            "approval_evidence_sha256": "9" * 64,
+            "approved_at_utc": "2026-07-17T00:00:00Z",
+        }
+
+    def authorized_runtime(self, bundle_digest: str) -> dict:
+        runtime = copy.deepcopy(self.runtime)
+        runtime.update(
+            {
+                "paid_calls_authorized": True,
+                "qualified_artifact_receipt": self.qualified_artifact_receipt(bundle_digest),
+                "approved_budget_receipt": self.approved_budget_receipt(bundle_digest),
+            }
+        )
+        return runtime
+
     def test_frozen_bundle_is_compatible(self) -> None:
         result = VALIDATOR.validate_bundle(ROOT)
         self.assertTrue(result["compatible"])
@@ -126,53 +212,71 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         runtime = copy.deepcopy(self.runtime)
         runtime["paid_calls_authorized"] = True
         errors: list[str] = []
-        VALIDATOR.validate_runtime(runtime, errors, allow_authorized=True)
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest="a" * 64,
+            expected_artifact_receipt_digest="b" * 64,
+            expected_budget_receipt_digest="c" * 64,
+        )
         self.assertIn(
-            "authorized runtime requires non-empty qualified_artifact_receipt",
+            "authorized runtime requires structured qualified_artifact_receipt",
             errors,
         )
         self.assertIn(
-            "authorized runtime requires non-empty approved_budget_receipt",
+            "authorized runtime requires structured approved_budget_receipt",
             errors,
         )
 
     def test_separate_authorized_runtime_config_is_accepted(self) -> None:
-        runtime = copy.deepcopy(self.runtime)
-        runtime.update(
-            {
-                "paid_calls_authorized": True,
-                "qualified_artifact_receipt": "qualification:sha256:abc123",
-                "approved_budget_receipt": "budget:approval:782",
-            }
-        )
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        runtime = self.authorized_runtime(digest)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "authorized-runtime.json"
             path.write_text(json.dumps(runtime), encoding="utf-8")
-            digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+            artifact_receipt_digest = VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["qualified_artifact_receipt"])
+            )
+            budget_receipt_digest = VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+            )
             result = VALIDATOR.validate_bundle(
                 ROOT,
                 expected_digest=digest,
                 runtime_config=path,
+                expected_artifact_receipt_digest=artifact_receipt_digest,
+                expected_budget_receipt_digest=budget_receipt_digest,
             )
         self.assertTrue(result["paid_calls_authorized"])
 
     def test_separate_authorized_runtime_requires_external_digest(self) -> None:
-        runtime = copy.deepcopy(self.runtime)
-        runtime.update(
-            {
-                "paid_calls_authorized": True,
-                "qualified_artifact_receipt": "qualification:sha256:abc123",
-                "approved_budget_receipt": "budget:approval:782",
-            }
-        )
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        runtime = self.authorized_runtime(digest)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "unanchored-runtime.json"
             path.write_text(json.dumps(runtime), encoding="utf-8")
             with self.assertRaisesRegex(
                 ValueError,
-                "paid authorization requires an externally anchored bundle digest",
+                "authorized runtime requires an externally anchored bundle digest",
             ):
                 VALIDATOR.validate_bundle(ROOT, runtime_config=path)
+
+    def test_authorized_runtime_requires_external_receipt_digests(self) -> None:
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        runtime = self.authorized_runtime(digest)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "unanchored-receipts.json"
+            path.write_text(json.dumps(runtime), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "authorized runtime requires an externally anchored artifact receipt digest",
+            ):
+                VALIDATOR.validate_bundle(
+                    ROOT,
+                    expected_digest=digest,
+                    runtime_config=path,
+                )
 
     def test_separate_runtime_config_cannot_drift_model(self) -> None:
         runtime = copy.deepcopy(self.runtime)
@@ -184,17 +288,86 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 VALIDATOR.validate_bundle(ROOT, runtime_config=path)
 
     def test_separate_runtime_config_rejects_credential_shaped_receipt(self) -> None:
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        runtime = self.authorized_runtime(digest)
+        runtime["qualified_artifact_receipt"]["ci_artifact_name"] = (
+            "sk-" + "ant-" + "not-a-receipt"
+        )
+        errors: list[str] = []
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=digest,
+            expected_artifact_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["qualified_artifact_receipt"])
+            ),
+            expected_budget_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+            ),
+        )
+        self.assertIn("runtime config contains a credential-shaped value", errors)
+
+    def test_receipt_strings_and_capability_fallback_fail_closed(self) -> None:
+        digest = "a" * 64
         runtime = copy.deepcopy(self.runtime)
         runtime.update(
             {
                 "paid_calls_authorized": True,
-                "qualified_artifact_receipt": "sk-" + "ant-" + "not-a-receipt",
-                "approved_budget_receipt": "budget:approval:782",
+                "qualified_artifact_receipt": "x",
+                "approved_budget_receipt": "y",
             }
         )
         errors: list[str] = []
-        VALIDATOR.validate_runtime(runtime, errors, allow_authorized=True)
-        self.assertIn("runtime config contains a credential-shaped value", errors)
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=digest,
+            expected_artifact_receipt_digest="b" * 64,
+            expected_budget_receipt_digest="c" * 64,
+        )
+        self.assertIn("authorized runtime requires structured qualified_artifact_receipt", errors)
+        self.assertIn("authorized runtime requires structured approved_budget_receipt", errors)
+
+        runtime = self.authorized_runtime(digest)
+        runtime["qualified_artifact_receipt"]["capability_evidence"]["metal"]["fallback"] = True
+        runtime["qualified_artifact_receipt"]["capability_evidence"]["lsp"]["degraded_jobs"] = 1
+        errors = []
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=digest,
+            expected_artifact_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["qualified_artifact_receipt"])
+            ),
+            expected_budget_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+            ),
+        )
+        self.assertIn("Metal qualification must be observed with no fallback", errors)
+        self.assertIn("LSP qualification degraded_jobs must be zero", errors)
+
+    def test_receipts_bind_protocol_and_budget_scope(self) -> None:
+        digest = "a" * 64
+        runtime = self.authorized_runtime(digest)
+        runtime["qualified_artifact_receipt"]["protocol_bundle_sha256"] = "b" * 64
+        runtime["approved_budget_receipt"]["authorization_scope"] = "qualification_pair"
+        errors: list[str] = []
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=digest,
+            expected_artifact_receipt_digest="0" * 64,
+            expected_budget_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+            ),
+        )
+        self.assertIn("qualified artifact receipt protocol digest mismatch", errors)
+        self.assertIn("qualification-pair budget scope mismatch", errors)
+        self.assertIn("externally anchored artifact receipt digest mismatch", errors)
 
     def test_packet_vector_freezes_b_and_c_bytes(self) -> None:
         errors: list[str] = []
@@ -214,6 +387,36 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         errors: list[str] = []
         VALIDATOR.validate_packet_vector(vector, errors)
         self.assertIn("packet record 2 relationship order drift", errors)
+
+    def test_acquisition_omissions_are_closed_and_consistent(self) -> None:
+        vector = copy.deepcopy(self.vector)
+        vector["metadata"]["acquisition"]["omissions"] = []
+        errors: list[str] = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertTrue(any("requires one omission" in error for error in errors))
+
+        vector = copy.deepcopy(self.vector)
+        vector["metadata"]["acquisition"]["loci"][0]["stable_id"] = "ambiguous-locus"
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("acquisition locus 1 stable_id drift", errors)
+
+    def test_retry_prompt_vector_freezes_codepoint_slice_and_bytes(self) -> None:
+        errors: list[str] = []
+        VALIDATOR.validate_retry_prompt_vector(self.vector["retry_prompt_vector"], errors)
+        self.assertEqual(errors, [])
+        request = VALIDATOR.assemble_retry_prompt_vector(self.vector["retry_prompt_vector"])
+        self.assertEqual(len(request), 12336)
+        self.assertEqual(
+            VALIDATOR.sha256_bytes(request),
+            "1043956d8aed9614eb3638d6fa09cde29273c382d8384a8710a0acd202fb2b09",
+        )
+
+        vector = copy.deepcopy(self.vector["retry_prompt_vector"])
+        vector["previous_response_codepoint_runs"][1]["repeat"] = 6000
+        errors = []
+        VALIDATOR.validate_retry_prompt_vector(vector, errors)
+        self.assertTrue(any("length drift" in error or "digest drift" in error for error in errors))
 
     def test_vendored_parser_ignores_reasoning_and_requires_unique_search(self) -> None:
         response = "reasoning first\n*** FILE: a/example.py\n*** SEARCH\nvalue = 1\n*** REPLACE\nvalue = 2\n*** END\ntrailing prose"
