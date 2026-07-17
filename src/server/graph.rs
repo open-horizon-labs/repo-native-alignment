@@ -467,7 +467,13 @@ impl RnaHandler {
 
             // Check for changes via scanner
             let mut scanner = Scanner::new(self.repo_root.clone())?;
-            let scan = scanner.scan()?;
+            let mut scan = scanner.scan()?;
+            self.business_context
+                .retain_repository_files(&mut scan.changed_files);
+            self.business_context
+                .retain_repository_files(&mut scan.new_files);
+            self.business_context
+                .retain_repository_files(&mut scan.deleted_files);
             let missing_graph_files: Vec<(String, PathBuf)> = {
                 let root_paths: std::collections::HashMap<String, PathBuf> =
                     WorkspaceConfig::load()
@@ -1013,7 +1019,11 @@ impl RnaHandler {
                         if let Err(e) = embed_idx.reindex_nodes(&changed_file_nodes).await {
                             tracing::warn!("Background incremental: re-embed failed: {}", e);
                             if let Err(e2) = embed_idx
-                                .index_all_with_symbols(&repo_root, &full_state.nodes)
+                                .index_all_with_symbols_and_business_context(
+                                    &repo_root,
+                                    &full_state.nodes,
+                                    &business_context,
+                                )
                                 .await
                             {
                                 tracing::warn!(

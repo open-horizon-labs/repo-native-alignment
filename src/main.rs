@@ -1429,7 +1429,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Open(args)) => {
             init_tracing("warn", log_path.as_deref());
-            repo_native_alignment::open_viewer::run(args.repo).await?;
+            repo_native_alignment::open_viewer::run(args.repo, business_context_mode).await?;
             return Ok(());
         }
         None => {}

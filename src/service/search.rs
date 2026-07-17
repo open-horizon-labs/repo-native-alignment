@@ -976,7 +976,13 @@ async fn search_flat(
     {
         let chunks: Vec<_> = chunks
             .into_iter()
-            .filter(|chunk| ctx.business_context.admit_repository_file(&chunk.file_path))
+            .filter(|chunk| {
+                let repository_path = chunk
+                    .file_path
+                    .strip_prefix(ctx.repo_root)
+                    .unwrap_or(&chunk.file_path);
+                ctx.business_context.admit_repository_file(repository_path)
+            })
             .collect();
         let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
             let workspace = crate::roots::WorkspaceConfig::load()

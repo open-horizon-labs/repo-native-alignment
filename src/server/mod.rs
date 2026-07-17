@@ -612,6 +612,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_get_graph_refresh_ignores_dot_oh_and_reopen_stays_clean() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/outcomes")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn ordinary_symbol() {}\n").unwrap();
+        let artifact = root.join(".oh/outcomes/leak.md");
+        std::fs::write(
+            &artifact,
+            "---\ntitle: Hidden\nstatus: active\n---\ninitial hidden context\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Disabled),
+            ..RnaHandler::default()
+        };
+        let graph = handler
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| !node.id.file.starts_with(".oh"))
+        );
+        super::store::persist_graph_to_lance(root, &graph.nodes, &graph.edges)
+            .await
+            .unwrap();
+        handler.graph.store(Arc::new(Some(Arc::new(graph))));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &artifact,
+            "---\ntitle: Hidden\nstatus: active\n---\nmutated hidden context\n",
+        )
+        .unwrap();
+
+        let refreshed = handler.get_graph().await.unwrap();
+        assert!(
+            refreshed
+                .nodes
+                .iter()
+                .any(|node| node.id.name == "ordinary_symbol")
+        );
+        assert!(
+            refreshed
+                .nodes
+                .iter()
+                .all(|node| !node.id.file.starts_with(".oh")),
+            "disabled live refresh must not publish changed .oh artifacts"
+        );
+
+        let reopened = load_graph_from_lance(root).await.unwrap();
+        assert!(
+            reopened
+                .nodes
+                .iter()
+                .all(|node| !node.id.file.starts_with(".oh")),
+            "excluded live refresh must not contaminate the persisted graph"
+        );
+        assert!(handler.business_context.counts().business_artifact_files >= 1);
+    }
+
+    #[tokio::test]
     async fn test_get_graph_detects_file_edits() {
         use tempfile::TempDir;
 

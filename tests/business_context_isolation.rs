@@ -285,6 +285,58 @@ async fn disabled_live_markdown_search_excludes_dot_oh_only() {
     assert!(business_context.counts().business_artifact_files >= 1);
 }
 
+#[tokio::test]
+async fn disabled_live_markdown_preserves_repo_under_dot_oh_ancestor() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/business_context_isolation");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join(".oh/repository");
+    copy_fixture(&fixture, &repo_root);
+
+    let graph_state = GraphState::new(
+        Vec::new(),
+        Vec::new(),
+        GraphIndex::new(),
+        None,
+        std::collections::HashSet::new(),
+    );
+    let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+    let params = SearchParams {
+        query: Some(SENTINEL.to_string()),
+        include_artifacts: false,
+        include_markdown: true,
+        limit: Some(20),
+        ..SearchParams::default()
+    };
+    let ctx = SearchContext {
+        graph_state: &graph_state,
+        embed_index: None,
+        repo_root: &repo_root,
+        lsp_status: None,
+        embed_status: None,
+        root_filter: None,
+        non_code_slugs: std::collections::HashSet::new(),
+        enrichment_jobs: Vec::new(),
+        business_context: &business_context,
+    };
+
+    let result = service::search(&params, &ctx).await;
+
+    assert!(
+        result.contains("README.md"),
+        "ancestor .oh falsely excluded ordinary Markdown: {result}"
+    );
+    assert!(
+        result.contains("docs/guide.md"),
+        "ancestor .oh falsely excluded nested Markdown: {result}"
+    );
+    assert!(
+        !result.contains(".oh/outcomes/leak.md"),
+        "repository-local business artifact escaped admission: {result}"
+    );
+    assert!(business_context.counts().business_artifact_files >= 1);
+}
+
 #[test]
 fn direct_disabled_cli_query_rebuilds_mismatched_and_legacy_caches_first() {
     let fixture =
