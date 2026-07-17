@@ -701,12 +701,33 @@ impl EmbeddingIndex {
         repo_root: &Path,
         symbols: &[crate::graph::Node],
     ) -> Result<usize> {
-        self.index_all_inner(repo_root, symbols).await
+        self.index_all_inner(
+            repo_root,
+            symbols,
+            &crate::business_context::BusinessContextAdmission::default(),
+        )
+        .await
+    }
+
+    /// Index graph nodes while admitting optional history producers once.
+    pub async fn index_all_with_symbols_and_business_context(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+        business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<usize> {
+        self.index_all_inner(repo_root, symbols, business_context)
+            .await
     }
 
     /// Index recent git commits only (no graph nodes). Rebuilds the table from scratch.
     pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
-        self.index_all_inner(repo_root, &[]).await
+        self.index_all_inner(
+            repo_root,
+            &[],
+            &crate::business_context::BusinessContextAdmission::default(),
+        )
+        .await
     }
 
     /// Re-embed a targeted subset of nodes and upsert them into the existing table.
@@ -983,6 +1004,7 @@ impl EmbeddingIndex {
         &self,
         repo_root: &Path,
         symbols: &[crate::graph::Node],
+        business_context: &crate::business_context::BusinessContextAdmission,
     ) -> Result<usize> {
         let index_start = std::time::Instant::now();
         tracing::info!(
@@ -1013,84 +1035,92 @@ impl EmbeddingIndex {
         let mut candidates: Vec<Candidate> = Vec::new();
 
         // Index recent git commits (capped for performance)
-        let commit_count = match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
-            Ok(commits) => {
-                for c in &commits {
-                    let changed_files_str = c
-                        .changed_files
-                        .iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
-                    let title = c.message.lines().next().unwrap_or(&c.message).to_string();
-                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+        let commit_count = if business_context.admit_git_history_producer() {
+            match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
+                Ok(commits) => {
+                    for c in &commits {
+                        let changed_files_str = c
+                            .changed_files
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
+                        let title = c.message.lines().next().unwrap_or(&c.message).to_string();
+                        let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
-                    candidates.push(Candidate {
-                        id: c.short_hash.clone(),
-                        kind: "commit".to_string(),
-                        title,
-                        body: body.clone(),
-                        text: body,
-                        text_hash,
-                        file_path: None,
-                        language: None,
-                        subsystem: None,
-                        cyclomatic: None,
-                    });
+                        candidates.push(Candidate {
+                            id: c.short_hash.clone(),
+                            kind: "commit".to_string(),
+                            title,
+                            body: body.clone(),
+                            text: body,
+                            text_hash,
+                            file_path: None,
+                            language: None,
+                            subsystem: None,
+                            cyclomatic: None,
+                        });
+                    }
+                    commits.len()
                 }
-                commits.len()
+                Err(err) => {
+                    tracing::debug!(
+                        "EmbeddingIndex: failed to load commits for {}: {}",
+                        repo_root.display(),
+                        err
+                    );
+                    0
+                }
             }
-            Err(err) => {
-                tracing::debug!(
-                    "EmbeddingIndex: failed to load commits for {}: {}",
-                    repo_root.display(),
-                    err
-                );
-                0
-            }
+        } else {
+            0
         };
         // Index PR merge commits for structural context (what shipped)
         let mut seen_merge_shas = std::collections::HashSet::new();
-        let merge_count = match git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
-            Ok((merge_nodes, _edges)) => {
-                for node in &merge_nodes {
-                    let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
-                    let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
-                    if seen_merge_shas.contains(&short) {
-                        continue;
+        let merge_count = if business_context.admit_git_history_producer() {
+            match git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
+                Ok((merge_nodes, _edges)) => {
+                    for node in &merge_nodes {
+                        let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                        let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                        if seen_merge_shas.contains(&short) {
+                            continue;
+                        }
+                        seen_merge_shas.insert(short.clone());
+
+                        let branch = node
+                            .metadata
+                            .get("branch_name")
+                            .cloned()
+                            .unwrap_or_default();
+                        let files = node
+                            .metadata
+                            .get("files_changed")
+                            .cloned()
+                            .unwrap_or_default();
+                        let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
+                        let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+
+                        candidates.push(Candidate {
+                            id: format!("merge:{}", short),
+                            kind: "merge".to_string(),
+                            title: node.signature.clone(),
+                            body: body.clone(),
+                            text: body,
+                            text_hash,
+                            file_path: None,
+                            language: None,
+                            subsystem: None,
+                            cyclomatic: None,
+                        });
                     }
-                    seen_merge_shas.insert(short.clone());
-
-                    let branch = node
-                        .metadata
-                        .get("branch_name")
-                        .cloned()
-                        .unwrap_or_default();
-                    let files = node
-                        .metadata
-                        .get("files_changed")
-                        .cloned()
-                        .unwrap_or_default();
-                    let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
-                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
-
-                    candidates.push(Candidate {
-                        id: format!("merge:{}", short),
-                        kind: "merge".to_string(),
-                        title: node.signature.clone(),
-                        body: body.clone(),
-                        text: body,
-                        text_hash,
-                        file_path: None,
-                        language: None,
-                        subsystem: None,
-                        cyclomatic: None,
-                    });
+                    seen_merge_shas.len()
                 }
-                seen_merge_shas.len()
+                Err(_) => 0,
             }
-            Err(_) => 0,
+        } else {
+            0
         };
 
         // Filter to embeddable node kinds before counting/indexing
@@ -1824,6 +1854,23 @@ mod tests {
             !idx.has_table().await.unwrap(),
             "has_table should be false on fresh DB"
         );
+    }
+
+    #[tokio::test]
+    async fn context_aware_full_index_skips_history_before_embedding() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
+        let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+
+        let indexed = idx
+            .index_all_with_symbols_and_business_context(tmp.path(), &[], &business_context)
+            .await
+            .unwrap();
+
+        assert_eq!(indexed, 0);
+        assert_eq!(business_context.counts().git_history_producers, 2);
     }
 
     #[tokio::test]

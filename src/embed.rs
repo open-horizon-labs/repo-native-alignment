@@ -147,6 +147,17 @@ impl EmbeddingIndex {
         ))
     }
 
+    pub async fn index_all_with_symbols_and_business_context(
+        &self,
+        _repo_root: &Path,
+        _symbols: &[crate::graph::Node],
+        _business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<usize> {
+        Err(anyhow!(
+            "embeddings support is not compiled in; rebuild with --features embeddings"
+        ))
+    }
+
     pub async fn index_all(&self, _repo_root: &Path) -> Result<usize> {
         Err(anyhow!(
             "embeddings support is not compiled in; rebuild with --features embeddings"

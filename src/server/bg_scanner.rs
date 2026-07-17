@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::business_context::BusinessContextAdmission;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
 use crate::graph::{Edge, Node};
@@ -122,6 +123,7 @@ pub(super) async fn update_graph(
     scan_result: &mut ScanResult,
     repo_root: &std::path::Path,
     scan_stats: &Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
+    business_context: &BusinessContextAdmission,
 ) -> (Vec<LanceDelta>, Vec<String>) {
     let mut lance_deltas: Vec<LanceDelta> = Vec::new();
     let mut enrichment_diagnostics = Vec::new();
@@ -138,7 +140,10 @@ pub(super) async fn update_graph(
     }
 
     // Apply file-level changes per root.
-    for (root_slug, scan, root_path, _scanner) in &scan_result.per_root_scans {
+    for (root_slug, scan, root_path, _scanner) in &mut scan_result.per_root_scans {
+        business_context.retain_repository_files(&mut scan.changed_files);
+        business_context.retain_repository_files(&mut scan.new_files);
+        business_context.retain_repository_files(&mut scan.deleted_files);
         if scan.changed_files.is_empty()
             && scan.new_files.is_empty()
             && scan.deleted_files.is_empty()
@@ -254,6 +259,7 @@ pub(super) async fn update_graph(
             primary_slug.clone(),
             repo_root.to_path_buf(),
             crate::extract::consumers::BusOptions {
+                business_context: business_context.clone(),
                 scan_stats: Some(Arc::clone(scan_stats)),
                 embed_idx: None,
                 lance_repo_root: None,

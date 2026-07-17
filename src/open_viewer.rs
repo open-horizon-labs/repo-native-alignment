@@ -19,7 +19,7 @@
 //! Responses are raw service-layer markdown/text wrapped in `{ "result": "..." }`.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -31,8 +31,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
+use crate::business_context::{
+    BusinessContextAdmission, BusinessContextMode, CacheModeDisposition,
+};
 use crate::embed::EmbeddingIndex;
 use crate::server::state::GraphState;
+use crate::server::{RnaHandler, ScanEnrichmentOptions};
 use crate::service::{
     RepoMapContext, RepoMapParams, SearchContext, SearchParams, list_roots_from_slugs, repo_map,
     search,
@@ -50,6 +54,7 @@ struct ViewerState {
     repo_root: PathBuf,
     /// Primary root slug for root_filter
     root_slug: String,
+    business_context: BusinessContextAdmission,
 }
 
 // ─── Request / response types ─────────────────────────────────────────────────
@@ -120,6 +125,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 repo_root: &state.repo_root,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &state.business_context,
             };
             Ok(repo_map(&params, &ctx))
         }
@@ -236,6 +242,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 root_filter,
                 non_code_slugs,
                 enrichment_jobs: Vec::new(),
+                business_context: &state.business_context,
             };
             Ok(search(&params, &ctx).await)
         }
@@ -268,30 +275,55 @@ async fn bind_random_port() -> anyhow::Result<TcpListener> {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+async fn load_viewer_graph(
+    repo_root: &Path,
+    business_context_mode: BusinessContextMode,
+) -> anyhow::Result<(GraphState, BusinessContextAdmission)> {
+    let handler = RnaHandler {
+        repo_root: repo_root.to_path_buf(),
+        business_context: BusinessContextAdmission::new(business_context_mode),
+        ..RnaHandler::default()
+    };
+
+    let graph = match handler.prepare_business_context_cache()? {
+        CacheModeDisposition::Compatible => {
+            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
+            if !lance_path.exists() {
+                anyhow::bail!(
+                    "No index found at {}.\nRun `repo-native-alignment scan --repo .` first.",
+                    lance_path.display()
+                );
+            }
+            crate::server::load_graph_from_lance(repo_root)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to load graph: {}", e))?
+        }
+        CacheModeDisposition::Initialized | CacheModeDisposition::Rebuilt { .. } => {
+            let rebuilt = handler
+                .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+                .await?;
+            crate::server::persist_graph_to_lance(repo_root, &rebuilt.nodes, &rebuilt.edges)
+                .await?;
+            rebuilt
+        }
+    };
+
+    Ok((graph, handler.business_context.clone()))
+}
+
 /// Run `repo-native-alignment open --repo <path>`.
 ///
-/// 1. Loads the cached graph from LanceDB (requires a prior `scan`).
+/// 1. Validates the selected business-context cache identity, rebuilding when needed.
 /// 2. Starts Axum on a random port.
 /// 3. Opens the browser.
 /// 4. Blocks until Ctrl-C.
-pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
+pub async fn run(repo: PathBuf, business_context_mode: BusinessContextMode) -> anyhow::Result<()> {
     let repo_root = repo
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Cannot resolve repo path {}: {}", repo.display(), e))?;
 
-    // Load graph from LanceDB cache.
-    let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-    if !lance_path.exists() {
-        anyhow::bail!(
-            "No index found at {}.\nRun `repo-native-alignment scan --repo .` first.",
-            lance_path.display()
-        );
-    }
-
     eprintln!("Loading graph from cache...");
-    let graph = crate::server::load_graph_from_lance(&repo_root)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load graph: {}", e))?;
+    let (graph, business_context) = load_viewer_graph(&repo_root, business_context_mode).await?;
     eprintln!(
         "  {} symbols, {} edges",
         graph.nodes.len(),
@@ -315,6 +347,7 @@ pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
         embed_index,
         repo_root,
         root_slug,
+        business_context,
     });
 
     let app = Router::new()
@@ -370,6 +403,87 @@ fn open_browser(url: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn viewer_loader_builds_before_cache_reads_for_missing_and_incompatible_modes() {
+        for (case, existing_cache, persisted_mode) in [
+            ("initialized", false, None),
+            ("mismatch", true, Some("enabled\n")),
+            ("legacy", true, None),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::write(root.join("README.md"), "# Ordinary viewer document\n").unwrap();
+            std::fs::create_dir_all(root.join(".oh/outcomes")).unwrap();
+            std::fs::write(
+                root.join(".oh/outcomes/leak.md"),
+                "---\ntitle: Hidden\nstatus: active\n---\nhidden viewer context\n",
+            )
+            .unwrap();
+
+            let cache = root.join(".oh/.cache");
+            let poison = cache.join("lance/not-a-lancedb");
+            if existing_cache {
+                std::fs::create_dir_all(poison.parent().unwrap()).unwrap();
+                std::fs::write(&poison, "must be deleted before any cache read").unwrap();
+                if let Some(mode) = persisted_mode {
+                    std::fs::write(cache.join("business-context-mode"), mode).unwrap();
+                }
+            }
+
+            let (graph, admission) = load_viewer_graph(root, BusinessContextMode::Disabled)
+                .await
+                .unwrap_or_else(|error| panic!("{case} viewer load failed: {error:#}"));
+
+            assert_eq!(admission.mode(), BusinessContextMode::Disabled);
+            assert_eq!(
+                std::fs::read_to_string(cache.join("business-context-mode")).unwrap(),
+                "disabled\n"
+            );
+            if existing_cache {
+                assert!(
+                    !poison.exists(),
+                    "{case} cache was read instead of deleted before rebuild"
+                );
+            }
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id.file == PathBuf::from("README.md")),
+                "{case} viewer rebuild lost ordinary repository Markdown"
+            );
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .all(|node| !node.id.file.starts_with(".oh")),
+                "{case} viewer rebuild admitted disabled business artifacts"
+            );
+
+            let (reopened, reopened_admission) =
+                load_viewer_graph(root, BusinessContextMode::Disabled)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{case} compatible viewer reopen failed: {error:#}")
+                    });
+            assert_eq!(reopened_admission.mode(), BusinessContextMode::Disabled);
+            assert!(
+                reopened
+                    .nodes
+                    .iter()
+                    .any(|node| node.id.file == PathBuf::from("README.md")),
+                "{case} compatible reopen lost ordinary repository Markdown"
+            );
+            assert!(
+                reopened
+                    .nodes
+                    .iter()
+                    .all(|node| !node.id.file.starts_with(".oh")),
+                "{case} compatible reopen admitted disabled business artifacts"
+            );
+        }
+    }
 
     // ── value_as_u64_tolerant ────────────────────────────────────────────
 

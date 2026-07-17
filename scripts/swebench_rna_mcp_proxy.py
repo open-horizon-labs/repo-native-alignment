@@ -19,6 +19,9 @@ from swebench_rna_one import utc_now
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rna-binary", type=Path, required=True)
+    parser.add_argument(
+        "--business-context", choices=("disabled",), default="disabled"
+    )
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--server-stderr", type=Path, required=True)
@@ -100,7 +103,13 @@ def main() -> int:
     lock = threading.Lock()
     with args.server_stderr.open("wb") as server_stderr:
         server = subprocess.Popen(
-            [str(args.rna_binary), "--repo", str(args.repo)],
+            [
+                str(args.rna_binary),
+                "--business-context",
+                args.business_context,
+                "--repo",
+                str(args.repo),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=server_stderr,

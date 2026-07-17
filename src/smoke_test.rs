@@ -1968,6 +1968,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         root_filter: None,
         non_code_slugs: std::collections::HashSet::new(),
         enrichment_jobs: Vec::new(),
+        business_context: &crate::business_context::BusinessContextAdmission::default(),
     };
 
     let params = crate::service::SearchParams {

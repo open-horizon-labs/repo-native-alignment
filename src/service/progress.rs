@@ -20,12 +20,17 @@ pub struct OutcomeProgressParams {
 pub struct OutcomeProgressContext<'a> {
     pub graph_state: &'a crate::server::state::GraphState,
     pub repo_root: &'a Path,
+    pub business_context: &'a crate::business_context::BusinessContextAdmission,
 }
 
 pub fn outcome_progress(
     params: &OutcomeProgressParams,
     ctx: &OutcomeProgressContext<'_>,
 ) -> String {
+    if !ctx.business_context.admit_git_history_producer() {
+        return "Outcome progress unavailable because business context is disabled.".to_string();
+    }
+
     let graph_nodes: Vec<crate::graph::Node> = ctx
         .graph_state
         .nodes
@@ -104,5 +109,43 @@ pub fn outcome_progress(
             md
         }
         Err(e) => format!("Error: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+    use crate::graph::index::GraphIndex;
+    use crate::server::state::GraphState;
+
+    #[test]
+    fn disabled_business_context_stops_outcome_progress_before_history_load() {
+        let graph_state = GraphState::new(
+            Vec::new(),
+            Vec::new(),
+            GraphIndex::new(),
+            None,
+            HashSet::new(),
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let params = OutcomeProgressParams {
+            outcome_id: "unreachable".to_string(),
+            include_impact: false,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+        };
+        let ctx = OutcomeProgressContext {
+            graph_state: &graph_state,
+            repo_root: repo.path(),
+            business_context: &business_context,
+        };
+
+        assert_eq!(
+            outcome_progress(&params, &ctx),
+            "Outcome progress unavailable because business context is disabled."
+        );
+        assert_eq!(business_context.counts().git_history_producers, 1);
     }
 }

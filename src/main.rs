@@ -7,6 +7,7 @@ use rust_mcp_sdk::ToMcpServerHandler;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 
 use repo_native_alignment::adr::{self, ValidateSelection};
+use repo_native_alignment::business_context::{BusinessContextAdmission, BusinessContextMode};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{
     self, BroadReferenceBudget, EnrichmentCapability, EnrichmentContinuation, EnrichmentJobLedger,
@@ -34,6 +35,9 @@ struct Cli {
     port: u16,
     #[arg(long)]
     log_path: Option<PathBuf>,
+    /// Include RNA-specific `.oh` and Git-history context in produced indexes.
+    #[arg(long, default_value_t = BusinessContextMode::Enabled)]
+    business_context: BusinessContextMode,
 }
 
 #[derive(Subcommand, Debug)]
@@ -532,6 +536,7 @@ struct ScanSummaryInput<'a> {
     lsp_state: server::operation_report::CapabilityState,
     lsp_detail: Option<String>,
     related_job_ids: Vec<String>,
+    business_context: &'a repo_native_alignment::business_context::BusinessContextAdmission,
 }
 
 fn lsp_call_edge_count(graph: &server::state::GraphState) -> usize {
@@ -558,6 +563,7 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         lsp_state,
         lsp_detail,
         related_job_ids,
+        business_context,
     } = input;
     let mut report = server::operation_report::OperationReport::new(
         operation,
@@ -574,6 +580,7 @@ fn print_scan_summary(input: ScanSummaryInput<'_>) {
         lsp_edge_count: Some(lsp_call_edge_count(graph)),
     };
     report.related_job_ids = related_job_ids;
+    report.record_business_context(business_context);
     for phase in extra_phases {
         report.add_phase(phase);
     }
@@ -637,6 +644,32 @@ async fn load_cached_graph(repo_root: &std::path::Path) -> server::state::GraphS
     }
 }
 
+/// Validate the disposable cache identity before a direct CLI query reads it.
+/// Incompatible caches are rebuilt once through the same producer-admission path
+/// used by scans; compatible caches keep the existing fast load path.
+async fn load_cache_backed_query_graph(
+    repo_root: &std::path::Path,
+    business_context_mode: BusinessContextMode,
+) -> anyhow::Result<server::state::GraphState> {
+    let handler = RnaHandler {
+        repo_root: repo_root.to_path_buf(),
+        business_context: BusinessContextAdmission::new(business_context_mode),
+        ..RnaHandler::default()
+    };
+    if handler
+        .prepare_business_context_cache()?
+        .requires_fresh_graph()
+    {
+        let graph = handler
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await?;
+        handler.persist_graph_snapshot(&graph).await?;
+        return Ok(graph);
+    }
+
+    Ok(load_cached_graph(repo_root).await)
+}
+
 fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> Option<String> {
     let root_slug =
         repo_native_alignment::roots::RootConfig::code_project(repo_root.to_path_buf()).slug();
@@ -679,6 +712,7 @@ fn main() {
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let log_path = cli.log_path.clone();
+    let business_context_mode = cli.business_context;
     match cli.command {
         Some(Commands::Setup(args)) => return setup::run(&args),
         Some(Commands::Test(args)) => {
@@ -711,6 +745,7 @@ async fn async_main() -> anyhow::Result<()> {
                 eprintln!("Full pipeline scan: {}", repo_root.display());
                 let handler = RnaHandler {
                     repo_root: repo_root.clone(),
+                    business_context: BusinessContextAdmission::new(business_context_mode),
                     lsp_only_roots: Arc::new(lsp_only_roots_scan),
                     ..Default::default()
                 };
@@ -750,9 +785,11 @@ async fn async_main() -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let handler = RnaHandler {
                 repo_root: repo_root.clone(),
+                business_context: BusinessContextAdmission::new(business_context_mode),
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
+            handler.prepare_business_context_cache()?;
             if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
                 if enrichment.runs_embeddings() {
                     tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
@@ -826,6 +863,7 @@ async fn async_main() -> anyhow::Result<()> {
                     lsp_state,
                     lsp_detail,
                     related_job_ids,
+                    business_context: &handler.business_context,
                 });
                 return Ok(());
             }
@@ -870,6 +908,7 @@ async fn async_main() -> anyhow::Result<()> {
                         lsp_state,
                         lsp_detail,
                         related_job_ids,
+                        business_context: &handler.business_context,
                     });
                     return Ok(());
                 }
@@ -906,6 +945,7 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_state,
                 lsp_detail,
                 related_job_ids,
+                business_context: &handler.business_context,
             });
             return Ok(());
         }
@@ -972,9 +1012,11 @@ async fn async_main() -> anyhow::Result<()> {
             let lsp_only_roots = workspace_config.lsp_only_roots();
             let handler = RnaHandler {
                 repo_root: repo_root.clone(),
+                business_context: BusinessContextAdmission::new(business_context_mode),
                 lsp_only_roots: Arc::new(lsp_only_roots),
                 ..Default::default()
             };
+            handler.prepare_business_context_cache()?;
             let graph = match try_load_cached_graph(&repo_root).await? {
                 Some(graph) => graph,
                 None => anyhow::bail!(
@@ -1074,6 +1116,7 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_edge_count: Some(lsp_edge_count),
             };
             report.related_job_ids = related_job_ids;
+            report.record_business_context(&handler.business_context);
             report.add_phase(server::operation_report::PhaseReport::ran(
                 match capability {
                     EnrichmentCapability::Embeddings => {
@@ -1105,7 +1148,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Search(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let gs = load_cached_graph(&repo_root).await;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             // Load existing embedding index -- do NOT rebuild.
             let embed_idx = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root)
                 .await
@@ -1203,6 +1246,7 @@ async fn async_main() -> anyhow::Result<()> {
                     .into_iter()
                     .map(|(slug, _)| slug)
                     .collect();
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = SearchContext {
                 graph_state: &gs,
                 embed_index: embed_ref,
@@ -1212,6 +1256,7 @@ async fn async_main() -> anyhow::Result<()> {
                 root_filter,
                 non_code_slugs,
                 enrichment_jobs: EnrichmentJobLedger::default().all_jobs(&repo_root),
+                business_context: &business_context,
             };
             println!("{}", service::search(&params, &ctx).await);
             return Ok(());
@@ -1219,7 +1264,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Graph(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let gs = load_cached_graph(&repo_root).await;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             let gp = GraphParams {
                 node: args.node.clone(),
                 mode: args.mode.clone(),
@@ -1246,12 +1291,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Stats(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-            if !lance_path.exists() {
-                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
-                std::process::exit(1);
-            }
-            let gs = server::load_graph_from_lance(&repo_root).await?;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             let st = service::stats(&repo_root, &gs).await;
             println!(
                 "  Symbols: {} | Edges: {} | Embeddings: {} | Languages: {} | Last scan: {} | .oh/: {} artifacts ({} outcomes, {} signals, {} guardrails, {} metis)",
@@ -1275,7 +1315,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::OutcomeProgress(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let gs = load_cached_graph(&repo_root).await;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = OutcomeProgressParams {
                 outcome_id: args.outcome_id.clone(),
@@ -1283,9 +1323,11 @@ async fn async_main() -> anyhow::Result<()> {
                 root_filter,
                 non_code_slugs: std::collections::HashSet::new(),
             };
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = OutcomeProgressContext {
                 graph_state: &gs,
                 repo_root: &repo_root,
+                business_context: &business_context,
             };
             println!("{}", service::outcome_progress(&params, &ctx));
             return Ok(());
@@ -1293,7 +1335,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::ListRoots(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let gs = load_cached_graph(&repo_root).await;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             let index_map = gs.node_index_map();
             // Start with graph-derived slugs (roots that have extracted nodes).
             let mut active_slugs: std::collections::HashSet<String> =
@@ -1322,18 +1364,20 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::RepoMap(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            let gs = load_cached_graph(&repo_root).await;
+            let gs = load_cache_backed_query_graph(&repo_root, business_context_mode).await?;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = RepoMapParams {
                 top_n: args.top_n,
                 root_filter,
                 non_code_slugs: std::collections::HashSet::new(),
             };
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = RepoMapContext {
                 graph_state: &gs,
                 repo_root: &repo_root,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &business_context,
             };
             println!("{}", service::repo_map(&params, &ctx));
             return Ok(());
@@ -1390,7 +1434,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Open(args)) => {
             init_tracing("warn", log_path.as_deref());
-            repo_native_alignment::open_viewer::run(args.repo).await?;
+            repo_native_alignment::open_viewer::run(args.repo, business_context_mode).await?;
             return Ok(());
         }
         None => {}
@@ -1402,6 +1446,7 @@ async fn async_main() -> anyhow::Result<()> {
         .lsp_only_roots();
     let handler = RnaHandler {
         repo_root: repo_root.clone(),
+        business_context: BusinessContextAdmission::new(business_context_mode),
         lsp_only_roots: Arc::new(lsp_only_roots),
         ..Default::default()
     };

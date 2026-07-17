@@ -97,6 +97,7 @@ struct PipelineReportInput {
     embeddings_attached: bool,
     phases: Vec<PhaseReport>,
     related_job_ids: Vec<String>,
+    business_context: crate::business_context::BusinessContextAdmission,
 }
 
 fn build_pipeline_operation_report(
@@ -140,6 +141,7 @@ fn build_pipeline_operation_report(
         input.lsp_state,
     );
     report.related_job_ids = input.related_job_ids;
+    report.record_business_context(&input.business_context);
     report
 }
 
@@ -412,6 +414,7 @@ async fn emit_lsp_pipeline_with_budget(
         input.primary_slug,
         input.repo_root,
         crate::extract::consumers::BusOptions {
+            business_context: Default::default(),
             scan_stats: Some(input.scan_stats),
             embed_idx: None,
             lance_repo_root: None,
@@ -442,6 +445,7 @@ impl RnaHandler {
     pub(crate) fn spawn_background_scanner(&self) {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
+        let business_context = self.business_context.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
         let scan_stats = Arc::clone(&self.scan_stats);
         let lsp_status = Arc::clone(&self.lsp_status);
@@ -519,6 +523,7 @@ impl RnaHandler {
                         &mut scan_result,
                         &repo_root,
                         &scan_stats,
+                        &business_context,
                     )
                     .await;
 
@@ -994,6 +999,7 @@ impl RnaHandler {
         let bg_repo_root = self.repo_root.clone();
         let bg_embed_index = self.embed_index.clone();
         let bg_embed_status = self.embed_status.clone();
+        let bg_business_context = self.business_context.clone();
         let bg_nodes = all_nodes.to_vec();
         let job_id = match self.enrichment_jobs.begin_job(
             &self.repo_root,
@@ -1054,8 +1060,12 @@ impl RnaHandler {
                             }
                             Ok(false) => {
                                 // Table missing -- full build needed
-                                idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes)
-                                    .await
+                                idx.index_all_with_symbols_and_business_context(
+                                    &embed_repo_root,
+                                    &embeddable_nodes,
+                                    &bg_business_context,
+                                )
+                                .await
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding table check failed: {}", e);
@@ -1362,6 +1372,12 @@ impl RnaHandler {
     {
         let pipeline_start = std::time::Instant::now();
 
+        // The foreground pipeline has its own Lance cache-load path instead of
+        // delegating to `build_full_graph_inner`. Validate the requested mode
+        // before even checking that cache so a legacy or mismatched index is
+        // deleted and rebuilt rather than entering the incremental path.
+        self.prepare_business_context_cache()?;
+
         // Try incremental path: load cached graph, apply delta, LSP on changed nodes.
         let lance_path = super::store::graph_lance_path(&self.repo_root);
         let cached = if lance_path.exists() {
@@ -1597,6 +1613,7 @@ impl RnaHandler {
                     embeddings_attached: self.embed_index.load().is_some(),
                     phases,
                     related_job_ids,
+                    business_context: self.business_context.clone(),
                 },
             );
 
@@ -1923,6 +1940,7 @@ impl RnaHandler {
                 embeddings_attached: self.embed_index.load().is_some(),
                 phases,
                 related_job_ids,
+                business_context: self.business_context.clone(),
             },
         );
 
@@ -2032,6 +2050,7 @@ impl RnaHandler {
 
         let embed_repo_root = self.repo_root.clone();
         let embed_index_ref = self.embed_index.clone();
+        let embed_business_context = self.business_context.clone();
         let (embed_job_id, run_embed_job) = if enrichment.runs_embeddings() {
             match self.enrichment_jobs.begin_job(
                 &self.repo_root,
@@ -2065,7 +2084,11 @@ impl RnaHandler {
             let count = match EmbeddingIndex::new(&embed_repo_root).await {
                 Ok(idx) => {
                     match idx
-                        .index_all_with_symbols(&embed_repo_root, &embeddable_nodes)
+                        .index_all_with_symbols_and_business_context(
+                            &embed_repo_root,
+                            &embeddable_nodes,
+                            &embed_business_context,
+                        )
                         .await
                     {
                         Ok(count) => {
@@ -2412,6 +2435,7 @@ impl RnaHandler {
                 embeddings_attached: self.embed_index.load().is_some(),
                 phases,
                 related_job_ids,
+                business_context: self.business_context.clone(),
             },
         );
 
@@ -3104,7 +3128,12 @@ impl RnaHandler {
                 );
             }
             let count = if matches!(scope, EnrichmentScope::Repo) {
-                idx.index_all_with_symbols(&self.repo_root, &selected_nodes).await?
+                idx.index_all_with_symbols_and_business_context(
+                    &self.repo_root,
+                    &selected_nodes,
+                    &self.business_context,
+                )
+                .await?
             } else {
                 idx.reindex_nodes(&selected_nodes).await?
             };
@@ -3363,6 +3392,7 @@ mod tests {
                 embeddings_attached: false,
                 phases: Vec::new(),
                 related_job_ids: Vec::new(),
+                business_context: crate::business_context::BusinessContextAdmission::default(),
             },
         );
 

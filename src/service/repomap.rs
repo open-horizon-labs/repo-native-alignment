@@ -25,6 +25,7 @@ pub struct RepoMapContext<'a> {
     pub repo_root: &'a Path,
     pub lsp_status: Option<&'a LspEnrichmentStatus>,
     pub embed_status: Option<&'a EmbeddingStatus>,
+    pub business_context: &'a crate::business_context::BusinessContextAdmission,
 }
 
 pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
@@ -298,7 +299,7 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             sections.push(format!("## Hotspot files\n\n{}", md));
         }
     }
-    {
+    if !ctx.business_context.mode().is_disabled() {
         let outcomes = crate::oh::load_oh_artifacts(ctx.repo_root)
             .unwrap_or_default()
             .into_iter()
@@ -407,6 +408,7 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
     use crate::graph::index::GraphIndex;
     use crate::graph::{ExtractionSource, NodeId};
     use crate::server::state::GraphState;
@@ -447,11 +449,13 @@ mod tests {
         node.metadata.insert("importance".into(), "0.5".into());
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
+        let business_context = BusinessContextAdmission::default();
         let ctx = RepoMapContext {
             graph_state: &gs,
             repo_root: &repo_root,
             lsp_status: None,
             embed_status: None,
+            business_context: &business_context,
         };
         let params = RepoMapParams {
             top_n: 15,
@@ -479,11 +483,13 @@ mod tests {
         node.metadata.insert("importance".into(), "0.5".into());
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
+        let business_context = BusinessContextAdmission::default();
         let ctx = RepoMapContext {
             graph_state: &gs,
             repo_root: &repo_root,
             lsp_status: None,
             embed_status: None,
+            business_context: &business_context,
         };
         let params = RepoMapParams {
             top_n: 15,
@@ -524,11 +530,13 @@ mod tests {
 
         let gs = make_graph_state(vec![duplicate_a, duplicate_b, distinct_same_name]);
         let repo_root = PathBuf::from("/tmp/test");
+        let business_context = BusinessContextAdmission::default();
         let ctx = RepoMapContext {
             graph_state: &gs,
             repo_root: &repo_root,
             lsp_status: None,
             embed_status: None,
+            business_context: &business_context,
         };
         let params = RepoMapParams {
             top_n: 15,
@@ -546,5 +554,43 @@ mod tests {
             result.contains("`src/extract/mod.rs`:30-40"),
             "same short name in a distinct file should remain visible: {result}"
         );
+    }
+
+    #[test]
+    fn disabled_business_context_skips_live_outcome_loading() {
+        let graph_state = make_graph_state(Vec::new());
+        let repo_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/business_context_isolation");
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+        };
+
+        let enabled = BusinessContextAdmission::default();
+        let enabled_result = repo_map(
+            &params,
+            &RepoMapContext {
+                graph_state: &graph_state,
+                repo_root: &repo_root,
+                lsp_status: None,
+                embed_status: None,
+                business_context: &enabled,
+            },
+        );
+        assert!(enabled_result.contains("## Active outcomes"));
+
+        let disabled = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let disabled_result = repo_map(
+            &params,
+            &RepoMapContext {
+                graph_state: &graph_state,
+                repo_root: &repo_root,
+                lsp_status: None,
+                embed_status: None,
+                business_context: &disabled,
+            },
+        );
+        assert!(!disabled_result.contains("## Active outcomes"));
     }
 }

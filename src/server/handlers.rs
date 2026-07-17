@@ -34,12 +34,19 @@ use crate::service::{
 };
 
 use super::RnaHandler;
+use super::ScanEnrichmentOptions;
 use super::helpers::text_result;
 use super::state::GraphState;
-use super::store::load_graph_from_lance;
+use super::store::{load_graph_from_lance, persist_graph_to_lance};
 use super::tools::{OutcomeProgress, RepoMap, Search};
 
 impl RnaHandler {
+    /// Persist a complete graph snapshot while holding this handler's Lance write lock.
+    pub async fn persist_graph_snapshot(&self, graph: &GraphState) -> anyhow::Result<()> {
+        let _lance_guard = self.lance_write_lock.lock().await;
+        persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await
+    }
+
     /// Resolve a `repo` path string to a canonical [`PathBuf`].
     ///
     /// Only absolute paths are accepted. Relative paths are rejected with an
@@ -68,6 +75,44 @@ impl RnaHandler {
     /// human-readable message (e.g. the repo has not been scanned yet).
     async fn load_external_graph(&self, repo: &str) -> Result<(GraphState, PathBuf), String> {
         let repo_path = self.resolve_repo_path(repo)?;
+        let external_handler = RnaHandler {
+            repo_root: repo_path.clone(),
+            business_context: self.business_context.clone(),
+            lance_write_lock: self.lance_write_lock.clone(),
+            ..RnaHandler::default()
+        };
+        let cache_disposition = external_handler.prepare_business_context_cache().map_err(
+            |error| {
+                format!(
+                    "Failed to load graph from repo \"{}\": disposable-cache validation failed: {}",
+                    repo_path.display(),
+                    error
+                )
+            },
+        )?;
+        if cache_disposition.requires_fresh_graph() {
+            let graph = external_handler
+                .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to rebuild incompatible graph cache for repo \"{}\": {}",
+                        repo_path.display(),
+                        error
+                    )
+                })?;
+            external_handler
+                .persist_graph_snapshot(&graph)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to persist fresh graph cache for repo \"{}\": {}",
+                        repo_path.display(),
+                        error
+                    )
+                })?;
+            return Ok((graph, repo_path));
+        }
         let graph = load_graph_from_lance(&repo_path).await.map_err(|e| {
             format!(
                 "Failed to load graph from repo \"{}\": {}. \
@@ -134,6 +179,7 @@ impl RnaHandler {
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
                 enrichment_jobs: Vec::new(),
+                business_context: &self.business_context,
             };
             let markdown = crate::service::search(&params, &ctx).await;
             return Ok(text_result(markdown));
@@ -160,6 +206,7 @@ impl RnaHandler {
             root_filter,
             non_code_slugs,
             enrichment_jobs: self.enrichment_jobs.all_jobs(&self.repo_root),
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
         if self.graph_build_status.is_building() {
@@ -189,6 +236,7 @@ impl RnaHandler {
             let ctx = OutcomeProgressContext {
                 graph_state: &external_graph,
                 repo_root: &repo_path,
+                business_context: &self.business_context,
             };
             let markdown = crate::service::outcome_progress(&params, &ctx);
             return Ok(text_result(markdown));
@@ -213,6 +261,7 @@ impl RnaHandler {
         let ctx = OutcomeProgressContext {
             graph_state: &graph_state,
             repo_root: &self.repo_root,
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::outcome_progress(&params, &ctx);
         if self.graph_build_status.is_building() {
@@ -275,6 +324,7 @@ impl RnaHandler {
                 repo_root: &repo_path,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &self.business_context,
             };
             let markdown = crate::service::repo_map(&params, &ctx);
             return Ok(text_result(markdown));
@@ -300,6 +350,7 @@ impl RnaHandler {
             repo_root: &self.repo_root,
             lsp_status: Some(&self.lsp_status),
             embed_status: Some(&self.embed_status),
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::repo_map(&params, &ctx);
         if self.graph_build_status.is_building() {
@@ -991,42 +1042,65 @@ mod tests {
         assert!(result.is_err(), "relative path '.' should be rejected");
     }
 
-    // ── Integration: load_external_graph with real LanceDB ──────────────
+    // ── Integration: external graph cache lifecycle ─────────────────────
 
-    /// Verify that load_external_graph succeeds when a real LanceDB is present.
-    ///
-    /// Uses the main repo's own LanceDB at `.oh/.cache/lance`. This is always
-    /// present in developer environments. If absent (fresh CI checkout without
-    /// a prior scan), the test is skipped gracefully.
+    /// Verify that an initialized external cache is built, persisted, and reopened.
     #[tokio::test]
-    async fn test_load_external_graph_succeeds_with_real_lance() {
-        let repo_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let lance_path = repo_path.join(".oh/.cache/lance/symbols.lance");
-        if !lance_path.exists() {
-            // LanceDB not present — skip rather than fail.
-            eprintln!(
-                "Skipping: symbols.lance not present at {}",
-                lance_path.display()
-            );
-            return;
-        }
-        let handler = make_handler(&std::path::PathBuf::from("/tmp"));
-        let result = handler
+    async fn test_load_external_graph_builds_initialized_cache_and_reopens() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn initialized_external_repo() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: std::path::PathBuf::from("/tmp"),
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        let repo_path = temp.path().to_path_buf();
+        let first = handler
             .load_external_graph(repo_path.to_str().unwrap())
             .await;
-        // Using match to avoid unwrap_err() which requires GraphState: Debug
-        match result {
-            Ok((graph, returned_path)) => {
-                assert_eq!(returned_path, repo_path, "Returned path should match input");
-                assert!(!graph.nodes.is_empty(), "Repo graph should have nodes");
-            }
-            Err(e) => panic!("Should load repo graph: {}", e),
-        }
+        let (first_graph, returned_path) = match first {
+            Ok(value) => value,
+            Err(error) => panic!("initialized external graph should build: {error}"),
+        };
+        assert_eq!(returned_path, repo_path);
+        assert!(
+            first_graph
+                .nodes
+                .iter()
+                .any(|node| node.id.file == PathBuf::from("src/lib.rs"))
+        );
+
+        let cache = repo_path.join(".oh/.cache");
+        assert_eq!(
+            std::fs::read_to_string(cache.join("business-context-mode")).unwrap(),
+            "disabled\n"
+        );
+        assert!(cache.join("lance/symbols.lance").exists());
+
+        let sentinel = cache.join("compatible-reopen-sentinel");
+        std::fs::write(&sentinel, "preserve compatible cache").unwrap();
+        let reopened = handler
+            .load_external_graph(repo_path.to_str().unwrap())
+            .await;
+        let (reopened_graph, _) = match reopened {
+            Ok(value) => value,
+            Err(error) => panic!("compatible external graph should reopen: {error}"),
+        };
+        assert!(sentinel.exists());
+        assert_eq!(reopened_graph.nodes.len(), first_graph.nodes.len());
     }
 
-    /// Verify that load_external_graph returns a clear error for a path without LanceDB.
+    /// Verify that load_external_graph returns a clear error for a missing repository.
     #[tokio::test]
-    async fn test_load_external_graph_fails_for_missing_lance() {
+    async fn test_load_external_graph_fails_for_missing_repo() {
         let handler = make_handler(&std::path::PathBuf::from("/tmp"));
         let result = handler
             .load_external_graph("/tmp/no-such-repo-rna-test")
