@@ -617,7 +617,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
                             server_missing: *server_missing,
                             remediation: remediation.clone(),
                             query_metrics: Vec::new(),
-                            validation: validation.clone(),
+                            validation: validation.as_deref().cloned(),
                         },
                     );
                 }
@@ -627,7 +627,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
                     slug,
                     added_edges.len(),
                     validation
-                        .as_ref()
+                        .as_deref()
                         .map(LspValidationEvidence::summary)
                         .unwrap_or_else(|| "not recorded".to_string()),
                 );
@@ -901,12 +901,12 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
-            validation: Some(LspValidationEvidence::processed(
+            validation: Some(Box::new(LspValidationEvidence::processed(
                 "rust",
                 "rust-analyzer",
                 "workspace/symbol",
                 0,
-            )),
+            ))),
         })
         .await
         .unwrap();
@@ -1116,11 +1116,11 @@ mod tests {
             remediation: Some("fix rust".to_string()),
             aborted: true,
             diagnostic: Some("forced abort".to_string()),
-            validation: Some(LspValidationEvidence::not_validated(
+            validation: Some(Box::new(LspValidationEvidence::not_validated(
                 "rust",
                 "rust-analyzer",
                 "forced abort",
-            )),
+            ))),
         })
         .await
         .unwrap();
