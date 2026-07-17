@@ -154,6 +154,10 @@ impl CacheModeDisposition {
     pub fn rebuilt(&self) -> bool {
         matches!(self, Self::Rebuilt { .. })
     }
+
+    pub fn requires_fresh_graph(&self) -> bool {
+        matches!(self, Self::Initialized | Self::Rebuilt { .. })
+    }
 }
 
 fn path_has_component(path: &Path, expected: &str) -> bool {
@@ -296,6 +300,21 @@ mod tests {
         assert!(!admission.admit_repository_file(Path::new(".oh/outcomes/leak.md")));
         assert!(!admission.admit_repository_file(Path::new("docs/.oh/leak.md")));
         assert_eq!(admission.counts().business_artifact_files, 2);
+    }
+
+    #[test]
+    fn cache_disposition_separates_deletion_from_fresh_graph_requirements() {
+        assert!(!CacheModeDisposition::Compatible.rebuilt());
+        assert!(!CacheModeDisposition::Compatible.requires_fresh_graph());
+
+        assert!(!CacheModeDisposition::Initialized.rebuilt());
+        assert!(CacheModeDisposition::Initialized.requires_fresh_graph());
+
+        let rebuilt = CacheModeDisposition::Rebuilt {
+            previous: Some("enabled".to_string()),
+        };
+        assert!(rebuilt.rebuilt());
+        assert!(rebuilt.requires_fresh_graph());
     }
 
     #[test]

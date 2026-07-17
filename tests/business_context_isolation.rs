@@ -338,24 +338,32 @@ async fn disabled_live_markdown_preserves_repo_under_dot_oh_ancestor() {
 }
 
 #[test]
-fn direct_disabled_cli_query_rebuilds_mismatched_and_legacy_caches_first() {
+fn direct_disabled_cli_query_builds_or_rebuilds_then_reopens_compatible_cache() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/business_context_isolation");
-    let temp = tempfile::tempdir().unwrap();
-    copy_fixture(&fixture, temp.path());
-    initialize_merge_history(temp.path());
 
-    let cache = temp.path().join(".oh/.cache");
-    for (case, persisted_mode) in [("mismatch", Some("enabled\n")), ("legacy", None)] {
-        fs::create_dir_all(&cache).unwrap();
-        let marker = cache.join("business-context-mode");
-        match persisted_mode {
-            Some(mode) => fs::write(&marker, mode).unwrap(),
-            None if marker.exists() => fs::remove_file(&marker).unwrap(),
-            None => {}
+    for (case, persisted_mode, poison_cache) in [
+        ("initialized", None, false),
+        ("mismatch", Some("enabled\n"), true),
+        ("legacy", None, true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        copy_fixture(&fixture, temp.path());
+        initialize_merge_history(temp.path());
+
+        let cache = temp.path().join(".oh/.cache");
+        if persisted_mode.is_some() || poison_cache {
+            fs::create_dir_all(&cache).unwrap();
         }
-        let poison = cache.join(format!("{case}-query-poison"));
-        fs::write(&poison, "must be deleted before query").unwrap();
+        let marker = cache.join("business-context-mode");
+        if let Some(mode) = persisted_mode {
+            fs::write(&marker, mode).unwrap();
+        }
+        let poison = poison_cache.then(|| {
+            let path = cache.join(format!("{case}-query-poison"));
+            fs::write(&path, "must be deleted before query").unwrap();
+            path
+        });
 
         let output = run_disabled_readme_query(temp.path());
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -364,12 +372,30 @@ fn direct_disabled_cli_query_rebuilds_mismatched_and_legacy_caches_first() {
             output.status.success(),
             "{case} direct query failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        assert!(!poison.exists(), "{case} cache was read without rebuild");
+        if let Some(poison) = poison {
+            assert!(!poison.exists(), "{case} cache was read without rebuild");
+        }
         assert_eq!(fs::read_to_string(&marker).unwrap(), "disabled\n");
         assert!(
             stdout.contains("README.md"),
             "{case} rebuild did not serve ordinary README content:\n{stdout}"
         );
         assert!(!stdout.contains(".oh/outcomes/leak.md"));
+
+        let compatible_sentinel = cache.join(format!("{case}-compatible-sentinel"));
+        fs::write(&compatible_sentinel, "preserve compatible cache").unwrap();
+        let reopened = run_disabled_readme_query(temp.path());
+        let reopened_stdout = String::from_utf8_lossy(&reopened.stdout);
+        let reopened_stderr = String::from_utf8_lossy(&reopened.stderr);
+        assert!(
+            reopened.status.success(),
+            "{case} compatible reopen failed\nstdout:\n{reopened_stdout}\nstderr:\n{reopened_stderr}"
+        );
+        assert!(
+            compatible_sentinel.exists(),
+            "{case} compatible reopen unexpectedly rebuilt the cache"
+        );
+        assert!(reopened_stdout.contains("README.md"));
+        assert!(!reopened_stdout.contains(".oh/outcomes/leak.md"));
     }
 }

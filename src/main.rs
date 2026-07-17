@@ -656,10 +656,15 @@ async fn load_cache_backed_query_graph(
         business_context: BusinessContextAdmission::new(business_context_mode),
         ..RnaHandler::default()
     };
-    if handler.prepare_business_context_cache()?.rebuilt() {
-        return handler
+    if handler
+        .prepare_business_context_cache()?
+        .requires_fresh_graph()
+    {
+        let graph = handler
             .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
-            .await;
+            .await?;
+        handler.persist_graph_snapshot(&graph).await?;
+        return Ok(graph);
     }
 
     Ok(load_cached_graph(repo_root).await)
