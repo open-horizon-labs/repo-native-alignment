@@ -25,10 +25,10 @@ fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
 fs.writeFileSync(
   workItemLedgerPath,
   JSON.stringify({
-    schema_version: 1,
+    schema_version: 3,
     records: {
       "mcp-smoke:0": {
-        schema_version: 1,
+        schema_version: 3,
         job_id: "mcp-smoke",
         item_id: 0,
         repo: repoPath,
@@ -189,6 +189,8 @@ try {
   console.log("\n── search (code) ──");
   const searchSymText = await callSearchWithRetry({
     query: "main",
+    compact: false,
+    verbose: true,
     include_artifacts: false,
     include_markdown: false,
     top_k: 5,
