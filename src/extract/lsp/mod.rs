@@ -827,11 +827,11 @@ impl LspEnricher {
         let mut candidates = matching_nodes
             .iter()
             .map(|node| repo_root.join(&node.id.file))
-            .filter(|path| path.starts_with(startup_root) && path.is_file())
+            .filter(|path| path.starts_with(startup_root))
             .collect::<Vec<_>>();
         candidates.sort_unstable();
         candidates.dedup();
-        candidates.into_iter().next()
+        candidates.into_iter().find(|path| path.is_file())
     }
 
     fn lsp_language_id_for_path<'a>(&'a self, path: &Path) -> &'a str {
