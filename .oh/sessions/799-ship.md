@@ -40,6 +40,10 @@ The independent findings were consolidated with CI evidence before one remediati
 - `node --check .github/scripts/mcp-smoke.mjs` and `git diff --check` — pass
 - protected dirty-file hashes exactly match preflight; protected/unrelated paths remain unstaged
 
+### Exact-Head CI Follow-up
+
+The automatic PR lint used Rust 1.97 and found one style-only `question_mark` diagnostic not emitted by the local Rust 1.91 Clippy. The exact suggested rewrite was applied without changing behavior; downstream exact-head review and CI were restarted after the repush.
+
 No model, embedding runtime, paid API, or benchmark episode was launched. The exact N=70 fleet execution remains #785.
 
 ### Step 4: Adversarial Test

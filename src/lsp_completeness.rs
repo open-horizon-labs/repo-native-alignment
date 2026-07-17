@@ -1948,10 +1948,8 @@ fn normalize_repository_url(url: &str) -> Option<String> {
         path
     } else if let Some(path) = trimmed.strip_prefix("https://github.com/") {
         path
-    } else if let Some(path) = trimmed.strip_prefix("http://github.com/") {
-        path
     } else {
-        return None;
+        trimmed.strip_prefix("http://github.com/")?
     };
     let mut components = path.split('/');
     let owner = components.next()?;
