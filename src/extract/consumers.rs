@@ -1576,6 +1576,7 @@ impl ExtractionConsumer for LspConsumer {
                         remediation: self.enricher.toolchain_remediation().map(str::to_string),
                         aborted: enrichment.aborted,
                         diagnostic: enrichment.diagnostic,
+                        validation: enrichment.lsp_validation,
                     },
                     ExtractionEvent::LspQueryMetrics {
                         slug: slug.clone(),
@@ -1623,6 +1624,13 @@ impl ExtractionConsumer for LspConsumer {
                         slug,
                         err_text
                     )),
+                    validation: Some(
+                        crate::extract::scan_stats::LspValidationEvidence::not_validated(
+                            self.language.clone(),
+                            self.enricher.name(),
+                            err_text,
+                        ),
+                    ),
                 }])
             }
         }
@@ -2591,6 +2599,63 @@ pub async fn emit_enrichment_pipeline(
     std::collections::HashSet<String>,
     Vec<String>,
 )> {
+    let (nodes, edges, frameworks, diagnostics, _) = emit_enrichment_pipeline_inner(
+        nodes,
+        edges,
+        root_pairs,
+        primary_slug,
+        repo_root,
+        opts,
+        dirty_slugs,
+    )
+    .await?;
+    Ok((nodes, edges, frameworks, diagnostics))
+}
+
+/// Run the enrichment pipeline and return readiness evidence emitted by this
+/// invocation only. Foreground jobs use this instead of reading cumulative scan stats.
+pub(crate) async fn emit_enrichment_pipeline_with_validations(
+    nodes: Vec<crate::graph::Node>,
+    edges: Vec<crate::graph::Edge>,
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+    repo_root: PathBuf,
+    opts: BusOptions,
+    dirty_slugs: Option<std::collections::HashSet<String>>,
+) -> anyhow::Result<(
+    Vec<crate::graph::Node>,
+    Vec<crate::graph::Edge>,
+    std::collections::HashSet<String>,
+    Vec<String>,
+    Vec<crate::extract::scan_stats::LspValidationEvidence>,
+)> {
+    emit_enrichment_pipeline_inner(
+        nodes,
+        edges,
+        root_pairs,
+        primary_slug,
+        repo_root,
+        opts,
+        dirty_slugs,
+    )
+    .await
+}
+
+async fn emit_enrichment_pipeline_inner(
+    nodes: Vec<crate::graph::Node>,
+    edges: Vec<crate::graph::Edge>,
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+    repo_root: PathBuf,
+    opts: BusOptions,
+    dirty_slugs: Option<std::collections::HashSet<String>>,
+) -> anyhow::Result<(
+    Vec<crate::graph::Node>,
+    Vec<crate::graph::Edge>,
+    std::collections::HashSet<String>,
+    Vec<String>,
+    Vec<crate::extract::scan_stats::LspValidationEvidence>,
+)> {
     use crate::extract::event_bus::ExtractionEvent;
 
     // Wrap into Arc<[T]> for zero-copy bus fan-out.
@@ -2608,6 +2673,24 @@ pub async fn emit_enrichment_pipeline(
             dirty_slugs,
         })
         .await;
+
+    let mut validations = events
+        .iter()
+        .filter_map(|event| match event {
+            ExtractionEvent::EnrichmentComplete {
+                validation: Some(validation),
+                ..
+            } => Some(validation.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    validations.sort_by(|left, right| {
+        (&left.language, &left.server_name, left.method.as_deref()).cmp(&(
+            &right.language,
+            &right.server_name,
+            right.method.as_deref(),
+        ))
+    });
 
     // Collect PassesComplete — produced by EnrichmentFinalizer.
     // PassesComplete is a pipeline invariant: EnrichmentFinalizer always emits it.
@@ -2628,6 +2711,7 @@ pub async fn emit_enrichment_pipeline(
             edges.to_vec(),
             detected_frameworks,
             enrichment_diagnostics.to_vec(),
+            validations,
         )),
         _ => {
             anyhow::bail!(
@@ -2925,6 +3009,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let finished = gate.on_event(&complete).await.unwrap();
         assert_eq!(finished.len(), 1);
@@ -3856,6 +3941,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         assert_eq!(
@@ -3939,6 +4025,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         // Should fire now: expected=1 (rust), received=1 (rust).
@@ -4020,6 +4107,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
         assert!(
@@ -4040,6 +4128,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&python_done).await.unwrap();
         assert_eq!(

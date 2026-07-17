@@ -582,8 +582,26 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
             .lsp_evidence
             .as_ref()
             .map(|evidence| {
+                let validations = if evidence.validations.is_empty() {
+                    String::new()
+                } else {
+                    let summaries = evidence
+                        .validations
+                        .iter()
+                        .map(|validation| {
+                            format!(
+                                "{}/{}: {}",
+                                validation.language,
+                                validation.server_name,
+                                validation.summary()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(" validation=[{summaries}]")
+                };
                 format!(
-                    " evidence={} declared_nodes={} requests={}/{} elapsed_ms={}/{} circuit_open={}",
+                    " evidence={} declared_nodes={} requests={}/{} elapsed_ms={}/{} circuit_open={}{}",
                     evidence.readiness.as_str(),
                     evidence.declared_node_count,
                     evidence.scheduled_requests,
@@ -595,6 +613,7 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
                         .max_duration_ms
                         .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
                     evidence.circuit_open,
+                    validations,
                 )
             })
             .unwrap_or_default();
@@ -3129,6 +3148,14 @@ mod tests {
                 elapsed_ms: 12,
                 circuit_open: false,
                 detail: Some("broad references were omitted".to_string()),
+                validations: vec![
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "json",
+                        "vscode-json-languageserver",
+                        "textDocument/documentSymbol",
+                        0,
+                    ),
+                ],
             },
         );
         let mut ctx = make_search_context(&gs, &repo_root);
@@ -3147,6 +3174,9 @@ mod tests {
         assert!(result.contains("default query profile"));
         assert!(result.contains("broad references were omitted"));
         assert!(result.contains("evidence=default_profile"));
+        assert!(result.contains(
+            "validation=[json/vscode-json-languageserver: processed via textDocument/documentSymbol (0 symbols)]"
+        ));
         assert!(!result.contains("LSP call/reference coverage**: ready"));
     }
 
@@ -3218,6 +3248,7 @@ mod tests {
                     elapsed_ms: 10,
                     circuit_open,
                     detail: None,
+                    validations: Vec::new(),
                 },
             );
         }

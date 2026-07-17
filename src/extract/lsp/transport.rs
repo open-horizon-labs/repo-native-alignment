@@ -122,6 +122,47 @@ pub(super) fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
 // LSP JSON-RPC transport
 // ---------------------------------------------------------------------------
 
+/// Structured JSON-RPC error returned by a language server.
+///
+/// Keeping the numeric code intact lets readiness distinguish an unsupported
+/// method (`-32601`) from an empty-but-successful response without parsing an
+/// error string.
+#[derive(Debug)]
+pub(super) struct LspRpcError {
+    pub(super) code: i64,
+    message: String,
+    data: Option<serde_json::Value>,
+}
+
+impl LspRpcError {
+    #[cfg(test)]
+    pub(super) fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LspRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LSP JSON-RPC error {}: {}", self.code, self.message)?;
+        if let Some(data) = &self.data {
+            write!(f, " ({data})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LspRpcError {}
+
+pub(super) fn is_method_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<LspRpcError>()
+        .is_some_and(|rpc| rpc.code == -32601)
+}
+
 /// Minimal JSON-RPC message framing for LSP over stdin/stdout.
 pub(super) struct LspTransport {
     pub(super) child: Child,
@@ -222,7 +263,19 @@ impl LspTransport {
                 && id.as_i64() == Some(expected_id)
             {
                 if let Some(error) = msg.get("error") {
-                    return Err(anyhow::anyhow!("LSP error: {}", error));
+                    return Err(LspRpcError {
+                        code: error
+                            .get("code")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or_default(),
+                        message: error
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown JSON-RPC error")
+                            .to_string(),
+                        data: error.get("data").cloned(),
+                    }
+                    .into());
                 }
                 return Ok(msg
                     .get("result")

@@ -215,6 +215,8 @@ pub struct EnrichmentResult {
     pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,
     /// Operation/declaration query-yield measurements from LSP enrichers.
     pub lsp_query_metrics: Vec<lsp::LspQueryMetric>,
+    /// Capability-driven readiness evidence for the language server.
+    pub lsp_validation: Option<scan_stats::LspValidationEvidence>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -734,6 +736,7 @@ impl EnricherRegistry {
                     let node_count = enrichment.new_nodes.len();
                     let error_count = enrichment.error_count;
                     let query_metrics = enrichment.lsp_query_metrics;
+                    let validation = enrichment.lsp_validation;
                     let status = if enrichment.aborted {
                         scan_stats::LspStatus::Aborted
                     } else {
@@ -754,6 +757,7 @@ impl EnricherRegistry {
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
                         query_metrics,
+                        validation,
                     });
                 }
                 Err(e) => {
@@ -770,6 +774,11 @@ impl EnricherRegistry {
                     } else {
                         scan_stats::LspStatus::Failed
                     };
+                    let validation = scan_stats::LspValidationEvidence::not_validated(
+                        lang.clone(),
+                        server.clone(),
+                        err_msg,
+                    );
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
                         language: lang,
                         server_name: server,
@@ -781,6 +790,7 @@ impl EnricherRegistry {
                         status,
                         remediation: enricher.toolchain_remediation().map(str::to_string),
                         query_metrics: Vec::new(),
+                        validation: Some(validation),
                     });
                 }
             }

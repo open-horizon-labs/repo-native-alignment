@@ -168,6 +168,10 @@ pub struct LspEvidenceCoverage {
     pub elapsed_ms: u64,
     pub circuit_open: bool,
     pub detail: Option<String>,
+    /// Per-language readiness validation evidence. This is deliberately
+    /// language-level; #784 owns the later per-file completeness expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validations: Vec<crate::extract::scan_stats::LspValidationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -732,6 +736,7 @@ impl EnrichmentJobLedger {
                                 .to_string()
                         })
                     }),
+                    validations: Vec::new(),
                 });
             }
             job.updated_at = now;
@@ -1098,6 +1103,14 @@ mod tests {
                 elapsed_ms: 15,
                 circuit_open: true,
                 detail: Some("request budget exhausted".to_string()),
+                validations: vec![
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "json",
+                        "vscode-json-language-server",
+                        "textDocument/documentSymbol",
+                        0,
+                    ),
+                ],
             },
         );
 
@@ -1108,6 +1121,82 @@ mod tests {
         assert_eq!(evidence.scheduled_requests, 2);
         assert!(evidence.circuit_open);
         assert_eq!(evidence.scope, scope.stable_key());
+        assert_eq!(evidence.validations.len(), 1);
+        assert_eq!(evidence.validations[0].symbol_count, Some(0));
+    }
+
+    #[test]
+    fn later_lsp_pass_replaces_terminal_job_validation_with_its_invocation() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let scope = EnrichmentScope::ChangedFiles;
+        let job = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::CallReferences,
+                scope.clone(),
+                EnrichmentTrigger::IncrementalRefresh,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("first job should start"),
+        };
+
+        ledger.mark_completed(tmp.path(), &job.job_id, 4, 5);
+        ledger.record_lsp_evidence(
+            tmp.path(),
+            &job.job_id,
+            LspEvidenceCoverage {
+                readiness: LspEvidenceReadiness::Scoped,
+                scope: scope.stable_key(),
+                declared_node_count: 0,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 0,
+                elapsed_ms: 0,
+                circuit_open: false,
+                detail: None,
+                validations: vec![
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "rust",
+                        "rust-analyzer",
+                        "workspace/symbol",
+                        3,
+                    ),
+                ],
+            },
+        );
+        ledger.record_lsp_evidence(
+            tmp.path(),
+            &job.job_id,
+            LspEvidenceCoverage {
+                readiness: LspEvidenceReadiness::Scoped,
+                scope: scope.stable_key(),
+                declared_node_count: 0,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 0,
+                elapsed_ms: 0,
+                circuit_open: false,
+                detail: None,
+                validations: vec![
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "json",
+                        "vscode-json-language-server",
+                        "textDocument/documentSymbol",
+                        0,
+                    ),
+                ],
+            },
+        );
+
+        let restored = ledger.recent_jobs(tmp.path(), 1).pop().unwrap();
+        let evidence = restored.lsp_evidence.unwrap();
+        assert_eq!(evidence.validations.len(), 1);
+        assert_eq!(evidence.validations[0].language, "json");
+        assert_eq!(evidence.validations[0].symbol_count, Some(0));
     }
 
     #[test]

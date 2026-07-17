@@ -9,6 +9,12 @@ use anyhow::Context as _;
 /// Shared with service.rs for filtering.
 pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IncrementalUpdateOutcome {
+    pub(super) persist_succeeded: bool,
+    pub(super) lsp_job_id: Option<String>,
+}
+
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
@@ -2308,6 +2314,18 @@ impl RnaHandler {
         pending_scan: Option<ScanResult>,
         enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<bool> {
+        Ok(self
+            .update_graph_with_scan_outcome(graph, pending_scan, enrichment)
+            .await?
+            .persist_succeeded)
+    }
+
+    pub(super) async fn update_graph_with_scan_outcome(
+        &self,
+        graph: &mut GraphState,
+        pending_scan: Option<ScanResult>,
+        enrichment: ScanEnrichmentOptions,
+    ) -> anyhow::Result<IncrementalUpdateOutcome> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
         let mut fallback_scanner: Option<Scanner> = None;
@@ -2336,7 +2354,10 @@ impl RnaHandler {
             if let Some(scanner) = fallback_scanner {
                 scanner.commit_state()?;
             }
-            return Ok(true);
+            return Ok(IncrementalUpdateOutcome {
+                persist_succeeded: true,
+                lsp_job_id: None,
+            });
         }
 
         tracing::info!(
@@ -2513,25 +2534,26 @@ impl RnaHandler {
                 plan_lsp_node_ids_for_touched_files(&files_to_remove, &graph.nodes)
                     .context("failed to plan changed-file LSP nodes")?;
 
-            let pipeline_result = crate::extract::consumers::emit_enrichment_pipeline(
-                std::mem::take(&mut graph.nodes),
-                std::mem::take(&mut graph.edges),
-                root_pairs_incremental,
-                primary_slug.clone(),
-                self.repo_root.clone(),
-                crate::extract::consumers::BusOptions {
-                    business_context: self.business_context.clone(),
-                    scan_stats: Some(Arc::clone(&self.scan_stats)),
-                    embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
-                    lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
-                    skip_lsp: !enrichment.runs_lsp(),
-                    lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
-                    broad_reference_budget: None,
-                },
-                dirty_slugs,
-            )
-            .await;
-            let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics) =
+            let pipeline_result =
+                crate::extract::consumers::emit_enrichment_pipeline_with_validations(
+                    std::mem::take(&mut graph.nodes),
+                    std::mem::take(&mut graph.edges),
+                    root_pairs_incremental,
+                    primary_slug.clone(),
+                    self.repo_root.clone(),
+                    crate::extract::consumers::BusOptions {
+                        business_context: self.business_context.clone(),
+                        scan_stats: Some(Arc::clone(&self.scan_stats)),
+                        embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
+                        lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                        skip_lsp: !enrichment.runs_lsp(),
+                        lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                        broad_reference_budget: None,
+                    },
+                    dirty_slugs,
+                )
+                .await;
+            let (enriched_nodes, enriched_edges, detected_frameworks, diagnostics, validations) =
                 match pipeline_result {
                     Ok(result) => result,
                     Err(error) => {
@@ -2540,6 +2562,20 @@ impl RnaHandler {
                                 &self.repo_root,
                                 job_id,
                                 format!("incremental enrichment pipeline failed: {error:#}"),
+                            );
+                            self.enrichment_jobs.record_lsp_evidence(
+                                &self.repo_root,
+                                job_id,
+                                super::enrichment::lsp_evidence(
+                                    super::enrichment_jobs::LspEvidenceReadiness::Unavailable,
+                                    &EnrichmentScope::ChangedFiles.stable_key(),
+                                    0,
+                                    None,
+                                    Some(format!(
+                                        "incremental enrichment pipeline failed: {error:#}"
+                                    )),
+                                    Vec::new(),
+                                ),
                             );
                         }
                         // Pipeline invariant violated — abort the incremental update so the
@@ -2556,7 +2592,7 @@ impl RnaHandler {
             let lsp_call_edge_count = scoped_lsp_call_edge_count(&graph.edges, &lsp_node_filter);
             let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
             if enrichment.runs_lsp() {
-                incremental_lsp_outcome = Some((lsp_call_edge_count, degraded_detail));
+                incremental_lsp_outcome = Some((lsp_call_edge_count, degraded_detail, validations));
             }
         }
 
@@ -2866,50 +2902,82 @@ impl RnaHandler {
             Ok(false) => true,
         };
 
-        if persist_succeeded
-            && let Some((lsp_call_edge_count, degraded_detail)) = incremental_lsp_outcome
-        {
-            if let Some(detail) = degraded_detail.as_deref() {
-                let existing_coverage = self.lsp_status.coverage_edge_count();
-                self.lsp_status.set_degraded_scoped(
-                    lsp_call_edge_count,
-                    existing_coverage,
-                    EnrichmentScope::ChangedFiles.stable_key(),
-                    detail,
-                );
-                if let Some(job_id) = incremental_lsp_job_id.as_deref() {
-                    self.enrichment_jobs.mark_degraded(
-                        &self.repo_root,
-                        job_id,
-                        graph.nodes.len(),
-                        graph.edges.len(),
+        if let Some((lsp_call_edge_count, degraded_detail, validations)) = incremental_lsp_outcome {
+            if persist_succeeded {
+                if let Some(detail) = degraded_detail.as_deref() {
+                    let existing_coverage = self.lsp_status.coverage_edge_count();
+                    self.lsp_status.set_degraded_scoped(
+                        lsp_call_edge_count,
+                        existing_coverage,
+                        EnrichmentScope::ChangedFiles.stable_key(),
                         detail,
                     );
+                    if let Some(job_id) = incremental_lsp_job_id.as_deref() {
+                        self.enrichment_jobs.mark_degraded(
+                            &self.repo_root,
+                            job_id,
+                            graph.nodes.len(),
+                            graph.edges.len(),
+                            detail,
+                        );
+                    }
+                } else {
+                    // A clean, durable incremental pass supersedes any prior
+                    // degraded/running state, including the valid zero-edge case.
+                    let existing_coverage = self.lsp_status.coverage_edge_count();
+                    self.lsp_status.set_complete_scoped(
+                        lsp_call_edge_count,
+                        existing_coverage,
+                        EnrichmentScope::ChangedFiles.stable_key(),
+                    );
+                    if let Some(job_id) = incremental_lsp_job_id.as_deref() {
+                        self.enrichment_jobs.mark_completed(
+                            &self.repo_root,
+                            job_id,
+                            graph.nodes.len(),
+                            graph.edges.len(),
+                        );
+                    }
                 }
-            } else {
-                // A clean, durable incremental pass supersedes any prior
-                // degraded/running state, including the valid zero-edge case.
-                let existing_coverage = self.lsp_status.coverage_edge_count();
-                self.lsp_status.set_complete_scoped(
-                    lsp_call_edge_count,
-                    existing_coverage,
-                    EnrichmentScope::ChangedFiles.stable_key(),
-                );
                 if let Some(job_id) = incremental_lsp_job_id.as_deref() {
-                    self.enrichment_jobs.mark_completed(
+                    self.enrichment_jobs.record_lsp_evidence(
                         &self.repo_root,
                         job_id,
-                        graph.nodes.len(),
-                        graph.edges.len(),
+                        super::enrichment::lsp_evidence(
+                            if degraded_detail.is_some() {
+                                super::enrichment_jobs::LspEvidenceReadiness::Partial
+                            } else {
+                                super::enrichment_jobs::LspEvidenceReadiness::Scoped
+                            },
+                            &EnrichmentScope::ChangedFiles.stable_key(),
+                            0,
+                            None,
+                            degraded_detail.clone(),
+                            validations,
+                        ),
                     );
                 }
+            } else if let Some(job_id) = incremental_lsp_job_id.as_deref() {
+                let detail =
+                    "incremental call-reference output was not durably persisted".to_string();
+                self.enrichment_jobs.mark_failed(
+                    &self.repo_root,
+                    job_id,
+                    detail.clone(),
+                );
+                self.enrichment_jobs.record_lsp_evidence(
+                    &self.repo_root,
+                    job_id,
+                    super::enrichment::lsp_evidence(
+                        super::enrichment_jobs::LspEvidenceReadiness::Partial,
+                        &EnrichmentScope::ChangedFiles.stable_key(),
+                        0,
+                        None,
+                        Some(detail.clone()),
+                        validations,
+                    ),
+                );
             }
-        } else if !persist_succeeded && let Some(job_id) = incremental_lsp_job_id.as_deref() {
-            self.enrichment_jobs.mark_failed(
-                &self.repo_root,
-                job_id,
-                "incremental call-reference output was not durably persisted",
-            );
         }
 
         if persist_succeeded && !enrichment.runs_lsp() {
@@ -2925,6 +2993,9 @@ impl RnaHandler {
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
 
-        Ok(persist_succeeded)
+        Ok(IncrementalUpdateOutcome {
+            persist_succeeded,
+            lsp_job_id: incremental_lsp_job_id,
+        })
     }
 }

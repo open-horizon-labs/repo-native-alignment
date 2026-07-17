@@ -145,7 +145,13 @@ fn build_pipeline_operation_report(
     report
 }
 
-type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>, Vec<String>);
+type LspBusOutput = (
+    Vec<Node>,
+    Vec<Edge>,
+    HashSet<String>,
+    Vec<String>,
+    Vec<crate::extract::scan_stats::LspValidationEvidence>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrichmentContinuation {
@@ -308,12 +314,13 @@ struct LspPipelineInput {
     broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
 }
 
-fn lsp_evidence(
+pub(super) fn lsp_evidence(
     readiness: LspEvidenceReadiness,
     scope: &str,
     declared_node_count: usize,
     budget: Option<&crate::extract::lsp::LspBroadReferenceBudgetSnapshot>,
     detail: Option<String>,
+    validations: Vec<crate::extract::scan_stats::LspValidationEvidence>,
 ) -> LspEvidenceCoverage {
     LspEvidenceCoverage {
         readiness,
@@ -325,6 +332,7 @@ fn lsp_evidence(
         elapsed_ms: budget.map_or(0, |snapshot| snapshot.elapsed_ms),
         circuit_open: budget.is_some_and(|snapshot| snapshot.circuit_open),
         detail,
+        validations,
     }
 }
 
@@ -407,7 +415,7 @@ fn plan_explicit_lsp_scope(
 async fn emit_lsp_pipeline_with_budget(
     input: LspPipelineInput,
 ) -> Result<LspBusOutput, LspPipelineFailure> {
-    let fut = crate::extract::consumers::emit_enrichment_pipeline(
+    let fut = crate::extract::consumers::emit_enrichment_pipeline_with_validations(
         input.nodes,
         input.edges,
         input.root_pairs,
@@ -424,10 +432,6 @@ async fn emit_lsp_pipeline_with_budget(
         },
         input.dirty_slugs,
     );
-
-    if input.skip_lsp {
-        return fut.await.map_err(LspPipelineFailure);
-    }
 
     // The LSP work-item/pass layer owns its timeout and abort diagnostics. Wrapping the
     // entire event bus in `timeout` drops the future before AllEnrichmentsDone and
@@ -716,7 +720,13 @@ impl RnaHandler {
             .await;
 
             match result {
-                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks, diagnostics)) => {
+                Ok((
+                    mut enriched_nodes,
+                    mut enriched_edges,
+                    enriched_frameworks,
+                    diagnostics,
+                    validations,
+                )) => {
                     // Update LSP status
                     let lsp_edge_count = enriched_edges
                         .iter()
@@ -911,7 +921,20 @@ impl RnaHandler {
                         .await
                         {
                             tracing::error!("[background-lsp] LanceDB persist failed: {}", e);
-                            jobs.mark_failed(&repo_root, &job_id, format!("{}", e));
+                            let detail = format!("persistence failed: {e}");
+                            jobs.mark_failed(&repo_root, &job_id, detail.clone());
+                            jobs.record_lsp_evidence(
+                                &repo_root,
+                                &job_id,
+                                lsp_evidence(
+                                    LspEvidenceReadiness::Partial,
+                                    &EnrichmentScope::ChangedFiles.stable_key(),
+                                    0,
+                                    None,
+                                    Some(detail.clone()),
+                                    validations.clone(),
+                                ),
+                            );
                         } else {
                             super::sentinel::write_extract_sentinel(
                                 &repo_root,
@@ -951,6 +974,22 @@ impl RnaHandler {
                                     enriched_edges.len(),
                                 );
                             }
+                            jobs.record_lsp_evidence(
+                                &repo_root,
+                                &job_id,
+                                lsp_evidence(
+                                    if degraded_detail.is_some() {
+                                        LspEvidenceReadiness::Partial
+                                    } else {
+                                        LspEvidenceReadiness::Scoped
+                                    },
+                                    &EnrichmentScope::ChangedFiles.stable_key(),
+                                    0,
+                                    None,
+                                    degraded_detail.clone(),
+                                    validations.clone(),
+                                ),
+                            );
                         }
                     }
 
@@ -1189,21 +1228,26 @@ impl RnaHandler {
             })
             .await;
 
-            let (mut enriched_nodes, mut enriched_edges, _detected_frameworks, diagnostics) =
-                match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
-                        if e.is_timeout() {
-                            bg_lsp_status.set_timed_out(&format!("{}", e));
-                            bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
-                        } else {
-                            bg_lsp_status.set_failed(&format!("{}", e));
-                            bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
-                        }
-                        return;
+            let (
+                mut enriched_nodes,
+                mut enriched_edges,
+                _detected_frameworks,
+                diagnostics,
+                validations,
+            ) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
+                    if e.is_timeout() {
+                        bg_lsp_status.set_timed_out(&format!("{}", e));
+                        bg_jobs.mark_timed_out(&bg_repo_root, &job_id, format!("{}", e));
+                    } else {
+                        bg_lsp_status.set_failed(&format!("{}", e));
+                        bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
                     }
-                };
+                    return;
+                }
+            };
 
             // Dedup: PassesComplete can re-emit cached entries when the cached graph already
             // contains output from a previous pass run. Dedup avoids duplicate rows in LanceDB
@@ -1324,11 +1368,45 @@ impl RnaHandler {
                             enriched_edges.len(),
                         );
                     }
+                    bg_jobs.record_lsp_evidence(
+                        &bg_repo_root,
+                        &job_id,
+                        lsp_evidence(
+                            if degraded_detail.is_some() {
+                                LspEvidenceReadiness::Partial
+                            } else {
+                                LspEvidenceReadiness::DefaultProfile
+                            },
+                            &EnrichmentScope::Repo.stable_key(),
+                            0,
+                            None,
+                            degraded_detail.clone().or_else(|| {
+                                Some(
+                                    "repo-wide default query profile completed; broad references were omitted"
+                                        .to_string(),
+                                )
+                            }),
+                            validations.clone(),
+                        ),
+                    );
                 }
                 Err(e) => {
                     tracing::error!("[cache-hit bus] LSP persist failed: {:#}", e);
                     bg_lsp_status.set_complete_persist_failed(lsp_call_edge_count);
-                    bg_jobs.mark_failed(&bg_repo_root, &job_id, format!("{}", e));
+                    let detail = format!("persistence failed: {e}");
+                    bg_jobs.mark_failed(&bg_repo_root, &job_id, detail.clone());
+                    bg_jobs.record_lsp_evidence(
+                        &bg_repo_root,
+                        &job_id,
+                        lsp_evidence(
+                            LspEvidenceReadiness::Partial,
+                            &EnrichmentScope::Repo.stable_key(),
+                            0,
+                            None,
+                            Some(detail.clone()),
+                            validations,
+                        ),
+                    );
                 }
             }
         });
@@ -1650,8 +1728,8 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        let _persist_succeeded = self
-            .update_graph_with_scan(&mut cached_state, Some(scan), enrichment)
+        let incremental_update = self
+            .update_graph_with_scan_outcome(&mut cached_state, Some(scan), enrichment)
             .await?;
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
@@ -1715,6 +1793,7 @@ impl RnaHandler {
 
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
+        let mut lsp_validations = Vec::new();
         let t2 = std::time::Instant::now();
         let bus_result = emit_lsp_pipeline_with_budget(LspPipelineInput {
             nodes: all_nodes,
@@ -1733,7 +1812,14 @@ impl RnaHandler {
 
         let lsp_edge_count;
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                bus_validations,
+            )) => {
+                lsp_validations = bus_validations;
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -1816,6 +1902,33 @@ impl RnaHandler {
                     } else {
                         self.lsp_status.set_unavailable();
                     }
+                    if let Some(job_id) = incremental_update.lsp_job_id.as_deref() {
+                        if e.is_timeout() {
+                            self.enrichment_jobs.mark_timed_out(
+                                &self.repo_root,
+                                job_id,
+                                e.to_string(),
+                            );
+                        } else {
+                            self.enrichment_jobs.mark_failed(
+                                &self.repo_root,
+                                job_id,
+                                e.to_string(),
+                            );
+                        }
+                        self.enrichment_jobs.record_lsp_evidence(
+                            &self.repo_root,
+                            job_id,
+                            lsp_evidence(
+                                LspEvidenceReadiness::Unavailable,
+                                &EnrichmentScope::ChangedFiles.stable_key(),
+                                0,
+                                None,
+                                Some(e.to_string()),
+                                Vec::new(),
+                            ),
+                        );
+                    }
                 }
                 lsp_edge_count = 0;
             }
@@ -1838,6 +1951,30 @@ impl RnaHandler {
                 );
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground incremental persist failed: {}", e);
+                    if lsp_stage_completed
+                        && let Some(job_id) = incremental_update.lsp_job_id.as_deref()
+                    {
+                        let detail = format!(
+                            "full persist failed during incremental foreground pipeline: {e}"
+                        );
+                        self.enrichment_jobs.mark_failed(
+                            &self.repo_root,
+                            job_id,
+                            detail.clone(),
+                        );
+                        self.enrichment_jobs.record_lsp_evidence(
+                            &self.repo_root,
+                            job_id,
+                            lsp_evidence(
+                                LspEvidenceReadiness::Partial,
+                                &EnrichmentScope::ChangedFiles.stable_key(),
+                                0,
+                                None,
+                                Some(detail.clone()),
+                                lsp_validations.clone(),
+                            ),
+                        );
+                    }
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                     return Err(
                         e.context("Full persist failed during incremental foreground pipeline")
@@ -1851,6 +1988,42 @@ impl RnaHandler {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
+                }
+                if lsp_stage_completed
+                    && let Some(job_id) = incremental_update.lsp_job_id.as_deref()
+                {
+                    if let Some(detail) = lsp_degraded_detail.as_deref() {
+                        self.enrichment_jobs.mark_degraded(
+                            &self.repo_root,
+                            job_id,
+                            nodes.len(),
+                            edges.len(),
+                            detail,
+                        );
+                    } else {
+                        self.enrichment_jobs.mark_completed(
+                            &self.repo_root,
+                            job_id,
+                            nodes.len(),
+                            edges.len(),
+                        );
+                    }
+                    self.enrichment_jobs.record_lsp_evidence(
+                        &self.repo_root,
+                        job_id,
+                        lsp_evidence(
+                            if lsp_degraded_detail.is_some() {
+                                LspEvidenceReadiness::Partial
+                            } else {
+                                LspEvidenceReadiness::Scoped
+                            },
+                            &EnrichmentScope::ChangedFiles.stable_key(),
+                            0,
+                            None,
+                            lsp_degraded_detail.clone(),
+                            lsp_validations.clone(),
+                        ),
+                    );
                 }
             }
         }
@@ -1900,7 +2073,11 @@ impl RnaHandler {
                 "skipped by scan options",
             ));
         }
-        let related_job_ids = Vec::new();
+        let related_job_ids = incremental_update
+            .lsp_job_id
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
@@ -2154,6 +2331,7 @@ impl RnaHandler {
 
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
+        let lsp_validations;
         let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
@@ -2165,7 +2343,14 @@ impl RnaHandler {
         let lsp_edge_count;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                bus_validations,
+            )) => {
+                lsp_validations = bus_validations;
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2317,10 +2502,23 @@ impl RnaHandler {
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground full persist failed: {}", e);
                     if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
+                        let detail = format!("Full persist failed during foreground pipeline: {e}");
                         self.enrichment_jobs.mark_failed(
                             &self.repo_root,
                             job_id,
-                            format!("Full persist failed during foreground pipeline: {}", e),
+                            detail.clone(),
+                        );
+                        self.enrichment_jobs.record_lsp_evidence(
+                            &self.repo_root,
+                            job_id,
+                            lsp_evidence(
+                                LspEvidenceReadiness::Partial,
+                                &EnrichmentScope::Repo.stable_key(),
+                                0,
+                                None,
+                                Some(detail.clone()),
+                                lsp_validations.clone(),
+                            ),
                         );
                     }
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
@@ -2352,6 +2550,27 @@ impl RnaHandler {
                             edges.len(),
                         );
                     }
+                    self.enrichment_jobs.record_lsp_evidence(
+                        &self.repo_root,
+                        job_id,
+                        lsp_evidence(
+                            if lsp_degraded_detail.is_some() {
+                                LspEvidenceReadiness::Partial
+                            } else {
+                                LspEvidenceReadiness::DefaultProfile
+                            },
+                            &EnrichmentScope::Repo.stable_key(),
+                            0,
+                            None,
+                            lsp_degraded_detail.clone().or_else(|| {
+                                Some(
+                                    "repo-wide default query profile completed; broad references were omitted"
+                                        .to_string(),
+                                )
+                            }),
+                            lsp_validations.clone(),
+                        ),
+                    );
                 }
             }
         }
@@ -2565,7 +2784,13 @@ impl RnaHandler {
         .await;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                lsp_validations,
+            )) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2741,6 +2966,7 @@ impl RnaHandler {
                             declared_node_count,
                             budget_snapshot.as_ref(),
                             Some(format!("persistence failed: {e}")),
+                            lsp_validations.clone(),
                         ),
                     );
                     return Err(e.context("LSP persist failed during foreground pipeline"));
@@ -2792,6 +3018,7 @@ impl RnaHandler {
                                     .to_string()
                             })
                         }),
+                        lsp_validations,
                     ),
                 );
 
@@ -2833,6 +3060,7 @@ impl RnaHandler {
                         declared_node_count,
                         budget_snapshot.as_ref(),
                         Some(e.to_string()),
+                        Vec::new(),
                     ),
                 );
                 if fail_on_lsp_error {
@@ -3576,6 +3804,7 @@ mod tests {
                     server_missing: false,
                     remediation: None,
                     query_metrics: Vec::new(),
+                    validation: None,
                 },
             )]
             .into_iter()
@@ -3595,6 +3824,7 @@ mod tests {
                     server_missing: false,
                     remediation: None,
                     query_metrics: Vec::new(),
+                    validation: None,
                 },
             )]
             .into_iter()
@@ -3607,5 +3837,60 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("current/rust"));
         assert!(!failures[0].contains("stale/rust"));
+    }
+
+    #[tokio::test]
+    async fn validation_evidence_is_invocation_local() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let scan_stats = Arc::new(std::sync::RwLock::new(
+            crate::extract::scan_stats::ScanStats::default(),
+        ));
+        scan_stats.write().unwrap().lsp_stats.insert(
+            "stale".to_string(),
+            [(
+                "rust".to_string(),
+                crate::extract::scan_stats::LspLanguageStats {
+                    server_name: "rust-analyzer".to_string(),
+                    edge_count: 0,
+                    node_count: 0,
+                    duration: Duration::from_secs(1),
+                    error_count: 0,
+                    aborted: false,
+                    server_missing: false,
+                    remediation: None,
+                    query_metrics: Vec::new(),
+                    validation: Some(
+                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                            "rust",
+                            "rust-analyzer",
+                            "workspace/symbol",
+                            9,
+                        ),
+                    ),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let (_, _, _, _, validations) = emit_lsp_pipeline_with_budget(LspPipelineInput {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            root_pairs: vec![("current".to_string(), temp.path().to_path_buf())],
+            primary_slug: "current".to_string(),
+            repo_root: temp.path().to_path_buf(),
+            scan_stats,
+            skip_lsp: true,
+            dirty_slugs: None,
+            lsp_node_filter: None,
+            broad_reference_budget: None,
+        })
+        .await
+        .expect("empty invocation should finalize");
+
+        assert!(
+            validations.is_empty(),
+            "current job must not inherit readiness evidence from cumulative scan stats"
+        );
     }
 }
