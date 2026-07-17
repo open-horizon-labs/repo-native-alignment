@@ -101,6 +101,7 @@ ACQUISITION_CANDIDATE_FIELDS = (
     "semantic_component",
     "graph_component",
     "total",
+    "eligibility_evidence",
     "eligibility",
     "selected",
 )
@@ -123,6 +124,19 @@ CANDIDATE_ELIGIBILITY = {
     "locus_overlap",
     "excluded_record_class",
 }
+CANDIDATE_ELIGIBILITY_EVIDENCE_FIELDS = (
+    "source_backed",
+    "complete_utf8_body",
+    "locus_overlap",
+    "excluded_record_class",
+)
+CANDIDATE_ELIGIBILITY_PRECEDENCE = (
+    "not_source_backed",
+    "incomplete_utf8_body",
+    "locus_overlap",
+    "excluded_record_class",
+    "eligible",
+)
 OMISSION_REASONS = CANDIDATE_ELIGIBILITY - {"eligible"} | {
     "maximum_candidates",
     "full_body_budget",
@@ -211,7 +225,7 @@ EDGE_TYPE_ORDINAL = {
 }
 
 EXPECTED_PROTOCOL_SHA256 = (
-    "f2fc5f2df68b0d082174685522638611e5ba6a9907f523766f23eb2e3bd1bb62"
+    "c2fe41f9d7353a9fe2e81d0bfcae1ea7c02074eb63de5dcad0f60d3adf5cc10d"
 )
 EXPECTED_POPULATION_SHA256 = (
     "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
@@ -227,6 +241,103 @@ MAXIMUM_CANDIDATES = 24
 FULL_BODY_BUDGET_BYTES = 65_536
 RETRY_SUFFIX = "\n\nYOUR PREVIOUS EDIT BLOCKS (for reference):\n{prev}\n\nThese edits FAILED to apply:\n{feedback}\n\nThe other edits were applied successfully. Re-emit corrected edit blocks ONLY for the failed edits,\nin the same *** FILE / SEARCH / REPLACE / END format."
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+CANDIDATE_REPRESENTATION = {
+    "not_source_backed": {
+        "path": "",
+        "start_line": 0,
+        "end_line": 0,
+        "language": "Unknown",
+        "full_body_byte_length": 0,
+        "full_body_sha256": EMPTY_SHA256,
+    },
+    "incomplete_utf8_body": {
+        "source_fields": (
+            "exact non-empty safe repo-relative artifact path, exact one-based "
+            "inclusive span, and exact non-empty language"
+        ),
+        "full_body_byte_length": 0,
+        "full_body_sha256": EMPTY_SHA256,
+    },
+    "locus_overlap": {
+        "source_fields": (
+            "exact non-empty safe repo-relative artifact path, exact one-based "
+            "inclusive span, and exact non-empty language"
+        ),
+        "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+        "overlap": (
+            "true when the candidate path and inclusive line span intersect any "
+            "non-new-file locus; rederived by the validator"
+        ),
+    },
+    "excluded_record_class": {
+        "source_fields": (
+            "exact non-empty safe repo-relative artifact path, exact one-based "
+            "inclusive span, and exact non-empty language"
+        ),
+        "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+        "overlap": False,
+    },
+    "eligible": {
+        "source_fields": (
+            "exact non-empty safe repo-relative artifact path, exact one-based "
+            "inclusive span, and exact non-empty language"
+        ),
+        "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+        "overlap": False,
+    },
+}
+CANDIDATE_ELIGIBILITY_TEST_VECTORS = (
+    {
+        "label": "eligible",
+        "evidence": {
+            "source_backed": True,
+            "complete_utf8_body": True,
+            "locus_overlap": False,
+            "excluded_record_class": False,
+        },
+        "expected_eligibility": "eligible",
+    },
+    {
+        "label": "not-source-backed-precedes-record-class",
+        "evidence": {
+            "source_backed": False,
+            "complete_utf8_body": False,
+            "locus_overlap": False,
+            "excluded_record_class": True,
+        },
+        "expected_eligibility": "not_source_backed",
+    },
+    {
+        "label": "incomplete-body-precedes-overlap-and-record-class",
+        "evidence": {
+            "source_backed": True,
+            "complete_utf8_body": False,
+            "locus_overlap": True,
+            "excluded_record_class": True,
+        },
+        "expected_eligibility": "incomplete_utf8_body",
+    },
+    {
+        "label": "overlap-precedes-record-class",
+        "evidence": {
+            "source_backed": True,
+            "complete_utf8_body": True,
+            "locus_overlap": True,
+            "excluded_record_class": True,
+        },
+        "expected_eligibility": "locus_overlap",
+    },
+    {
+        "label": "excluded-record-class",
+        "evidence": {
+            "source_backed": True,
+            "complete_utf8_body": True,
+            "locus_overlap": False,
+            "excluded_record_class": True,
+        },
+        "expected_eligibility": "excluded_record_class",
+    },
+)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 UTC_SECOND = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -631,7 +742,9 @@ def paired_difference_interval(
 
 def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     _require(
-        errors, protocol.get("schema_version") == 1, "protocol schema_version must be 1"
+        errors,
+        type(protocol.get("schema_version")) is int and protocol["schema_version"] == 1,
+        "protocol schema_version must be JSON integer 1",
     )
     _require(
         errors, protocol.get("status") == "frozen", "protocol status must be frozen"
@@ -822,6 +935,38 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         == CANDIDATE_ELIGIBILITY,
         "candidate eligibility vocabulary drift",
     )
+    _require(
+        errors,
+        acquisition_schema.get("candidate_eligibility_evidence_fields")
+        == list(CANDIDATE_ELIGIBILITY_EVIDENCE_FIELDS),
+        "candidate eligibility evidence schema drift",
+    )
+    _require(
+        errors,
+        acquisition_schema.get("candidate_eligibility_precedence")
+        == list(CANDIDATE_ELIGIBILITY_PRECEDENCE),
+        "candidate eligibility precedence drift",
+    )
+    _require(
+        errors,
+        acquisition_schema.get("candidate_representation") == CANDIDATE_REPRESENTATION,
+        "candidate representation contract drift",
+    )
+    eligibility_vectors = acquisition_schema.get("candidate_eligibility_test_vectors")
+    _require(
+        errors,
+        eligibility_vectors == list(CANDIDATE_ELIGIBILITY_TEST_VECTORS),
+        "candidate eligibility test-vector drift",
+    )
+    if isinstance(eligibility_vectors, list):
+        for ordinal, vector in enumerate(eligibility_vectors, 1):
+            _require(
+                errors,
+                isinstance(vector, dict)
+                and _derived_candidate_eligibility(vector.get("evidence"))
+                == vector.get("expected_eligibility"),
+                f"candidate eligibility test-vector {ordinal} replay drift",
+            )
     _require(
         errors,
         set(acquisition_schema.get("omission_reason_values", [])) == OMISSION_REASONS,
@@ -2083,6 +2228,142 @@ def _safe_relative_path(value: Any) -> bool:
     )
 
 
+def _derived_candidate_eligibility(evidence: Any) -> str | None:
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != set(CANDIDATE_ELIGIBILITY_EVIDENCE_FIELDS)
+        or any(
+            type(evidence.get(field)) is not bool
+            for field in CANDIDATE_ELIGIBILITY_EVIDENCE_FIELDS
+        )
+    ):
+        return None
+    if not evidence["source_backed"]:
+        return "not_source_backed"
+    if not evidence["complete_utf8_body"]:
+        return "incomplete_utf8_body"
+    if evidence["locus_overlap"]:
+        return "locus_overlap"
+    if evidence["excluded_record_class"]:
+        return "excluded_record_class"
+    return "eligible"
+
+
+def _candidate_overlaps_locus(
+    candidate: dict[str, Any], loci: list[Any]
+) -> bool | None:
+    path = candidate.get("path")
+    start_line = candidate.get("start_line")
+    end_line = candidate.get("end_line")
+    if (
+        not _safe_relative_path(path)
+        or type(start_line) is not int
+        or type(end_line) is not int
+        or not 1 <= start_line <= end_line
+    ):
+        return None
+    return any(
+        isinstance(locus, dict)
+        and locus.get("source_kind") != "new_file"
+        and locus.get("path") == path
+        and type(locus.get("start_line")) is int
+        and type(locus.get("end_line")) is int
+        and start_line <= locus["end_line"]
+        and end_line >= locus["start_line"]
+        for locus in loci
+    )
+
+
+def _validate_candidate_representation(
+    candidate: dict[str, Any],
+    loci: list[Any],
+    ordinal: int,
+    errors: list[str],
+) -> str | None:
+    evidence = candidate.get("eligibility_evidence")
+    expected_eligibility = _derived_candidate_eligibility(evidence)
+    _require(
+        errors,
+        expected_eligibility is not None,
+        f"acquisition candidate {ordinal} eligibility evidence is invalid",
+    )
+    if expected_eligibility is None:
+        return None
+    _require(
+        errors,
+        candidate.get("eligibility") == expected_eligibility,
+        f"acquisition candidate {ordinal} eligibility derivation drift",
+    )
+
+    if expected_eligibility == "not_source_backed":
+        _require(
+            errors,
+            evidence["complete_utf8_body"] is False
+            and evidence["locus_overlap"] is False
+            and candidate.get("path") == ""
+            and type(candidate.get("start_line")) is int
+            and candidate["start_line"] == 0
+            and type(candidate.get("end_line")) is int
+            and candidate["end_line"] == 0
+            and candidate.get("language") == "Unknown"
+            and type(candidate.get("full_body_byte_length")) is int
+            and candidate["full_body_byte_length"] == 0
+            and type(candidate.get("full_body_sha256")) is str
+            and candidate["full_body_sha256"] == EMPTY_SHA256,
+            f"acquisition candidate {ordinal} not-source-backed sentinel drift",
+        )
+        return expected_eligibility
+
+    _require(
+        errors,
+        _safe_relative_path(candidate.get("path")),
+        f"acquisition candidate {ordinal} path is unsafe",
+    )
+    _require(
+        errors,
+        type(candidate.get("start_line")) is int
+        and type(candidate.get("end_line")) is int
+        and 1 <= candidate["start_line"] <= candidate["end_line"],
+        f"acquisition candidate {ordinal} line bounds are invalid",
+    )
+    _require(
+        errors,
+        type(candidate.get("language")) is str and bool(candidate["language"]),
+        f"acquisition candidate {ordinal} language is invalid",
+    )
+    actual_overlap = _candidate_overlaps_locus(candidate, loci)
+    if actual_overlap is not None:
+        _require(
+            errors,
+            evidence["locus_overlap"] is actual_overlap,
+            f"acquisition candidate {ordinal} locus-overlap evidence drift",
+        )
+
+    if expected_eligibility == "incomplete_utf8_body":
+        _require(
+            errors,
+            type(candidate.get("full_body_byte_length")) is int
+            and candidate["full_body_byte_length"] == 0
+            and type(candidate.get("full_body_sha256")) is str
+            and candidate["full_body_sha256"] == EMPTY_SHA256,
+            f"acquisition candidate {ordinal} incomplete-body sentinel drift",
+        )
+    else:
+        _require(
+            errors,
+            type(candidate.get("full_body_byte_length")) is int
+            and candidate["full_body_byte_length"] >= 0,
+            f"acquisition candidate {ordinal} full-body length is invalid",
+        )
+        _require(
+            errors,
+            type(candidate.get("full_body_sha256")) is str
+            and bool(HEX64.fullmatch(candidate["full_body_sha256"])),
+            f"acquisition candidate {ordinal} full-body digest is invalid",
+        )
+    return expected_eligibility
+
+
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     total = candidate.get("total")
     semantic_rank = candidate.get("semantic_rank")
@@ -2210,8 +2491,9 @@ def validate_acquisition_vector(
     )
     _require(
         errors,
-        acquisition.get("schema_version") == 1,
-        "packet acquisition schema_version drift",
+        type(acquisition.get("schema_version")) is int
+        and acquisition["schema_version"] == 1,
+        "packet acquisition schema_version must be JSON integer 1",
     )
     for field in ("dataset_row_sha256", "query_sha256", "rna_artifact_receipt_sha256"):
         _require(
@@ -2362,34 +2644,7 @@ def validate_acquisition_vector(
             and bool(candidate["stable_id"]),
             f"acquisition candidate {ordinal} stable_id is invalid",
         )
-        _require(
-            errors,
-            _safe_relative_path(candidate.get("path")),
-            f"acquisition candidate {ordinal} path is unsafe",
-        )
-        _require(
-            errors,
-            type(candidate.get("start_line")) is int
-            and type(candidate.get("end_line")) is int
-            and 1 <= candidate["start_line"] <= candidate["end_line"],
-            f"acquisition candidate {ordinal} line bounds are invalid",
-        )
-        _require(
-            errors,
-            isinstance(candidate.get("language"), str) and bool(candidate["language"]),
-            f"acquisition candidate {ordinal} language is invalid",
-        )
-        _require(
-            errors,
-            type(candidate.get("full_body_byte_length")) is int
-            and candidate["full_body_byte_length"] >= 0,
-            f"acquisition candidate {ordinal} full-body length is invalid",
-        )
-        _require(
-            errors,
-            bool(HEX64.fullmatch(str(candidate.get("full_body_sha256", "")))),
-            f"acquisition candidate {ordinal} full-body digest is invalid",
-        )
+        _validate_candidate_representation(candidate, loci, ordinal, errors)
         for field in ("semantic_rank", "graph_hops"):
             value = candidate.get(field)
             _require(
@@ -2531,6 +2786,8 @@ def validate_acquisition_vector(
         and type(candidate.get("full_body_byte_length")) is int
         and candidate["full_body_byte_length"] >= 0
         and candidate.get("eligibility") in CANDIDATE_ELIGIBILITY
+        and _derived_candidate_eligibility(candidate.get("eligibility_evidence"))
+        == candidate.get("eligibility")
         for candidate in candidates
     )
     if candidate_replay_ready:
@@ -3067,7 +3324,9 @@ def validate_h2_token_vectors(
 def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
     initial_error_count = len(errors)
     _require(
-        errors, vector.get("schema_version") == 1, "packet vector schema_version drift"
+        errors,
+        type(vector.get("schema_version")) is int and vector["schema_version"] == 1,
+        "packet vector schema_version must be JSON integer 1",
     )
     _require(
         errors,
@@ -3388,8 +3647,8 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         )
         _require(
             errors,
-            isinstance(entry.get("bytes"), int) and entry["bytes"] >= 0,
-            f"lock entry {entry_ordinal} byte length is invalid",
+            type(entry.get("bytes")) is int and entry["bytes"] >= 0,
+            f"lock entry {entry_ordinal} byte length must be a JSON integer >= 0",
         )
         _require(
             errors,

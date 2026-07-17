@@ -893,6 +893,167 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         VALIDATOR.validate_packet_vector(vector, errors)
         self.assertIn("acquisition locus 1 stable_id drift", errors)
 
+    def test_candidate_eligibility_representation_and_precedence_are_frozen(
+        self,
+    ) -> None:
+        schema = self.protocol["rna_acquisition"]["record_schema"]
+        self.assertEqual(
+            schema["candidate_eligibility_evidence_fields"],
+            list(VALIDATOR.CANDIDATE_ELIGIBILITY_EVIDENCE_FIELDS),
+        )
+        self.assertEqual(
+            schema["candidate_eligibility_precedence"],
+            list(VALIDATOR.CANDIDATE_ELIGIBILITY_PRECEDENCE),
+        )
+        self.assertEqual(
+            schema["candidate_representation"], VALIDATOR.CANDIDATE_REPRESENTATION
+        )
+        for vector in schema["candidate_eligibility_test_vectors"]:
+            with self.subTest(vector=vector["label"]):
+                self.assertEqual(
+                    VALIDATOR._derived_candidate_eligibility(vector["evidence"]),
+                    vector["expected_eligibility"],
+                )
+
+        drifted_protocol = copy.deepcopy(self.protocol)
+        drifted_protocol["rna_acquisition"]["record_schema"][
+            "candidate_eligibility_test_vectors"
+        ][2]["expected_eligibility"] = "locus_overlap"
+        errors: list[str] = []
+        VALIDATOR.validate_protocol(drifted_protocol, errors)
+        self.assertIn("candidate eligibility test-vector drift", errors)
+        self.assertIn("candidate eligibility test-vector 3 replay drift", errors)
+
+        loci = self.vector["metadata"]["acquisition"]["loci"]
+        base = copy.deepcopy(self.vector["metadata"]["acquisition"]["candidates"][0])
+        positive_candidates = (
+            ("eligible", copy.deepcopy(base)),
+            (
+                "not_source_backed_with_lower_conditions",
+                {
+                    **copy.deepcopy(base),
+                    **VALIDATOR.CANDIDATE_REPRESENTATION["not_source_backed"],
+                    "eligibility_evidence": {
+                        "source_backed": False,
+                        "complete_utf8_body": False,
+                        "locus_overlap": False,
+                        "excluded_record_class": True,
+                    },
+                    "eligibility": "not_source_backed",
+                    "selected": False,
+                },
+            ),
+            (
+                "incomplete_body_precedes_lower_conditions",
+                {
+                    **copy.deepcopy(base),
+                    "path": "src/example.py",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "language": "Python",
+                    "full_body_byte_length": 0,
+                    "full_body_sha256": VALIDATOR.EMPTY_SHA256,
+                    "eligibility_evidence": {
+                        "source_backed": True,
+                        "complete_utf8_body": False,
+                        "locus_overlap": True,
+                        "excluded_record_class": True,
+                    },
+                    "eligibility": "incomplete_utf8_body",
+                    "selected": False,
+                },
+            ),
+            (
+                "locus_overlap_precedes_record_class",
+                {
+                    **copy.deepcopy(base),
+                    "path": "src/example.py",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "eligibility_evidence": {
+                        "source_backed": True,
+                        "complete_utf8_body": True,
+                        "locus_overlap": True,
+                        "excluded_record_class": True,
+                    },
+                    "eligibility": "locus_overlap",
+                    "selected": False,
+                },
+            ),
+            (
+                "excluded_record_class",
+                {
+                    **copy.deepcopy(base),
+                    "eligibility_evidence": {
+                        "source_backed": True,
+                        "complete_utf8_body": True,
+                        "locus_overlap": False,
+                        "excluded_record_class": True,
+                    },
+                    "eligibility": "excluded_record_class",
+                    "selected": False,
+                },
+            ),
+        )
+        for label, candidate in positive_candidates:
+            with self.subTest(positive=label):
+                errors = []
+                VALIDATOR._validate_candidate_representation(candidate, loci, 1, errors)
+                self.assertEqual(errors, [])
+
+        negative_candidates = []
+        wrong_eligibility = copy.deepcopy(positive_candidates[2][1])
+        wrong_eligibility["eligibility"] = "locus_overlap"
+        negative_candidates.append(
+            (
+                "precedence",
+                wrong_eligibility,
+                "acquisition candidate 1 eligibility derivation drift",
+            )
+        )
+        sentinel_drift = copy.deepcopy(positive_candidates[1][1])
+        sentinel_drift["path"] = "src/not-a-sentinel.py"
+        negative_candidates.append(
+            (
+                "not_source_backed_sentinel",
+                sentinel_drift,
+                "acquisition candidate 1 not-source-backed sentinel drift",
+            )
+        )
+        body_drift = copy.deepcopy(positive_candidates[2][1])
+        body_drift["full_body_byte_length"] = 1
+        body_drift["full_body_sha256"] = "a" * 64
+        negative_candidates.append(
+            (
+                "incomplete_body_sentinel",
+                body_drift,
+                "acquisition candidate 1 incomplete-body sentinel drift",
+            )
+        )
+        overlap_drift = copy.deepcopy(positive_candidates[3][1])
+        overlap_drift["path"] = "src/not-a-locus.py"
+        negative_candidates.append(
+            (
+                "overlap_derivation",
+                overlap_drift,
+                "acquisition candidate 1 locus-overlap evidence drift",
+            )
+        )
+        evidence_type_drift = copy.deepcopy(base)
+        evidence_type_drift["eligibility_evidence"]["source_backed"] = 1
+        negative_candidates.append(
+            (
+                "evidence_type",
+                evidence_type_drift,
+                "acquisition candidate 1 eligibility evidence is invalid",
+            )
+        )
+        for label, candidate, expected_error in negative_candidates:
+            with self.subTest(negative=label):
+                errors = []
+                VALIDATOR._validate_candidate_representation(candidate, loci, 1, errors)
+                self.assertIn(expected_error, errors)
+
     def test_acquisition_relationships_are_bound_to_locus_seeds(self) -> None:
         vector = copy.deepcopy(self.vector)
         acquisition = vector["metadata"]["acquisition"]
@@ -1194,6 +1355,60 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 self.assertEqual(result, 1)
                 self.assertNotIn(rejected_value, stdout.getvalue().lower())
                 self.assertNotIn(rejected_value, stderr.getvalue().lower())
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "INCOMPATIBLE: protocol validation failed",
+                )
+
+    def test_closed_integer_fields_reject_booleans_and_nonintegers(self) -> None:
+        rejected_values = (True, False, 1.0, "1", None)
+        for rejected_value in rejected_values:
+            with self.subTest(field="schema_versions", value=rejected_value):
+                protocol = copy.deepcopy(self.protocol)
+                protocol["schema_version"] = rejected_value
+                errors: list[str] = []
+                VALIDATOR.validate_protocol(protocol, errors)
+                self.assertIn("protocol schema_version must be JSON integer 1", errors)
+
+                vector = copy.deepcopy(self.vector)
+                vector["schema_version"] = rejected_value
+                vector["metadata"]["acquisition"]["schema_version"] = rejected_value
+                errors = []
+                VALIDATOR.validate_packet_vector(vector, errors)
+                self.assertIn(
+                    "packet vector schema_version must be JSON integer 1", errors
+                )
+                self.assertIn(
+                    "packet acquisition schema_version must be JSON integer 1", errors
+                )
+
+            with (
+                self.subTest(field="lock_byte_count", value=rejected_value),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                copied_root = Path(temporary)
+                self.copy_locked_bundle(copied_root)
+                lock_path = copied_root / VALIDATOR.LOCK_REL
+                lock = VALIDATOR.load_json(lock_path)
+                lock["files"][0]["bytes"] = rejected_value
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                errors = []
+                VALIDATOR.validate_lock(copied_root, errors)
+                self.assertIn(
+                    "lock entry 1 byte length must be a JSON integer >= 0", errors
+                )
+
+                rejected_marker = json.dumps(rejected_value).lower()
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = VALIDATOR.main(["--root", str(copied_root)])
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(rejected_marker, stderr.getvalue().lower())
                 self.assertEqual(
                     stderr.getvalue().strip(),
                     "INCOMPATIBLE: protocol validation failed",

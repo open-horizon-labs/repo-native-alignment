@@ -266,6 +266,7 @@
         "semantic_component",
         "graph_component",
         "total",
+        "eligibility_evidence",
         "eligibility",
         "selected"
       ],
@@ -276,6 +277,101 @@
         "incomplete_utf8_body",
         "locus_overlap",
         "excluded_record_class"
+      ],
+      "candidate_eligibility_evidence_fields": [
+        "source_backed",
+        "complete_utf8_body",
+        "locus_overlap",
+        "excluded_record_class"
+      ],
+      "candidate_eligibility_precedence": [
+        "not_source_backed",
+        "incomplete_utf8_body",
+        "locus_overlap",
+        "excluded_record_class",
+        "eligible"
+      ],
+      "candidate_representation": {
+        "not_source_backed": {
+          "path": "",
+          "start_line": 0,
+          "end_line": 0,
+          "language": "Unknown",
+          "full_body_byte_length": 0,
+          "full_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "incomplete_utf8_body": {
+          "source_fields": "exact non-empty safe repo-relative artifact path, exact one-based inclusive span, and exact non-empty language",
+          "full_body_byte_length": 0,
+          "full_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "locus_overlap": {
+          "source_fields": "exact non-empty safe repo-relative artifact path, exact one-based inclusive span, and exact non-empty language",
+          "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+          "overlap": "true when the candidate path and inclusive line span intersect any non-new-file locus; rederived by the validator"
+        },
+        "excluded_record_class": {
+          "source_fields": "exact non-empty safe repo-relative artifact path, exact one-based inclusive span, and exact non-empty language",
+          "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+          "overlap": false
+        },
+        "eligible": {
+          "source_fields": "exact non-empty safe repo-relative artifact path, exact one-based inclusive span, and exact non-empty language",
+          "body_fields": "exact complete UTF-8 body byte length and SHA-256",
+          "overlap": false
+        }
+      },
+      "candidate_eligibility_test_vectors": [
+        {
+          "label": "eligible",
+          "evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": false,
+            "excluded_record_class": false
+          },
+          "expected_eligibility": "eligible"
+        },
+        {
+          "label": "not-source-backed-precedes-record-class",
+          "evidence": {
+            "source_backed": false,
+            "complete_utf8_body": false,
+            "locus_overlap": false,
+            "excluded_record_class": true
+          },
+          "expected_eligibility": "not_source_backed"
+        },
+        {
+          "label": "incomplete-body-precedes-overlap-and-record-class",
+          "evidence": {
+            "source_backed": true,
+            "complete_utf8_body": false,
+            "locus_overlap": true,
+            "excluded_record_class": true
+          },
+          "expected_eligibility": "incomplete_utf8_body"
+        },
+        {
+          "label": "overlap-precedes-record-class",
+          "evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": true,
+            "excluded_record_class": true
+          },
+          "expected_eligibility": "locus_overlap"
+        },
+        {
+          "label": "excluded-record-class",
+          "evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": false,
+            "excluded_record_class": true
+          },
+          "expected_eligibility": "excluded_record_class"
+        }
       ],
       "relationship_exact_fields": [
         "source",

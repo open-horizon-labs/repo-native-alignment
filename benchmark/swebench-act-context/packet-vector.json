@@ -40,6 +40,12 @@
           "semantic_component": 999000000,
           "graph_component": 98989,
           "total": 999098989,
+          "eligibility_evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": false,
+            "excluded_record_class": false
+          },
           "eligibility": "eligible",
           "selected": true
         },
@@ -57,6 +63,12 @@
           "semantic_component": 998000000,
           "graph_component": 98988,
           "total": 998098988,
+          "eligibility_evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": false,
+            "excluded_record_class": false
+          },
           "eligibility": "eligible",
           "selected": false
         },
@@ -74,6 +86,12 @@
           "semantic_component": 0,
           "graph_component": 98978,
           "total": 98978,
+          "eligibility_evidence": {
+            "source_backed": true,
+            "complete_utf8_body": true,
+            "locus_overlap": false,
+            "excluded_record_class": false
+          },
           "eligibility": "eligible",
           "selected": true
         }
@@ -402,6 +420,6 @@
     "expected_retry_request_byte_length": 12336,
     "expected_retry_request_sha256": "1043956d8aed9614eb3638d6fa09cde29273c382d8384a8710a0acd202fb2b09"
   },
-  "expected_b_sha256": "622bcb8206fed40f5daef34978fea14ff5486a3bfcfac352d3110d1d5b781f2e",
-  "expected_c_sha256": "abee3d4599ca2a22376f87b9c92c59be30108ee1ef10df5f4c104782ab63803f"
+  "expected_b_sha256": "8a0a241c19521110f550227e73abc8f5be05731d06a60e60fe406322e22b65b2",
+  "expected_c_sha256": "10f5adfb10679613d5f216a9c64bd008c4cf0ae34e5a5a9ff0fd85a1cf39d493"
 }
