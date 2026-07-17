@@ -1,3 +1,10 @@
+---
+type: friction-log
+pr: 795
+status: active
+date: 2026-07-17
+---
+
 # PR #795 Ship Friction
 
 | Time | Tool/Path | Severity | Friction | Fallback | Impact |
