@@ -786,6 +786,53 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             ):
                 VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
 
+    def test_lock_manifest_rejects_boolean_schema_version_without_echo(self) -> None:
+        for schema_version in (True, False):
+            with (
+                self.subTest(schema_version=schema_version),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                copied_root = Path(temporary)
+                self.copy_locked_bundle(copied_root)
+                lock_path = copied_root / VALIDATOR.LOCK_REL
+                lock = VALIDATOR.load_json(lock_path)
+                lock["schema_version"] = schema_version
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                digest = (
+                    (copied_root / VALIDATOR.DIGEST_REL)
+                    .read_text(encoding="ascii")
+                    .strip()
+                )
+                rejected_value = json.dumps(schema_version)
+
+                with self.assertRaisesRegex(
+                    ValueError, "lock schema_version must be JSON integer 1"
+                ) as context:
+                    VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
+                self.assertNotIn(rejected_value, str(context.exception).lower())
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = VALIDATOR.main(
+                        [
+                            "--root",
+                            str(copied_root),
+                            "--expected-digest",
+                            digest,
+                        ]
+                    )
+                self.assertEqual(result, 1)
+                self.assertNotIn(rejected_value, stdout.getvalue().lower())
+                self.assertNotIn(rejected_value, stderr.getvalue().lower())
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "INCOMPATIBLE: protocol validation failed",
+                )
+
     def test_resealed_locked_file_with_common_credential_shape_fails_closed(
         self,
     ) -> None:

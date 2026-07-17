@@ -3250,7 +3250,11 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         == {"schema_version", "algorithm", "material_format", "files", "bundle_sha256"},
         "lock field set drift",
     )
-    _require(errors, lock.get("schema_version") == 1, "lock schema_version must be 1")
+    _require(
+        errors,
+        type(lock.get("schema_version")) is int and lock["schema_version"] == 1,
+        "lock schema_version must be JSON integer 1",
+    )
     _require(errors, lock.get("algorithm") == "sha256", "lock algorithm drift")
     _require(
         errors,
