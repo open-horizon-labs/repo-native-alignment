@@ -1022,14 +1022,19 @@ pub fn build_and_persist_report(
     related_job_ids: &[String],
     scan_started_at_ms: u64,
 ) -> Result<LspCompletenessReport> {
-    let work_items =
-        crate::extract::lsp::work_items::load_records_since(repo_root, scan_started_at_ms)?;
-    let related_ids = related_job_ids.iter().collect::<BTreeSet<_>>();
+    let related_ids = related_job_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let work_items = filter_work_items_for_related_jobs(
+        crate::extract::lsp::work_items::load_records_since(repo_root, scan_started_at_ms)?,
+        &related_ids,
+    );
     let jobs = EnrichmentJobLedger::default()
         .all_jobs(repo_root)
         .into_iter()
         .filter(|job| {
-            related_ids.contains(&job.job_id)
+            related_ids.contains(job.job_id.as_str())
                 && job.capability == EnrichmentCapability::CallReferences
         })
         .collect::<Vec<_>>();
@@ -1045,6 +1050,16 @@ pub fn build_and_persist_report(
     )?;
     persist_report(repo_root, &report)?;
     Ok(report)
+}
+
+fn filter_work_items_for_related_jobs(
+    records: Vec<LspWorkItemRecord>,
+    related_job_ids: &BTreeSet<&str>,
+) -> Vec<LspWorkItemRecord> {
+    records
+        .into_iter()
+        .filter(|record| related_job_ids.contains(record.job_id.as_str()))
+        .collect()
 }
 
 pub fn load_readiness_check(
@@ -1216,6 +1231,7 @@ fn build_report(
             .push(entry);
     }
     let mut server_identities = BTreeMap::new();
+    let persisted_by_path = persisted_results_by_path(nodes, edges);
     let mut files = Vec::with_capacity(paths.len());
 
     for path in paths {
@@ -1277,7 +1293,10 @@ fn build_report(
         let validations = job_validations_for_language(jobs, descriptor.language());
         let (advertised_capabilities, requests_attempted) =
             evidence_from_work_items(&records, &language_entries, &validations);
-        let persisted_results = persisted_results_for_path(&normalized, nodes, edges);
+        let persisted_results = persisted_by_path
+            .get(&normalized)
+            .cloned()
+            .unwrap_or_default();
         let (expected_results, expected_result_ids) =
             expected_evidence_from_work_items(&records, &validations, &normalized);
         let terminal_status = terminal_status_for_file(
@@ -1431,12 +1450,16 @@ fn lsp_method(operation: &str) -> &'static str {
     }
 }
 
-fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> PersistedResults {
-    let mut results = PersistedResults::default();
-    for node in nodes.iter().filter(|node| {
-        node.source == ExtractionSource::Lsp
-            && node.id.file.to_string_lossy().replace('\\', "/") == path
-    }) {
+fn persisted_results_by_path(nodes: &[Node], edges: &[Edge]) -> BTreeMap<String, PersistedResults> {
+    let mut by_path = BTreeMap::<String, PersistedResults>::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.source == ExtractionSource::Lsp)
+    {
+        let Ok(path) = normalize_repo_relative_path(&node.id.file.to_string_lossy()) else {
+            continue;
+        };
+        let results = by_path.entry(path).or_default();
         results.provenance.insert(node.stable_id());
         match &node.id.kind {
             NodeKind::Other(kind) if kind == "lsp_document_symbol" => {
@@ -1452,21 +1475,39 @@ fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> Per
         .iter()
         .filter(|edge| edge.source == ExtractionSource::Lsp)
     {
-        let from = edge.from.file.to_string_lossy().replace('\\', "/");
-        let to = edge.to.file.to_string_lossy().replace('\\', "/");
-        if from != path && to != path {
-            continue;
-        }
-        results.provenance.insert(edge.stable_id());
-        match edge.kind {
-            EdgeKind::Calls => results.call_hierarchy_edges += 1,
-            EdgeKind::ReferencedBy => results.references += 1,
-            EdgeKind::Implements => results.definitions += 1,
-            EdgeKind::DependsOn => results.document_links += 1,
-            _ => {}
+        let mut endpoint_paths = [
+            normalize_repo_relative_path(&edge.from.file.to_string_lossy()).ok(),
+            normalize_repo_relative_path(&edge.to.file.to_string_lossy()).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        endpoint_paths.sort();
+        endpoint_paths.dedup();
+        let stable_id = edge.stable_id();
+        for path in endpoint_paths {
+            let results = by_path.entry(path).or_default();
+            results.provenance.insert(stable_id.clone());
+            match edge.kind {
+                EdgeKind::Calls => results.call_hierarchy_edges += 1,
+                EdgeKind::ReferencedBy => results.references += 1,
+                EdgeKind::Implements => results.definitions += 1,
+                EdgeKind::DependsOn => results.document_links += 1,
+                _ => {}
+            }
         }
     }
-    results
+    by_path
+}
+
+#[cfg(test)]
+fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> PersistedResults {
+    let Ok(path) = normalize_repo_relative_path(path) else {
+        return PersistedResults::default();
+    };
+    persisted_results_by_path(nodes, edges)
+        .remove(&path)
+        .unwrap_or_default()
 }
 
 fn job_validations_for_language<'a>(
@@ -1497,6 +1538,7 @@ fn runtime_compatibility_violations(
             ),
         });
     }
+    let persisted_by_path = persisted_results_by_path(nodes, edges);
     let mut current_servers = BTreeMap::new();
     for file in report.files.iter().filter(|file| file.role.is_included()) {
         if let Some(expected) = &file.expected_server {
@@ -1514,7 +1556,10 @@ fn runtime_compatibility_violations(
             }
         }
 
-        let persisted = persisted_results_for_path(&file.path, nodes, edges);
+        let persisted = persisted_by_path
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_default();
         for missing in file.expected_result_ids.difference(&persisted.provenance) {
             violations.push(ReadinessViolation {
                 code: ReadinessViolationCode::StaleReport,
@@ -2449,6 +2494,97 @@ mod tests {
 
         file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge]);
         assert!(report(vec![file]).is_ready());
+    }
+
+    #[test]
+    fn persisted_results_index_counts_each_distinct_edge_endpoint_once() {
+        let cross_file = Edge {
+            from: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/b.py"),
+                name: "callee".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let self_edge = Edge {
+            from: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let index = persisted_results_by_path(&[], &[cross_file.clone(), self_edge.clone()]);
+
+        assert_eq!(index["src/a.py"].call_hierarchy_edges, 1);
+        assert_eq!(index["src/b.py"].call_hierarchy_edges, 1);
+        assert_eq!(index["src/a.py"].references, 1);
+        assert_eq!(index["src/b.py"].references, 0);
+        assert_eq!(index["src/a.py"].provenance.len(), 2);
+        assert_eq!(index["src/b.py"].provenance.len(), 1);
+        assert!(
+            index["src/a.py"]
+                .provenance
+                .contains(&cross_file.stable_id())
+        );
+        assert!(
+            index["src/a.py"]
+                .provenance
+                .contains(&self_edge.stable_id())
+        );
+    }
+
+    #[test]
+    fn unrelated_fresh_work_item_cannot_satisfy_scan_coverage() {
+        let related = LspWorkItemRecord {
+            job_id: "scan-job".to_string(),
+            file: "src/a.py".to_string(),
+            state: LspWorkItemState::Skipped,
+            ..LspWorkItemRecord::default()
+        };
+        let unrelated = LspWorkItemRecord {
+            job_id: "other-job".to_string(),
+            file: "src/a.py".to_string(),
+            node_kind: "function".to_string(),
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            observed_result_count: 1,
+            ..LspWorkItemRecord::default()
+        };
+        let related_ids = BTreeSet::from(["scan-job"]);
+        let filtered = filter_work_items_for_related_jobs(vec![unrelated, related], &related_ids);
+        let filtered = filtered.iter().collect::<Vec<_>>();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].job_id, "scan-job");
+        assert_eq!(
+            aggregate_request_outcome(&filtered),
+            RequestOutcome::Unsupported
+        );
+        let (expected, expected_ids) =
+            expected_evidence_from_work_items(&filtered, &[], "src/a.py");
+        assert!(expected.is_empty());
+        assert!(expected_ids.is_empty());
     }
 
     #[test]
