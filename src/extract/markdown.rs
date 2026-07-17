@@ -1714,6 +1714,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
             "content.metadata_without_body_evidence"
         );
 
+        let business_context = crate::business_context::BusinessContextAdmission::default();
         let ctx = SearchContext {
             graph_state: &loaded,
             embed_index: None,
@@ -1723,6 +1724,7 @@ The manuscript uses the proxy-risk claim in the opening argument.
             root_filter: None,
             non_code_slugs: HashSet::new(),
             enrichment_jobs: Vec::new(),
+            business_context: &business_context,
         };
         let answer = search(
             &SearchParams {

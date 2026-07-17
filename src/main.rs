@@ -1241,6 +1241,7 @@ async fn async_main() -> anyhow::Result<()> {
                     .into_iter()
                     .map(|(slug, _)| slug)
                     .collect();
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = SearchContext {
                 graph_state: &gs,
                 embed_index: embed_ref,
@@ -1250,6 +1251,7 @@ async fn async_main() -> anyhow::Result<()> {
                 root_filter,
                 non_code_slugs,
                 enrichment_jobs: EnrichmentJobLedger::default().all_jobs(&repo_root),
+                business_context: &business_context,
             };
             println!("{}", service::search(&params, &ctx).await);
             return Ok(());
@@ -1316,9 +1318,11 @@ async fn async_main() -> anyhow::Result<()> {
                 root_filter,
                 non_code_slugs: std::collections::HashSet::new(),
             };
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = OutcomeProgressContext {
                 graph_state: &gs,
                 repo_root: &repo_root,
+                business_context: &business_context,
             };
             println!("{}", service::outcome_progress(&params, &ctx));
             return Ok(());
@@ -1362,11 +1366,13 @@ async fn async_main() -> anyhow::Result<()> {
                 root_filter,
                 non_code_slugs: std::collections::HashSet::new(),
             };
+            let business_context = BusinessContextAdmission::new(business_context_mode);
             let ctx = RepoMapContext {
                 graph_state: &gs,
                 repo_root: &repo_root,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &business_context,
             };
             println!("{}", service::repo_map(&params, &ctx));
             return Ok(());

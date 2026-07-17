@@ -974,6 +974,10 @@ async fn search_flat(
         && !query_str.is_empty()
         && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root)
     {
+        let chunks: Vec<_> = chunks
+            .into_iter()
+            .filter(|chunk| ctx.business_context.admit_repository_file(&chunk.file_path))
+            .collect();
         let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
             let workspace = crate::roots::WorkspaceConfig::load()
                 .with_primary_root(ctx.repo_root.to_path_buf())
@@ -2662,6 +2666,9 @@ mod tests {
         graph_state: &'a GraphState,
         repo_root: &'a Path,
     ) -> SearchContext<'a> {
+        static BUSINESS_CONTEXT: std::sync::LazyLock<
+            crate::business_context::BusinessContextAdmission,
+        > = std::sync::LazyLock::new(crate::business_context::BusinessContextAdmission::default);
         SearchContext {
             graph_state,
             embed_index: None,
@@ -2671,6 +2678,7 @@ mod tests {
             root_filter: None,
             non_code_slugs: HashSet::new(),
             enrichment_jobs: Vec::new(),
+            business_context: &BUSINESS_CONTEXT,
         }
     }
 
@@ -4462,6 +4470,7 @@ mod tests {
         other.id.root = "other-project".to_string();
         let gs = make_graph_state(vec![local, other]);
         let repo_root = PathBuf::from("/tmp/test");
+        let business_context = crate::business_context::BusinessContextAdmission::default();
         let ctx = SearchContext {
             graph_state: &gs,
             embed_index: None,
@@ -4471,6 +4480,7 @@ mod tests {
             root_filter: Some("my-project".into()),
             non_code_slugs: HashSet::new(),
             enrichment_jobs: Vec::new(),
+            business_context: &business_context,
         };
         let params = SearchParams {
             query: Some("handler".into()),

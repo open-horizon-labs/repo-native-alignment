@@ -450,14 +450,17 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 "excluded producer inputs: 3 .oh file(s), 2 Git-history producer(s)\n",
                 encoding="utf-8",
             )
-            state = HARNESS.parse_business_context_state({"scan_stderr": log})
+            state = HARNESS.parse_business_context_state(
+                {"scan": {"stderr": log}}
+            )
             self.assertEqual(state["selected_mode"], "disabled")
             self.assertEqual(state["business_artifact_files"], 3)
             self.assertEqual(state["git_history_producers"], 2)
+            self.assertEqual(state["validated_phases"], ["scan"])
 
             log.write_text("scan complete without diagnostics\n", encoding="utf-8")
             with self.assertRaises(HARNESS.HarnessError):
-                HARNESS.parse_business_context_state({"scan_stderr": log})
+                HARNESS.parse_business_context_state({"scan": {"stderr": log}})
 
             log.write_text(
                 "business context: enabled\n"
@@ -465,7 +468,42 @@ class SwebenchRnaOneTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaises(HARNESS.HarnessError):
-                HARNESS.parse_business_context_state({"scan_stderr": log})
+                HARNESS.parse_business_context_state({"scan": {"stderr": log}})
+
+    def test_business_context_diagnostics_are_phase_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            scan = logs / "scan.stderr.log"
+            embedding = logs / "embedding.stderr.log"
+            scan.write_text(
+                "business context: disabled\n"
+                "excluded producer inputs: 3 .oh file(s), 2 Git-history producer(s)\n",
+                encoding="utf-8",
+            )
+            embedding.write_text("embedding complete without diagnostics\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(HARNESS.HarnessError, "embedding phase omitted"):
+                HARNESS.parse_business_context_state(
+                    {
+                        "scan": {"stderr": scan},
+                        "embedding": {"stderr": embedding},
+                    }
+                )
+
+            embedding.write_text(
+                "business context: disabled\n"
+                "excluded producer inputs: 0 .oh file(s), 1 Git-history producer(s)\n",
+                encoding="utf-8",
+            )
+            state = HARNESS.parse_business_context_state(
+                {
+                    "scan": {"stderr": scan},
+                    "embedding": {"stderr": embedding},
+                }
+            )
+            self.assertEqual(state["validated_phases"], ["scan", "embedding"])
+            self.assertEqual(state["business_artifact_files"], 3)
+            self.assertEqual(state["git_history_producers"], 2)
 
     def test_dry_run_builds_auditable_bundle_without_executor_or_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

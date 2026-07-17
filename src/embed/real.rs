@@ -1857,6 +1857,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_aware_full_index_skips_history_before_embedding() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
+        let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+
+        let indexed = idx
+            .index_all_with_symbols_and_business_context(tmp.path(), &[], &business_context)
+            .await
+            .unwrap();
+
+        assert_eq!(indexed, 0);
+        assert_eq!(business_context.counts().git_history_producers, 2);
+    }
+
+    #[tokio::test]
     async fn has_table_returns_true_after_index_build() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;

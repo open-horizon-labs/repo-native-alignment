@@ -2772,7 +2772,11 @@ impl RnaHandler {
                             e
                         );
                         if let Err(e2) = embed_idx
-                            .index_all_with_symbols(&self.repo_root, &graph.nodes)
+                            .index_all_with_symbols_and_business_context(
+                                &self.repo_root,
+                                &graph.nodes,
+                                &self.business_context,
+                            )
                             .await
                         {
                             tracing::warn!("Full embed rebuild also failed: {}", e2);

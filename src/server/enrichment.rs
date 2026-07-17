@@ -2044,6 +2044,7 @@ impl RnaHandler {
 
         let embed_repo_root = self.repo_root.clone();
         let embed_index_ref = self.embed_index.clone();
+        let embed_business_context = self.business_context.clone();
         let (embed_job_id, run_embed_job) = if enrichment.runs_embeddings() {
             match self.enrichment_jobs.begin_job(
                 &self.repo_root,
@@ -2077,7 +2078,11 @@ impl RnaHandler {
             let count = match EmbeddingIndex::new(&embed_repo_root).await {
                 Ok(idx) => {
                     match idx
-                        .index_all_with_symbols(&embed_repo_root, &embeddable_nodes)
+                        .index_all_with_symbols_and_business_context(
+                            &embed_repo_root,
+                            &embeddable_nodes,
+                            &embed_business_context,
+                        )
                         .await
                     {
                         Ok(count) => {

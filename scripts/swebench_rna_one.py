@@ -989,8 +989,10 @@ def parse_enrichment_state(
     }
 
 
-def parse_business_context_state(log_paths: Mapping[str, Path]) -> dict[str, Any]:
-    """Fail closed unless RNA reports the benchmark's selected isolation mode."""
+def parse_business_context_state(
+    phase_log_paths: Mapping[str, Mapping[str, Path]],
+) -> dict[str, Any]:
+    """Fail closed unless every reporting phase certifies the selected mode."""
     mode_pattern = re.compile(r"business context:\s*(enabled|disabled)", re.IGNORECASE)
     counts_pattern = re.compile(
         r"excluded producer inputs:\s*(\d+)\s+\.oh file\(s\),\s*"
@@ -998,47 +1000,61 @@ def parse_business_context_state(log_paths: Mapping[str, Path]) -> dict[str, Any
         re.IGNORECASE,
     )
     observations: list[dict[str, Any]] = []
-    observed_modes: list[str] = []
     observed_counts: list[tuple[int, int]] = []
-    for name, path in log_paths.items():
-        if not path.exists():
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        modes = [match.lower() for match in mode_pattern.findall(text)]
-        counts = [
-            (int(files), int(producers))
-            for files, producers in counts_pattern.findall(text)
-        ]
-        observed_modes.extend(modes)
-        observed_counts.extend(counts)
-        if modes or counts:
-            observations.append(
-                {
-                    "source": name,
-                    "modes": modes,
-                    "counts": [
-                        {
-                            "business_artifact_files": files,
-                            "git_history_producers": producers,
-                        }
-                        for files, producers in counts
-                    ],
-                }
-            )
+    if not phase_log_paths:
+        raise HarnessError("RNA pre-warm declared no business-context reporting phases")
+    for phase, log_paths in phase_log_paths.items():
+        phase_modes: list[str] = []
+        phase_counts: list[tuple[int, int]] = []
+        phase_observations: list[dict[str, Any]] = []
+        for name, path in log_paths.items():
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            modes = [match.lower() for match in mode_pattern.findall(text)]
+            counts = [
+                (int(files), int(producers))
+                for files, producers in counts_pattern.findall(text)
+            ]
+            phase_modes.extend(modes)
+            phase_counts.extend(counts)
+            if modes or counts:
+                phase_observations.append(
+                    {
+                        "source": name,
+                        "modes": modes,
+                        "counts": [
+                            {
+                                "business_artifact_files": files,
+                                "git_history_producers": producers,
+                            }
+                            for files, producers in counts
+                        ],
+                    }
+                )
 
-    if not observed_modes or not observed_counts:
-        raise HarnessError(
-            "RNA pre-warm omitted business-context mode and exclusion diagnostics"
+        if not phase_modes or not phase_counts:
+            raise HarnessError(
+                f"RNA {phase} phase omitted business-context mode and exclusion diagnostics"
+            )
+        unexpected = sorted(set(phase_modes) - {BUSINESS_CONTEXT_MODE})
+        if unexpected:
+            raise HarnessError(
+                f"RNA {phase} phase escaped disabled business-context mode: "
+                + ", ".join(unexpected)
+            )
+        observed_counts.extend(phase_counts)
+        observations.append(
+            {
+                "phase": phase,
+                "sources": phase_observations,
+            }
         )
-    unexpected = sorted(set(observed_modes) - {BUSINESS_CONTEXT_MODE})
-    if unexpected:
-        raise HarnessError(
-            "RNA benchmark command escaped disabled business-context mode: "
-            + ", ".join(unexpected)
-        )
+
     return {
         "selected_mode": BUSINESS_CONTEXT_MODE,
         "diagnostic_status": "validated",
+        "validated_phases": list(phase_log_paths),
         "business_artifact_files": max(files for files, _ in observed_counts),
         "git_history_producers": max(producers for _, producers in observed_counts),
         "observations": observations,
@@ -1113,16 +1129,18 @@ def prewarm_rna(
     state = parse_enrichment_state(
         scan, scan_stdout, scan_stderr, embedding, readiness
     )
-    business_context_logs = {
-        "scan_stdout": scan_stdout,
-        "scan_stderr": scan_stderr,
-        "readiness_stdout": readiness_stdout,
-        "readiness_stderr": readiness_stderr,
+    business_context_phases = {
+        "scan": {
+            "stdout": scan_stdout,
+            "stderr": scan_stderr,
+        },
     }
     if embedding is not None:
-        business_context_logs["embedding_stdout"] = logs / "embeddings.stdout.log"
-        business_context_logs["embedding_stderr"] = logs / "embeddings.stderr.log"
-    state["business_context"] = parse_business_context_state(business_context_logs)
+        business_context_phases["embedding"] = {
+            "stdout": logs / "embeddings.stdout.log",
+            "stderr": logs / "embeddings.stderr.log",
+        }
+    state["business_context"] = parse_business_context_state(business_context_phases)
     state["selected_condition"] = condition
     if readiness.exit_code != 0:
         raise HarnessError(

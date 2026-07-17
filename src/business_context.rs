@@ -101,24 +101,25 @@ impl BusinessContextAdmission {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Remove `.oh` paths before a producer constructs an extraction event.
-    pub fn retain_repository_files(&self, files: &mut Vec<PathBuf>) -> usize {
-        if !self.mode.is_disabled() {
-            return 0;
+    /// Return whether a repository file may be produced, recording disabled `.oh` paths.
+    pub fn admit_repository_file(&self, path: &Path) -> bool {
+        if !self.mode.is_disabled() || !path_has_component(path, ".oh") {
+            return true;
         }
 
+        let mut counts = self
+            .counts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.business_artifact_files = counts.business_artifact_files.saturating_add(1);
+        false
+    }
+
+    /// Remove `.oh` paths before a producer constructs an extraction event.
+    pub fn retain_repository_files(&self, files: &mut Vec<PathBuf>) -> usize {
         let before = files.len();
-        files.retain(|path| !path_has_component(path, ".oh"));
-        let excluded = before.saturating_sub(files.len());
-        if excluded > 0 {
-            let mut counts = self
-                .counts
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            counts.business_artifact_files =
-                counts.business_artifact_files.saturating_add(excluded);
-        }
-        excluded
+        files.retain(|path| self.admit_repository_file(path));
+        before.saturating_sub(files.len())
     }
 
     /// Return whether a Git-history producer may run, recording disabled decisions.
@@ -284,6 +285,17 @@ mod tests {
                 git_history_producers: 1,
             }
         );
+    }
+
+    #[test]
+    fn single_file_admission_shares_dot_oh_policy_and_counts() {
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+
+        assert!(admission.admit_repository_file(Path::new("README.md")));
+        assert!(admission.admit_repository_file(Path::new("docs/oh/guide.md")));
+        assert!(!admission.admit_repository_file(Path::new(".oh/outcomes/leak.md")));
+        assert!(!admission.admit_repository_file(Path::new("docs/.oh/leak.md")));
+        assert_eq!(admission.counts().business_artifact_files, 2);
     }
 
     #[test]

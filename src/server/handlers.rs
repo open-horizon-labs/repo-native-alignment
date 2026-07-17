@@ -162,6 +162,7 @@ impl RnaHandler {
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
                 enrichment_jobs: Vec::new(),
+                business_context: &self.business_context,
             };
             let markdown = crate::service::search(&params, &ctx).await;
             return Ok(text_result(markdown));
@@ -188,6 +189,7 @@ impl RnaHandler {
             root_filter,
             non_code_slugs,
             enrichment_jobs: self.enrichment_jobs.all_jobs(&self.repo_root),
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
         if self.graph_build_status.is_building() {
@@ -217,6 +219,7 @@ impl RnaHandler {
             let ctx = OutcomeProgressContext {
                 graph_state: &external_graph,
                 repo_root: &repo_path,
+                business_context: &self.business_context,
             };
             let markdown = crate::service::outcome_progress(&params, &ctx);
             return Ok(text_result(markdown));
@@ -241,6 +244,7 @@ impl RnaHandler {
         let ctx = OutcomeProgressContext {
             graph_state: &graph_state,
             repo_root: &self.repo_root,
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::outcome_progress(&params, &ctx);
         if self.graph_build_status.is_building() {
@@ -303,6 +307,7 @@ impl RnaHandler {
                 repo_root: &repo_path,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &self.business_context,
             };
             let markdown = crate::service::repo_map(&params, &ctx);
             return Ok(text_result(markdown));
@@ -328,6 +333,7 @@ impl RnaHandler {
             repo_root: &self.repo_root,
             lsp_status: Some(&self.lsp_status),
             embed_status: Some(&self.embed_status),
+            business_context: &self.business_context,
         };
         let mut markdown = crate::service::repo_map(&params, &ctx);
         if self.graph_build_status.is_building() {

@@ -50,6 +50,7 @@ struct ViewerState {
     repo_root: PathBuf,
     /// Primary root slug for root_filter
     root_slug: String,
+    business_context: crate::business_context::BusinessContextAdmission,
 }
 
 // ─── Request / response types ─────────────────────────────────────────────────
@@ -120,6 +121,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 repo_root: &state.repo_root,
                 lsp_status: None,
                 embed_status: None,
+                business_context: &state.business_context,
             };
             Ok(repo_map(&params, &ctx))
         }
@@ -236,6 +238,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 root_filter,
                 non_code_slugs,
                 enrichment_jobs: Vec::new(),
+                business_context: &state.business_context,
             };
             Ok(search(&params, &ctx).await)
         }
@@ -315,6 +318,7 @@ pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
         embed_index,
         repo_root,
         root_slug,
+        business_context: crate::business_context::BusinessContextAdmission::default(),
     });
 
     let app = Router::new()

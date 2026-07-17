@@ -336,6 +336,7 @@ pub struct SearchContext<'a> {
     pub root_filter: Option<String>,
     pub non_code_slugs: HashSet<String>,
     pub enrichment_jobs: Vec<EnrichmentJobRecord>,
+    pub business_context: &'a crate::business_context::BusinessContextAdmission,
 }
 
 /// Returns true when a graph node's root passes the active root filter.
