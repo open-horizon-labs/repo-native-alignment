@@ -61,13 +61,16 @@ pub enum LspStatus {
     Failed,
 }
 
-/// Durable evidence that readiness validation either processed a document or
-/// never reached a supported validation method. `symbol_count: Some(0)` is a
-/// successful processed-zero result; `None` is reserved for not-validated.
+/// Durable evidence that readiness validation processed a symbol request,
+/// observed an authoritative quiescence signal, or never reached a supported
+/// validation method. `symbol_count: Some(0)` is a successful processed-zero
+/// result; the status distinguishes quiescence from not-validated when no
+/// symbol count applies.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LspValidationStatus {
     Processed,
+    Quiescent,
     NotValidated,
 }
 
@@ -113,10 +116,28 @@ impl LspValidationEvidence {
         }
     }
 
+    pub fn quiescent(
+        language: impl Into<String>,
+        server_name: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            server_name: server_name.into(),
+            status: LspValidationStatus::Quiescent,
+            method: Some(method.into()),
+            symbol_count: None,
+            detail: None,
+        }
+    }
+
     pub fn summary(&self) -> String {
         match (&self.status, self.method.as_deref(), self.symbol_count) {
             (LspValidationStatus::Processed, Some(method), Some(count)) => {
                 format!("processed via {method} ({count} symbols)")
+            }
+            (LspValidationStatus::Quiescent, Some(method), None) => {
+                format!("quiescent via {method}")
             }
             _ => format!(
                 "not validated{}",
@@ -250,7 +271,8 @@ pub struct LspLanguageStats {
     /// Query-yield measurements grouped by operation and declaration class.
     pub query_metrics: Vec<crate::extract::lsp::LspQueryMetric>,
     /// Capability-driven readiness evidence. `Some(0)` symbols means the
-    /// server processed the validation request successfully and found none.
+    /// server processed the validation request successfully and found none;
+    /// authoritative quiescence signals do not fabricate a symbol count.
     pub validation: Option<LspValidationEvidence>,
 }
 
@@ -1152,6 +1174,19 @@ mod tests {
         assert!(l.contains("OK"));
         assert!(l.contains("150 edges"));
         assert!(l.contains("processed via textDocument/documentSymbol (0 symbols)"));
+    }
+
+    #[test]
+    fn test_quiescent_validation_has_no_symbol_count() {
+        let evidence =
+            LspValidationEvidence::quiescent("rust", "rust-analyzer", "experimental/serverStatus");
+
+        assert_eq!(evidence.status, LspValidationStatus::Quiescent);
+        assert_eq!(evidence.symbol_count, None);
+        assert_eq!(
+            evidence.summary(),
+            "quiescent via experimental/serverStatus"
+        );
     }
 
     #[test]

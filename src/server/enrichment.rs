@@ -415,8 +415,7 @@ fn plan_explicit_lsp_scope(
 async fn emit_lsp_pipeline_with_budget(
     input: LspPipelineInput,
 ) -> Result<LspBusOutput, LspPipelineFailure> {
-    let scan_stats = Arc::clone(&input.scan_stats);
-    let fut = crate::extract::consumers::emit_enrichment_pipeline(
+    let fut = crate::extract::consumers::emit_enrichment_pipeline_with_validations(
         input.nodes,
         input.edges,
         input.root_pairs,
@@ -437,19 +436,7 @@ async fn emit_lsp_pipeline_with_budget(
     // The LSP work-item/pass layer owns its timeout and abort diagnostics. Wrapping the
     // entire event bus in `timeout` drops the future before AllEnrichmentsDone and
     // PassesComplete can preserve partial output, violating the finalization contract.
-    let (nodes, edges, frameworks, diagnostics) = fut.await.map_err(LspPipelineFailure)?;
-    let mut validations = scan_stats
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .lsp_stats
-        .values()
-        .flat_map(|by_language| by_language.values())
-        .filter_map(|language_stats| language_stats.validation.clone())
-        .collect::<Vec<_>>();
-    validations.sort_by(|left, right| {
-        (&left.language, &left.server_name).cmp(&(&right.language, &right.server_name))
-    });
-    Ok((nodes, edges, frameworks, diagnostics, validations))
+    fut.await.map_err(LspPipelineFailure)
 }
 
 impl RnaHandler {
@@ -3681,5 +3668,60 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("current/rust"));
         assert!(!failures[0].contains("stale/rust"));
+    }
+
+    #[tokio::test]
+    async fn validation_evidence_is_invocation_local() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let scan_stats = Arc::new(std::sync::RwLock::new(
+            crate::extract::scan_stats::ScanStats::default(),
+        ));
+        scan_stats.write().unwrap().lsp_stats.insert(
+            "stale".to_string(),
+            [(
+                "rust".to_string(),
+                crate::extract::scan_stats::LspLanguageStats {
+                    server_name: "rust-analyzer".to_string(),
+                    edge_count: 0,
+                    node_count: 0,
+                    duration: Duration::from_secs(1),
+                    error_count: 0,
+                    aborted: false,
+                    server_missing: false,
+                    remediation: None,
+                    query_metrics: Vec::new(),
+                    validation: Some(
+                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                            "rust",
+                            "rust-analyzer",
+                            "workspace/symbol",
+                            9,
+                        ),
+                    ),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let (_, _, _, _, validations) = emit_lsp_pipeline_with_budget(LspPipelineInput {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            root_pairs: vec![("current".to_string(), temp.path().to_path_buf())],
+            primary_slug: "current".to_string(),
+            repo_root: temp.path().to_path_buf(),
+            scan_stats,
+            skip_lsp: true,
+            dirty_slugs: None,
+            lsp_node_filter: None,
+            broad_reference_budget: None,
+        })
+        .await
+        .expect("empty invocation should finalize");
+
+        assert!(
+            validations.is_empty(),
+            "current job must not inherit readiness evidence from cumulative scan stats"
+        );
     }
 }

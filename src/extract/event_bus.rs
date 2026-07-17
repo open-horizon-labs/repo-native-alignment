@@ -360,6 +360,7 @@ impl ExtractionEvent {
                 new_nodes,
                 updated_nodes,
                 diagnostic,
+                validation,
                 ..
             } => {
                 buf.extend_from_slice(slug.as_bytes());
@@ -403,6 +404,29 @@ impl ExtractionEvent {
                 if let Some(diagnostic) = diagnostic {
                     buf.push(b'\n');
                     buf.extend_from_slice(diagnostic.as_bytes());
+                }
+                if let Some(validation) = validation {
+                    buf.extend_from_slice(b"\nvalidation\t");
+                    buf.extend_from_slice(validation.language.as_bytes());
+                    buf.push(b'\t');
+                    buf.extend_from_slice(validation.server_name.as_bytes());
+                    buf.push(b'\t');
+                    buf.extend_from_slice(match validation.status {
+                        crate::extract::scan_stats::LspValidationStatus::Processed => b"processed",
+                        crate::extract::scan_stats::LspValidationStatus::Quiescent => b"quiescent",
+                        crate::extract::scan_stats::LspValidationStatus::NotValidated => {
+                            b"not_validated"
+                        }
+                    });
+                    buf.push(b'\t');
+                    buf.extend_from_slice(validation.method.as_deref().unwrap_or("-").as_bytes());
+                    buf.push(b'\t');
+                    match validation.symbol_count {
+                        Some(count) => buf.extend_from_slice(count.to_string().as_bytes()),
+                        None => buf.push(b'-'),
+                    }
+                    buf.push(b'\t');
+                    buf.extend_from_slice(validation.detail.as_deref().unwrap_or("-").as_bytes());
                 }
             }
             ExtractionEvent::LspQueryMetrics {
@@ -1435,6 +1459,45 @@ mod tests {
             e1.canonical_bytes(),
             e2.canonical_bytes(),
             "canonical_bytes must differ when patch values change (same node ID, different inferred type)"
+        );
+    }
+
+    #[test]
+    fn test_canonical_bytes_enrichment_complete_includes_validation() {
+        let make_enrichment = |validation| ExtractionEvent::EnrichmentComplete {
+            slug: "test".to_string(),
+            language: "rust".to_string(),
+            added_edges: Arc::from(vec![].into_boxed_slice()),
+            new_nodes: Arc::from(vec![].into_boxed_slice()),
+            updated_nodes: Arc::from(vec![].into_boxed_slice()),
+            server_name: Some("fixture-server".to_string()),
+            error_count: 0,
+            aborted: false,
+            server_missing: false,
+            remediation: None,
+            diagnostic: None,
+            validation: Some(validation),
+        };
+        let processed = make_enrichment(
+            crate::extract::scan_stats::LspValidationEvidence::processed(
+                "rust",
+                "fixture-server",
+                "workspace/symbol",
+                0,
+            ),
+        );
+        let quiescent = make_enrichment(
+            crate::extract::scan_stats::LspValidationEvidence::quiescent(
+                "rust",
+                "fixture-server",
+                "experimental/serverStatus",
+            ),
+        );
+
+        assert_ne!(
+            processed.canonical_bytes(),
+            quiescent.canonical_bytes(),
+            "canonical_bytes must include readiness evidence"
         );
     }
 

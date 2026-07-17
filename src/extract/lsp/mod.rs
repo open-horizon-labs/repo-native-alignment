@@ -814,92 +814,24 @@ impl LspEnricher {
             .unwrap_or(false)
     }
 
-    /// Find a representative source file in `root` to open via didOpen.
-    /// Picks a short, non-test, non-generated file from the enricher's configured
-    /// extensions — we just need one file to trigger project detection and indexing.
-    fn find_warmup_file(&self, root: &Path) -> Option<PathBuf> {
-        let extensions: std::collections::HashSet<&str> =
-            self.extensions.iter().map(String::as_str).collect();
-        if extensions.is_empty() {
-            return None;
-        }
-
-        fn walk(
-            dir: &Path,
-            extensions: &std::collections::HashSet<&str>,
-            depth: u8,
-        ) -> Option<PathBuf> {
-            if depth > 4 {
-                return None;
-            }
-            let mut entries = std::fs::read_dir(dir)
-                .ok()?
-                .flatten()
-                .collect::<Vec<_>>();
-            entries.sort_by_key(|entry| entry.file_name());
-            let mut subdirs = Vec::new();
-            for entry in entries {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with('.')
-                    || matches!(
-                        name_str.as_ref(),
-                        "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
-                    )
-                {
-                    continue;
-                }
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if ft.is_dir() {
-                    subdirs.push(entry.path());
-                    continue;
-                }
-                if !ft.is_file() {
-                    continue;
-                }
-                let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !extensions.contains(ext) {
-                    continue;
-                }
-                if name_str.starts_with("test_")
-                    || name_str.contains(".test.")
-                    || name_str.contains(".spec.")
-                    || name_str.contains(".gen.")
-                    || name_str.contains("_pb2")
-                    || name_str.starts_with("conftest")
-                    || name_str.ends_with(".d.ts")
-                {
-                    continue;
-                }
-                let entry_path = entry.path();
-                let in_test_dir = entry_path.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::Normal(seg)
-                            if seg == "tests" || seg == "test" || seg == "__tests__"
-                    )
-                });
-                if in_test_dir {
-                    continue;
-                }
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
-                if size > 0 && size < 50_000 {
-                    return Some(path);
-                }
-            }
-            for subdir in subdirs {
-                if let Some(found) = walk(&subdir, extensions, depth + 1) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-
-        walk(root, &extensions, 0)
+    /// Pick a deterministic didOpen file from the nodes admitted to this invocation.
+    ///
+    /// The current admitted cohort already carries dirty-root and node-scope filtering,
+    /// so selecting from it cannot warm up an excluded or unrelated file.
+    fn find_warmup_file(&self, repo_root: &Path, matching_nodes: &[&Node]) -> Option<PathBuf> {
+        let startup_root = self
+            .startup_root_override
+            .get()
+            .map(PathBuf::as_path)
+            .unwrap_or(repo_root);
+        let mut candidates = matching_nodes
+            .iter()
+            .map(|node| repo_root.join(&node.id.file))
+            .filter(|path| path.starts_with(startup_root) && path.is_file())
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.into_iter().next()
     }
 
     fn lsp_language_id_for_path<'a>(&'a self, path: &Path) -> &'a str {
@@ -950,8 +882,8 @@ impl LspEnricher {
             .unwrap_or_default()
     }
 
-    async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
-        let result = self.ensure_initialized_inner(repo_root).await;
+    async fn ensure_initialized(&self, repo_root: &Path, warmup_path: Option<&Path>) -> Result<()> {
+        let result = self.ensure_initialized_inner(repo_root, warmup_path).await;
         if result.is_err() {
             self.reset_incomplete_initialization().await;
         }
@@ -969,7 +901,11 @@ impl LspEnricher {
     }
 
     /// Initialize the language server if not already running.
-    async fn ensure_initialized_inner(&self, repo_root: &Path) -> Result<()> {
+    async fn ensure_initialized_inner(
+        &self,
+        repo_root: &Path,
+        warmup_path: Option<&Path>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
 
         if state.pipelined.is_some() {
@@ -1234,38 +1170,34 @@ impl LspEnricher {
         // context. tsserver requires at least one open file before it creates
         // a project; pyright uses it to trigger import-graph indexing.
         // Save the URI for use as a documentSymbol validation fallback.
-        let warmup_uri: Option<String> =
-            if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
-                let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
-                match self.send_did_open(transport, &warmup_path).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "{} sent didOpen for '{}'",
-                            self.server_command,
-                            warmup_path.display()
-                        );
-                        uri_str
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "{} didOpen warmup failed (non-fatal): {}",
-                            self.server_command,
-                            e
-                        );
-                        None
-                    }
+        let warmup_uri: Option<String> = if let Some(warmup_path) = warmup_path {
+            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
+            match self.send_did_open(transport, &warmup_path).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "{} sent didOpen for '{}'",
+                        self.server_command,
+                        warmup_path.display()
+                    );
+                    uri_str
                 }
-            } else {
-                None
-            };
+                Err(e) => {
+                    tracing::debug!(
+                        "{} didOpen warmup failed (non-fatal): {}",
+                        self.server_command,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        let readiness_method = validation_capabilities.primary().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} advertises neither workspace/symbol nor textDocument/documentSymbol; readiness was not validated",
-                self.server_command
-            )
-        })?;
-        if readiness_method == ReadinessValidationMethod::DocumentSymbol && warmup_uri.is_none() {
+        let readiness_method = validation_capabilities.primary();
+        if readiness_method == Some(ReadinessValidationMethod::DocumentSymbol)
+            && warmup_uri.is_none()
+        {
             return Err(anyhow::anyhow!(
                 "{} advertises documentSymbol but no deterministic included warm-up file was available; readiness was not validated",
                 self.server_command
@@ -1399,11 +1331,10 @@ impl LspEnricher {
                                 if quiescent {
                                     saw_quiescent = true;
                                     validation_evidence = Some(
-                                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                                        crate::extract::scan_stats::LspValidationEvidence::quiescent(
                                             self.language.clone(),
                                             self.server_command.clone(),
                                             "experimental/serverStatus",
-                                            0,
                                         ),
                                     );
                                 }
@@ -1484,6 +1415,12 @@ impl LspEnricher {
                         next_probe =
                             tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
 
+                        let readiness_method = readiness_method.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "{} sent no experimental/serverStatus and advertises neither workspace/symbol nor textDocument/documentSymbol; readiness was not validated",
+                                self.server_command
+                            )
+                        })?;
                         let symbol_count = execute_readiness_validation(
                             transport,
                             readiness_method,
@@ -1498,13 +1435,14 @@ impl LspEnricher {
 
                         match readiness_method {
                             ReadinessValidationMethod::DocumentSymbol => {
-                                validation_evidence =
-                                    Some(crate::extract::scan_stats::LspValidationEvidence::processed(
+                                validation_evidence = Some(
+                                    crate::extract::scan_stats::LspValidationEvidence::processed(
                                         self.language.clone(),
                                         self.server_command.clone(),
                                         readiness_method.method(),
                                         symbol_count,
-                                    ));
+                                    ),
+                                );
                                 server_responsive = true;
                                 server_ready = true;
                                 saw_quiescent = true;
@@ -1624,11 +1562,10 @@ impl LspEnricher {
                                 server_ready = true;
                                 saw_quiescent = true;
                                 validation_evidence = Some(
-                                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                                    crate::extract::scan_stats::LspValidationEvidence::quiescent(
                                         self.language.clone(),
                                         self.server_command.clone(),
                                         "experimental/serverStatus",
-                                        0,
                                     ),
                                 );
                             }
@@ -2906,6 +2843,8 @@ impl Enricher for LspEnricher {
             return Ok(result);
         }
 
+        let warmup_file = self.find_warmup_file(repo_root, &matching_nodes);
+
         // Try to initialize the language server using the repo root from --repo.
         // Scoped requests enforce their shared deadline here rather than at the
         // event-bus boundary, where cancellation would discard Pass 1 output.
@@ -2913,7 +2852,7 @@ impl Enricher for LspEnricher {
             .within_enrichment_deadline(
                 job_deadline,
                 "language-server initialization",
-                self.ensure_initialized(repo_root),
+                self.ensure_initialized(repo_root, warmup_file.as_deref()),
             )
             .await
         {
@@ -3399,13 +3338,60 @@ mod tests {
         std::fs::write(temp.path().join("z.json"), "{}").unwrap();
         std::fs::write(temp.path().join("a.json"), "{}").unwrap();
         let enricher = LspEnricher::new("json", "fixture-server", &[], &["json"]);
+        let admitted = Node {
+            id: NodeId {
+                root: "primary".to_string(),
+                file: PathBuf::from("z.json"),
+                name: "value".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "json".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
         assert_eq!(
             enricher
-                .find_warmup_file(temp.path())
+                .find_warmup_file(temp.path(), &[&admitted])
                 .unwrap()
                 .file_name()
                 .unwrap(),
-            "a.json"
+            "z.json",
+            "warm-up must come from the invocation's admitted cohort"
+        );
+    }
+
+    #[test]
+    fn readiness_warmup_accepts_only_admitted_test_or_large_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let tests_dir = temp.path().join("tests");
+        std::fs::create_dir(&tests_dir).unwrap();
+        let relative_path = PathBuf::from("tests/only.test.json");
+        std::fs::write(temp.path().join(&relative_path), vec![b'x'; 60_000]).unwrap();
+        let enricher = LspEnricher::new("json", "fixture-server", &[], &["json"]);
+        let admitted = Node {
+            id: NodeId {
+                root: "primary".to_string(),
+                file: relative_path.clone(),
+                name: "value".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "json".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        assert_eq!(
+            enricher.find_warmup_file(temp.path(), &[&admitted]),
+            Some(temp.path().join(relative_path)),
+            "scope-valid files must not be rejected by test-name or size heuristics"
         );
     }
 
