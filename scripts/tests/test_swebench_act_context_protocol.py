@@ -163,6 +163,40 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         )
         return errors
 
+    def assert_authorized_runtime_rejected(
+        self,
+        runtime: dict,
+        bundle_digest: str,
+        anchors: dict,
+        expected_error: str,
+        rejected_value: object,
+    ) -> None:
+        errors: list[str] = []
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=bundle_digest,
+            **anchors,
+        )
+        marker = json.dumps(rejected_value).lower()
+        self.assertIn(expected_error, errors)
+        self.assertNotIn(marker, "\n".join(errors).lower())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_path = Path(temporary) / "rejected-runtime.json"
+            runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+            with self.assertRaises(ValueError) as context:
+                VALIDATOR.validate_bundle(
+                    ROOT,
+                    expected_digest=bundle_digest,
+                    runtime_config=runtime_path,
+                    **anchors,
+                )
+        exception_text = str(context.exception).lower()
+        self.assertIn(expected_error.lower(), exception_text)
+        self.assertNotIn(marker, exception_text)
+
     def test_frozen_bundle_is_compatible(self) -> None:
         result = VALIDATOR.validate_bundle(ROOT)
         self.assertTrue(result["compatible"])
@@ -453,6 +487,191 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         self.assertTrue(any("must be JSON integer zero" in error for error in errors))
         self.assertIn("LSP per-file coverage must be complete", errors)
         self.assertTrue(any("budget scope mismatch" in error for error in errors))
+
+    def test_authorization_receipt_text_fields_require_exact_json_strings(
+        self,
+    ) -> None:
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        receipt_cases = (
+            (
+                "artifact protocol digest",
+                "qualified_artifact_receipt",
+                ("protocol_bundle_sha256",),
+                int("1" * 64),
+                "qualified artifact receipt protocol digest is invalid",
+            ),
+            (
+                "artifact commit",
+                "qualified_artifact_receipt",
+                ("artifact_commit_sha",),
+                int("7" * 40),
+                "qualified artifact receipt commit is invalid",
+            ),
+            (
+                "artifact digest",
+                "qualified_artifact_receipt",
+                ("artifact_sha256",),
+                int("8" * 64),
+                "qualified artifact receipt artifact digest is invalid",
+            ),
+            (
+                "artifact name",
+                "qualified_artifact_receipt",
+                ("ci_artifact_name",),
+                123,
+                "qualified artifact receipt artifact name is invalid",
+            ),
+            (
+                "qualification comment URL",
+                "qualified_artifact_receipt",
+                ("qualification_comment_url",),
+                123,
+                "qualified artifact receipt qualification URL is invalid",
+            ),
+            (
+                "release evidence digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "release_build", "evidence_sha256"),
+                int("1" * 64),
+                "release-build evidence digest is invalid",
+            ),
+            (
+                "Metal evidence digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "metal", "evidence_sha256"),
+                int("2" * 64),
+                "Metal evidence digest is invalid",
+            ),
+            (
+                "embeddings evidence digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "embeddings", "evidence_sha256"),
+                int("3" * 64),
+                "embeddings evidence digest is invalid",
+            ),
+            (
+                "reranking evidence digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "reranking", "evidence_sha256"),
+                int("4" * 64),
+                "reranking evidence digest is invalid",
+            ),
+            (
+                "LSP coverage manifest digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "lsp", "coverage_manifest_sha256"),
+                int("5" * 64),
+                "LSP coverage_manifest_sha256 is invalid",
+            ),
+            (
+                "LSP evidence digest",
+                "qualified_artifact_receipt",
+                ("capability_evidence", "lsp", "evidence_sha256"),
+                int("6" * 64),
+                "LSP evidence_sha256 is invalid",
+            ),
+            (
+                "budget protocol digest",
+                "approved_budget_receipt",
+                ("protocol_bundle_sha256",),
+                int("1" * 64),
+                "approved budget receipt protocol digest is invalid",
+            ),
+            (
+                "maximum total USD",
+                "approved_budget_receipt",
+                ("maximum_total_usd",),
+                100,
+                "approved budget receipt maximum_total_usd is invalid",
+            ),
+            (
+                "approval comment URL",
+                "approved_budget_receipt",
+                ("approval_comment_url",),
+                123,
+                "approved budget receipt approval URL is invalid",
+            ),
+            (
+                "approval evidence digest",
+                "approved_budget_receipt",
+                ("approval_evidence_sha256",),
+                int("9" * 64),
+                "approved budget receipt evidence digest is invalid",
+            ),
+        )
+        for (
+            label,
+            receipt_name,
+            field_path,
+            numeric_value,
+            expected_error,
+        ) in receipt_cases:
+            for value_kind, rejected_value in (
+                ("numeric", numeric_value),
+                ("boolean", True),
+                ("null", None),
+            ):
+                with self.subTest(field=label, value_kind=value_kind):
+                    runtime = self.authorized_runtime(digest)
+                    target = runtime[receipt_name]
+                    for field in field_path[:-1]:
+                        target = target[field]
+                    target[field_path[-1]] = rejected_value
+                    anchors = {
+                        "expected_artifact_receipt_digest": VALIDATOR.sha256_bytes(
+                            VALIDATOR.canonical_json(
+                                runtime["qualified_artifact_receipt"]
+                            )
+                        ),
+                        "expected_budget_receipt_digest": VALIDATOR.sha256_bytes(
+                            VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+                        ),
+                    }
+                    self.assert_authorized_runtime_rejected(
+                        runtime,
+                        digest,
+                        anchors,
+                        expected_error,
+                        rejected_value,
+                    )
+
+        valid_runtime = self.authorized_runtime(digest)
+        valid_artifact_digest = VALIDATOR.sha256_bytes(
+            VALIDATOR.canonical_json(valid_runtime["qualified_artifact_receipt"])
+        )
+        valid_budget_digest = VALIDATOR.sha256_bytes(
+            VALIDATOR.canonical_json(valid_runtime["approved_budget_receipt"])
+        )
+        for label, anchor_name, expected_error in (
+            (
+                "artifact receipt anchor",
+                "expected_artifact_receipt_digest",
+                "authorized runtime requires an externally anchored artifact receipt digest",
+            ),
+            (
+                "budget receipt anchor",
+                "expected_budget_receipt_digest",
+                "authorized runtime requires an externally anchored budget receipt digest",
+            ),
+        ):
+            for value_kind, rejected_value in (
+                ("numeric", int("1" * 64)),
+                ("boolean", True),
+                ("null", None),
+            ):
+                with self.subTest(field=label, value_kind=value_kind):
+                    anchors = {
+                        "expected_artifact_receipt_digest": valid_artifact_digest,
+                        "expected_budget_receipt_digest": valid_budget_digest,
+                    }
+                    anchors[anchor_name] = rejected_value
+                    self.assert_authorized_runtime_rejected(
+                        valid_runtime,
+                        digest,
+                        anchors,
+                        expected_error,
+                        rejected_value,
+                    )
 
     def test_common_credential_shapes_fail_closed_without_value_echo(self) -> None:
         digest = "a" * 64

@@ -510,6 +510,11 @@ def _exact_json_scalar(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+def _json_string_fullmatch(value: Any, pattern: re.Pattern[str]) -> bool:
+    """Match only actual JSON strings, never coerced numbers, booleans, or null."""
+    return type(value) is str and pattern.fullmatch(value) is not None
+
+
 def _valid_utc_second(value: Any) -> bool:
     if not isinstance(value, str) or UTC_SECOND.fullmatch(value) is None:
         return False
@@ -1580,17 +1585,17 @@ def validate_qualified_artifact_receipt(
         )
     _require(
         errors,
-        bool(HEX64.fullmatch(str(receipt.get("protocol_bundle_sha256", "")))),
+        _json_string_fullmatch(receipt.get("protocol_bundle_sha256"), HEX64),
         "qualified artifact receipt protocol digest is invalid",
     )
     _require(
         errors,
-        bool(HEX40.fullmatch(str(receipt.get("artifact_commit_sha", "")))),
+        _json_string_fullmatch(receipt.get("artifact_commit_sha"), HEX40),
         "qualified artifact receipt commit is invalid",
     )
     _require(
         errors,
-        bool(HEX64.fullmatch(str(receipt.get("artifact_sha256", "")))),
+        _json_string_fullmatch(receipt.get("artifact_sha256"), HEX64),
         "qualified artifact receipt artifact digest is invalid",
     )
     workflow = receipt.get("ci_workflow")
@@ -1617,16 +1622,16 @@ def validate_qualified_artifact_receipt(
     )
     _require(
         errors,
-        bool(ARTIFACT_NAME.fullmatch(str(receipt.get("ci_artifact_name", "")))),
+        _json_string_fullmatch(receipt.get("ci_artifact_name"), ARTIFACT_NAME),
         "qualified artifact receipt artifact name is invalid",
     )
     _require(
         errors,
-        bool(
-            re.fullmatch(
-                r"https://github\.com/open-horizon-labs/repo-native-alignment/issues/786#issuecomment-[0-9]+",
-                str(receipt.get("qualification_comment_url", "")),
-            )
+        _json_string_fullmatch(
+            receipt.get("qualification_comment_url"),
+            re.compile(
+                r"https://github\.com/open-horizon-labs/repo-native-alignment/issues/786#issuecomment-[0-9]+"
+            ),
         ),
         "qualified artifact receipt qualification URL is invalid",
     )
@@ -1663,7 +1668,7 @@ def validate_qualified_artifact_receipt(
         )
         _require(
             errors,
-            bool(HEX64.fullmatch(str(release.get("evidence_sha256", "")))),
+            _json_string_fullmatch(release.get("evidence_sha256"), HEX64),
             "release-build evidence digest is invalid",
         )
 
@@ -1684,7 +1689,7 @@ def validate_qualified_artifact_receipt(
         )
         _require(
             errors,
-            bool(HEX64.fullmatch(str(metal.get("evidence_sha256", "")))),
+            _json_string_fullmatch(metal.get("evidence_sha256"), HEX64),
             "Metal evidence digest is invalid",
         )
 
@@ -1706,7 +1711,7 @@ def validate_qualified_artifact_receipt(
             )
             _require(
                 errors,
-                bool(HEX64.fullmatch(str(evidence.get("evidence_sha256", "")))),
+                _json_string_fullmatch(evidence.get("evidence_sha256"), HEX64),
                 f"{name} evidence digest is invalid",
             )
 
@@ -1780,7 +1785,7 @@ def validate_qualified_artifact_receipt(
     for field in ("coverage_manifest_sha256", "evidence_sha256"):
         _require(
             errors,
-            bool(HEX64.fullmatch(str(lsp.get(field, "")))),
+            _json_string_fullmatch(lsp.get(field), HEX64),
             f"LSP {field} is invalid",
         )
 
@@ -1825,7 +1830,7 @@ def validate_approved_budget_receipt(
         )
     _require(
         errors,
-        bool(HEX64.fullmatch(str(receipt.get("protocol_bundle_sha256", "")))),
+        _json_string_fullmatch(receipt.get("protocol_bundle_sha256"), HEX64),
         "approved budget receipt protocol digest is invalid",
     )
     scope = receipt.get("authorization_scope")
@@ -1861,22 +1866,22 @@ def validate_approved_budget_receipt(
         errors.append("approved budget receipt authorization_scope is invalid")
     _require(
         errors,
-        bool(POSITIVE_USD.fullmatch(str(receipt.get("maximum_total_usd", "")))),
+        _json_string_fullmatch(receipt.get("maximum_total_usd"), POSITIVE_USD),
         "approved budget receipt maximum_total_usd is invalid",
     )
     _require(
         errors,
-        bool(
-            re.fullmatch(
+        _json_string_fullmatch(
+            receipt.get("approval_comment_url"),
+            re.compile(
                 rf"https://github\.com/open-horizon-labs/repo-native-alignment/issues/{issue}#issuecomment-[0-9]+",
-                str(receipt.get("approval_comment_url", "")),
-            )
+            ),
         ),
         "approved budget receipt approval URL is invalid",
     )
     _require(
         errors,
-        bool(HEX64.fullmatch(str(receipt.get("approval_evidence_sha256", "")))),
+        _json_string_fullmatch(receipt.get("approval_evidence_sha256"), HEX64),
         "approved budget receipt evidence digest is invalid",
     )
     _require(
@@ -1971,11 +1976,10 @@ def validate_runtime(
         ):
             _require(
                 errors,
-                isinstance(expected_receipt_digest, str)
-                and bool(HEX64.fullmatch(expected_receipt_digest)),
+                _json_string_fullmatch(expected_receipt_digest, HEX64),
                 f"authorized runtime requires an externally anchored {label} receipt digest",
             )
-            if isinstance(receipt, dict) and isinstance(expected_receipt_digest, str):
+            if isinstance(receipt, dict) and type(expected_receipt_digest) is str:
                 _require(
                     errors,
                     sha256_bytes(canonical_json(receipt)) == expected_receipt_digest,
