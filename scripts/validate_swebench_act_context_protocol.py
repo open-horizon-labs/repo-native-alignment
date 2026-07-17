@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import sys
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
@@ -3248,8 +3249,72 @@ def _lock_material(entries: list[dict[str, Any]]) -> bytes:
     ).encode("utf-8")
 
 
+def _has_symlink_component(root: Path, parts: tuple[str, ...]) -> bool:
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _bundle_file_inventory(root: Path, errors: list[str]) -> tuple[set[str], bool]:
+    bundle_rel = PurePosixPath("benchmark/swebench-act-context")
+    if _has_symlink_component(root, bundle_rel.parts):
+        errors.append("bundle file inventory contains a symlink")
+        return set(), False
+
+    actual_paths: set[str] = set()
+    inventory_safe = True
+    pending = [root.joinpath(*bundle_rel.parts)]
+    while pending:
+        directory = pending.pop()
+        try:
+            directory_mode = directory.lstat().st_mode
+        except OSError:
+            errors.append("bundle file inventory is unreadable")
+            inventory_safe = False
+            continue
+        if stat.S_ISLNK(directory_mode):
+            errors.append("bundle file inventory contains a symlink")
+            inventory_safe = False
+            continue
+        if not stat.S_ISDIR(directory_mode):
+            errors.append("bundle file inventory contains an unsupported entry")
+            inventory_safe = False
+            continue
+        try:
+            children = sorted(directory.iterdir(), key=lambda child: child.name)
+        except OSError:
+            errors.append("bundle file inventory is unreadable")
+            inventory_safe = False
+            continue
+        for child in children:
+            try:
+                child_mode = child.lstat().st_mode
+            except OSError:
+                errors.append("bundle file inventory is unreadable")
+                inventory_safe = False
+                continue
+            if stat.S_ISLNK(child_mode):
+                errors.append("bundle file inventory contains a symlink")
+                inventory_safe = False
+                continue
+            if stat.S_ISDIR(child_mode):
+                pending.append(child)
+            elif stat.S_ISREG(child_mode):
+                actual_paths.add(child.relative_to(root).as_posix())
+            else:
+                errors.append("bundle file inventory contains an unsupported entry")
+                inventory_safe = False
+    return actual_paths, inventory_safe
+
+
 def validate_lock(root: Path, errors: list[str]) -> str | None:
     root = root.resolve()
+    if _has_symlink_component(root, LOCK_REL.parts):
+        errors.append("lock manifest path is unsafe")
+        return None
     lock_path = root / LOCK_REL
     lock_bytes = lock_path.read_bytes()
     if SECRET_VALUE.search(lock_bytes.decode("utf-8", errors="ignore")):
@@ -3278,9 +3343,11 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     )
     if not isinstance(entries, list):
         return None
+    paths_safe = True
     paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
     paths_are_strings = all(type(path) is str for path in paths)
     _require(errors, paths_are_strings, "lock paths must be strings")
+    paths_safe = paths_safe and paths_are_strings
     if paths_are_strings:
         _require(errors, paths == sorted(paths), "lock paths must be sorted")
         _require(errors, len(paths) == len(set(paths)), "lock paths must be unique")
@@ -3288,6 +3355,7 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     for entry_ordinal, entry in enumerate(entries, 1):
         _require(errors, isinstance(entry, dict), "lock file entry must be an object")
         if not isinstance(entry, dict):
+            paths_safe = False
             continue
         _require(
             errors,
@@ -3307,6 +3375,7 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         raw_rel = entry.get("path")
         if type(raw_rel) is not str:
             errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            paths_safe = False
             continue
         rel = PurePosixPath(raw_rel)
         if (
@@ -3317,20 +3386,28 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
             or raw_rel != rel.as_posix()
         ):
             errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            paths_safe = False
+            continue
+        if _has_symlink_component(root, rel.parts):
+            errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            paths_safe = False
             continue
         candidate = root.joinpath(*rel.parts)
         try:
             path = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
             errors.append(f"lock entry {entry_ordinal} file is missing")
+            paths_safe = False
             continue
         try:
             path.relative_to(root)
         except ValueError:
             errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            paths_safe = False
             continue
         if not path.is_file():
             errors.append(f"lock entry {entry_ordinal} file is missing")
+            paths_safe = False
             continue
         data = path.read_bytes()
         _require(
@@ -3345,12 +3422,8 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         )
         if SECRET_VALUE.search(data.decode("utf-8", errors="ignore")):
             errors.append("credential-shaped value in locked file")
-    bundle_root = root / "benchmark/swebench-act-context"
-    actual_bundle_paths = {
-        path.relative_to(root).as_posix()
-        for path in bundle_root.rglob("*")
-        if path.is_file()
-    }
+    actual_bundle_paths, inventory_safe = _bundle_file_inventory(root, errors)
+    paths_safe = paths_safe and inventory_safe
     expected_bundle_paths = {
         path
         for path in EXPECTED_LOCK_PATHS
@@ -3365,9 +3438,12 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     _require(
         errors, digest == lock.get("bundle_sha256"), "bundle digest mismatch in lock"
     )
+    if _has_symlink_component(root, DIGEST_REL.parts):
+        errors.append("protocol digest path is unsafe")
+        return None
     digest_file = (root / DIGEST_REL).read_text(encoding="ascii").strip()
     _require(errors, digest_file == digest, "protocol.sha256 does not match bundle")
-    return digest
+    return digest if paths_safe else None
 
 
 def validate_bundle(
@@ -3379,6 +3455,9 @@ def validate_bundle(
 ) -> dict[str, Any]:
     root = root.resolve()
     errors: list[str] = []
+    bundle_digest = validate_lock(root, errors)
+    if bundle_digest is None:
+        raise ValueError("protocol validation failed:\n- " + "\n- ".join(errors))
     protocol_path = root / PROTOCOL_REL
     population_path = root / POPULATION_REL
     _require(
@@ -3416,7 +3495,6 @@ def validate_bundle(
             expected_budget_receipt_digest=expected_budget_receipt_digest,
         )
     validate_packet_vector(vector, errors)
-    bundle_digest = validate_lock(root, errors)
     if expected_digest is not None:
         _require(
             errors,

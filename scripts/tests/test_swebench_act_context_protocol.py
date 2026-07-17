@@ -1118,8 +1118,14 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 )
 
     def test_unsafe_lock_paths_are_rejected_before_target_read(self) -> None:
-        cases = ("absolute", "parent", "non_normalized", "symlink_escape")
-        locked_rel = VALIDATOR.EXPECTED_LOCK_PATHS[0]
+        cases = (
+            "absolute",
+            "parent",
+            "non_normalized",
+            "symlink_escape",
+            "symlink_in_repo",
+            "symlink_parent",
+        )
         for case in cases:
             with (
                 self.subTest(case=case),
@@ -1128,12 +1134,18 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 temporary_root = Path(temporary)
                 copied_root = temporary_root / "repo"
                 self.copy_locked_bundle(copied_root)
-                outside = temporary_root / "outside-target.txt"
+                marker = f"UNTRUSTED_{case.upper()}_TARGET_MARKER"
+                outside = temporary_root / f"{marker}.txt"
                 outside.write_text(
                     "outside target must never be opened", encoding="utf-8"
                 )
                 lock_path = copied_root / VALIDATOR.LOCK_REL
                 lock = VALIDATOR.load_json(lock_path)
+                locked_rel = (
+                    "benchmark/swebench-act-context/upstream/LICENSE"
+                    if case == "symlink_parent"
+                    else VALIDATOR.EXPECTED_LOCK_PATHS[0]
+                )
                 entry_ordinal, entry = next(
                     (ordinal, item)
                     for ordinal, item in enumerate(lock["files"], 1)
@@ -1150,10 +1162,23 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 elif case == "non_normalized":
                     entry["path"] = locked_rel.replace("/", "//", 1)
                     forbidden = locked_path
-                else:
+                elif case == "symlink_escape":
                     locked_path.unlink()
                     locked_path.symlink_to(outside)
                     forbidden = outside
+                elif case == "symlink_in_repo":
+                    forbidden = copied_root / f"{marker}.md"
+                    shutil.copy2(locked_path, forbidden)
+                    locked_path.unlink()
+                    locked_path.symlink_to(forbidden)
+                else:
+                    forbidden_parent = copied_root / marker
+                    shutil.copytree(locked_path.parent, forbidden_parent)
+                    shutil.rmtree(locked_path.parent)
+                    locked_path.parent.symlink_to(
+                        forbidden_parent, target_is_directory=True
+                    )
+                    forbidden = forbidden_parent / locked_path.name
 
                 lock_path.write_text(json.dumps(lock), encoding="utf-8")
                 forbidden_resolved = forbidden.resolve(strict=True)
@@ -1167,13 +1192,29 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     return original_read_bytes(path)
 
                 errors: list[str] = []
-                with mock.patch.object(Path, "read_bytes", guarded_read_bytes):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(Path, "read_bytes", guarded_read_bytes),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
                     VALIDATOR.validate_lock(copied_root, errors)
+                    result = VALIDATOR.main(["--root", str(copied_root)])
                 self.assertIn(
                     f"lock entry {entry_ordinal} path is unsafe",
                     errors,
                 )
                 self.assertEqual(opened_forbidden, [])
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(marker, stderr.getvalue())
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "INCOMPATIBLE: protocol validation failed",
+                )
+                if case in {"symlink_escape", "symlink_in_repo", "symlink_parent"}:
+                    self.assertIn("bundle file inventory contains a symlink", errors)
 
     def test_resealed_locked_file_with_common_credential_shape_fails_closed(
         self,
