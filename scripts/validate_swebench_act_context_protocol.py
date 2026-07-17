@@ -1847,10 +1847,30 @@ def validate_approved_budget_receipt(
     population_n = receipt.get("population_n")
     maximum_requests = receipt.get("maximum_model_requests")
     if scope == "qualification_pair":
+        expected_issue = 789
+        approval_prefix = (
+            "https://github.com/open-horizon-labs/repo-native-alignment/"
+            "issues/789#issuecomment-"
+        )
+    elif scope == "n70_cohort":
+        expected_issue = 790
+        approval_prefix = (
+            "https://github.com/open-horizon-labs/repo-native-alignment/"
+            "issues/790#issuecomment-"
+        )
+    else:
+        expected_issue = None
+        approval_prefix = None
+    issue_matches_scope = type(issue) is int and issue == expected_issue
+    _require(
+        errors,
+        issue_matches_scope,
+        "approved budget receipt authorization_issue must be the declared JSON integer",
+    )
+    if scope == "qualification_pair":
         _require(
             errors,
-            type(issue) is int
-            and issue == 789
+            issue_matches_scope
             and instance_id == "astropy__astropy-13398"
             and type(population_n) is int
             and population_n == 1
@@ -1861,8 +1881,7 @@ def validate_approved_budget_receipt(
     elif scope == "n70_cohort":
         _require(
             errors,
-            type(issue) is int
-            and issue == 790
+            issue_matches_scope
             and instance_id is None
             and type(population_n) is int
             and population_n == 70
@@ -1877,14 +1896,19 @@ def validate_approved_budget_receipt(
         _json_string_fullmatch(receipt.get("maximum_total_usd"), POSITIVE_USD),
         "approved budget receipt maximum_total_usd is invalid",
     )
+    approval_url = receipt.get("approval_comment_url")
+    approval_suffix = (
+        approval_url.removeprefix(approval_prefix)
+        if type(approval_url) is str
+        and approval_prefix is not None
+        and approval_url.startswith(approval_prefix)
+        else ""
+    )
     _require(
         errors,
-        _json_string_fullmatch(
-            receipt.get("approval_comment_url"),
-            re.compile(
-                rf"https://github\.com/open-horizon-labs/repo-native-alignment/issues/{issue}#issuecomment-[0-9]+",
-            ),
-        ),
+        issue_matches_scope
+        and bool(approval_suffix)
+        and all("0" <= character <= "9" for character in approval_suffix),
         "approved budget receipt approval URL is invalid",
     )
     _require(

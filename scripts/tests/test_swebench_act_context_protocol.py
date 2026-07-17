@@ -489,6 +489,85 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         self.assertIn("LSP per-file coverage must be complete", errors)
         self.assertTrue(any("budget scope mismatch" in error for error in errors))
 
+    def test_budget_authorization_issue_is_exact_and_never_compiled_as_regex(
+        self,
+    ) -> None:
+        digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+        rejected_issues = (
+            ("string", "790"),
+            ("regex_metacharacter", "["),
+            ("number", 790.0),
+            ("boolean", True),
+            ("null", None),
+        )
+        for value_kind, rejected_issue in rejected_issues:
+            with (
+                self.subTest(value_kind=value_kind),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime = self.authorized_runtime(digest)
+                runtime["approved_budget_receipt"]["authorization_issue"] = (
+                    rejected_issue
+                )
+                artifact_receipt_digest = VALIDATOR.sha256_bytes(
+                    VALIDATOR.canonical_json(runtime["qualified_artifact_receipt"])
+                )
+                budget_receipt_digest = VALIDATOR.sha256_bytes(
+                    VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+                )
+                anchors = {
+                    "expected_artifact_receipt_digest": artifact_receipt_digest,
+                    "expected_budget_receipt_digest": budget_receipt_digest,
+                }
+                errors: list[str] = []
+                VALIDATOR.validate_runtime(
+                    runtime,
+                    errors,
+                    allow_authorized=True,
+                    expected_bundle_digest=digest,
+                    **anchors,
+                )
+                rejected_marker = json.dumps(rejected_issue).lower()
+                self.assertIn(
+                    "approved budget receipt authorization_issue must be the declared JSON integer",
+                    errors,
+                )
+                self.assertIn(
+                    "approved budget receipt approval URL is invalid",
+                    errors,
+                )
+                self.assertNotIn(rejected_marker, "\n".join(errors).lower())
+
+                runtime_path = Path(temporary) / "rejected-runtime.json"
+                runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = VALIDATOR.main(
+                        [
+                            "--root",
+                            str(ROOT),
+                            "--expected-digest",
+                            digest,
+                            "--runtime-config",
+                            str(runtime_path),
+                            "--expected-artifact-receipt-digest",
+                            artifact_receipt_digest,
+                            "--expected-budget-receipt-digest",
+                            budget_receipt_digest,
+                        ]
+                    )
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(rejected_marker, stderr.getvalue().lower())
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "INCOMPATIBLE: protocol validation failed",
+                )
+
     def test_authorization_receipt_text_fields_require_exact_json_strings(
         self,
     ) -> None:
@@ -1003,9 +1082,10 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 ):
                     copied_root = Path(temporary)
                     self.copy_locked_bundle(copied_root)
-                    (copied_root / rel).write_text(
-                        json.dumps(malformed), encoding="utf-8"
-                    )
+                    malformed_path = copied_root / rel
+                    malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "JSON object"):
+                        VALIDATOR.load_json_object(malformed_path, input_label)
                     stdout = io.StringIO()
                     stderr = io.StringIO()
                     with (
@@ -1027,6 +1107,8 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             ):
                 runtime_path = Path(temporary) / "runtime.json"
                 runtime_path.write_text(json.dumps(malformed), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "JSON object"):
+                    VALIDATOR.load_json_object(runtime_path, "runtime config")
                 stdout = io.StringIO()
                 stderr = io.StringIO()
                 with (
@@ -1137,7 +1219,7 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 marker = f"UNTRUSTED_{case.upper()}_TARGET_MARKER"
                 outside = temporary_root / f"{marker}.txt"
                 outside.write_text(
-                    "outside target must never be opened", encoding="utf-8"
+                    f"{marker}: outside target must never be opened", encoding="utf-8"
                 )
                 lock_path = copied_root / VALIDATOR.LOCK_REL
                 lock = VALIDATOR.load_json(lock_path)
@@ -1158,7 +1240,11 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     forbidden = outside
                 elif case == "parent":
                     entry["path"] = "../outside-target.txt"
-                    forbidden = outside
+                    forbidden = temporary_root / "outside-target.txt"
+                    forbidden.write_text(
+                        f"{marker}: exact parent target must never be opened",
+                        encoding="utf-8",
+                    )
                 elif case == "non_normalized":
                     entry["path"] = locked_rel.replace("/", "//", 1)
                     forbidden = locked_path
@@ -1181,21 +1267,33 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     forbidden = forbidden_parent / locked_path.name
 
                 lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                readable_without_guard = forbidden.read_bytes()
+                self.assertTrue(forbidden.is_file())
+                self.assertGreater(len(readable_without_guard), 0)
                 forbidden_resolved = forbidden.resolve(strict=True)
                 opened_forbidden: list[Path] = []
-                original_read_bytes = Path.read_bytes
+                original_open = Path.open
 
-                def guarded_read_bytes(path: Path) -> bytes:
+                def guarded_open(
+                    path: Path,
+                    mode: str = "r",
+                    buffering: int = -1,
+                    encoding: str | None = None,
+                    errors: str | None = None,
+                    newline: str | None = None,
+                ) -> object:
                     if path.resolve(strict=True) == forbidden_resolved:
                         opened_forbidden.append(path)
                         raise AssertionError("unsafe lock target was opened")
-                    return original_read_bytes(path)
+                    return original_open(
+                        path, mode, buffering, encoding, errors, newline
+                    )
 
                 errors: list[str] = []
                 stdout = io.StringIO()
                 stderr = io.StringIO()
                 with (
-                    mock.patch.object(Path, "read_bytes", guarded_read_bytes),
+                    mock.patch.object(Path, "open", guarded_open),
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
