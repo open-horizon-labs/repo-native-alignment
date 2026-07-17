@@ -622,9 +622,28 @@ def _require(errors: list[str], condition: bool, message: str) -> None:
         errors.append(message)
 
 
+def _is_json_integer(
+    value: Any,
+    *,
+    expected: int | None = None,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> bool:
+    """Validate a JSON integer without Python's bool/int or int/float coercion."""
+    if type(value) is not int:
+        return False
+    if expected is not None and value != expected:
+        return False
+    if minimum is not None and value < minimum:
+        return False
+    return maximum is None or value <= maximum
+
+
 def _exact_json_scalar(actual: Any, expected: Any) -> bool:
     """Compare JSON scalars without allowing bool/int or int/float coercion."""
-    if type(expected) in {bool, int, float}:
+    if type(expected) is int:
+        return _is_json_integer(actual, expected=expected)
+    if type(expected) in {bool, float}:
         return type(actual) is type(expected) and actual == expected
     return actual == expected
 
@@ -716,7 +735,7 @@ def paired_difference_interval(
 ) -> dict[str, str]:
     """Frozen conservative 95% interval for second-arm minus first-arm risk."""
     cells = (n00, n01, n10, n11)
-    if not all(type(cell) is int and cell >= 0 for cell in cells):
+    if not all(_is_json_integer(cell, minimum=0) for cell in cells):
         raise ValueError("paired table cells must be non-negative JSON integers")
     trials = sum(cells)
     if trials <= 0:
@@ -743,7 +762,7 @@ def paired_difference_interval(
 def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     _require(
         errors,
-        type(protocol.get("schema_version")) is int and protocol["schema_version"] == 1,
+        _is_json_integer(protocol.get("schema_version"), expected=1),
         "protocol schema_version must be JSON integer 1",
     )
     _require(
@@ -755,6 +774,13 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         upstream.get("commit") == EXPECTED_UPSTREAM_COMMIT,
         "upstream commit drift",
     )
+    issues = protocol.get("issues", {})
+    for field, expected in (("parent", 779), ("methodology", 782)):
+        _require(
+            errors,
+            _is_json_integer(issues.get(field), expected=expected),
+            f"protocol {field} issue must be JSON integer {expected}",
+        )
 
     request = protocol.get("instrument", {}).get("request", {})
     _require(
@@ -773,8 +799,16 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         == "response.model must equal claude-sonnet-4-6 exactly",
         "resolved-model policy drift",
     )
-    _require(errors, request.get("temperature") == 0.0, "temperature drift")
-    _require(errors, request.get("max_tokens") == 8000, "max_tokens drift")
+    _require(
+        errors,
+        _exact_json_scalar(request.get("temperature"), 0.0),
+        "temperature drift",
+    )
+    _require(
+        errors,
+        _is_json_integer(request.get("max_tokens"), expected=8000),
+        "max_tokens drift",
+    )
     _require(errors, request.get("system") is None, "system prompt must remain absent")
 
     prompt = protocol.get("instrument", {}).get("prompt", {})
@@ -808,7 +842,7 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
     _require(
         errors,
-        retry.get("maximum_feedback_rounds") == 2,
+        _is_json_integer(retry.get("maximum_feedback_rounds"), expected=2),
         "edit-feedback retry count drift",
     )
     _require(errors, retry_text == RETRY_SUFFIX, "retry suffix bytes drift")
@@ -861,7 +895,11 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         evaluator.get("entrypoint") == "python -m swebench.harness.run_evaluation",
         "evaluator entrypoint drift",
     )
-    _require(errors, evaluator.get("max_workers") == 1, "evaluator parallelism drift")
+    _require(
+        errors,
+        _is_json_integer(evaluator.get("max_workers"), expected=1),
+        "evaluator parallelism drift",
+    )
 
     dataset = protocol.get("dataset", {})
     _require(
@@ -877,8 +915,33 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
 
     arms = protocol.get("arms", {})
     _require(errors, arms.get("A", {}).get("execute") is False, "A must never be rerun")
-    _require(errors, arms.get("A", {}).get("reported_n") == 70, "A population drift")
-    _require(errors, arms.get("A", {}).get("resolved") == 19, "A outcome total drift")
+    _require(
+        errors,
+        _is_json_integer(arms.get("A", {}).get("reported_n"), expected=70),
+        "A population drift",
+    )
+    _require(
+        errors,
+        _is_json_integer(arms.get("A", {}).get("resolved"), expected=19),
+        "A outcome total drift",
+    )
+    run_contract = protocol.get("run", {})
+    run_population = run_contract.get("population", {})
+    run_budget = run_contract.get("budget", {})
+    for label, value, expected in (
+        ("selected population", run_population.get("selected"), 71),
+        ("included population", run_population.get("included"), 70),
+        ("parallelism", run_contract.get("parallelism"), 1),
+        ("API request timeout", run_contract.get("api_request_timeout_seconds"), 600),
+        ("episode timeout", run_contract.get("episode_timeout_seconds"), 1800),
+        ("evaluator timeout", run_contract.get("evaluator_timeout_seconds"), 1800),
+        ("model request budget", run_budget.get("maximum_model_requests"), 420),
+    ):
+        _require(
+            errors,
+            _is_json_integer(value, expected=expected),
+            f"protocol {label} must be JSON integer {expected}",
+        )
     _require(
         errors,
         protocol.get("rna_acquisition", {}).get("access")
@@ -893,6 +956,11 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         "business context must remain disabled",
     )
     acquisition_schema = protocol.get("rna_acquisition", {}).get("record_schema", {})
+    _require(
+        errors,
+        _is_json_integer(acquisition_schema.get("schema_version"), expected=1),
+        "acquisition record schema_version must be JSON integer 1",
+    )
     _require(
         errors,
         acquisition_schema.get("exact_fields") == list(ACQUISITION_FIELDS),
@@ -952,6 +1020,26 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         acquisition_schema.get("candidate_representation") == CANDIDATE_REPRESENTATION,
         "candidate representation contract drift",
     )
+    candidate_representation = acquisition_schema.get("candidate_representation", {})
+    not_source_backed = candidate_representation.get("not_source_backed", {})
+    incomplete_body = candidate_representation.get("incomplete_utf8_body", {})
+    for label, value in (
+        ("not-source-backed start_line", not_source_backed.get("start_line")),
+        ("not-source-backed end_line", not_source_backed.get("end_line")),
+        (
+            "not-source-backed full_body_byte_length",
+            not_source_backed.get("full_body_byte_length"),
+        ),
+        (
+            "incomplete-body full_body_byte_length",
+            incomplete_body.get("full_body_byte_length"),
+        ),
+    ):
+        _require(
+            errors,
+            _is_json_integer(value, expected=0),
+            f"candidate representation {label} must be JSON integer zero",
+        )
     eligibility_vectors = acquisition_schema.get("candidate_eligibility_test_vectors")
     _require(
         errors,
@@ -973,12 +1061,31 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         "candidate omission vocabulary drift",
     )
     selection = protocol.get("rna_acquisition", {}).get("selection", {})
+    search = protocol.get("rna_acquisition", {}).get("search", {})
+    traversal = protocol.get("rna_acquisition", {}).get("traversal", {})
+    for label, value, expected in (
+        ("search limit", search.get("limit"), 20),
+        ("traversal depth", traversal.get("depth"), 1),
+        (
+            "traversal per-seed direction limit",
+            traversal.get("per_seed_direction_limit"),
+            50,
+        ),
+    ):
+        _require(
+            errors,
+            _is_json_integer(value, expected=expected),
+            f"RNA {label} must be JSON integer {expected}",
+        )
     _require(
         errors,
-        type(selection.get("maximum_candidates")) is int
-        and selection.get("maximum_candidates") == MAXIMUM_CANDIDATES
-        and type(selection.get("full_body_budget_bytes")) is int
-        and selection.get("full_body_budget_bytes") == FULL_BODY_BUDGET_BYTES
+        _is_json_integer(
+            selection.get("maximum_candidates"), expected=MAXIMUM_CANDIDATES
+        )
+        and _is_json_integer(
+            selection.get("full_body_budget_bytes"),
+            expected=FULL_BODY_BUDGET_BYTES,
+        )
         and selection.get("algorithm")
         == (
             "derive semantic and graph scores from the recorded search ranks and "
@@ -1095,6 +1202,30 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         budget_schema.get("exact_fields") == list(APPROVED_BUDGET_RECEIPT_FIELDS),
         "approved budget receipt schema drift",
     )
+    artifact_constants = artifact_schema.get("constants", {})
+    budget_constants = budget_schema.get("constants", {})
+    for label, value, expected in (
+        (
+            "qualified artifact schema_version",
+            artifact_constants.get("schema_version"),
+            1,
+        ),
+        (
+            "qualified artifact qualification_issue",
+            artifact_constants.get("qualification_issue"),
+            786,
+        ),
+        (
+            "approved budget schema_version",
+            budget_constants.get("schema_version"),
+            1,
+        ),
+    ):
+        _require(
+            errors,
+            _is_json_integer(value, expected=expected),
+            f"{label} must be JSON integer {expected}",
+        )
     _require(
         errors,
         "exact JSON integer" in artifact_schema.get("provenance_requirements", "")
@@ -1502,12 +1633,17 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     instances = population.get("instances", [])
     _require(
         errors,
-        selection.get("n_selected") == 71,
+        _is_json_integer(population.get("schema_version"), expected=1),
+        "population schema_version must be JSON integer 1",
+    )
+    _require(
+        errors,
+        _is_json_integer(selection.get("n_selected"), expected=71),
         "selected population must remain N=71",
     )
     _require(
         errors,
-        selection.get("n_included") == 70,
+        _is_json_integer(selection.get("n_included"), expected=70),
         "included population must remain N=70",
     )
     _require(
@@ -1522,6 +1658,14 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     )
     if not isinstance(instances, list):
         return
+
+    for row_ordinal, row in enumerate(instances, 1):
+        _require(
+            errors,
+            isinstance(row, dict)
+            and _is_json_integer(row.get("gold_file_count"), minimum=2),
+            f"population row {row_ordinal}: not multi-file",
+        )
 
     identifiers = [row.get("instance_id") for row in instances if isinstance(row, dict)]
     _require(errors, len(set(identifiers)) == 71, "instance IDs must be unique")
@@ -1560,11 +1704,6 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
                 bool(HEX64.fullmatch(str(row.get(field, "")))),
                 f"population row {row_ordinal}: invalid {field}",
             )
-        _require(
-            errors,
-            isinstance(row.get("gold_file_count"), int) and row["gold_file_count"] >= 2,
-            f"population row {row_ordinal}: not multi-file",
-        )
         evidence = row.get("upstream_a")
         _require(
             errors,
@@ -1587,18 +1726,23 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
         count = evidence.get("anthropic_initial_request_input_tokens")
         _require(
             errors,
-            isinstance(count, int) and count > 0,
+            _is_json_integer(count, minimum=1),
             f"population row {row_ordinal}: missing A initial-request token count",
         )
-        if isinstance(count, int):
+        if _is_json_integer(count, minimum=1):
             initial_total += count
+        _require(
+            errors,
+            _is_json_integer(evidence.get("cl100k_context_tokens"), minimum=1),
+            f"population row {row_ordinal}: invalid A context-token count",
+        )
         rounds = evidence.get("edit_feedback_rounds")
         _require(
             errors,
-            isinstance(rounds, int) and 0 <= rounds <= 2,
+            _is_json_integer(rounds, minimum=0, maximum=2),
             f"population row {row_ordinal}: invalid feedback-round count",
         )
-        if isinstance(rounds, int):
+        if _is_json_integer(rounds, minimum=0, maximum=2):
             feedback_rounds += rounds
         _require(
             errors,
@@ -1621,14 +1765,23 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     _require(errors, resolved == 19, "A must remain 19/70 resolved")
     _require(errors, initial_total == 2_279_203, "A initial-request token total drift")
     _require(errors, feedback_rounds == 22, "A edit-feedback round total drift")
+    for label, value, expected in (
+        ("reported population", summary.get("reported_n"), 70),
+        ("resolved", summary.get("resolved"), 19),
+        ("unresolved", summary.get("unresolved"), 51),
+        ("retrying instances", summary.get("retrying_instances"), 11),
+        ("edit-feedback rounds", summary.get("edit_feedback_rounds"), 22),
+    ):
+        _require(
+            errors,
+            _is_json_integer(value, expected=expected),
+            f"A summary {label} must be JSON integer {expected}",
+        )
     _require(
         errors,
-        summary.get("resolved") == 19 and summary.get("unresolved") == 51,
-        "A summary outcome drift",
-    )
-    _require(
-        errors,
-        summary.get("total_initial_request_input_tokens") == initial_total,
+        _is_json_integer(
+            summary.get("total_initial_request_input_tokens"), expected=initial_total
+        ),
         "A summary initial-token total mismatch",
     )
     _require(
@@ -1641,12 +1794,6 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
         summary.get("retry_inclusive_input_tokens_reason") == "upstream_not_measured",
         "A summary retry-token null reason drift",
     )
-    _require(
-        errors,
-        summary.get("retrying_instances") == 11,
-        "A retrying-instance count drift",
-    )
-
     schedule = population.get("run_schedule", {})
     episodes = schedule.get("episodes", [])
     _require(errors, schedule.get("seed") == ORDER_SEED, "run-order seed drift")
@@ -1672,7 +1819,7 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
             arm_order = ["B", "C"] if int(key[:2], 16) % 2 == 0 else ["C", "B"]
             _require(
                 errors,
-                episode.get("ordinal") == ordinal,
+                _is_json_integer(episode.get("ordinal"), expected=ordinal),
                 f"schedule ordinal drift at {ordinal}",
             )
             _require(
@@ -1721,13 +1868,12 @@ def validate_qualified_artifact_receipt(
         )
     _require(
         errors,
-        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        _is_json_integer(receipt.get("schema_version"), expected=1),
         "qualified artifact receipt schema_version must be JSON integer 1",
     )
     _require(
         errors,
-        type(receipt.get("qualification_issue")) is int
-        and receipt["qualification_issue"] == 786,
+        _is_json_integer(receipt.get("qualification_issue"), expected=786),
         "qualified artifact receipt qualification_issue must be JSON integer 786",
     )
     if expected_bundle_digest is not None:
@@ -1764,7 +1910,7 @@ def validate_qualified_artifact_receipt(
     run_id = receipt.get("ci_run_id")
     _require(
         errors,
-        type(run_id) is int and run_id > 0,
+        _is_json_integer(run_id, minimum=1),
         "qualified artifact receipt CI run ID is invalid",
     )
     _require(
@@ -1916,17 +2062,15 @@ def validate_qualified_artifact_receipt(
     ):
         _require(
             errors,
-            type(lsp.get(counter)) is int and lsp[counter] == 0,
+            _is_json_integer(lsp.get(counter), expected=0),
             f"LSP qualification {counter} must be JSON integer zero",
         )
     included_files = lsp.get("included_file_count")
     covered_files = lsp.get("covered_file_count")
     _require(
         errors,
-        type(included_files) is int
-        and included_files > 0
-        and type(covered_files) is int
-        and covered_files == included_files,
+        _is_json_integer(included_files, minimum=1)
+        and _is_json_integer(covered_files, expected=included_files),
         "LSP per-file coverage must be complete",
     )
     _require(
@@ -1972,7 +2116,7 @@ def validate_approved_budget_receipt(
         )
     _require(
         errors,
-        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        _is_json_integer(receipt.get("schema_version"), expected=1),
         "approved budget receipt schema_version must be JSON integer 1",
     )
     if expected_bundle_digest is not None:
@@ -2006,7 +2150,9 @@ def validate_approved_budget_receipt(
     else:
         expected_issue = None
         approval_prefix = None
-    issue_matches_scope = type(issue) is int and issue == expected_issue
+    issue_matches_scope = expected_issue is not None and _is_json_integer(
+        issue, expected=expected_issue
+    )
     _require(
         errors,
         issue_matches_scope,
@@ -2017,10 +2163,8 @@ def validate_approved_budget_receipt(
             errors,
             issue_matches_scope
             and instance_id == "astropy__astropy-13398"
-            and type(population_n) is int
-            and population_n == 1
-            and type(maximum_requests) is int
-            and 1 <= maximum_requests <= 6,
+            and _is_json_integer(population_n, expected=1)
+            and _is_json_integer(maximum_requests, minimum=1, maximum=6),
             "qualification-pair budget scope mismatch",
         )
     elif scope == "n70_cohort":
@@ -2028,10 +2172,8 @@ def validate_approved_budget_receipt(
             errors,
             issue_matches_scope
             and instance_id is None
-            and type(population_n) is int
-            and population_n == 70
-            and type(maximum_requests) is int
-            and 1 <= maximum_requests <= 420,
+            and _is_json_integer(population_n, expected=70)
+            and _is_json_integer(maximum_requests, minimum=1, maximum=420),
             "N70 cohort budget scope mismatch",
         )
     else:
@@ -2257,17 +2399,16 @@ def _candidate_overlaps_locus(
     end_line = candidate.get("end_line")
     if (
         not _safe_relative_path(path)
-        or type(start_line) is not int
-        or type(end_line) is not int
-        or not 1 <= start_line <= end_line
+        or not _is_json_integer(start_line, minimum=1)
+        or not _is_json_integer(end_line, minimum=start_line)
     ):
         return None
     return any(
         isinstance(locus, dict)
         and locus.get("source_kind") != "new_file"
         and locus.get("path") == path
-        and type(locus.get("start_line")) is int
-        and type(locus.get("end_line")) is int
+        and _is_json_integer(locus.get("start_line"), minimum=1)
+        and _is_json_integer(locus.get("end_line"), minimum=locus["start_line"])
         and start_line <= locus["end_line"]
         and end_line >= locus["start_line"]
         for locus in loci
@@ -2301,13 +2442,10 @@ def _validate_candidate_representation(
             evidence["complete_utf8_body"] is False
             and evidence["locus_overlap"] is False
             and candidate.get("path") == ""
-            and type(candidate.get("start_line")) is int
-            and candidate["start_line"] == 0
-            and type(candidate.get("end_line")) is int
-            and candidate["end_line"] == 0
+            and _is_json_integer(candidate.get("start_line"), expected=0)
+            and _is_json_integer(candidate.get("end_line"), expected=0)
             and candidate.get("language") == "Unknown"
-            and type(candidate.get("full_body_byte_length")) is int
-            and candidate["full_body_byte_length"] == 0
+            and _is_json_integer(candidate.get("full_body_byte_length"), expected=0)
             and type(candidate.get("full_body_sha256")) is str
             and candidate["full_body_sha256"] == EMPTY_SHA256,
             f"acquisition candidate {ordinal} not-source-backed sentinel drift",
@@ -2321,9 +2459,10 @@ def _validate_candidate_representation(
     )
     _require(
         errors,
-        type(candidate.get("start_line")) is int
-        and type(candidate.get("end_line")) is int
-        and 1 <= candidate["start_line"] <= candidate["end_line"],
+        _is_json_integer(candidate.get("start_line"), minimum=1)
+        and _is_json_integer(
+            candidate.get("end_line"), minimum=candidate.get("start_line")
+        ),
         f"acquisition candidate {ordinal} line bounds are invalid",
     )
     _require(
@@ -2342,8 +2481,7 @@ def _validate_candidate_representation(
     if expected_eligibility == "incomplete_utf8_body":
         _require(
             errors,
-            type(candidate.get("full_body_byte_length")) is int
-            and candidate["full_body_byte_length"] == 0
+            _is_json_integer(candidate.get("full_body_byte_length"), expected=0)
             and type(candidate.get("full_body_sha256")) is str
             and candidate["full_body_sha256"] == EMPTY_SHA256,
             f"acquisition candidate {ordinal} incomplete-body sentinel drift",
@@ -2351,8 +2489,7 @@ def _validate_candidate_representation(
     else:
         _require(
             errors,
-            type(candidate.get("full_body_byte_length")) is int
-            and candidate["full_body_byte_length"] >= 0,
+            _is_json_integer(candidate.get("full_body_byte_length"), minimum=0),
             f"acquisition candidate {ordinal} full-body length is invalid",
         )
         _require(
@@ -2369,9 +2506,9 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     semantic_rank = candidate.get("semantic_rank")
     graph_hops = candidate.get("graph_hops")
     return (
-        -total if type(total) is int else sys.maxsize,
-        semantic_rank if type(semantic_rank) is int else sys.maxsize,
-        graph_hops if type(graph_hops) is int else sys.maxsize,
+        -total if _is_json_integer(total) else sys.maxsize,
+        semantic_rank if _is_json_integer(semantic_rank) else sys.maxsize,
+        graph_hops if _is_json_integer(graph_hops) else sys.maxsize,
         str(candidate.get("stable_id", "")).encode("utf-8"),
     )
 
@@ -2491,8 +2628,7 @@ def validate_acquisition_vector(
     )
     _require(
         errors,
-        type(acquisition.get("schema_version")) is int
-        and acquisition["schema_version"] == 1,
+        _is_json_integer(acquisition.get("schema_version"), expected=1),
         "packet acquisition schema_version must be JSON integer 1",
     )
     for field in ("dataset_row_sha256", "query_sha256", "rna_artifact_receipt_sha256"):
@@ -2526,7 +2662,7 @@ def validate_acquisition_vector(
         source_kind = locus.get("source_kind")
         _require(
             errors,
-            locus.get("ordinal") == ordinal,
+            _is_json_integer(locus.get("ordinal"), expected=ordinal),
             f"acquisition locus {ordinal} ordinal drift",
         )
         _require(
@@ -2548,7 +2684,7 @@ def validate_acquisition_vector(
         preimage_sha = locus.get("preimage_sha256")
         _require(
             errors,
-            type(preimage_length) is int and preimage_length >= 0,
+            _is_json_integer(preimage_length, minimum=0),
             f"acquisition locus {ordinal} preimage length is invalid",
         )
         _require(
@@ -2585,10 +2721,10 @@ def validate_acquisition_vector(
         if source_kind == "new_file":
             _require(
                 errors,
-                locus.get("start_line") == 0
-                and locus.get("end_line") == 0
+                _is_json_integer(locus.get("start_line"), expected=0)
+                and _is_json_integer(locus.get("end_line"), expected=0)
                 and locus.get("language") == "Unknown"
-                and preimage_length == 0
+                and _is_json_integer(preimage_length, expected=0)
                 and preimage_sha == EMPTY_SHA256
                 and seeds == [],
                 f"acquisition new-file locus {ordinal} sentinel drift",
@@ -2596,9 +2732,10 @@ def validate_acquisition_vector(
         else:
             _require(
                 errors,
-                type(locus.get("start_line")) is int
-                and type(locus.get("end_line")) is int
-                and 1 <= locus["start_line"] <= locus["end_line"],
+                _is_json_integer(locus.get("start_line"), minimum=1)
+                and _is_json_integer(
+                    locus.get("end_line"), minimum=locus.get("start_line")
+                ),
                 f"acquisition locus {ordinal} line bounds are invalid",
             )
             expected_language = (
@@ -2635,7 +2772,7 @@ def validate_acquisition_vector(
         )
         _require(
             errors,
-            candidate.get("acquisition_ordinal") == ordinal,
+            _is_json_integer(candidate.get("acquisition_ordinal"), expected=ordinal),
             f"acquisition candidate {ordinal} ordinal drift",
         )
         _require(
@@ -2649,31 +2786,31 @@ def validate_acquisition_vector(
             value = candidate.get(field)
             _require(
                 errors,
-                value is None or (type(value) is int and value >= 1),
+                value is None or _is_json_integer(value, minimum=1),
                 f"acquisition candidate {ordinal} {field} is invalid",
             )
         _require(
             errors,
             candidate.get("semantic_rank") is None
-            or (
-                type(candidate.get("semantic_rank")) is int
-                and 1 <= candidate["semantic_rank"] <= 20
-            ),
+            or _is_json_integer(candidate.get("semantic_rank"), minimum=1, maximum=20),
             f"acquisition candidate {ordinal} semantic_rank exceeds search limit",
         )
         for field in ("semantic_component", "graph_component", "total"):
             _require(
                 errors,
-                type(candidate.get(field)) is int and candidate[field] >= 0,
+                _is_json_integer(candidate.get(field), minimum=0),
                 f"acquisition candidate {ordinal} {field} is invalid",
             )
-        _require(
-            errors,
-            candidate.get("total")
-            == candidate.get("semantic_component", -1)
-            + candidate.get("graph_component", -1),
-            f"acquisition candidate {ordinal} score total drift",
-        )
+        if all(
+            _is_json_integer(candidate.get(field), minimum=0)
+            for field in ("semantic_component", "graph_component", "total")
+        ):
+            _require(
+                errors,
+                candidate["total"]
+                == candidate["semantic_component"] + candidate["graph_component"],
+                f"acquisition candidate {ordinal} score total drift",
+            )
         _require(
             errors,
             candidate.get("eligibility") in CANDIDATE_ELIGIBILITY,
@@ -2701,7 +2838,7 @@ def validate_acquisition_vector(
         semantic_ranks = [
             candidate.get("semantic_rank")
             for candidate in candidates
-            if type(candidate.get("semantic_rank")) is int
+            if _is_json_integer(candidate.get("semantic_rank"))
         ]
         _require(
             errors,
@@ -2728,10 +2865,10 @@ def validate_acquisition_vector(
             and bool(relationship["target"])
             and relationship.get("edge_type") in EDGE_TYPE_ORDINAL
             and relationship.get("direction") in DIRECTION_ORDINAL
-            and type(relationship.get("locus_ordinal")) is int
-            and 1 <= relationship["locus_ordinal"] <= len(loci)
-            and type(relationship.get("cli_ordinal")) is int
-            and relationship["cli_ordinal"] >= 1
+            and _is_json_integer(
+                relationship.get("locus_ordinal"), minimum=1, maximum=len(loci)
+            )
+            and _is_json_integer(relationship.get("cli_ordinal"), minimum=1)
         )
         _require(
             errors,
@@ -2778,13 +2915,9 @@ def validate_acquisition_vector(
         and bool(candidate.get("stable_id"))
         and (
             candidate.get("semantic_rank") is None
-            or (
-                type(candidate.get("semantic_rank")) is int
-                and 1 <= candidate["semantic_rank"] <= 20
-            )
+            or _is_json_integer(candidate.get("semantic_rank"), minimum=1, maximum=20)
         )
-        and type(candidate.get("full_body_byte_length")) is int
-        and candidate["full_body_byte_length"] >= 0
+        and _is_json_integer(candidate.get("full_body_byte_length"), minimum=0)
         and candidate.get("eligibility") in CANDIDATE_ELIGIBILITY
         and _derived_candidate_eligibility(candidate.get("eligibility_evidence"))
         == candidate.get("eligibility")
@@ -2921,7 +3054,7 @@ def validate_acquisition_vector(
         if reason in {"maximum_candidates", "full_body_budget"}:
             _require(
                 errors,
-                all(type(value) is int and value >= 0 for value in byte_fields),
+                all(_is_json_integer(value, minimum=0) for value in byte_fields),
                 f"acquisition omission {ordinal} budget fields are invalid",
             )
         else:
@@ -3133,8 +3266,7 @@ def validate_retry_prompt_vector(vector: Any, errors: list[str]) -> None:
             and set(run) == {"text", "repeat"}
             and isinstance(run.get("text"), str)
             and bool(run["text"])
-            and type(run.get("repeat")) is int
-            and 1 <= run["repeat"] <= 10_000
+            and _is_json_integer(run.get("repeat"), minimum=1, maximum=10_000)
         )
         _require(errors, valid, "retry prompt vector codepoint run is invalid")
         valid_runs = valid_runs and valid
@@ -3158,18 +3290,26 @@ def validate_retry_prompt_vector(vector: Any, errors: list[str]) -> None:
     )
     _require(
         errors,
-        len(previous) == vector.get("expected_previous_response_codepoints"),
+        _is_json_integer(
+            vector.get("expected_previous_response_codepoints"),
+            expected=len(previous),
+        ),
         "retry prompt previous-response length drift",
     )
     _require(
         errors,
-        len(previous[-6000:]) == vector.get("expected_retained_previous_codepoints"),
+        _is_json_integer(
+            vector.get("expected_retained_previous_codepoints"),
+            expected=len(previous[-6000:]),
+        ),
         "retry prompt retained-response length drift",
     )
     request = assemble_retry_prompt_vector(vector)
     _require(
         errors,
-        len(request) == vector.get("expected_retry_request_byte_length"),
+        _is_json_integer(
+            vector.get("expected_retry_request_byte_length"), expected=len(request)
+        ),
         "retry prompt byte length drift",
     )
     _require(
@@ -3202,7 +3342,7 @@ def validate_h2_token_vectors(
     }
     _require(
         errors,
-        type(vector.get("schema_version")) is int and vector["schema_version"] == 1,
+        _is_json_integer(vector.get("schema_version"), expected=1),
         "H2 token vector schema_version must be JSON integer 1",
     )
     for field, expected in constants.items():
@@ -3242,7 +3382,8 @@ def validate_h2_token_vectors(
         minified_payload = candidate.get("minified_payload")
         _require(
             errors,
-            token_record.get("record_ordinal") == header.get("ordinal"),
+            _is_json_integer(token_record.get("record_ordinal"), minimum=1)
+            and token_record.get("record_ordinal") == header.get("ordinal"),
             "H2 token record ordinal mismatch",
         )
         if isinstance(full_payload, str):
@@ -3265,8 +3406,7 @@ def validate_h2_token_vectors(
             ids_digest_field = f"{prefix}_token_ids_sha256"
             _require(
                 errors,
-                type(token_record.get(count_field)) is int
-                and token_record[count_field] >= 0,
+                _is_json_integer(token_record.get(count_field), minimum=0),
                 f"H2 {count_field} must be a non-negative JSON integer",
             )
             token_ids = token_record.get(ids_field)
@@ -3274,14 +3414,14 @@ def validate_h2_token_vectors(
                 errors,
                 isinstance(token_ids, list)
                 and all(
-                    type(token_id) is int and token_id >= 0 for token_id in token_ids
+                    _is_json_integer(token_id, minimum=0) for token_id in token_ids
                 ),
                 f"H2 {ids_field} must contain non-negative JSON integers",
             )
             if isinstance(token_ids, list):
                 _require(
                     errors,
-                    type(token_record.get(count_field)) is int
+                    _is_json_integer(token_record.get(count_field), minimum=0)
                     and len(token_ids) == token_record[count_field],
                     f"H2 {prefix} token ID count mismatch",
                 )
@@ -3298,24 +3438,25 @@ def validate_h2_token_vectors(
             )
     _require(
         errors,
-        type(vector.get("expected_full_payload_tokens")) is int
+        _is_json_integer(vector.get("expected_full_payload_tokens"), minimum=0)
         and vector["expected_full_payload_tokens"]
         == sum(
             record.get("full_token_count", 0)
             for record in token_records
-            if isinstance(record, dict) and type(record.get("full_token_count")) is int
+            if isinstance(record, dict)
+            and _is_json_integer(record.get("full_token_count"), minimum=0)
         ),
         "H2 full-payload token total drift",
     )
     _require(
         errors,
-        type(vector.get("expected_minified_payload_tokens")) is int
+        _is_json_integer(vector.get("expected_minified_payload_tokens"), minimum=0)
         and vector["expected_minified_payload_tokens"]
         == sum(
             record.get("minified_token_count", 0)
             for record in token_records
             if isinstance(record, dict)
-            and type(record.get("minified_token_count")) is int
+            and _is_json_integer(record.get("minified_token_count"), minimum=0)
         ),
         "H2 minified-payload token total drift",
     )
@@ -3325,7 +3466,7 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
     initial_error_count = len(errors)
     _require(
         errors,
-        type(vector.get("schema_version")) is int and vector["schema_version"] == 1,
+        _is_json_integer(vector.get("schema_version"), expected=1),
         "packet vector schema_version must be JSON integer 1",
     )
     _require(
@@ -3366,7 +3507,7 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
     if isinstance(metadata, dict):
         _require(
             errors,
-            metadata.get("record_count") == len(records),
+            _is_json_integer(metadata.get("record_count"), expected=len(records)),
             "packet record_count drift",
         )
         validate_acquisition_vector(metadata.get("acquisition"), records, errors)
@@ -3403,8 +3544,15 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
         )
         _require(
             errors,
-            header.get("ordinal") == ordinal,
+            _is_json_integer(header.get("ordinal"), expected=ordinal),
             f"packet record {ordinal} ordinal drift",
+        )
+        _require(
+            errors,
+            _is_json_integer(header.get("start_line"), minimum=0)
+            and _is_json_integer(header.get("end_line"), minimum=0)
+            and _is_json_integer(header.get("full_body_byte_length"), minimum=0),
+            f"packet record {ordinal} integer fields are invalid",
         )
         _require(
             errors,
@@ -3433,7 +3581,9 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
             full_bytes = full_payload.encode("utf-8")
             _require(
                 errors,
-                header.get("full_body_byte_length") == len(full_bytes),
+                _is_json_integer(
+                    header.get("full_body_byte_length"), expected=len(full_bytes)
+                ),
                 f"packet record {ordinal} full-body length drift",
             )
             _require(
@@ -3457,7 +3607,11 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
                 errors,
                 isinstance(header.get("score"), dict)
                 and set(header["score"])
-                == {"semantic_component", "graph_component", "total"},
+                == {"semantic_component", "graph_component", "total"}
+                and all(
+                    _is_json_integer(header["score"].get(field), minimum=0)
+                    for field in ("semantic_component", "graph_component", "total")
+                ),
                 f"packet candidate {ordinal} score field set drift",
             )
             _require(
@@ -3483,14 +3637,27 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
             f"packet record {ordinal} relationships must be a list",
         )
         if isinstance(relationships, list):
+            relationships_valid = True
             for relationship in relationships:
+                relationship_valid = (
+                    isinstance(relationship, dict)
+                    and set(relationship) == set(PACKET_RELATIONSHIP_FIELDS)
+                    and isinstance(relationship.get("source"), str)
+                    and bool(relationship["source"])
+                    and isinstance(relationship.get("target"), str)
+                    and bool(relationship["target"])
+                    and relationship.get("edge_type") in EDGE_TYPE_ORDINAL
+                    and relationship.get("direction") in DIRECTION_ORDINAL
+                    and _is_json_integer(relationship.get("locus_ordinal"), minimum=1)
+                    and _is_json_integer(relationship.get("cli_ordinal"), minimum=1)
+                )
                 _require(
                     errors,
-                    isinstance(relationship, dict)
-                    and set(relationship) == set(PACKET_RELATIONSHIP_FIELDS),
+                    relationship_valid,
                     f"packet record {ordinal} relationship field set drift",
                 )
-            if all(isinstance(relationship, dict) for relationship in relationships):
+                relationships_valid = relationships_valid and relationship_valid
+            if relationships_valid:
                 _require(
                     errors,
                     relationships == sorted(relationships, key=_relationship_sort_key),
@@ -3612,7 +3779,7 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     )
     _require(
         errors,
-        type(lock.get("schema_version")) is int and lock["schema_version"] == 1,
+        _is_json_integer(lock.get("schema_version"), expected=1),
         "lock schema_version must be JSON integer 1",
     )
     _require(errors, lock.get("algorithm") == "sha256", "lock algorithm drift")
@@ -3647,7 +3814,7 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         )
         _require(
             errors,
-            type(entry.get("bytes")) is int and entry["bytes"] >= 0,
+            _is_json_integer(entry.get("bytes"), minimum=0),
             f"lock entry {entry_ordinal} byte length must be a JSON integer >= 0",
         )
         _require(

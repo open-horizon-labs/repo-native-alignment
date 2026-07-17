@@ -1360,59 +1360,490 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     "INCOMPATIBLE: protocol validation failed",
                 )
 
-    def test_closed_integer_fields_reject_booleans_and_nonintegers(self) -> None:
-        rejected_values = (True, False, 1.0, "1", None)
-        for rejected_value in rejected_values:
-            with self.subTest(field="schema_versions", value=rejected_value):
-                protocol = copy.deepcopy(self.protocol)
-                protocol["schema_version"] = rejected_value
+    def test_json_integer_helper_accepts_only_exact_boundary_values(self) -> None:
+        positive_cases = (
+            ("zero-minimum", 0, {"minimum": 0}),
+            ("exact", 1, {"expected": 1}),
+            ("lower-bound", 1, {"minimum": 1, "maximum": 6}),
+            ("upper-bound", 6, {"minimum": 1, "maximum": 6}),
+            ("cohort-upper-bound", 420, {"minimum": 1, "maximum": 420}),
+        )
+        for label, value, constraints in positive_cases:
+            with self.subTest(positive=label):
+                self.assertTrue(VALIDATOR._is_json_integer(value, **constraints))
+
+        negative_cases = (
+            ("true", True, {}),
+            ("false", False, {}),
+            ("equal-float", 1.0, {"expected": 1}),
+            ("string", "1", {"expected": 1}),
+            ("null", None, {"expected": 1}),
+            ("below", 0, {"minimum": 1}),
+            ("above", 7, {"maximum": 6}),
+        )
+        for label, value, constraints in negative_cases:
+            with self.subTest(negative=label):
+                self.assertFalse(VALIDATOR._is_json_integer(value, **constraints))
+
+        digest = "a" * 64
+        for scope, issue, instance_id, population_n, maximum_requests in (
+            ("qualification_pair", 789, "astropy__astropy-13398", 1, 1),
+            ("qualification_pair", 789, "astropy__astropy-13398", 1, 6),
+            ("n70_cohort", 790, None, 70, 1),
+            ("n70_cohort", 790, None, 70, 420),
+        ):
+            with self.subTest(scope=scope, maximum_requests=maximum_requests):
+                receipt = self.approved_budget_receipt(digest)
+                receipt.update(
+                    {
+                        "authorization_scope": scope,
+                        "authorization_issue": issue,
+                        "qualification_instance_id": instance_id,
+                        "population_n": population_n,
+                        "maximum_model_requests": maximum_requests,
+                        "approval_comment_url": (
+                            "https://github.com/open-horizon-labs/"
+                            "repo-native-alignment/issues/"
+                            f"{issue}#issuecomment-12345"
+                        ),
+                    }
+                )
                 errors: list[str] = []
-                VALIDATOR.validate_protocol(protocol, errors)
-                self.assertIn("protocol schema_version must be JSON integer 1", errors)
+                VALIDATOR.validate_approved_budget_receipt(receipt, errors, digest)
+                self.assertEqual(errors, [])
 
-                vector = copy.deepcopy(self.vector)
-                vector["schema_version"] = rejected_value
-                vector["metadata"]["acquisition"]["schema_version"] = rejected_value
-                errors = []
-                VALIDATOR.validate_packet_vector(vector, errors)
-                self.assertIn(
-                    "packet vector schema_version must be JSON integer 1", errors
-                )
-                self.assertIn(
-                    "packet acquisition schema_version must be JSON integer 1", errors
-                )
+    def test_integer_contract_categories_reject_coercions(self) -> None:
+        digest = "a" * 64
+        sources = {
+            "protocol": self.protocol,
+            "population": self.population,
+            "runtime": self.runtime,
+            "packet": self.vector,
+            "artifact_receipt": self.qualified_artifact_receipt(digest),
+            "budget_receipt": self.approved_budget_receipt(digest),
+        }
+        validators = {
+            "protocol": VALIDATOR.validate_protocol,
+            "population": VALIDATOR.validate_population,
+            "runtime": VALIDATOR.validate_runtime,
+            "packet": VALIDATOR.validate_packet_vector,
+            "artifact_receipt": lambda value, errors: (
+                VALIDATOR.validate_qualified_artifact_receipt(value, errors, digest)
+            ),
+            "budget_receipt": lambda value, errors: (
+                VALIDATOR.validate_approved_budget_receipt(value, errors, digest)
+            ),
+        }
+        cases = (
+            (
+                "protocol-schema",
+                "protocol",
+                ("schema_version",),
+                "protocol schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "protocol-evaluator-workers",
+                "protocol",
+                ("evaluator", "max_workers"),
+                "evaluator parallelism drift",
+                False,
+            ),
+            (
+                "protocol-timeout",
+                "protocol",
+                ("run", "api_request_timeout_seconds"),
+                "protocol API request timeout must be JSON integer 600",
+                False,
+            ),
+            (
+                "protocol-representation-sentinel",
+                "protocol",
+                (
+                    "rna_acquisition",
+                    "record_schema",
+                    "candidate_representation",
+                    "not_source_backed",
+                    "start_line",
+                ),
+                "candidate representation not-source-backed start_line must be JSON integer zero",
+                False,
+            ),
+            (
+                "population-schema",
+                "population",
+                ("schema_version",),
+                "population schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "population-gold-file-count",
+                "population",
+                ("instances", 0, "gold_file_count"),
+                "population row 1: not multi-file",
+                False,
+            ),
+            (
+                "population-input-token-count",
+                "population",
+                (
+                    "instances",
+                    0,
+                    "upstream_a",
+                    "anthropic_initial_request_input_tokens",
+                ),
+                "population row 1: missing A initial-request token count",
+                False,
+            ),
+            (
+                "population-feedback-rounds",
+                "population",
+                ("instances", 0, "upstream_a", "edit_feedback_rounds"),
+                "population row 1: invalid feedback-round count",
+                False,
+            ),
+            (
+                "population-summary-count",
+                "population",
+                ("upstream_a", "reported_n"),
+                "A summary reported population must be JSON integer 70",
+                False,
+            ),
+            (
+                "population-schedule-ordinal",
+                "population",
+                ("run_schedule", "episodes", 0, "ordinal"),
+                "schedule ordinal drift at 1",
+                False,
+            ),
+            (
+                "runtime-limit",
+                "runtime",
+                ("max_tokens",),
+                "runtime max_tokens drift",
+                False,
+            ),
+            (
+                "artifact-schema",
+                "artifact_receipt",
+                ("schema_version",),
+                "qualified artifact receipt schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "artifact-qualification-issue",
+                "artifact_receipt",
+                ("qualification_issue",),
+                "qualified artifact receipt qualification_issue must be JSON integer 786",
+                False,
+            ),
+            (
+                "artifact-run-id",
+                "artifact_receipt",
+                ("ci_run_id",),
+                "qualified artifact receipt CI run ID is invalid",
+                False,
+            ),
+            (
+                "artifact-zero-counter",
+                "artifact_receipt",
+                ("capability_evidence", "lsp", "skipped_files"),
+                "LSP qualification skipped_files must be JSON integer zero",
+                False,
+            ),
+            (
+                "artifact-file-count",
+                "artifact_receipt",
+                ("capability_evidence", "lsp", "included_file_count"),
+                "LSP per-file coverage must be complete",
+                False,
+            ),
+            (
+                "budget-schema",
+                "budget_receipt",
+                ("schema_version",),
+                "approved budget receipt schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "budget-issue",
+                "budget_receipt",
+                ("authorization_issue",),
+                "approved budget receipt authorization_issue must be the declared JSON integer",
+                False,
+            ),
+            (
+                "budget-population",
+                "budget_receipt",
+                ("population_n",),
+                "N70 cohort budget scope mismatch",
+                False,
+            ),
+            (
+                "budget-request-limit",
+                "budget_receipt",
+                ("maximum_model_requests",),
+                "N70 cohort budget scope mismatch",
+                False,
+            ),
+            (
+                "packet-schema",
+                "packet",
+                ("schema_version",),
+                "packet vector schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "packet-record-count",
+                "packet",
+                ("metadata", "record_count"),
+                "packet record_count drift",
+                False,
+            ),
+            (
+                "acquisition-schema",
+                "packet",
+                ("metadata", "acquisition", "schema_version"),
+                "packet acquisition schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "locus-ordinal",
+                "packet",
+                ("metadata", "acquisition", "loci", 0, "ordinal"),
+                "acquisition locus 1 ordinal drift",
+                False,
+            ),
+            (
+                "locus-line",
+                "packet",
+                ("metadata", "acquisition", "loci", 0, "start_line"),
+                "acquisition locus 1 line bounds are invalid",
+                False,
+            ),
+            (
+                "locus-byte-length",
+                "packet",
+                ("metadata", "acquisition", "loci", 0, "preimage_byte_length"),
+                "acquisition locus 1 preimage length is invalid",
+                False,
+            ),
+            (
+                "candidate-ordinal",
+                "packet",
+                ("metadata", "acquisition", "candidates", 0, "acquisition_ordinal"),
+                "acquisition candidate 1 ordinal drift",
+                False,
+            ),
+            (
+                "candidate-nullable-rank",
+                "packet",
+                ("metadata", "acquisition", "candidates", 0, "semantic_rank"),
+                "acquisition candidate 1 semantic_rank is invalid",
+                True,
+            ),
+            (
+                "candidate-score",
+                "packet",
+                ("metadata", "acquisition", "candidates", 0, "semantic_component"),
+                "acquisition candidate 1 semantic_component is invalid",
+                False,
+            ),
+            (
+                "candidate-byte-length",
+                "packet",
+                (
+                    "metadata",
+                    "acquisition",
+                    "candidates",
+                    0,
+                    "full_body_byte_length",
+                ),
+                "acquisition candidate 1 full-body length is invalid",
+                False,
+            ),
+            (
+                "acquisition-relationship-locus-ordinal",
+                "packet",
+                ("metadata", "acquisition", "relationships", 0, "locus_ordinal"),
+                "packet acquisition relationship 1 field set drift",
+                False,
+            ),
+            (
+                "acquisition-relationship-cli-ordinal",
+                "packet",
+                ("metadata", "acquisition", "relationships", 0, "cli_ordinal"),
+                "packet acquisition relationship 1 field set drift",
+                False,
+            ),
+            (
+                "omission-byte-count",
+                "packet",
+                ("metadata", "acquisition", "omissions", 0, "required_bytes"),
+                "acquisition omission 1 budget fields are invalid",
+                False,
+            ),
+            (
+                "header-ordinal",
+                "packet",
+                ("records", 0, "header", "ordinal"),
+                "packet record 1 ordinal drift",
+                False,
+            ),
+            (
+                "header-line",
+                "packet",
+                ("records", 0, "header", "start_line"),
+                "packet record 1 integer fields are invalid",
+                False,
+            ),
+            (
+                "header-byte-length",
+                "packet",
+                ("records", 0, "header", "full_body_byte_length"),
+                "packet record 1 integer fields are invalid",
+                False,
+            ),
+            (
+                "header-score",
+                "packet",
+                ("records", 1, "header", "score", "semantic_component"),
+                "packet candidate 2 score field set drift",
+                False,
+            ),
+            (
+                "header-relationship-ordinal",
+                "packet",
+                ("records", 1, "header", "relationships", 0, "cli_ordinal"),
+                "packet record 2 relationship field set drift",
+                False,
+            ),
+            (
+                "h2-schema",
+                "packet",
+                ("h2_token_vectors", "schema_version"),
+                "H2 token vector schema_version must be JSON integer 1",
+                False,
+            ),
+            (
+                "h2-record-ordinal",
+                "packet",
+                ("h2_token_vectors", "records", 0, "record_ordinal"),
+                "H2 token record ordinal mismatch",
+                False,
+            ),
+            (
+                "h2-token-count",
+                "packet",
+                ("h2_token_vectors", "records", 0, "full_token_count"),
+                "H2 full_token_count must be a non-negative JSON integer",
+                False,
+            ),
+            (
+                "h2-token-id",
+                "packet",
+                ("h2_token_vectors", "records", 0, "full_token_ids", 0),
+                "H2 full_token_ids must contain non-negative JSON integers",
+                False,
+            ),
+            (
+                "h2-total",
+                "packet",
+                ("h2_token_vectors", "expected_full_payload_tokens"),
+                "H2 full-payload token total drift",
+                False,
+            ),
+            (
+                "retry-repeat",
+                "packet",
+                (
+                    "retry_prompt_vector",
+                    "previous_response_codepoint_runs",
+                    0,
+                    "repeat",
+                ),
+                "retry prompt vector codepoint run is invalid",
+                False,
+            ),
+            (
+                "retry-derived-length",
+                "packet",
+                ("retry_prompt_vector", "expected_retry_request_byte_length"),
+                "retry prompt byte length drift",
+                False,
+            ),
+        )
 
-            with (
-                self.subTest(field="lock_byte_count", value=rejected_value),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                copied_root = Path(temporary)
-                self.copy_locked_bundle(copied_root)
-                lock_path = copied_root / VALIDATOR.LOCK_REL
-                lock = VALIDATOR.load_json(lock_path)
-                lock["files"][0]["bytes"] = rejected_value
-                lock_path.write_text(json.dumps(lock), encoding="utf-8")
-                errors = []
-                VALIDATOR.validate_lock(copied_root, errors)
-                self.assertIn(
-                    "lock entry 1 byte length must be a JSON integer >= 0", errors
-                )
+        def path_value(document: object, path: tuple[object, ...]) -> object:
+            current = document
+            for component in path:
+                current = current[component]  # type: ignore[index]
+            return current
 
-                rejected_marker = json.dumps(rejected_value).lower()
-                stdout = io.StringIO()
-                stderr = io.StringIO()
+        def replace_path(
+            document: object, path: tuple[object, ...], replacement: object
+        ) -> None:
+            current = document
+            for component in path[:-1]:
+                current = current[component]  # type: ignore[index]
+            current[path[-1]] = replacement  # type: ignore[index]
+
+        for label, source_name, path, expected_error, nullable in cases:
+            valid_value = path_value(sources[source_name], path)
+            rejected_values = [True, False, float(valid_value), str(valid_value)]
+            if not nullable:
+                rejected_values.append(None)
+            for rejected_value in rejected_values:
+                with self.subTest(case=label, value=rejected_value):
+                    mutated = copy.deepcopy(sources[source_name])
+                    replace_path(mutated, path, rejected_value)
+                    errors: list[str] = []
+                    validators[source_name](mutated, errors)
+                    self.assertIn(expected_error, errors)
+
+        lock_cases = (
+            (
+                "schema_version",
+                ("schema_version",),
+                "lock schema_version must be JSON integer 1",
+            ),
+            (
+                "byte_count",
+                ("files", 0, "bytes"),
+                "lock entry 1 byte length must be a JSON integer >= 0",
+            ),
+        )
+        for label, path, expected_error in lock_cases:
+            for rejected_value in (True, False, 1.0, "1", None):
                 with (
-                    contextlib.redirect_stdout(stdout),
-                    contextlib.redirect_stderr(stderr),
+                    self.subTest(case=f"lock-{label}", value=rejected_value),
+                    tempfile.TemporaryDirectory() as temporary,
                 ):
-                    result = VALIDATOR.main(["--root", str(copied_root)])
-                self.assertEqual(result, 1)
-                self.assertEqual(stdout.getvalue(), "")
-                self.assertNotIn(rejected_marker, stderr.getvalue().lower())
-                self.assertEqual(
-                    stderr.getvalue().strip(),
-                    "INCOMPATIBLE: protocol validation failed",
-                )
+                    copied_root = Path(temporary)
+                    self.copy_locked_bundle(copied_root)
+                    lock_path = copied_root / VALIDATOR.LOCK_REL
+                    lock = VALIDATOR.load_json(lock_path)
+                    replace_path(lock, path, rejected_value)
+                    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                    errors = []
+                    VALIDATOR.validate_lock(copied_root, errors)
+                    self.assertIn(expected_error, errors)
+
+                    rejected_marker = json.dumps(rejected_value).lower()
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        result = VALIDATOR.main(["--root", str(copied_root)])
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertNotIn(rejected_marker, stderr.getvalue().lower())
+                    self.assertEqual(
+                        stderr.getvalue().strip(),
+                        "INCOMPATIBLE: protocol validation failed",
+                    )
 
     def test_unsafe_lock_paths_are_rejected_before_target_read(self) -> None:
         cases = (
