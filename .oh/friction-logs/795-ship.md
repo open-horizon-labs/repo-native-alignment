@@ -1,0 +1,9 @@
+# PR #795 Ship Friction
+
+| Time | Tool/Path | Severity | Friction | Fallback | Impact |
+|---|---|---|---|---|---|
+| 2026-07-16 | RNA MCP discovery | skipped | RNA MCP tools were not exposed in this agent session. | Used the installed `repo-native-alignment` CLI against the repository index before any raw fallback. | Exploration remained RNA-grounded through the mandatory supported fallback. |
+| 2026-07-16 | RNA changed-file LSP context | degraded | The live index reported degraded TypeScript LSP coverage and could not provide dependable changed-file call/reference context. | Used RNA exact search for orientation, then bounded diff/source inspection only where the graph could not answer the review question. | The methodology-only Python/JSON diff was still reviewable, but caller/reference evidence was unavailable. |
+| 2026-07-16 | RNA extract-only persistence | blocking | Two incremental `scan --extract-only` attempts completed extraction but failed persistence with ambiguous LanceDB merge-insert errors. | Continued with the already-queryable exact graph and independently validated the issue-owned bundle from pinned files. | The live index could not be safely refreshed with these new artifacts during the session. |
+| 2026-07-16 | RNA file-scoped TODO search | skipped | The requested file filter returned unrelated repository markdown instead of only issue-owned paths. | Ran a bounded exact marker scan over the PR's changed paths and recorded the fallback in Ship Step 6. | TODO resolution remained exact to the review scope. |
+| 2026-07-16 | Ship metis lookup | skipped | A workflow reference used a stale metis location for a rule now represented by a canonical guardrail. | Used the repository's canonical guardrail and current ship instructions. | No quality-gate step was omitted. |
