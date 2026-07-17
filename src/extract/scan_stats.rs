@@ -117,8 +117,11 @@ pub struct LspValidationEvidence {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negotiated_capabilities: Option<LspNegotiatedCapabilities>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub document_symbols: Vec<LspDocumentSymbolEvidence>,
+    #[serde(
+        default,
+        skip_serializing_if = "<[LspDocumentSymbolEvidence]>::is_empty"
+    )]
+    pub document_symbols: Box<[LspDocumentSymbolEvidence]>,
 }
 
 impl LspValidationEvidence {
@@ -137,7 +140,7 @@ impl LspValidationEvidence {
             symbol_count: Some(symbol_count),
             detail: None,
             negotiated_capabilities: None,
-            document_symbols: Vec::new(),
+            document_symbols: Box::default(),
         }
     }
 
@@ -155,7 +158,7 @@ impl LspValidationEvidence {
             symbol_count: None,
             detail: Some(detail.into()),
             negotiated_capabilities: None,
-            document_symbols: Vec::new(),
+            document_symbols: Box::default(),
         }
     }
 
@@ -173,7 +176,7 @@ impl LspValidationEvidence {
             symbol_count: None,
             detail: None,
             negotiated_capabilities: None,
-            document_symbols: Vec::new(),
+            document_symbols: Box::default(),
         }
     }
 
@@ -184,7 +187,7 @@ impl LspValidationEvidence {
 
     pub fn with_document_symbols(mut self, mut symbols: Vec<LspDocumentSymbolEvidence>) -> Self {
         symbols.sort();
-        self.document_symbols = symbols;
+        self.document_symbols = symbols.into_boxed_slice();
         self
     }
 
