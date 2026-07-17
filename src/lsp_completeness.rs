@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -24,10 +25,15 @@ use crate::server::{
     LspEvidenceReadiness,
 };
 
-pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 1;
+pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 2;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v1";
+const FROZEN_POPULATION_JSON: &[u8] =
+    include_bytes!("../benchmark/swebench-act-context/population.json");
+const FROZEN_PROTOCOL_LOCK_JSON: &[u8] =
+    include_bytes!("../benchmark/swebench-act-context/protocol.lock.json");
+const FROZEN_POPULATION_PATH: &str = "benchmark/swebench-act-context/population.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -258,6 +264,9 @@ pub struct ReportIdentity {
     pub context_mode: String,
     pub graph_schema_version: u32,
     pub enrichment_generation: String,
+    /// Normalized upstream repository identity (`owner/repo`) when available.
+    #[serde(default)]
+    pub repository: String,
 }
 
 impl ReportIdentity {
@@ -277,6 +286,7 @@ impl ReportIdentity {
             context_mode: context_mode.into(),
             graph_schema_version,
             enrichment_generation: enrichment_generation.into(),
+            repository: String::new(),
         }
     }
 }
@@ -322,6 +332,10 @@ pub struct ReportSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LspCompletenessReport {
     pub identity: ReportIdentity,
+    /// Canonical digest of the exact graph snapshot used to build this report.
+    /// Unlike per-result IDs, this also binds legitimate zero-result reports.
+    #[serde(default)]
+    pub graph_snapshot_digest: String,
     #[serde(default)]
     pub files: Vec<FileCoverageRecord>,
     #[serde(default)]
@@ -333,8 +347,18 @@ pub struct LspCompletenessReport {
 
 impl LspCompletenessReport {
     pub fn new(identity: ReportIdentity, files: Vec<FileCoverageRecord>) -> Self {
+        Self::new_bound(identity, files, &[], &[])
+    }
+
+    pub fn new_bound(
+        identity: ReportIdentity,
+        files: Vec<FileCoverageRecord>,
+        nodes: &[Node],
+        edges: &[Edge],
+    ) -> Self {
         let mut report = Self {
             identity,
+            graph_snapshot_digest: graph_snapshot_digest(nodes, edges),
             files,
             summary: ReportSummary::default(),
             violations: Vec::new(),
@@ -363,6 +387,7 @@ impl LspCompletenessReport {
         #[derive(Serialize)]
         struct DigestPayload<'a> {
             identity: &'a ReportIdentity,
+            graph_snapshot_digest: &'a str,
             files: &'a [FileCoverageRecord],
             summary: &'a ReportSummary,
             violations: &'a [ReadinessViolation],
@@ -370,6 +395,7 @@ impl LspCompletenessReport {
 
         let bytes = serde_json::to_vec(&DigestPayload {
             identity: &self.identity,
+            graph_snapshot_digest: &self.graph_snapshot_digest,
             files: &self.files,
             summary: &self.summary,
             violations: &self.violations,
@@ -438,6 +464,11 @@ impl LspCompletenessReport {
                 self.identity.enrichment_generation.clone(),
                 expected.enrichment_generation.clone(),
             ),
+            (
+                "repository",
+                self.identity.repository.clone(),
+                expected.repository.clone(),
+            ),
         ] {
             if actual != wanted {
                 violations.push(ReadinessViolation {
@@ -455,6 +486,19 @@ impl LspCompletenessReport {
         violations.dedup();
         violations
     }
+}
+
+fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
+    let mut entries = BTreeSet::new();
+    for node in nodes {
+        entries.insert(("node", node.stable_id(), format!("{:?}", node.source)));
+    }
+    for edge in edges {
+        entries.insert(("edge", edge.stable_id(), format!("{:?}", edge.source)));
+    }
+    let bytes =
+        serde_json::to_vec(&entries).expect("graph snapshot digest serialization cannot fail");
+    blake3::hash(&bytes).to_hex().to_string()
 }
 
 fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
@@ -689,6 +733,8 @@ pub struct AggregateCheckout {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AggregateCompletenessReport {
     pub schema_version: u32,
+    /// SHA-256 from the checked-in protocol lock for the frozen population.
+    pub cohort_digest: String,
     pub checkouts: Vec<AggregateCheckout>,
     pub counts: AggregateCounts,
     pub digest: String,
@@ -709,7 +755,10 @@ pub struct FrozenCohortManifest {
 }
 
 impl AggregateCompletenessReport {
-    pub fn from_frozen_cases(cases: &[(FrozenCohortCase, LspCompletenessReport)]) -> Self {
+    fn from_frozen_cases(
+        cases: &[(FrozenCohortCase, LspCompletenessReport)],
+        cohort_digest: String,
+    ) -> Self {
         let mut checkouts = Vec::with_capacity(cases.len());
         let mut counts = AggregateCounts {
             checkouts: cases.len() as u64,
@@ -720,7 +769,8 @@ impl AggregateCompletenessReport {
             let ready = report.is_ready()
                 && report.integrity_violations().is_empty()
                 && report.identity.context_mode == "disabled"
-                && report.identity.checkout_sha == case.base_commit;
+                && report.identity.checkout_sha == case.base_commit
+                && report.identity.repository == case.repository;
             if ready {
                 counts.ready_checkouts += 1;
             }
@@ -748,6 +798,7 @@ impl AggregateCompletenessReport {
 
         let mut aggregate = Self {
             schema_version: LSP_COMPLETENESS_SCHEMA_VERSION,
+            cohort_digest,
             checkouts,
             counts,
             digest: String::new(),
@@ -760,11 +811,13 @@ impl AggregateCompletenessReport {
         #[derive(Serialize)]
         struct DigestPayload<'a> {
             schema_version: u32,
+            cohort_digest: &'a str,
             checkouts: &'a [AggregateCheckout],
             counts: &'a AggregateCounts,
         }
         let bytes = serde_json::to_vec(&DigestPayload {
             schema_version: self.schema_version,
+            cohort_digest: &self.cohort_digest,
             checkouts: &self.checkouts,
             counts: &self.counts,
         })
@@ -773,11 +826,86 @@ impl AggregateCompletenessReport {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.counts.checkouts == FROZEN_SWEBENCH_COHORT_SIZE
+        let Ok((expected_digest, expected_cases)) = canonical_frozen_cohort() else {
+            return false;
+        };
+        let actual_cases = self
+            .checkouts
+            .iter()
+            .map(|checkout| {
+                (
+                    checkout.instance_id.clone(),
+                    checkout.repository.clone(),
+                    checkout.base_commit.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        self.cohort_digest == expected_digest
+            && actual_cases == expected_cases
+            && self.counts.checkouts == FROZEN_SWEBENCH_COHORT_SIZE
             && self.counts.unique_instances == FROZEN_SWEBENCH_COHORT_SIZE
             && self.counts.ready_checkouts == FROZEN_SWEBENCH_COHORT_SIZE
             && self.checkouts.iter().all(|checkout| checkout.ready)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalPopulation {
+    instances: Vec<CanonicalPopulationCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalPopulationCase {
+    instance_id: String,
+    repo: String,
+    base_commit: String,
+    included: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProtocolLock {
+    files: Vec<ProtocolLockEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProtocolLockEntry {
+    path: String,
+    sha256: String,
+}
+
+type CanonicalCohortIdentity = (String, String, String);
+
+fn canonical_frozen_cohort() -> Result<(String, BTreeSet<CanonicalCohortIdentity>)> {
+    let lock: ProtocolLock = serde_json::from_slice(FROZEN_PROTOCOL_LOCK_JSON)
+        .context("checked-in SWE-bench protocol lock is invalid")?;
+    let locked_digest = lock
+        .files
+        .iter()
+        .find(|entry| entry.path == FROZEN_POPULATION_PATH)
+        .map(|entry| entry.sha256.as_str())
+        .context("protocol lock does not seal the frozen SWE-bench population")?;
+    let computed_digest = format!("{:x}", Sha256::digest(FROZEN_POPULATION_JSON));
+    if computed_digest != locked_digest {
+        anyhow::bail!(
+            "checked-in frozen SWE-bench population digest does not match protocol.lock.json"
+        );
+    }
+    let population: CanonicalPopulation = serde_json::from_slice(FROZEN_POPULATION_JSON)
+        .context("checked-in frozen SWE-bench population is invalid")?;
+    let cases = population
+        .instances
+        .into_iter()
+        .filter(|case| case.included)
+        .map(|case| (case.instance_id, case.repo, case.base_commit))
+        .collect::<BTreeSet<_>>();
+    if cases.len() as u64 != FROZEN_SWEBENCH_COHORT_SIZE {
+        anyhow::bail!(
+            "checked-in frozen SWE-bench population has {} included identities, expected {}",
+            cases.len(),
+            FROZEN_SWEBENCH_COHORT_SIZE
+        );
+    }
+    Ok((locked_digest.to_string(), cases))
 }
 
 pub fn load_frozen_cohort_aggregate(path: &Path) -> Result<AggregateCompletenessReport> {
@@ -793,6 +921,26 @@ pub fn load_frozen_cohort_aggregate(path: &Path) -> Result<AggregateCompleteness
         );
     }
     manifest.cases.sort();
+    let (cohort_digest, canonical_cases) = canonical_frozen_cohort()?;
+    let supplied_cases = manifest
+        .cases
+        .iter()
+        .map(|case| {
+            (
+                case.instance_id.clone(),
+                case.repository.clone(),
+                case.base_commit.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if manifest.cases.len() as u64 != FROZEN_SWEBENCH_COHORT_SIZE
+        || supplied_cases != canonical_cases
+    {
+        anyhow::bail!(
+            "cohort manifest identities do not exactly match the locked N={} SWE-bench population",
+            FROZEN_SWEBENCH_COHORT_SIZE
+        );
+    }
     let base = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -810,7 +958,10 @@ pub fn load_frozen_cohort_aggregate(path: &Path) -> Result<AggregateCompleteness
             Ok((case, report))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(AggregateCompletenessReport::from_frozen_cases(&cases))
+    Ok(AggregateCompletenessReport::from_frozen_cases(
+        &cases,
+        cohort_digest,
+    ))
 }
 
 fn merge_counts(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, u64>) {
@@ -1020,14 +1171,16 @@ pub fn current_report_identity(
         .to_hex()
         .to_string();
     let enrichment_generation = work_item_generation(repo_root)?;
-    Ok(ReportIdentity::new(
+    let mut identity = ReportIdentity::new(
         checkout_sha,
         config_digest,
         policy_digest,
         context_mode.to_string(),
         crate::graph::store::SCHEMA_VERSION,
         enrichment_generation,
-    ))
+    );
+    identity.repository = repository_identity(repo_root).unwrap_or_default();
+    Ok(identity)
 }
 
 fn build_report(
@@ -1145,7 +1298,9 @@ fn build_report(
         });
     }
 
-    Ok(LspCompletenessReport::new(identity, files))
+    Ok(LspCompletenessReport::new_bound(
+        identity, files, nodes, edges,
+    ))
 }
 
 fn evidence_from_work_items(
@@ -1196,14 +1351,10 @@ fn evidence_from_work_items(
     for record in records {
         for operation in &record.requested_operations {
             let method = lsp_method(operation).to_string();
-            capabilities.insert(AdvertisedCapability {
-                name: method.clone(),
-                supported: true,
-            });
             requests.push(RequestAttempt {
                 method,
                 outcome: request_outcome(record.state),
-                result_count: Some((record.output_edges.len() + record.output_nodes.len()) as u64),
+                result_count: Some(record.observed_result_count),
                 duration_ms: record
                     .started_at_ms
                     .zip(record.completed_at_ms)
@@ -1290,16 +1441,6 @@ fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> Per
     results
 }
 
-fn edge_matches_kind(edge: &Edge, kind: ExpectedResultKind) -> bool {
-    matches!(
-        (&edge.kind, kind),
-        (&EdgeKind::Calls, ExpectedResultKind::CallHierarchy)
-            | (&EdgeKind::ReferencedBy, ExpectedResultKind::Reference)
-            | (&EdgeKind::Implements, ExpectedResultKind::Definition)
-            | (&EdgeKind::DependsOn, ExpectedResultKind::DocumentLink)
-    )
-}
-
 fn job_validations_for_language<'a>(
     jobs: &'a [EnrichmentJobRecord],
     language: &str,
@@ -1317,6 +1458,17 @@ fn runtime_compatibility_violations(
     edges: &[Edge],
 ) -> Vec<ReadinessViolation> {
     let mut violations = Vec::new();
+    let current_graph_digest = graph_snapshot_digest(nodes, edges);
+    if report.graph_snapshot_digest != current_graph_digest {
+        violations.push(ReadinessViolation {
+            code: ReadinessViolationCode::StaleReport,
+            path: None,
+            detail: format!(
+                "graph snapshot digest changed: report={}, current={}",
+                report.graph_snapshot_digest, current_graph_digest
+            ),
+        });
+    }
     let mut current_servers = BTreeMap::new();
     for file in report.files.iter().filter(|file| file.role.is_included()) {
         if let Some(expected) = &file.expected_server {
@@ -1357,24 +1509,21 @@ fn expected_evidence_from_work_items(
     {
         expected_ids.extend(record.output_edges.iter().map(Edge::stable_id));
         expected_ids.extend(record.output_nodes.iter().map(Node::stable_id));
-        if !record.output_nodes.is_empty() {
-            expected.insert(ExpectedResultKind::DocumentSymbol);
-        }
-        for operation in &record.requested_operations {
-            let kind = match operation.as_str() {
-                "call_hierarchy" => Some(ExpectedResultKind::CallHierarchy),
-                "references" => Some(ExpectedResultKind::Reference),
-                "implementations" | "type_hierarchy" => Some(ExpectedResultKind::Definition),
-                "document_links" => Some(ExpectedResultKind::DocumentLink),
-                _ => None,
-            };
-            if let Some(kind) = kind
-                && record
-                    .output_edges
-                    .iter()
-                    .any(|edge| edge_matches_kind(edge, kind))
-            {
-                expected.insert(kind);
+        if record.observed_result_count > 0 {
+            for operation in &record.requested_operations {
+                let kind = match operation.as_str() {
+                    "call_hierarchy" => Some(ExpectedResultKind::CallHierarchy),
+                    "references" if record.node_kind == "function" => {
+                        Some(ExpectedResultKind::CallHierarchy)
+                    }
+                    "references" => Some(ExpectedResultKind::Reference),
+                    "implementations" | "type_hierarchy" => Some(ExpectedResultKind::Definition),
+                    "document_links" => Some(ExpectedResultKind::DocumentLink),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    expected.insert(kind);
+                }
             }
         }
     }
@@ -1396,6 +1545,11 @@ fn terminal_status_for_file(
                 "{} is absent or did not provide a deterministic --version response",
                 server.name
             ),
+        };
+    }
+    if jobs.is_empty() {
+        return FileTerminalStatus::NeverProcessed {
+            detail: "full scan produced no related durable call-reference job".to_string(),
         };
     }
     if language_entries
@@ -1464,6 +1618,11 @@ fn terminal_status_for_file(
             detail: "related LSP job lacks complete durable readiness evidence".to_string(),
         };
     }
+    if validations.is_empty() {
+        return FileTerminalStatus::Degraded {
+            detail: "related LSP job has no durable validation for this language".to_string(),
+        };
+    }
     if validations
         .iter()
         .any(|validation| validation.status == LspValidationStatus::NotValidated)
@@ -1510,7 +1669,7 @@ fn terminal_status_for_file(
         return FileTerminalStatus::Processed {
             result_count: completed
                 .iter()
-                .map(|record| (record.output_edges.len() + record.output_nodes.len()) as u64)
+                .map(|record| record.observed_result_count)
                 .sum(),
         };
     }
@@ -1775,6 +1934,34 @@ fn repository_at_root(repo_root: &Path) -> Option<git2::Repository> {
     (Some(workdir) == repo_root.canonicalize().ok()).then_some(repository)
 }
 
+fn repository_identity(repo_root: &Path) -> Option<String> {
+    let repository = repository_at_root(repo_root)?;
+    let remote = repository.find_remote("origin").ok()?;
+    normalize_repository_url(remote.url().ok()?)
+}
+
+fn normalize_repository_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
+        path
+    } else if let Some(path) = trimmed.strip_prefix("https://github.com/") {
+        path
+    } else if let Some(path) = trimmed.strip_prefix("http://github.com/") {
+        path
+    } else {
+        return None;
+    };
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let repository = components.next()?;
+    if owner.is_empty() || repository.is_empty() || components.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
+}
+
 fn content_tree_digest(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     for path in paths {
@@ -1912,6 +2099,46 @@ mod tests {
         }
     }
 
+    fn completed_job(validations: Vec<LspValidationEvidence>) -> EnrichmentJobRecord {
+        serde_json::from_value(serde_json::json!({
+            "job_id": "job-complete",
+            "repo": "/fixture",
+            "root": null,
+            "capability": "call_references",
+            "scope": { "kind": "repo" },
+            "trigger": "foreground_scan",
+            "state": "completed",
+            "phase": "complete",
+            "counters": {
+                "current": 1,
+                "total": 1,
+                "node_count": 1,
+                "edge_count": 0
+            },
+            "created_at": 1,
+            "updated_at": 2,
+            "completed_at": 2,
+            "failure": null,
+            "lsp_evidence": {
+                "readiness": "full",
+                "scope": "repo",
+                "declared_node_count": 1,
+                "max_requests": null,
+                "max_duration_ms": null,
+                "scheduled_requests": 1,
+                "elapsed_ms": 1,
+                "circuit_open": false,
+                "detail": null,
+                "validations": validations
+            },
+            "superseded_by": null,
+            "owner_id": null,
+            "lease_expires_at": null,
+            "schema_version": 1
+        }))
+        .unwrap()
+    }
+
     fn included(path: &str, status: FileTerminalStatus) -> FileCoverageRecord {
         FileCoverageRecord {
             path: path.to_string(),
@@ -1943,8 +2170,10 @@ mod tests {
 
     fn cohort_case(
         ordinal: usize,
-        report: LspCompletenessReport,
+        mut report: LspCompletenessReport,
     ) -> (FrozenCohortCase, LspCompletenessReport) {
+        report.identity.repository = "owner/repo".to_string();
+        report.finalize();
         (
             FrozenCohortCase {
                 instance_id: format!("instance-{ordinal:02}"),
@@ -2167,14 +2396,22 @@ mod tests {
             state: LspWorkItemState::Skipped,
             ..LspWorkItemRecord::default()
         };
+        let validation = LspValidationEvidence::processed(
+            "python",
+            "fixture-ls",
+            "textDocument/documentSymbol",
+            0,
+        );
+        let jobs = vec![completed_job(vec![validation])];
+        let validations = job_validations_for_language(&jobs, "python");
         let status = terminal_status_for_file(
             "src/a.py",
             &[&completed, &skipped],
             &[],
             true,
             &server(),
-            &[],
-            &[],
+            &jobs,
+            &validations,
         );
         assert!(matches!(status, FileTerminalStatus::Degraded { .. }));
     }
@@ -2245,14 +2482,17 @@ mod tests {
         second.identity.checkout_sha = "def456".to_string();
         second.finalize();
 
-        let left = AggregateCompletenessReport::from_frozen_cases(&[
-            cohort_case(1, second.clone()),
-            cohort_case(0, first.clone()),
-        ]);
-        let right = AggregateCompletenessReport::from_frozen_cases(&[
-            cohort_case(0, first),
-            cohort_case(1, second),
-        ]);
+        let left = AggregateCompletenessReport::from_frozen_cases(
+            &[
+                cohort_case(1, second.clone()),
+                cohort_case(0, first.clone()),
+            ],
+            "fixture-cohort".to_string(),
+        );
+        let right = AggregateCompletenessReport::from_frozen_cases(
+            &[cohort_case(0, first), cohort_case(1, second)],
+            "fixture-cohort".to_string(),
+        );
         assert_eq!(left, right);
         assert_eq!(left.counts.checkouts, 2);
         assert_eq!(left.counts.unique_instances, 2);
@@ -2432,6 +2672,94 @@ mod tests {
     }
 
     #[test]
+    fn work_item_requests_do_not_self_advertise_capability() {
+        let record = LspWorkItemRecord {
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            observed_result_count: 3,
+            ..LspWorkItemRecord::default()
+        };
+        let (capabilities, requests) = evidence_from_work_items(&[&record], &[], &[]);
+        assert!(capabilities.is_empty());
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].result_count, Some(3));
+    }
+
+    #[test]
+    fn raw_applicable_response_without_mapped_output_fails_closed() {
+        let record = LspWorkItemRecord {
+            file: "src/a.py".to_string(),
+            node_kind: "function".to_string(),
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            observed_result_count: 1,
+            ..LspWorkItemRecord::default()
+        };
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        (file.expected_results, file.expected_result_ids) =
+            expected_evidence_from_work_items(&[&record]);
+        assert!(
+            file.expected_results
+                .contains(&ExpectedResultKind::CallHierarchy)
+        );
+        let report = report(vec![file]);
+        assert!(
+            report.violations.iter().any(|violation| {
+                violation.code == ReadinessViolationCode::MissingExpectedResult
+            })
+        );
+    }
+
+    #[test]
+    fn missing_related_job_or_language_validation_fails_closed() {
+        let completed = LspWorkItemRecord {
+            state: LspWorkItemState::Completed,
+            ..LspWorkItemRecord::default()
+        };
+        let no_job =
+            terminal_status_for_file("src/a.py", &[&completed], &[], true, &server(), &[], &[]);
+        assert!(matches!(no_job, FileTerminalStatus::NeverProcessed { .. }));
+
+        let jobs = vec![completed_job(Vec::new())];
+        let no_validation =
+            terminal_status_for_file("src/a.py", &[&completed], &[], true, &server(), &jobs, &[]);
+        assert!(matches!(no_validation, FileTerminalStatus::Degraded { .. }));
+    }
+
+    #[test]
+    fn processed_zero_report_is_bound_to_exact_graph_snapshot() {
+        let node = Node {
+            id: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "symbol".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def symbol():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let persisted = LspCompletenessReport::new_bound(
+            identity("generation-1"),
+            Vec::new(),
+            std::slice::from_ref(&node),
+            &[],
+        );
+        let violations = runtime_compatibility_violations(&persisted, &[], &[]);
+        assert!(violations.iter().any(|violation| {
+            violation.code == ReadinessViolationCode::StaleReport
+                && violation.detail.contains("graph snapshot digest changed")
+        }));
+    }
+
+    #[test]
     fn related_job_terminal_failure_blocks_every_file() {
         let job: EnrichmentJobRecord = serde_json::from_value(serde_json::json!({
             "job_id": "job-1",
@@ -2477,30 +2805,53 @@ mod tests {
 
     #[test]
     fn aggregate_gate_requires_exact_frozen_population() {
-        let reports = (0..70)
+        let (cohort_digest, identities) = canonical_frozen_cohort().unwrap();
+        let cases = identities
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (instance_id, repository, base_commit))| {
+                let mut ready = report(vec![included(
+                    "src/a.py",
+                    FileTerminalStatus::Processed { result_count: 0 },
+                )]);
+                ready.identity.checkout_sha = base_commit.clone();
+                ready.identity.repository = repository.clone();
+                ready.finalize();
+                (
+                    FrozenCohortCase {
+                        instance_id,
+                        repository,
+                        base_commit,
+                        report_path: PathBuf::from(format!("report-{ordinal:02}.json")),
+                    },
+                    ready,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seventy = AggregateCompletenessReport::from_frozen_cases(&cases, cohort_digest.clone());
+        assert!(seventy.is_ready());
+        let sixty_nine =
+            AggregateCompletenessReport::from_frozen_cases(&cases[..69], cohort_digest.clone());
+        assert!(!sixty_nine.is_ready());
+
+        let duplicated = AggregateCompletenessReport::from_frozen_cases(
+            &vec![cases[0].clone(); 70],
+            cohort_digest.clone(),
+        );
+        assert!(!duplicated.is_ready());
+
+        let invented = (0..70)
             .map(|ordinal| {
                 let mut ready = report(vec![included(
                     "src/a.py",
                     FileTerminalStatus::Processed { result_count: 0 },
                 )]);
-                ready.identity.checkout_sha = format!("checkout-{ordinal:02}");
-                ready.finalize();
-                ready
+                ready.identity.checkout_sha = "reused-base".to_string();
+                cohort_case(ordinal, ready)
             })
             .collect::<Vec<_>>();
-        let cases = reports
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, report)| cohort_case(ordinal, report))
-            .collect::<Vec<_>>();
-        let seventy = AggregateCompletenessReport::from_frozen_cases(&cases);
-        assert!(seventy.is_ready());
-        let sixty_nine = AggregateCompletenessReport::from_frozen_cases(&cases[..69]);
-        assert!(!sixty_nine.is_ready());
-
-        let duplicated =
-            AggregateCompletenessReport::from_frozen_cases(&vec![cases[0].clone(); 70]);
-        assert!(!duplicated.is_ready());
+        let invented = AggregateCompletenessReport::from_frozen_cases(&invented, cohort_digest);
+        assert!(!invented.is_ready());
     }
 
     #[test]
@@ -2511,7 +2862,10 @@ mod tests {
         )]);
         enabled.identity.context_mode = "enabled".to_string();
         enabled.finalize();
-        let aggregate = AggregateCompletenessReport::from_frozen_cases(&[cohort_case(0, enabled)]);
+        let aggregate = AggregateCompletenessReport::from_frozen_cases(
+            &[cohort_case(0, enabled)],
+            "fixture-cohort".to_string(),
+        );
         assert_eq!(aggregate.counts.ready_checkouts, 0);
         assert!(!aggregate.is_ready());
     }

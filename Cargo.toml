@@ -101,6 +101,7 @@ url = "2"
 
 # Content hashing (incremental extraction/embedding skip)
 blake3 = "1"
+sha2 = "0.10"
 
 # Parallel file extraction
 rayon = "1"

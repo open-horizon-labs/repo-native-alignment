@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Edge, Node};
 
-const STORE_SCHEMA_VERSION: u32 = 2;
+const STORE_SCHEMA_VERSION: u32 = 3;
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
@@ -98,6 +98,11 @@ pub struct LspWorkItemRecord {
     pub output_edges: Vec<Edge>,
     #[serde(default)]
     pub output_nodes: Vec<Node>,
+    /// Number of raw, applicable LSP results observed before graph mapping.
+    /// This remains non-zero when a server response cannot be mapped to a
+    /// persistable graph node or edge, allowing readiness to fail closed.
+    #[serde(default)]
+    pub observed_result_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,7 +498,7 @@ impl LspWorkItemLedger {
 
     #[cfg(test)]
     pub(crate) async fn mark_completed(&self, item_id: usize) -> Result<()> {
-        self.mark_completed_with_output(item_id, &[], &[]).await
+        self.mark_completed_with_output(item_id, &[], &[], 0).await
     }
 
     pub(crate) async fn mark_completed_with_output(
@@ -501,10 +506,12 @@ impl LspWorkItemLedger {
         item_id: usize,
         edges: &[Edge],
         nodes: &[Node],
+        observed_result_count: u64,
     ) -> Result<()> {
         self.update(item_id, |record| {
             record.output_edges = edges.to_vec();
             record.output_nodes = nodes.to_vec();
+            record.observed_result_count = observed_result_count;
         })?;
         self.mark_terminal(item_id, LspWorkItemState::Completed, None)
             .await
@@ -543,6 +550,7 @@ impl LspWorkItemLedger {
             if state != LspWorkItemState::Completed {
                 record.output_edges.clear();
                 record.output_nodes.clear();
+                record.observed_result_count = 0;
             }
         })?;
         self.maybe_flush().await
@@ -649,6 +657,7 @@ fn new_record(
         recovery: LspWorkItemRecovery::New,
         output_edges: Vec::new(),
         output_nodes: Vec::new(),
+        observed_result_count: 0,
     }
 }
 
@@ -1026,12 +1035,21 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
             STORE_SCHEMA_VERSION
         );
     }
-    store.schema_version = STORE_SCHEMA_VERSION;
-    for record in store.records.values_mut() {
-        if record.schema_version == 0 {
-            record.schema_version = STORE_SCHEMA_VERSION;
-        }
+    if store.schema_version < STORE_SCHEMA_VERSION
+        || store
+            .records
+            .values()
+            .any(|record| record.schema_version < STORE_SCHEMA_VERSION)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            stored_schema = store.schema_version,
+            current_schema = STORE_SCHEMA_VERSION,
+            "Replaying LSP work items because persisted evidence predates raw result counts"
+        );
+        return Ok(LspWorkItemStore::default());
     }
+    store.schema_version = STORE_SCHEMA_VERSION;
     Ok(store)
 }
 
@@ -1187,9 +1205,7 @@ mod tests {
         )
         .unwrap();
         let snapshots = load_queue_snapshots(older.path(), 1).unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].job_id, "legacy");
-        assert_eq!(snapshots[0].pending, 1);
+        assert!(snapshots.is_empty());
     }
 
     #[tokio::test]
@@ -1248,7 +1264,7 @@ mod tests {
         .unwrap();
         let recovered_edge = edge("item_0", "item_1");
         ledger
-            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
+            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[], 1)
             .await
             .unwrap();
         ledger.mark_skipped(1, "not supported").await.unwrap();
@@ -1351,7 +1367,7 @@ mod tests {
         .await
         .unwrap();
         ledger
-            .mark_completed_with_output(0, &[edge("item_0", "item_1")], &[])
+            .mark_completed_with_output(0, &[edge("item_0", "item_1")], &[], 1)
             .await
             .unwrap();
         ledger.mark_phase(1, "requesting_references").await.unwrap();

@@ -41,3 +41,28 @@ The independent findings were consolidated with CI evidence before one remediati
 - protected dirty-file hashes exactly match preflight; protected/unrelated paths remain unstaged
 
 No model, embedding runtime, paid API, or benchmark episode was launched. The exact N=70 fleet execution remains #785.
+
+### Step 4: Adversarial Test
+**Verdict:** FAIL on `e1c7ec4d`
+**Comment:** https://github.com/open-horizon-labs/repo-native-alignment/pull/799#issuecomment-5007312745
+
+The adversarial pass found four fail-open seams: absent related-job/language validation could still become processed; expected output was inferred only after mapping; processed-zero reports were not graph-snapshot-bound; and 70 arbitrary identities could satisfy the aggregate.
+
+### Consolidated Adversarial Remediation
+**Status:** COMPLETE
+
+- Work-item schema v3 persists raw applicable result counts before graph mapping; nonzero raw output now requires persisted graph evidence.
+- Missing related call-reference jobs or per-language durable validation fail closed, and requested operations no longer self-advertise server capability.
+- Completeness schema v2 binds every report, including processed-zero reports, to the full graph snapshot digest.
+- Aggregate readiness verifies the checked-in `population.json` against its existing `protocol.lock.json` SHA-256, requires the exact 70 included instance/repository/base-commit tuples, and requires each report to bind the matching repository and checkout.
+- Four adversarial regressions cover those exact seams. No runner, fleet, model, embedding, credential, provisioning, or #797 cleanup work was added.
+
+### Adversarial Remediation Verification
+**Status:** COMPLETE
+
+- completeness focused suite — 27 passed, 0 failed
+- exact corrected regressions — 1 passed each
+- `cargo clippy --lib --bin repo-native-alignment --no-default-features -- -D warnings` — pass
+- `cargo test --no-default-features` — pass: 2,099 lib + 6 bin + 7 integration tests; 4 lib tests and 12 doctests intentionally ignored
+- `git diff --check` — pass
+- protected dirty-file hashes exactly match preflight; protected/unrelated paths remain unstaged

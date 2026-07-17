@@ -190,6 +190,8 @@ struct Pass1TaskResult {
 pub(super) struct QueryObservation {
     pub(super) scheduled_requests: usize,
     pub(super) non_empty_responses: usize,
+    /// Raw applicable result items returned by the server before graph mapping.
+    pub(super) result_count: usize,
     pub(super) errors: usize,
     pub(super) timeouts: usize,
 }
@@ -444,19 +446,27 @@ impl LspPass1Diagnostics {
         }
     }
 
-    async fn finish(&self, item: &LspPass1WorkItem, success: bool, edges: &[Edge], nodes: &[Node]) {
+    async fn finish(
+        &self,
+        item: &LspPass1WorkItem,
+        success: bool,
+        edges: &[Edge],
+        nodes: &[Node],
+        observed_result_count: usize,
+    ) {
         self.finish_with_error(
             item,
             success,
             (!success).then(|| "one or more LSP operations failed".to_string()),
             edges,
             nodes,
+            observed_result_count,
         )
         .await;
     }
 
     async fn finish_failed(&self, item: &LspPass1WorkItem, error: impl Into<String>) {
-        self.finish_with_error(item, false, Some(error.into()), &[], &[])
+        self.finish_with_error(item, false, Some(error.into()), &[], &[], 0)
             .await;
     }
 
@@ -467,6 +477,7 @@ impl LspPass1Diagnostics {
         error: Option<String>,
         edges: &[Edge],
         nodes: &[Node],
+        observed_result_count: usize,
     ) {
         {
             let mut in_flight = self.in_flight.lock().await;
@@ -486,7 +497,12 @@ impl LspPass1Diagnostics {
         if let Some(work_items) = &self.work_items {
             let result = if success {
                 work_items
-                    .mark_completed_with_output(item.id, edges, nodes)
+                    .mark_completed_with_output(
+                        item.id,
+                        edges,
+                        nodes,
+                        observed_result_count.try_into().unwrap_or(u64::MAX),
+                    )
                     .await
             } else {
                 work_items
@@ -1215,7 +1231,13 @@ impl LspEnricher {
         );
 
         diagnostics
-            .finish(item, !had_error, &edges, &new_nodes)
+            .finish(
+                item,
+                !had_error,
+                &edges,
+                &new_nodes,
+                observation.result_count,
+            )
             .await;
         Pass1TaskResult {
             edges,
@@ -1260,13 +1282,13 @@ impl LspEnricher {
                         {
                             continue;
                         }
-
                         if ref_path == node.id.file
                             && ref_line >= node.line_start
                             && ref_line <= node.line_end
                         {
                             continue;
                         }
+                        observation.result_count += 1;
 
                         let referrer_id =
                             refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
@@ -1345,6 +1367,10 @@ impl LspEnricher {
                                     if caller_path.to_string_lossy().contains(".cargo") {
                                         continue;
                                     }
+                                    if caller_path == node.id.file && caller_name == node.id.name {
+                                        continue;
+                                    }
+                                    observation.result_count += 1;
 
                                     let key = (caller_path.clone(), caller_name.to_string());
                                     let caller_id = match refs_by_file_name.get(&key) {
@@ -1417,6 +1443,7 @@ impl LspEnricher {
                                         if fqn.is_empty() {
                                             continue;
                                         }
+                                        observation.result_count += 1;
 
                                         let package =
                                             fqn.split("::").next().unwrap_or(fqn).to_string();
@@ -1452,6 +1479,10 @@ impl LspEnricher {
                                         });
                                         continue;
                                     }
+                                    if callee_path == node.id.file && callee_name == node.id.name {
+                                        continue;
+                                    }
+                                    observation.result_count += 1;
 
                                     let key = (callee_path.clone(), callee_name.to_string());
                                     let callee_id = match refs_by_file_name.get(&key) {
@@ -1535,6 +1566,7 @@ impl LspEnricher {
                     if impl_path.to_string_lossy().contains(".cargo") {
                         continue;
                     }
+                    observation.result_count += 1;
 
                     let impl_id = matching_refs
                         .iter()
@@ -1609,6 +1641,7 @@ impl LspEnricher {
                     {
                         continue;
                     }
+                    observation.result_count += 1;
 
                     let referrer_id = refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
                         find_enclosing_symbol(candidates, &ref_path, ref_line)
@@ -1669,6 +1702,7 @@ impl LspEnricher {
                         if rel_target.to_string_lossy().starts_with("http") {
                             continue;
                         }
+                        observation.result_count += 1;
 
                         let target_id = NodeId {
                             root: node.id.root.clone(),
@@ -2392,7 +2426,7 @@ mod tests {
             evidence: Vec::new(),
         };
         initial
-            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
+            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[], 1)
             .await
             .unwrap();
         initial
