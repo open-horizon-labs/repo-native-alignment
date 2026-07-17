@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -978,6 +979,70 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 "INCOMPATIBLE: protocol validation failed",
             )
 
+    def test_every_top_level_json_object_input_rejects_other_shapes(self) -> None:
+        malformed_values = {
+            "list": ["UNTRUSTED_LIST_MARKER"],
+            "null": None,
+            "string": "UNTRUSTED_STRING_MARKER",
+            "number": 7,
+            "boolean": True,
+        }
+        bundle_inputs = {
+            "protocol": VALIDATOR.PROTOCOL_REL,
+            "population": VALIDATOR.POPULATION_REL,
+            "runtime_template": VALIDATOR.RUNTIME_REL,
+            "packet_vector": VALIDATOR.VECTOR_REL,
+            "lock_manifest": VALIDATOR.LOCK_REL,
+        }
+
+        for input_label, rel in bundle_inputs.items():
+            for shape, malformed in malformed_values.items():
+                with (
+                    self.subTest(input=input_label, shape=shape),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    copied_root = Path(temporary)
+                    self.copy_locked_bundle(copied_root)
+                    (copied_root / rel).write_text(
+                        json.dumps(malformed), encoding="utf-8"
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        result = VALIDATOR.main(["--root", str(copied_root)])
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(
+                        stderr.getvalue().strip(),
+                        "INCOMPATIBLE: protocol validation failed",
+                    )
+
+        for shape, malformed in malformed_values.items():
+            with (
+                self.subTest(input="runtime_config", shape=shape),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime_path = Path(temporary) / "runtime.json"
+                runtime_path.write_text(json.dumps(malformed), encoding="utf-8")
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = VALIDATOR.main(
+                        ["--root", str(ROOT), "--runtime-config", str(runtime_path)]
+                    )
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "INCOMPATIBLE: protocol validation failed",
+                )
+
     def test_locked_file_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             copied_root = Path(temporary)
@@ -1051,6 +1116,64 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                     stderr.getvalue().strip(),
                     "INCOMPATIBLE: protocol validation failed",
                 )
+
+    def test_unsafe_lock_paths_are_rejected_before_target_read(self) -> None:
+        cases = ("absolute", "parent", "non_normalized", "symlink_escape")
+        locked_rel = VALIDATOR.EXPECTED_LOCK_PATHS[0]
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                temporary_root = Path(temporary)
+                copied_root = temporary_root / "repo"
+                self.copy_locked_bundle(copied_root)
+                outside = temporary_root / "outside-target.txt"
+                outside.write_text(
+                    "outside target must never be opened", encoding="utf-8"
+                )
+                lock_path = copied_root / VALIDATOR.LOCK_REL
+                lock = VALIDATOR.load_json(lock_path)
+                entry_ordinal, entry = next(
+                    (ordinal, item)
+                    for ordinal, item in enumerate(lock["files"], 1)
+                    if item["path"] == locked_rel
+                )
+                locked_path = copied_root / locked_rel
+
+                if case == "absolute":
+                    entry["path"] = str(outside)
+                    forbidden = outside
+                elif case == "parent":
+                    entry["path"] = "../outside-target.txt"
+                    forbidden = outside
+                elif case == "non_normalized":
+                    entry["path"] = locked_rel.replace("/", "//", 1)
+                    forbidden = locked_path
+                else:
+                    locked_path.unlink()
+                    locked_path.symlink_to(outside)
+                    forbidden = outside
+
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                forbidden_resolved = forbidden.resolve(strict=True)
+                opened_forbidden: list[Path] = []
+                original_read_bytes = Path.read_bytes
+
+                def guarded_read_bytes(path: Path) -> bytes:
+                    if path.resolve(strict=True) == forbidden_resolved:
+                        opened_forbidden.append(path)
+                        raise AssertionError("unsafe lock target was opened")
+                    return original_read_bytes(path)
+
+                errors: list[str] = []
+                with mock.patch.object(Path, "read_bytes", guarded_read_bytes):
+                    VALIDATOR.validate_lock(copied_root, errors)
+                self.assertIn(
+                    f"lock entry {entry_ordinal} path is unsafe",
+                    errors,
+                )
+                self.assertEqual(opened_forbidden, [])
 
     def test_resealed_locked_file_with_common_credential_shape_fails_closed(
         self,

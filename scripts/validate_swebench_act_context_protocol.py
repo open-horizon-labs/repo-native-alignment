@@ -17,7 +17,7 @@ import sys
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 from math import comb
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -479,6 +479,13 @@ def load_json(path: Path) -> Any:
     return json.loads(
         path.read_text(encoding="utf-8"), object_pairs_hook=_object_no_duplicates
     )
+
+
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    value = load_json(path)
+    if type(value) is not dict:
+        raise ValueError(f"{label} must be a JSON object")
+    return value
 
 
 def canonical_json(value: Any) -> bytes:
@@ -3242,11 +3249,12 @@ def _lock_material(entries: list[dict[str, Any]]) -> bytes:
 
 
 def validate_lock(root: Path, errors: list[str]) -> str | None:
+    root = root.resolve()
     lock_path = root / LOCK_REL
     lock_bytes = lock_path.read_bytes()
     if SECRET_VALUE.search(lock_bytes.decode("utf-8", errors="ignore")):
         errors.append("credential-shaped value in lock manifest")
-    lock = load_json(lock_path)
+    lock = load_json_object(lock_path, "lock manifest")
     entries = lock.get("files", [])
     _require(
         errors,
@@ -3271,9 +3279,12 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     if not isinstance(entries, list):
         return None
     paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
-    _require(errors, paths == sorted(paths), "lock paths must be sorted")
-    _require(errors, len(paths) == len(set(paths)), "lock paths must be unique")
-    _require(errors, paths == list(EXPECTED_LOCK_PATHS), "lock path set drift")
+    paths_are_strings = all(type(path) is str for path in paths)
+    _require(errors, paths_are_strings, "lock paths must be strings")
+    if paths_are_strings:
+        _require(errors, paths == sorted(paths), "lock paths must be sorted")
+        _require(errors, len(paths) == len(set(paths)), "lock paths must be unique")
+        _require(errors, paths == list(EXPECTED_LOCK_PATHS), "lock path set drift")
     for entry_ordinal, entry in enumerate(entries, 1):
         _require(errors, isinstance(entry, dict), "lock file entry must be an object")
         if not isinstance(entry, dict):
@@ -3293,19 +3304,33 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
             bool(HEX64.fullmatch(str(entry.get("sha256", "")))),
             f"lock entry {entry_ordinal} digest is invalid",
         )
-        rel = Path(entry.get("path", ""))
-        _require(
-            errors,
-            not rel.is_absolute() and ".." not in rel.parts,
-            f"lock entry {entry_ordinal} path is unsafe",
-        )
-        path = root / rel
-        _require(
-            errors,
-            path.is_file(),
-            f"lock entry {entry_ordinal} file is missing",
-        )
+        raw_rel = entry.get("path")
+        if type(raw_rel) is not str:
+            errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            continue
+        rel = PurePosixPath(raw_rel)
+        if (
+            not rel.parts
+            or rel.is_absolute()
+            or ".." in rel.parts
+            or "\\" in raw_rel
+            or raw_rel != rel.as_posix()
+        ):
+            errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            continue
+        candidate = root.joinpath(*rel.parts)
+        try:
+            path = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            errors.append(f"lock entry {entry_ordinal} file is missing")
+            continue
+        try:
+            path.relative_to(root)
+        except ValueError:
+            errors.append(f"lock entry {entry_ordinal} path is unsafe")
+            continue
         if not path.is_file():
+            errors.append(f"lock entry {entry_ordinal} file is missing")
             continue
         data = path.read_bytes()
         _require(
@@ -3372,16 +3397,16 @@ def validate_bundle(
         "vendored parser digest drift",
     )
 
-    protocol = load_json(protocol_path)
-    population = load_json(population_path)
-    runtime_template = load_json(root / RUNTIME_REL)
-    vector = load_json(root / VECTOR_REL)
+    protocol = load_json_object(protocol_path, "protocol")
+    population = load_json_object(population_path, "population")
+    runtime_template = load_json_object(root / RUNTIME_REL, "runtime template")
+    vector = load_json_object(root / VECTOR_REL, "packet vector")
     validate_protocol(protocol, errors)
     validate_population(population, errors)
     validate_runtime(runtime_template, errors)
     runtime = runtime_template
     if runtime_config is not None:
-        runtime = load_json(runtime_config)
+        runtime = load_json_object(runtime_config, "runtime config")
         validate_runtime(
             runtime,
             errors,
@@ -3462,6 +3487,7 @@ def main(argv: list[str] | None = None) -> int:
         OSError,
         json.JSONDecodeError,
         DuplicateKey,
+        AttributeError,
         KeyError,
         TypeError,
         ValueError,
