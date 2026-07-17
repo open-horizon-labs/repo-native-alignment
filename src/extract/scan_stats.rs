@@ -61,6 +61,74 @@ pub enum LspStatus {
     Failed,
 }
 
+/// Durable evidence that readiness validation either processed a document or
+/// never reached a supported validation method. `symbol_count: Some(0)` is a
+/// successful processed-zero result; `None` is reserved for not-validated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspValidationStatus {
+    Processed,
+    NotValidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LspValidationEvidence {
+    pub language: String,
+    pub server_name: String,
+    pub status: LspValidationStatus,
+    pub method: Option<String>,
+    pub symbol_count: Option<usize>,
+    pub detail: Option<String>,
+}
+
+impl LspValidationEvidence {
+    pub fn processed(
+        language: impl Into<String>,
+        server_name: impl Into<String>,
+        method: impl Into<String>,
+        symbol_count: usize,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            server_name: server_name.into(),
+            status: LspValidationStatus::Processed,
+            method: Some(method.into()),
+            symbol_count: Some(symbol_count),
+            detail: None,
+        }
+    }
+
+    pub fn not_validated(
+        language: impl Into<String>,
+        server_name: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            server_name: server_name.into(),
+            status: LspValidationStatus::NotValidated,
+            method: None,
+            symbol_count: None,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match (&self.status, self.method.as_deref(), self.symbol_count) {
+            (LspValidationStatus::Processed, Some(method), Some(count)) => {
+                format!("processed via {method} ({count} symbols)")
+            }
+            _ => format!(
+                "not validated{}",
+                self.detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for LspStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -85,6 +153,7 @@ pub struct LspEnrichmentEntry {
     pub status: LspStatus,
     pub remediation: Option<String>,
     pub query_metrics: Vec<crate::extract::lsp::LspQueryMetric>,
+    pub validation: Option<LspValidationEvidence>,
 }
 
 impl LspEnrichmentEntry {
@@ -144,6 +213,10 @@ impl LspEnrichmentEntry {
                 " -- query yield {non_empty}/{scheduled} non-empty"
             ));
         }
+        if let Some(validation) = &self.validation {
+            line.push_str(" -- validation ");
+            line.push_str(&validation.summary());
+        }
         line
     }
 }
@@ -176,6 +249,9 @@ pub struct LspLanguageStats {
     pub remediation: Option<String>,
     /// Query-yield measurements grouped by operation and declaration class.
     pub query_metrics: Vec<crate::extract::lsp::LspQueryMetric>,
+    /// Capability-driven readiness evidence. `Some(0)` symbols means the
+    /// server processed the validation request successfully and found none.
+    pub validation: Option<LspValidationEvidence>,
 }
 
 /// Per-root stats populated after `RootExtracted`.
@@ -401,6 +477,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 aborted,
                 server_missing,
                 remediation,
+                validation,
                 ..
             } => {
                 // Remove from in-flight.
@@ -443,14 +520,19 @@ impl ExtractionConsumer for ScanStatsConsumer {
                             server_missing: *server_missing,
                             remediation: remediation.clone(),
                             query_metrics: Vec::new(),
+                            validation: validation.clone(),
                         },
                     );
                 }
                 tracing::debug!(
-                    "ScanStatsConsumer: EnrichmentComplete '{}' for '{}': {} LSP edges",
+                    "ScanStatsConsumer: EnrichmentComplete '{}' for '{}': {} LSP edges, validation={}",
                     language,
                     slug,
                     added_edges.len(),
+                    validation
+                        .as_ref()
+                        .map(LspValidationEvidence::summary)
+                        .unwrap_or_else(|| "not recorded".to_string()),
                 );
             }
 
@@ -652,6 +734,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         })
         .await
         .unwrap();
@@ -721,6 +804,12 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: Some(LspValidationEvidence::processed(
+                "rust",
+                "rust-analyzer",
+                "workspace/symbol",
+                0,
+            )),
         })
         .await
         .unwrap();
@@ -734,6 +823,12 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(count, 3, "lsp_edge_count should reflect added_edges length");
+        let validation = stats.lsp_stats["api"]["rust"]
+            .validation
+            .as_ref()
+            .expect("validation evidence should be delivered");
+        assert_eq!(validation.status, LspValidationStatus::Processed);
+        assert_eq!(validation.symbol_count, Some(0));
     }
 
     #[tokio::test]
@@ -775,6 +870,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         })
         .await
         .unwrap();
@@ -856,6 +952,7 @@ mod tests {
                 remediation: None,
                 aborted: false,
                 diagnostic: None,
+                validation: None,
             })
             .await;
         assert!(
@@ -922,6 +1019,11 @@ mod tests {
             remediation: Some("fix rust".to_string()),
             aborted: true,
             diagnostic: Some("forced abort".to_string()),
+            validation: Some(LspValidationEvidence::not_validated(
+                "rust",
+                "rust-analyzer",
+                "forced abort",
+            )),
         })
         .await
         .unwrap();
@@ -938,6 +1040,12 @@ mod tests {
         assert_eq!(lsp.node_count, 0);
         assert_eq!(lsp.error_count, 5);
         assert!(lsp.aborted);
+        let validation = lsp
+            .validation
+            .as_ref()
+            .expect("not-validated evidence should be delivered");
+        assert_eq!(validation.status, LspValidationStatus::NotValidated);
+        assert_eq!(validation.symbol_count, None);
         // Duration is non-zero because LanguageDetected fires before EnrichmentComplete.
         // (In practice the test runs so fast this may be 0, so just assert it parsed.)
         let _ = lsp.duration;
@@ -958,6 +1066,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         })
         .await
         .unwrap();
@@ -1006,6 +1115,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         })
         .await
         .unwrap();
@@ -1030,11 +1140,18 @@ mod tests {
             status: LspStatus::Ok,
             remediation: None,
             query_metrics: Vec::new(),
+            validation: Some(LspValidationEvidence::processed(
+                "rust",
+                "rust-analyzer",
+                "textDocument/documentSymbol",
+                0,
+            )),
         };
         let l = e.summary_line();
         assert!(l.contains("rust (rust-analyzer)"));
         assert!(l.contains("OK"));
         assert!(l.contains("150 edges"));
+        assert!(l.contains("processed via textDocument/documentSymbol (0 symbols)"));
     }
 
     #[test]
@@ -1050,6 +1167,7 @@ mod tests {
             status: LspStatus::NotFound,
             remediation: Some("install json ls".to_string()),
             query_metrics: Vec::new(),
+            validation: None,
         };
         let line = e.summary_line();
         assert!(line.contains("not found"));

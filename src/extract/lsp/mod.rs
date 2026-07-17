@@ -25,7 +25,7 @@ pub(crate) use policy::{LspBroadReferenceBudget, LspBroadReferenceBudgetSnapshot
 use policy::{LspQueryProfile, LspServerCapabilities};
 mod transport;
 pub(crate) mod work_items;
-use transport::{LspTransport, PipelinedTransport, path_to_uri};
+use transport::{LspTransport, PipelinedTransport, is_method_not_found, path_to_uri};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,8 @@ use tokio::sync::Mutex;
 
 use lsp_types::{
     ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    InitializeResult, Location, Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    InitializeResult, Location, OneOf, Position, ServerCapabilities, TextDocumentIdentifier,
+    TextDocumentPositionParams, Uri,
 };
 
 use super::{Enricher, EnrichmentResult};
@@ -374,6 +375,10 @@ struct LspState {
     /// Whether the language server supports inlay hints
     /// (`textDocument/inlayHint`, LSP 3.17+).
     has_inlay_hints: bool,
+    /// Exact capabilities retained from the initialize response.
+    server_capabilities: Option<ServerCapabilities>,
+    /// Capability-driven readiness proof for this server.
+    validation_evidence: Option<crate::extract::scan_stats::LspValidationEvidence>,
     /// Whether the server reached quiescent=true during initialization.
     /// When false, the quiescence deadline expired before the server finished
     /// indexing. In that case Pass 3 (diagnostics) is skipped to avoid flooding
@@ -412,6 +417,167 @@ const ZERO_EDGE_MIN_WARMUP: std::time::Duration = std::time::Duration::from_secs
 /// node-count threshold can take 100+ minutes. This caps the wait at 2 minutes.
 const ZERO_EDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+const READINESS_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessValidationMethod {
+    WorkspaceSymbol,
+    DocumentSymbol,
+}
+
+impl ReadinessValidationMethod {
+    fn method(self) -> &'static str {
+        match self {
+            Self::WorkspaceSymbol => "workspace/symbol",
+            Self::DocumentSymbol => "textDocument/documentSymbol",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadinessValidationCapabilities {
+    workspace_symbols: bool,
+    document_symbols: bool,
+}
+
+impl ReadinessValidationCapabilities {
+    fn from_server_capabilities(capabilities: &ServerCapabilities) -> Self {
+        Self {
+            workspace_symbols: provider_is_enabled(&capabilities.workspace_symbol_provider),
+            document_symbols: provider_is_enabled(&capabilities.document_symbol_provider),
+        }
+    }
+
+    fn primary(self) -> Option<ReadinessValidationMethod> {
+        if self.workspace_symbols {
+            Some(ReadinessValidationMethod::WorkspaceSymbol)
+        } else if self.document_symbols {
+            Some(ReadinessValidationMethod::DocumentSymbol)
+        } else {
+            None
+        }
+    }
+}
+
+fn provider_is_enabled<T>(provider: &Option<OneOf<bool, T>>) -> bool {
+    match provider {
+        Some(OneOf::Left(enabled)) => *enabled,
+        Some(OneOf::Right(_)) => true,
+        None => false,
+    }
+}
+
+#[async_trait::async_trait]
+trait ReadinessRequester: Send {
+    async fn readiness_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value>;
+}
+
+#[async_trait::async_trait]
+impl ReadinessRequester for LspTransport {
+    async fn readiness_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.request(method, params).await
+    }
+}
+
+async fn execute_readiness_validation(
+    requester: &mut dyn ReadinessRequester,
+    method: ReadinessValidationMethod,
+    warmup_uri: Option<&str>,
+    workspace_query: &str,
+    timeout: tokio::time::Duration,
+) -> Result<usize> {
+    let params = match method {
+        ReadinessValidationMethod::WorkspaceSymbol => {
+            serde_json::json!({ "query": workspace_query })
+        }
+        ReadinessValidationMethod::DocumentSymbol => {
+            let uri = warmup_uri.context(
+                "server advertises documentSymbol validation but no deterministic warm-up file was available",
+            )?;
+            serde_json::json!({ "textDocument": { "uri": uri } })
+        }
+    };
+    match tokio::time::timeout(
+        timeout,
+        requester.readiness_request(method.method(), params),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response.as_array().map_or(0, Vec::len)),
+        Ok(Err(error)) if is_method_not_found(&error) => Err(anyhow::anyhow!(
+            "server advertised {} but returned unsupported method (-32601)",
+            method.method()
+        )),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "server advertised {} but validation failed: {}",
+            method.method(),
+            error
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "server advertised {} but validation timed out after {}ms",
+            method.method(),
+            timeout.as_millis()
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadinessValidationResult {
+    method: ReadinessValidationMethod,
+    symbol_count: usize,
+}
+
+async fn execute_indexing_validation_once(
+    requester: &mut dyn ReadinessRequester,
+    capabilities: ReadinessValidationCapabilities,
+    warmup_uri: Option<&str>,
+    workspace_query: &str,
+    timeout: tokio::time::Duration,
+) -> Result<Option<ReadinessValidationResult>> {
+    let Some(primary) = capabilities.primary() else {
+        return Err(anyhow::anyhow!(
+            "server advertises neither workspace/symbol nor textDocument/documentSymbol"
+        ));
+    };
+    let primary_count = execute_readiness_validation(
+        requester,
+        primary,
+        warmup_uri,
+        workspace_query,
+        timeout,
+    )
+    .await?;
+    if primary == ReadinessValidationMethod::DocumentSymbol || primary_count > 0 {
+        return Ok(Some(ReadinessValidationResult {
+            method: primary,
+            symbol_count: primary_count,
+        }));
+    }
+    if capabilities.document_symbols {
+        let symbol_count = execute_readiness_validation(
+            requester,
+            ReadinessValidationMethod::DocumentSymbol,
+            warmup_uri,
+            "",
+            timeout,
+        )
+        .await?;
+        return Ok(Some(ReadinessValidationResult {
+            method: ReadinessValidationMethod::DocumentSymbol,
+            symbol_count,
+        }));
+    }
+    Ok(None)
+}
+
 impl LspEnricher {
     /// Create a new LSP enricher for the given language server.
     ///
@@ -447,6 +613,8 @@ impl LspEnricher {
                 has_document_links: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
+                server_capabilities: None,
+                validation_evidence: None,
                 was_quiescent: false,
                 type_hierarchy_strikes: 0,
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -664,9 +832,13 @@ impl LspEnricher {
             if depth > 4 {
                 return None;
             }
-            let entries = std::fs::read_dir(dir).ok()?;
+            let mut entries = std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
             let mut subdirs = Vec::new();
-            for entry in entries.flatten() {
+            for entry in entries {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with('.')
@@ -730,7 +902,7 @@ impl LspEnricher {
         walk(root, &extensions, 0)
     }
 
-    fn lsp_language_id_for_path(&self, path: &Path) -> &'static str {
+    fn lsp_language_id_for_path<'a>(&'a self, path: &Path) -> &'a str {
         match path.extension().and_then(|e| e.to_str()) {
             Some("py") => "python",
             Some("ts") => "typescript",
@@ -744,7 +916,7 @@ impl LspEnricher {
                 "typescript" | "deno" => "typescript",
                 "rust" => "rust",
                 "go" => "go",
-                _ => "plaintext",
+                language => language,
             },
         }
     }
@@ -791,6 +963,8 @@ impl LspEnricher {
         if state.pipelined.is_none() {
             state.transport.take();
             state.root_path = None;
+            state.server_capabilities = None;
+            state.validation_evidence = None;
         }
     }
 
@@ -1010,6 +1184,9 @@ impl LspEnricher {
 
         let init_result_parsed: InitializeResult =
             serde_json::from_value(init_result).context("Failed to parse initialize result")?;
+        let server_capabilities = init_result_parsed.capabilities.clone();
+        let validation_capabilities =
+            ReadinessValidationCapabilities::from_server_capabilities(&server_capabilities);
 
         let has_references = init_result_parsed
             .capabilities
@@ -1024,7 +1201,7 @@ impl LspEnricher {
             .document_link_provider
             .is_some();
         tracing::info!(
-            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}",
+            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, document_links={}, pull_diagnostics={}, inlay_hints={}, workspace_symbols={}, document_symbols={}",
             self.server_command,
             has_references,
             has_call_hierarchy,
@@ -1032,7 +1209,9 @@ impl LspEnricher {
             has_type_hierarchy,
             has_document_links,
             has_pull_diagnostics,
-            has_inlay_hints
+            has_inlay_hints,
+            validation_capabilities.workspace_symbols,
+            validation_capabilities.document_symbols
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
@@ -1042,6 +1221,8 @@ impl LspEnricher {
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
         state.has_inlay_hints = has_inlay_hints;
+        state.server_capabilities = Some(server_capabilities);
+        state.validation_evidence = None;
 
         // Send initialized notification
         let transport = state.transport.as_mut().unwrap();
@@ -1077,6 +1258,19 @@ impl LspEnricher {
             } else {
                 None
             };
+
+        let readiness_method = validation_capabilities.primary().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} advertises neither workspace/symbol nor textDocument/documentSymbol; readiness was not validated",
+                self.server_command
+            )
+        })?;
+        if readiness_method == ReadinessValidationMethod::DocumentSymbol && warmup_uri.is_none() {
+            return Err(anyhow::anyhow!(
+                "{} advertises documentSymbol but no deterministic included warm-up file was available; readiness was not validated",
+                self.server_command
+            ));
+        }
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
@@ -1137,6 +1331,7 @@ impl LspEnricher {
         // by sending workspace/symbol with non-empty queries. A server that responds
         // to probes but returns 0 symbols for real queries hasn't finished indexing.
         let mut server_responsive = false;
+        let mut validation_evidence = None;
 
         while tokio::time::Instant::now() < circuit_breaker {
             let elapsed = start.elapsed().as_secs();
@@ -1203,6 +1398,14 @@ impl LspEnricher {
                                 // not about compilation health (which may be "warning" or "error").
                                 if quiescent {
                                     saw_quiescent = true;
+                                    validation_evidence = Some(
+                                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                                            self.language.clone(),
+                                            self.server_command.clone(),
+                                            "experimental/serverStatus",
+                                            0,
+                                        ),
+                                    );
                                 }
 
                                 if Self::server_status_is_ready(&msg) {
@@ -1274,31 +1477,46 @@ impl LspEnricher {
                         continue;
                     }
 
-                    // No serverStatus — use the probe strategy.
-                    // Send a lightweight workspace/symbol request to test responsiveness.
-                    // An empty query returns quickly and is safe on all LSP servers.
+                    // No serverStatus — probe only an advertised validation method.
                     if tokio::time::Instant::now() >= next_probe {
                         // Schedule next probe from probe start so cadence is ~5s regardless
                         // of whether the probe request itself times out or succeeds quickly.
                         next_probe =
                             tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
 
-                        let probe_result = tokio::time::timeout(
+                        let symbol_count = execute_readiness_validation(
+                            transport,
+                            readiness_method,
+                            warmup_uri.as_deref(),
+                            "",
                             tokio::time::Duration::from_secs(5),
-                            transport
-                                .request("workspace/symbol", serde_json::json!({ "query": "" })),
                         )
-                        .await;
+                        .await
+                        .with_context(|| {
+                            format!("{} readiness probe failed", self.server_command)
+                        })?;
 
-                        match probe_result {
-                            Ok(Ok(_)) | Ok(Err(_)) => {
-                                if let Ok(Err(e)) = &probe_result {
-                                    tracing::debug!(
-                                        "{} probe returned error (server responsive): {}",
-                                        self.server_command,
-                                        e
-                                    );
-                                }
+                        match readiness_method {
+                            ReadinessValidationMethod::DocumentSymbol => {
+                                validation_evidence =
+                                    Some(crate::extract::scan_stats::LspValidationEvidence::processed(
+                                        self.language.clone(),
+                                        self.server_command.clone(),
+                                        readiness_method.method(),
+                                        symbol_count,
+                                    ));
+                                server_responsive = true;
+                                server_ready = true;
+                                saw_quiescent = true;
+                                tracing::info!(
+                                    "{} indexing validated via documentSymbol: {} symbols in deterministic warm-up file ({}s elapsed)",
+                                    self.server_command,
+                                    symbol_count,
+                                    elapsed
+                                );
+                                break;
+                            }
+                            ReadinessValidationMethod::WorkspaceSymbol => {
                                 probe_success_count += 1;
                                 if probe_success_count >= 2 {
                                     server_responsive = true;
@@ -1313,15 +1531,6 @@ impl LspEnricher {
                                     "{} probe {}/2 succeeded ({}s elapsed), waiting for second confirmation...",
                                     self.server_command,
                                     probe_success_count,
-                                    elapsed
-                                );
-                            }
-                            Err(_) => {
-                                // Probe timed out — server still starting up.
-                                probe_success_count = 0;
-                                tracing::debug!(
-                                    "{} probe timed out ({}s elapsed), server still starting...",
-                                    self.server_command,
                                     elapsed
                                 );
                             }
@@ -1414,6 +1623,14 @@ impl LspEnricher {
                                 );
                                 server_ready = true;
                                 saw_quiescent = true;
+                                validation_evidence = Some(
+                                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                                        self.language.clone(),
+                                        self.server_command.clone(),
+                                        "experimental/serverStatus",
+                                        0,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -1424,99 +1641,48 @@ impl LspEnricher {
                     break;
                 }
 
-                let validation_result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    transport.request("workspace/symbol", serde_json::json!({ "query": query })),
-                )
-                .await;
-
                 let elapsed = start.elapsed().as_secs();
-
-                match validation_result {
-                    Ok(Ok(ref response)) => {
-                        let symbol_count = response.as_array().map(|a| a.len()).unwrap_or(0);
-                        if symbol_count > 0 {
-                            tracing::info!(
-                                "{} indexing validated: workspace/symbol(\"{}\") returned {} symbols ({}s elapsed)",
-                                self.server_command,
-                                query,
-                                symbol_count,
-                                elapsed
-                            );
-                            server_ready = true;
-                            saw_quiescent = true;
-                            break;
-                        }
-                        // workspace/symbol returned 0 — try documentSymbol on the
-                        // warmup file as a fallback. pyright's workspace/symbol
-                        // is unreliable (returns 0 even when fully indexed), but
-                        // documentSymbol works.
-                        if let Some(ref uri) = warmup_uri {
-                            let doc_result = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(10),
-                                transport.request(
-                                    "textDocument/documentSymbol",
-                                    serde_json::json!({
-                                        "textDocument": { "uri": uri }
-                                    }),
-                                ),
-                            )
-                            .await;
-                            if let Ok(Ok(ref resp)) = doc_result {
-                                let doc_count = resp.as_array().map(|a| a.len()).unwrap_or(0);
-                                if doc_count > 0 {
-                                    tracing::info!(
-                                        "{} indexing validated via documentSymbol fallback: {} symbols in warmup file ({}s elapsed)",
-                                        self.server_command,
-                                        doc_count,
-                                        elapsed
-                                    );
-                                    server_ready = true;
-                                    saw_quiescent = true;
-                                    break;
-                                }
-                            }
-                        }
-                        consecutive_empty += 1;
-                        tracing::info!(
-                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
-                            self.server_command,
-                            attempt,
-                            MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query,
-                            elapsed,
-                            validation_delay.as_secs()
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        // Error response — the server is responsive but the query
-                        // may not be supported. Count it as non-indexed.
-                        consecutive_empty += 1;
-                        tracing::info!(
-                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned error: {} ({}s elapsed)",
-                            self.server_command,
-                            attempt,
-                            MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query,
-                            e,
-                            elapsed
-                        );
-                    }
-                    Err(_) => {
-                        // Timeout — server is busy indexing. Do NOT count toward
-                        // consecutive_empty: a timeout means the server is actively
-                        // working (not that it returned empty results). Let the
-                        // attempt counter and circuit breaker handle slow servers.
-                        tracing::info!(
-                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed, not counting as empty)",
-                            self.server_command,
-                            attempt,
-                            MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query,
-                            elapsed
-                        );
-                    }
+                if let Some(validation) = execute_indexing_validation_once(
+                    transport,
+                    validation_capabilities,
+                    warmup_uri.as_deref(),
+                    query,
+                    READINESS_REQUEST_TIMEOUT,
+                )
+                .await
+                .with_context(|| {
+                    format!("{} indexing validation failed", self.server_command)
+                })? {
+                    tracing::info!(
+                        "{} indexing validated via {}: {} symbols ({}s elapsed)",
+                        self.server_command,
+                        validation.method.method(),
+                        validation.symbol_count,
+                        elapsed
+                    );
+                    validation_evidence = Some(
+                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                            self.language.clone(),
+                            self.server_command.clone(),
+                            validation.method.method(),
+                            validation.symbol_count,
+                        ),
+                    );
+                    server_ready = true;
+                    saw_quiescent = true;
+                    break;
                 }
+
+                consecutive_empty += 1;
+                tracing::info!(
+                    "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
+                    self.server_command,
+                    attempt,
+                    MAX_INDEXING_VALIDATION_ATTEMPTS,
+                    query,
+                    elapsed,
+                    validation_delay.as_secs()
+                );
 
                 // After consecutive empty responses on different queries,
                 // the server may not have finished indexing yet. Only bail
@@ -1578,6 +1744,13 @@ impl LspEnricher {
         // on validation (e.g., pyright before indexing completes) is NOT treated
         // as quiescent — Pass 1 and Pass 3 would produce 0 edges.
         state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+        state.validation_evidence = Some(validation_evidence.unwrap_or_else(|| {
+            crate::extract::scan_stats::LspValidationEvidence::not_validated(
+                self.language.clone(),
+                self.server_command.clone(),
+                "server did not complete an advertised readiness validation method",
+            )
+        }));
         if !state.was_quiescent {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
@@ -2771,6 +2944,7 @@ impl Enricher for LspEnricher {
             has_pull_diagnostics,
             has_inlay_hints,
             was_quiescent,
+            validation_evidence,
             diag_sink,
         ) = {
             let state = self.state.lock().await;
@@ -2796,9 +2970,18 @@ impl Enricher for LspEnricher {
                 state.has_pull_diagnostics,
                 state.has_inlay_hints,
                 was_quiescent,
+                state.validation_evidence.clone(),
                 diag_sink,
             )
         };
+        result.lsp_validation = validation_evidence;
+        if let Some(validation) = result.lsp_validation.as_ref() {
+            tracing::info!(
+                "{} readiness validation evidence: {}",
+                self.server_command,
+                validation.summary()
+            );
+        }
 
         // Pass 0: crate-level dependency graph (Rust only, no quiescence needed)
         if let Err(detail) = self
@@ -3003,11 +3186,228 @@ impl Enricher for LspEnricher {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::str::FromStr;
 
-    use super::transport::{find_enclosing_symbol, uri_to_relative_path};
+    use super::transport::{LspRpcError, find_enclosing_symbol, uri_to_relative_path};
     use super::*;
+
+    enum ValidationFixtureResponse {
+        Success(serde_json::Value),
+        RpcError(i64),
+        Crash,
+        Timeout,
+    }
+
+    struct ValidationFixture {
+        responses: VecDeque<ValidationFixtureResponse>,
+        calls: Vec<String>,
+    }
+
+    impl ValidationFixture {
+        fn new(responses: impl IntoIterator<Item = ValidationFixtureResponse>) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadinessRequester for ValidationFixture {
+        async fn readiness_request(
+            &mut self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            self.calls.push(method.to_string());
+            match self.responses.pop_front().expect("fixture response") {
+                ValidationFixtureResponse::Success(value) => Ok(value),
+                ValidationFixtureResponse::RpcError(code) => {
+                    Err(LspRpcError::new(code, "fixture RPC error").into())
+                }
+                ValidationFixtureResponse::Crash => Err(anyhow::anyhow!("server exited")),
+                ValidationFixtureResponse::Timeout => {
+                    std::future::pending::<Result<serde_json::Value>>().await
+                }
+            }
+        }
+    }
+
+    fn validation_capabilities(
+        workspace_symbols: bool,
+        document_symbols: bool,
+    ) -> ReadinessValidationCapabilities {
+        ReadinessValidationCapabilities {
+            workspace_symbols,
+            document_symbols,
+        }
+    }
+
+    fn parsed_validation_capabilities(
+        initialize_result: serde_json::Value,
+    ) -> ReadinessValidationCapabilities {
+        let result: InitializeResult =
+            serde_json::from_value(initialize_result).expect("valid initialize fixture");
+        ReadinessValidationCapabilities::from_server_capabilities(&result.capabilities)
+    }
+
+    #[tokio::test]
+    async fn readiness_absent_or_false_workspace_capability_uses_only_document_symbols() {
+        let absent = parsed_validation_capabilities(
+            serde_json::json!({"capabilities": {"documentSymbolProvider": true}}),
+        );
+        let explicit_false = parsed_validation_capabilities(
+            serde_json::json!({"capabilities": {
+                "workspaceSymbolProvider": false,
+                "documentSymbolProvider": {"label": "supported"}
+            }}),
+        );
+        assert_eq!(absent.primary(), Some(ReadinessValidationMethod::DocumentSymbol));
+        assert_eq!(
+            explicit_false.primary(),
+            Some(ReadinessValidationMethod::DocumentSymbol)
+        );
+
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(
+            serde_json::json!([]),
+        )]);
+        let outcome = execute_indexing_validation_once(
+            &mut fixture,
+            explicit_false,
+            Some("file:///fixture.json"),
+            "main",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("document validation should succeed")
+        .expect("document validation is terminal");
+        assert_eq!(outcome.method, ReadinessValidationMethod::DocumentSymbol);
+        assert_eq!(fixture.calls, ["textDocument/documentSymbol"]);
+    }
+
+    #[tokio::test]
+    async fn readiness_document_symbol_fallback_is_deterministic_and_accepts_zero_symbols() {
+        let mut fixture = ValidationFixture::new([
+            ValidationFixtureResponse::Success(serde_json::json!([])),
+            ValidationFixtureResponse::Success(serde_json::json!([])),
+        ]);
+        let outcome = execute_indexing_validation_once(
+            &mut fixture,
+            validation_capabilities(true, true),
+            Some("file:///fixture.html"),
+            "main",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("fallback should succeed")
+        .expect("fallback should be terminal");
+        assert_eq!(outcome.method, ReadinessValidationMethod::DocumentSymbol);
+        assert_eq!(outcome.symbol_count, 0);
+        assert_eq!(
+            fixture.calls,
+            ["workspace/symbol", "textDocument/documentSymbol"]
+        );
+
+        let evidence = crate::extract::scan_stats::LspValidationEvidence::processed(
+            "html",
+            "fixture-server",
+            outcome.method.method(),
+            outcome.symbol_count,
+        );
+        assert_eq!(evidence.symbol_count, Some(0));
+        assert!(evidence.summary().contains("processed"));
+    }
+
+    #[tokio::test]
+    async fn readiness_workspace_symbol_server_uses_advertised_method() {
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(
+            serde_json::json!([{"name": "one"}, {"name": "two"}]),
+        )]);
+        let outcome = execute_indexing_validation_once(
+            &mut fixture,
+            validation_capabilities(true, false),
+            None,
+            "main",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("workspace validation should succeed")
+        .expect("non-empty workspace symbols should be terminal");
+        assert_eq!(outcome.method, ReadinessValidationMethod::WorkspaceSymbol);
+        assert_eq!(outcome.symbol_count, 2);
+        assert_eq!(fixture.calls, ["workspace/symbol"]);
+    }
+
+    #[tokio::test]
+    async fn readiness_method_not_found_fails_immediately_without_retry() {
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::RpcError(-32601)]);
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            execute_indexing_validation_once(
+                &mut fixture,
+                validation_capabilities(true, false),
+                None,
+                "main",
+                tokio::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("-32601 must complete within the deterministic 50ms bound");
+        let error = result.expect_err("advertised unsupported method is a hard error");
+        assert!(error.to_string().contains("-32601"));
+        assert_eq!(fixture.calls, ["workspace/symbol"]);
+    }
+
+    #[tokio::test]
+    async fn readiness_advertised_capability_crash_is_a_hard_error() {
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Crash]);
+        let error = execute_indexing_validation_once(
+            &mut fixture,
+            validation_capabilities(false, true),
+            Some("file:///fixture.json"),
+            "",
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("server crash must not become success");
+        assert!(error.to_string().contains("validation failed"));
+    }
+
+    #[tokio::test]
+    async fn readiness_advertised_capability_timeout_is_a_hard_error() {
+        let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Timeout]);
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            execute_indexing_validation_once(
+                &mut fixture,
+                validation_capabilities(false, true),
+                Some("file:///fixture.json"),
+                "",
+                tokio::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("fixture timeout must stay within the deterministic 100ms bound");
+        let error = result.expect_err("timeout must not become success");
+        assert!(error.to_string().contains("timed out after 10ms"));
+    }
+
+    #[test]
+    fn readiness_warmup_file_selection_is_deterministic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("z.json"), "{}").unwrap();
+        std::fs::write(temp.path().join("a.json"), "{}").unwrap();
+        let enricher = LspEnricher::new("json", "fixture-server", &[], &["json"]);
+        assert_eq!(
+            enricher
+                .find_warmup_file(temp.path())
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "a.json"
+        );
+    }
 
     /// Verify the Enricher trait can be implemented (compile-time check).
     #[tokio::test]

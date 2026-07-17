@@ -125,6 +125,9 @@ pub enum ExtractionEvent {
         aborted: bool,
         /// Actionable failure detail for a degraded/aborted completion.
         diagnostic: Option<String>,
+        /// Capability-driven validation evidence. A processed result may carry
+        /// `symbol_count = Some(0)`; absence means validation did not run.
+        validation: Option<crate::extract::scan_stats::LspValidationEvidence>,
     },
 
     /// Query-yield measurements emitted separately from graph enrichment output.
@@ -1421,6 +1424,7 @@ mod tests {
                 server_missing: false,
                 remediation: None,
                 diagnostic: None,
+                validation: None,
             }
         };
 

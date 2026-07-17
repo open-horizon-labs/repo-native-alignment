@@ -260,6 +260,12 @@ pub fn list_roots_from_slugs(
                     if ls.aborted {
                         detail_parts.push("aborted".to_string());
                     }
+                    detail_parts.push(
+                        ls.validation
+                            .as_ref()
+                            .map(|validation| format!("validation {}", validation.summary()))
+                            .unwrap_or_else(|| "validation not recorded".to_string()),
+                    );
                     if let Some(remediation) = &ls.remediation
                         && (ls.server_missing || ls.aborted || ls.error_count > 0)
                     {
@@ -1347,6 +1353,14 @@ mod tests {
                     timeouts: 1,
                     errors: 2,
                 }],
+                validation: Some(
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "rust",
+                        "rust-analyzer",
+                        "textDocument/documentSymbol",
+                        0,
+                    ),
+                ),
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1375,6 +1389,11 @@ mod tests {
         assert!(
             result.contains("45s"),
             "should show duration, got: {}",
+            result
+        );
+        assert!(
+            result.contains("validation processed via textDocument/documentSymbol (0 symbols)"),
+            "should distinguish processed-zero validation, got: {}",
             result
         );
         assert!(
@@ -1426,6 +1445,13 @@ mod tests {
                 server_missing: false,
                 remediation: Some("install pyright".to_string()),
                 query_metrics: Vec::new(),
+                validation: Some(
+                    crate::extract::scan_stats::LspValidationEvidence::not_validated(
+                        "python",
+                        "pyright-langserver",
+                        "server exited before validation",
+                    ),
+                ),
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
@@ -1459,6 +1485,11 @@ mod tests {
         assert!(
             result.contains("2m"),
             "should show duration, got: {}",
+            result
+        );
+        assert!(
+            result.contains("validation not validated: server exited before validation"),
+            "should expose not-validated evidence, got: {}",
             result
         );
     }
@@ -1501,6 +1532,7 @@ mod tests {
                 server_missing: false,
                 remediation: None,
                 query_metrics: Vec::new(),
+                validation: None,
             },
         );
         stats.lsp_stats.insert(primary_slug.clone(), root_lsp);

@@ -1576,6 +1576,7 @@ impl ExtractionConsumer for LspConsumer {
                         remediation: self.enricher.toolchain_remediation().map(str::to_string),
                         aborted: enrichment.aborted,
                         diagnostic: enrichment.diagnostic,
+                        validation: enrichment.lsp_validation,
                     },
                     ExtractionEvent::LspQueryMetrics {
                         slug: slug.clone(),
@@ -1623,6 +1624,13 @@ impl ExtractionConsumer for LspConsumer {
                         slug,
                         err_text
                     )),
+                    validation: Some(
+                        crate::extract::scan_stats::LspValidationEvidence::not_validated(
+                            self.language.clone(),
+                            self.enricher.name(),
+                            err_text,
+                        ),
+                    ),
                 }])
             }
         }
@@ -2925,6 +2933,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let finished = gate.on_event(&complete).await.unwrap();
         assert_eq!(finished.len(), 1);
@@ -3856,6 +3865,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         assert_eq!(
@@ -3939,6 +3949,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         // Should fire now: expected=1 (rust), received=1 (rust).
@@ -4020,6 +4031,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
         assert!(
@@ -4040,6 +4052,7 @@ mod tests {
             remediation: None,
             aborted: false,
             diagnostic: None,
+            validation: None,
         };
         let result = gate.on_event(&python_done).await.unwrap();
         assert_eq!(

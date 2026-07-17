@@ -145,7 +145,13 @@ fn build_pipeline_operation_report(
     report
 }
 
-type LspBusOutput = (Vec<Node>, Vec<Edge>, HashSet<String>, Vec<String>);
+type LspBusOutput = (
+    Vec<Node>,
+    Vec<Edge>,
+    HashSet<String>,
+    Vec<String>,
+    Vec<crate::extract::scan_stats::LspValidationEvidence>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrichmentContinuation {
@@ -314,6 +320,7 @@ fn lsp_evidence(
     declared_node_count: usize,
     budget: Option<&crate::extract::lsp::LspBroadReferenceBudgetSnapshot>,
     detail: Option<String>,
+    validations: Vec<crate::extract::scan_stats::LspValidationEvidence>,
 ) -> LspEvidenceCoverage {
     LspEvidenceCoverage {
         readiness,
@@ -325,6 +332,7 @@ fn lsp_evidence(
         elapsed_ms: budget.map_or(0, |snapshot| snapshot.elapsed_ms),
         circuit_open: budget.is_some_and(|snapshot| snapshot.circuit_open),
         detail,
+        validations,
     }
 }
 
@@ -407,6 +415,7 @@ fn plan_explicit_lsp_scope(
 async fn emit_lsp_pipeline_with_budget(
     input: LspPipelineInput,
 ) -> Result<LspBusOutput, LspPipelineFailure> {
+    let scan_stats = Arc::clone(&input.scan_stats);
     let fut = crate::extract::consumers::emit_enrichment_pipeline(
         input.nodes,
         input.edges,
@@ -425,14 +434,22 @@ async fn emit_lsp_pipeline_with_budget(
         input.dirty_slugs,
     );
 
-    if input.skip_lsp {
-        return fut.await.map_err(LspPipelineFailure);
-    }
-
     // The LSP work-item/pass layer owns its timeout and abort diagnostics. Wrapping the
     // entire event bus in `timeout` drops the future before AllEnrichmentsDone and
     // PassesComplete can preserve partial output, violating the finalization contract.
-    fut.await.map_err(LspPipelineFailure)
+    let (nodes, edges, frameworks, diagnostics) = fut.await.map_err(LspPipelineFailure)?;
+    let mut validations = scan_stats
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .lsp_stats
+        .values()
+        .flat_map(|by_language| by_language.values())
+        .filter_map(|language_stats| language_stats.validation.clone())
+        .collect::<Vec<_>>();
+    validations.sort_by(|left, right| {
+        (&left.language, &left.server_name).cmp(&(&right.language, &right.server_name))
+    });
+    Ok((nodes, edges, frameworks, diagnostics, validations))
 }
 
 impl RnaHandler {
@@ -716,7 +733,13 @@ impl RnaHandler {
             .await;
 
             match result {
-                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks, diagnostics)) => {
+                Ok((
+                    mut enriched_nodes,
+                    mut enriched_edges,
+                    enriched_frameworks,
+                    diagnostics,
+                    _validations,
+                )) => {
                     // Update LSP status
                     let lsp_edge_count = enriched_edges
                         .iter()
@@ -1189,8 +1212,13 @@ impl RnaHandler {
             })
             .await;
 
-            let (mut enriched_nodes, mut enriched_edges, _detected_frameworks, diagnostics) =
-                match result {
+            let (
+                mut enriched_nodes,
+                mut enriched_edges,
+                _detected_frameworks,
+                diagnostics,
+                _validations,
+            ) = match result {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
@@ -1733,7 +1761,13 @@ impl RnaHandler {
 
         let lsp_edge_count;
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                _lsp_validations,
+            )) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2154,6 +2188,7 @@ impl RnaHandler {
 
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
+        let lsp_validations;
         let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
@@ -2165,7 +2200,14 @@ impl RnaHandler {
         let lsp_edge_count;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                bus_validations,
+            )) => {
+                lsp_validations = bus_validations;
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2352,6 +2394,27 @@ impl RnaHandler {
                             edges.len(),
                         );
                     }
+                    self.enrichment_jobs.record_lsp_evidence(
+                        &self.repo_root,
+                        job_id,
+                        lsp_evidence(
+                            if lsp_degraded_detail.is_some() {
+                                LspEvidenceReadiness::Partial
+                            } else {
+                                LspEvidenceReadiness::DefaultProfile
+                            },
+                            &EnrichmentScope::Repo.stable_key(),
+                            0,
+                            None,
+                            lsp_degraded_detail.clone().or_else(|| {
+                                Some(
+                                    "repo-wide default query profile completed; broad references were omitted"
+                                        .to_string(),
+                                )
+                            }),
+                            lsp_validations.clone(),
+                        ),
+                    );
                 }
             }
         }
@@ -2565,7 +2628,13 @@ impl RnaHandler {
         .await;
 
         match bus_result {
-            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks, diagnostics)) => {
+            Ok((
+                mut enriched_nodes,
+                mut enriched_edges,
+                detected_frameworks,
+                diagnostics,
+                lsp_validations,
+            )) => {
                 // Dedup: passes can re-emit cached entries.
                 {
                     let mut seen_nodes = std::collections::HashSet::new();
@@ -2741,6 +2810,7 @@ impl RnaHandler {
                             declared_node_count,
                             budget_snapshot.as_ref(),
                             Some(format!("persistence failed: {e}")),
+                            lsp_validations.clone(),
                         ),
                     );
                     return Err(e.context("LSP persist failed during foreground pipeline"));
@@ -2792,6 +2862,7 @@ impl RnaHandler {
                                     .to_string()
                             })
                         }),
+                        lsp_validations,
                     ),
                 );
 
@@ -2833,6 +2904,7 @@ impl RnaHandler {
                         declared_node_count,
                         budget_snapshot.as_ref(),
                         Some(e.to_string()),
+                        Vec::new(),
                     ),
                 );
                 if fail_on_lsp_error {
@@ -3576,6 +3648,7 @@ mod tests {
                     server_missing: false,
                     remediation: None,
                     query_metrics: Vec::new(),
+                    validation: None,
                 },
             )]
             .into_iter()
@@ -3595,6 +3668,7 @@ mod tests {
                     server_missing: false,
                     remediation: None,
                     query_metrics: Vec::new(),
+                    validation: None,
                 },
             )]
             .into_iter()

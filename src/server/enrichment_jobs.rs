@@ -168,6 +168,10 @@ pub struct LspEvidenceCoverage {
     pub elapsed_ms: u64,
     pub circuit_open: bool,
     pub detail: Option<String>,
+    /// Per-language readiness validation evidence. This is deliberately
+    /// language-level; #784 owns the later per-file completeness expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validations: Vec<crate::extract::scan_stats::LspValidationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -732,6 +736,7 @@ impl EnrichmentJobLedger {
                                 .to_string()
                         })
                     }),
+                    validations: Vec::new(),
                 });
             }
             job.updated_at = now;
@@ -1098,6 +1103,14 @@ mod tests {
                 elapsed_ms: 15,
                 circuit_open: true,
                 detail: Some("request budget exhausted".to_string()),
+                validations: vec![
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "json",
+                        "vscode-json-language-server",
+                        "textDocument/documentSymbol",
+                        0,
+                    ),
+                ],
             },
         );
 
@@ -1108,6 +1121,8 @@ mod tests {
         assert_eq!(evidence.scheduled_requests, 2);
         assert!(evidence.circuit_open);
         assert_eq!(evidence.scope, scope.stable_key());
+        assert_eq!(evidence.validations.len(), 1);
+        assert_eq!(evidence.validations[0].symbol_count, Some(0));
     }
 
     #[test]
