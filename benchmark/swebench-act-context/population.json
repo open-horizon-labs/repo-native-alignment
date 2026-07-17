@@ -1,0 +1,2298 @@
+{
+  "schema_version": 1,
+  "population_id": "swebench-verified-multifile-n71-gold-valid-n70",
+  "dataset": {
+    "name": "princeton-nlp/SWE-bench_Verified",
+    "split": "test",
+    "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+    "parquet_path": "data/test-00000-of-00001.parquet",
+    "parquet_lfs_sha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd",
+    "row_digest": "sha256 of UTF-8 JSON with lexicographically sorted keys, separators comma/colon, ensure_ascii=false, and no trailing newline"
+  },
+  "selection": {
+    "criterion": "at least two distinct files in the gold patch",
+    "n_selected": 71,
+    "n_included": 70,
+    "ordering": "upstream scaled_instances.json order",
+    "excluded_by_gold": [
+      "astropy__astropy-8707"
+    ]
+  },
+  "upstream_a": {
+    "arm": "oracle_full",
+    "reported_n": 70,
+    "resolved": 19,
+    "unresolved": 51,
+    "mean_cl100k_context_tokens": 25426.3,
+    "initial_request_input_tokens": "exact per-instance values imported; sum across all N=70 divided by resolved_count is the H1 efficiency quantity",
+    "retry_inclusive_input_tokens": null,
+    "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+    "retrying_instances": 11,
+    "edit_feedback_rounds": 22,
+    "timing": "unavailable; upstream did not publish comparable per-instance wall-clock time",
+    "total_initial_request_input_tokens": 2279203,
+    "initial_request_input_tokens_per_resolved_issue": 119958.05263157895
+  },
+  "run_schedule": {
+    "seed": "rna-act-context-bc-order-v1",
+    "ordering": "ascending SHA-256(seed + NUL + instance_id), then instance_id",
+    "arm_order": "B,C when first order-key byte is even; C,B when odd",
+    "episodes": [
+      {
+        "ordinal": 1,
+        "instance_id": "sphinx-doc__sphinx-8120",
+        "order_key_sha256": "001d87c9b5d164a24a724cd20ae8b1b0d081ff2315d7d3ba2f18ccb05e844491",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 2,
+        "instance_id": "django__django-12155",
+        "order_key_sha256": "01d9731b8e48af56c52ff43efc19e6c94b7afcf937df17775fa10f5682f2042c",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 3,
+        "instance_id": "matplotlib__matplotlib-24870",
+        "order_key_sha256": "06877c85c572bccbcb813a23a670a9f1df494102b55c4c3a1f90453ddcfcb11b",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 4,
+        "instance_id": "django__django-14315",
+        "order_key_sha256": "08e7776680a49bddbab4191863058a6b73e22cc83ce91bdc567f0780610a6422",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 5,
+        "instance_id": "sympy__sympy-20438",
+        "order_key_sha256": "0bfea8d1d50fd0dcd0935823dbd6514e5a6d60a71ef87faaae257962e5941848",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 6,
+        "instance_id": "sphinx-doc__sphinx-7462",
+        "order_key_sha256": "0e9618fe4dab148b1891a7f5a136eb936f630466fb7bd3a5475d7151146227c5",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 7,
+        "instance_id": "pydata__xarray-6992",
+        "order_key_sha256": "0ef6ae83639f5938ebd878cd681f4773cbd2a6558fd4b1555c25d3d47d4af731",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 8,
+        "instance_id": "django__django-15629",
+        "order_key_sha256": "102a04608c2e7bcddc6e099eb3d868c4a7fc9e4337d4168115c80b63b5640df0",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 9,
+        "instance_id": "django__django-16631",
+        "order_key_sha256": "10e260aa14025c5544aef0970698e401d68dda8af6a3a0dfc75ff5a50f921ef0",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 10,
+        "instance_id": "sympy__sympy-17318",
+        "order_key_sha256": "16149b9dff9931f3d8e2f9a8117f6bbbc922813fbde5f6b8df26c31868b0abea",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 11,
+        "instance_id": "matplotlib__matplotlib-25479",
+        "order_key_sha256": "20dde691dee1be6b623a92e49c083b5cf325b8d72b969825c5d5de91681b099b",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 12,
+        "instance_id": "django__django-12741",
+        "order_key_sha256": "23de30639a3a3a42959868503563e2021d9e729938904626b522a9385fafacaf",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 13,
+        "instance_id": "pylint-dev__pylint-4661",
+        "order_key_sha256": "2ab65d405c771e9575bfa56597a04e1c1b9e4ed72d860035a0d8da28bf051d7d",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 14,
+        "instance_id": "scikit-learn__scikit-learn-12682",
+        "order_key_sha256": "2fb5ea28da8cd6343a34bf5e2d2a156f4943a7611644b5508c5bdec044934269",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 15,
+        "instance_id": "django__django-14170",
+        "order_key_sha256": "34a11f6f710ba98a6bb50b8ca48c2c53089811b411fb8ecf40a9f966f4c5285c",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 16,
+        "instance_id": "pydata__xarray-3095",
+        "order_key_sha256": "3525b57a90a4ec40f8badeb53359b402f8c7ed2e7ca9ad39cc7b6722630902a0",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 17,
+        "instance_id": "django__django-15563",
+        "order_key_sha256": "36c32de0d8ce81252ca43323acddf47bba8c548a3de934b0401451e78802a9c3",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 18,
+        "instance_id": "django__django-15103",
+        "order_key_sha256": "373083396ccf88a9916e23085ef670efcba5f3d481f9ee37e68567b4c0894843",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 19,
+        "instance_id": "django__django-13212",
+        "order_key_sha256": "38ef2464a65477f9738c255cd637d8e00a2fc1c158514f2f011463e141b51ccc",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 20,
+        "instance_id": "django__django-16938",
+        "order_key_sha256": "3bdd93f0a789d20dbb6e2d4cb898bbfefa2a65c7b42a0a7db5b28223e83a3fb2",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 21,
+        "instance_id": "django__django-14631",
+        "order_key_sha256": "3e823b90e2183dbedcf25457b12121d008588c203c724d90b804c880f35651d3",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 22,
+        "instance_id": "pylint-dev__pylint-4604",
+        "order_key_sha256": "42f3a67bc30eef1bf7db8ab22ddf5b1834a201077c1470a78aafa8f2ea9e0079",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 23,
+        "instance_id": "mwaskom__seaborn-3187",
+        "order_key_sha256": "434d82084a1cc41c300e290af4ff9e147ef004d2e56d27a714a7a2530d01a108",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 24,
+        "instance_id": "pydata__xarray-3993",
+        "order_key_sha256": "43519295b1982a9268f0b4d843a1b677dac55c9a2d4b41653436e5d2d931e5cb",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 25,
+        "instance_id": "pylint-dev__pylint-6528",
+        "order_key_sha256": "4423dfa693e64aaf04e6da1b56ca47fd89858bba4736b8e1d505d27acfe322aa",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 26,
+        "instance_id": "django__django-16315",
+        "order_key_sha256": "4d15114c987aea4caca05476f91a4491e4e7a7b2094db7e248a4689be9350265",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 27,
+        "instance_id": "astropy__astropy-13398",
+        "order_key_sha256": "4f695a1d08fc5cd24d09662032738e7ed2a3b7804b3f8fc5caf80aae19adc400",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 28,
+        "instance_id": "sphinx-doc__sphinx-9461",
+        "order_key_sha256": "500e77a58836987bd6d253d670c9933c4bad73b221c1e2ff535bc2899e5aa1db",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 29,
+        "instance_id": "pydata__xarray-3305",
+        "order_key_sha256": "501b60ed5e294134d8181ecbc16340d6c4a9fb5e7e91935992f60ce92309fb64",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 30,
+        "instance_id": "pylint-dev__pylint-6386",
+        "order_key_sha256": "529f95fb66879d60e2ef4899daf07cabb054301bad0e8461acafcb8bee5faccb",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 31,
+        "instance_id": "sympy__sympy-22080",
+        "order_key_sha256": "547f18529ab8843e284d4a5a295e746b67cb13e10e4269b397055cc89ac8d8c3",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 32,
+        "instance_id": "django__django-16032",
+        "order_key_sha256": "5d0093ad9e67dc144adaece3132ba36050a4bc306ff97408b7c67dadf874a4a9",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 33,
+        "instance_id": "django__django-16263",
+        "order_key_sha256": "6020cf50f6fd42496ff05e8ae2ac633bf2b8fa41f0934218f6ca06a1bb7a2885",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 34,
+        "instance_id": "django__django-10554",
+        "order_key_sha256": "63d6e8c38408c39d5ff2679dac18006a757089dfff30bacc5cbe74dfa00ed1ce",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 35,
+        "instance_id": "sphinx-doc__sphinx-7590",
+        "order_key_sha256": "6497e50a6e1196baf41dd2703a4eda264bc96f41d1d0891612ca22e277ca89a4",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 36,
+        "instance_id": "django__django-16560",
+        "order_key_sha256": "6e9006d339df94da8a9a5981dc3fd3cf29d61d4bc0d1284fc7cdf610fd181e85",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 37,
+        "instance_id": "pylint-dev__pylint-8898",
+        "order_key_sha256": "7263a19abfe8e427ac54929c4e662334b26c88a75dbd36494a6a6885edf1b4da",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 38,
+        "instance_id": "sphinx-doc__sphinx-8551",
+        "order_key_sha256": "766a63557a4a1047cc6368c2a453e8567d59f75725f58aae7632f152f71adffd",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 39,
+        "instance_id": "sympy__sympy-13877",
+        "order_key_sha256": "7715b664e7546ca09363a7ff273d06ed4e76344d094ad3a12ea2962be49f2ff6",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 40,
+        "instance_id": "pylint-dev__pylint-4551",
+        "order_key_sha256": "7722a38aa9d98a3dff6a639c57cceae6c82daa66ec15442325bcb071970bf424",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 41,
+        "instance_id": "sympy__sympy-13091",
+        "order_key_sha256": "7f88016cd6636cf2b02f04b3368022abbe08cae82d726431cac582c9dae037f2",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 42,
+        "instance_id": "django__django-11734",
+        "order_key_sha256": "8152330e7d89cbb57ef4b8861ec4356763ab8b4499c10b0c9791688364cb3b2d",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 43,
+        "instance_id": "matplotlib__matplotlib-25775",
+        "order_key_sha256": "85736e5f4474465aae6e7a4d6ff5e6d01945b0ee7cca2a8b59b2eee4751d2186",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 44,
+        "instance_id": "django__django-11138",
+        "order_key_sha256": "8c6d6baa2bb85a61204865779910d1e7776e0754ba109eb722a0be5d62b25a6d",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 45,
+        "instance_id": "django__django-13512",
+        "order_key_sha256": "8e9bb4d0ccf3f55a47b2dad3ecc232e84d156562d6cf2e0752683b2fe114c4c8",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 46,
+        "instance_id": "sphinx-doc__sphinx-8548",
+        "order_key_sha256": "94904b51cfe14fc7e21e78b6eca2d76de9bd59631a342cef97fbcce70c2b2d1b",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 47,
+        "instance_id": "django__django-15561",
+        "order_key_sha256": "964eec0c3a3a2a41ccc2ec2d554a2930a04325039a117ce6a9e486b44cb58b3f",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 48,
+        "instance_id": "django__django-12325",
+        "order_key_sha256": "a906aba0529f2cd5cbb077556deefabffa26e2c54efe917f6c5a17a097b13c37",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 49,
+        "instance_id": "scikit-learn__scikit-learn-25102",
+        "order_key_sha256": "a999c42d4c0527ab43927810477a8a3e1e904c2bc6f9376a0338e8de60d604d3",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 50,
+        "instance_id": "matplotlib__matplotlib-14623",
+        "order_key_sha256": "aa26723ec09d777cf34085f97cd759a2535bbd7161169cd244925ea7bdfa986f",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 51,
+        "instance_id": "django__django-16256",
+        "order_key_sha256": "b7fef77a8e185b354698c97cb89ccf5dafed47afa6a90181500b82f349a3cf79",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 52,
+        "instance_id": "pydata__xarray-6938",
+        "order_key_sha256": "b833143274064a2557a8276916f17c65b2b4c67a00755dc4c1b6c92b5c81b577",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 53,
+        "instance_id": "django__django-13121",
+        "order_key_sha256": "bc721bf9a965f4e7d49681256937f6896f79d4172672b6898c4b8d0830576d28",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 54,
+        "instance_id": "pytest-dev__pytest-8399",
+        "order_key_sha256": "c07e5a78676ce997bfd92b72c0dbd452193cb63a04628f8a2f589037584c0ff5",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 55,
+        "instance_id": "sympy__sympy-16597",
+        "order_key_sha256": "c0af51e5345ec9e976d73c78561ff415a715555404962ecd761a973e5ff855c1",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 56,
+        "instance_id": "sphinx-doc__sphinx-8593",
+        "order_key_sha256": "c0ccfbe7d3751a2f17d9d21871c5298aeda25831eeba80d9875ad0fec69bafb6",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 57,
+        "instance_id": "pytest-dev__pytest-5840",
+        "order_key_sha256": "c27a4cf6641525e10eb1d340f6b2077e63f774acfe0c1894196534eb179a8247",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 58,
+        "instance_id": "django__django-13344",
+        "order_key_sha256": "ccc1a8b2a13b4fd52b855e4c2744e33ee97140203a78f4a1706120e60b4d2e8f",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 59,
+        "instance_id": "django__django-11532",
+        "order_key_sha256": "d024b8f35598916dd6cebbda1e88086976d4b7b785b674b0a2fa90d7e3cecfe1",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 60,
+        "instance_id": "django__django-13195",
+        "order_key_sha256": "d0b6a02427fb2c96c938e16d01fb64602f4c7f1bcbc25fbd72673fb46999e39e",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 61,
+        "instance_id": "django__django-14011",
+        "order_key_sha256": "d9c8e8aa115dcd967c01f6e64cc75c0374e0236aede5bc5fa641e407027ec4ac",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 62,
+        "instance_id": "astropy__astropy-14369",
+        "order_key_sha256": "dcd262efca3cbe14cdf71adc89cb15a2cade3ab80d89806c821aa47d2182b151",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 63,
+        "instance_id": "sympy__sympy-14248",
+        "order_key_sha256": "de5e910eec9a458dc68073200ccadf251f56e84444d2249146a4e583cfdfefc6",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 64,
+        "instance_id": "sympy__sympy-19783",
+        "order_key_sha256": "deb0eda4dc328ed6db2549752418b87db922b8578411f9312985ef7a671ad39b",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 65,
+        "instance_id": "django__django-12406",
+        "order_key_sha256": "df4d4e7747da12129c3bf09ce263684656c230fea03f50725ce2ce60fb495d29",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 66,
+        "instance_id": "django__django-14376",
+        "order_key_sha256": "e0fb4307195000fab9794d0e6b1368351ac363b6b568327922e17a7109a8ca4a",
+        "arm_order": [
+          "B",
+          "C"
+        ]
+      },
+      {
+        "ordinal": 67,
+        "instance_id": "django__django-11333",
+        "order_key_sha256": "e797c94bfe245dd45cc4839de57369e7888e43b1cf3e20aedf040fcff9a5ae6f",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 68,
+        "instance_id": "sphinx-doc__sphinx-10673",
+        "order_key_sha256": "e9eb516b84db3231ace08f0b91a18e475d6eaea4ddfc005275552a7cdc4859de",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 69,
+        "instance_id": "django__django-11400",
+        "order_key_sha256": "ed446a3636450421071b6c4139fe3f22bbf0bcd1060beb1fe999dd8442ed5acf",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      },
+      {
+        "ordinal": 70,
+        "instance_id": "django__django-11885",
+        "order_key_sha256": "f1df6d5c5982878125a6c6bbf28573a42426dbec144d64f200a8092c161e88f9",
+        "arm_order": [
+          "C",
+          "B"
+        ]
+      }
+    ]
+  },
+  "instances": [
+    {
+      "instance_id": "astropy__astropy-13398",
+      "repo": "astropy/astropy",
+      "base_commit": "6500928dc0e57be8f06d1162eacc3ba5e2eff692",
+      "dataset_row_sha256": "7ae665be8df7cbb7ec7dca754b11da5c72350d5781699e8456bde37f8c8700ce",
+      "problem_statement_sha256": "c26c8dc258dc5cb9dd34f30bdbaaed3f19a8ada137e0f19d81d7f57dc5f11bba",
+      "gold_patch_sha256": "5124ad079250b10166141d9deeb28d2cdf58ca42e50fb898b0ec8819bacc06e1",
+      "test_patch_sha256": "cd02c0d60f66544acb68a86b63f824cf2671d7570020c6c33d32325d8d8fac78",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 5176,
+        "anthropic_initial_request_input_tokens": 8075,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "astropy__astropy-14369",
+      "repo": "astropy/astropy",
+      "base_commit": "fa4e8d1cd279acf9b24560813c8652494ccd5922",
+      "dataset_row_sha256": "548e31e1d3d06dd1586124a0c637932dd906b96fc712a344d2f4b313559ec2da",
+      "problem_statement_sha256": "005d3d61c2ffbfa601f53125a9fb5271a1a87979977b857204d9f3cf5190fba9",
+      "gold_patch_sha256": "f58ccaa7b95c38a3d9ee7c950a51e98e34ca30e9f778e74338f4fadc450ad055",
+      "test_patch_sha256": "dc05f26fb59ff1f69b7f7ffe07cf73f279abea6393fde4d6bc2f3d22fd524047",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 4502,
+        "anthropic_initial_request_input_tokens": 6549,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "astropy__astropy-8707",
+      "repo": "astropy/astropy",
+      "base_commit": "a85a0747c54bac75e9c3b2fe436b105ea029d6cf",
+      "dataset_row_sha256": "b557e14bd30a8c3d88be401c8f31a8a97c813cf12ae291cb90a97712c97c6ab1",
+      "problem_statement_sha256": "f7420a19ba5b0c807396a84da376d8303e69ff66d0216c332adf099da589a714",
+      "gold_patch_sha256": "f993c1ada6f19bcdfa8989e0c1c61151cd881a81d549f2789663270537c093f2",
+      "test_patch_sha256": "55e5fc9aa40b774674d633a324005d996bafa91c2791cd7c287f90acdaf702f4",
+      "gold_file_count": 2,
+      "included": false,
+      "exclusion_reason": "gold_validation_failed",
+      "upstream_a": null
+    },
+    {
+      "instance_id": "django__django-10554",
+      "repo": "django/django",
+      "base_commit": "14d026cccb144c6877294ba4cd4e03ebf0842498",
+      "dataset_row_sha256": "e6e14913eed7432cfc1cc31a24d9e15aa8893dfe9399ae4abcab8245cade8b82",
+      "problem_statement_sha256": "2f72fa6137f1d53983cff629a05e06c42a2ad477ea4557746c4688cbd6aeb724",
+      "gold_patch_sha256": "98523eeb6147f2d4be05885f8e4f49a8505b3368c2e1ec4ecd39ea9fc880105d",
+      "test_patch_sha256": "bdea7d62eb6235551316d487dd221468aa85be398d436546e512c31cbc9521aa",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 34783,
+        "anthropic_initial_request_input_tokens": 45771,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11138",
+      "repo": "django/django",
+      "base_commit": "c84b91b7603e488f7171fdff8f08368ef3d6b856",
+      "dataset_row_sha256": "a1bd144ef3907d77a8a10053069e351e5d3722038e440ca29f7f87b2d82c8147",
+      "problem_statement_sha256": "b33c129178156fdb6d35f4d406ac6090bc6fbb7b220893ec068c0d76d7bca1ea",
+      "gold_patch_sha256": "9ae4408e05d1a96259df33cc7606befd29e043cfb334bfecbf254fd643df0cb8",
+      "test_patch_sha256": "e9cc9e09bafd57eb9402b743a74d8496c815d646e4b6b33150092c2870cf1ae0",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 16861,
+        "anthropic_initial_request_input_tokens": 23205,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11333",
+      "repo": "django/django",
+      "base_commit": "55b68de643b5c2d5f0a8ea7587ab3b2966021ccc",
+      "dataset_row_sha256": "ee0b2f293b39d4790e2833900c4c466a563c54d8b282a99384a94fc5a4b7bb36",
+      "problem_statement_sha256": "46c75805409021e7df849f3ee81081ba222cd9ceac4020e5a956be44df192d5d",
+      "gold_patch_sha256": "eda6a87fe39c2bc8b3b136c10053d2c59a7134c35224f0fd762b00ad8662b21d",
+      "test_patch_sha256": "efe44e2052ad75df36c34d1661688b8115e69ec36e538c85d183b58de0923980",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 6620,
+        "anthropic_initial_request_input_tokens": 9103,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11400",
+      "repo": "django/django",
+      "base_commit": "1f8382d34d54061eddc41df6994e20ee38c60907",
+      "dataset_row_sha256": "5b8595361b513da564e4f75a234620c576091d03c95b76911b8775fc8755bee2",
+      "problem_statement_sha256": "3add264d5b3fc0e287b7bfe3c5b1179263d4a811de6caeb2a739b918bb049a21",
+      "gold_patch_sha256": "15eacae4cdbd410dc9d6d210a565aaf1466679c654974c820c81398886c6a21f",
+      "test_patch_sha256": "a2bb4f19da1563005ccec4a3a767d7bb0822ea7044e5da723ff01bb26a1b5d6a",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 23005,
+        "anthropic_initial_request_input_tokens": 30573,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11532",
+      "repo": "django/django",
+      "base_commit": "a5308514fb4bc5086c9a16a8a24a945eeebb073c",
+      "dataset_row_sha256": "36cf5445cf9038e3ea97881e3c91da04e0914ed70fa68335b606539e8f2b550e",
+      "problem_statement_sha256": "55f341608fd38b10a968d018743892b2ae8828db032984dc7c105f6679eb65c7",
+      "gold_patch_sha256": "7cc347f6cafe297ddfe4f7401b4b78cfa1b3500c998448afd58c6dea4f0c8a73",
+      "test_patch_sha256": "7aab19e6d0e93d23ca7eb1b4ceca4f499b65317fee721a233c984aff448773fe",
+      "gold_file_count": 5,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 13418,
+        "anthropic_initial_request_input_tokens": 18112,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11734",
+      "repo": "django/django",
+      "base_commit": "999891bd80b3d02dd916731a7a239e1036174885",
+      "dataset_row_sha256": "e96fb7e7a183e8d982c2925f4fed5961c14ab3168127b900fa0aab5a38bd63e6",
+      "problem_statement_sha256": "b51d07c9174dd7bef00b07bb42a728e48a83131a9a9b752fa99f6eb5ef0c76cc",
+      "gold_patch_sha256": "e4e2f3f5febec4ba6e566a4348783425a66d0609c8179b696573f85acef24d8e",
+      "test_patch_sha256": "3ac18462a338ea32b3840a9d3fcc298db104b82a7a830bddeb4c97b395e60d1d",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 40284,
+        "anthropic_initial_request_input_tokens": 52257,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-11885",
+      "repo": "django/django",
+      "base_commit": "04ac9b45a34440fa447feb6ae934687aacbfc5f4",
+      "dataset_row_sha256": "71a4041dd2e6452c7b3c4aad1f78aa929720f18e8e3e135dd5c1341bb5c7deb1",
+      "problem_statement_sha256": "bd6ce8dcb4e3ccf23898a9f244352cc8d464c3f6e5fff1f656d5a30446a6ea10",
+      "gold_patch_sha256": "c3097c2e23c45888542b92364d2b727bdd0ed58b6527e7cf530e7b75f3006e64",
+      "test_patch_sha256": "5f60c281419f91c9fc2500b83cf1c48b47a26673c5f5030039a99ea6dd9e9a26",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 7059,
+        "anthropic_initial_request_input_tokens": 9836,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-12155",
+      "repo": "django/django",
+      "base_commit": "e8fcdaad5c428878d0a5d6ba820d957013f75595",
+      "dataset_row_sha256": "38bac985fc59ba0438c3a4a6c6234851055c535a199c611fca26b5948f8797ad",
+      "problem_statement_sha256": "9f32a4a285f49a0f7005c54b76bcfa9d413dcf203ccc4e6f03bdb5bd89f537a4",
+      "gold_patch_sha256": "b9fe08301b7bcda6d724d253fa522266487c71d4e27e3b6f099e3fd92232532c",
+      "test_patch_sha256": "544dde367f892a84033a80d5a775198f533906bf89b4649b25f1cdf7f27d7edd",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 5353,
+        "anthropic_initial_request_input_tokens": 7491,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-12325",
+      "repo": "django/django",
+      "base_commit": "29c126bb349526b5f1cd78facbe9f25906f18563",
+      "dataset_row_sha256": "776d4277deda0c873ea590813b16a40db4374ffe5090e60525e4e6868521ea89",
+      "problem_statement_sha256": "8f920ccb5f6169fecd052cc74e6c0149701d063e78802c8f33d585a69bb18c02",
+      "gold_patch_sha256": "88a576600f625378c478021c4415421bda24b1146750e27616b7f4b47d855384",
+      "test_patch_sha256": "90884d00181ceeb30fb0b84b8a77961e6ad444209a9e3e3b35b27f8698fbc2ee",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 22451,
+        "anthropic_initial_request_input_tokens": 29346,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-12406",
+      "repo": "django/django",
+      "base_commit": "335c9c94acf263901fb023404408880245b0c4b4",
+      "dataset_row_sha256": "aa2e4c4e1c03a052d380139f18d450d5a9017cbee8eb349240b7611e5e62bb9c",
+      "problem_statement_sha256": "0c14152f7ac2ba5dc35c69013918f93d4c0941bee9547f5eaf4e55012f00e717",
+      "gold_patch_sha256": "b6b2baa9c9acf5d945e985719aafb64dbd0a1c8c0e18447f9c5e5655d5202fee",
+      "test_patch_sha256": "b1f16c3b0cc26a5c41e02821820bc3594637808b8cf1cd1066becd0ae76f9e5a",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 25294,
+        "anthropic_initial_request_input_tokens": 33913,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-12741",
+      "repo": "django/django",
+      "base_commit": "537d422942b53bc0a2b6a51968f379c0de07793c",
+      "dataset_row_sha256": "340f5383dc902fd4414c0fb2f4f715ef859f3942d378b1a0fcb560f3bc85da55",
+      "problem_statement_sha256": "06e228f603008bf1f807cfa5e10f0e54802d174667e2297d56503df2a19ac25d",
+      "gold_patch_sha256": "4092d481eddfdf2c6cb1201f684edc689699a27af77bfa78590187f92864191a",
+      "test_patch_sha256": "41b0d16c6ed1dc4d30678a834525ce7a770c09a15bbe30b17037c9a3307f291c",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 6307,
+        "anthropic_initial_request_input_tokens": 8111,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-13121",
+      "repo": "django/django",
+      "base_commit": "ec5aa2161d8015a3fe57dcbbfe14200cd18f0a16",
+      "dataset_row_sha256": "299f73197c832086df45997384b818335214a55873a3848a39d9c7295d0d1e38",
+      "problem_statement_sha256": "37a34c2a2b342e01d020f528d940358d465faa6f1c427f0f2a855a1d7d768f45",
+      "gold_patch_sha256": "6c3817c1f9ac977ee2de4d35a570e9edda3fc5c5da703145875f6bb9d0ceab56",
+      "test_patch_sha256": "ecbd46beecf8e3f760f4d5199664660a5bfc0f9e00c5a4aee13fb42cb283b0ec",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 22831,
+        "anthropic_initial_request_input_tokens": 29901,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-13195",
+      "repo": "django/django",
+      "base_commit": "156a2138db20abc89933121e4ff2ee2ce56a173a",
+      "dataset_row_sha256": "e650bdcded3e5ad6b620e23a38d93c9b316cbad203cd2dc9b1a041484d79b98a",
+      "problem_statement_sha256": "0e4d0ef4cd6f3ef28f227f6d3eb1c9db8a5249e7dbb5361922695786e5394fce",
+      "gold_patch_sha256": "72c9740f89e88304565d49a9aa1c37d38633215b9fd69aaca3a9f277821b02cf",
+      "test_patch_sha256": "bb08205c8a77456735fb37569a493e082f76a554cb680b3f71afed4ad3e3d6f7",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 6450,
+        "anthropic_initial_request_input_tokens": 9002,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-13212",
+      "repo": "django/django",
+      "base_commit": "f4e93919e4608cfc50849a1f764fd856e0917401",
+      "dataset_row_sha256": "0c36360e517605c4e48b3265296379dd7f136a235d570dcfee8160b05a017cfc",
+      "problem_statement_sha256": "a79d287e01597f81eca52a95eafec22b22872f3dc0e06b8837a711242627b150",
+      "gold_patch_sha256": "e5289566e5f9bfe936d6339b7f2562207ba34f90d3a1f10b2f08194a0e5b5166",
+      "test_patch_sha256": "cc303c39ef13b8694834b70b97fb9b67dfae9b0f1c7bd4702c5dd1a316563099",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 13843,
+        "anthropic_initial_request_input_tokens": 18102,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-13344",
+      "repo": "django/django",
+      "base_commit": "e39e727ded673e74016b5d3658d23cbe20234d11",
+      "dataset_row_sha256": "a3f8913c740930fa9b5a6c439958d647cd203bad0e2b7d0457362c8d208efc7a",
+      "problem_statement_sha256": "fa0d64caaae3c17b9e52c447593c2c8ac3354046b1df2ceb293645b293b06090",
+      "gold_patch_sha256": "cd4ce142ef39fd702719df87d61b4d6c21d40a39985baf48a469c3fa9248459a",
+      "test_patch_sha256": "f5a64bd24eaf102fc5e6fce0aa0bcc5ce6dd8a7d3a5c63e91f52e3375dc756dd",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 2956,
+        "anthropic_initial_request_input_tokens": 4435,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-13512",
+      "repo": "django/django",
+      "base_commit": "b79088306513d5ed76d31ac40ab3c15f858946ea",
+      "dataset_row_sha256": "f7442a13b63c44ee30fb844f7c606ba4ea4cc3ee917c78fc52e97d6bce8fc3b7",
+      "problem_statement_sha256": "77633ba2243ab634f8e720517e2dea5dee17f839be6ad5ae87c58b4bf021cbf6",
+      "gold_patch_sha256": "c8370211cbf37387fa30af6468cc52c0078a51e80fa36168001daa7b7071e600",
+      "test_patch_sha256": "cd12fb4765bc07c47283100b754c74960638a395e1436c53deef811f7c647aad",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 13514,
+        "anthropic_initial_request_input_tokens": 17890,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-14011",
+      "repo": "django/django",
+      "base_commit": "e4430f22c8e3d29ce5d9d0263fba57121938d06d",
+      "dataset_row_sha256": "a2fa7cbe450e11387fc6b9f2ff095e5d6a01f63bc02eeb677cd6a40ad77ff15b",
+      "problem_statement_sha256": "be59236cc1523a08327292712cb4cb8f939a49866e7355254a3efa586ae4fdd2",
+      "gold_patch_sha256": "0c612fbb1f40099e0a095c654002935489e5f5d09c4f11c2a2f47d2681a0bedf",
+      "test_patch_sha256": "8bbe0c72690340bdb4ebaf2e93970f2ef733859e5f05253fcb92deeca800b8b1",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 2897,
+        "anthropic_initial_request_input_tokens": 4456,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-14170",
+      "repo": "django/django",
+      "base_commit": "6efc35b4fe3009666e56a60af0675d7d532bf4ff",
+      "dataset_row_sha256": "b390898ef2896eb2d9a1d2d27001098eae7d80fc291b2bed8f9c90a83763b365",
+      "problem_statement_sha256": "8cf4ee1d30b4dea29472bf630efb43bae3dba0dcd4704599e04ab5fcf0789dc6",
+      "gold_patch_sha256": "df02fc2e1b8a022b44a889c026750b2808bb6e72378afec2e4dc40d61a53047a",
+      "test_patch_sha256": "63e8639c3ff2120d3397aa35b9c37ea23522de83b9ce742e08dfe71526155b93",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 10571,
+        "anthropic_initial_request_input_tokens": 14499,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-14315",
+      "repo": "django/django",
+      "base_commit": "187118203197801c6cb72dc8b06b714b23b6dd3d",
+      "dataset_row_sha256": "2f24c6505d4059d61cdddea82121ed94903c9158ea947819bb1295e142480167",
+      "problem_statement_sha256": "bef4cf98805c60cd26812114b20594a4cf19b71cbd87b68f2424e16bb288c768",
+      "gold_patch_sha256": "ed8be697b5db400ec850270d66b4e57ca0aebc2677fba7c6094862947d828c26",
+      "test_patch_sha256": "40d459a8f7a80300cdb95fd51c5b16b70627646473cbac9b77217623011d7d9a",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 672,
+        "anthropic_initial_request_input_tokens": 1271,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-14376",
+      "repo": "django/django",
+      "base_commit": "d06c5b358149c02a62da8a5469264d05f29ac659",
+      "dataset_row_sha256": "13fd00282bd13e2616888fa833419248a0cdf5e5c2312c3a230e182e595f224e",
+      "problem_statement_sha256": "5365417653d0973045c8b9dad432b1ea4300765b3114a94b249824beb70ec215",
+      "gold_patch_sha256": "e2ed16289f208a60f6c662e66638dd658db39c176dbacad4f6cd9b815dc52769",
+      "test_patch_sha256": "5e5382527834399bc2b73d9f3591f5bfeace4702dd936fe53a23ae9541613d5c",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 4025,
+        "anthropic_initial_request_input_tokens": 5622,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-14631",
+      "repo": "django/django",
+      "base_commit": "84400d2e9db7c51fee4e9bb04c028f665b8e7624",
+      "dataset_row_sha256": "492ac4e083b7fc6034c40afe22300866581751ffe279662c5468ee7bcdfee036",
+      "problem_statement_sha256": "1d3f964a6347e618040724052803c6e2011af7a3288f08293494b40da803118d",
+      "gold_patch_sha256": "69262a38ecda46e4919c388a92bb29beb563dab2625381708d355a98466834ec",
+      "test_patch_sha256": "e772038448f76dd6e393700751d8b84d4e607e6fd6ed1efcf6e030f3b401e20b",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 6213,
+        "anthropic_initial_request_input_tokens": 8566,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-15103",
+      "repo": "django/django",
+      "base_commit": "dd528cb2cefc0db8b91a7ff0a2bc87305b976597",
+      "dataset_row_sha256": "0c81252a5f27a299a3dfa6ce414731d8169595c0bac93c3c403558057593dba2",
+      "problem_statement_sha256": "34eeb1884ba091d5ef043989c3516cae61b057232f28bbf2d341c5cf670b2f84",
+      "gold_patch_sha256": "ca566f4c3bccc161a9c709789a26836368611a67161009bbe62b1acf24961594",
+      "test_patch_sha256": "e12231ed9ceb44650d2924c420aa3a87b8f2ee5d4197bd1af9eeba44eef0e577",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 9642,
+        "anthropic_initial_request_input_tokens": 12557,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-15561",
+      "repo": "django/django",
+      "base_commit": "6991880109e35c879b71b7d9d9c154baeec12b89",
+      "dataset_row_sha256": "9a6154c064860dd52b316dbbbf8f87c9fe3c0d0dc9e18e7ac1985f7680c96881",
+      "problem_statement_sha256": "faf31e89ae86084aeea09177048679096a74f81864023dda9cbe3a32e3db6e46",
+      "gold_patch_sha256": "21a16cd2075ee98d03798302d693e0d49a9eac2df4bb30bd8ddc996326a26e12",
+      "test_patch_sha256": "7e9d11434034f60bdcc213b496d7125eabfbfad04339bbf58d32a9dab9de3dd7",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 31934,
+        "anthropic_initial_request_input_tokens": 42237,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-15563",
+      "repo": "django/django",
+      "base_commit": "9ffd4eae2ce7a7100c98f681e2b6ab818df384a4",
+      "dataset_row_sha256": "2bdb2ae70756a04b2587d477d0434453364d5f5fa11a3dc90eb7527ccce04349",
+      "problem_statement_sha256": "46a090e69eecd18516e4819f11699ec9c5b3d2226db86a616217d9115cdfb5a7",
+      "gold_patch_sha256": "5e8e9ba00474f521ef63e85e42edb2d51e2566ad114d6ff7c62e1d64dbadd832",
+      "test_patch_sha256": "8d59339d648d36aa02092fde595e503ba1e5363faa6f17d4c564a9ca2bc1fc24",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 16490,
+        "anthropic_initial_request_input_tokens": 22543,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-15629",
+      "repo": "django/django",
+      "base_commit": "694cf458f16b8d340a3195244196980b2dec34fd",
+      "dataset_row_sha256": "feb67ac0dadf8505b95050955c264b4f4d4c3ca9a49cf0cbcb2df8f09f50f438",
+      "problem_statement_sha256": "f0d48bfd83441c3935b06e4a92bcdb578150b817ce17a73b3275233796473aa6",
+      "gold_patch_sha256": "50f993edaa94aeef286b9fbcb787a08ad0d09bdb894ca8dc787a736ded879405",
+      "test_patch_sha256": "5f8467d2511b1712fde6c6fec06ddc7e5b11c8554399ecd5ee9d6adfd1fe8ab2",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 33720,
+        "anthropic_initial_request_input_tokens": 46021,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16032",
+      "repo": "django/django",
+      "base_commit": "0c3981eb5094419fe200eb46c71b5376a2266166",
+      "dataset_row_sha256": "53989172c9f11ede64896a9b41e0ee5fc42abef5143c6f8856a02d6886308724",
+      "problem_statement_sha256": "a6962d82b41042e5d8c3ddd56535e25107582436685e7ab9efc78b0da6df86c1",
+      "gold_patch_sha256": "6c6c9fc490767cb2fbdcb99d0da38ae6e5a84e0f1edb2577ac42f6cd619f93ea",
+      "test_patch_sha256": "f520ab13455158277372148fe49d42d5cc8910cdcda2cd714fa4376d2ea345c3",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 24537,
+        "anthropic_initial_request_input_tokens": 31824,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16256",
+      "repo": "django/django",
+      "base_commit": "76e37513e22f4d9a01c7f15eee36fe44388e6670",
+      "dataset_row_sha256": "ccf38e0f54a15a2be48de5afc3f8a1a248964c05a33c8e1e88822f57e537e191",
+      "problem_statement_sha256": "8573a7026e50e932c44f36aeeb9c57c6fd28231d65e43fb98b39afa563d4f01c",
+      "gold_patch_sha256": "ad5011a53655f561ee8f084d7373198c8b73c6dfd10eb3593f25205a54d1ed7f",
+      "test_patch_sha256": "412c76539029826623afc2d1606063873b63141e53afddfd3fefc4c43b8903be",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 16676,
+        "anthropic_initial_request_input_tokens": 23569,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16263",
+      "repo": "django/django",
+      "base_commit": "321ecb40f4da842926e1bc07e11df4aabe53ca4b",
+      "dataset_row_sha256": "8c8d939fd5cf79421cdc14f7e959ea5f37a8ccdcfa0efdd6eb25a3a5d44ed99a",
+      "problem_statement_sha256": "ef08a5be58ef19907c5ccbc08283ca421442f12cf119e39a33cc4d0224911e56",
+      "gold_patch_sha256": "3a0e0fa30ad2c67371093472cb1f815424558f8f30a88a59291997845b07600c",
+      "test_patch_sha256": "f988938ad1feeae064f11fa1498b37e1743750d362c41eb207931719d4a3e914",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 42028,
+        "anthropic_initial_request_input_tokens": 54381,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16315",
+      "repo": "django/django",
+      "base_commit": "7d5329852f19c6ae78c6f6f3d3e41835377bf295",
+      "dataset_row_sha256": "516c4f80b3393b01b677042f5f0bc0465fc61f77d877c0ad8499c9bc7bd829fb",
+      "problem_statement_sha256": "1e77d04330a04cec33e1085c3641b845bddc133ae3c5102cdd71b9fd61023fa9",
+      "gold_patch_sha256": "f44da47b5a2e0b3826ff21e1cd221b40d2bd262b91ca4aff58631ae5281e5774",
+      "test_patch_sha256": "fec04b5f7733fc5a237815ce95ef9bdfa42d8a034cfa9a24aa078bc068775074",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 37125,
+        "anthropic_initial_request_input_tokens": 49127,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16560",
+      "repo": "django/django",
+      "base_commit": "51c9bb7cd16081133af4f0ab6d06572660309730",
+      "dataset_row_sha256": "1cb4eeb1d7bf16850523cd641f70042122633547021635006b51106e5209081c",
+      "problem_statement_sha256": "55bdf0c9598df4bb15567401559ad47ae47a817a1a61031101d6d4105e3e2da3",
+      "gold_patch_sha256": "3cfb9f5484180d2312eef8d498f60d6370c8670476cfc19c34110504e0070b39",
+      "test_patch_sha256": "130139e65a5facb3f09d6d16d4a814d9a835965a3ed91833da13880959678d04",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 5033,
+        "anthropic_initial_request_input_tokens": 6975,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16631",
+      "repo": "django/django",
+      "base_commit": "9b224579875e30203d079cc2fee83b116d98eb78",
+      "dataset_row_sha256": "017e9804d5acae41dadc7b27d089df1ab1733e21f2ca60faa4d76fe74d4a91f6",
+      "problem_statement_sha256": "32af93df5e62a2e558611028be5030691d5720d2a172c9a0e83213c68d779a8a",
+      "gold_patch_sha256": "20274be5d42c638fdf8eb0ee1cd49534067f68a27d736f9eccbd8a34f8b213cb",
+      "test_patch_sha256": "f722c5ea2092e38c59bf63c2cbf5dde8a612e37046b9a9c82172f9796a18dc91",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 2574,
+        "anthropic_initial_request_input_tokens": 3785,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "django__django-16938",
+      "repo": "django/django",
+      "base_commit": "1136aa5005f0ae70fea12796b7e37d6f027b9263",
+      "dataset_row_sha256": "f58f56840421d35f0df517f66639ecd81d154273e088512de0e0c5c818c734f9",
+      "problem_statement_sha256": "df77a03b1d4dc247eb9cb80cd7a2d98d9b6f63f3036e1a3d65431ff0edc39d39",
+      "gold_patch_sha256": "7d3a9762ecc6ed1fb0450b4a3712f880cf1554bb1bcb7b2d76d93ab682d87612",
+      "test_patch_sha256": "06fe14c1ec915fa04d2be86fa48af2633ff8567fad7ebef4c0d54ba34f240732",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 4998,
+        "anthropic_initial_request_input_tokens": 8268,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-14623",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "d65c9ca20ddf81ef91199e6d819f9d3506ef477c",
+      "dataset_row_sha256": "b128ee1f47acdd1e106b59ef707b4be9ceddde883df27c2debd272d0f555498e",
+      "problem_statement_sha256": "464f0388f374a7b9d35c4376287b032364fc63e51dfb872fbd0806154dbbc152",
+      "gold_patch_sha256": "bf6c58aeace23b251199ff653b448e26c5b916eabbe9f7972cd16fbb81bfbf03",
+      "test_patch_sha256": "bbc0b0e3377ca3e7c22237c63e5f38b53164e2a39fcbd8ab43b0d72ca9a67ea4",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 82882,
+        "anthropic_initial_request_input_tokens": 103627,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-24870",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "6091437be9776139d3672cde28a19cbe6c09dcd5",
+      "dataset_row_sha256": "b0f5622382c457670a9393f4473580745a2d601718cf2ceb34711748f2440dad",
+      "problem_statement_sha256": "9fdff9e3329f9ef19a9deb6f152b3a23c9c3e091258eb9deb5f740f036885f70",
+      "gold_patch_sha256": "ceb6f79d48e324840a79d06860950ed4aa5c10b4c1d5218eba3044dc28d0773a",
+      "test_patch_sha256": "bb48ddf0fa6ea5cf61bb3100dd09b142dd478ec66f12a3181da7e7c4fb4dc7a4",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 19273,
+        "anthropic_initial_request_input_tokens": 23746,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-25479",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "7fdf772201e4c9bafbc16dfac23b5472d6a53fa2",
+      "dataset_row_sha256": "7d88fb971fdea3c241f3f18928f203b701b70284866900d1c8a0c0cecb9892c6",
+      "problem_statement_sha256": "4581a22d3e68c0fdc0b045d3f6560197585f94d041d18c57a6ee1153a968b709",
+      "gold_patch_sha256": "27ae2a70459ca8189b9750f9c0b890632c81207f0247c036d36ca545f00c9b48",
+      "test_patch_sha256": "8bdc9e7abb3113168db7dfcb277c42dab7ae269258e7db3ace3a7325a38f8343",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 29936,
+        "anthropic_initial_request_input_tokens": 38485,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-25775",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "26224d96066b5c60882296c551f54ca7732c0af0",
+      "dataset_row_sha256": "5107e2f4f60f40b7bad1ea514a0ee7a911bda93742f6813a708e25a3734d78bf",
+      "problem_statement_sha256": "a15b46987ceec554e057cf8fc62b015b435221182f76357b9d54ada6417c6401",
+      "gold_patch_sha256": "c3edfedb54386335fbb875b0d03e9406c9099fbc9d5b0b984edf5cc40cd34bc2",
+      "test_patch_sha256": "13a721825518e157da80091f9227d1b3521e9748a1f62dd99e7f1a480f4d7b14",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 24136,
+        "anthropic_initial_request_input_tokens": 31134,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "mwaskom__seaborn-3187",
+      "repo": "mwaskom/seaborn",
+      "base_commit": "22cdfb0c93f8ec78492d87edb810f10cb7f57a31",
+      "dataset_row_sha256": "80aa45876204fa0a13ba2c7916e5723b61713622784ca260ebd40f7786abd9d0",
+      "problem_statement_sha256": "72157e71b5c0ed5d58d66a7eeb30ed7b2fb237374183b9ebee200f5d58abd77b",
+      "gold_patch_sha256": "578f98370810261561a8936dd7202e8c6644ef8d9ae52a54578a680f3cb4fc1f",
+      "test_patch_sha256": "580a0ee004bb0143ba24afcaf0e45ec309635fa4610049ed91a8a15f7e9e1fc8",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 13421,
+        "anthropic_initial_request_input_tokens": 17267,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pydata__xarray-3095",
+      "repo": "pydata/xarray",
+      "base_commit": "1757dffac2fa493d7b9a074b84cf8c830a706688",
+      "dataset_row_sha256": "9b7fa4f7243bdc754656a5041253aeb0c24a8c72805ab913a32b78cd1fc6c252",
+      "problem_statement_sha256": "3d8f2d8422b56bd5980ec478be1413ef87805484446fc15dbd482342a59abb25",
+      "gold_patch_sha256": "15ee0073513dfa4723e55f92c67f7ca66c9651a6d627c08c06e7bada6bcd7525",
+      "test_patch_sha256": "74e9567e31b72197c929b56e94c92b21f8fb62f9b8008bee43aba3ac81d33134",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 28028,
+        "anthropic_initial_request_input_tokens": 36008,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pydata__xarray-3305",
+      "repo": "pydata/xarray",
+      "base_commit": "69c7e01e5167a3137c285cb50d1978252bb8bcbf",
+      "dataset_row_sha256": "f9a4743b76ef9d8c4b329d709a407ac2173117876273929152bba1825982f24d",
+      "problem_statement_sha256": "21a3e64aad08beb73b01c601fffd82ad2f9086802463ce389ca5b50f7c271883",
+      "gold_patch_sha256": "6e02fe879c0a070e2ded9b70e7f88a12551beb6b3e46a5a57bd4dbb0118c2266",
+      "test_patch_sha256": "5405369ddaae064c134b6182243156746ad866da4e900cd5358ad4d4efe6cc52",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 57808,
+        "anthropic_initial_request_input_tokens": 71393,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pydata__xarray-3993",
+      "repo": "pydata/xarray",
+      "base_commit": "8cc34cb412ba89ebca12fc84f76a9e452628f1bc",
+      "dataset_row_sha256": "483076f3842f8c69d23b98ce30c9c8ede28567e711873203cdaa2270f5b5b4b2",
+      "problem_statement_sha256": "3d888dbe00aca081458ceccefa5c7b6e323f5d30b3e5f165c668a7cd51260301",
+      "gold_patch_sha256": "71416a1368862b9d068eab21976cb76e9d127f4d5596a1bffe21dd34eb32f5b8",
+      "test_patch_sha256": "0b2e7ba69982a93171bb6a5245e6fd80e8aab2463bcb96b56a13187fc521710a",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 95482,
+        "anthropic_initial_request_input_tokens": 113995,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pydata__xarray-6938",
+      "repo": "pydata/xarray",
+      "base_commit": "c4e40d991c28be51de9ac560ce895ac7f9b14924",
+      "dataset_row_sha256": "327992550838581971adcd673b596f519f0380b6c77160841299d97dbe1752d6",
+      "problem_statement_sha256": "80200279ed4af4b8b73e3d9bf2ec5a39dbded0c3e337b1b944253fd7b7b04248",
+      "gold_patch_sha256": "d4ea59b82202690181a9d254cef7d3759a1a0ef37a7c2cb43923c656b3313d02",
+      "test_patch_sha256": "fd68042cf44b0446b4cb7e74ac2469c89121f06dfe01eb7b7179f41395474c4f",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 100756,
+        "anthropic_initial_request_input_tokens": 122232,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pydata__xarray-6992",
+      "repo": "pydata/xarray",
+      "base_commit": "45c0a114e2b7b27b83c9618bc05b36afac82183c",
+      "dataset_row_sha256": "b2929496bc01afda4604941fb957f49b6cf64e0a8184e78c2b1bf993f3a8a6ac",
+      "problem_statement_sha256": "2fd625e5f58b6b7b7c292b9ba90307e8583cad9d4ddb395fe9805bb06c74208b",
+      "gold_patch_sha256": "2c9df82ff3c01c158b6cf1155a89b46da0d60f6705cd29ededd6bce02e9847e8",
+      "test_patch_sha256": "41f0aead689f02738cecae41605836cb9e6aceb17e1e6c0e4b7ffa57191763a8",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 87428,
+        "anthropic_initial_request_input_tokens": 106222,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4551",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "99589b08de8c5a2c6cc61e13a37420a868c80599",
+      "dataset_row_sha256": "27cfe762c4da44e202b32242dd9b6bfa438eeb050109faacb0b12aa62e0d988f",
+      "problem_statement_sha256": "28e19b9ac4f2a25215824cc162bb26d6ef73d661478746cd0cfc2e0432fadb18",
+      "gold_patch_sha256": "06a5ae87f8794dff30b6733c4427cf46fed7ae67c545449b3168977be5cf215c",
+      "test_patch_sha256": "ccdbb6351dd77464ac7429d8a43de3fc42088c03aed9618e5ba77bc8178fec87",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 8022,
+        "anthropic_initial_request_input_tokens": 10716,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4604",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "1e55ae64624d28c5fe8b63ad7979880ee2e6ef3f",
+      "dataset_row_sha256": "8c8cabd8cf5cfb861fff15731cd9cf784b32f35e730cf1226005822c46d6cb69",
+      "problem_statement_sha256": "0072c898db86e2500d95b0b95f0929f23f8a733dc9b0eb4a0d170189049a8dbb",
+      "gold_patch_sha256": "b50bd937b95d0b58008208d4e7cd122bb869602d0c84319bbae3ebf0f024887c",
+      "test_patch_sha256": "1d84ca139e0defdacbc56094a916a83dff514c77fbc446a0d015dbd260c264bb",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 17463,
+        "anthropic_initial_request_input_tokens": 22762,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4661",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "1d1619ef913b99b06647d2030bddff4800abdf63",
+      "dataset_row_sha256": "e8b223a8e349c1ea98f36add1e21d05922e895178ffc673d8fca973e3c96c7ff",
+      "problem_statement_sha256": "9888ff5d07c438e865ef06f4e23337fdf555c438756ab3d74e75abea222cb932",
+      "gold_patch_sha256": "43b3e2e849942d287987af5f42b532695dac6e68625778d6d29981cb0dcb3b59",
+      "test_patch_sha256": "ee7c4ca17fff72e7af07a9876cf1aa07552ae49099831b42f5d429c3132dcaaf",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 2161,
+        "anthropic_initial_request_input_tokens": 3148,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-6386",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "754b487f4d892e3d4872b6fc7468a71db4e31c13",
+      "dataset_row_sha256": "7d818af60f679bc96ba24a82d8c6879e87808e5204e473e583d620f3a2aef784",
+      "problem_statement_sha256": "5a767dafdd95cd6eef40ba263e539f02b0f86d745a804a7bc792d1a8c8b59a41",
+      "gold_patch_sha256": "9f82c0b5df51c65fbbe78c3f24bda13c07571ab541c2e50d0ee15a9aabbeef45",
+      "test_patch_sha256": "3759937a5549ed383ea878200baaced050baded89ce76ae9687b3f5e6604111c",
+      "gold_file_count": 4,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 14877,
+        "anthropic_initial_request_input_tokens": 19195,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-6528",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "273a8b25620467c1e5686aa8d2a1dbb8c02c78d0",
+      "dataset_row_sha256": "22bfa5d64566f5e9643b5ae93bf808a35e48326b57d65181533e794a5bc12116",
+      "problem_statement_sha256": "b11d702c9bf142c2d05d59049258cd45746f2328b7598d6fd4acfa49530e8b39",
+      "gold_patch_sha256": "ed4b5b19c13c683360c4743ed660335fe029bd870faa3e786eda6271abc55265",
+      "test_patch_sha256": "ad226b44584268da8913bf72e2e537e45fd6b0aa2f94c6d57855727b28dc4290",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 10688,
+        "anthropic_initial_request_input_tokens": 14512,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pylint-dev__pylint-8898",
+      "repo": "pylint-dev/pylint",
+      "base_commit": "1f8c4d9eb185c16a2c1d881c054f015e1c2eb334",
+      "dataset_row_sha256": "e82dc2ecb965a8f3461ade593f8eb0529b999ff17dd11fc703e4a010ca8ff9d9",
+      "problem_statement_sha256": "fe9420583d351e0e81a7cbc876fef18b386ba1d375bcfb031830f3885d4f4347",
+      "gold_patch_sha256": "1ef5ef80b29bcfb5902b6818e58a576cf6d97b66fb7b354fa1392451954a6c98",
+      "test_patch_sha256": "0fa5d0f2e19d994ed7a5b0450f502b986cb3dc862f83ee7cbc96676210012b10",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 6302,
+        "anthropic_initial_request_input_tokens": 9444,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5840",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "73c5b7f4b11a81e971f7d1bb18072e06a87060f4",
+      "dataset_row_sha256": "4d53b9c5b965c2752703931a17c1975264a218c96946086aebaf757dea91845b",
+      "problem_statement_sha256": "20d9cc3dd4114c8bc9f5eb76bb16d3c50ff8826b8c106119be6c3cf4ed01f398",
+      "gold_patch_sha256": "7f6486d010e024a28295d8370931a9079d48e4b2ea3b8a6f66447ce2c73b5778",
+      "test_patch_sha256": "f4974c373808cd5a9309b75e2eec2a9a6540fb3017f94a991bd23c9b6ffdbd1d",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 10997,
+        "anthropic_initial_request_input_tokens": 14378,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "pytest-dev__pytest-8399",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "6e7dc8bac831cd8cf7a53b08efa366bd84f0c0fe",
+      "dataset_row_sha256": "dce037012f267dce6b35ae06f82601f6df42cfa8d5a2873c3bc9a36ef872cea6",
+      "problem_statement_sha256": "2471cd247002e8cb4c9cff40999a0841dbfea96004fb15d6df9c23528395c011",
+      "gold_patch_sha256": "fcc0962e001dbc5c6c718a885b0a3369af3b018b942d3574675c51ecdc59eff2",
+      "test_patch_sha256": "506cca658cf270e5ef62256ea4261cd6557ed8368317a97d715123486fa1ddd6",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 16991,
+        "anthropic_initial_request_input_tokens": 22162,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-12682",
+      "repo": "scikit-learn/scikit-learn",
+      "base_commit": "d360ffa7c5896a91ae498b3fb9cf464464ce8f34",
+      "dataset_row_sha256": "282aa394ce085091ec8f56acdc5cb7ebe22d902f7507aa4cd6bd965e7d9190c5",
+      "problem_statement_sha256": "4dcadd0e9335f9d8fdd65b5192353e4b58702fc3370a468414ad8e5de7d891b2",
+      "gold_patch_sha256": "631e2c178614daaab168ae7008c31a3026742c623da3ed4341d17d2dd7a4e3c4",
+      "test_patch_sha256": "8d519457ef3c8e195eef39523e30030b69b175aed203a6d33ae67a9e3d1e6e2a",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 12700,
+        "anthropic_initial_request_input_tokens": 16253,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-25102",
+      "repo": "scikit-learn/scikit-learn",
+      "base_commit": "f9a1cf072da9d7375d6c2163f68a6038b13b310f",
+      "dataset_row_sha256": "acd7f40a1d955998a227d05bb8e9bc8e9649b17b7b4b5425ad492dddb50b8d08",
+      "problem_statement_sha256": "1a82e3a4fcebb5f0fc0f744df67eb1972fa38f469885fe52a1db5e9ae2ed4884",
+      "gold_patch_sha256": "1112300429f02c451ee124abb1fc98d52605b0f839a41e77b3a08c2292640ab0",
+      "test_patch_sha256": "a93bd2180f1eb477f05f20a085d824dae342864efd31db562498fdb07f8a92ec",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 10186,
+        "anthropic_initial_request_input_tokens": 13410,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-10673",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "f35d2a6cc726f97d0e859ca7a0e1729f7da8a6c8",
+      "dataset_row_sha256": "e78b2025f20b122e83d26234721f4b67b8813d456a3e25629501f59581631d6e",
+      "problem_statement_sha256": "f455450f1dbed1a4b75c2bcd97f9147d124b866223283f6287bd09ce6eab7d8e",
+      "gold_patch_sha256": "0fc6f76c4f0a0d81c35e62ba53b45c47cb9850195710a9a50c5361c6aff07685",
+      "test_patch_sha256": "428b666326466803e05ce8137b5626af83881035e775108b59aac3c9f47e5106",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 9185,
+        "anthropic_initial_request_input_tokens": 12229,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7462",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "b3e26a6c851133b82b50f4b68b53692076574d13",
+      "dataset_row_sha256": "3cada1b77435c007ac8953f0cf3ed97d1307983b4bf618c43a22ab60669323ea",
+      "problem_statement_sha256": "8b7f970ed7e3c847eb7675a3564030771ff64e2f479027f3bb628d7d7c925acc",
+      "gold_patch_sha256": "13cebe1d1a9993e2bbb9707a9c85bf4e98fab0563d8305e446147266f7274fae",
+      "test_patch_sha256": "1745f2e0dfab31c3d3e871d528b1847969758b3aa457a5aa0145b50f647d29e1",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 12997,
+        "anthropic_initial_request_input_tokens": 17031,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7590",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "2e506c5ab457cba743bb47eb5b8c8eb9dd51d23d",
+      "dataset_row_sha256": "67e484d727432d1521dca8bb836da84b9bdc25c19e56c151d963c67237853556",
+      "problem_statement_sha256": "23b9b88e30541f1109b04492ccf35a93a15fdeecb2b736bf22be5a2a6173f84e",
+      "gold_patch_sha256": "23c3b2333c3512be7350376c631bbbb079684b7ce1563c5a30ddf665c0f1ec7a",
+      "test_patch_sha256": "77ee427a569addb63364093290096af046dffd77fa65fcc6f60197db7021d8da",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 92533,
+        "anthropic_initial_request_input_tokens": 121380,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8120",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "795747bdb6b8fb7d717d5bbfc2c3316869e66a73",
+      "dataset_row_sha256": "b75860fe933918ba381157d08f98c43887829f927814e131a6100a065a4f621a",
+      "problem_statement_sha256": "2260a8491280312f611378ddff0e08bb9f0961011d0a49b7a2be74a1844cb18b",
+      "gold_patch_sha256": "1d2160f01959bb4ed0d53733de5b8c06ab08373b573f096bcb208275ddecb432",
+      "test_patch_sha256": "eb9a04bc97ed47e30a15fd525fe2ac94982bc3f1924659c975dfb0cc1277eba6",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 12848,
+        "anthropic_initial_request_input_tokens": 16208,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8548",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "dd1615c59dc6fff633e27dbb3861f2d27e1fb976",
+      "dataset_row_sha256": "187829b433187f4ee660175b9d7eae3c572d4bae1cabac806a6adebc18249d02",
+      "problem_statement_sha256": "f0c8a912cffb03b9d6346146e11cf044329280bfe2a193fd9e46980b193cffb0",
+      "gold_patch_sha256": "251471d2d20ebed68514d09bc725355bd6d7fdc416927281b8d4b99c7867b419",
+      "test_patch_sha256": "a697bd0ee0ca6d137d4b550390ec376bfc68686c89f565d2c9276806e51a665f",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 23839,
+        "anthropic_initial_request_input_tokens": 30307,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8551",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "57ed10c68057c96491acbd3e62254ccfaf9e3861",
+      "dataset_row_sha256": "17680b0dcaa151dbd9f5d9dbc4f4f5d7f8d4f7ae8f88fc537953094ae17b7578",
+      "problem_statement_sha256": "59b1b15138bca3802f81a94c49ced00a098c6dc015474f0a7c06967bc623d7b6",
+      "gold_patch_sha256": "1d625c366890a2953524c49b163a3da5c464c4d2c4e80c2329afc6b68b8d0b41",
+      "test_patch_sha256": "9e1554ce27c939b2d3613b6437e4e5c6c6a52f5e14c351c3fae9d8e114d41de1",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 15282,
+        "anthropic_initial_request_input_tokens": 20096,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8593",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "07983a5a8704ad91ae855218ecbda1c8598200ca",
+      "dataset_row_sha256": "3ddb69211dfde4ad3a6969267fe2bd45040d74b727af98da32dee7fc65da2469",
+      "problem_statement_sha256": "d7a0b222ecda2268846b70d86cee54c8162748aacb047519b2e657c3c18dc962",
+      "gold_patch_sha256": "1282276489fa1ca2086f318b33fa36e49cfa4d391d56b1a58f100f8696f45f2c",
+      "test_patch_sha256": "5c4fe5ea0e0c0f4cfd8f3b3545ca78d393460ecbae886e167efec5bad22edc50",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 24322,
+        "anthropic_initial_request_input_tokens": 31010,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-9461",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "939c7bb7ff7c53a4d27df067cea637540f0e1dad",
+      "dataset_row_sha256": "f034f0886e586c039f6062cb8106c80aa5456106c4d8abdc6f645c4b00951517",
+      "problem_statement_sha256": "cc2eb5d4afca2da5e00ca423f2dce2bf467613a98b9686da7dc19a08e1f4de0f",
+      "gold_patch_sha256": "7d1179fe5a6a26c54c163617df88820365178e66ae74d95505c93586deaf7b27",
+      "test_patch_sha256": "010d231b9ad23cca12d162a5ae8403414f4b7377c59bc22628f98aa7ad8eeb75",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 42159,
+        "anthropic_initial_request_input_tokens": 54137,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-13091",
+      "repo": "sympy/sympy",
+      "base_commit": "d1320814eda6549996190618a21eaf212cfd4d1e",
+      "dataset_row_sha256": "6caa716b9f98c7c2a228fbd6916e8d5c5310946ba6c07f2597e7111eae32f710",
+      "problem_statement_sha256": "56dd1975c2cdb9924609fb6ce9a46f4a1269dce8da33bf80032d1c9d8a73e7db",
+      "gold_patch_sha256": "8e7c1c0d19cf5a7196900c0819b839051b2ed43a8fc797a7ba2103587e60d635",
+      "test_patch_sha256": "c2538c896b3b100b37a19c12a586bef01370f77e8a9d17290f02cd5536390aec",
+      "gold_file_count": 21,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 211543,
+        "anthropic_initial_request_input_tokens": 261449,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-13877",
+      "repo": "sympy/sympy",
+      "base_commit": "1659712001810f5fc563a443949f8e3bb38af4bd",
+      "dataset_row_sha256": "57af07b722c5bd81b082265e80f022587676b49bc100cac9a43da2fe93b7583b",
+      "problem_statement_sha256": "e8eb7f7fe32ffe357b6a54186c56ae0f9326084bf90504838895599d08e0dbc8",
+      "gold_patch_sha256": "dde1037513c519560a0a2dca777d048dd4d1a3eaf07303decb77e93746760011",
+      "test_patch_sha256": "798780674c8e33823a50a49b6c7b29b0f6b9d1730e18ee6c5d44f545e0459dc2",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "resolved",
+        "resolved": true,
+        "cl100k_context_tokens": 36915,
+        "anthropic_initial_request_input_tokens": 45398,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-14248",
+      "repo": "sympy/sympy",
+      "base_commit": "9986b38181cdd556a3f3411e553864f11912244e",
+      "dataset_row_sha256": "f1ac9e0702bb763adc88ad4b91b87b7e5ea69d07a7ef1681be5a491cd7145e37",
+      "problem_statement_sha256": "056549bbb76a727325fc85b052ecb5d1c9ba9d70d702cf011b407e3877e5c383",
+      "gold_patch_sha256": "361928d537fb11a0cbf89d481fa7f8132d1580a18e5301b9c2be8678ddf15522",
+      "test_patch_sha256": "477f70dcbc971aac43652ad84f83d73289d84ac77973c95698033121d1eb0dff",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 49438,
+        "anthropic_initial_request_input_tokens": 62205,
+        "edit_feedback_rounds": 2,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-16597",
+      "repo": "sympy/sympy",
+      "base_commit": "6fd65310fa3167b9626c38a5487e171ca407d988",
+      "dataset_row_sha256": "d60f67575e0c75892153280f68b02e46cfaab6ea4e327a093839cc1668ee7d26",
+      "problem_statement_sha256": "1b04ffa8e91360cc91e2397541d3f8c5f34ffc0cb5cd84b0015747240c26932c",
+      "gold_patch_sha256": "413a90c09ecfd8f552a5db49bb59f74eac1ae550dca0d19aaa1eb11575bea1ac",
+      "test_patch_sha256": "aa1263270ae0b8e7befe02678ac8ace76ea44779054690595982de41a56956e9",
+      "gold_file_count": 6,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 36269,
+        "anthropic_initial_request_input_tokens": 44709,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-17318",
+      "repo": "sympy/sympy",
+      "base_commit": "d4e0231b08147337745dcf601e62de7eefe2fb2d",
+      "dataset_row_sha256": "da60236dc6083d56774e944061747eed3584331d369da516dcc77565d644cdeb",
+      "problem_statement_sha256": "8a310f20c7a096a6254d15f08997beaed275576879e726690cc2a8de13e47e3c",
+      "gold_patch_sha256": "9b911775207c165c369d7fdd0af375428405d1adfed3849eccfe95a19c561219",
+      "test_patch_sha256": "bd1d58da2ab8231d3d0f56f268e9118c59cbc03202604a71ce63d5aeeda20545",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 16210,
+        "anthropic_initial_request_input_tokens": 20736,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-19783",
+      "repo": "sympy/sympy",
+      "base_commit": "586a43201d0357e92e8c93548d69a9f42bf548f4",
+      "dataset_row_sha256": "f2b6374bce0009c4e4fefae7910f6063139e27e2f5d2e8dc58e576e8697279ab",
+      "problem_statement_sha256": "6c701bb3840d26e89d9d3fef6d91d7d72ba7ed68cf6c2347f8d5c2eb275425c5",
+      "gold_patch_sha256": "76add5ea570c383988366d507e33d810e0cc0801b5dfb451c98a7a1f2d8f959d",
+      "test_patch_sha256": "13fed870f6afe3148db2c5ccaad0c7d626b158d2398215ca39947cea80b3196c",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 4970,
+        "anthropic_initial_request_input_tokens": 6533,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-20438",
+      "repo": "sympy/sympy",
+      "base_commit": "33b47e4bd60e2302e42616141e76285038b724d6",
+      "dataset_row_sha256": "1fa1a8ccb809daa055929f65f7468c13f4bd7050a13fc07c14627164c1e4aa76",
+      "problem_statement_sha256": "ab48dc1dc9b89443d93044930f964e8d4dfe25706fceb03dddf2295c060d339a",
+      "gold_patch_sha256": "a877856d45e00af4f24956d9a7b6b4d92cb3412c23a16f64f1058684a10ca380",
+      "test_patch_sha256": "97c79cc32a35302e026cfc95b82337445cc151cca470ba0e72867b461a5bcb56",
+      "gold_file_count": 3,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 12931,
+        "anthropic_initial_request_input_tokens": 16769,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    },
+    {
+      "instance_id": "sympy__sympy-22080",
+      "repo": "sympy/sympy",
+      "base_commit": "3f8c8c2377cb8e0daaf8073e8d03ac7d87580813",
+      "dataset_row_sha256": "7bd2be69f3d2ff4eca70c3028a1a7f41d4b3a0cdc67438b7a412626a302f43cb",
+      "problem_statement_sha256": "e4e025ba043919887cf1773f79e5bb6f7b7ad8eab54718e8ec0d0ff2f4c37b14",
+      "gold_patch_sha256": "56f7c477f169c0215b38de32c58a27b45f28eacef1a54e6581587c3714e01a33",
+      "test_patch_sha256": "3d413e43158c71ff7ba615210d9b268a7b31f05735d88a1471098904f9657650",
+      "gold_file_count": 2,
+      "included": true,
+      "exclusion_reason": null,
+      "upstream_a": {
+        "outcome": "unresolved",
+        "resolved": false,
+        "cl100k_context_tokens": 9018,
+        "anthropic_initial_request_input_tokens": 11544,
+        "edit_feedback_rounds": 0,
+        "retry_inclusive_input_tokens": null,
+        "retry_inclusive_input_tokens_reason": "upstream_not_measured",
+        "wall_clock_seconds": null,
+        "wall_clock_seconds_reason": "upstream_not_published"
+      }
+    }
+  ]
+}

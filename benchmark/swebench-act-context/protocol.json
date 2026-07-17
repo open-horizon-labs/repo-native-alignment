@@ -1,0 +1,456 @@
+{
+  "schema_version": 1,
+  "protocol_id": "rna-act-context-swebench-v1",
+  "status": "frozen",
+  "frozen_on": "2026-07-16",
+  "scope": "methodology only; no model call is authorized by this manifest",
+  "issues": {
+    "parent": 779,
+    "methodology": 782
+  },
+  "references": {
+    "paper": {
+      "arxiv_id": "2607.09691",
+      "version": "v1",
+      "submitted_utc": "2026-06-19T04:22:17Z",
+      "pdf_sha256": "cf5e72ba371a96915d2ed540bb3c6663ebd64925e1c7f64befff14c39905a766"
+    },
+    "upstream": {
+      "repository": "https://github.com/integrallis/act-context",
+      "commit": "fd115351d0ab742993aa5d7006f1369fb15b6e74",
+      "license": "MIT",
+      "repository_paper_pdf_sha256": "58c50eec36f4eeffc8ed93de4df692a9b8c38241a8883d43123dd1de0f6e6575"
+    }
+  },
+  "compatibility": {
+    "a_decision": "compatible for official binary outcomes, cl100k context, and exact initial-request Anthropic input tokens only when the offline validator passes",
+    "not_comparable": [
+      "A wall-clock timing",
+      "A retry-inclusive input tokens",
+      "A total episode input tokens",
+      "A dollar cost"
+    ],
+    "reason": "upstream did not publish timing and counted only the exact initial prompt; 11 A episodes used 22 edit-feedback rounds whose input tokens are not recoverable",
+    "required_equalities": [
+      "requested and resolved model",
+      "direct Anthropic Messages API request shape",
+      "temperature",
+      "max_tokens",
+      "prompt template",
+      "edit parser and patch builder",
+      "maximum edit-feedback rounds",
+      "SWE-bench package and evaluator entrypoint",
+      "dataset revision and every row digest",
+      "N=71 selection",
+      "single gold exclusion and N=70 included population"
+    ],
+    "on_failure": "stop before model access and request an explicit methodology decision; never rerun A or relabel the design as paired",
+    "on_total_episode_h1_request": "stop for an explicit methodology decision; never reconstruct or fabricate missing A retry inputs"
+  },
+  "instrument": {
+    "provider": "Anthropic direct Messages API",
+    "sdk": {
+      "name": "anthropic",
+      "version": "0.109.1",
+      "wheel_sha256": "ce7d94a7657f2aa29338cca448945eac621b4f62c1794cf461cb32847223e9b8"
+    },
+    "request": {
+      "method": "client.messages.create",
+      "requested_model": "claude-sonnet-4-6",
+      "resolved_model_check": "response.model must equal claude-sonnet-4-6 exactly",
+      "temperature": 0.0,
+      "max_tokens": 8000,
+      "system": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "formatted prompt template"
+        }
+      ],
+      "stream": false
+    },
+    "prompt": {
+      "template": "You are fixing a GitHub issue in the `{repo}` repository.\n\nISSUE:\n{issue}\n\nRELEVANT CODE (already localized for you):\n{context}\n\nThink briefly about the fix first if that helps. Then output ONE OR MORE edit blocks in EXACTLY\nthis format (the blocks are parsed mechanically; everything outside them is ignored):\n*** FILE: <path relative to repo root>\n*** SEARCH\n<exact existing lines to replace — copy them VERBATIM from the code above, incl. indentation>\n*** REPLACE\n<the new lines>\n*** END\n\nRules:\n- each SEARCH block must be copied verbatim from the provided code and match exactly ONE location;\n  keep it small and uniquely matching.\n- to CREATE a new file, emit a block whose SEARCH section is empty.\n- edit only what is necessary to fix the issue.",
+      "template_sha256": "0a85336461844269a4c64f00e35717880e52b241d8feb95ec2f8254f03cb8f26",
+      "format_encoding": "UTF-8; Python str.format(repo, issue, context); no truncation or normalization"
+    },
+    "parser": {
+      "reference_path": "benchmark/swebench-act-context/upstream/edit_patch_v2.py",
+      "reference_sha256": "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e",
+      "entrypoints": [
+        "parse_edits",
+        "apply_edits_detailed",
+        "make_diff",
+        "failure_feedback"
+      ],
+      "policy": "reasoning outside edit blocks is ignored; SEARCH must match exactly once, with the pinned trailing-whitespace fallback; state persists across rounds; empty SEARCH creates only a new file"
+    },
+    "retry": {
+      "maximum_feedback_rounds": 2,
+      "retry_trigger": "one or more edit results not matched/created and at least one edit was parsed",
+      "retry_suffix": "\n\nYOUR PREVIOUS EDIT BLOCKS (for reference):\n{prev}\n\nThese edits FAILED to apply:\n{feedback}\n\nThe other edits were applied successfully. Re-emit corrected edit blocks ONLY for the failed edits,\nin the same *** FILE / SEARCH / REPLACE / END format.",
+      "retry_suffix_sha256": "16b9a0ddb39d289333b54af4e4199921890c9610ed77d4dc96a90bb95ec981e1",
+      "model/API transport_retry_policy": "the pinned Anthropic SDK default; no harness-level transport retry"
+    }
+  },
+  "evaluator": {
+    "package": "swebench",
+    "version": "4.1.0",
+    "sdist_sha256": "5aaa6a92c2db1aa64892d28a47483ca46a45a15cf1d2df673d7744f71811dc9a",
+    "wheel_sha256": "1243776f720047cc9e20a427f7a52b75c13a07abda6154fb60fe77f82ec8af57",
+    "entrypoint": "python -m swebench.harness.run_evaluation",
+    "namespace": "swebench",
+    "max_workers": 1,
+    "cache_level": "env",
+    "resolved_definition": "the official per-instance report has resolved=true; all other terminal model outcomes are unresolved"
+  },
+  "dataset": {
+    "name": "princeton-nlp/SWE-bench_Verified",
+    "split": "test",
+    "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+    "parquet_path": "data/test-00000-of-00001.parquet",
+    "parquet_lfs_sha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd",
+    "datasets_package_version": "5.0.0",
+    "population_path": "benchmark/swebench-act-context/population.json",
+    "population_sha256": "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
+  },
+  "oracle_surface": {
+    "gold_file_source": "dataset patch field only; it is used for oracle localization, never as model context",
+    "locus_algorithm_reference": {
+      "path": "experiments/resolve/arms_v2.py",
+      "sha256": "784aa472671dff1ad96551570816959925815a5ab7e90ac5a9c391b43b5577a3",
+      "functions": [
+        "gold_edited_lines",
+        "gold_units_v2",
+        "module_preamble_segments"
+      ]
+    },
+    "locus_members": [
+      "every byte-faithful gold_units_v2 span including decorators",
+      "every non-empty module-preamble segment in every gold Python file",
+      "the entire file for every non-Python gold file"
+    ],
+    "locus_order": "gold file first appearance in patch; then UTF-8 path bytes; then start line; then end line; then stable node ID",
+    "expressibility": "every non-new-file hunk requirement from upstream hunk_preimages must be present under the upstream rstrip-tolerant coverage check; failure stops the cohort before model access",
+    "new_files": "represented by their gold path with an empty preimage; gold replacement content is never exposed"
+  },
+  "arms": {
+    "A": {
+      "name": "plain",
+      "source": "immutable upstream oracle_full evidence",
+      "execute": false,
+      "context": "entire oracle gold files as constructed upstream",
+      "reported_n": 70,
+      "resolved": 19,
+      "mean_cl100k_context_tokens": 25426.3
+    },
+    "B": {
+      "name": "RNA",
+      "context": "the verbatim oracle surface followed by the deterministic RNA packet with full selected non-locus bodies"
+    },
+    "C": {
+      "name": "RNA + structural minification",
+      "context": "the identical verbatim oracle surface and identical acquisition record as B; only eligible selected non-locus body payloads are minified"
+    },
+    "invariant": "B and C must reuse one sealed acquisition record with byte-identical loci, candidate IDs, score components, graph relationships, selection/omission decisions, and ordering; C may change only eligible body payload bytes and their payload digests/lengths"
+  },
+  "rna_acquisition": {
+    "access": "CLI only; MCP is forbidden",
+    "artifact": "exact qualified CI release receipt from issue #786; release, Metal, embeddings, reranking, and complete LSP must all be proven",
+    "business_context": "disabled; exclude .oh artifacts, automatic business preambles, commits, PR merges, and history-derived records",
+    "ordinary_context": "README, docs, all normal Markdown/RST project documents, source, tests, and ordinary config remain eligible",
+    "query_bytes": "the dataset problem_statement UTF-8 bytes exactly, without stripping or normalization",
+    "search": {
+      "mode": "hybrid",
+      "rerank": true,
+      "limit": 20,
+      "include_markdown": true,
+      "include_artifacts": false,
+      "result_order": "CLI emitted order; duplicates retain first occurrence",
+      "command_semantics": "search the exact query against the sealed local index with business_context=disabled"
+    },
+    "traversal": {
+      "seeds": "all RNA nodes that exactly correspond to oracle locus spans, in locus order",
+      "directions": [
+        "incoming",
+        "outgoing"
+      ],
+      "depth": 1,
+      "per_seed_direction_limit": 50,
+      "edge_type_order": [
+        "Calls",
+        "ReferencedBy",
+        "Imports",
+        "DependsOn",
+        "Implements",
+        "Extends",
+        "Defines",
+        "Contains",
+        "Tests",
+        "Other"
+      ],
+      "record": "stable source ID, target ID, edge type, direction, locus ordinal, and CLI ordinal"
+    },
+    "candidate_eligibility": [
+      "source-backed code node with a complete UTF-8 body",
+      "ordinary Markdown/RST section with a complete UTF-8 source span",
+      "not a locus and no byte overlap with a locus",
+      "not generated/vendor/cache/minified evidence and not any excluded business/history record"
+    ],
+    "score": {
+      "semantic_component": "1,000,000,000 - (one-based search rank - 1) * 1,000,000, or 0 when absent",
+      "graph_component": "maximum over relationships of max(1, 100,000 - locus_ordinal*1,000 - edge_type_ordinal*10 - CLI_ordinal), or 0 when absent",
+      "total": "semantic_component + graph_component; integers only",
+      "tie_break": "total descending, semantic rank ascending with null last, graph hops ascending with null last, UTF-8 stable node ID ascending"
+    },
+    "selection": {
+      "maximum_candidates": 24,
+      "full_body_budget_bytes": 65536,
+      "budget_basis": "B full UTF-8 body bytes only; framing and loci do not consume this selection budget",
+      "algorithm": "walk scored candidates in order; select an eligible candidate only when its complete full body fits remaining bytes; record oversize/noneligible candidates as omitted and continue",
+      "body_truncation": "forbidden",
+      "empty_selection": "valid only when the candidate pool is empty; otherwise unexplained empty selection stops the run"
+    }
+  },
+  "packet_serialization": {
+    "encoding": "raw UTF-8 bytes",
+    "container": "RNA_PACKET_V1 length-prefixed records",
+    "preamble": "RNA_PACKET_V1\\n followed by canonical JSON acquisition metadata and LF",
+    "record": "canonical JSON header with record kind, ordinal, stable ID, path, span, language, full-body byte length/digest, score components, and relationships; LF; exactly byte_length payload bytes; LF",
+    "canonical_json": "UTF-8 JSON with keys sorted lexicographically, separators comma/colon, ensure_ascii=false, and no insignificant whitespace",
+    "line_endings": "payload line endings are preserved exactly; framing uses LF",
+    "ordering": "all loci in locus order, then selected non-locus candidates in score order",
+    "digest": "SHA-256 over the complete packet bytes",
+    "repeatability": "two independent implementations must produce identical acquisition JSON, B packet bytes, and C packet bytes from the same checkout, population row, and qualified RNA artifact"
+  },
+  "minification": {
+    "scope": "C selected non-locus payloads only",
+    "forbidden": [
+      "all locus bytes",
+      "packet headers",
+      "candidate set/order/scores/relationships",
+      "Markdown/RST/docs/config/plain-text payloads",
+      "unsupported-language fallback",
+      "any body whose minified form is empty, unparsable, longer than the full form, or changes exported names/string literals/control-flow/callee/member tokens"
+    ],
+    "eligible_languages": [
+      "Python",
+      "Rust",
+      "TypeScript",
+      "TSX",
+      "JavaScript",
+      "JSX",
+      "Go",
+      "C#"
+    ],
+    "implementation": "qualified RNA structural minify_body from the exact #786 artifact; text fallback is forbidden",
+    "verification": "minify the sealed B payload independently, require deterministic byte equality on repetition, parse success, and full-to-minified source map/legend; any failure stops the instance before model access"
+  },
+  "definitions": {
+    "locus": "a byte-faithful oracle-surface record defined above; never minified",
+    "non_locus": "an eligible source span with zero byte overlap with every locus",
+    "full_body": "the exact complete UTF-8 source bytes for one selected node span, with original line endings and no truncation",
+    "minified_body": "the deterministic qualified structural-minifier output for one eligible full body plus its source-map legend",
+    "candidate": "one deduplicated stable RNA node admitted to scoring before budget selection",
+    "traversal_edge": "one sealed directed typed relationship returned by the pinned one-hop CLI traversal",
+    "truncation": "any removal of bytes from an included issue, locus, prompt, or selected body; forbidden; budget omission is not truncation and is recorded",
+    "retry": "one additional Messages request caused only by edit-application feedback; at most two",
+    "failure": "a terminal non-resolved model outcome or a pre-model protocol/infrastructure stop, classified separately",
+    "missing_telemetry": "a required metric represented as JSON null with reason; never zero and never inferred",
+    "resolved_issue": "official SWE-bench resolved=true for that arm and instance"
+  },
+  "run": {
+    "population": {
+      "selected": 71,
+      "included": 70,
+      "gold_exclusion": [
+        "astropy__astropy-8707"
+      ],
+      "post_hoc_exclusions": false
+    },
+    "schedule": "the exact 70-episode order and per-instance B/C order in population.json; no reshuffle, substitution, or opportunistic rerun",
+    "parallelism": 1,
+    "api_request_timeout_seconds": 600,
+    "episode_timeout_seconds": 1800,
+    "evaluator_timeout_seconds": 1800,
+    "budget": {
+      "authorization": "a separate explicit approval is required by issue #789/#790; this manifest authorizes zero spend",
+      "maximum_model_requests": 420,
+      "ledger": "reserve the worst-case next request before dispatch; stop before dispatch when the declared approved dollar or token budget cannot cover it",
+      "overrun": "stop the cohort, preserve evidence, and seek a methodology/budget decision; never drop rows"
+    },
+    "incomplete_treatment": {
+      "pre_model_protocol_or_infrastructure": "block and resume the same sealed schedule only after the gate is restored without source/protocol/artifact drift",
+      "model_timeout_transport_empty_or_parser_failure": "terminal unresolved for that arm; preserve raw status and telemetry nulls",
+      "evaluator_infrastructure": "retry evaluator without another model call; if still unavailable the cohort remains incomplete and no final hypothesis verdict is issued",
+      "no_post_hoc_exclusion": "all 70 included rows remain in paired tables"
+    }
+  },
+  "hypotheses": {
+    "H1": {
+      "claim": "B uses at least 40% fewer exact comparable initial-request Anthropic input tokens per resolved issue than A, where the quantity is total exact initial-request input tokens across frozen N=70 divided by resolved_count",
+      "quality_gate": "lower bound of paired B-A resolved-rate difference is greater than -0.10",
+      "disclosure": "A retry-inclusive episode tokens are null/upstream_not_measured; B/C retry-inclusive totals are secondary and not A-comparable"
+    },
+    "H2": {
+      "claim": "C uses at least 30% fewer act-context payload input tokens and at least 20% fewer total episode input tokens per resolved issue than B",
+      "quality_gate": "lower bound of paired C-B resolved-rate difference is greater than -0.10"
+    },
+    "decision": "each efficiency threshold and non-inferiority gate must pass; otherwise publish the failed/null hypothesis unchanged"
+  },
+  "statistics": {
+    "resolution": "official binary SWE-bench outcome",
+    "paired_tables": [
+      "A/B",
+      "B/C"
+    ],
+    "tests": "exact two-sided McNemar tests with discordant counts",
+    "intervals": [
+      "Wilson 95% intervals for each arm resolved rate",
+      "paired 95% confidence interval for each arm-rate difference using the frozen exact paired-binomial method implemented and test-vectored before qualification"
+    ],
+    "noninferiority_margin": -0.1,
+    "noise_floor": "report the upstream approximately 9% per-instance flip rate for byte-identical temperature-0 runs",
+    "token_denominator": "for H1, sum exact initial-request input tokens across all frozen N=70 rows divided by resolved_count (not mean among resolved rows); for H2 use the separately named metric with the same all-row numerator rule; if any required initial A count is missing or resolved_count is zero, the numerical comparison is blocked",
+    "rounding": "compute from unrounded integers; display counts exactly, rates/intervals to four decimals, token ratios to four decimals"
+  },
+  "telemetry": {
+    "required_phases": [
+      "guest_boot",
+      "lsp_model_warmup",
+      "cold_scan",
+      "embeddings",
+      "packet_construction",
+      "api",
+      "edit_application",
+      "evaluator",
+      "warm_repeated_query"
+    ],
+    "timing": "monotonic wall-clock nanoseconds per phase; A phase timing remains null/unavailable",
+    "tokens": [
+      "exact Anthropic input/output/total per B/C request",
+      "exact initial-request input comparable to A",
+      "cl100k locus/packet/full/minified payload counts"
+    ],
+    "cost": "provider-reported or exact price-table computation per request with price-table identity; null if unavailable",
+    "missing": "status=missing, value=null, and reason are mandatory",
+    "a_null_requirements": {
+      "retry_inclusive_input_tokens": {
+        "value": null,
+        "reason": "upstream_not_measured"
+      },
+      "wall_clock_seconds": {
+        "value": null,
+        "reason": "upstream_not_published"
+      }
+    },
+    "comparability": "B/C retry-inclusive episode totals are secondary only and must never be labeled comparable to A"
+  },
+  "stop_rules": [
+    "offline validator nonzero",
+    "protocol/bundle/population digest mismatch",
+    "A compatibility mismatch",
+    "credential detected in argv/git/GitHub/log/bundle/guest image",
+    "unqualified or wrong CI artifact",
+    "Metal/embedding/rerank fallback",
+    "any LSP bug, missing relevant extension, skipped file, friction, partial/degraded/cancelled job, crash, timeout, or non-quiescence",
+    "business/history leakage or missing ordinary docs/source/test/config coverage",
+    "locus expressibility failure",
+    "B/C acquisition mismatch",
+    "any source/protocol/artifact change after qualification",
+    "budget reservation failure"
+  ],
+  "credentials": {
+    "environment_only": "ANTHROPIC_API_KEY",
+    "forbidden_locations": [
+      "argv",
+      "git",
+      "GitHub",
+      "logs",
+      "manifests",
+      "evidence bundles",
+      "guest images",
+      "shell history"
+    ],
+    "validator_behavior": "reject key-like values and account identifiers; never print secret values"
+  },
+  "upstream_artifacts": {
+    "experiments/resolve/scaled_run.py": {
+      "sha256": "3af9988b514114bd23dbaaee555bd59a7fc3ab86c549aa322547308978e633cc",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/scaled_run.py"
+    },
+    "experiments/resolve/arms_v2.py": {
+      "sha256": "784aa472671dff1ad96551570816959925815a5ab7e90ac5a9c391b43b5577a3",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/arms_v2.py"
+    },
+    "experiments/resolve/edit_patch_v2.py": {
+      "sha256": "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/edit_patch_v2.py"
+    },
+    "experiments/resolve/select_instances.py": {
+      "sha256": "10916152e66babd14358bec5922fe91156308f165bbdd39d725618024864f412",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/select_instances.py"
+    },
+    "experiments/resolve/stats.py": {
+      "sha256": "16d577d2aabb4b9d82d85641c98f57f903d2a3c95122ef11972000b9b7fe3436",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/stats.py"
+    },
+    "experiments/resolve/scaled_instances.json": {
+      "sha256": "b2b31f1e50894cf836c865d285bd83b0c37237be511ce32874d1966f8b315615",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/scaled_instances.json"
+    },
+    "experiments/resolve/results/run_meta.json": {
+      "sha256": "d808e381ca75d7278f7a34cf6f684fba8d302bce04434281d30c269b8e0e5af3",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/run_meta.json"
+    },
+    "experiments/resolve/results/gold.exp014b_gold.json": {
+      "sha256": "106d24a0f5f637a673fd91eb7a490dc6647581605ff3312c28e9045d486316db",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/gold.exp014b_gold.json"
+    },
+    "experiments/resolve/results/oracle_full.exp014b_oracle_full.json": {
+      "sha256": "657c55adb26d49fe319152b6caa7077f7a8b267a3c1d8fcdbd00bdf4612df704",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/oracle_full.exp014b_oracle_full.json"
+    },
+    "experiments/resolve/results/costs.json": {
+      "sha256": "9350a416a3239a293512e69ba5135a4383c7bc53931c7f679091e3d5dfaaa944",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/costs.json"
+    },
+    "experiments/resolve/results/metrics.json": {
+      "sha256": "0f6819d3f3a234349499f8d15a6b2f5508c96a83554a19505082c1853ca5d661",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/metrics.json"
+    },
+    "experiments/resolve/results/analysis.json": {
+      "sha256": "6d3091113869aca57fa01174a1a8188f1e95cd71a5a837bb4217ddc25cf70ff2",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/experiments/resolve/results/analysis.json"
+    },
+    "src/dhcm_ng/llm.py": {
+      "sha256": "753113635806abad63629f89d0a4f4ee28db55c58c0e49c4cf49155f82b8a6d3",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/src/dhcm_ng/llm.py"
+    },
+    "src/dhcm_ng/context_arms.py": {
+      "sha256": "ef70d377a1916bd12d9b4c6dc3a3cc0928af59ca1e195f21329ddb40be9dfdeb",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/src/dhcm_ng/context_arms.py"
+    },
+    "uv.lock": {
+      "sha256": "3818138601bfe63a078c7e4a751214b3917c68b227fd34ae2708e4d0541a39ca",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/uv.lock"
+    },
+    "LICENSE": {
+      "sha256": "d908118fd95dbc8bea42747d1dacfdfe30db655bfb3047b00b8992453a43b969",
+      "source_url": "https://github.com/integrallis/act-context/blob/fd115351d0ab742993aa5d7006f1369fb15b6e74/LICENSE"
+    }
+  },
+  "validator_policy": {
+    "offline": true,
+    "network_calls": false,
+    "must_reject": [
+      "any non-null A retry-inclusive or episode input token value",
+      "any claim that A/B retry-inclusive episode tokens are comparable",
+      "any missing A initial-request token count",
+      "any H1 denominator defined as mean only among resolved rows",
+      "any protocol, population, source-reference, schedule, count, outcome, or digest drift",
+      "any secret-shaped content"
+    ],
+    "success_output": "machine-readable compatibility decision plus bundle digest; no credential values"
+  }
+}
