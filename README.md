@@ -257,6 +257,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `search <query>` | Search symbols by name, keyword, or meaning — filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --repo <dir>` | Scan + extract + embed + persist. Prints an OperationReport summary with ready capabilities, degraded query classes, and next enrichment commands. |
+| `--business-context enabled\|disabled <command>` | Global context mode. `disabled` excludes `.oh/**`, automatic business-context preambles, and Git-history producers while preserving ordinary repository files; incompatible disposable caches are deleted and rebuilt before use. Defaults to `enabled`. |
 | `scan --repo <dir> --timings` | Include measured operation phase timings in the scan summary. Unmeasured subphases are omitted rather than inferred. |
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. Persists a recent OperationReport for `list_roots`. |
 | `enrich --repo <dir> --capability embeddings\|call-references --scope repo\|root\|changed\|targets\|task` | Run selected enrichment against an existing graph cache without source extraction. Broad type/constant references are default-off and run only for an explicit `changed`, `targets`, or `task` scope with visible `--max-requests` and `--max-duration-ms` limits. Use repeated `--target-symbol` values for `targets`; use `--task-file` and/or `--target-symbol` for `task`. Scoped broad-reference work never continues repo-wide, persists `default_profile`/full/scoped/partial/unavailable evidence, and rejects empty, ambiguous, or unmapped declarations rather than widening the request. |
@@ -273,6 +274,8 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 
 
 Recent scan/enrich operation history is bounded diagnostic state under `.oh/.cache/operation_reports.json`. It is repo-native control-plane state for CLI/MCP visibility, not source truth; non-terminal records from a previous process are marked stale on read.
+
+Use `--business-context disabled` only when a run must exclude RNA-specific business and history context, such as a benchmark. The mode is producer-based: README, Markdown, RST, source, tests, and configuration paths are not excluded by the context policy. Extraction and LSP availability for each admitted file type still follow the repository's configured baseline capabilities.
 
 ### ADR validation primitive
 

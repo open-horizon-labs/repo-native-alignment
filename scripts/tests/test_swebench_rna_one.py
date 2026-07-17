@@ -33,6 +33,23 @@ PROXY_SPEC.loader.exec_module(PROXY)
 
 
 class SwebenchRnaOneTests(unittest.TestCase):
+    def test_benchmark_rna_commands_pin_disabled_business_context(self) -> None:
+        command = HARNESS.rna_command(Path("/rna"), "scan", "--repo", "/checkout")
+        self.assertEqual(
+            command[:3], ["/rna", "--business-context", "disabled"]
+        )
+        self.assertIn("--timings", command)
+        config = HARNESS.proxy_config(
+            proxy_script=Path("/proxy.py"),
+            rna_binary=Path("/rna"),
+            checkout=Path("/checkout"),
+            trace_path=Path("/trace.jsonl"),
+            stderr_path=Path("/stderr.log"),
+        )
+        proxy_args = config["mcpServers"]["rna-server"]["args"]
+        flag = proxy_args.index("--business-context")
+        self.assertEqual(proxy_args[flag + 1], "disabled")
+
     def test_isolated_checkout_has_one_local_commit_and_no_remote(self) -> None:
         instance = json.loads(
             (FIXTURES / "swebench_instance.json").read_text(encoding="utf-8")
@@ -425,6 +442,31 @@ class SwebenchRnaOneTests(unittest.TestCase):
             )
             self.assertIn("embedding_stderr", state["raw_logs"])
 
+    def test_business_context_diagnostics_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "scan.stderr.log"
+            log.write_text(
+                "business context: disabled\n"
+                "excluded producer inputs: 3 .oh file(s), 2 Git-history producer(s)\n",
+                encoding="utf-8",
+            )
+            state = HARNESS.parse_business_context_state({"scan_stderr": log})
+            self.assertEqual(state["selected_mode"], "disabled")
+            self.assertEqual(state["business_artifact_files"], 3)
+            self.assertEqual(state["git_history_producers"], 2)
+
+            log.write_text("scan complete without diagnostics\n", encoding="utf-8")
+            with self.assertRaises(HARNESS.HarnessError):
+                HARNESS.parse_business_context_state({"scan_stderr": log})
+
+            log.write_text(
+                "business context: enabled\n"
+                "excluded producer inputs: 0 .oh file(s), 0 Git-history producer(s)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(HARNESS.HarnessError):
+                HARNESS.parse_business_context_state({"scan_stderr": log})
+
     def test_dry_run_builds_auditable_bundle_without_executor_or_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "bundle"
@@ -456,6 +498,15 @@ class SwebenchRnaOneTests(unittest.TestCase):
             )
             self.assertEqual(manifest["status"], "dry_run_complete")
             self.assertEqual(manifest["dry_run"]["tokens_spent"], 0)
+            self.assertEqual(
+                manifest["rna"]["business_context"]["selected_mode"], "disabled"
+            )
+            self.assertEqual(
+                manifest["rna"]["business_context"]["diagnostic_status"], "not_run"
+            )
+            self.assertIsNone(
+                manifest["rna"]["business_context"]["business_artifact_files"]
+            )
             self.assertEqual(
                 manifest["checkout_isolation"]["history_commit_count"], 1
             )

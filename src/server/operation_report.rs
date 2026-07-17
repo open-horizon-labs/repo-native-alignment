@@ -4,6 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::business_context::{
+    BusinessContextAdmission, BusinessContextExclusionCounts, BusinessContextMode,
+};
+
 use super::enrichment_jobs::{EnrichmentCapability, EnrichmentScope};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -16,6 +20,10 @@ pub struct OperationReport {
     pub operation: OperationKind,
     pub trigger: OperationTrigger,
     pub repo: String,
+    #[serde(default)]
+    pub business_context_mode: BusinessContextMode,
+    #[serde(default)]
+    pub business_context_exclusions: BusinessContextExclusionCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     pub state: OperationState,
@@ -51,6 +59,8 @@ impl OperationReport {
             operation,
             trigger,
             repo: repo.display().to_string(),
+            business_context_mode: BusinessContextMode::default(),
+            business_context_exclusions: BusinessContextExclusionCounts::default(),
             scope: None,
             state: OperationState::Running,
             started_at: unix_now(),
@@ -86,6 +96,11 @@ impl OperationReport {
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
+    }
+
+    pub fn record_business_context(&mut self, business_context: &BusinessContextAdmission) {
+        self.business_context_mode = business_context.mode();
+        self.business_context_exclusions = business_context.counts();
     }
 
     pub fn add_phase(&mut self, phase: PhaseReport) {
@@ -135,6 +150,15 @@ impl OperationReport {
             scope,
             state,
             duration
+        ));
+        lines.push(format!(
+            "  business context: {}",
+            self.business_context_mode
+        ));
+        lines.push(format!(
+            "  excluded producer inputs: {} .oh file(s), {} Git-history producer(s)",
+            self.business_context_exclusions.business_artifact_files,
+            self.business_context_exclusions.git_history_producers
         ));
 
         let mut output_parts = Vec::new();
@@ -1068,6 +1092,36 @@ mod tests {
         assert!(rendered.contains("embeddings: skipped"));
         assert!(rendered.contains("semantic search: embeddings skipped"));
         assert!(rendered.contains("repo-native-alignment enrich --capability embeddings"));
+    }
+
+    #[test]
+    fn operation_report_json_and_cli_deliver_business_context_mode_and_counts() {
+        let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let mut files = vec![PathBuf::from(".oh/outcomes/leak.md")];
+        business_context.retain_repository_files(&mut files);
+        assert!(!business_context.admit_git_history_producer());
+
+        let mut report = OperationReport::new(
+            OperationKind::ExtractOnly,
+            OperationTrigger::Test,
+            Path::new("/tmp/repo"),
+        );
+        report.record_business_context(&business_context);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["business_context_mode"], "disabled");
+        assert_eq!(
+            json["business_context_exclusions"]["business_artifact_files"],
+            1
+        );
+        assert_eq!(
+            json["business_context_exclusions"]["git_history_producers"],
+            1
+        );
+
+        let rendered = report.render_cli(false);
+        assert!(rendered.contains("business context: disabled"));
+        assert!(rendered.contains("1 .oh file(s), 1 Git-history producer(s)"));
     }
 
     #[tokio::test]

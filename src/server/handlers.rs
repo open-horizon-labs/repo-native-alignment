@@ -34,6 +34,7 @@ use crate::service::{
 };
 
 use super::RnaHandler;
+use super::ScanEnrichmentOptions;
 use super::helpers::text_result;
 use super::state::GraphState;
 use super::store::load_graph_from_lance;
@@ -68,6 +69,33 @@ impl RnaHandler {
     /// human-readable message (e.g. the repo has not been scanned yet).
     async fn load_external_graph(&self, repo: &str) -> Result<(GraphState, PathBuf), String> {
         let repo_path = self.resolve_repo_path(repo)?;
+        let external_handler = RnaHandler {
+            repo_root: repo_path.clone(),
+            business_context: self.business_context.clone(),
+            ..RnaHandler::default()
+        };
+        let cache_disposition = external_handler.prepare_business_context_cache().map_err(
+            |error| {
+                format!(
+                    "Failed to load graph from repo \"{}\": disposable-cache validation failed: {}",
+                    repo_path.display(),
+                    error
+                )
+            },
+        )?;
+        if cache_disposition.rebuilt() {
+            let graph = external_handler
+                .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to rebuild incompatible graph cache for repo \"{}\": {}",
+                        repo_path.display(),
+                        error
+                    )
+                })?;
+            return Ok((graph, repo_path));
+        }
         let graph = load_graph_from_lance(&repo_path).await.map_err(|e| {
             format!(
                 "Failed to load graph from repo \"{}\": {}. \

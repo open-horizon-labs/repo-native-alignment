@@ -12,6 +12,7 @@ import importlib.util
 import importlib.metadata
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -42,6 +43,7 @@ TOKEN_FIELDS = (
     "reasoning_tokens",
     "cost_usd",
 )
+BUSINESS_CONTEXT_MODE = "disabled"
 
 
 class HarnessError(RuntimeError):
@@ -102,6 +104,19 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def rna_command(rna_binary: Path, *args: str) -> list[str]:
+    """Build every benchmark RNA command with isolation made explicit."""
+    command = [
+        str(rna_binary),
+        "--business-context",
+        BUSINESS_CONTEXT_MODE,
+        *args,
+    ]
+    if args and args[0] == "scan":
+        command.append("--timings")
+    return command
 
 
 def run_logged(
@@ -390,6 +405,8 @@ def proxy_config(
                     str(proxy_script),
                     "--rna-binary",
                     str(rna_binary),
+                    "--business-context",
+                    BUSINESS_CONTEXT_MODE,
                     "--repo",
                     str(checkout),
                     "--trace",
@@ -972,6 +989,62 @@ def parse_enrichment_state(
     }
 
 
+def parse_business_context_state(log_paths: Mapping[str, Path]) -> dict[str, Any]:
+    """Fail closed unless RNA reports the benchmark's selected isolation mode."""
+    mode_pattern = re.compile(r"business context:\s*(enabled|disabled)", re.IGNORECASE)
+    counts_pattern = re.compile(
+        r"excluded producer inputs:\s*(\d+)\s+\.oh file\(s\),\s*"
+        r"(\d+)\s+Git-history producer\(s\)",
+        re.IGNORECASE,
+    )
+    observations: list[dict[str, Any]] = []
+    observed_modes: list[str] = []
+    observed_counts: list[tuple[int, int]] = []
+    for name, path in log_paths.items():
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        modes = [match.lower() for match in mode_pattern.findall(text)]
+        counts = [
+            (int(files), int(producers))
+            for files, producers in counts_pattern.findall(text)
+        ]
+        observed_modes.extend(modes)
+        observed_counts.extend(counts)
+        if modes or counts:
+            observations.append(
+                {
+                    "source": name,
+                    "modes": modes,
+                    "counts": [
+                        {
+                            "business_artifact_files": files,
+                            "git_history_producers": producers,
+                        }
+                        for files, producers in counts
+                    ],
+                }
+            )
+
+    if not observed_modes or not observed_counts:
+        raise HarnessError(
+            "RNA pre-warm omitted business-context mode and exclusion diagnostics"
+        )
+    unexpected = sorted(set(observed_modes) - {BUSINESS_CONTEXT_MODE})
+    if unexpected:
+        raise HarnessError(
+            "RNA benchmark command escaped disabled business-context mode: "
+            + ", ".join(unexpected)
+        )
+    return {
+        "selected_mode": BUSINESS_CONTEXT_MODE,
+        "diagnostic_status": "validated",
+        "business_artifact_files": max(files for files, _ in observed_counts),
+        "git_history_producers": max(producers for _, producers in observed_counts),
+        "observations": observations,
+    }
+
+
 def prewarm_rna(
     *,
     rna_binary: Path,
@@ -984,7 +1057,7 @@ def prewarm_rna(
     commands: list[CommandResult] = []
     scan_stdout = logs / "scan.stdout.log"
     scan_stderr = logs / "scan.stderr.log"
-    scan_command = [str(rna_binary), "scan", "--repo", str(checkout)]
+    scan_command = rna_command(rna_binary, "scan", "--repo", str(checkout))
     if condition == "structural":
         scan_command.append("--extract-only")
     else:
@@ -1000,8 +1073,8 @@ def prewarm_rna(
     embedding: CommandResult | None = None
     if condition == "full":
         embedding = run_logged(
-            [
-                str(rna_binary),
+            rna_command(
+                rna_binary,
                 "enrich",
                 "--capability",
                 "embeddings",
@@ -1010,16 +1083,18 @@ def prewarm_rna(
                 "--repo",
                 str(checkout),
                 "--no-background-continuation",
-            ],
+            ),
             cwd=checkout,
             stdout_path=logs / "embeddings.stdout.log",
             stderr_path=logs / "embeddings.stderr.log",
             timeout=timeout,
         )
         commands.append(embedding)
+    readiness_stdout = logs / "readiness.stdout.log"
+    readiness_stderr = logs / "readiness.stderr.log"
     readiness = run_logged(
-        [
-            str(rna_binary),
+        rna_command(
+            rna_binary,
             "search",
             "--repo",
             str(checkout),
@@ -1028,16 +1103,26 @@ def prewarm_rna(
             "--limit",
             "1",
             "--verbose",
-        ],
+        ),
         cwd=checkout,
-        stdout_path=logs / "readiness.stdout.log",
-        stderr_path=logs / "readiness.stderr.log",
+        stdout_path=readiness_stdout,
+        stderr_path=readiness_stderr,
         timeout=60,
     )
     commands.append(readiness)
     state = parse_enrichment_state(
         scan, scan_stdout, scan_stderr, embedding, readiness
     )
+    business_context_logs = {
+        "scan_stdout": scan_stdout,
+        "scan_stderr": scan_stderr,
+        "readiness_stdout": readiness_stdout,
+        "readiness_stderr": readiness_stderr,
+    }
+    if embedding is not None:
+        business_context_logs["embedding_stdout"] = logs / "embeddings.stdout.log"
+        business_context_logs["embedding_stderr"] = logs / "embeddings.stderr.log"
+    state["business_context"] = parse_business_context_state(business_context_logs)
     state["selected_condition"] = condition
     if readiness.exit_code != 0:
         raise HarnessError(
@@ -1257,6 +1342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
             },
             "selected_enrichment_condition": args.enrichment_condition,
+            "business_context": {
+                "selected_mode": BUSINESS_CONTEXT_MODE,
+                "diagnostic_status": "not_run",
+                "business_artifact_files": None,
+                "git_history_producers": None,
+                "observations": [],
+            },
         }
         checkout = run_dir / "checkout"
         materialize_started = time.monotonic()
@@ -1350,6 +1442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout=args.prewarm_timeout_seconds,
         )
         manifest["rna"]["enrichment_state"] = enrichment_state
+        manifest["rna"]["business_context"] = enrichment_state["business_context"]
         manifest["rna"]["prewarm_commands"] = [
             dataclasses.asdict(command) for command in prewarm_commands
         ]

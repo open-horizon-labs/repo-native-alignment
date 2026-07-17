@@ -623,6 +623,7 @@ impl RnaHandler {
                 let scan_stats = Arc::clone(&self.scan_stats);
                 let lance_write_lock = Arc::clone(&self.lance_write_lock);
                 let embed_index = Arc::clone(&self.embed_index);
+                let business_context = self.business_context.clone();
                 let lsp_status = Arc::clone(&self.lsp_status);
                 let graph_build_lock = Arc::clone(&self.graph_build_lock);
                 let incremental_update_lock = Arc::clone(&self.incremental_update_lock);
@@ -787,6 +788,7 @@ impl RnaHandler {
                             primary_slug.clone(),
                             repo_root.clone(),
                             crate::extract::consumers::BusOptions {
+                                business_context: business_context.clone(),
                                 scan_stats: Some(Arc::clone(&scan_stats)),
                                 embed_idx: None,
                                 lance_repo_root: None,
@@ -809,10 +811,8 @@ impl RnaHandler {
                                 full_state.detected_frameworks = detected_frameworks;
 
                                 // Update LSP status
-                                let lsp_call_edge_count = scoped_lsp_call_edge_count(
-                                    &full_state.edges,
-                                    &lsp_node_filter,
-                                );
+                                let lsp_call_edge_count =
+                                    scoped_lsp_call_edge_count(&full_state.edges, &lsp_node_filter);
                                 let degraded_detail =
                                     (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
                                 if let Some(detail) = degraded_detail.as_deref() {
@@ -1236,6 +1236,10 @@ impl RnaHandler {
         // Invalidate cached root slugs since workspace/worktree config may have changed.
         self.invalidate_non_code_root_slugs_cache();
 
+        // Business-context mode is part of the disposable index identity. A legacy,
+        // invalid, or mismatched cache is deleted before any Lance-backed read.
+        self.prepare_business_context_cache()?;
+
         // Initialize pattern config from .oh/config.toml (once, at first build).
         crate::extract::generic::init_pattern_config(&self.repo_root);
 
@@ -1455,7 +1459,11 @@ impl RnaHandler {
                                     }
                                     Ok(false) => {
                                         match idx
-                                            .index_all_with_symbols(&self.repo_root, &state.nodes)
+                                            .index_all_with_symbols_and_business_context(
+                                                &self.repo_root,
+                                                &state.nodes,
+                                                &self.business_context,
+                                            )
                                             .await
                                         {
                                             Ok(count) => {
@@ -1614,7 +1622,17 @@ impl RnaHandler {
             }
 
             // Dirty root (or clean root with no cache): full extract
-            let all_files = scanner.all_known_files();
+            let mut all_files = scanner.all_known_files();
+            let excluded_business_files = self
+                .business_context
+                .retain_repository_files(&mut all_files);
+            if excluded_business_files > 0 {
+                tracing::info!(
+                    "Business-context admission skipped {} .oh file(s) for root '{}'",
+                    excluded_business_files,
+                    root_slug
+                );
+            }
             let full_scan = crate::scanner::ScanResult {
                 changed_files: Vec::new(),
                 new_files: all_files,
@@ -1737,23 +1755,25 @@ impl RnaHandler {
             }
         }
 
-        // 4. Extract PR merges from git history
-        match crate::git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
-            Ok((pr_nodes, pr_edges)) => {
-                let modified_edges =
-                    crate::git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
-                tracing::info!(
-                    "PR merges: {} nodes, {} edges, {} Modified links",
-                    pr_nodes.len(),
-                    pr_edges.len(),
-                    modified_edges.len()
-                );
-                all_nodes.extend(pr_nodes);
-                all_edges.extend(pr_edges);
-                all_edges.extend(modified_edges);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to extract PR merges: {}", e);
+        // 4. Extract PR merges from git history when admitted by the selected mode.
+        if self.business_context.admit_git_history_producer() {
+            match crate::git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
+                Ok((pr_nodes, pr_edges)) => {
+                    let modified_edges =
+                        crate::git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
+                    tracing::info!(
+                        "PR merges: {} nodes, {} edges, {} Modified links",
+                        pr_nodes.len(),
+                        pr_edges.len(),
+                        modified_edges.len()
+                    );
+                    all_nodes.extend(pr_nodes);
+                    all_edges.extend(pr_edges);
+                    all_edges.extend(modified_edges);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to extract PR merges: {}", e);
+                }
             }
         }
 
@@ -1813,6 +1833,7 @@ impl RnaHandler {
                     primary_slug,
                     self.repo_root.clone(),
                     crate::extract::consumers::BusOptions {
+                        business_context: self.business_context.clone(),
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
@@ -2280,7 +2301,7 @@ impl RnaHandler {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
         let mut fallback_scanner: Option<Scanner> = None;
-        let scan = match pending_scan {
+        let mut scan = match pending_scan {
             Some(s) => s,
             None => {
                 // Fallback: scan fresh (used by background scanner path)
@@ -2291,10 +2312,20 @@ impl RnaHandler {
             }
         };
 
+        self.business_context
+            .retain_repository_files(&mut scan.changed_files);
+        self.business_context
+            .retain_repository_files(&mut scan.new_files);
+        self.business_context
+            .retain_repository_files(&mut scan.deleted_files);
+
         if scan.changed_files.is_empty()
             && scan.new_files.is_empty()
             && scan.deleted_files.is_empty()
         {
+            if let Some(scanner) = fallback_scanner {
+                scanner.commit_state()?;
+            }
             return Ok(true);
         }
 
@@ -2479,6 +2510,7 @@ impl RnaHandler {
                 primary_slug.clone(),
                 self.repo_root.clone(),
                 crate::extract::consumers::BusOptions {
+                    business_context: self.business_context.clone(),
                     scan_stats: Some(Arc::clone(&self.scan_stats)),
                     embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                     lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
@@ -2511,8 +2543,7 @@ impl RnaHandler {
             graph.nodes = enriched_nodes;
             graph.edges = enriched_edges;
             graph.detected_frameworks = detected_frameworks;
-            let lsp_call_edge_count =
-                scoped_lsp_call_edge_count(&graph.edges, &lsp_node_filter);
+            let lsp_call_edge_count = scoped_lsp_call_edge_count(&graph.edges, &lsp_node_filter);
             let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
             if enrichment.runs_lsp() {
                 incremental_lsp_outcome = Some((lsp_call_edge_count, degraded_detail));

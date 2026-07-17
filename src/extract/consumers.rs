@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
+use crate::business_context::BusinessContextAdmission;
 use crate::extract::ExtractorRegistry;
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
 use crate::extract::scan_stats::{ScanStats, ScanStatsConsumer};
@@ -81,6 +82,7 @@ impl ExtractionConsumer for ManifestConsumer {
 /// Emits: `RootExtracted` (carrying all nodes + edges for this root)
 pub struct TreeSitterConsumer {
     registry: ExtractorRegistry,
+    business_context: BusinessContextAdmission,
     /// Optional handle to live scan stats — used to propagate encoding stats
     /// (binary skipped / lossy-decoded counts) without changing the event schema.
     scan_stats: Option<Arc<RwLock<ScanStats>>>,
@@ -90,6 +92,7 @@ impl TreeSitterConsumer {
     pub fn new() -> Self {
         Self {
             registry: ExtractorRegistry::with_builtins(),
+            business_context: BusinessContextAdmission::default(),
             scan_stats: None,
         }
     }
@@ -98,6 +101,18 @@ impl TreeSitterConsumer {
     pub fn with_scan_stats(scan_stats: Arc<RwLock<ScanStats>>) -> Self {
         Self {
             registry: ExtractorRegistry::with_builtins(),
+            business_context: BusinessContextAdmission::default(),
+            scan_stats: Some(scan_stats),
+        }
+    }
+
+    pub fn with_scan_stats_and_business_context(
+        scan_stats: Arc<RwLock<ScanStats>>,
+        business_context: BusinessContextAdmission,
+    ) -> Self {
+        Self {
+            registry: ExtractorRegistry::with_builtins(),
+            business_context,
             scan_stats: Some(scan_stats),
         }
     }
@@ -137,10 +152,12 @@ impl ExtractionConsumer for TreeSitterConsumer {
 
         // Build a ScanResult that includes all files in the root.
         let mut scanner = crate::scanner::Scanner::new(path.clone())?;
-        let all_files = {
+        let mut all_files = {
             let _ = scanner.scan(); // populate internal state
             scanner.all_known_files()
         };
+        self.business_context
+            .retain_repository_files(&mut all_files);
 
         let full_scan = crate::scanner::ScanResult {
             changed_files: Vec::new(),
@@ -2277,6 +2294,8 @@ impl ExtractionConsumer for SubsystemConsumer {
 /// in real vs stub mode. All fields default to `None` (stub / throwaway).
 #[derive(Default)]
 pub struct BusOptions {
+    /// Shared producer-admission policy for direct `RootDiscovered` extraction.
+    pub business_context: BusinessContextAdmission,
     /// Shared `ScanStats` handle owned by `RnaHandler`. When `None`, a fresh
     /// throwaway `Arc` is created. Only pass `Some` from server call sites.
     pub scan_stats: Option<Arc<RwLock<ScanStats>>>,
@@ -2338,6 +2357,7 @@ pub fn build_builtin_bus(
     opts: BusOptions,
 ) -> (crate::extract::event_bus::EventBus, Arc<RwLock<ScanStats>>) {
     let BusOptions {
+        business_context,
         scan_stats,
         embed_idx,
         lance_repo_root,
@@ -2358,9 +2378,12 @@ pub fn build_builtin_bus(
 
     // --- RootDiscovered consumers ---
     bus.register(Box::new(ManifestConsumer));
-    bus.register(Box::new(TreeSitterConsumer::with_scan_stats(Arc::clone(
-        &stats_arc,
-    ))));
+    bus.register(Box::new(
+        TreeSitterConsumer::with_scan_stats_and_business_context(
+            Arc::clone(&stats_arc),
+            business_context,
+        ),
+    ));
 
     // --- RootExtracted consumers ---
     // LanguageAccumulatorConsumer must run first (emits LanguageDetected which

@@ -44,6 +44,7 @@ use rust_mcp_sdk::schema::{
     RpcError, TextContent,
 };
 
+use crate::business_context::{BusinessContextAdmission, CacheModeDisposition};
 use crate::embed::EmbeddingIndex;
 #[cfg(test)]
 use crate::graph::NodeKind;
@@ -79,6 +80,8 @@ impl PipelineResult {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
+    /// Producer admission and disposable-cache mode shared by every scan path.
+    pub business_context: BusinessContextAdmission,
     /// Lock-free graph state via ArcSwap (#574).
     /// Readers (tool calls) load an atomic snapshot — zero blocking.
     /// Writers (pre-warm, background scanner) build a new graph and swap the pointer.
@@ -144,6 +147,7 @@ impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            business_context: BusinessContextAdmission::default(),
             graph: Arc::new(ArcSwap::from_pointee(None)),
             embed_index: Arc::new(ArcSwap::from_pointee(None)),
             context_injected: std::sync::atomic::AtomicBool::new(false),
@@ -172,6 +176,20 @@ impl Default for RnaHandler {
 }
 
 impl RnaHandler {
+    /// Validate the exact disposable repo cache before any cache-backed read.
+    pub fn prepare_business_context_cache(&self) -> anyhow::Result<CacheModeDisposition> {
+        let disposition = self.business_context.prepare_cache(&self.repo_root)?;
+        if disposition.rebuilt() {
+            self.graph.store(Arc::new(None));
+            self.embed_index.store(Arc::new(None));
+            tracing::info!(
+                "Rebuilt incompatible disposable cache for business context mode {}",
+                self.business_context.mode()
+            );
+        }
+        Ok(disposition)
+    }
+
     /// Create a clone of this handler that shares all `Arc`-wrapped state.
     ///
     /// Used by `start_prewarm()` to spawn a background graph build task that
@@ -181,6 +199,7 @@ impl RnaHandler {
     fn clone_shared(&self) -> Self {
         Self {
             repo_root: self.repo_root.clone(),
+            business_context: self.business_context.clone(),
             graph: Arc::clone(&self.graph),
             embed_index: Arc::clone(&self.embed_index),
             context_injected: std::sync::atomic::AtomicBool::new(false),
@@ -442,6 +461,18 @@ fn build_context_preamble(root: &Path) -> String {
     out
 }
 
+fn build_context_preamble_for_mode(
+    root: &Path,
+    mode: crate::business_context::BusinessContextMode,
+) -> Option<String> {
+    if mode.is_disabled() {
+        return None;
+    }
+
+    let preamble = build_context_preamble(root);
+    (!preamble.is_empty()).then_some(preamble)
+}
+
 #[async_trait]
 impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     /// Called after the MCP client sends the `initialized` notification.
@@ -484,12 +515,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             .context_injected
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let ctx = build_context_preamble(root);
-            if !ctx.is_empty() {
+            if let Some(ctx) = build_context_preamble_for_mode(root, self.business_context.mode()) {
                 tracing::info!("Injecting business context preamble on first tool call");
                 Some(ctx)
             } else {
-                // Empty preamble — mark as injected so we don't retry.
+                // Empty or policy-disabled preamble — mark as injected so we don't retry.
                 self.context_injected
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 None
@@ -554,6 +584,32 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_mode_suppresses_automatic_business_context_preamble() {
+        let repo = tempfile::tempdir().unwrap();
+        let outcomes = repo.path().join(".oh/outcomes");
+        std::fs::create_dir_all(&outcomes).unwrap();
+        std::fs::write(
+            outcomes.join("benchmark-leak.md"),
+            "---\ntitle: Benchmark leak\nstatus: active\n---\nsecret benchmark context\n",
+        )
+        .unwrap();
+
+        let enabled = build_context_preamble_for_mode(
+            repo.path(),
+            crate::business_context::BusinessContextMode::Enabled,
+        )
+        .expect("enabled mode should expose fixture business context");
+        assert!(enabled.contains("Business Context"));
+        assert_eq!(
+            build_context_preamble_for_mode(
+                repo.path(),
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn test_get_graph_detects_file_edits() {
