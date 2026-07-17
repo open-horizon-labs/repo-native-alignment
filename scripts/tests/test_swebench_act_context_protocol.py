@@ -16,14 +16,20 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "validate_swebench_act_context_protocol.py"
-SPEC = importlib.util.spec_from_file_location("validate_swebench_act_context_protocol", SCRIPT)
+SPEC = importlib.util.spec_from_file_location(
+    "validate_swebench_act_context_protocol", SCRIPT
+)
 assert SPEC and SPEC.loader
 VALIDATOR = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = VALIDATOR
 SPEC.loader.exec_module(VALIDATOR)
 
-PARSER_PATH = ROOT / "benchmark" / "swebench-act-context" / "upstream" / "edit_patch_v2.py"
-PARSER_SPEC = importlib.util.spec_from_file_location("frozen_edit_patch_v2", PARSER_PATH)
+PARSER_PATH = (
+    ROOT / "benchmark" / "swebench-act-context" / "upstream" / "edit_patch_v2.py"
+)
+PARSER_SPEC = importlib.util.spec_from_file_location(
+    "frozen_edit_patch_v2", PARSER_PATH
+)
 assert PARSER_SPEC and PARSER_SPEC.loader
 PARSER = importlib.util.module_from_spec(PARSER_SPEC)
 sys.modules[PARSER_SPEC.name] = PARSER
@@ -131,11 +137,29 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         runtime.update(
             {
                 "paid_calls_authorized": True,
-                "qualified_artifact_receipt": self.qualified_artifact_receipt(bundle_digest),
+                "qualified_artifact_receipt": self.qualified_artifact_receipt(
+                    bundle_digest
+                ),
                 "approved_budget_receipt": self.approved_budget_receipt(bundle_digest),
             }
         )
         return runtime
+
+    def authorized_runtime_errors(self, runtime: dict, bundle_digest: str) -> list[str]:
+        errors: list[str] = []
+        VALIDATOR.validate_runtime(
+            runtime,
+            errors,
+            allow_authorized=True,
+            expected_bundle_digest=bundle_digest,
+            expected_artifact_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["qualified_artifact_receipt"])
+            ),
+            expected_budget_receipt_digest=VALIDATOR.sha256_bytes(
+                VALIDATOR.canonical_json(runtime["approved_budget_receipt"])
+            ),
+        )
+        return errors
 
     def test_frozen_bundle_is_compatible(self) -> None:
         result = VALIDATOR.validate_bundle(ROOT)
@@ -143,7 +167,9 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         self.assertTrue(result["a_binary_outcomes_comparable"])
         self.assertTrue(result["a_initial_request_tokens_comparable"])
         self.assertFalse(result["a_retry_inclusive_tokens_comparable"])
-        self.assertEqual(result["a_retry_inclusive_tokens_reason"], "upstream_not_measured")
+        self.assertEqual(
+            result["a_retry_inclusive_tokens_reason"], "upstream_not_measured"
+        )
         self.assertFalse(result["network_accessed"])
         self.assertFalse(result["model_accessed"])
 
@@ -174,7 +200,9 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         first["upstream_a"]["anthropic_initial_request_input_tokens"] = None
         errors: list[str] = []
         VALIDATOR.validate_population(population, errors)
-        self.assertTrue(any("missing A initial-request token count" in error for error in errors))
+        self.assertTrue(
+            any("missing A initial-request token count" in error for error in errors)
+        )
 
     def test_inferred_a_retry_inclusive_total_is_rejected(self) -> None:
         population = copy.deepcopy(self.population)
@@ -182,14 +210,21 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         first["upstream_a"]["retry_inclusive_input_tokens"] = 12345
         errors: list[str] = []
         VALIDATOR.validate_population(population, errors)
-        self.assertTrue(any("inferred A retry-inclusive tokens are forbidden" in error for error in errors))
+        self.assertTrue(
+            any(
+                "inferred A retry-inclusive tokens are forbidden" in error
+                for error in errors
+            )
+        )
 
     def test_h1_denominator_and_noninferiority_are_frozen(self) -> None:
         protocol = copy.deepcopy(self.protocol)
         protocol["hypotheses"]["H1"]["claim"] = "B is cheaper on resolved rows"
         errors: list[str] = []
         VALIDATOR.validate_protocol(protocol, errors)
-        self.assertTrue(any("H1 efficiency threshold drift" in error for error in errors))
+        self.assertTrue(
+            any("H1 efficiency threshold drift" in error for error in errors)
+        )
         self.assertTrue(any("H1 denominator drift" in error for error in errors))
 
     def test_schedule_and_arm_order_are_rederived(self) -> None:
@@ -327,12 +362,20 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             expected_artifact_receipt_digest="b" * 64,
             expected_budget_receipt_digest="c" * 64,
         )
-        self.assertIn("authorized runtime requires structured qualified_artifact_receipt", errors)
-        self.assertIn("authorized runtime requires structured approved_budget_receipt", errors)
+        self.assertIn(
+            "authorized runtime requires structured qualified_artifact_receipt", errors
+        )
+        self.assertIn(
+            "authorized runtime requires structured approved_budget_receipt", errors
+        )
 
         runtime = self.authorized_runtime(digest)
-        runtime["qualified_artifact_receipt"]["capability_evidence"]["metal"]["fallback"] = True
-        runtime["qualified_artifact_receipt"]["capability_evidence"]["lsp"]["degraded_jobs"] = 1
+        runtime["qualified_artifact_receipt"]["capability_evidence"]["metal"][
+            "fallback"
+        ] = True
+        runtime["qualified_artifact_receipt"]["capability_evidence"]["lsp"][
+            "degraded_jobs"
+        ] = 1
         errors = []
         VALIDATOR.validate_runtime(
             runtime,
@@ -347,7 +390,9 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             ),
         )
         self.assertIn("Metal qualification must be observed with no fallback", errors)
-        self.assertIn("LSP qualification degraded_jobs must be zero", errors)
+        self.assertIn(
+            "LSP qualification degraded_jobs must be JSON integer zero", errors
+        )
 
     def test_receipts_bind_protocol_and_budget_scope(self) -> None:
         digest = "a" * 64
@@ -369,6 +414,96 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         self.assertIn("qualification-pair budget scope mismatch", errors)
         self.assertIn("externally anchored artifact receipt digest mismatch", errors)
 
+    def test_receipts_reject_boolean_integers_and_impossible_timestamps(self) -> None:
+        digest = "a" * 64
+        runtime = self.authorized_runtime(digest)
+        artifact = runtime["qualified_artifact_receipt"]
+        budget = runtime["approved_budget_receipt"]
+        artifact["schema_version"] = True
+        artifact["qualification_issue"] = True
+        artifact["qualified_at_utc"] = "2026-99-99T99:99:99Z"
+        lsp = artifact["capability_evidence"]["lsp"]
+        for counter in (
+            "skipped_files",
+            "partial_jobs",
+            "degraded_jobs",
+            "cancelled_jobs",
+            "crashed_jobs",
+            "timed_out_jobs",
+        ):
+            lsp[counter] = False
+        lsp["included_file_count"] = True
+        lsp["covered_file_count"] = True
+        budget["schema_version"] = True
+        budget["authorization_issue"] = True
+        budget["population_n"] = True
+        budget["maximum_model_requests"] = True
+        budget["approved_at_utc"] = "2026-02-30T00:00:00Z"
+
+        errors = self.authorized_runtime_errors(runtime, digest)
+        self.assertTrue(
+            any("schema_version must be JSON integer" in error for error in errors)
+        )
+        self.assertTrue(
+            any("qualification_issue must be JSON integer" in error for error in errors)
+        )
+        self.assertTrue(any("timestamp is invalid" in error for error in errors))
+        self.assertTrue(any("must be JSON integer zero" in error for error in errors))
+        self.assertIn("LSP per-file coverage must be complete", errors)
+        self.assertTrue(any("budget scope mismatch" in error for error in errors))
+
+    def test_common_credential_shapes_fail_closed_without_value_echo(self) -> None:
+        digest = "a" * 64
+        synthetic_values = {
+            "github": "gh" + "p_" + "A" * 36,
+            "aws_access_key": "AK" + "IA" + "A" * 16,
+            "aws_secret": "aws_" + "secret_access_key=" + "A" * 40,
+            "slack": "xo" + "xb-" + "A" * 20,
+            "bearer": "Bear" + "er " + "A" * 24,
+            "private_key": "-----BEGIN " + "PRIVATE KEY-----",
+        }
+        for label, synthetic_value in synthetic_values.items():
+            with self.subTest(label=label):
+                runtime = self.authorized_runtime(digest)
+                runtime["qualified_artifact_receipt"]["ci_artifact_name"] = (
+                    synthetic_value
+                )
+                errors = self.authorized_runtime_errors(runtime, digest)
+                self.assertIn(
+                    "runtime config contains a credential-shaped value", errors
+                )
+                self.assertFalse(any(synthetic_value in error for error in errors))
+
+    def test_paired_difference_interval_and_h2_token_vectors_are_frozen(self) -> None:
+        interval = self.protocol["statistics"]["paired_difference_interval"]
+        for vector in interval["test_vectors"]:
+            self.assertEqual(
+                VALIDATOR.paired_difference_interval(**vector["cells"]),
+                vector["expected"],
+            )
+        with self.assertRaisesRegex(ValueError, "JSON integers"):
+            VALIDATOR.paired_difference_interval(True, 0, 0, 69)
+
+        errors: list[str] = []
+        protocol = copy.deepcopy(self.protocol)
+        protocol["statistics"]["paired_difference_interval"]["test_vectors"][0][
+            "expected"
+        ]["lower"] = "-0.000000000001"
+        VALIDATOR.validate_protocol(protocol, errors)
+        self.assertIn("paired-difference test vectors drift", errors)
+
+        vector = copy.deepcopy(self.vector)
+        vector["h2_token_vectors"]["records"][0]["full_token_ids"][0] += 1
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertTrue(
+            any(
+                "H2 per-record token vectors drift" in error
+                or "token ID digest mismatch" in error
+                for error in errors
+            )
+        )
+
     def test_packet_vector_freezes_b_and_c_bytes(self) -> None:
         errors: list[str] = []
         VALIDATOR.validate_packet_vector(self.vector, errors)
@@ -388,6 +523,52 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         VALIDATOR.validate_packet_vector(vector, errors)
         self.assertIn("packet record 2 relationship order drift", errors)
 
+    def test_packet_relationship_projection_is_exact(self) -> None:
+        vector = copy.deepcopy(self.vector)
+        vector["records"][1]["header"]["relationships"] = []
+        errors: list[str] = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet candidate 1 relationship projection mismatch", errors)
+
+        vector = copy.deepcopy(self.vector)
+        omitted_only = vector["metadata"]["acquisition"]["relationships"][-1]
+        vector["records"][1]["header"]["relationships"].append(omitted_only)
+        vector["records"][1]["header"]["relationships"].sort(
+            key=VALIDATOR._relationship_sort_key
+        )
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet candidate 1 relationship projection mismatch", errors)
+
+        vector = copy.deepcopy(self.vector)
+        vector["records"][0]["header"]["relationships"] = [
+            vector["metadata"]["acquisition"]["relationships"][0]
+        ]
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet locus 1 relationships must be empty", errors)
+
+        self.assertEqual(len(self.vector["records"]), 3)
+        self.assertEqual(
+            [record["header"]["stable_id"] for record in self.vector["records"][1:]],
+            ["src/helper.py:helper:function", "src/second.py:second:function"],
+        )
+        self.assertFalse(
+            any(
+                omitted_only in record["header"]["relationships"]
+                for record in self.vector["records"]
+            )
+        )
+
+        vector = copy.deepcopy(self.vector)
+        vector["metadata"]["acquisition"]["candidates"][1]["graph_component"] = 0
+        vector["metadata"]["acquisition"]["candidates"][1]["total"] = 998000000
+        vector["metadata"]["acquisition"]["candidates"][1]["graph_hops"] = None
+        errors = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("acquisition candidate 2 graph score derivation drift", errors)
+        self.assertIn("acquisition candidate 2 graph_hops derivation drift", errors)
+
     def test_acquisition_omissions_are_closed_and_consistent(self) -> None:
         vector = copy.deepcopy(self.vector)
         vector["metadata"]["acquisition"]["omissions"] = []
@@ -403,9 +584,13 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
 
     def test_retry_prompt_vector_freezes_codepoint_slice_and_bytes(self) -> None:
         errors: list[str] = []
-        VALIDATOR.validate_retry_prompt_vector(self.vector["retry_prompt_vector"], errors)
+        VALIDATOR.validate_retry_prompt_vector(
+            self.vector["retry_prompt_vector"], errors
+        )
         self.assertEqual(errors, [])
-        request = VALIDATOR.assemble_retry_prompt_vector(self.vector["retry_prompt_vector"])
+        request = VALIDATOR.assemble_retry_prompt_vector(
+            self.vector["retry_prompt_vector"]
+        )
         self.assertEqual(len(request), 12336)
         self.assertEqual(
             VALIDATOR.sha256_bytes(request),
@@ -416,7 +601,9 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         vector["previous_response_codepoint_runs"][1]["repeat"] = 6000
         errors = []
         VALIDATOR.validate_retry_prompt_vector(vector, errors)
-        self.assertTrue(any("length drift" in error or "digest drift" in error for error in errors))
+        self.assertTrue(
+            any("length drift" in error or "digest drift" in error for error in errors)
+        )
 
     def test_vendored_parser_ignores_reasoning_and_requires_unique_search(self) -> None:
         response = "reasoning first\n*** FILE: a/example.py\n*** SEARCH\nvalue = 1\n*** REPLACE\nvalue = 2\n*** END\ntrailing prose"
@@ -440,7 +627,9 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             copied_root = Path(temporary)
             self.copy_locked_bundle(copied_root)
             protocol_path = copied_root / VALIDATOR.PROTOCOL_REL
-            protocol_path.write_text(protocol_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            protocol_path.write_text(
+                protocol_path.read_text(encoding="utf-8") + " ", encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "digest drift"):
                 VALIDATOR.validate_bundle(copied_root)
 
@@ -452,9 +641,49 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
             lock = VALIDATOR.load_json(lock_path)
             lock["note"] = "sk-" + "ant-" + "not-lock-metadata"
             lock_path.write_text(json.dumps(lock), encoding="utf-8")
-            digest = (copied_root / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
-            with self.assertRaisesRegex(ValueError, "credential-shaped value in lock manifest"):
+            digest = (
+                (copied_root / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+            )
+            with self.assertRaisesRegex(
+                ValueError, "credential-shaped value in lock manifest"
+            ):
                 VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
+
+    def test_resealed_locked_file_with_common_credential_shape_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied_root = Path(temporary)
+            self.copy_locked_bundle(copied_root)
+            synthetic_value = "gh" + "p_" + "A" * 36
+            readme_path = copied_root / "benchmark/swebench-act-context/README.md"
+            readme_path.write_text(
+                readme_path.read_text(encoding="utf-8") + "\n" + synthetic_value + "\n",
+                encoding="utf-8",
+            )
+            lock_path = copied_root / VALIDATOR.LOCK_REL
+            lock = VALIDATOR.load_json(lock_path)
+            for entry in lock["files"]:
+                file_path = copied_root / entry["path"]
+                data = file_path.read_bytes()
+                entry["bytes"] = len(data)
+                entry["sha256"] = VALIDATOR.sha256_bytes(data)
+            digest = VALIDATOR.sha256_bytes(VALIDATOR._lock_material(lock["files"]))
+            lock["bundle_sha256"] = digest
+            lock_path.write_text(
+                json.dumps(lock, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            (copied_root / VALIDATOR.DIGEST_REL).write_text(
+                digest + "\n", encoding="ascii"
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "credential-shaped value in locked file",
+            ) as context:
+                VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
+            self.assertNotIn(synthetic_value, str(context.exception))
 
     def test_unlisted_bundle_file_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

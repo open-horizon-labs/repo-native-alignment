@@ -106,6 +106,28 @@ strings were not schema-bound evidence, acquisition/omission and exceptional
 locus serialization were incomplete, and retry-request bytes did not freeze
 the upstream 6,000-character state rule. Those findings reopened the diff.
 
-A replacement fresh reviewer remains pending after the fixes and renewed
-verification. Its exact-head verdict will be authoritative in a PR #795
-comment. No diff changes are permitted after that approval.
+The replacement fresh reviewer,
+`/root/issue_782/pr795_final_diff_review_v2`, bound `REQUEST CHANGES` to commit
+`9cd35797268d5944c5f798eab49d650096ba1bde`. Its adversarial probes found four
+additional P1 gaps: JSON booleans and impossible dates passed receipt
+validation, common credential shapes passed the locked gate, candidate-header
+relationship projection was only a subset check, and the paired-difference CI
+plus H2 payload metric were deferred/ambiguous.
+
+The reopened diff now rejects coerced receipt integers, parses and round-trips
+UTC timestamps, scans synthetic nonprinting GitHub/AWS/Slack/bearer/private-key
+regressions, and requires exact per-record relationship projection. Statistics
+are executable: a conservative finite-sample Bonferroni/Clopper-Pearson paired
+risk-difference interval freezes its cell orientation, equations, tail
+allocation, Decimal inversion, edges, and four vectors. H2 freezes the exact
+selected-candidate payload domain, tiktoken 0.13.0 artifacts, cl100k ranks,
+`encode_ordinary` boundary, complete token-ID vectors, provider-usage total,
+and all-N70 denominators. The intentionally unfavorable fixture shrinks bytes
+but grows from 58 to 72 cl100k tokens; per-record token reduction is not an
+eligibility rule and H2 may fail unchanged.
+
+The resealed candidate has 29 focused tests passing and an offline anchored
+validator result with no model/network/paid access. A third brand-new reviewer
+remains pending after commit, upstream replay, full tests, and renewed CI. Its
+exact-head verdict will be authoritative in a PR #795 comment. No diff changes
+are permitted after that approval.

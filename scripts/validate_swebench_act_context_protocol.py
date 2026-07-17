@@ -14,6 +14,9 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
+from math import comb
 from pathlib import Path
 from typing import Any
 
@@ -163,6 +166,29 @@ APPROVED_BUDGET_RECEIPT_FIELDS = (
     "approval_evidence_sha256",
     "approved_at_utc",
 )
+H2_TOKEN_VECTOR_FIELDS = (
+    "schema_version",
+    "encoding",
+    "operation",
+    "tiktoken_version",
+    "tiktoken_sdist_sha256",
+    "darwin_arm64_cp312_wheel_sha256",
+    "mergeable_ranks_sha256",
+    "records",
+    "expected_full_payload_tokens",
+    "expected_minified_payload_tokens",
+)
+H2_TOKEN_RECORD_FIELDS = (
+    "record_ordinal",
+    "full_payload_sha256",
+    "full_token_count",
+    "full_token_ids",
+    "full_token_ids_sha256",
+    "minified_payload_sha256",
+    "minified_token_count",
+    "minified_token_ids",
+    "minified_token_ids_sha256",
+)
 DIRECTION_ORDINAL = {"incoming": 1, "outgoing": 2}
 EDGE_TYPE_ORDINAL = {
     name: ordinal
@@ -183,9 +209,15 @@ EDGE_TYPE_ORDINAL = {
     )
 }
 
-EXPECTED_PROTOCOL_SHA256 = "87257d4435b2cd16b985c5bcc72153e3745254e086a4e1bc250bb1abc01efd1d"
-EXPECTED_POPULATION_SHA256 = "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
-EXPECTED_PARSER_SHA256 = "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e"
+EXPECTED_PROTOCOL_SHA256 = (
+    "9884defdd786fed134921a43353379cb24888151d9304cd85891321fe7a3797a"
+)
+EXPECTED_POPULATION_SHA256 = (
+    "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
+)
+EXPECTED_PARSER_SHA256 = (
+    "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e"
+)
 EXPECTED_UPSTREAM_COMMIT = "fd115351d0ab742993aa5d7006f1369fb15b6e74"
 EXPECTED_DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
 EXPECTED_EXCLUSION = "astropy__astropy-8707"
@@ -198,7 +230,231 @@ UTC_SECOND = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}
 ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 POSITIVE_USD = re.compile(r"^(?:0\.(?:0[1-9]|[1-9][0-9])|[1-9][0-9]{0,5}\.[0-9]{2})$")
 SECRET_VALUE = re.compile(
-    r"(?:sk-ant-[A-Za-z0-9_-]{8,}|(?:org|acct|account|workspace|wrkspc)_[A-Za-z0-9_-]{8,})"
+    r"(?:"
+    r"sk-ant-[A-Za-z0-9_-]{8,}"
+    r"|sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}"
+    r"|gh[pousr]_[A-Za-z0-9]{36,255}"
+    r"|github_pat_[A-Za-z0-9_]{20,255}"
+    r"|(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[0-9A-Za-z_-]{35}"
+    r"|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+    r"|(?i:bearer)[ \t]+[A-Za-z0-9._~+/-]{16,}={0,2}"
+    r"|(?i:(?:aws_)?secret_access_key)[\"'\s:=]+[A-Za-z0-9/+=]{40}"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+    r"|(?:org|acct|account|workspace|wrkspc)_[A-Za-z0-9_-]{8,}"
+    r")"
+)
+PAIRED_ALPHA = Decimal("0.05")
+PAIRED_TAIL = Decimal("0.0125")
+PAIRED_QUANTUM = Decimal("0.000000000001")
+PAIRED_BISECTION_STEPS = 256
+PAIRED_DECIMAL_PRECISION = 80
+TIKTOKEN_VERSION = "0.13.0"
+TIKTOKEN_SDIST_SHA256 = (
+    "c9435714c3a84c2319499de9a300c0e604449dd0799ff246458b3bb6a7f433c1"
+)
+TIKTOKEN_DARWIN_ARM64_CP312_WHEEL_SHA256 = (
+    "4d9980f11429ed2d737c463bb1fb78cf330caa026adf002f714aced7849a687b"
+)
+CL100K_MERGEABLE_RANKS_SHA256 = (
+    "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
+)
+EXPECTED_PAIRED_INTERVAL_VECTORS = (
+    {
+        "name": "all_concordant_unresolved",
+        "cells": {"n00": 70, "n01": 0, "n10": 0, "n11": 0},
+        "expected": {
+            "estimate": "0.000000000000",
+            "lower": "-0.060681231202",
+            "upper": "0.060681231202",
+        },
+    },
+    {
+        "name": "mixed_discordance",
+        "cells": {"n00": 41, "n01": 10, "n10": 4, "n11": 15},
+        "expected": {
+            "estimate": "0.085714285714",
+            "lower": "-0.089620963787",
+            "upper": "0.249721611353",
+        },
+    },
+    {
+        "name": "all_second_only",
+        "cells": {"n00": 0, "n01": 70, "n10": 0, "n11": 0},
+        "expected": {
+            "estimate": "1.000000000000",
+            "lower": "0.878637537595",
+            "upper": "1.000000000000",
+        },
+    },
+    {
+        "name": "all_first_only",
+        "cells": {"n00": 0, "n01": 0, "n10": 70, "n11": 0},
+        "expected": {
+            "estimate": "-1.000000000000",
+            "lower": "-1.000000000000",
+            "upper": "-0.878637537595",
+        },
+    },
+)
+EXPECTED_H2_TOKEN_RECORDS = (
+    {
+        "record_ordinal": 2,
+        "full_payload_sha256": "b4822456be25088b7bae98323a799fdd9f1cf87c1e6d845e3df14400a74bdc75",
+        "full_token_count": 40,
+        "full_token_ids": [
+            755,
+            13438,
+            12916,
+            1292,
+            997,
+            262,
+            41165,
+            3220,
+            284,
+            1317,
+            1292,
+            489,
+            220,
+            16,
+            198,
+            262,
+            41165,
+            3220,
+            284,
+            41165,
+            3220,
+            353,
+            220,
+            17,
+            198,
+            262,
+            41165,
+            3220,
+            284,
+            41165,
+            3220,
+            482,
+            220,
+            18,
+            198,
+            262,
+            471,
+            41165,
+            3220,
+            198,
+        ],
+        "full_token_ids_sha256": "d08043dcaf81524ed14daeafb30c01975ea004755499ce355bc3d686fd91813c",
+        "minified_payload_sha256": "39a0476b347f0960d9b56b73a6f9a19cff38e541a0ab8ceac2d1d36bb396ed57",
+        "minified_token_count": 47,
+        "minified_token_ids": [
+            755,
+            13438,
+            12916,
+            1292,
+            997,
+            262,
+            24039,
+            65,
+            284,
+            1317,
+            1292,
+            489,
+            220,
+            16,
+            198,
+            262,
+            24039,
+            65,
+            284,
+            24039,
+            65,
+            353,
+            220,
+            17,
+            198,
+            262,
+            24039,
+            65,
+            284,
+            24039,
+            65,
+            482,
+            220,
+            18,
+            198,
+            262,
+            471,
+            24039,
+            65,
+            198,
+            2,
+            24039,
+            65,
+            28,
+            40031,
+            7913,
+            3220,
+        ],
+        "minified_token_ids_sha256": "8dc5f3772c5056d08e81358e98031cf1e131a9814262c27b2e2f5d893cce6ca8",
+    },
+    {
+        "record_ordinal": 3,
+        "full_payload_sha256": "a0962bc495254a4ab272510ceae3ca866da3297c670925c7b3025953485ef6e4",
+        "full_token_count": 18,
+        "full_token_ids": [
+            755,
+            2132,
+            3764,
+            997,
+            262,
+            41165,
+            3220,
+            284,
+            907,
+            482,
+            220,
+            16,
+            198,
+            262,
+            471,
+            41165,
+            3220,
+            198,
+        ],
+        "full_token_ids_sha256": "3ca4122ad1e39f8af7593286f7fe08853a2e2756502966193da0a19cad59ec46",
+        "minified_payload_sha256": "e95d5f82ee352f2caaf06d1c72ede09efa07988b7bdb7a498bf9ec74eae38219",
+        "minified_token_count": 25,
+        "minified_token_ids": [
+            755,
+            2132,
+            3764,
+            997,
+            262,
+            24039,
+            65,
+            284,
+            907,
+            482,
+            220,
+            16,
+            198,
+            262,
+            471,
+            24039,
+            65,
+            198,
+            2,
+            24039,
+            65,
+            28,
+            40031,
+            7913,
+            3220,
+        ],
+        "minified_token_ids_sha256": "bfb9ccf07d22832074ac8d089bfb805e661396f7c2d2d415fe075baaae579995",
+    },
 )
 
 
@@ -216,7 +472,9 @@ def _object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_object_no_duplicates)
+    return json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=_object_no_duplicates
+    )
 
 
 def canonical_json(value: Any) -> bytes:
@@ -241,15 +499,144 @@ def _require(errors: list[str], condition: bool, message: str) -> None:
         errors.append(message)
 
 
+def _exact_json_scalar(actual: Any, expected: Any) -> bool:
+    """Compare JSON scalars without allowing bool/int or int/float coercion."""
+    if type(expected) in {bool, int, float}:
+        return type(actual) is type(expected) and actual == expected
+    return actual == expected
+
+
+def _valid_utc_second(value: Any) -> bool:
+    if not isinstance(value, str) or UTC_SECOND.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+
+
+def _binomial_cdf_at_most(successes: int, trials: int, probability: Decimal) -> Decimal:
+    failure_probability = Decimal(1) - probability
+    return sum(
+        (
+            Decimal(comb(trials, count))
+            * probability**count
+            * failure_probability ** (trials - count)
+        )
+        for count in range(successes + 1)
+    )
+
+
+def _binomial_probability_at_least(
+    successes: int,
+    trials: int,
+    probability: Decimal,
+) -> Decimal:
+    failure_probability = Decimal(1) - probability
+    return sum(
+        (
+            Decimal(comb(trials, count))
+            * probability**count
+            * failure_probability ** (trials - count)
+        )
+        for count in range(successes, trials + 1)
+    )
+
+
+def _clopper_pearson_975(successes: int, trials: int) -> tuple[Decimal, Decimal]:
+    """97.5% two-sided CP interval: each tail is alpha/4 = 0.0125."""
+    with localcontext() as context:
+        context.prec = PAIRED_DECIMAL_PRECISION
+        context.rounding = ROUND_HALF_EVEN
+        if successes == 0:
+            lower = Decimal(0)
+        else:
+            left = Decimal(0)
+            right = Decimal(1)
+            for _ in range(PAIRED_BISECTION_STEPS):
+                midpoint = (left + right) / 2
+                if (
+                    _binomial_probability_at_least(successes, trials, midpoint)
+                    < PAIRED_TAIL
+                ):
+                    left = midpoint
+                else:
+                    right = midpoint
+            lower = (left + right) / 2
+
+        if successes == trials:
+            upper = Decimal(1)
+        else:
+            left = Decimal(0)
+            right = Decimal(1)
+            for _ in range(PAIRED_BISECTION_STEPS):
+                midpoint = (left + right) / 2
+                if _binomial_cdf_at_most(successes, trials, midpoint) > PAIRED_TAIL:
+                    left = midpoint
+                else:
+                    right = midpoint
+            upper = (left + right) / 2
+        return +lower, +upper
+
+
+def paired_difference_interval(
+    n00: int,
+    n01: int,
+    n10: int,
+    n11: int,
+) -> dict[str, str]:
+    """Frozen conservative 95% interval for second-arm minus first-arm risk."""
+    cells = (n00, n01, n10, n11)
+    if not all(type(cell) is int and cell >= 0 for cell in cells):
+        raise ValueError("paired table cells must be non-negative JSON integers")
+    trials = sum(cells)
+    if trials <= 0:
+        raise ValueError("paired table must contain at least one pair")
+    with localcontext() as context:
+        context.prec = PAIRED_DECIMAL_PRECISION
+        context.rounding = ROUND_HALF_EVEN
+        lower_01, upper_01 = _clopper_pearson_975(n01, trials)
+        lower_10, upper_10 = _clopper_pearson_975(n10, trials)
+        estimate = Decimal(n01 - n10) / Decimal(trials)
+        lower = max(Decimal(-1), lower_01 - upper_10)
+        upper = min(Decimal(1), upper_01 - lower_10)
+
+        def render(value: Decimal) -> str:
+            return format(value.quantize(PAIRED_QUANTUM), "f")
+
+        return {
+            "estimate": render(estimate),
+            "lower": render(lower),
+            "upper": render(upper),
+        }
+
+
 def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
-    _require(errors, protocol.get("schema_version") == 1, "protocol schema_version must be 1")
-    _require(errors, protocol.get("status") == "frozen", "protocol status must be frozen")
+    _require(
+        errors, protocol.get("schema_version") == 1, "protocol schema_version must be 1"
+    )
+    _require(
+        errors, protocol.get("status") == "frozen", "protocol status must be frozen"
+    )
     upstream = protocol.get("references", {}).get("upstream", {})
-    _require(errors, upstream.get("commit") == EXPECTED_UPSTREAM_COMMIT, "upstream commit drift")
+    _require(
+        errors,
+        upstream.get("commit") == EXPECTED_UPSTREAM_COMMIT,
+        "upstream commit drift",
+    )
 
     request = protocol.get("instrument", {}).get("request", {})
-    _require(errors, request.get("method") == "client.messages.create", "model API method drift")
-    _require(errors, request.get("requested_model") == "claude-sonnet-4-6", "requested model drift")
+    _require(
+        errors,
+        request.get("method") == "client.messages.create",
+        "model API method drift",
+    )
+    _require(
+        errors,
+        request.get("requested_model") == "claude-sonnet-4-6",
+        "requested model drift",
+    )
     _require(
         errors,
         request.get("resolved_model_check")
@@ -289,12 +676,17 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
         },
         "retry contract field set drift",
     )
-    _require(errors, retry.get("maximum_feedback_rounds") == 2, "edit-feedback retry count drift")
+    _require(
+        errors,
+        retry.get("maximum_feedback_rounds") == 2,
+        "edit-feedback retry count drift",
+    )
     _require(errors, retry_text == RETRY_SUFFIX, "retry suffix bytes drift")
     if isinstance(retry_text, str):
         _require(
             errors,
-            sha256_bytes(retry_text.encode("utf-8")) == retry.get("retry_suffix_sha256"),
+            sha256_bytes(retry_text.encode("utf-8"))
+            == retry.get("retry_suffix_sha256"),
             "retry suffix hash mismatch",
         )
     else:
@@ -325,7 +717,11 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
 
     parser = protocol.get("instrument", {}).get("parser", {})
-    _require(errors, parser.get("reference_sha256") == EXPECTED_PARSER_SHA256, "parser pin drift")
+    _require(
+        errors,
+        parser.get("reference_sha256") == EXPECTED_PARSER_SHA256,
+        "parser pin drift",
+    )
 
     evaluator = protocol.get("evaluator", {})
     _require(errors, evaluator.get("package") == "swebench", "evaluator package drift")
@@ -338,7 +734,11 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     _require(errors, evaluator.get("max_workers") == 1, "evaluator parallelism drift")
 
     dataset = protocol.get("dataset", {})
-    _require(errors, dataset.get("revision") == EXPECTED_DATASET_REVISION, "dataset revision drift")
+    _require(
+        errors,
+        dataset.get("revision") == EXPECTED_DATASET_REVISION,
+        "dataset revision drift",
+    )
     _require(
         errors,
         dataset.get("population_sha256") == EXPECTED_POPULATION_SHA256,
@@ -349,8 +749,19 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     _require(errors, arms.get("A", {}).get("execute") is False, "A must never be rerun")
     _require(errors, arms.get("A", {}).get("reported_n") == 70, "A population drift")
     _require(errors, arms.get("A", {}).get("resolved") == 19, "A outcome total drift")
-    _require(errors, protocol.get("rna_acquisition", {}).get("access") == "CLI only; MCP is forbidden", "RNA access must remain CLI-only")
-    _require(errors, protocol.get("rna_acquisition", {}).get("business_context", "").startswith("disabled;"), "business context must remain disabled")
+    _require(
+        errors,
+        protocol.get("rna_acquisition", {}).get("access")
+        == "CLI only; MCP is forbidden",
+        "RNA access must remain CLI-only",
+    )
+    _require(
+        errors,
+        protocol.get("rna_acquisition", {})
+        .get("business_context", "")
+        .startswith("disabled;"),
+        "business context must remain disabled",
+    )
     acquisition_schema = protocol.get("rna_acquisition", {}).get("record_schema", {})
     _require(
         errors,
@@ -364,17 +775,20 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
     _require(
         errors,
-        acquisition_schema.get("candidate_exact_fields") == list(ACQUISITION_CANDIDATE_FIELDS),
+        acquisition_schema.get("candidate_exact_fields")
+        == list(ACQUISITION_CANDIDATE_FIELDS),
         "acquisition candidate schema drift",
     )
     _require(
         errors,
-        acquisition_schema.get("relationship_exact_fields") == list(PACKET_RELATIONSHIP_FIELDS),
+        acquisition_schema.get("relationship_exact_fields")
+        == list(PACKET_RELATIONSHIP_FIELDS),
         "acquisition relationship schema drift",
     )
     _require(
         errors,
-        acquisition_schema.get("omission_exact_fields") == list(ACQUISITION_OMISSION_FIELDS),
+        acquisition_schema.get("omission_exact_fields")
+        == list(ACQUISITION_OMISSION_FIELDS),
         "acquisition omission schema drift",
     )
     _require(
@@ -387,7 +801,8 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
     _require(
         errors,
-        set(acquisition_schema.get("candidate_eligibility_values", [])) == CANDIDATE_ELIGIBILITY,
+        set(acquisition_schema.get("candidate_eligibility_values", []))
+        == CANDIDATE_ELIGIBILITY,
         "candidate eligibility vocabulary drift",
     )
     _require(
@@ -399,12 +814,14 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     packet = protocol.get("packet_serialization", {})
     _require(
         errors,
-        packet.get("metadata_schema", {}).get("exact_fields") == list(PACKET_METADATA_FIELDS),
+        packet.get("metadata_schema", {}).get("exact_fields")
+        == list(PACKET_METADATA_FIELDS),
         "packet metadata schema drift",
     )
     _require(
         errors,
-        packet.get("header_schema", {}).get("base_exact_fields") == list(PACKET_HEADER_FIELDS),
+        packet.get("header_schema", {}).get("base_exact_fields")
+        == list(PACKET_HEADER_FIELDS),
         "packet header schema drift",
     )
     _require(
@@ -420,9 +837,31 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
     _require(
         errors,
+        packet.get("relationship_schema", {}).get("header_projection")
+        == (
+            "locus headers contain []; each selected candidate header contains exactly the "
+            "acquisition relationships whose source or target equals that candidate stable_id, "
+            "preserving acquisition order; relationships incident only to omitted candidates "
+            "remain acquisition-only"
+        ),
+        "packet relationship header projection drift",
+    )
+    _require(
+        errors,
         "final line of the same payload"
         in protocol.get("definitions", {}).get("minified_body", ""),
         "minifier legend framing drift",
+    )
+    _require(
+        errors,
+        protocol.get("minification", {}).get("token_effect")
+        == (
+            "per-record or cohort cl100k token reduction is not an eligibility condition; "
+            "a structurally valid byte-shorter minified payload may tokenize longer, the frozen "
+            "vector intentionally exercises this, and H2 must be reported failed/null unchanged "
+            "when its preregistered token thresholds do not pass"
+        ),
+        "minification token-effect disclosure drift",
     )
 
     receipt_schemas = protocol.get("authorization_receipts", {})
@@ -467,44 +906,410 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     )
     _require(
         errors,
+        "exact JSON integer" in artifact_schema.get("provenance_requirements", "")
+        and "calendar-valid" in artifact_schema.get("provenance_requirements", "")
+        and "exact JSON integer zero" in artifact_schema.get("lsp_requirements", ""),
+        "qualified artifact receipt type/timestamp contract drift",
+    )
+    _require(
+        errors,
+        "exact JSON integers" in budget_schema.get("qualification_pair", "")
+        and "exact JSON integers" in budget_schema.get("n70_cohort", "")
+        and "calendar-valid" in budget_schema.get("budget_requirements", ""),
+        "approved budget receipt type/timestamp contract drift",
+    )
+    _require(
+        errors,
         "three independent CLI trust anchors"
         in receipt_schemas.get("external_anchor_requirements", ""),
         "authorization receipt trust-anchor policy drift",
     )
 
     h1 = protocol.get("hypotheses", {}).get("H1", {})
-    _require(errors, "at least 40% fewer" in h1.get("claim", ""), "H1 efficiency threshold drift")
-    _require(errors, "frozen N=70 divided by resolved_count" in h1.get("claim", ""), "H1 denominator drift")
-    _require(errors, "greater than -0.10" in h1.get("quality_gate", ""), "H1 non-inferiority drift")
+    _require(
+        errors,
+        "at least 40% fewer" in h1.get("claim", ""),
+        "H1 efficiency threshold drift",
+    )
+    _require(
+        errors,
+        "frozen N=70 divided by resolved_count" in h1.get("claim", ""),
+        "H1 denominator drift",
+    )
+    _require(
+        errors,
+        "greater than -0.10" in h1.get("quality_gate", ""),
+        "H1 non-inferiority drift",
+    )
     h2 = protocol.get("hypotheses", {}).get("H2", {})
-    _require(errors, "at least 30% fewer" in h2.get("claim", ""), "H2 ActContext threshold drift")
-    _require(errors, "at least 20% fewer" in h2.get("claim", ""), "H2 total threshold drift")
-    _require(errors, "greater than -0.10" in h2.get("quality_gate", ""), "H2 non-inferiority drift")
+    _require(
+        errors,
+        "at least 30% fewer" in h2.get("claim", ""),
+        "H2 ActContext threshold drift",
+    )
+    _require(
+        errors, "at least 20% fewer" in h2.get("claim", ""), "H2 total threshold drift"
+    )
+    _require(
+        errors,
+        "greater than -0.10" in h2.get("quality_gate", ""),
+        "H2 non-inferiority drift",
+    )
+    validate_statistics(protocol.get("statistics"), errors)
 
     compatibility = protocol.get("compatibility", {})
     not_comparable = set(compatibility.get("not_comparable", []))
-    _require(errors, "A retry-inclusive input tokens" in not_comparable, "A retry-token null was removed")
-    _require(errors, "A total episode input tokens" in not_comparable, "A episode-token null was removed")
-    _require(errors, "never reconstruct or fabricate" in compatibility.get("on_total_episode_h1_request", ""), "missing total-episode methodology stop")
+    _require(
+        errors,
+        "A retry-inclusive input tokens" in not_comparable,
+        "A retry-token null was removed",
+    )
+    _require(
+        errors,
+        "A total episode input tokens" in not_comparable,
+        "A episode-token null was removed",
+    )
+    _require(
+        errors,
+        "never reconstruct or fabricate"
+        in compatibility.get("on_total_episode_h1_request", ""),
+        "missing total-episode methodology stop",
+    )
 
     validator_policy = protocol.get("validator_policy", {})
     rejected = " ".join(validator_policy.get("must_reject", []))
-    _require(errors, validator_policy.get("offline") is True, "validator must remain offline")
-    _require(errors, validator_policy.get("network_calls") is False, "validator network policy drift")
-    _require(errors, "non-null A retry-inclusive" in rejected, "validator no longer rejects inferred A retry totals")
-    _require(errors, "missing A initial-request" in rejected, "validator no longer blocks missing A initial counts")
-    _require(errors, "closed artifact/budget receipts" in rejected, "validator no longer requires closed authorization receipts")
-    _require(errors, "acquisition/omission" in rejected, "validator no longer rejects acquisition schema drift")
-    _require(errors, "codepoint-slice byte vector" in rejected, "validator no longer freezes retry bytes")
+    _require(
+        errors, validator_policy.get("offline") is True, "validator must remain offline"
+    )
+    _require(
+        errors,
+        validator_policy.get("network_calls") is False,
+        "validator network policy drift",
+    )
+    _require(
+        errors,
+        "non-null A retry-inclusive" in rejected,
+        "validator no longer rejects inferred A retry totals",
+    )
+    _require(
+        errors,
+        "missing A initial-request" in rejected,
+        "validator no longer blocks missing A initial counts",
+    )
+    _require(
+        errors,
+        "closed artifact/budget receipts" in rejected,
+        "validator no longer requires closed authorization receipts",
+    )
+    _require(
+        errors,
+        "acquisition/omission" in rejected,
+        "validator no longer rejects acquisition schema drift",
+    )
+    _require(
+        errors,
+        "codepoint-slice byte vector" in rejected,
+        "validator no longer freezes retry bytes",
+    )
+    _require(
+        errors,
+        all(
+            name in rejected
+            for name in ("GitHub", "AWS", "Slack", "bearer-token", "private-key")
+        ),
+        "validator credential-shape policy drift",
+    )
+
+
+def validate_statistics(statistics: Any, errors: list[str]) -> None:
+    _require(errors, isinstance(statistics, dict), "statistics must be an object")
+    if not isinstance(statistics, dict):
+        return
+    _require(
+        errors,
+        statistics.get("paired_table_cells")
+        == (
+            "n00=first unresolved/second unresolved; n01=first unresolved/second resolved; "
+            "n10=first resolved/second unresolved; n11=first resolved/second resolved; "
+            "delta=second-minus-first=(n01-n10)/N"
+        ),
+        "paired table orientation drift",
+    )
+
+    mcnemar = statistics.get("mcnemar")
+    _require(
+        errors,
+        isinstance(mcnemar, dict)
+        and set(mcnemar)
+        == {"method_id", "alternative", "alpha", "formula", "zero_discordant"},
+        "McNemar specification field set drift",
+    )
+    if isinstance(mcnemar, dict):
+        _require(
+            errors,
+            mcnemar.get("method_id") == "conditional-exact-mcnemar-equal-tail-v1"
+            and mcnemar.get("alternative") == "two-sided"
+            and mcnemar.get("alpha") == "0.05"
+            and mcnemar.get("zero_discordant") == "when n01+n10=0, p_value=1 exactly",
+            "McNemar specification drift",
+        )
+        _require(
+            errors,
+            mcnemar.get("formula")
+            == (
+                "m=n01+n10; x=min(n01,n10); p_value=min(1, "
+                "2*sum_{k=0..x} choose(m,k)*0.5^m)"
+            ),
+            "McNemar tail formula drift",
+        )
+
+    _require(
+        errors,
+        statistics.get("arm_rate_wilson")
+        == {
+            "method_id": "wilson-score-two-sided-v1",
+            "confidence": "0.95",
+            "z": "1.959963984540054",
+            "formula": (
+                "for p=x/N and z as pinned: denominator=1+z^2/N; "
+                "center=(p+z^2/(2N))/denominator; "
+                "half=z*sqrt(p*(1-p)/N+z^2/(4*N^2))/denominator; "
+                "interval=[max(0,center-half),min(1,center+half)]"
+            ),
+            "edge_cases": (
+                "x and N are JSON integers with 0<=x<=N and N>0; no continuity correction"
+            ),
+        },
+        "Wilson arm-rate interval specification drift",
+    )
+
+    interval = statistics.get("paired_difference_interval")
+    interval_fields = {
+        "method_id",
+        "estimand",
+        "reference",
+        "confidence",
+        "alpha",
+        "tail_allocation",
+        "clopper_pearson_equations",
+        "combination",
+        "numerics",
+        "edge_cases",
+        "decision_rule",
+        "test_vectors",
+    }
+    _require(
+        errors,
+        isinstance(interval, dict) and set(interval) == interval_fields,
+        "paired-difference interval field set drift",
+    )
+    if isinstance(interval, dict):
+        expected_scalars = {
+            "method_id": "bonferroni-clopper-pearson-matched-risk-difference-v1",
+            "estimand": "delta=p01-p10=Pr(second resolved)-Pr(first resolved)",
+            "reference": (
+                "Clopper CJ and Pearson ES (1934), Biometrika 26(4):404-413, "
+                "doi:10.1093/biomet/26.4.404; Bonferroni simultaneous coverage"
+            ),
+            "confidence": "0.95 two-sided",
+            "alpha": "0.05 exactly",
+            "tail_allocation": (
+                "four one-sided tails each alpha/4=0.0125; therefore each discordant-cell "
+                "Clopper-Pearson interval is 97.5% two-sided and joint coverage is at least 95%"
+            ),
+            "combination": (
+                "compute [L01,U01] and [L10,U10]; return "
+                "[max(-1,L01-U10),min(1,U01-L10)]"
+            ),
+            "numerics": (
+                "base-10 Decimal precision 80, ROUND_HALF_EVEN, exactly 256 bisection steps "
+                "on [0,1] for every non-boundary root; gate on the unrounded Decimal endpoints; "
+                "serialize test endpoints to 12 decimal places"
+            ),
+            "edge_cases": (
+                "cells are non-negative JSON integers (booleans forbidden), N=sum(cells)>0; "
+                "for a cell count x=0 set L=0 exactly; for x=N set U=1 exactly"
+            ),
+            "decision_rule": (
+                "for A/B use first=A second=B; for B/C use first=B second=C; "
+                "non-inferiority passes only when the unrounded lower endpoint is strictly greater than -0.10"
+            ),
+        }
+        for field, expected in expected_scalars.items():
+            _require(
+                errors,
+                interval.get(field) == expected,
+                f"paired-difference {field} drift",
+            )
+        _require(
+            errors,
+            interval.get("clopper_pearson_equations")
+            == (
+                "for 0<x<=N, L is the unique p in [0,1] satisfying "
+                "sum_{k=x..N} choose(N,k)*p^k*(1-p)^(N-k)=0.0125; for 0<=x<N, "
+                "U is the unique p satisfying sum_{k=0..x} "
+                "choose(N,k)*p^k*(1-p)^(N-k)=0.0125"
+            ),
+            "paired-difference binomial-tail equations drift",
+        )
+        vectors = interval.get("test_vectors")
+        _require(
+            errors,
+            isinstance(vectors, list)
+            and vectors == list(EXPECTED_PAIRED_INTERVAL_VECTORS),
+            "paired-difference test vectors drift",
+        )
+        if isinstance(vectors, list):
+            for vector in vectors:
+                if not isinstance(vector, dict):
+                    continue
+                cells = vector.get("cells")
+                if not isinstance(cells, dict) or set(cells) != {
+                    "n00",
+                    "n01",
+                    "n10",
+                    "n11",
+                }:
+                    errors.append("paired-difference vector cell schema drift")
+                    continue
+                try:
+                    calculated = paired_difference_interval(
+                        cells["n00"], cells["n01"], cells["n10"], cells["n11"]
+                    )
+                except ValueError as error:
+                    errors.append(f"paired-difference vector invalid: {error}")
+                    continue
+                _require(
+                    errors,
+                    calculated == vector.get("expected"),
+                    f"paired-difference vector result drift: {vector.get('name')}",
+                )
+
+    h2_metrics = statistics.get("h2_metrics")
+    _require(
+        errors,
+        isinstance(h2_metrics, dict)
+        and set(h2_metrics)
+        == {
+            "act_context_payload_tokens",
+            "total_episode_input_tokens",
+            "reduction_formula",
+            "blocked_when",
+        },
+        "H2 metric specification field set drift",
+    )
+    if not isinstance(h2_metrics, dict):
+        return
+    payload_metric = h2_metrics.get("act_context_payload_tokens")
+    payload_fields = {
+        "byte_domain",
+        "arm_payload",
+        "tokenizer",
+        "per_instance",
+        "cohort_numerator",
+        "per_resolved_issue",
+        "vector",
+    }
+    _require(
+        errors,
+        isinstance(payload_metric, dict) and set(payload_metric) == payload_fields,
+        "H2 ActContext payload metric field set drift",
+    )
+    if isinstance(payload_metric, dict):
+        expected_payload = {
+            "byte_domain": (
+                "initial packet selected-candidate payload text only; exclude every locus, "
+                "acquisition object, header, framing byte, issue, prompt template, and retry repetition"
+            ),
+            "arm_payload": "B uses full_payload; C uses minified_payload",
+            "per_instance": (
+                "in selected candidate record order call cl100k_base.encode_ordinary separately "
+                "for each exact payload string and sum token-list lengths; never concatenate records"
+            ),
+            "cohort_numerator": "sum the per-instance counts over all frozen N=70 rows",
+            "per_resolved_issue": (
+                "divide that arm's all-N70 cohort numerator by that arm's official SWE-bench resolved_count"
+            ),
+            "vector": "packet-vector.json h2_token_vectors must match every selected candidate payload",
+        }
+        for field, expected in expected_payload.items():
+            _require(
+                errors,
+                payload_metric.get(field) == expected,
+                f"H2 payload {field} drift",
+            )
+        tokenizer = payload_metric.get("tokenizer")
+        expected_tokenizer = {
+            "package": "tiktoken",
+            "version": TIKTOKEN_VERSION,
+            "operation": "Encoding.encode_ordinary(text); special-token strings are ordinary text",
+            "encoding": "cl100k_base",
+            "sdist_sha256": TIKTOKEN_SDIST_SHA256,
+            "darwin_arm64_cp312_wheel_sha256": TIKTOKEN_DARWIN_ARM64_CP312_WHEEL_SHA256,
+            "mergeable_ranks_sha256": CL100K_MERGEABLE_RANKS_SHA256,
+        }
+        _require(errors, tokenizer == expected_tokenizer, "H2 tokenizer identity drift")
+
+    total_metric = h2_metrics.get("total_episode_input_tokens")
+    _require(
+        errors,
+        total_metric
+        == {
+            "source": "exact integer response.usage.input_tokens returned by Anthropic",
+            "request_scope": (
+                "sum every initial and edit-feedback retry request for the arm and instance; "
+                "transport retries that do not produce a response usage record are not fabricated"
+            ),
+            "cohort_numerator": "sum request counts over all frozen N=70 rows",
+            "per_resolved_issue": (
+                "divide that arm's all-N70 cohort numerator by that arm's official SWE-bench resolved_count"
+            ),
+        },
+        "H2 total-episode metric drift",
+    )
+    _require(
+        errors,
+        h2_metrics.get("reduction_formula")
+        == (
+            "for each metric compute 1-(C per-resolved value)/(B per-resolved value) from "
+            "unrounded integer numerators and counts; require >=0.30 for payload and >=0.20 for total"
+        ),
+        "H2 reduction formula drift",
+    )
+    _require(
+        errors,
+        h2_metrics.get("blocked_when")
+        == (
+            "block numerical H2 when any required token count is missing/non-integer/negative, "
+            "either resolved_count is zero, the B comparator is zero, or tokenizer/vector identity fails"
+        ),
+        "H2 blocked-case policy drift",
+    )
 
 
 def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     selection = population.get("selection", {})
     instances = population.get("instances", [])
-    _require(errors, selection.get("n_selected") == 71, "selected population must remain N=71")
-    _require(errors, selection.get("n_included") == 70, "included population must remain N=70")
-    _require(errors, selection.get("excluded_by_gold") == [EXPECTED_EXCLUSION], "gold exclusion drift")
-    _require(errors, isinstance(instances, list) and len(instances) == 71, "population must have 71 rows")
+    _require(
+        errors,
+        selection.get("n_selected") == 71,
+        "selected population must remain N=71",
+    )
+    _require(
+        errors,
+        selection.get("n_included") == 70,
+        "included population must remain N=70",
+    )
+    _require(
+        errors,
+        selection.get("excluded_by_gold") == [EXPECTED_EXCLUSION],
+        "gold exclusion drift",
+    )
+    _require(
+        errors,
+        isinstance(instances, list) and len(instances) == 71,
+        "population must have 71 rows",
+    )
     if not isinstance(instances, list):
         return
 
@@ -513,73 +1318,161 @@ def validate_population(population: dict[str, Any], errors: list[str]) -> None:
     included = [row for row in instances if row.get("included") is True]
     excluded = [row for row in instances if row.get("included") is False]
     _require(errors, len(included) == 70, "exactly 70 rows must be included")
-    _require(errors, len(excluded) == 1 and excluded[0].get("instance_id") == EXPECTED_EXCLUSION, "only astropy__astropy-8707 may be excluded")
+    _require(
+        errors,
+        len(excluded) == 1 and excluded[0].get("instance_id") == EXPECTED_EXCLUSION,
+        "only astropy__astropy-8707 may be excluded",
+    )
     if excluded:
-        _require(errors, excluded[0].get("upstream_a") is None, "excluded row must not have A evidence")
+        _require(
+            errors,
+            excluded[0].get("upstream_a") is None,
+            "excluded row must not have A evidence",
+        )
 
     resolved = 0
     initial_total = 0
     feedback_rounds = 0
     for row in included:
         iid = row.get("instance_id", "<missing>")
-        _require(errors, bool(HEX40.fullmatch(str(row.get("base_commit", "")))), f"{iid}: invalid base commit")
+        _require(
+            errors,
+            bool(HEX40.fullmatch(str(row.get("base_commit", "")))),
+            f"{iid}: invalid base commit",
+        )
         for field in (
             "dataset_row_sha256",
             "problem_statement_sha256",
             "gold_patch_sha256",
             "test_patch_sha256",
         ):
-            _require(errors, bool(HEX64.fullmatch(str(row.get(field, "")))), f"{iid}: invalid {field}")
-        _require(errors, isinstance(row.get("gold_file_count"), int) and row["gold_file_count"] >= 2, f"{iid}: not multi-file")
+            _require(
+                errors,
+                bool(HEX64.fullmatch(str(row.get(field, "")))),
+                f"{iid}: invalid {field}",
+            )
+        _require(
+            errors,
+            isinstance(row.get("gold_file_count"), int) and row["gold_file_count"] >= 2,
+            f"{iid}: not multi-file",
+        )
         evidence = row.get("upstream_a")
         _require(errors, isinstance(evidence, dict), f"{iid}: missing A evidence")
         if not isinstance(evidence, dict):
             continue
-        _require(errors, evidence.get("outcome") in {"resolved", "unresolved"}, f"{iid}: invalid A outcome")
-        _require(errors, evidence.get("resolved") == (evidence.get("outcome") == "resolved"), f"{iid}: A outcome fields disagree")
+        _require(
+            errors,
+            evidence.get("outcome") in {"resolved", "unresolved"},
+            f"{iid}: invalid A outcome",
+        )
+        _require(
+            errors,
+            evidence.get("resolved") == (evidence.get("outcome") == "resolved"),
+            f"{iid}: A outcome fields disagree",
+        )
         resolved += int(evidence.get("resolved") is True)
         count = evidence.get("anthropic_initial_request_input_tokens")
-        _require(errors, isinstance(count, int) and count > 0, f"{iid}: missing A initial-request token count")
+        _require(
+            errors,
+            isinstance(count, int) and count > 0,
+            f"{iid}: missing A initial-request token count",
+        )
         if isinstance(count, int):
             initial_total += count
         rounds = evidence.get("edit_feedback_rounds")
-        _require(errors, isinstance(rounds, int) and 0 <= rounds <= 2, f"{iid}: invalid feedback-round count")
+        _require(
+            errors,
+            isinstance(rounds, int) and 0 <= rounds <= 2,
+            f"{iid}: invalid feedback-round count",
+        )
         if isinstance(rounds, int):
             feedback_rounds += rounds
-        _require(errors, evidence.get("retry_inclusive_input_tokens") is None, f"{iid}: inferred A retry-inclusive tokens are forbidden")
-        _require(errors, evidence.get("retry_inclusive_input_tokens_reason") == "upstream_not_measured", f"{iid}: missing A retry-token null reason")
-        _require(errors, evidence.get("wall_clock_seconds") is None, f"{iid}: inferred A wall-clock timing is forbidden")
+        _require(
+            errors,
+            evidence.get("retry_inclusive_input_tokens") is None,
+            f"{iid}: inferred A retry-inclusive tokens are forbidden",
+        )
+        _require(
+            errors,
+            evidence.get("retry_inclusive_input_tokens_reason")
+            == "upstream_not_measured",
+            f"{iid}: missing A retry-token null reason",
+        )
+        _require(
+            errors,
+            evidence.get("wall_clock_seconds") is None,
+            f"{iid}: inferred A wall-clock timing is forbidden",
+        )
 
     summary = population.get("upstream_a", {})
     _require(errors, resolved == 19, "A must remain 19/70 resolved")
     _require(errors, initial_total == 2_279_203, "A initial-request token total drift")
     _require(errors, feedback_rounds == 22, "A edit-feedback round total drift")
-    _require(errors, summary.get("resolved") == 19 and summary.get("unresolved") == 51, "A summary outcome drift")
-    _require(errors, summary.get("total_initial_request_input_tokens") == initial_total, "A summary initial-token total mismatch")
-    _require(errors, summary.get("retry_inclusive_input_tokens") is None, "A summary retry-inclusive tokens must be null")
-    _require(errors, summary.get("retry_inclusive_input_tokens_reason") == "upstream_not_measured", "A summary retry-token null reason drift")
-    _require(errors, summary.get("retrying_instances") == 11, "A retrying-instance count drift")
+    _require(
+        errors,
+        summary.get("resolved") == 19 and summary.get("unresolved") == 51,
+        "A summary outcome drift",
+    )
+    _require(
+        errors,
+        summary.get("total_initial_request_input_tokens") == initial_total,
+        "A summary initial-token total mismatch",
+    )
+    _require(
+        errors,
+        summary.get("retry_inclusive_input_tokens") is None,
+        "A summary retry-inclusive tokens must be null",
+    )
+    _require(
+        errors,
+        summary.get("retry_inclusive_input_tokens_reason") == "upstream_not_measured",
+        "A summary retry-token null reason drift",
+    )
+    _require(
+        errors,
+        summary.get("retrying_instances") == 11,
+        "A retrying-instance count drift",
+    )
 
     schedule = population.get("run_schedule", {})
     episodes = schedule.get("episodes", [])
     _require(errors, schedule.get("seed") == ORDER_SEED, "run-order seed drift")
-    _require(errors, isinstance(episodes, list) and len(episodes) == 70, "schedule must contain 70 episodes")
+    _require(
+        errors,
+        isinstance(episodes, list) and len(episodes) == 70,
+        "schedule must contain 70 episodes",
+    )
     included_by_id = {row["instance_id"] for row in included}
     scheduled_ids: list[str] = []
     if isinstance(episodes, list):
         expected_order = sorted(
             included_by_id,
-            key=lambda iid: (sha256_bytes((ORDER_SEED + "\0" + iid).encode("utf-8")), iid),
+            key=lambda iid: (
+                sha256_bytes((ORDER_SEED + "\0" + iid).encode("utf-8")),
+                iid,
+            ),
         )
         for ordinal, episode in enumerate(episodes, 1):
             iid = episode.get("instance_id", "")
             scheduled_ids.append(iid)
             key = sha256_bytes((ORDER_SEED + "\0" + iid).encode("utf-8"))
             arm_order = ["B", "C"] if int(key[:2], 16) % 2 == 0 else ["C", "B"]
-            _require(errors, episode.get("ordinal") == ordinal, f"schedule ordinal drift at {ordinal}")
-            _require(errors, episode.get("order_key_sha256") == key, f"{iid}: schedule key drift")
-            _require(errors, episode.get("arm_order") == arm_order, f"{iid}: arm-order drift")
-        _require(errors, scheduled_ids == expected_order, "scheduled instance order drift")
+            _require(
+                errors,
+                episode.get("ordinal") == ordinal,
+                f"schedule ordinal drift at {ordinal}",
+            )
+            _require(
+                errors,
+                episode.get("order_key_sha256") == key,
+                f"{iid}: schedule key drift",
+            )
+            _require(
+                errors, episode.get("arm_order") == arm_order, f"{iid}: arm-order drift"
+            )
+        _require(
+            errors, scheduled_ids == expected_order, "scheduled instance order drift"
+        )
 
 
 def validate_qualified_artifact_receipt(
@@ -587,7 +1480,11 @@ def validate_qualified_artifact_receipt(
     errors: list[str],
     expected_bundle_digest: str | None,
 ) -> None:
-    _require(errors, isinstance(receipt, dict), "authorized runtime requires structured qualified_artifact_receipt")
+    _require(
+        errors,
+        isinstance(receipt, dict),
+        "authorized runtime requires structured qualified_artifact_receipt",
+    )
     if not isinstance(receipt, dict):
         return
     _require(
@@ -596,15 +1493,28 @@ def validate_qualified_artifact_receipt(
         "qualified artifact receipt field set drift",
     )
     constants = {
-        "schema_version": 1,
         "receipt_type": "rna-qualified-artifact-v1",
         "protocol_id": "rna-act-context-swebench-v1",
         "ci_repository": "open-horizon-labs/repo-native-alignment",
         "platform": "darwin-arm64-m4",
-        "qualification_issue": 786,
     }
     for field, expected in constants.items():
-        _require(errors, receipt.get(field) == expected, f"qualified artifact receipt {field} drift")
+        _require(
+            errors,
+            receipt.get(field) == expected,
+            f"qualified artifact receipt {field} drift",
+        )
+    _require(
+        errors,
+        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        "qualified artifact receipt schema_version must be JSON integer 1",
+    )
+    _require(
+        errors,
+        type(receipt.get("qualification_issue")) is int
+        and receipt["qualification_issue"] == 786,
+        "qualified artifact receipt qualification_issue must be JSON integer 786",
+    )
     if expected_bundle_digest is not None:
         _require(
             errors,
@@ -665,12 +1575,16 @@ def validate_qualified_artifact_receipt(
     )
     _require(
         errors,
-        bool(UTC_SECOND.fullmatch(str(receipt.get("qualified_at_utc", "")))),
+        _valid_utc_second(receipt.get("qualified_at_utc")),
         "qualified artifact receipt timestamp is invalid",
     )
 
     capabilities = receipt.get("capability_evidence")
-    _require(errors, isinstance(capabilities, dict), "qualified artifact capability evidence must be an object")
+    _require(
+        errors,
+        isinstance(capabilities, dict),
+        "qualified artifact capability evidence must be an object",
+    )
     if not isinstance(capabilities, dict):
         return
     _require(
@@ -685,8 +1599,16 @@ def validate_qualified_artifact_receipt(
         "release-build evidence field set drift",
     )
     if isinstance(release, dict):
-        _require(errors, release.get("status") == "passed", "release build was not successful")
-        _require(errors, bool(HEX64.fullmatch(str(release.get("evidence_sha256", "")))), "release-build evidence digest is invalid")
+        _require(
+            errors,
+            release.get("status") == "passed",
+            "release build was not successful",
+        )
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(release.get("evidence_sha256", "")))),
+            "release-build evidence digest is invalid",
+        )
 
     metal = capabilities.get("metal")
     _require(
@@ -703,7 +1625,11 @@ def validate_qualified_artifact_receipt(
             and metal.get("fallback") is False,
             "Metal qualification must be observed with no fallback",
         )
-        _require(errors, bool(HEX64.fullmatch(str(metal.get("evidence_sha256", "")))), "Metal evidence digest is invalid")
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(metal.get("evidence_sha256", "")))),
+            "Metal evidence digest is invalid",
+        )
 
     for name in ("embeddings", "reranking"):
         evidence = capabilities.get(name)
@@ -721,7 +1647,11 @@ def validate_qualified_artifact_receipt(
                 and evidence.get("fallback") is False,
                 f"{name} qualification must be enabled and complete with no fallback",
             )
-            _require(errors, bool(HEX64.fullmatch(str(evidence.get("evidence_sha256", "")))), f"{name} evidence digest is invalid")
+            _require(
+                errors,
+                bool(HEX64.fullmatch(str(evidence.get("evidence_sha256", "")))),
+                f"{name} evidence digest is invalid",
+            )
 
     lsp = capabilities.get("lsp")
     lsp_fields = {
@@ -740,7 +1670,11 @@ def validate_qualified_artifact_receipt(
         "coverage_manifest_sha256",
         "evidence_sha256",
     }
-    _require(errors, isinstance(lsp, dict) and set(lsp) == lsp_fields, "LSP evidence field set drift")
+    _require(
+        errors,
+        isinstance(lsp, dict) and set(lsp) == lsp_fields,
+        "LSP evidence field set drift",
+    )
     if not isinstance(lsp, dict):
         return
     _require(
@@ -765,23 +1699,33 @@ def validate_qualified_artifact_receipt(
         "crashed_jobs",
         "timed_out_jobs",
     ):
-        _require(errors, lsp.get(counter) == 0, f"LSP qualification {counter} must be zero")
+        _require(
+            errors,
+            type(lsp.get(counter)) is int and lsp[counter] == 0,
+            f"LSP qualification {counter} must be JSON integer zero",
+        )
     included_files = lsp.get("included_file_count")
     covered_files = lsp.get("covered_file_count")
     _require(
         errors,
         type(included_files) is int
         and included_files > 0
+        and type(covered_files) is int
         and covered_files == included_files,
         "LSP per-file coverage must be complete",
     )
     _require(
         errors,
-        lsp.get("coverage_scope") == "every included ordinary docs/source/test/config file",
+        lsp.get("coverage_scope")
+        == "every included ordinary docs/source/test/config file",
         "LSP coverage scope drift",
     )
     for field in ("coverage_manifest_sha256", "evidence_sha256"):
-        _require(errors, bool(HEX64.fullmatch(str(lsp.get(field, "")))), f"LSP {field} is invalid")
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(lsp.get(field, "")))),
+            f"LSP {field} is invalid",
+        )
 
 
 def validate_approved_budget_receipt(
@@ -789,7 +1733,11 @@ def validate_approved_budget_receipt(
     errors: list[str],
     expected_bundle_digest: str | None,
 ) -> None:
-    _require(errors, isinstance(receipt, dict), "authorized runtime requires structured approved_budget_receipt")
+    _require(
+        errors,
+        isinstance(receipt, dict),
+        "authorized runtime requires structured approved_budget_receipt",
+    )
     if not isinstance(receipt, dict):
         return
     _require(
@@ -798,12 +1746,20 @@ def validate_approved_budget_receipt(
         "approved budget receipt field set drift",
     )
     constants = {
-        "schema_version": 1,
         "receipt_type": "approved-model-budget-v1",
         "protocol_id": "rna-act-context-swebench-v1",
     }
     for field, expected in constants.items():
-        _require(errors, receipt.get(field) == expected, f"approved budget receipt {field} drift")
+        _require(
+            errors,
+            receipt.get(field) == expected,
+            f"approved budget receipt {field} drift",
+        )
+    _require(
+        errors,
+        type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1,
+        "approved budget receipt schema_version must be JSON integer 1",
+    )
     if expected_bundle_digest is not None:
         _require(
             errors,
@@ -823,8 +1779,10 @@ def validate_approved_budget_receipt(
     if scope == "qualification_pair":
         _require(
             errors,
-            issue == 789
+            type(issue) is int
+            and issue == 789
             and instance_id == "astropy__astropy-13398"
+            and type(population_n) is int
             and population_n == 1
             and type(maximum_requests) is int
             and 1 <= maximum_requests <= 6,
@@ -833,8 +1791,10 @@ def validate_approved_budget_receipt(
     elif scope == "n70_cohort":
         _require(
             errors,
-            issue == 790
+            type(issue) is int
+            and issue == 790
             and instance_id is None
+            and type(population_n) is int
             and population_n == 70
             and type(maximum_requests) is int
             and 1 <= maximum_requests <= 420,
@@ -864,7 +1824,7 @@ def validate_approved_budget_receipt(
     )
     _require(
         errors,
-        bool(UTC_SECOND.fullmatch(str(receipt.get("approved_at_utc", "")))),
+        _valid_utc_second(receipt.get("approved_at_utc")),
         "approved budget receipt timestamp is invalid",
     )
 
@@ -896,7 +1856,9 @@ def validate_runtime(
         "credential_source": "environment-only; read only after validator success",
     }
     for key, value in expected.items():
-        _require(errors, runtime.get(key) == value, f"runtime {key} drift")
+        _require(
+            errors, _exact_json_scalar(runtime.get(key), value), f"runtime {key} drift"
+        )
     expected_keys = set(expected) | {
         "paid_calls_authorized",
         "qualified_artifact_receipt",
@@ -916,9 +1878,17 @@ def validate_runtime(
     )
 
     authorized = runtime.get("paid_calls_authorized")
-    _require(errors, isinstance(authorized, bool), "runtime paid_calls_authorized must be boolean")
+    _require(
+        errors,
+        isinstance(authorized, bool),
+        "runtime paid_calls_authorized must be boolean",
+    )
     if authorized:
-        _require(errors, allow_authorized, "committed runtime template must not authorize paid calls")
+        _require(
+            errors,
+            allow_authorized,
+            "committed runtime template must not authorize paid calls",
+        )
         _require(
             errors,
             expected_bundle_digest is not None,
@@ -955,8 +1925,16 @@ def validate_runtime(
                     f"externally anchored {label} receipt digest mismatch",
                 )
     else:
-        _require(errors, runtime.get("qualified_artifact_receipt") is None, "unauthorized runtime must not carry artifact receipt")
-        _require(errors, runtime.get("approved_budget_receipt") is None, "unauthorized runtime must not carry budget receipt")
+        _require(
+            errors,
+            runtime.get("qualified_artifact_receipt") is None,
+            "unauthorized runtime must not carry artifact receipt",
+        )
+        _require(
+            errors,
+            runtime.get("approved_budget_receipt") is None,
+            "unauthorized runtime must not carry budget receipt",
+        )
 
 
 def assemble_packet_vector(vector: dict[str, Any], arm: str) -> bytes:
@@ -966,8 +1944,16 @@ def assemble_packet_vector(vector: dict[str, Any], arm: str) -> bytes:
     output.extend(canonical_json(vector["metadata"]))
     output.extend(b"\n")
     for source in vector["records"]:
-        payload_key = "full_payload" if arm == "B" or source["kind"] == "locus" else "minified_payload"
-        representation = "verbatim" if source["kind"] == "locus" else ("full" if arm == "B" else "minified")
+        payload_key = (
+            "full_payload"
+            if arm == "B" or source["kind"] == "locus"
+            else "minified_payload"
+        )
+        representation = (
+            "verbatim"
+            if source["kind"] == "locus"
+            else ("full" if arm == "B" else "minified")
+        )
         payload = source[payload_key].encode("utf-8")
         header = dict(source["header"])
         header.update(
@@ -999,7 +1985,9 @@ def _safe_relative_path(value: Any) -> bool:
     if not isinstance(value, str) or not value:
         return False
     path = Path(value)
-    return not path.is_absolute() and ".." not in path.parts and value == path.as_posix()
+    return (
+        not path.is_absolute() and ".." not in path.parts and value == path.as_posix()
+    )
 
 
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
@@ -1014,16 +2002,40 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _project_relationships(
+    stable_id: Any,
+    relationships: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(stable_id, str):
+        return []
+    return [
+        relationship
+        for relationship in relationships
+        if relationship.get("source") == stable_id
+        or relationship.get("target") == stable_id
+    ]
+
+
 def validate_acquisition_vector(
     acquisition: Any,
     records: list[Any],
     errors: list[str],
 ) -> None:
-    _require(errors, isinstance(acquisition, dict), "packet acquisition must be an object")
+    _require(
+        errors, isinstance(acquisition, dict), "packet acquisition must be an object"
+    )
     if not isinstance(acquisition, dict):
         return
-    _require(errors, set(acquisition) == set(ACQUISITION_FIELDS), "packet acquisition field set drift")
-    _require(errors, acquisition.get("schema_version") == 1, "packet acquisition schema_version drift")
+    _require(
+        errors,
+        set(acquisition) == set(ACQUISITION_FIELDS),
+        "packet acquisition field set drift",
+    )
+    _require(
+        errors,
+        acquisition.get("schema_version") == 1,
+        "packet acquisition schema_version drift",
+    )
     for field in ("dataset_row_sha256", "query_sha256", "rna_artifact_receipt_sha256"):
         _require(
             errors,
@@ -1032,23 +2044,59 @@ def validate_acquisition_vector(
         )
 
     loci = acquisition.get("loci")
-    _require(errors, isinstance(loci, list) and bool(loci), "packet acquisition loci must be non-empty")
+    _require(
+        errors,
+        isinstance(loci, list) and bool(loci),
+        "packet acquisition loci must be non-empty",
+    )
     if not isinstance(loci, list):
         loci = []
     for ordinal, locus in enumerate(loci, 1):
-        _require(errors, isinstance(locus, dict), f"acquisition locus {ordinal} must be an object")
+        _require(
+            errors,
+            isinstance(locus, dict),
+            f"acquisition locus {ordinal} must be an object",
+        )
         if not isinstance(locus, dict):
             continue
-        _require(errors, set(locus) == set(ACQUISITION_LOCUS_FIELDS), f"acquisition locus {ordinal} field set drift")
+        _require(
+            errors,
+            set(locus) == set(ACQUISITION_LOCUS_FIELDS),
+            f"acquisition locus {ordinal} field set drift",
+        )
         source_kind = locus.get("source_kind")
-        _require(errors, locus.get("ordinal") == ordinal, f"acquisition locus {ordinal} ordinal drift")
-        _require(errors, source_kind in LOCUS_SOURCE_KINDS, f"acquisition locus {ordinal} source_kind drift")
-        _require(errors, _safe_relative_path(locus.get("path")), f"acquisition locus {ordinal} path is unsafe")
-        _require(errors, isinstance(locus.get("language"), str) and bool(locus["language"]), f"acquisition locus {ordinal} language is invalid")
+        _require(
+            errors,
+            locus.get("ordinal") == ordinal,
+            f"acquisition locus {ordinal} ordinal drift",
+        )
+        _require(
+            errors,
+            source_kind in LOCUS_SOURCE_KINDS,
+            f"acquisition locus {ordinal} source_kind drift",
+        )
+        _require(
+            errors,
+            _safe_relative_path(locus.get("path")),
+            f"acquisition locus {ordinal} path is unsafe",
+        )
+        _require(
+            errors,
+            isinstance(locus.get("language"), str) and bool(locus["language"]),
+            f"acquisition locus {ordinal} language is invalid",
+        )
         preimage_length = locus.get("preimage_byte_length")
         preimage_sha = locus.get("preimage_sha256")
-        _require(errors, type(preimage_length) is int and preimage_length >= 0, f"acquisition locus {ordinal} preimage length is invalid")
-        _require(errors, bool(HEX64.fullmatch(str(preimage_sha or ""))), f"acquisition locus {ordinal} preimage digest is invalid")
+        _require(
+            errors,
+            type(preimage_length) is int and preimage_length >= 0,
+            f"acquisition locus {ordinal} preimage length is invalid",
+        )
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(preimage_sha or ""))),
+            f"acquisition locus {ordinal} preimage digest is invalid",
+        )
         expected_stable_id = "locus:{}:{}".format(
             source_kind,
             sha256_bytes(
@@ -1062,7 +2110,11 @@ def validate_acquisition_vector(
                 )
             ),
         )
-        _require(errors, locus.get("stable_id") == expected_stable_id, f"acquisition locus {ordinal} stable_id drift")
+        _require(
+            errors,
+            locus.get("stable_id") == expected_stable_id,
+            f"acquisition locus {ordinal} stable_id drift",
+        )
         seeds = locus.get("seed_stable_ids")
         _require(
             errors,
@@ -1090,21 +2142,54 @@ def validate_acquisition_vector(
                 and 1 <= locus["start_line"] <= locus["end_line"],
                 f"acquisition locus {ordinal} line bounds are invalid",
             )
-            expected_language = "Python" if source_kind in {"gold_unit", "module_preamble"} else "Unknown"
-            _require(errors, locus.get("language") == expected_language, f"acquisition locus {ordinal} language drift")
+            expected_language = (
+                "Python"
+                if source_kind in {"gold_unit", "module_preamble"}
+                else "Unknown"
+            )
+            _require(
+                errors,
+                locus.get("language") == expected_language,
+                f"acquisition locus {ordinal} language drift",
+            )
 
     candidates = acquisition.get("candidates")
-    _require(errors, isinstance(candidates, list), "packet acquisition candidates must be a list")
+    _require(
+        errors,
+        isinstance(candidates, list),
+        "packet acquisition candidates must be a list",
+    )
     if not isinstance(candidates, list):
         candidates = []
     for ordinal, candidate in enumerate(candidates, 1):
-        _require(errors, isinstance(candidate, dict), f"acquisition candidate {ordinal} must be an object")
+        _require(
+            errors,
+            isinstance(candidate, dict),
+            f"acquisition candidate {ordinal} must be an object",
+        )
         if not isinstance(candidate, dict):
             continue
-        _require(errors, set(candidate) == set(ACQUISITION_CANDIDATE_FIELDS), f"acquisition candidate {ordinal} field set drift")
-        _require(errors, candidate.get("acquisition_ordinal") == ordinal, f"acquisition candidate {ordinal} ordinal drift")
-        _require(errors, isinstance(candidate.get("stable_id"), str) and bool(candidate["stable_id"]), f"acquisition candidate {ordinal} stable_id is invalid")
-        _require(errors, _safe_relative_path(candidate.get("path")), f"acquisition candidate {ordinal} path is unsafe")
+        _require(
+            errors,
+            set(candidate) == set(ACQUISITION_CANDIDATE_FIELDS),
+            f"acquisition candidate {ordinal} field set drift",
+        )
+        _require(
+            errors,
+            candidate.get("acquisition_ordinal") == ordinal,
+            f"acquisition candidate {ordinal} ordinal drift",
+        )
+        _require(
+            errors,
+            isinstance(candidate.get("stable_id"), str)
+            and bool(candidate["stable_id"]),
+            f"acquisition candidate {ordinal} stable_id is invalid",
+        )
+        _require(
+            errors,
+            _safe_relative_path(candidate.get("path")),
+            f"acquisition candidate {ordinal} path is unsafe",
+        )
         _require(
             errors,
             type(candidate.get("start_line")) is int
@@ -1112,31 +2197,86 @@ def validate_acquisition_vector(
             and 1 <= candidate["start_line"] <= candidate["end_line"],
             f"acquisition candidate {ordinal} line bounds are invalid",
         )
-        _require(errors, isinstance(candidate.get("language"), str) and bool(candidate["language"]), f"acquisition candidate {ordinal} language is invalid")
-        _require(errors, type(candidate.get("full_body_byte_length")) is int and candidate["full_body_byte_length"] >= 0, f"acquisition candidate {ordinal} full-body length is invalid")
-        _require(errors, bool(HEX64.fullmatch(str(candidate.get("full_body_sha256", "")))), f"acquisition candidate {ordinal} full-body digest is invalid")
+        _require(
+            errors,
+            isinstance(candidate.get("language"), str) and bool(candidate["language"]),
+            f"acquisition candidate {ordinal} language is invalid",
+        )
+        _require(
+            errors,
+            type(candidate.get("full_body_byte_length")) is int
+            and candidate["full_body_byte_length"] >= 0,
+            f"acquisition candidate {ordinal} full-body length is invalid",
+        )
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(candidate.get("full_body_sha256", "")))),
+            f"acquisition candidate {ordinal} full-body digest is invalid",
+        )
         for field in ("semantic_rank", "graph_hops"):
             value = candidate.get(field)
-            _require(errors, value is None or (type(value) is int and value >= 1), f"acquisition candidate {ordinal} {field} is invalid")
+            _require(
+                errors,
+                value is None or (type(value) is int and value >= 1),
+                f"acquisition candidate {ordinal} {field} is invalid",
+            )
+        _require(
+            errors,
+            candidate.get("semantic_rank") is None
+            or (
+                type(candidate.get("semantic_rank")) is int
+                and 1 <= candidate["semantic_rank"] <= 20
+            ),
+            f"acquisition candidate {ordinal} semantic_rank exceeds search limit",
+        )
         for field in ("semantic_component", "graph_component", "total"):
-            _require(errors, type(candidate.get(field)) is int and candidate[field] >= 0, f"acquisition candidate {ordinal} {field} is invalid")
+            _require(
+                errors,
+                type(candidate.get(field)) is int and candidate[field] >= 0,
+                f"acquisition candidate {ordinal} {field} is invalid",
+            )
         _require(
             errors,
             candidate.get("total")
-            == candidate.get("semantic_component", -1) + candidate.get("graph_component", -1),
+            == candidate.get("semantic_component", -1)
+            + candidate.get("graph_component", -1),
             f"acquisition candidate {ordinal} score total drift",
         )
-        _require(errors, candidate.get("eligibility") in CANDIDATE_ELIGIBILITY, f"acquisition candidate {ordinal} eligibility drift")
-        _require(errors, isinstance(candidate.get("selected"), bool), f"acquisition candidate {ordinal} selected flag is invalid")
+        _require(
+            errors,
+            candidate.get("eligibility") in CANDIDATE_ELIGIBILITY,
+            f"acquisition candidate {ordinal} eligibility drift",
+        )
+        _require(
+            errors,
+            isinstance(candidate.get("selected"), bool),
+            f"acquisition candidate {ordinal} selected flag is invalid",
+        )
         if candidate.get("selected") is True:
-            _require(errors, candidate.get("eligibility") == "eligible", f"acquisition candidate {ordinal} selected while ineligible")
+            _require(
+                errors,
+                candidate.get("eligibility") == "eligible",
+                f"acquisition candidate {ordinal} selected while ineligible",
+            )
     if all(isinstance(candidate, dict) for candidate in candidates):
-        _require(errors, candidates == sorted(candidates, key=_candidate_sort_key), "packet acquisition candidate order drift")
+        _require(
+            errors,
+            candidates == sorted(candidates, key=_candidate_sort_key),
+            "packet acquisition candidate order drift",
+        )
         stable_ids = [candidate.get("stable_id") for candidate in candidates]
-        _require(errors, len(stable_ids) == len(set(stable_ids)), "packet acquisition candidate IDs must be unique")
+        _require(
+            errors,
+            len(stable_ids) == len(set(stable_ids)),
+            "packet acquisition candidate IDs must be unique",
+        )
 
     relationships = acquisition.get("relationships")
-    _require(errors, isinstance(relationships, list), "packet acquisition relationships must be a list")
+    _require(
+        errors,
+        isinstance(relationships, list),
+        "packet acquisition relationships must be a list",
+    )
     if not isinstance(relationships, list):
         relationships = []
     relationships_valid = True
@@ -1162,9 +2302,20 @@ def validate_acquisition_vector(
         )
         relationships_valid = relationships_valid and valid
     if relationships_valid:
-        _require(errors, relationships == sorted(relationships, key=_relationship_sort_key), "packet acquisition relationship order drift")
-        relationship_tuples = [tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS) for relationship in relationships]
-        _require(errors, len(relationship_tuples) == len(set(relationship_tuples)), "packet acquisition duplicate relationship")
+        _require(
+            errors,
+            relationships == sorted(relationships, key=_relationship_sort_key),
+            "packet acquisition relationship order drift",
+        )
+        relationship_tuples = [
+            tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS)
+            for relationship in relationships
+        ]
+        _require(
+            errors,
+            len(relationship_tuples) == len(set(relationship_tuples)),
+            "packet acquisition duplicate relationship",
+        )
         new_file_ordinals = {
             locus.get("ordinal")
             for locus in loci
@@ -1181,27 +2332,104 @@ def validate_acquisition_vector(
     else:
         relationship_tuples = []
 
+    if relationships_valid:
+        for ordinal, candidate in enumerate(candidates, 1):
+            if not isinstance(candidate, dict):
+                continue
+            semantic_rank = candidate.get("semantic_rank")
+            if semantic_rank is None:
+                expected_semantic = 0
+            elif type(semantic_rank) is int:
+                expected_semantic = 1_000_000_000 - (semantic_rank - 1) * 1_000_000
+            else:
+                continue
+            incident = _project_relationships(candidate.get("stable_id"), relationships)
+            expected_graph = max(
+                (
+                    max(
+                        1,
+                        100_000
+                        - relationship["locus_ordinal"] * 1_000
+                        - EDGE_TYPE_ORDINAL[relationship["edge_type"]] * 10
+                        - relationship["cli_ordinal"],
+                    )
+                    for relationship in incident
+                ),
+                default=0,
+            )
+            expected_hops = 1 if incident else None
+            _require(
+                errors,
+                candidate.get("semantic_component") == expected_semantic,
+                f"acquisition candidate {ordinal} semantic score derivation drift",
+            )
+            _require(
+                errors,
+                candidate.get("graph_component") == expected_graph,
+                f"acquisition candidate {ordinal} graph score derivation drift",
+            )
+            _require(
+                errors,
+                candidate.get("graph_hops") == expected_hops,
+                f"acquisition candidate {ordinal} graph_hops derivation drift",
+            )
+
     omissions = acquisition.get("omissions")
-    _require(errors, isinstance(omissions, list), "packet acquisition omissions must be a list")
+    _require(
+        errors,
+        isinstance(omissions, list),
+        "packet acquisition omissions must be a list",
+    )
     if not isinstance(omissions, list):
         omissions = []
     omission_by_id: dict[str, dict[str, Any]] = {}
     for ordinal, omission in enumerate(omissions, 1):
-        _require(errors, isinstance(omission, dict), f"acquisition omission {ordinal} must be an object")
+        _require(
+            errors,
+            isinstance(omission, dict),
+            f"acquisition omission {ordinal} must be an object",
+        )
         if not isinstance(omission, dict):
             continue
-        _require(errors, set(omission) == set(ACQUISITION_OMISSION_FIELDS), f"acquisition omission {ordinal} field set drift")
+        _require(
+            errors,
+            set(omission) == set(ACQUISITION_OMISSION_FIELDS),
+            f"acquisition omission {ordinal} field set drift",
+        )
         candidate_id = omission.get("candidate_stable_id")
-        _require(errors, isinstance(candidate_id, str) and bool(candidate_id), f"acquisition omission {ordinal} candidate ID is invalid")
-        _require(errors, candidate_id not in omission_by_id, f"duplicate acquisition omission for {candidate_id}")
+        _require(
+            errors,
+            isinstance(candidate_id, str) and bool(candidate_id),
+            f"acquisition omission {ordinal} candidate ID is invalid",
+        )
+        _require(
+            errors,
+            candidate_id not in omission_by_id,
+            f"duplicate acquisition omission for {candidate_id}",
+        )
         omission_by_id[candidate_id] = omission
         reason = omission.get("reason")
-        _require(errors, reason in OMISSION_REASONS, f"acquisition omission {ordinal} reason drift")
-        byte_fields = (omission.get("required_bytes"), omission.get("remaining_budget_bytes"))
+        _require(
+            errors,
+            reason in OMISSION_REASONS,
+            f"acquisition omission {ordinal} reason drift",
+        )
+        byte_fields = (
+            omission.get("required_bytes"),
+            omission.get("remaining_budget_bytes"),
+        )
         if reason in {"maximum_candidates", "full_body_budget"}:
-            _require(errors, all(type(value) is int and value >= 0 for value in byte_fields), f"acquisition omission {ordinal} budget fields are invalid")
+            _require(
+                errors,
+                all(type(value) is int and value >= 0 for value in byte_fields),
+                f"acquisition omission {ordinal} budget fields are invalid",
+            )
         else:
-            _require(errors, byte_fields == (None, None), f"acquisition omission {ordinal} eligibility budget fields must be null")
+            _require(
+                errors,
+                byte_fields == (None, None),
+                f"acquisition omission {ordinal} eligibility budget fields must be null",
+            )
 
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -1209,21 +2437,48 @@ def validate_acquisition_vector(
         candidate_id = candidate.get("stable_id")
         omission = omission_by_id.get(candidate_id)
         if candidate.get("selected") is True:
-            _require(errors, omission is None, f"selected candidate {candidate_id} must not be omitted")
+            _require(
+                errors,
+                omission is None,
+                f"selected candidate {candidate_id} must not be omitted",
+            )
         else:
-            _require(errors, omission is not None, f"unselected candidate {candidate_id} requires one omission")
+            _require(
+                errors,
+                omission is not None,
+                f"unselected candidate {candidate_id} requires one omission",
+            )
             if omission is not None and candidate.get("eligibility") != "eligible":
-                _require(errors, omission.get("reason") == candidate.get("eligibility"), f"candidate {candidate_id} omission reason mismatch")
+                _require(
+                    errors,
+                    omission.get("reason") == candidate.get("eligibility"),
+                    f"candidate {candidate_id} omission reason mismatch",
+                )
             elif omission is not None:
-                _require(errors, omission.get("reason") in {"maximum_candidates", "full_body_budget"}, f"eligible candidate {candidate_id} omission reason mismatch")
+                _require(
+                    errors,
+                    omission.get("reason")
+                    in {"maximum_candidates", "full_body_budget"},
+                    f"eligible candidate {candidate_id} omission reason mismatch",
+                )
     _require(
         errors,
-        set(omission_by_id).issubset({candidate.get("stable_id") for candidate in candidates if isinstance(candidate, dict)}),
+        set(omission_by_id).issubset(
+            {
+                candidate.get("stable_id")
+                for candidate in candidates
+                if isinstance(candidate, dict)
+            }
+        ),
         "acquisition omission references an unknown candidate",
     )
     _require(
         errors,
-        [omission.get("candidate_stable_id") for omission in omissions if isinstance(omission, dict)]
+        [
+            omission.get("candidate_stable_id")
+            for omission in omissions
+            if isinstance(omission, dict)
+        ]
         == [
             candidate.get("stable_id")
             for candidate in candidates
@@ -1232,11 +2487,31 @@ def validate_acquisition_vector(
         "packet acquisition omission order drift",
     )
 
-    packet_loci = [record for record in records if isinstance(record, dict) and record.get("kind") == "locus"]
-    packet_candidates = [record for record in records if isinstance(record, dict) and record.get("kind") == "candidate"]
-    selected_candidates = [candidate for candidate in candidates if isinstance(candidate, dict) and candidate.get("selected") is True]
-    _require(errors, len(packet_loci) == len(loci), "packet locus records do not match acquisition loci")
-    _require(errors, len(packet_candidates) == len(selected_candidates), "packet candidate records do not match acquisition selection")
+    packet_loci = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("kind") == "locus"
+    ]
+    packet_candidates = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("kind") == "candidate"
+    ]
+    selected_candidates = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("selected") is True
+    ]
+    _require(
+        errors,
+        len(packet_loci) == len(loci),
+        "packet locus records do not match acquisition loci",
+    )
+    _require(
+        errors,
+        len(packet_candidates) == len(selected_candidates),
+        "packet candidate records do not match acquisition selection",
+    )
     for locus, record in zip(loci, packet_loci):
         if not isinstance(locus, dict):
             continue
@@ -1252,6 +2527,11 @@ def validate_acquisition_vector(
             and header.get("end_line") == locus.get("end_line")
             and header.get("language") == locus.get("language"),
             f"packet locus {locus.get('ordinal')} header does not match acquisition",
+        )
+        _require(
+            errors,
+            isinstance(header, dict) and header.get("relationships") == [],
+            f"packet locus {locus.get('ordinal')} relationships must be empty",
         )
         if isinstance(payload, str):
             payload_bytes = payload.encode("utf-8")
@@ -1272,7 +2552,8 @@ def validate_acquisition_vector(
             and header.get("start_line") == candidate.get("start_line")
             and header.get("end_line") == candidate.get("end_line")
             and header.get("language") == candidate.get("language")
-            and header.get("full_body_byte_length") == candidate.get("full_body_byte_length")
+            and header.get("full_body_byte_length")
+            == candidate.get("full_body_byte_length")
             and header.get("full_body_sha256") == candidate.get("full_body_sha256")
             and header.get("score")
             == {
@@ -1282,19 +2563,19 @@ def validate_acquisition_vector(
             },
             f"packet candidate {candidate.get('acquisition_ordinal')} does not match acquisition",
         )
-    relationship_set = set(relationship_tuples)
-    for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("header"), dict):
-            continue
-        for relationship in record["header"].get("relationships", []):
-            if isinstance(relationship, dict) and set(relationship) == set(PACKET_RELATIONSHIP_FIELDS):
-                relationship_tuple = tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS)
-                _require(errors, relationship_tuple in relationship_set, "packet header relationship missing from acquisition record")
+        _require(
+            errors,
+            isinstance(header, dict)
+            and header.get("relationships")
+            == _project_relationships(candidate.get("stable_id"), relationships),
+            f"packet candidate {candidate.get('acquisition_ordinal')} relationship projection mismatch",
+        )
 
 
 def assemble_retry_prompt_vector(vector: dict[str, Any]) -> bytes:
     previous = "".join(
-        run["text"] * run["repeat"] for run in vector["previous_response_codepoint_runs"]
+        run["text"] * run["repeat"]
+        for run in vector["previous_response_codepoint_runs"]
     )
     request = vector["base_prompt"] + RETRY_SUFFIX.format(
         prev=previous[-6000:], feedback=vector["feedback"]
@@ -1312,13 +2593,29 @@ def validate_retry_prompt_vector(vector: Any, errors: list[str]) -> None:
         "expected_retry_request_byte_length",
         "expected_retry_request_sha256",
     }
-    _require(errors, isinstance(vector, dict) and set(vector) == expected_fields, "retry prompt vector field set drift")
+    _require(
+        errors,
+        isinstance(vector, dict) and set(vector) == expected_fields,
+        "retry prompt vector field set drift",
+    )
     if not isinstance(vector, dict):
         return
-    _require(errors, isinstance(vector.get("base_prompt"), str), "retry prompt vector base prompt must be text")
-    _require(errors, isinstance(vector.get("feedback"), str), "retry prompt vector feedback must be text")
+    _require(
+        errors,
+        isinstance(vector.get("base_prompt"), str),
+        "retry prompt vector base prompt must be text",
+    )
+    _require(
+        errors,
+        isinstance(vector.get("feedback"), str),
+        "retry prompt vector feedback must be text",
+    )
     runs = vector.get("previous_response_codepoint_runs")
-    _require(errors, isinstance(runs, list) and bool(runs), "retry prompt vector runs must be non-empty")
+    _require(
+        errors,
+        isinstance(runs, list) and bool(runs),
+        "retry prompt vector runs must be non-empty",
+    )
     if not isinstance(runs, list):
         return
     valid_runs = True
@@ -1333,22 +2630,194 @@ def validate_retry_prompt_vector(vector: Any, errors: list[str]) -> None:
         )
         _require(errors, valid, "retry prompt vector codepoint run is invalid")
         valid_runs = valid_runs and valid
-    if not valid_runs or not isinstance(vector.get("base_prompt"), str) or not isinstance(vector.get("feedback"), str):
+    if (
+        not valid_runs
+        or not isinstance(vector.get("base_prompt"), str)
+        or not isinstance(vector.get("feedback"), str)
+    ):
         return
     previous = "".join(run["text"] * run["repeat"] for run in runs)
-    _require(errors, len(previous) <= 20_000, "retry prompt vector expansion is too large")
-    _require(errors, len(previous) > 6000, "retry prompt vector must exercise truncation")
-    _require(errors, len(previous.encode("utf-8")) > len(previous), "retry prompt vector must exercise Unicode codepoint slicing")
-    _require(errors, len(previous) == vector.get("expected_previous_response_codepoints"), "retry prompt previous-response length drift")
-    _require(errors, len(previous[-6000:]) == vector.get("expected_retained_previous_codepoints"), "retry prompt retained-response length drift")
+    _require(
+        errors, len(previous) <= 20_000, "retry prompt vector expansion is too large"
+    )
+    _require(
+        errors, len(previous) > 6000, "retry prompt vector must exercise truncation"
+    )
+    _require(
+        errors,
+        len(previous.encode("utf-8")) > len(previous),
+        "retry prompt vector must exercise Unicode codepoint slicing",
+    )
+    _require(
+        errors,
+        len(previous) == vector.get("expected_previous_response_codepoints"),
+        "retry prompt previous-response length drift",
+    )
+    _require(
+        errors,
+        len(previous[-6000:]) == vector.get("expected_retained_previous_codepoints"),
+        "retry prompt retained-response length drift",
+    )
     request = assemble_retry_prompt_vector(vector)
-    _require(errors, len(request) == vector.get("expected_retry_request_byte_length"), "retry prompt byte length drift")
-    _require(errors, sha256_bytes(request) == vector.get("expected_retry_request_sha256"), "retry prompt byte digest drift")
+    _require(
+        errors,
+        len(request) == vector.get("expected_retry_request_byte_length"),
+        "retry prompt byte length drift",
+    )
+    _require(
+        errors,
+        sha256_bytes(request) == vector.get("expected_retry_request_sha256"),
+        "retry prompt byte digest drift",
+    )
+
+
+def validate_h2_token_vectors(
+    vector: Any,
+    records: list[Any],
+    errors: list[str],
+) -> None:
+    _require(errors, isinstance(vector, dict), "H2 token vector must be an object")
+    if not isinstance(vector, dict):
+        return
+    _require(
+        errors,
+        set(vector) == set(H2_TOKEN_VECTOR_FIELDS),
+        "H2 token vector field set drift",
+    )
+    constants = {
+        "encoding": "cl100k_base",
+        "operation": "encode_ordinary each selected candidate payload independently; never concatenate records",
+        "tiktoken_version": TIKTOKEN_VERSION,
+        "tiktoken_sdist_sha256": TIKTOKEN_SDIST_SHA256,
+        "darwin_arm64_cp312_wheel_sha256": TIKTOKEN_DARWIN_ARM64_CP312_WHEEL_SHA256,
+        "mergeable_ranks_sha256": CL100K_MERGEABLE_RANKS_SHA256,
+    }
+    _require(
+        errors,
+        type(vector.get("schema_version")) is int and vector["schema_version"] == 1,
+        "H2 token vector schema_version must be JSON integer 1",
+    )
+    for field, expected in constants.items():
+        _require(
+            errors, vector.get(field) == expected, f"H2 token vector {field} drift"
+        )
+    token_records = vector.get("records")
+    _require(
+        errors,
+        isinstance(token_records, list)
+        and token_records == list(EXPECTED_H2_TOKEN_RECORDS),
+        "H2 per-record token vectors drift",
+    )
+    if not isinstance(token_records, list):
+        return
+    candidates = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("kind") == "candidate"
+    ]
+    _require(
+        errors,
+        len(token_records) == len(candidates),
+        "H2 token vector must cover every selected candidate",
+    )
+    for token_record, candidate in zip(token_records, candidates):
+        _require(
+            errors,
+            isinstance(token_record, dict)
+            and set(token_record) == set(H2_TOKEN_RECORD_FIELDS),
+            "H2 token record field set drift",
+        )
+        if not isinstance(token_record, dict):
+            continue
+        header = candidate.get("header", {})
+        full_payload = candidate.get("full_payload")
+        minified_payload = candidate.get("minified_payload")
+        _require(
+            errors,
+            token_record.get("record_ordinal") == header.get("ordinal"),
+            "H2 token record ordinal mismatch",
+        )
+        if isinstance(full_payload, str):
+            _require(
+                errors,
+                token_record.get("full_payload_sha256")
+                == sha256_bytes(full_payload.encode("utf-8")),
+                "H2 full-payload digest mismatch",
+            )
+        if isinstance(minified_payload, str):
+            _require(
+                errors,
+                token_record.get("minified_payload_sha256")
+                == sha256_bytes(minified_payload.encode("utf-8")),
+                "H2 minified-payload digest mismatch",
+            )
+        for prefix in ("full", "minified"):
+            count_field = f"{prefix}_token_count"
+            ids_field = f"{prefix}_token_ids"
+            ids_digest_field = f"{prefix}_token_ids_sha256"
+            _require(
+                errors,
+                type(token_record.get(count_field)) is int
+                and token_record[count_field] >= 0,
+                f"H2 {count_field} must be a non-negative JSON integer",
+            )
+            token_ids = token_record.get(ids_field)
+            _require(
+                errors,
+                isinstance(token_ids, list)
+                and all(
+                    type(token_id) is int and token_id >= 0 for token_id in token_ids
+                ),
+                f"H2 {ids_field} must contain non-negative JSON integers",
+            )
+            if isinstance(token_ids, list):
+                _require(
+                    errors,
+                    type(token_record.get(count_field)) is int
+                    and len(token_ids) == token_record[count_field],
+                    f"H2 {prefix} token ID count mismatch",
+                )
+                _require(
+                    errors,
+                    sha256_bytes(canonical_json(token_ids))
+                    == token_record.get(ids_digest_field),
+                    f"H2 {prefix} token ID digest mismatch",
+                )
+            _require(
+                errors,
+                bool(HEX64.fullmatch(str(token_record.get(ids_digest_field, "")))),
+                f"H2 {ids_digest_field} is invalid",
+            )
+    _require(
+        errors,
+        type(vector.get("expected_full_payload_tokens")) is int
+        and vector["expected_full_payload_tokens"]
+        == sum(
+            record.get("full_token_count", 0)
+            for record in token_records
+            if isinstance(record, dict) and type(record.get("full_token_count")) is int
+        ),
+        "H2 full-payload token total drift",
+    )
+    _require(
+        errors,
+        type(vector.get("expected_minified_payload_tokens")) is int
+        and vector["expected_minified_payload_tokens"]
+        == sum(
+            record.get("minified_token_count", 0)
+            for record in token_records
+            if isinstance(record, dict)
+            and type(record.get("minified_token_count")) is int
+        ),
+        "H2 minified-payload token total drift",
+    )
 
 
 def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
     initial_error_count = len(errors)
-    _require(errors, vector.get("schema_version") == 1, "packet vector schema_version drift")
+    _require(
+        errors, vector.get("schema_version") == 1, "packet vector schema_version drift"
+    )
     _require(
         errors,
         set(vector)
@@ -1356,6 +2825,7 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
             "schema_version",
             "metadata",
             "records",
+            "h2_token_vectors",
             "retry_prompt_vector",
             "expected_b_sha256",
             "expected_c_sha256",
@@ -1365,17 +2835,37 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
     metadata = vector.get("metadata", {})
     _require(errors, isinstance(metadata, dict), "packet metadata must be an object")
     if isinstance(metadata, dict):
-        _require(errors, set(metadata) == set(PACKET_METADATA_FIELDS), "packet metadata field set drift")
-        _require(errors, metadata.get("protocol_id") == "rna-act-context-swebench-v1", "packet protocol_id drift")
+        _require(
+            errors,
+            set(metadata) == set(PACKET_METADATA_FIELDS),
+            "packet metadata field set drift",
+        )
+        _require(
+            errors,
+            metadata.get("protocol_id") == "rna-act-context-swebench-v1",
+            "packet protocol_id drift",
+        )
     records = vector.get("records", [])
-    _require(errors, isinstance(records, list) and bool(records), "packet vector records must be non-empty")
+    _require(
+        errors,
+        isinstance(records, list) and bool(records),
+        "packet vector records must be non-empty",
+    )
     if not isinstance(records, list):
         return
     if isinstance(metadata, dict):
-        _require(errors, metadata.get("record_count") == len(records), "packet record_count drift")
+        _require(
+            errors,
+            metadata.get("record_count") == len(records),
+            "packet record_count drift",
+        )
         validate_acquisition_vector(metadata.get("acquisition"), records, errors)
     for ordinal, source in enumerate(records, 1):
-        _require(errors, isinstance(source, dict), f"packet record {ordinal} must be an object")
+        _require(
+            errors,
+            isinstance(source, dict),
+            f"packet record {ordinal} must be an object",
+        )
         if not isinstance(source, dict):
             continue
         _require(
@@ -1383,14 +2873,34 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
             set(source) == {"kind", "header", "full_payload", "minified_payload"},
             f"packet record {ordinal} field set drift",
         )
-        _require(errors, source.get("kind") in {"locus", "candidate"}, f"packet record {ordinal} kind drift")
+        _require(
+            errors,
+            source.get("kind") in {"locus", "candidate"},
+            f"packet record {ordinal} kind drift",
+        )
         header = source.get("header", {})
-        _require(errors, isinstance(header, dict), f"packet record {ordinal} header must be an object")
+        _require(
+            errors,
+            isinstance(header, dict),
+            f"packet record {ordinal} header must be an object",
+        )
         if not isinstance(header, dict):
             continue
-        _require(errors, set(header) == set(PACKET_HEADER_FIELDS), f"packet record {ordinal} header field set drift")
-        _require(errors, header.get("ordinal") == ordinal, f"packet record {ordinal} ordinal drift")
-        _require(errors, header.get("kind") == source.get("kind"), f"packet record {ordinal} kind drift")
+        _require(
+            errors,
+            set(header) == set(PACKET_HEADER_FIELDS),
+            f"packet record {ordinal} header field set drift",
+        )
+        _require(
+            errors,
+            header.get("ordinal") == ordinal,
+            f"packet record {ordinal} ordinal drift",
+        )
+        _require(
+            errors,
+            header.get("kind") == source.get("kind"),
+            f"packet record {ordinal} kind drift",
+        )
         _require(
             errors,
             header.get("source_kind")
@@ -1399,15 +2909,39 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
         )
         full_payload = source.get("full_payload")
         minified_payload = source.get("minified_payload")
-        _require(errors, isinstance(full_payload, str), f"packet record {ordinal} full payload must be text")
-        _require(errors, isinstance(minified_payload, str), f"packet record {ordinal} minified payload must be text")
+        _require(
+            errors,
+            isinstance(full_payload, str),
+            f"packet record {ordinal} full payload must be text",
+        )
+        _require(
+            errors,
+            isinstance(minified_payload, str),
+            f"packet record {ordinal} minified payload must be text",
+        )
         if isinstance(full_payload, str):
             full_bytes = full_payload.encode("utf-8")
-            _require(errors, header.get("full_body_byte_length") == len(full_bytes), f"packet record {ordinal} full-body length drift")
-            _require(errors, header.get("full_body_sha256") == sha256_bytes(full_bytes), f"packet record {ordinal} full-body digest drift")
+            _require(
+                errors,
+                header.get("full_body_byte_length") == len(full_bytes),
+                f"packet record {ordinal} full-body length drift",
+            )
+            _require(
+                errors,
+                header.get("full_body_sha256") == sha256_bytes(full_bytes),
+                f"packet record {ordinal} full-body digest drift",
+            )
         if source.get("kind") == "locus":
-            _require(errors, minified_payload == full_payload, f"packet locus {ordinal} must remain verbatim")
-            _require(errors, header.get("score") is None, f"packet locus {ordinal} score must be null")
+            _require(
+                errors,
+                minified_payload == full_payload,
+                f"packet locus {ordinal} must remain verbatim",
+            )
+            _require(
+                errors,
+                header.get("score") is None,
+                f"packet locus {ordinal} score must be null",
+            )
         elif isinstance(full_payload, str) and isinstance(minified_payload, str):
             _require(
                 errors,
@@ -1416,15 +2950,28 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
                 == {"semantic_component", "graph_component", "total"},
                 f"packet candidate {ordinal} score field set drift",
             )
-            _require(errors, bool(minified_payload), f"packet candidate {ordinal} minified payload is empty")
-            _require(errors, len(minified_payload.encode("utf-8")) <= len(full_payload.encode("utf-8")), f"packet candidate {ordinal} minified payload grew")
+            _require(
+                errors,
+                bool(minified_payload),
+                f"packet candidate {ordinal} minified payload is empty",
+            )
+            _require(
+                errors,
+                len(minified_payload.encode("utf-8"))
+                <= len(full_payload.encode("utf-8")),
+                f"packet candidate {ordinal} minified payload grew",
+            )
             _require(
                 errors,
                 "\n# mvb=accumulated_value" in minified_payload,
                 "C packet vector must include the minifier legend",
             )
         relationships = header.get("relationships", [])
-        _require(errors, isinstance(relationships, list), f"packet record {ordinal} relationships must be a list")
+        _require(
+            errors,
+            isinstance(relationships, list),
+            f"packet record {ordinal} relationships must be a list",
+        )
         if isinstance(relationships, list):
             for relationship in relationships:
                 _require(
@@ -1439,16 +2986,34 @@ def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
                     relationships == sorted(relationships, key=_relationship_sort_key),
                     f"packet record {ordinal} relationship order drift",
                 )
-                tuples = [tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS) for relationship in relationships]
-                _require(errors, len(tuples) == len(set(tuples)), f"packet record {ordinal} duplicate relationship")
+                tuples = [
+                    tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS)
+                    for relationship in relationships
+                ]
+                _require(
+                    errors,
+                    len(tuples) == len(set(tuples)),
+                    f"packet record {ordinal} duplicate relationship",
+                )
+    validate_h2_token_vectors(vector.get("h2_token_vectors"), records, errors)
     validate_retry_prompt_vector(vector.get("retry_prompt_vector"), errors)
     if len(errors) != initial_error_count:
         return
     b_packet = assemble_packet_vector(vector, "B")
     c_packet = assemble_packet_vector(vector, "C")
-    _require(errors, sha256_bytes(b_packet) == vector.get("expected_b_sha256"), "B packet test-vector digest drift")
-    _require(errors, sha256_bytes(c_packet) == vector.get("expected_c_sha256"), "C packet test-vector digest drift")
-    _require(errors, b_packet != c_packet, "packet vector must exercise C-only minification")
+    _require(
+        errors,
+        sha256_bytes(b_packet) == vector.get("expected_b_sha256"),
+        "B packet test-vector digest drift",
+    )
+    _require(
+        errors,
+        sha256_bytes(c_packet) == vector.get("expected_c_sha256"),
+        "C packet test-vector digest drift",
+    )
+    _require(
+        errors, b_packet != c_packet, "packet vector must exercise C-only minification"
+    )
 
 
 def _lock_material(entries: list[dict[str, Any]]) -> bytes:
@@ -1466,13 +3031,20 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
     entries = lock.get("files", [])
     _require(
         errors,
-        set(lock) == {"schema_version", "algorithm", "material_format", "files", "bundle_sha256"},
+        set(lock)
+        == {"schema_version", "algorithm", "material_format", "files", "bundle_sha256"},
         "lock field set drift",
     )
     _require(errors, lock.get("schema_version") == 1, "lock schema_version must be 1")
     _require(errors, lock.get("algorithm") == "sha256", "lock algorithm drift")
-    _require(errors, lock.get("material_format") == LOCK_MATERIAL_FORMAT, "lock material format drift")
-    _require(errors, isinstance(entries, list) and bool(entries), "lock must contain files")
+    _require(
+        errors,
+        lock.get("material_format") == LOCK_MATERIAL_FORMAT,
+        "lock material format drift",
+    )
+    _require(
+        errors, isinstance(entries, list) and bool(entries), "lock must contain files"
+    )
     if not isinstance(entries, list):
         return None
     paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
@@ -1483,18 +3055,36 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         _require(errors, isinstance(entry, dict), "lock file entry must be an object")
         if not isinstance(entry, dict):
             continue
-        _require(errors, set(entry) == {"path", "bytes", "sha256"}, f"lock entry field set drift: {entry.get('path')}")
-        _require(errors, isinstance(entry.get("bytes"), int) and entry["bytes"] >= 0, f"invalid lock byte length: {entry.get('path')}")
-        _require(errors, bool(HEX64.fullmatch(str(entry.get("sha256", "")))), f"invalid lock digest: {entry.get('path')}")
+        _require(
+            errors,
+            set(entry) == {"path", "bytes", "sha256"},
+            f"lock entry field set drift: {entry.get('path')}",
+        )
+        _require(
+            errors,
+            isinstance(entry.get("bytes"), int) and entry["bytes"] >= 0,
+            f"invalid lock byte length: {entry.get('path')}",
+        )
+        _require(
+            errors,
+            bool(HEX64.fullmatch(str(entry.get("sha256", "")))),
+            f"invalid lock digest: {entry.get('path')}",
+        )
         rel = Path(entry.get("path", ""))
-        _require(errors, not rel.is_absolute() and ".." not in rel.parts, f"unsafe lock path: {rel}")
+        _require(
+            errors,
+            not rel.is_absolute() and ".." not in rel.parts,
+            f"unsafe lock path: {rel}",
+        )
         path = root / rel
         _require(errors, path.is_file(), f"missing locked file: {rel}")
         if not path.is_file():
             continue
         data = path.read_bytes()
         _require(errors, len(data) == entry.get("bytes"), f"byte length drift: {rel}")
-        _require(errors, sha256_bytes(data) == entry.get("sha256"), f"digest drift: {rel}")
+        _require(
+            errors, sha256_bytes(data) == entry.get("sha256"), f"digest drift: {rel}"
+        )
         if SECRET_VALUE.search(data.decode("utf-8", errors="ignore")):
             errors.append(f"credential-shaped value in locked file: {rel}")
     bundle_root = root / "benchmark/swebench-act-context"
@@ -1504,7 +3094,9 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         if path.is_file()
     }
     expected_bundle_paths = {
-        path for path in EXPECTED_LOCK_PATHS if path.startswith("benchmark/swebench-act-context/")
+        path
+        for path in EXPECTED_LOCK_PATHS
+        if path.startswith("benchmark/swebench-act-context/")
     } | {LOCK_REL.as_posix(), DIGEST_REL.as_posix()}
     _require(
         errors,
@@ -1512,7 +3104,9 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         "bundle file inventory drift",
     )
     digest = sha256_bytes(_lock_material(entries))
-    _require(errors, digest == lock.get("bundle_sha256"), "bundle digest mismatch in lock")
+    _require(
+        errors, digest == lock.get("bundle_sha256"), "bundle digest mismatch in lock"
+    )
     digest_file = (root / DIGEST_REL).read_text(encoding="ascii").strip()
     _require(errors, digest_file == digest, "protocol.sha256 does not match bundle")
     return digest
@@ -1529,9 +3123,21 @@ def validate_bundle(
     errors: list[str] = []
     protocol_path = root / PROTOCOL_REL
     population_path = root / POPULATION_REL
-    _require(errors, sha256_file(protocol_path) == EXPECTED_PROTOCOL_SHA256, "frozen protocol.json digest drift")
-    _require(errors, sha256_file(population_path) == EXPECTED_POPULATION_SHA256, "frozen population.json digest drift")
-    _require(errors, sha256_file(root / PARSER_REL) == EXPECTED_PARSER_SHA256, "vendored parser digest drift")
+    _require(
+        errors,
+        sha256_file(protocol_path) == EXPECTED_PROTOCOL_SHA256,
+        "frozen protocol.json digest drift",
+    )
+    _require(
+        errors,
+        sha256_file(population_path) == EXPECTED_POPULATION_SHA256,
+        "frozen population.json digest drift",
+    )
+    _require(
+        errors,
+        sha256_file(root / PARSER_REL) == EXPECTED_PARSER_SHA256,
+        "vendored parser digest drift",
+    )
 
     protocol = load_json(protocol_path)
     population = load_json(population_path)
@@ -1554,8 +3160,16 @@ def validate_bundle(
     validate_packet_vector(vector, errors)
     bundle_digest = validate_lock(root, errors)
     if expected_digest is not None:
-        _require(errors, bool(HEX64.fullmatch(expected_digest)), "--expected-digest must be 64 lowercase hex characters")
-        _require(errors, bundle_digest == expected_digest, "externally anchored protocol digest mismatch")
+        _require(
+            errors,
+            bool(HEX64.fullmatch(expected_digest)),
+            "--expected-digest must be 64 lowercase hex characters",
+        )
+        _require(
+            errors,
+            bundle_digest == expected_digest,
+            "externally anchored protocol digest mismatch",
+        )
 
     if errors:
         raise ValueError("protocol validation failed:\n- " + "\n- ".join(errors))
@@ -1578,7 +3192,9 @@ def validate_bundle(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--root", type=Path, default=Path(__file__).resolve().parents[1]
+    )
     parser.add_argument("--expected-digest", help="externally anchored bundle SHA-256")
     parser.add_argument(
         "--runtime-config",
@@ -1593,7 +3209,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--expected-budget-receipt-digest",
         help="externally anchored canonical approved-budget receipt SHA-256",
     )
-    parser.add_argument("--json", action="store_true", help="emit the compatibility record as JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="emit the compatibility record as JSON"
+    )
     return parser.parse_args(argv)
 
 
@@ -1607,14 +3225,23 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_artifact_receipt_digest,
             args.expected_budget_receipt_digest,
         )
-    except (OSError, json.JSONDecodeError, DuplicateKey, KeyError, TypeError, ValueError) as error:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        DuplicateKey,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
         print(f"INCOMPATIBLE: {error}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     else:
         print(f"COMPATIBLE {result['protocol_id']} {result['bundle_sha256']}")
-        print("A: binary outcomes + initial-request tokens comparable; retry-inclusive tokens unavailable")
+        print(
+            "A: binary outcomes + initial-request tokens comparable; retry-inclusive tokens unavailable"
+        )
     return 0
 
 

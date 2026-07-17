@@ -301,7 +301,7 @@
         "full_body_budget"
       ],
       "omission_null_rules": "required_bytes and remaining_budget_bytes are integers only for maximum_candidates/full_body_budget; both are null for eligibility omissions",
-      "consistency": "loci, candidates, relationships, and omissions are ordered arrays; every unselected candidate has exactly one omission; every selected candidate has none; packet candidate records are exactly the selected candidates in candidate order"
+      "consistency": "loci, candidates, relationships, and omissions are ordered arrays; every unselected candidate has exactly one omission; every selected candidate has none; packet candidate records are exactly the selected candidates in candidate order; every locus header has relationships=[]; every selected candidate header relationship array equals the deterministic packet relationship_schema header_projection, including an empty array when no acquisition relationship is incident"
     }
   },
   "packet_serialization": {
@@ -353,7 +353,8 @@
         "cli_ordinal"
       ],
       "deduplication": "deduplicate the exact six-field tuple, retaining its first acquisition occurrence",
-      "ordering": "ascending by locus_ordinal, direction ordinal in the frozen traversal directions list, cli_ordinal, edge-type ordinal in the frozen edge_type_order list, UTF-8 source bytes, then UTF-8 target bytes"
+      "ordering": "ascending by locus_ordinal, direction ordinal in the frozen traversal directions list, cli_ordinal, edge-type ordinal in the frozen edge_type_order list, UTF-8 source bytes, then UTF-8 target bytes",
+      "header_projection": "locus headers contain []; each selected candidate header contains exactly the acquisition relationships whose source or target equals that candidate stable_id, preserving acquisition order; relationships incident only to omitted candidates remain acquisition-only"
     },
     "record": "canonical JSON base header plus derived payload fields; LF; exactly payload_byte_length payload bytes; LF",
     "canonical_json": "UTF-8 JSON with keys sorted lexicographically, separators comma/colon, ensure_ascii=false, and no insignificant whitespace",
@@ -383,7 +384,8 @@
       "C#"
     ],
     "implementation": "qualified RNA structural minify_body from the exact #786 artifact; text fallback is forbidden",
-    "verification": "minify the sealed B payload independently, require deterministic byte equality on repetition, parse success, and the deterministic full-to-minified legend as the final payload line when identifiers are renamed; the legend bytes are part of payload length and digest; any failure stops the instance before model access"
+    "verification": "minify the sealed B payload independently, require deterministic byte equality on repetition, parse success, and the deterministic full-to-minified legend as the final payload line when identifiers are renamed; the legend bytes are part of payload length and digest; any failure stops the instance before model access",
+    "token_effect": "per-record or cohort cl100k token reduction is not an eligibility condition; a structurally valid byte-shorter minified payload may tokenize longer, the frozen vector intentionally exercises this, and H2 must be reported failed/null unchanged when its preregistered token thresholds do not pass"
   },
   "definitions": {
     "locus": "a byte-faithful oracle-surface record defined above; never minified",
@@ -495,8 +497,8 @@
         "coverage_manifest_sha256",
         "evidence_sha256"
       ],
-      "lsp_requirements": "status=complete, quiescent=true, Python is present in a sorted unique language list, every failure/partial counter is zero, covered_file_count equals positive included_file_count, and coverage_scope is every included ordinary docs/source/test/config file",
-      "provenance_requirements": "artifact_commit_sha is 40 lowercase hex; every artifact/evidence/protocol/coverage digest is 64 lowercase hex; ci_workflow is a .github/workflows YAML path; ci_run_id is positive and ci_run_url exactly names that GitHub Actions run; qualification_comment_url exactly names an issue #786 comment; qualified_at_utc is second-precision UTC"
+      "lsp_requirements": "status=complete, quiescent=true, Python is present in a sorted unique language list, every failure/partial counter is exact JSON integer zero (booleans forbidden), covered_file_count and positive included_file_count are exact JSON integers and equal, and coverage_scope is every included ordinary docs/source/test/config file",
+      "provenance_requirements": "schema_version=1 and qualification_issue=786 are exact JSON integers (booleans forbidden); artifact_commit_sha is 40 lowercase hex; every artifact/evidence/protocol/coverage digest is 64 lowercase hex; ci_workflow is a .github/workflows YAML path; ci_run_id is a positive JSON integer and ci_run_url exactly names that GitHub Actions run; qualification_comment_url exactly names an issue #786 comment; qualified_at_utc parses and round-trips as a real calendar-valid second-precision UTC instant"
     },
     "approved_budget_receipt_schema": {
       "exact_fields": [
@@ -519,9 +521,9 @@
         "receipt_type": "approved-model-budget-v1",
         "protocol_id": "rna-act-context-swebench-v1"
       },
-      "qualification_pair": "authorization_scope=qualification_pair; authorization_issue=789; qualification_instance_id=astropy__astropy-13398; population_n=1; maximum_model_requests is 1..6",
-      "n70_cohort": "authorization_scope=n70_cohort; authorization_issue=790; qualification_instance_id=null; population_n=70; maximum_model_requests is 1..420",
-      "budget_requirements": "maximum_total_usd is a positive fixed two-decimal ASCII string; approval_comment_url exactly names a comment on the matching authorization issue; approval_evidence_sha256 is 64 lowercase hex; approved_at_utc is second-precision UTC; protocol_bundle_sha256 equals the externally anchored bundle"
+      "qualification_pair": "schema_version=1, authorization_issue=789, population_n=1, and maximum_model_requests are exact JSON integers (booleans forbidden); authorization_scope=qualification_pair; qualification_instance_id=astropy__astropy-13398; maximum_model_requests is 1..6",
+      "n70_cohort": "schema_version=1, authorization_issue=790, population_n=70, and maximum_model_requests are exact JSON integers (booleans forbidden); authorization_scope=n70_cohort; qualification_instance_id=null; maximum_model_requests is 1..420",
+      "budget_requirements": "maximum_total_usd is a positive fixed two-decimal ASCII string; approval_comment_url exactly names a comment on the matching authorization issue; approval_evidence_sha256 is 64 lowercase hex; approved_at_utc parses and round-trips as a real calendar-valid second-precision UTC instant; protocol_bundle_sha256 equals the externally anchored bundle"
     },
     "external_anchor_requirements": "paid authorization requires three independent CLI trust anchors copied from GitHub: the protocol bundle SHA-256, SHA-256 of canonical JSON for qualified_artifact_receipt, and SHA-256 of canonical JSON for approved_budget_receipt; each must match before model access",
     "trust_boundary": "the offline validator performs no network or signature lookup; the operator must copy the exact receipt objects and all three digests from their externally anchored GitHub approvals. Closed schemas, independent receipt digests, and cross-bindings reject omission, drift, wrong capability state, wrong issue/run/platform, or receipt reuse across protocol digests."
@@ -544,14 +546,127 @@
       "A/B",
       "B/C"
     ],
-    "tests": "exact two-sided McNemar tests with discordant counts",
+    "paired_table_cells": "n00=first unresolved/second unresolved; n01=first unresolved/second resolved; n10=first resolved/second unresolved; n11=first resolved/second resolved; delta=second-minus-first=(n01-n10)/N",
+    "tests": "frozen conditional exact two-sided McNemar test with discordant counts",
+    "mcnemar": {
+      "method_id": "conditional-exact-mcnemar-equal-tail-v1",
+      "alternative": "two-sided",
+      "alpha": "0.05",
+      "formula": "m=n01+n10; x=min(n01,n10); p_value=min(1, 2*sum_{k=0..x} choose(m,k)*0.5^m)",
+      "zero_discordant": "when n01+n10=0, p_value=1 exactly"
+    },
     "intervals": [
       "Wilson 95% intervals for each arm resolved rate",
-      "paired 95% confidence interval for each arm-rate difference using the frozen exact paired-binomial method implemented and test-vectored before qualification"
+      "frozen conservative finite-sample Bonferroni-Clopper-Pearson 95% interval for each paired arm-rate difference"
     ],
+    "arm_rate_wilson": {
+      "method_id": "wilson-score-two-sided-v1",
+      "confidence": "0.95",
+      "z": "1.959963984540054",
+      "formula": "for p=x/N and z as pinned: denominator=1+z^2/N; center=(p+z^2/(2N))/denominator; half=z*sqrt(p*(1-p)/N+z^2/(4*N^2))/denominator; interval=[max(0,center-half),min(1,center+half)]",
+      "edge_cases": "x and N are JSON integers with 0<=x<=N and N>0; no continuity correction"
+    },
+    "paired_difference_interval": {
+      "method_id": "bonferroni-clopper-pearson-matched-risk-difference-v1",
+      "estimand": "delta=p01-p10=Pr(second resolved)-Pr(first resolved)",
+      "reference": "Clopper CJ and Pearson ES (1934), Biometrika 26(4):404-413, doi:10.1093/biomet/26.4.404; Bonferroni simultaneous coverage",
+      "confidence": "0.95 two-sided",
+      "alpha": "0.05 exactly",
+      "tail_allocation": "four one-sided tails each alpha/4=0.0125; therefore each discordant-cell Clopper-Pearson interval is 97.5% two-sided and joint coverage is at least 95%",
+      "clopper_pearson_equations": "for 0<x<=N, L is the unique p in [0,1] satisfying sum_{k=x..N} choose(N,k)*p^k*(1-p)^(N-k)=0.0125; for 0<=x<N, U is the unique p satisfying sum_{k=0..x} choose(N,k)*p^k*(1-p)^(N-k)=0.0125",
+      "combination": "compute [L01,U01] and [L10,U10]; return [max(-1,L01-U10),min(1,U01-L10)]",
+      "numerics": "base-10 Decimal precision 80, ROUND_HALF_EVEN, exactly 256 bisection steps on [0,1] for every non-boundary root; gate on the unrounded Decimal endpoints; serialize test endpoints to 12 decimal places",
+      "edge_cases": "cells are non-negative JSON integers (booleans forbidden), N=sum(cells)>0; for a cell count x=0 set L=0 exactly; for x=N set U=1 exactly",
+      "decision_rule": "for A/B use first=A second=B; for B/C use first=B second=C; non-inferiority passes only when the unrounded lower endpoint is strictly greater than -0.10",
+      "test_vectors": [
+        {
+          "name": "all_concordant_unresolved",
+          "cells": {
+            "n00": 70,
+            "n01": 0,
+            "n10": 0,
+            "n11": 0
+          },
+          "expected": {
+            "estimate": "0.000000000000",
+            "lower": "-0.060681231202",
+            "upper": "0.060681231202"
+          }
+        },
+        {
+          "name": "mixed_discordance",
+          "cells": {
+            "n00": 41,
+            "n01": 10,
+            "n10": 4,
+            "n11": 15
+          },
+          "expected": {
+            "estimate": "0.085714285714",
+            "lower": "-0.089620963787",
+            "upper": "0.249721611353"
+          }
+        },
+        {
+          "name": "all_second_only",
+          "cells": {
+            "n00": 0,
+            "n01": 70,
+            "n10": 0,
+            "n11": 0
+          },
+          "expected": {
+            "estimate": "1.000000000000",
+            "lower": "0.878637537595",
+            "upper": "1.000000000000"
+          }
+        },
+        {
+          "name": "all_first_only",
+          "cells": {
+            "n00": 0,
+            "n01": 0,
+            "n10": 70,
+            "n11": 0
+          },
+          "expected": {
+            "estimate": "-1.000000000000",
+            "lower": "-1.000000000000",
+            "upper": "-0.878637537595"
+          }
+        }
+      ]
+    },
     "noninferiority_margin": -0.1,
     "noise_floor": "report the upstream approximately 9% per-instance flip rate for byte-identical temperature-0 runs",
-    "token_denominator": "for H1, sum exact initial-request input tokens across all frozen N=70 rows divided by resolved_count (not mean among resolved rows); for H2 use the separately named metric with the same all-row numerator rule; if any required initial A count is missing or resolved_count is zero, the numerical comparison is blocked",
+    "token_denominator": "for H1, sum exact initial-request input tokens across all frozen N=70 rows divided by resolved_count (not mean among resolved rows); H2 exact metrics and blocked cases are defined below",
+    "h2_metrics": {
+      "act_context_payload_tokens": {
+        "byte_domain": "initial packet selected-candidate payload text only; exclude every locus, acquisition object, header, framing byte, issue, prompt template, and retry repetition",
+        "arm_payload": "B uses full_payload; C uses minified_payload",
+        "tokenizer": {
+          "package": "tiktoken",
+          "version": "0.13.0",
+          "operation": "Encoding.encode_ordinary(text); special-token strings are ordinary text",
+          "encoding": "cl100k_base",
+          "sdist_sha256": "c9435714c3a84c2319499de9a300c0e604449dd0799ff246458b3bb6a7f433c1",
+          "darwin_arm64_cp312_wheel_sha256": "4d9980f11429ed2d737c463bb1fb78cf330caa026adf002f714aced7849a687b",
+          "mergeable_ranks_sha256": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
+        },
+        "per_instance": "in selected candidate record order call cl100k_base.encode_ordinary separately for each exact payload string and sum token-list lengths; never concatenate records",
+        "cohort_numerator": "sum the per-instance counts over all frozen N=70 rows",
+        "per_resolved_issue": "divide that arm's all-N70 cohort numerator by that arm's official SWE-bench resolved_count",
+        "vector": "packet-vector.json h2_token_vectors must match every selected candidate payload"
+      },
+      "total_episode_input_tokens": {
+        "source": "exact integer response.usage.input_tokens returned by Anthropic",
+        "request_scope": "sum every initial and edit-feedback retry request for the arm and instance; transport retries that do not produce a response usage record are not fabricated",
+        "cohort_numerator": "sum request counts over all frozen N=70 rows",
+        "per_resolved_issue": "divide that arm's all-N70 cohort numerator by that arm's official SWE-bench resolved_count"
+      },
+      "reduction_formula": "for each metric compute 1-(C per-resolved value)/(B per-resolved value) from unrounded integer numerators and counts; require >=0.30 for payload and >=0.20 for total",
+      "blocked_when": "block numerical H2 when any required token count is missing/non-integer/negative, either resolved_count is zero, the B comparator is zero, or tokenizer/vector identity fails"
+    },
     "rounding": "compute from unrounded integers; display counts exactly, rates/intervals to four decimals, token ratios to four decimals"
   },
   "telemetry": {
@@ -693,7 +808,7 @@
       "any paid authorization without closed artifact/budget receipts bound to the external protocol digest",
       "any acquisition/omission or exceptional-locus record outside its exact closed schema",
       "any retry prompt that does not match the frozen codepoint-slice byte vector",
-      "any secret-shaped content"
+      "any common GitHub, AWS, Slack, bearer-token, private-key, provider-key, or account-identifier credential shape without printing the value"
     ],
     "success_output": "machine-readable compatibility decision plus bundle digest; no credential values"
   }
