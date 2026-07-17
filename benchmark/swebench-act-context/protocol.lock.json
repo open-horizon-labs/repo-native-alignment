@@ -5,13 +5,13 @@
   "files": [
     {
       "path": "benchmark/swebench-act-context/README.md",
-      "bytes": 4327,
-      "sha256": "4147c2c000d124e9c6002ac6e18755f8cd430cb87b199b8caeed098dab34d8b4"
+      "bytes": 4440,
+      "sha256": "b062c6cd1d543bd80b50af1406b1b991127cdc3fe714b6f9e750a7d40b08bbff"
     },
     {
       "path": "benchmark/swebench-act-context/packet-vector.json",
-      "bytes": 1878,
-      "sha256": "fb57a8903fa14beb656355e7dccd619829e5414da63985964f2fad61f87bfa31"
+      "bytes": 2437,
+      "sha256": "52d8a0578ddff41b2e6b8a656cd9e63328c2b79508db630bf7c8c4de531a3657"
     },
     {
       "path": "benchmark/swebench-act-context/population.json",
@@ -20,8 +20,8 @@
     },
     {
       "path": "benchmark/swebench-act-context/protocol.json",
-      "bytes": 24877,
-      "sha256": "ad8d40e833a0601651998ff2902bd58eb36fdc1dffa3111518fef8c88dd98a79"
+      "bytes": 26428,
+      "sha256": "a6a590c14811dfb2616c4557753aa3bddb61ed02f90fe90ea10361e7e1c6fa63"
     },
     {
       "path": "benchmark/swebench-act-context/runtime-config.json",
@@ -40,14 +40,14 @@
     },
     {
       "path": "scripts/tests/test_swebench_act_context_protocol.py",
-      "bytes": 9517,
-      "sha256": "58a8ad3016781952860fdeeb6c72cbcfb36cb4df72f52f220da65902b770d88f"
+      "bytes": 12349,
+      "sha256": "9fc30c88496f745060e4b3da2b308114ff07bdd15f0ee9e25bd68a01e1930bf8"
     },
     {
       "path": "scripts/validate_swebench_act_context_protocol.py",
-      "bytes": 22614,
-      "sha256": "f08bc8cb6ed1625c6024064e4d9d2b1509acbf3186809edc54bb16bab5a57a63"
+      "bytes": 31892,
+      "sha256": "73ada401b55ea78b3360665862152c9fd60bda9123ebaf6b66e8fc7526c80e88"
     }
   ],
-  "bundle_sha256": "a015cfea7967f223f75e496175bc05ab5e732d1057decc1b4102f8e1672a7a86"
+  "bundle_sha256": "db21e71b81ebe26cb10bb9072397421a957793958b10d83f5d478677c3d05a1a"
 }

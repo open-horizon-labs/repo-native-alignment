@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "validate_swebench_act_context_protocol.py"
 SPEC = importlib.util.spec_from_file_location("validate_swebench_act_context_protocol", SCRIPT)
@@ -36,6 +37,19 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         cls.population = VALIDATOR.load_json(ROOT / VALIDATOR.POPULATION_REL)
         cls.runtime = VALIDATOR.load_json(ROOT / VALIDATOR.RUNTIME_REL)
         cls.vector = VALIDATOR.load_json(ROOT / VALIDATOR.VECTOR_REL)
+
+    @staticmethod
+    def copy_locked_bundle(destination_root: Path) -> None:
+        lock = VALIDATOR.load_json(ROOT / VALIDATOR.LOCK_REL)
+        for entry in lock["files"]:
+            rel = Path(entry["path"])
+            destination = destination_root / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / rel, destination)
+        for rel in (VALIDATOR.LOCK_REL, VALIDATOR.DIGEST_REL):
+            destination = destination_root / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / rel, destination)
 
     def test_frozen_bundle_is_compatible(self) -> None:
         result = VALIDATOR.validate_bundle(ROOT)
@@ -134,8 +148,31 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "authorized-runtime.json"
             path.write_text(json.dumps(runtime), encoding="utf-8")
-            result = VALIDATOR.validate_bundle(ROOT, runtime_config=path)
+            digest = (ROOT / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+            result = VALIDATOR.validate_bundle(
+                ROOT,
+                expected_digest=digest,
+                runtime_config=path,
+            )
         self.assertTrue(result["paid_calls_authorized"])
+
+    def test_separate_authorized_runtime_requires_external_digest(self) -> None:
+        runtime = copy.deepcopy(self.runtime)
+        runtime.update(
+            {
+                "paid_calls_authorized": True,
+                "qualified_artifact_receipt": "qualification:sha256:abc123",
+                "approved_budget_receipt": "budget:approval:782",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "unanchored-runtime.json"
+            path.write_text(json.dumps(runtime), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "paid authorization requires an externally anchored bundle digest",
+            ):
+                VALIDATOR.validate_bundle(ROOT, runtime_config=path)
 
     def test_separate_runtime_config_cannot_drift_model(self) -> None:
         runtime = copy.deepcopy(self.runtime)
@@ -167,7 +204,16 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
         c_packet = VALIDATOR.assemble_packet_vector(self.vector, "C")
         self.assertNotEqual(b_packet, c_packet)
         self.assertIn(b"def target():\n    return 1\n", c_packet)
-        self.assertNotIn(b"long_name", c_packet)
+        self.assertIn(b"def helper(long_name):\n    mvb = long_name + 1", c_packet)
+        self.assertIn(b"# mvb=accumulated_value", c_packet)
+        self.assertIn(b'"full_body_byte_length":182', c_packet)
+
+    def test_packet_relationship_order_is_frozen(self) -> None:
+        vector = copy.deepcopy(self.vector)
+        vector["records"][1]["header"]["relationships"].reverse()
+        errors: list[str] = []
+        VALIDATOR.validate_packet_vector(vector, errors)
+        self.assertIn("packet record 2 relationship order drift", errors)
 
     def test_vendored_parser_ignores_reasoning_and_requires_unique_search(self) -> None:
         response = "reasoning first\n*** FILE: a/example.py\n*** SEARCH\nvalue = 1\n*** REPLACE\nvalue = 2\n*** END\ntrailing prose"
@@ -187,21 +233,33 @@ class SwebenchActContextProtocolTests(unittest.TestCase):
                 VALIDATOR.load_json(path)
 
     def test_locked_file_tamper_fails_closed(self) -> None:
-        lock = VALIDATOR.load_json(ROOT / VALIDATOR.LOCK_REL)
         with tempfile.TemporaryDirectory() as temporary:
             copied_root = Path(temporary)
-            for entry in lock["files"]:
-                rel = Path(entry["path"])
-                destination = copied_root / rel
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(ROOT / rel, destination)
-            for rel in (VALIDATOR.LOCK_REL, VALIDATOR.DIGEST_REL):
-                destination = copied_root / rel
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(ROOT / rel, destination)
+            self.copy_locked_bundle(copied_root)
             protocol_path = copied_root / VALIDATOR.PROTOCOL_REL
             protocol_path.write_text(protocol_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "digest drift"):
+                VALIDATOR.validate_bundle(copied_root)
+
+    def test_lock_manifest_credential_metadata_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied_root = Path(temporary)
+            self.copy_locked_bundle(copied_root)
+            lock_path = copied_root / VALIDATOR.LOCK_REL
+            lock = VALIDATOR.load_json(lock_path)
+            lock["note"] = "sk-" + "ant-" + "not-lock-metadata"
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            digest = (copied_root / VALIDATOR.DIGEST_REL).read_text(encoding="ascii").strip()
+            with self.assertRaisesRegex(ValueError, "credential-shaped value in lock manifest"):
+                VALIDATOR.validate_bundle(copied_root, expected_digest=digest)
+
+    def test_unlisted_bundle_file_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied_root = Path(temporary)
+            self.copy_locked_bundle(copied_root)
+            extra = copied_root / "benchmark/swebench-act-context/unlisted.txt"
+            extra.write_text("unexpected", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "bundle file inventory drift"):
                 VALIDATOR.validate_bundle(copied_root)
 
 

@@ -26,7 +26,61 @@ LOCK_REL = Path("benchmark/swebench-act-context/protocol.lock.json")
 DIGEST_REL = Path("benchmark/swebench-act-context/protocol.sha256")
 PARSER_REL = Path("benchmark/swebench-act-context/upstream/edit_patch_v2.py")
 
-EXPECTED_PROTOCOL_SHA256 = "ad8d40e833a0601651998ff2902bd58eb36fdc1dffa3111518fef8c88dd98a79"
+EXPECTED_LOCK_PATHS = (
+    "benchmark/swebench-act-context/README.md",
+    "benchmark/swebench-act-context/packet-vector.json",
+    "benchmark/swebench-act-context/population.json",
+    "benchmark/swebench-act-context/protocol.json",
+    "benchmark/swebench-act-context/runtime-config.json",
+    "benchmark/swebench-act-context/upstream/LICENSE",
+    "benchmark/swebench-act-context/upstream/edit_patch_v2.py",
+    "scripts/tests/test_swebench_act_context_protocol.py",
+    "scripts/validate_swebench_act_context_protocol.py",
+)
+LOCK_MATERIAL_FORMAT = "<sha256> <byte-count> <repo-relative-path> LF, sorted by path"
+PACKET_METADATA_FIELDS = ("instance_id", "protocol_id", "record_count")
+PACKET_HEADER_FIELDS = (
+    "kind",
+    "ordinal",
+    "stable_id",
+    "path",
+    "start_line",
+    "end_line",
+    "language",
+    "full_body_byte_length",
+    "full_body_sha256",
+    "score",
+    "relationships",
+)
+PACKET_RELATIONSHIP_FIELDS = (
+    "source",
+    "target",
+    "edge_type",
+    "direction",
+    "locus_ordinal",
+    "cli_ordinal",
+)
+DIRECTION_ORDINAL = {"incoming": 1, "outgoing": 2}
+EDGE_TYPE_ORDINAL = {
+    name: ordinal
+    for ordinal, name in enumerate(
+        (
+            "Calls",
+            "ReferencedBy",
+            "Imports",
+            "DependsOn",
+            "Implements",
+            "Extends",
+            "Defines",
+            "Contains",
+            "Tests",
+            "Other",
+        ),
+        1,
+    )
+}
+
+EXPECTED_PROTOCOL_SHA256 = "a6a590c14811dfb2616c4557753aa3bddb61ed02f90fe90ea10361e7e1c6fa63"
 EXPECTED_POPULATION_SHA256 = "067a5589b4cdb34c5fbd81bb6ff7ff6ede4dbfc26694758fafbef3544f9e6acf"
 EXPECTED_PARSER_SHA256 = "68b44b5b39ff7fbf3e7417b4f16f0c37513a4cd7a96be8ba00611c825f462c2e"
 EXPECTED_UPSTREAM_COMMIT = "fd115351d0ab742993aa5d7006f1369fb15b6e74"
@@ -35,7 +89,9 @@ EXPECTED_EXCLUSION = "astropy__astropy-8707"
 ORDER_SEED = "rna-act-context-bc-order-v1"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-SECRET_VALUE = re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}")
+SECRET_VALUE = re.compile(
+    r"(?:sk-ant-[A-Za-z0-9_-]{8,}|(?:org|acct|account|workspace|wrkspc)_[A-Za-z0-9_-]{8,})"
+)
 
 
 class DuplicateKey(ValueError):
@@ -144,6 +200,35 @@ def validate_protocol(protocol: dict[str, Any], errors: list[str]) -> None:
     _require(errors, arms.get("A", {}).get("resolved") == 19, "A outcome total drift")
     _require(errors, protocol.get("rna_acquisition", {}).get("access") == "CLI only; MCP is forbidden", "RNA access must remain CLI-only")
     _require(errors, protocol.get("rna_acquisition", {}).get("business_context", "").startswith("disabled;"), "business context must remain disabled")
+
+    packet = protocol.get("packet_serialization", {})
+    _require(
+        errors,
+        packet.get("metadata_schema", {}).get("exact_fields") == list(PACKET_METADATA_FIELDS),
+        "packet metadata schema drift",
+    )
+    _require(
+        errors,
+        packet.get("header_schema", {}).get("base_exact_fields") == list(PACKET_HEADER_FIELDS),
+        "packet header schema drift",
+    )
+    _require(
+        errors,
+        packet.get("relationship_schema", {}).get("exact_fields")
+        == list(PACKET_RELATIONSHIP_FIELDS),
+        "packet relationship schema drift",
+    )
+    _require(
+        errors,
+        "locus_ordinal" in packet.get("relationship_schema", {}).get("ordering", ""),
+        "packet relationship ordering drift",
+    )
+    _require(
+        errors,
+        "final line of the same payload"
+        in protocol.get("definitions", {}).get("minified_body", ""),
+        "minifier legend framing drift",
+    )
 
     h1 = protocol.get("hypotheses", {}).get("H1", {})
     _require(errors, "at least 40% fewer" in h1.get("claim", ""), "H1 efficiency threshold drift")
@@ -336,7 +421,91 @@ def assemble_packet_vector(vector: dict[str, Any], arm: str) -> bytes:
     return bytes(output)
 
 
+def _relationship_sort_key(relationship: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        relationship.get("locus_ordinal"),
+        DIRECTION_ORDINAL.get(relationship.get("direction"), 99),
+        relationship.get("cli_ordinal"),
+        EDGE_TYPE_ORDINAL.get(relationship.get("edge_type"), 99),
+        str(relationship.get("source", "")).encode("utf-8"),
+        str(relationship.get("target", "")).encode("utf-8"),
+    )
+
+
 def validate_packet_vector(vector: dict[str, Any], errors: list[str]) -> None:
+    initial_error_count = len(errors)
+    _require(errors, vector.get("schema_version") == 1, "packet vector schema_version drift")
+    _require(
+        errors,
+        set(vector)
+        == {"schema_version", "metadata", "records", "expected_b_sha256", "expected_c_sha256"},
+        "packet vector field set drift",
+    )
+    metadata = vector.get("metadata", {})
+    _require(errors, isinstance(metadata, dict), "packet metadata must be an object")
+    if isinstance(metadata, dict):
+        _require(errors, set(metadata) == set(PACKET_METADATA_FIELDS), "packet metadata field set drift")
+        _require(errors, metadata.get("protocol_id") == "rna-act-context-swebench-v1", "packet protocol_id drift")
+    records = vector.get("records", [])
+    _require(errors, isinstance(records, list) and bool(records), "packet vector records must be non-empty")
+    if not isinstance(records, list):
+        return
+    if isinstance(metadata, dict):
+        _require(errors, metadata.get("record_count") == len(records), "packet record_count drift")
+    for ordinal, source in enumerate(records, 1):
+        _require(errors, isinstance(source, dict), f"packet record {ordinal} must be an object")
+        if not isinstance(source, dict):
+            continue
+        _require(
+            errors,
+            set(source) == {"kind", "header", "full_payload", "minified_payload"},
+            f"packet record {ordinal} field set drift",
+        )
+        header = source.get("header", {})
+        _require(errors, isinstance(header, dict), f"packet record {ordinal} header must be an object")
+        if not isinstance(header, dict):
+            continue
+        _require(errors, set(header) == set(PACKET_HEADER_FIELDS), f"packet record {ordinal} header field set drift")
+        _require(errors, header.get("ordinal") == ordinal, f"packet record {ordinal} ordinal drift")
+        _require(errors, header.get("kind") == source.get("kind"), f"packet record {ordinal} kind drift")
+        full_payload = source.get("full_payload")
+        minified_payload = source.get("minified_payload")
+        _require(errors, isinstance(full_payload, str), f"packet record {ordinal} full payload must be text")
+        _require(errors, isinstance(minified_payload, str), f"packet record {ordinal} minified payload must be text")
+        if isinstance(full_payload, str):
+            full_bytes = full_payload.encode("utf-8")
+            _require(errors, header.get("full_body_byte_length") == len(full_bytes), f"packet record {ordinal} full-body length drift")
+            _require(errors, header.get("full_body_sha256") == sha256_bytes(full_bytes), f"packet record {ordinal} full-body digest drift")
+        if source.get("kind") == "locus":
+            _require(errors, minified_payload == full_payload, f"packet locus {ordinal} must remain verbatim")
+        elif isinstance(full_payload, str) and isinstance(minified_payload, str):
+            _require(errors, bool(minified_payload), f"packet candidate {ordinal} minified payload is empty")
+            _require(errors, len(minified_payload.encode("utf-8")) <= len(full_payload.encode("utf-8")), f"packet candidate {ordinal} minified payload grew")
+            _require(
+                errors,
+                "\n# mvb=accumulated_value" in minified_payload,
+                "C packet vector must include the minifier legend",
+            )
+        relationships = header.get("relationships", [])
+        _require(errors, isinstance(relationships, list), f"packet record {ordinal} relationships must be a list")
+        if isinstance(relationships, list):
+            for relationship in relationships:
+                _require(
+                    errors,
+                    isinstance(relationship, dict)
+                    and set(relationship) == set(PACKET_RELATIONSHIP_FIELDS),
+                    f"packet record {ordinal} relationship field set drift",
+                )
+            if all(isinstance(relationship, dict) for relationship in relationships):
+                _require(
+                    errors,
+                    relationships == sorted(relationships, key=_relationship_sort_key),
+                    f"packet record {ordinal} relationship order drift",
+                )
+                tuples = [tuple(relationship[field] for field in PACKET_RELATIONSHIP_FIELDS) for relationship in relationships]
+                _require(errors, len(tuples) == len(set(tuples)), f"packet record {ordinal} duplicate relationship")
+    if len(errors) != initial_error_count:
+        return
     b_packet = assemble_packet_vector(vector, "B")
     c_packet = assemble_packet_vector(vector, "C")
     _require(errors, sha256_bytes(b_packet) == vector.get("expected_b_sha256"), "B packet test-vector digest drift")
@@ -351,17 +520,34 @@ def _lock_material(entries: list[dict[str, Any]]) -> bytes:
 
 
 def validate_lock(root: Path, errors: list[str]) -> str | None:
-    lock = load_json(root / LOCK_REL)
+    lock_path = root / LOCK_REL
+    lock_bytes = lock_path.read_bytes()
+    if SECRET_VALUE.search(lock_bytes.decode("utf-8", errors="ignore")):
+        errors.append("credential-shaped value in lock manifest")
+    lock = load_json(lock_path)
     entries = lock.get("files", [])
+    _require(
+        errors,
+        set(lock) == {"schema_version", "algorithm", "material_format", "files", "bundle_sha256"},
+        "lock field set drift",
+    )
     _require(errors, lock.get("schema_version") == 1, "lock schema_version must be 1")
     _require(errors, lock.get("algorithm") == "sha256", "lock algorithm drift")
+    _require(errors, lock.get("material_format") == LOCK_MATERIAL_FORMAT, "lock material format drift")
     _require(errors, isinstance(entries, list) and bool(entries), "lock must contain files")
     if not isinstance(entries, list):
         return None
-    paths = [entry.get("path") for entry in entries]
+    paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
     _require(errors, paths == sorted(paths), "lock paths must be sorted")
     _require(errors, len(paths) == len(set(paths)), "lock paths must be unique")
+    _require(errors, paths == list(EXPECTED_LOCK_PATHS), "lock path set drift")
     for entry in entries:
+        _require(errors, isinstance(entry, dict), "lock file entry must be an object")
+        if not isinstance(entry, dict):
+            continue
+        _require(errors, set(entry) == {"path", "bytes", "sha256"}, f"lock entry field set drift: {entry.get('path')}")
+        _require(errors, isinstance(entry.get("bytes"), int) and entry["bytes"] >= 0, f"invalid lock byte length: {entry.get('path')}")
+        _require(errors, bool(HEX64.fullmatch(str(entry.get("sha256", "")))), f"invalid lock digest: {entry.get('path')}")
         rel = Path(entry.get("path", ""))
         _require(errors, not rel.is_absolute() and ".." not in rel.parts, f"unsafe lock path: {rel}")
         path = root / rel
@@ -373,6 +559,20 @@ def validate_lock(root: Path, errors: list[str]) -> str | None:
         _require(errors, sha256_bytes(data) == entry.get("sha256"), f"digest drift: {rel}")
         if SECRET_VALUE.search(data.decode("utf-8", errors="ignore")):
             errors.append(f"credential-shaped value in locked file: {rel}")
+    bundle_root = root / "benchmark/swebench-act-context"
+    actual_bundle_paths = {
+        path.relative_to(root).as_posix()
+        for path in bundle_root.rglob("*")
+        if path.is_file()
+    }
+    expected_bundle_paths = {
+        path for path in EXPECTED_LOCK_PATHS if path.startswith("benchmark/swebench-act-context/")
+    } | {LOCK_REL.as_posix(), DIGEST_REL.as_posix()}
+    _require(
+        errors,
+        actual_bundle_paths == expected_bundle_paths,
+        "bundle file inventory drift",
+    )
     digest = sha256_bytes(_lock_material(entries))
     _require(errors, digest == lock.get("bundle_sha256"), "bundle digest mismatch in lock")
     digest_file = (root / DIGEST_REL).read_text(encoding="ascii").strip()
@@ -404,6 +604,12 @@ def validate_bundle(
     if runtime_config is not None:
         runtime = load_json(runtime_config)
         validate_runtime(runtime, errors, allow_authorized=True)
+    if runtime.get("paid_calls_authorized") is True:
+        _require(
+            errors,
+            expected_digest is not None,
+            "paid authorization requires an externally anchored bundle digest",
+        )
     validate_packet_vector(vector, errors)
     bundle_digest = validate_lock(root, errors)
     if expected_digest is not None:

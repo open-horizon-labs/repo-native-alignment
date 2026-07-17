@@ -16,6 +16,7 @@
         "start_line": 1,
         "end_line": 2,
         "language": "Python",
+        "full_body_byte_length": 27,
         "full_body_sha256": "e90074bde6f68906b18cd2dd68cec01eb01d6b35cfa5264896405a14cf650435",
         "score": null,
         "relationships": []
@@ -31,15 +32,24 @@
         "stable_id": "src/helper.py:helper:function",
         "path": "src/helper.py",
         "start_line": 4,
-        "end_line": 6,
+        "end_line": 8,
         "language": "Python",
-        "full_body_sha256": "9a9133fa463119b3ad8485e185c74ef39a1035bd5223a9999ea26b654cc09b4d",
+        "full_body_byte_length": 182,
+        "full_body_sha256": "b4822456be25088b7bae98323a799fdd9f1cf87c1e6d845e3df14400a74bdc75",
         "score": {
           "semantic_component": 999000000,
           "graph_component": 98989,
           "total": 999098989
         },
         "relationships": [
+          {
+            "source": "src/helper.py:helper:function",
+            "target": "src/example.py:target:function",
+            "edge_type": "ReferencedBy",
+            "direction": "incoming",
+            "locus_ordinal": 1,
+            "cli_ordinal": 1
+          },
           {
             "source": "src/example.py:target:function",
             "target": "src/helper.py:helper:function",
@@ -50,10 +60,10 @@
           }
         ]
       },
-      "full_payload": "def helper(long_name):\n    value = long_name + 1\n    return value\n",
-      "minified_payload": "def helper(a):\n b=a+1\n return b\n"
+      "full_payload": "def helper(long_name):\n    accumulated_value = long_name + 1\n    accumulated_value = accumulated_value * 2\n    accumulated_value = accumulated_value - 3\n    return accumulated_value\n",
+      "minified_payload": "def helper(long_name):\n    mvb = long_name + 1\n    mvb = mvb * 2\n    mvb = mvb - 3\n    return mvb\n# mvb=accumulated_value"
     }
   ],
-  "expected_b_sha256": "5c0de7bfd2bc9d10a9a5f18e6252963f86281d1e57eb08e9bc8892ed38b31713",
-  "expected_c_sha256": "b96bea9a39c8b0e5eea842ed69e075a56a18a8919df3158ef22bc2f3710cc484"
+  "expected_b_sha256": "80a0641fec3ed4cc5b883f5ea087635e0558db017673784e60a70bdd7166d6a3",
+  "expected_c_sha256": "863fbc26b917b65783039fef3225f46f844a0692acb629a3ca8ec0565cb4020e"
 }

@@ -216,7 +216,50 @@
     "encoding": "raw UTF-8 bytes",
     "container": "RNA_PACKET_V1 length-prefixed records",
     "preamble": "RNA_PACKET_V1\\n followed by canonical JSON acquisition metadata and LF",
-    "record": "canonical JSON header with record kind, ordinal, stable ID, path, span, language, full-body byte length/digest, score components, and relationships; LF; exactly byte_length payload bytes; LF",
+    "metadata_schema": {
+      "exact_fields": [
+        "instance_id",
+        "protocol_id",
+        "record_count"
+      ],
+      "instance_id": "exact dataset instance_id string",
+      "protocol_id": "exact constant rna-act-context-swebench-v1",
+      "record_count": "integer count of serialized records"
+    },
+    "header_schema": {
+      "base_exact_fields": [
+        "kind",
+        "ordinal",
+        "stable_id",
+        "path",
+        "start_line",
+        "end_line",
+        "language",
+        "full_body_byte_length",
+        "full_body_sha256",
+        "score",
+        "relationships"
+      ],
+      "derived_exact_fields": [
+        "payload_representation",
+        "payload_byte_length",
+        "payload_sha256"
+      ],
+      "derivation": "copy the base header, then add exactly the three derived fields for the selected payload before canonical serialization"
+    },
+    "relationship_schema": {
+      "exact_fields": [
+        "source",
+        "target",
+        "edge_type",
+        "direction",
+        "locus_ordinal",
+        "cli_ordinal"
+      ],
+      "deduplication": "deduplicate the exact six-field tuple, retaining its first acquisition occurrence",
+      "ordering": "ascending by locus_ordinal, direction ordinal in the frozen traversal directions list, cli_ordinal, edge-type ordinal in the frozen edge_type_order list, UTF-8 source bytes, then UTF-8 target bytes"
+    },
+    "record": "canonical JSON base header plus derived payload fields; LF; exactly payload_byte_length payload bytes; LF",
     "canonical_json": "UTF-8 JSON with keys sorted lexicographically, separators comma/colon, ensure_ascii=false, and no insignificant whitespace",
     "line_endings": "payload line endings are preserved exactly; framing uses LF",
     "ordering": "all loci in locus order, then selected non-locus candidates in score order",
@@ -244,13 +287,13 @@
       "C#"
     ],
     "implementation": "qualified RNA structural minify_body from the exact #786 artifact; text fallback is forbidden",
-    "verification": "minify the sealed B payload independently, require deterministic byte equality on repetition, parse success, and full-to-minified source map/legend; any failure stops the instance before model access"
+    "verification": "minify the sealed B payload independently, require deterministic byte equality on repetition, parse success, and the deterministic full-to-minified legend as the final payload line when identifiers are renamed; the legend bytes are part of payload length and digest; any failure stops the instance before model access"
   },
   "definitions": {
     "locus": "a byte-faithful oracle-surface record defined above; never minified",
     "non_locus": "an eligible source span with zero byte overlap with every locus",
     "full_body": "the exact complete UTF-8 source bytes for one selected node span, with original line endings and no truncation",
-    "minified_body": "the deterministic qualified structural-minifier output for one eligible full body plus its source-map legend",
+    "minified_body": "the exact UTF-8 bytes returned by the qualified structural minify_body implementation; when identifiers are renamed its deterministic source-map legend is the final line of the same payload, not a separate frame",
     "candidate": "one deduplicated stable RNA node admitted to scoring before budget selection",
     "traversal_edge": "one sealed directed typed relationship returned by the pinned one-hop CLI traversal",
     "truncation": "any removal of bytes from an included issue, locus, prompt, or selected body; forbidden; budget omission is not truncation and is recorded",

@@ -61,9 +61,10 @@ python3 scripts/validate_swebench_act_context_protocol.py \
 The separate run config must preserve every frozen field. Setting
 `paid_calls_authorized` to true is accepted only when both
 `qualified_artifact_receipt` and `approved_budget_receipt` are non-empty; the
-committed template can never authorize paid calls. Any nonzero result stops
-before the API key is read. The validator performs no network, subprocess,
-model, evaluator, or credential access.
+committed template can never authorize paid calls, and an authorized external
+config is rejected unless `--expected-digest` matches the externally anchored
+bundle. Any nonzero result stops before the API key is read. The validator
+performs no network, subprocess, model, evaluator, or credential access.
 
 ## A compatibility boundary
 
