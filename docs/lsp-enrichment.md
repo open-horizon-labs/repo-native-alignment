@@ -89,7 +89,9 @@ For a benchmark checkout, use the stricter persisted per-file gate after a full 
 repo-native-alignment --business-context disabled lsp-readiness --repo /path/to/checkout --json
 ```
 
-The command exits `0` only when the report matches the current checkout, graph schema, configuration, inventory policy, and durable LSP generation and every included file has complete evidence. Missing servers, unsupported relevant extensions, skipped or unfinished work, stale reports, and emitted LSP results absent from the persisted graph block with a nonzero exit. Repeating `--aggregate-report` with `--aggregate-output` produces the deterministic no-spend cohort manifest; the aggregate also rejects duplicate checkout identities and defaults to requiring exactly 70 ready reports.
+The command exits `0` only when the report matches the current checkout, persisted graph, installed server binaries, configuration, inventory policy, and durable LSP job generation and every included file has complete evidence. Missing servers, unsupported relevant extensions, skipped or unfinished work, stale reports, and emitted LSP results absent from the persisted graph block with a nonzero exit.
+
+For the cohort gate, pass `--cohort-manifest frozen-cohort.json --aggregate-output aggregate.json`. The manifest binds each report path to its frozen `instance_id`, repository, and exact base commit. The fixed gate requires exactly 70 distinct instances; callers cannot lower that threshold.
 
 ## Type Hierarchy Enrichment
 

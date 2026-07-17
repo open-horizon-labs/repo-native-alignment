@@ -199,6 +199,11 @@ try {
     assertContains("search returns code symbol entry", searchSymText, "main");
     pass("search('main') returned results");
   }
+  assertContains(
+    "MCP search delivers per-file LSP completeness readiness",
+    searchSymText,
+    "benchmark per-file LSP completeness",
+  );
 
   // ── 4a. persisted local-knowledge provenance ────────────────────────────
   console.log("\n── search (local-knowledge provenance) ──");

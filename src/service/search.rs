@@ -560,15 +560,21 @@ fn format_verbose_readiness(
             semantic_index_attached,
             semantic_index_available,
         ),
-        format_lsp_completeness(ctx.repo_root),
+        format_lsp_completeness(ctx.repo_root, &gs.nodes, &gs.edges),
         format_enrichment_jobs(ctx),
     )
 }
 
-fn format_lsp_completeness(repo_root: &Path) -> String {
-    match crate::lsp_completeness::load_readiness_check(
+fn format_lsp_completeness(
+    repo_root: &Path,
+    nodes: &[crate::graph::Node],
+    edges: &[crate::graph::Edge],
+) -> String {
+    match crate::lsp_completeness::load_readiness_check_with_graph(
         repo_root,
         crate::business_context::BusinessContextMode::Disabled,
+        nodes,
+        edges,
     ) {
         Ok(check) => {
             let blocked_paths = check
@@ -577,14 +583,18 @@ fn format_lsp_completeness(repo_root: &Path) -> String {
                 .iter()
                 .filter_map(|violation| violation.path.as_deref())
                 .collect::<std::collections::BTreeSet<_>>();
-            let covered = check
+            let covered = if check.compatibility_violations.is_empty() {
+                check
                 .report
                 .files
                 .iter()
                 .filter(|file| {
                     file.role.is_included() && !blocked_paths.contains(file.path.as_str())
                 })
-                .count();
+                .count()
+            } else {
+                0
+            };
             format!(
                 "\n- **benchmark per-file LSP completeness**: {} — {}/{} included files covered; {} violation(s); digest={}",
                 if check.ready { "ready" } else { "partial/degraded" },
@@ -6087,9 +6097,9 @@ mod tests {
             }],
         );
         crate::lsp_completeness::persist_report(repo.path(), &report).unwrap();
-        let rendered = format_lsp_completeness(repo.path());
-        assert!(rendered.contains("benchmark per-file LSP completeness**: ready"));
+        let rendered = format_lsp_completeness(repo.path(), &[], &[]);
+        assert!(rendered.contains("benchmark per-file LSP completeness**: partial/degraded"));
         assert!(rendered.contains(&report.digest));
-        assert!(rendered.contains("1/1 included files covered"));
+        assert!(rendered.contains("0/1 included files covered"));
     }
 }

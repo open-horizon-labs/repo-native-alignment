@@ -15,11 +15,18 @@ use std::time::{Duration, Instant};
 
 use crate::business_context::BusinessContextMode;
 use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemState};
-use crate::extract::scan_stats::{LspEnrichmentEntry, LspStatus, LspValidationStatus};
+use crate::extract::scan_stats::{
+    LspEnrichmentEntry, LspStatus, LspValidationEvidence, LspValidationStatus,
+};
 use crate::graph::{Edge, EdgeKind, ExtractionSource, Node};
+use crate::server::{
+    EnrichmentCapability, EnrichmentJobLedger, EnrichmentJobRecord, EnrichmentJobState,
+    LspEvidenceReadiness,
+};
 
 pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 1;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
+pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -656,7 +663,7 @@ pub fn normalize_repo_relative_path(path: &str) -> Result<String, String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AggregateCounts {
     pub checkouts: u64,
-    pub unique_checkouts: u64,
+    pub unique_instances: u64,
     pub ready_checkouts: u64,
     pub files: u64,
     #[serde(default)]
@@ -669,6 +676,9 @@ pub struct AggregateCounts {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AggregateCheckout {
+    pub instance_id: String,
+    pub repository: String,
+    pub base_commit: String,
     pub checkout_sha: String,
     pub report_digest: String,
     pub ready: bool,
@@ -684,18 +694,33 @@ pub struct AggregateCompletenessReport {
     pub digest: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FrozenCohortCase {
+    pub instance_id: String,
+    pub repository: String,
+    pub base_commit: String,
+    pub report_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenCohortManifest {
+    pub schema_version: u32,
+    pub cases: Vec<FrozenCohortCase>,
+}
+
 impl AggregateCompletenessReport {
-    pub fn from_reports(reports: &[LspCompletenessReport]) -> Self {
-        let mut checkouts = Vec::with_capacity(reports.len());
+    pub fn from_frozen_cases(cases: &[(FrozenCohortCase, LspCompletenessReport)]) -> Self {
+        let mut checkouts = Vec::with_capacity(cases.len());
         let mut counts = AggregateCounts {
-            checkouts: reports.len() as u64,
+            checkouts: cases.len() as u64,
             ..AggregateCounts::default()
         };
 
-        for report in reports {
+        for (case, report) in cases {
             let ready = report.is_ready()
                 && report.integrity_violations().is_empty()
-                && report.identity.context_mode == "disabled";
+                && report.identity.context_mode == "disabled"
+                && report.identity.checkout_sha == case.base_commit;
             if ready {
                 counts.ready_checkouts += 1;
             }
@@ -704,6 +729,9 @@ impl AggregateCompletenessReport {
             merge_counts(&mut counts.by_role, &report.summary.by_role);
             merge_counts(&mut counts.by_status, &report.summary.by_status);
             checkouts.push(AggregateCheckout {
+                instance_id: case.instance_id.clone(),
+                repository: case.repository.clone(),
+                base_commit: case.base_commit.clone(),
                 checkout_sha: report.identity.checkout_sha.clone(),
                 report_digest: report.digest.clone(),
                 ready,
@@ -712,9 +740,9 @@ impl AggregateCompletenessReport {
             });
         }
         checkouts.sort();
-        counts.unique_checkouts = checkouts
+        counts.unique_instances = checkouts
             .iter()
-            .map(|checkout| checkout.checkout_sha.as_str())
+            .map(|checkout| checkout.instance_id.as_str())
             .collect::<BTreeSet<_>>()
             .len() as u64;
 
@@ -744,12 +772,45 @@ impl AggregateCompletenessReport {
         blake3::hash(&bytes).to_hex().to_string()
     }
 
-    pub fn is_ready(&self, required_checkouts: u64) -> bool {
-        self.counts.checkouts == required_checkouts
-            && self.counts.unique_checkouts == required_checkouts
-            && self.counts.ready_checkouts == required_checkouts
+    pub fn is_ready(&self) -> bool {
+        self.counts.checkouts == FROZEN_SWEBENCH_COHORT_SIZE
+            && self.counts.unique_instances == FROZEN_SWEBENCH_COHORT_SIZE
+            && self.counts.ready_checkouts == FROZEN_SWEBENCH_COHORT_SIZE
             && self.checkouts.iter().all(|checkout| checkout.ready)
     }
+}
+
+pub fn load_frozen_cohort_aggregate(path: &Path) -> Result<AggregateCompletenessReport> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read frozen cohort manifest {}", path.display()))?;
+    let mut manifest: FrozenCohortManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid frozen cohort manifest {}", path.display()))?;
+    if manifest.schema_version != LSP_COMPLETENESS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "frozen cohort schema {} does not match {}",
+            manifest.schema_version,
+            LSP_COMPLETENESS_SCHEMA_VERSION
+        );
+    }
+    manifest.cases.sort();
+    let base = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let cases = manifest
+        .cases
+        .into_iter()
+        .map(|case| {
+            let report_path = if case.report_path.is_absolute() {
+                case.report_path.clone()
+            } else {
+                base.join(&case.report_path)
+            };
+            let report = load_report_path(&report_path)?;
+            Ok((case, report))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AggregateCompletenessReport::from_frozen_cases(&cases))
 }
 
 fn merge_counts(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, u64>) {
@@ -802,12 +863,30 @@ pub fn build_and_persist_report(
     nodes: &[Node],
     edges: &[Edge],
     lsp_entries: &[LspEnrichmentEntry],
+    related_job_ids: &[String],
     scan_started_at_ms: u64,
 ) -> Result<LspCompletenessReport> {
     let work_items =
         crate::extract::lsp::work_items::load_records_since(repo_root, scan_started_at_ms)?;
+    let related_ids = related_job_ids.iter().collect::<BTreeSet<_>>();
+    let jobs = EnrichmentJobLedger::default()
+        .all_jobs(repo_root)
+        .into_iter()
+        .filter(|job| {
+            related_ids.contains(&job.job_id)
+                && job.capability == EnrichmentCapability::CallReferences
+        })
+        .collect::<Vec<_>>();
     let identity = current_report_identity(repo_root, context_mode)?;
-    let report = build_report(repo_root, identity, nodes, edges, lsp_entries, &work_items)?;
+    let report = build_report(
+        repo_root,
+        identity,
+        nodes,
+        edges,
+        lsp_entries,
+        &work_items,
+        &jobs,
+    )?;
     persist_report(repo_root, &report)?;
     Ok(report)
 }
@@ -819,6 +898,28 @@ pub fn load_readiness_check(
     let report = load_report(repo_root)?;
     let expected = current_report_identity(repo_root, context_mode)?;
     Ok(ReadinessCheck::from_report(report, &expected))
+}
+
+/// Reload a persisted report against the exact graph snapshot and installed
+/// server binaries that will be delivered to the caller.
+pub fn load_readiness_check_with_graph(
+    repo_root: &Path,
+    context_mode: BusinessContextMode,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<ReadinessCheck> {
+    let mut check = load_readiness_check(repo_root, context_mode)?;
+    check
+        .compatibility_violations
+        .extend(runtime_compatibility_violations(
+            &check.report,
+            nodes,
+            edges,
+        ));
+    check.compatibility_violations.sort();
+    check.compatibility_violations.dedup();
+    check.ready = check.report.is_ready() && check.compatibility_violations.is_empty();
+    Ok(check)
 }
 
 pub fn report_path(repo_root: &Path) -> PathBuf {
@@ -879,9 +980,7 @@ pub fn persist_aggregate_report(
     path: &Path,
     aggregate: &AggregateCompletenessReport,
 ) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("aggregate LSP completeness path has no parent")?;
+    let parent = aggregate_output_parent(path);
     fs::create_dir_all(parent)?;
     let temp = parent.join(format!(
         ".lsp_completeness_aggregate.json.tmp-{}",
@@ -902,6 +1001,12 @@ pub fn persist_aggregate_report(
         )
     })?;
     Ok(())
+}
+
+fn aggregate_output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 pub fn current_report_identity(
@@ -932,6 +1037,7 @@ fn build_report(
     edges: &[Edge],
     lsp_entries: &[LspEnrichmentEntry],
     work_items: &[LspWorkItemRecord],
+    jobs: &[EnrichmentJobRecord],
 ) -> Result<LspCompletenessReport> {
     let paths = inventory_paths(repo_root)?;
     let extracted_paths = nodes
@@ -1010,9 +1116,10 @@ fn build_report(
             .cloned()
             .unwrap_or_default();
         let records = work_by_path.get(&normalized).cloned().unwrap_or_default();
+        let validations = job_validations_for_language(jobs, descriptor.language());
         let (advertised_capabilities, requests_attempted) =
-            evidence_from_work_items(&records, &language_entries);
-        let persisted_results = persisted_results_for_path(&normalized, edges);
+            evidence_from_work_items(&records, &language_entries, &validations);
+        let persisted_results = persisted_results_for_path(&normalized, nodes, edges);
         let (expected_results, expected_result_ids) = expected_evidence_from_work_items(&records);
         let terminal_status = terminal_status_for_file(
             &normalized,
@@ -1020,6 +1127,8 @@ fn build_report(
             &language_entries,
             extracted_paths.contains(&normalized),
             &server,
+            jobs,
+            &validations,
         );
         files.push(FileCoverageRecord {
             path: normalized,
@@ -1042,8 +1151,10 @@ fn build_report(
 fn evidence_from_work_items(
     records: &[&LspWorkItemRecord],
     language_entries: &[&LspEnrichmentEntry],
+    validations: &[&LspValidationEvidence],
 ) -> (Vec<AdvertisedCapability>, Vec<RequestAttempt>) {
     let mut capabilities = BTreeSet::new();
+    let mut requests = Vec::new();
     for entry in language_entries {
         if let Some(validation) = &entry.validation
             && let Some(method) = validation.method.as_deref()
@@ -1054,7 +1165,25 @@ fn evidence_from_work_items(
             });
         }
     }
-    let mut requests = Vec::new();
+    for validation in validations {
+        if let Some(method) = validation.method.as_deref() {
+            capabilities.insert(AdvertisedCapability {
+                name: method.to_string(),
+                supported: validation.status != LspValidationStatus::NotValidated,
+            });
+            requests.push(RequestAttempt {
+                method: method.to_string(),
+                outcome: if validation.status == LspValidationStatus::NotValidated {
+                    RequestOutcome::Failed
+                } else {
+                    RequestOutcome::Completed
+                },
+                result_count: validation.symbol_count.map(|count| count as u64),
+                duration_ms: None,
+                detail: validation.detail.clone(),
+            });
+        }
+    }
     if !records.is_empty() {
         requests.push(RequestAttempt {
             method: "textDocument/didOpen".to_string(),
@@ -1131,8 +1260,15 @@ fn lsp_method(operation: &str) -> &'static str {
     }
 }
 
-fn persisted_results_for_path(path: &str, edges: &[Edge]) -> PersistedResults {
+fn persisted_results_for_path(path: &str, nodes: &[Node], edges: &[Edge]) -> PersistedResults {
     let mut results = PersistedResults::default();
+    for node in nodes.iter().filter(|node| {
+        node.source == ExtractionSource::Lsp
+            && node.id.file.to_string_lossy().replace('\\', "/") == path
+    }) {
+        results.document_symbols += 1;
+        results.provenance.insert(node.stable_id());
+    }
     for edge in edges
         .iter()
         .filter(|edge| edge.source == ExtractionSource::Lsp)
@@ -1154,6 +1290,62 @@ fn persisted_results_for_path(path: &str, edges: &[Edge]) -> PersistedResults {
     results
 }
 
+fn edge_matches_kind(edge: &Edge, kind: ExpectedResultKind) -> bool {
+    matches!(
+        (&edge.kind, kind),
+        (&EdgeKind::Calls, ExpectedResultKind::CallHierarchy)
+            | (&EdgeKind::ReferencedBy, ExpectedResultKind::Reference)
+            | (&EdgeKind::Implements, ExpectedResultKind::Definition)
+            | (&EdgeKind::DependsOn, ExpectedResultKind::DocumentLink)
+    )
+}
+
+fn job_validations_for_language<'a>(
+    jobs: &'a [EnrichmentJobRecord],
+    language: &str,
+) -> Vec<&'a LspValidationEvidence> {
+    jobs.iter()
+        .filter_map(|job| job.lsp_evidence.as_ref())
+        .flat_map(|evidence| evidence.validations.iter())
+        .filter(|validation| validation.language == language)
+        .collect()
+}
+
+fn runtime_compatibility_violations(
+    report: &LspCompletenessReport,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Vec<ReadinessViolation> {
+    let mut violations = Vec::new();
+    let mut current_servers = BTreeMap::new();
+    for file in report.files.iter().filter(|file| file.role.is_included()) {
+        if let Some(expected) = &file.expected_server {
+            let current = current_servers
+                .entry(expected.name.clone())
+                .or_insert_with(|| probe_server_identity(&expected.name));
+            if current != expected {
+                violations.push(ReadinessViolation {
+                    code: ReadinessViolationCode::IdentityMismatch,
+                    path: Some(file.path.clone()),
+                    detail: format!(
+                        "language server identity changed: report={expected:?}, current={current:?}"
+                    ),
+                });
+            }
+        }
+
+        let persisted = persisted_results_for_path(&file.path, nodes, edges);
+        for missing in file.expected_result_ids.difference(&persisted.provenance) {
+            violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::StaleReport,
+                path: Some(file.path.clone()),
+                detail: format!("persisted graph no longer contains reported LSP result {missing}"),
+            });
+        }
+    }
+    violations
+}
+
 fn expected_evidence_from_work_items(
     records: &[&LspWorkItemRecord],
 ) -> (BTreeSet<ExpectedResultKind>, BTreeSet<String>) {
@@ -1163,10 +1355,11 @@ fn expected_evidence_from_work_items(
         .iter()
         .filter(|record| record.state == LspWorkItemState::Completed)
     {
-        if record.output_edges.is_empty() {
-            continue;
-        }
         expected_ids.extend(record.output_edges.iter().map(Edge::stable_id));
+        expected_ids.extend(record.output_nodes.iter().map(Node::stable_id));
+        if !record.output_nodes.is_empty() {
+            expected.insert(ExpectedResultKind::DocumentSymbol);
+        }
         for operation in &record.requested_operations {
             let kind = match operation.as_str() {
                 "call_hierarchy" => Some(ExpectedResultKind::CallHierarchy),
@@ -1175,7 +1368,12 @@ fn expected_evidence_from_work_items(
                 "document_links" => Some(ExpectedResultKind::DocumentLink),
                 _ => None,
             };
-            if let Some(kind) = kind {
+            if let Some(kind) = kind
+                && record
+                    .output_edges
+                    .iter()
+                    .any(|edge| edge_matches_kind(edge, kind))
+            {
                 expected.insert(kind);
             }
         }
@@ -1189,6 +1387,8 @@ fn terminal_status_for_file(
     language_entries: &[&LspEnrichmentEntry],
     extracted: bool,
     server: &ServerIdentity,
+    jobs: &[EnrichmentJobRecord],
+    validations: &[&LspValidationEvidence],
 ) -> FileTerminalStatus {
     if server.version.is_none() || server.executable_digest.is_none() {
         return FileTerminalStatus::MissingServer {
@@ -1225,6 +1425,51 @@ fn terminal_status_for_file(
     }) {
         return FileTerminalStatus::Degraded {
             detail: "language server never reached validated readiness".to_string(),
+        };
+    }
+    if let Some(job) = jobs
+        .iter()
+        .find(|job| job.state != EnrichmentJobState::Completed)
+    {
+        let detail = job
+            .failure
+            .clone()
+            .or_else(|| {
+                job.lsp_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.detail.clone())
+            })
+            .unwrap_or_else(|| format!("related LSP job {} ended {:?}", job.job_id, job.state));
+        return match job.state {
+            EnrichmentJobState::Cancelled | EnrichmentJobState::Superseded => {
+                FileTerminalStatus::Cancelled { detail }
+            }
+            EnrichmentJobState::Degraded => FileTerminalStatus::Degraded { detail },
+            EnrichmentJobState::Failed => failure_terminal_status(detail),
+            EnrichmentJobState::Queued
+            | EnrichmentJobState::Running
+            | EnrichmentJobState::Persisting => FileTerminalStatus::Partial { detail },
+            EnrichmentJobState::Completed => unreachable!("completed jobs were filtered"),
+        };
+    }
+    if jobs.iter().any(|job| {
+        job.lsp_evidence.as_ref().is_none_or(|evidence| {
+            matches!(
+                evidence.readiness,
+                LspEvidenceReadiness::Partial | LspEvidenceReadiness::Unavailable
+            )
+        })
+    }) {
+        return FileTerminalStatus::Degraded {
+            detail: "related LSP job lacks complete durable readiness evidence".to_string(),
+        };
+    }
+    if validations
+        .iter()
+        .any(|validation| validation.status == LspValidationStatus::NotValidated)
+    {
+        return FileTerminalStatus::Degraded {
+            detail: "durable language-server validation did not reach readiness".to_string(),
         };
     }
     if let Some(record) = records.iter().find(|record| {
@@ -1696,6 +1941,21 @@ mod tests {
         LspCompletenessReport::new(identity("generation-1"), files)
     }
 
+    fn cohort_case(
+        ordinal: usize,
+        report: LspCompletenessReport,
+    ) -> (FrozenCohortCase, LspCompletenessReport) {
+        (
+            FrozenCohortCase {
+                instance_id: format!("instance-{ordinal:02}"),
+                repository: "owner/repo".to_string(),
+                base_commit: report.identity.checkout_sha.clone(),
+                report_path: PathBuf::from(format!("report-{ordinal:02}.json")),
+            },
+            report,
+        )
+    }
+
     #[test]
     fn stable_ordering_and_digest_ignore_input_order() {
         let a = included(
@@ -1885,7 +2145,7 @@ mod tests {
         );
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&records);
-        file.persisted_results = persisted_results_for_path("src/a.py", &[]);
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[]);
         let missing = report(vec![file.clone()]);
         assert!(
             missing.violations.iter().any(|violation| {
@@ -1893,7 +2153,7 @@ mod tests {
             })
         );
 
-        file.persisted_results = persisted_results_for_path("src/a.py", &[edge]);
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge]);
         assert!(report(vec![file]).is_ready());
     }
 
@@ -1907,8 +2167,15 @@ mod tests {
             state: LspWorkItemState::Skipped,
             ..LspWorkItemRecord::default()
         };
-        let status =
-            terminal_status_for_file("src/a.py", &[&completed, &skipped], &[], true, &server());
+        let status = terminal_status_for_file(
+            "src/a.py",
+            &[&completed, &skipped],
+            &[],
+            true,
+            &server(),
+            &[],
+            &[],
+        );
         assert!(matches!(status, FileTerminalStatus::Degraded { .. }));
     }
 
@@ -1978,11 +2245,17 @@ mod tests {
         second.identity.checkout_sha = "def456".to_string();
         second.finalize();
 
-        let left = AggregateCompletenessReport::from_reports(&[second.clone(), first.clone()]);
-        let right = AggregateCompletenessReport::from_reports(&[first, second]);
+        let left = AggregateCompletenessReport::from_frozen_cases(&[
+            cohort_case(1, second.clone()),
+            cohort_case(0, first.clone()),
+        ]);
+        let right = AggregateCompletenessReport::from_frozen_cases(&[
+            cohort_case(0, first),
+            cohort_case(1, second),
+        ]);
         assert_eq!(left, right);
         assert_eq!(left.counts.checkouts, 2);
-        assert_eq!(left.counts.unique_checkouts, 2);
+        assert_eq!(left.counts.unique_instances, 2);
         assert_eq!(left.counts.ready_checkouts, 1);
         assert_eq!(left.counts.by_extension.get("py"), Some(&1));
         assert_eq!(left.counts.by_extension.get("md"), Some(&1));
@@ -2072,6 +2345,137 @@ mod tests {
     }
 
     #[test]
+    fn document_symbol_output_must_survive_graph_persistence() {
+        let node = Node {
+            id: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "symbol".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def symbol():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Lsp,
+        };
+        let record = LspWorkItemRecord {
+            file: "src/a.py".to_string(),
+            state: LspWorkItemState::Completed,
+            output_nodes: vec![node.clone()],
+            ..LspWorkItemRecord::default()
+        };
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        (file.expected_results, file.expected_result_ids) =
+            expected_evidence_from_work_items(&[&record]);
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[]);
+        assert!(!report(vec![file.clone()]).is_ready());
+
+        file.persisted_results = persisted_results_for_path("src/a.py", &[node], &[]);
+        assert!(report(vec![file]).is_ready());
+    }
+
+    #[test]
+    fn reopen_rejects_reported_output_missing_from_current_graph() {
+        let edge = Edge {
+            from: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/a.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/b.py"),
+                name: "target".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        file.expected_result_ids.insert(edge.stable_id());
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge]);
+        let persisted = report(vec![file]);
+
+        let violations = runtime_compatibility_violations(&persisted, &[], &[]);
+        assert!(violations.iter().any(|violation| {
+            violation.code == ReadinessViolationCode::StaleReport
+                && violation.detail.contains("no longer contains")
+        }));
+    }
+
+    #[test]
+    fn durable_validation_is_request_and_capability_evidence() {
+        let validation = LspValidationEvidence {
+            language: "python".to_string(),
+            server_name: "pyright".to_string(),
+            status: LspValidationStatus::Processed,
+            method: Some("textDocument/documentSymbol".to_string()),
+            symbol_count: Some(2),
+            detail: None,
+        };
+        let (capabilities, requests) = evidence_from_work_items(&[], &[], &[&validation]);
+        assert_eq!(capabilities[0].name, "textDocument/documentSymbol");
+        assert_eq!(requests[0].result_count, Some(2));
+        assert_eq!(requests[0].outcome, RequestOutcome::Completed);
+    }
+
+    #[test]
+    fn related_job_terminal_failure_blocks_every_file() {
+        let job: EnrichmentJobRecord = serde_json::from_value(serde_json::json!({
+            "job_id": "job-1",
+            "repo": "/fixture",
+            "root": null,
+            "capability": "call_references",
+            "scope": { "kind": "repo" },
+            "trigger": "foreground_scan",
+            "state": "failed",
+            "phase": "lsp",
+            "counters": {
+                "current": 0,
+                "total": null,
+                "node_count": null,
+                "edge_count": null
+            },
+            "created_at": 1,
+            "updated_at": 2,
+            "completed_at": 2,
+            "failure": "server crashed",
+            "superseded_by": null,
+            "owner_id": null,
+            "lease_expires_at": null,
+            "schema_version": 1
+        }))
+        .unwrap();
+        let completed = LspWorkItemRecord {
+            state: LspWorkItemState::Completed,
+            ..LspWorkItemRecord::default()
+        };
+        let status =
+            terminal_status_for_file("src/a.py", &[&completed], &[], true, &server(), &[job], &[]);
+        assert!(matches!(status, FileTerminalStatus::Crashed { .. }));
+    }
+
+    #[test]
+    fn relative_aggregate_output_uses_current_directory() {
+        assert_eq!(
+            aggregate_output_parent(Path::new("aggregate.json")),
+            Path::new(".")
+        );
+    }
+
+    #[test]
     fn aggregate_gate_requires_exact_frozen_population() {
         let reports = (0..70)
             .map(|ordinal| {
@@ -2084,13 +2488,19 @@ mod tests {
                 ready
             })
             .collect::<Vec<_>>();
-        let seventy = AggregateCompletenessReport::from_reports(&reports);
-        assert!(seventy.is_ready(70));
-        let sixty_nine = AggregateCompletenessReport::from_reports(&reports[..69]);
-        assert!(!sixty_nine.is_ready(70));
+        let cases = reports
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, report)| cohort_case(ordinal, report))
+            .collect::<Vec<_>>();
+        let seventy = AggregateCompletenessReport::from_frozen_cases(&cases);
+        assert!(seventy.is_ready());
+        let sixty_nine = AggregateCompletenessReport::from_frozen_cases(&cases[..69]);
+        assert!(!sixty_nine.is_ready());
 
-        let duplicated = AggregateCompletenessReport::from_reports(&vec![reports[0].clone(); 70]);
-        assert!(!duplicated.is_ready(70));
+        let duplicated =
+            AggregateCompletenessReport::from_frozen_cases(&vec![cases[0].clone(); 70]);
+        assert!(!duplicated.is_ready());
     }
 
     #[test]
@@ -2101,8 +2511,8 @@ mod tests {
         )]);
         enabled.identity.context_mode = "enabled".to_string();
         enabled.finalize();
-        let aggregate = AggregateCompletenessReport::from_reports(&[enabled]);
+        let aggregate = AggregateCompletenessReport::from_frozen_cases(&[cohort_case(0, enabled)]);
         assert_eq!(aggregate.counts.ready_checkouts, 0);
-        assert!(!aggregate.is_ready(1));
+        assert!(!aggregate.is_ready());
     }
 }

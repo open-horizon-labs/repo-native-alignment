@@ -105,15 +105,12 @@ struct LspReadinessArgs {
     /// Emit the complete machine-readable report and compatibility result.
     #[arg(long)]
     json: bool,
-    /// Persisted checkout report to include in a no-spend aggregate gate.
-    #[arg(long = "aggregate-report")]
-    aggregate_reports: Vec<PathBuf>,
+    /// Frozen N=70 case manifest. Each case binds instance/repository/base commit to a report.
+    #[arg(long)]
+    cohort_manifest: Option<PathBuf>,
     /// Destination for the deterministic aggregate manifest.
-    #[arg(long, requires = "aggregate_reports")]
+    #[arg(long, requires = "cohort_manifest")]
     aggregate_output: Option<PathBuf>,
-    /// Exact number of checkout reports required by the aggregate gate.
-    #[arg(long, default_value_t = 70, requires = "aggregate_reports")]
-    require_checkouts: u64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -802,6 +799,7 @@ async fn async_main() -> anyhow::Result<()> {
                             &graph.nodes,
                             &graph.edges,
                             &result.lsp_entries,
+                            &result.report.related_job_ids,
                             scan_started_at_ms,
                         )?;
                     eprintln!(
@@ -810,7 +808,7 @@ async fn async_main() -> anyhow::Result<()> {
                         completeness.violations.len(),
                         completeness.digest,
                     );
-                    if !completeness.is_ready() {
+                    if enrichment.runs_lsp() && !completeness.is_ready() {
                         anyhow::bail!(
                             "benchmark LSP completeness blocked by {} per-file violation(s); inspect {}",
                             completeness.violations.len(),
@@ -1004,15 +1002,13 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::LspReadiness(args)) => {
             init_tracing("warn", log_path.as_deref());
-            if !args.aggregate_reports.is_empty() {
-                let reports = args
-                    .aggregate_reports
-                    .iter()
-                    .map(|path| repo_native_alignment::lsp_completeness::load_report_path(path))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let aggregate = repo_native_alignment::lsp_completeness::AggregateCompletenessReport::from_reports(&reports);
+            if let Some(cohort_manifest) = args.cohort_manifest.as_deref() {
+                let aggregate =
+                    repo_native_alignment::lsp_completeness::load_frozen_cohort_aggregate(
+                        cohort_manifest,
+                    )?;
                 let output = args.aggregate_output.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--aggregate-output is required with --aggregate-report")
+                    anyhow::anyhow!("--aggregate-output is required with --cohort-manifest")
                 })?;
                 repo_native_alignment::lsp_completeness::persist_aggregate_report(
                     output, &aggregate,
@@ -1021,29 +1017,28 @@ async fn async_main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&aggregate)?);
                 } else {
                     println!(
-                        "LSP aggregate readiness: {} ({}/{} ready, {} unique checkouts, {} files, digest={})",
-                        if aggregate.is_ready(args.require_checkouts) {
+                        "LSP aggregate readiness: {} ({}/{} ready, {} unique instances, {} files, digest={})",
+                        if aggregate.is_ready() {
                             "READY"
                         } else {
                             "BLOCKED"
                         },
                         aggregate.counts.ready_checkouts,
                         aggregate.counts.checkouts,
-                        aggregate.counts.unique_checkouts,
+                        aggregate.counts.unique_instances,
                         aggregate.counts.files,
                         aggregate.digest,
                     );
                 }
-                std::process::exit(if aggregate.is_ready(args.require_checkouts) {
-                    0
-                } else {
-                    2
-                });
+                std::process::exit(if aggregate.is_ready() { 0 } else { 2 });
             }
             let repo_root = args.repo.canonicalize()?;
-            let check = repo_native_alignment::lsp_completeness::load_readiness_check(
+            let graph = server::load_graph_from_lance(&repo_root).await?;
+            let check = repo_native_alignment::lsp_completeness::load_readiness_check_with_graph(
                 &repo_root,
                 business_context_mode,
+                &graph.nodes,
+                &graph.edges,
             )?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&check)?);
@@ -1638,30 +1633,28 @@ mod tests {
         assert_eq!(checkout.business_context, BusinessContextMode::Disabled);
         assert_eq!(args.repo, PathBuf::from("/tmp/checkout"));
         assert!(args.json);
-        assert!(args.aggregate_reports.is_empty());
+        assert!(args.cohort_manifest.is_none());
 
         let aggregate = Cli::try_parse_from([
             "repo-native-alignment",
             "lsp-readiness",
-            "--aggregate-report",
-            "/tmp/a.json",
-            "--aggregate-report",
-            "/tmp/b.json",
+            "--cohort-manifest",
+            "/tmp/frozen-cohort.json",
             "--aggregate-output",
             "/tmp/aggregate.json",
-            "--require-checkouts",
-            "2",
         ])
         .expect("aggregate readiness CLI should parse");
         let Some(Commands::LspReadiness(args)) = aggregate.command else {
             panic!("expected lsp-readiness command");
         };
-        assert_eq!(args.aggregate_reports.len(), 2);
+        assert_eq!(
+            args.cohort_manifest,
+            Some(PathBuf::from("/tmp/frozen-cohort.json"))
+        );
         assert_eq!(
             args.aggregate_output,
             Some(PathBuf::from("/tmp/aggregate.json"))
         );
-        assert_eq!(args.require_checkouts, 2);
     }
 
     #[test]
