@@ -3817,6 +3817,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binding_final_review_python_server_persists_source_and_test_call_provenance() {
+        use crate::extract::python::PythonExtractor;
+        use crate::server::store::{load_graph_from_lance, persist_graph_to_lance};
+
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["src", "tests"] {
+            std::fs::create_dir_all(repo.path().join(directory)).unwrap();
+        }
+        let mut nodes = Vec::new();
+        for path in ["src/app.py", "tests/test_app.py"] {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lsp_capability_repo")
+                .join(path);
+            std::fs::copy(&source, repo.path().join(path)).unwrap();
+            let content = std::fs::read_to_string(source).unwrap();
+            nodes.extend(
+                PythonExtractor::new()
+                    .extract(Path::new(path), &content)
+                    .unwrap()
+                    .nodes,
+            );
+        }
+        assert!(nodes.iter().any(|node| {
+            node.id.file.as_path() == Path::new("src/app.py") && node.id.name == "greet"
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.id.file.as_path() == Path::new("tests/test_app.py")
+                && node.id.name == "test_greet"
+        }));
+
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = LspEnricher::new(
+            "python",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "python_features",
+            ],
+            &["py"],
+        );
+        let result = enricher
+            .enrich(&nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("mock Python enrichment succeeds");
+        assert!(
+            !result.aborted,
+            "mock Python enrichment aborted: {result:?}"
+        );
+        let negotiated = result
+            .lsp_validation
+            .as_ref()
+            .and_then(|validation| validation.negotiated_capabilities)
+            .expect("negotiated Python capabilities");
+        assert!(negotiated.references_provider);
+        assert!(negotiated.document_symbol_provider);
+
+        let records = work_items::load_records_since(repo.path(), 0).unwrap();
+        let relation = result
+            .added_edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::Calls
+                    && edge.source == ExtractionSource::Lsp
+                    && edge.from.file.as_path() == Path::new("tests/test_app.py")
+                    && edge.from.name == "test_greet"
+                    && edge.to.file.as_path() == Path::new("src/app.py")
+                    && edge.to.name == "greet"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "mock references response did not emit the test-to-source call edge; edges={:?}; records={:?}",
+                    result.added_edges, records
+                )
+            })
+            .clone();
+        let reference_records = records
+            .iter()
+            .filter(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "references")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reference_records.len(), 1);
+        assert_eq!(reference_records[0].file, "src/app.py");
+        assert_eq!(
+            reference_records[0].state,
+            work_items::LspWorkItemState::Completed
+        );
+        assert_eq!(reference_records[0].observed_result_count, 1);
+        assert!(
+            reference_records[0]
+                .output_edges
+                .iter()
+                .any(|edge| edge.stable_id() == relation.stable_id())
+        );
+
+        for path in ["src/app.py", "tests/test_app.py"] {
+            let symbol_record = records
+                .iter()
+                .find(|record| {
+                    record.file == path
+                        && record
+                            .requested_operations
+                            .iter()
+                            .any(|operation| operation == "document_symbols")
+                })
+                .unwrap_or_else(|| panic!("{path} has no durable document-symbol request"));
+            assert_eq!(symbol_record.state, work_items::LspWorkItemState::Completed);
+            let expected_count = u64::from(path == "src/app.py");
+            assert_eq!(symbol_record.observed_result_count, expected_count);
+            assert_eq!(symbol_record.output_nodes.len() as u64, expected_count);
+            assert!(
+                symbol_record
+                    .output_nodes
+                    .iter()
+                    .all(|node| node.id.file.as_path() == Path::new(path))
+            );
+        }
+
+        let mut persisted_nodes = nodes;
+        persisted_nodes.extend(result.new_nodes);
+        persist_graph_to_lance(repo.path(), &persisted_nodes, &result.added_edges)
+            .await
+            .expect("persist mock Python graph");
+        let reopened = load_graph_from_lance(repo.path())
+            .await
+            .expect("reopen mock Python graph");
+        let reopened_relation = reopened
+            .edges
+            .iter()
+            .find(|edge| edge.stable_id() == relation.stable_id())
+            .expect("persisted call edge survives graph reopen");
+        assert_eq!(reopened_relation.source, ExtractionSource::Lsp);
+        for path in ["src/app.py", "tests/test_app.py"] {
+            assert!(
+                reopened_relation.from.file.as_path() == Path::new(path)
+                    || reopened_relation.to.file.as_path() == Path::new(path),
+                "persisted LSP provenance does not include {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn readiness_workspace_symbol_server_uses_advertised_method() {
         let mut fixture = ValidationFixture::new([ValidationFixtureResponse::Success(
             serde_json::json!([{"name": "one"}, {"name": "two"}]),

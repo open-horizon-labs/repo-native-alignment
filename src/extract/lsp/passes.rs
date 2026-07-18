@@ -1317,6 +1317,8 @@ impl LspEnricher {
                             item.id,
                             telemetry,
                             &mut edges,
+                            &mut had_error,
+                            error_count,
                         )
                         .await
                     }
@@ -1916,6 +1918,8 @@ impl LspEnricher {
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
         edges: &mut Vec<Edge>,
+        had_error: &mut bool,
+        error_count: &AtomicI64,
     ) -> QueryObservation {
         let mut observation = QueryObservation {
             scheduled_requests: 1,
@@ -1972,7 +1976,11 @@ impl LspEnricher {
                     }
                 }
             }
-            Err(error) => observation.record_error(&error),
+            Err(error) => {
+                *had_error = true;
+                error_count.fetch_add(1, Ordering::Relaxed);
+                observation.record_error(&error);
+            }
         }
         observation
     }

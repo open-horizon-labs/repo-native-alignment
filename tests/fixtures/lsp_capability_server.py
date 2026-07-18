@@ -2,9 +2,9 @@
 """Deterministic stdio LSP fixture for capability/readiness CLI checks.
 
 Set RNA_LSP_FIXTURE_SCENARIO (or the first argument) to document_zero
-(default), document_features, workspace, method_not_found, crash, or timeout.
-The document_features scenario exercises Markdown symbol/link/definition/
-reference evidence without provisioning a real server.
+(default), document_features, document_definition_error, python_features,
+workspace, method_not_found, crash, or timeout. The deterministic feature
+scenarios exercise Markdown and Python evidence without provisioning a server.
 """
 
 import json
@@ -58,6 +58,13 @@ def lsp_character(text):
     return len(text.encode("utf-16-le")) // 2
 
 
+def repository_file_uri(message, relative_path):
+    uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
+    path = Path(unquote(urlparse(uri).path))
+    root = path.parent.parent if path.parent.name in ("docs", "src", "tests") else path.parent
+    return (root / relative_path).as_uri()
+
+
 def document_link_result(uri):
     """Return the src/app.py link at its exact range in the requested document."""
     if not uri:
@@ -84,9 +91,32 @@ def document_link_result(uri):
                         "character": lsp_character(line[: match.end()]),
                     },
                 },
-                "target": (Path.cwd() / "src/app.py").as_uri(),
+                "target": (
+                    (path.parent.parent if path.parent.name == "docs" else path.parent)
+                    / "src/app.py"
+                ).as_uri(),
             }
         ]
+    return []
+
+
+def python_document_symbols(uri):
+    path = Path(unquote(urlparse(uri).path))
+    if path.as_posix().endswith("/src/app.py"):
+        return [
+            {
+                "name": "greet",
+                "kind": 12,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 1, "character": 27},
+                },
+            }
+        ]
+    if path.as_posix().endswith("/tests/test_app.py"):
+        # Valid processed-zero response: test functions are represented through
+        # the reference edge returned for the source declaration below.
+        return []
     return []
 
 
@@ -106,11 +136,16 @@ def main():
         if method == "initialize":
             if scenario == "workspace":
                 capabilities = {"workspaceSymbolProvider": True}
-            elif scenario == "document_features":
+            elif scenario in ("document_features", "document_definition_error"):
                 capabilities = {
                     "referencesProvider": True,
                     "definitionProvider": True,
                     "documentLinkProvider": {"resolveProvider": False},
+                    "documentSymbolProvider": True,
+                }
+            elif scenario == "python_features":
+                capabilities = {
+                    "referencesProvider": True,
                     "documentSymbolProvider": True,
                 }
             else:
@@ -125,7 +160,7 @@ def main():
                 time.sleep(60)
             elif scenario == "workspace":
                 result(request_id, [{"name": "fixture-symbol"}])
-            elif scenario == "document_features":
+            elif scenario in ("document_features", "document_definition_error"):
                 result(
                     request_id,
                     [
@@ -139,20 +174,40 @@ def main():
                         }
                     ],
                 )
+            elif scenario == "python_features":
+                uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
+                result(request_id, python_document_symbols(uri))
             else:
                 result(request_id, [])
-        elif method == "textDocument/documentLink" and scenario == "document_features":
+        elif method == "textDocument/documentLink" and scenario in (
+            "document_features",
+            "document_definition_error",
+        ):
             uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
             result(request_id, document_link_result(uri))
-        elif method == "textDocument/definition" and scenario == "document_features":
+        elif method == "textDocument/definition" and scenario in (
+            "document_features",
+            "document_definition_error",
+        ):
+            if scenario == "document_definition_error":
+                rpc_error(request_id, -32603, "fixture definition failure")
+            else:
+                result(
+                    request_id,
+                    [{"uri": repository_file_uri(message, "src/app.py"), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}],
+                )
+        elif method == "textDocument/references" and scenario in (
+            "document_features",
+            "document_definition_error",
+        ):
             result(
                 request_id,
-                [{"uri": (Path.cwd() / "src/app.py").as_uri(), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}],
+                [{"uri": repository_file_uri(message, "tests/test_app.py"), "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 10}}}],
             )
-        elif method == "textDocument/references" and scenario == "document_features":
+        elif method == "textDocument/references" and scenario == "python_features":
             result(
                 request_id,
-                [{"uri": (Path.cwd() / "tests/test_app.py").as_uri(), "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 10}}}],
+                [{"uri": repository_file_uri(message, "tests/test_app.py"), "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 14}}}],
             )
         elif method == "shutdown":
             result(request_id, None)

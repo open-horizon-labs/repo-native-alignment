@@ -3115,18 +3115,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn binding_final_review_definition_error_persists_failure_and_blocks_readiness() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["docs", "src", "tests"] {
+            std::fs::create_dir_all(repo.path().join(directory)).unwrap();
+        }
+        for path in [
+            "README.md",
+            "docs/guide.md",
+            "src/app.py",
+            "tests/test_app.py",
+        ] {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lsp_capability_repo")
+                .join(path);
+            std::fs::copy(source, repo.path().join(path)).unwrap();
+        }
+
+        let markdown = crate::extract::markdown::MarkdownExtractor::new();
+        let mut nodes = Vec::new();
+        for path in ["README.md", "docs/guide.md"] {
+            let content = std::fs::read_to_string(repo.path().join(path)).unwrap();
+            nodes.extend(markdown.extract(Path::new(path), &content).unwrap().nodes);
+        }
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = crate::extract::lsp::LspEnricher::new(
+            "markdown",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "document_definition_error",
+            ],
+            &["md"],
+        );
+        let result = enricher
+            .enrich(&nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("mock definition failure is represented as enrichment evidence");
+        assert!(result.error_count > 0);
+
+        let records = crate::extract::lsp::work_items::load_records_since(repo.path(), 0).unwrap();
+        let file_records = records
+            .iter()
+            .filter(|record| record.file == "docs/guide.md")
+            .collect::<Vec<_>>();
+        let definition = file_records
+            .iter()
+            .find(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "definitions")
+            })
+            .expect("guide definition request is durable");
+        assert_eq!(definition.state, LspWorkItemState::Failed);
+        assert!(definition.last_error.is_some());
+
+        let validation = result
+            .lsp_validation
+            .as_ref()
+            .expect("mock retains language readiness evidence");
+        let jobs = vec![completed_job(vec![validation.clone()])];
+        let status = terminal_status_for_file(
+            "docs/guide.md",
+            &file_records,
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &[validation],
+        );
+        match &status {
+            FileTerminalStatus::Degraded { detail } => {
+                assert!(detail.contains("one or more LSP operations failed"));
+            }
+            other => panic!("failed definition request must degrade the file, got {other:?}"),
+        }
+        let (capabilities, requests) = evidence_from_work_items(&file_records, &[], &[validation]);
+        assert!(requests.iter().any(|request| {
+            request.method == "textDocument/definition" && request.outcome == RequestOutcome::Failed
+        }));
+        let (expected, expected_ids) =
+            expected_evidence_from_work_items(&file_records, &[validation], "docs/guide.md");
+        let mut file = included("docs/guide.md", status);
+        file.role = FileRole::Docs;
+        file.advertised_capabilities = capabilities;
+        file.requests_attempted = requests;
+        file.expected_results = expected;
+        file.expected_result_ids = expected_ids;
+        file.persisted_results =
+            persisted_results_for_path("docs/guide.md", &result.new_nodes, &result.added_edges);
+        assert!(!report(vec![file]).is_ready());
+    }
+
     #[test]
-    fn mock_fixture_proves_docs_source_and_test_graph_persistence() {
+    fn mock_fixture_proves_document_requirement_accounting() {
         assert!(
             include_str!("../tests/fixtures/lsp_capability_repo/docs/guide.md")
                 .contains("the source")
-        );
-        assert!(
-            include_str!("../tests/fixtures/lsp_capability_repo/src/app.py").contains("def greet")
-        );
-        assert!(
-            include_str!("../tests/fixtures/lsp_capability_repo/tests/test_app.py")
-                .contains("test_greet")
         );
         let fixture_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_repo");
@@ -3284,66 +3372,6 @@ mod tests {
             .requests_attempted
             .retain(|request| request.method != "textDocument/definition");
         assert!(!report(vec![missing_definition_request]).is_ready());
-
-        let relation = Edge {
-            from: NodeId {
-                root: "fixture".to_string(),
-                file: PathBuf::from("tests/test_app.py"),
-                name: "test_greet".to_string(),
-                kind: NodeKind::Function,
-            },
-            to: NodeId {
-                root: "fixture".to_string(),
-                file: PathBuf::from("src/app.py"),
-                name: "greet".to_string(),
-                kind: NodeKind::Function,
-            },
-            kind: EdgeKind::Calls,
-            source: ExtractionSource::Lsp,
-            confidence: Confidence::Confirmed,
-            evidence: Vec::new(),
-        };
-        let source_persisted = persisted_results_for_path(
-            "src/app.py",
-            std::slice::from_ref(&doc_node),
-            std::slice::from_ref(&relation),
-        );
-        let test_persisted = persisted_results_for_path(
-            "tests/test_app.py",
-            std::slice::from_ref(&doc_node),
-            std::slice::from_ref(&relation),
-        );
-        assert_eq!(source_persisted.call_hierarchy_edges, 1);
-        assert_eq!(test_persisted.call_hierarchy_edges, 1);
-
-        for (path, role) in [
-            ("docs/guide.md", FileRole::Docs),
-            ("src/app.py", FileRole::Source),
-            ("tests/test_app.py", FileRole::Test),
-        ] {
-            let absolute = Path::new("tests/fixtures/lsp_capability_repo").join(path);
-            assert_eq!(classify_file(Path::new(path), &absolute).0, role);
-        }
-        for path in ["src/app.py", "tests/test_app.py"] {
-            let record = LspWorkItemRecord {
-                file: path.to_string(),
-                node_kind: "function".to_string(),
-                requested_operations: vec!["references".to_string()],
-                state: LspWorkItemState::Completed,
-                output_edges: vec![relation.clone()],
-                observed_result_count: 1,
-                ..LspWorkItemRecord::default()
-            };
-            let (kinds, ids) = expected_evidence_from_work_items(&[&record], &[], path);
-            assert!(kinds.contains(&ExpectedResultKind::CallHierarchy));
-            assert!(ids.contains(&relation.stable_id()));
-            let persisted = if path == "src/app.py" {
-                &source_persisted
-            } else {
-                &test_persisted
-            };
-            assert!(persisted.provenance.contains(&relation.stable_id()));
-        }
     }
 
     #[test]
