@@ -438,8 +438,12 @@ async fn disabled_full_scan_rebuilds_enabled_cache_before_lance_load() {
     let disabled_stdout = String::from_utf8_lossy(&disabled.stdout);
     let disabled_stderr = String::from_utf8_lossy(&disabled.stderr);
     assert!(
-        disabled.status.success(),
-        "disabled full scan failed\nstdout:\n{disabled_stdout}\nstderr:\n{disabled_stderr}"
+        !disabled.status.success(),
+        "disabled extract-only benchmark scan must fail closed\nstdout:\n{disabled_stdout}\nstderr:\n{disabled_stderr}"
+    );
+    assert!(
+        disabled_stderr.contains("benchmark LSP completeness blocked"),
+        "disabled extract-only scan lost the completeness diagnostic:\n{disabled_stderr}"
     );
     assert!(
         !enabled_cache_sentinel.exists(),

@@ -83,6 +83,16 @@ MCP output distinguishes freshness from readiness. Freshness says when the index
 
 If a language server stops making progress and RNA aborts the pass, graph finalization still completes and preserves every node and edge produced before the abort. CLI and MCP readiness report this terminal result as `partial/degraded` with the original abort diagnostic. RNA does not write the full-LSP completion sentinel for a degraded run, so a later scan can retry instead of treating partial coverage as complete.
 
+For a benchmark checkout, use the stricter persisted per-file gate after a full scan:
+
+```bash
+repo-native-alignment --business-context disabled lsp-readiness --repo /path/to/checkout --json
+```
+
+The command exits `0` only when the report matches the current checkout, persisted graph, installed server binaries, configuration, inventory policy, and durable LSP job generation and every included file has complete evidence. Missing servers, unsupported relevant extensions, skipped or unfinished work, stale reports, and emitted LSP results absent from the persisted graph block with a nonzero exit.
+
+For the cohort gate, pass `--cohort-manifest frozen-cohort.json --aggregate-output aggregate.json`. The manifest binds each report path to its frozen `instance_id`, repository, and exact base commit. The gate verifies the checked-in `benchmark/swebench-act-context/population.json` against its existing protocol lock and requires the exact 70 included identities; callers cannot substitute a different population or lower the threshold.
+
 ## Type Hierarchy Enrichment
 
 When a language server advertises `typeHierarchyProvider`, RNA queries supertypes for each Trait, Struct, and Enum node to create compiler-accurate `Implements` edges (e.g., `MyStruct -> MyTrait`).

@@ -20,18 +20,32 @@ use super::policy::{
     LspServerCapabilities,
 };
 use super::transport::{
-    PipelinedTransport, find_enclosing_symbol, path_to_uri, uri_to_relative_path,
+    PipelinedTransport, find_enclosing_symbol, find_enclosing_symbol_in_file, path_to_uri,
+    uri_to_relative_path,
 };
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
-    ZERO_EDGE_TIMEOUT, lsp_job_timeout,
+    ZERO_EDGE_TIMEOUT, lsp_job_timeout, materialize_document_symbols,
+    normalized_document_symbol_evidence,
 };
 use crate::scanner::LspConfig;
 
 const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn should_abort_zero_edge_pass(
+    edge_producing_total: usize,
+    edge_attempted: u32,
+    emitted_edges: bool,
+    elapsed: Duration,
+) -> bool {
+    edge_producing_total > 0
+        && !emitted_edges
+        && ((edge_attempted >= ZERO_EDGE_ABORT_THRESHOLD && elapsed >= ZERO_EDGE_MIN_WARMUP)
+            || elapsed > ZERO_EDGE_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DidOpenStatus {
@@ -184,12 +198,15 @@ struct Pass1TaskResult {
     edges: Vec<Edge>,
     new_nodes: Vec<Node>,
     had_error: bool,
+    edge_producing: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct QueryObservation {
     pub(super) scheduled_requests: usize,
     pub(super) non_empty_responses: usize,
+    /// Raw applicable result items returned by the server before graph mapping.
+    pub(super) result_count: usize,
     pub(super) errors: usize,
     pub(super) timeouts: usize,
 }
@@ -444,19 +461,27 @@ impl LspPass1Diagnostics {
         }
     }
 
-    async fn finish(&self, item: &LspPass1WorkItem, success: bool, edges: &[Edge], nodes: &[Node]) {
+    async fn finish(
+        &self,
+        item: &LspPass1WorkItem,
+        success: bool,
+        edges: &[Edge],
+        nodes: &[Node],
+        observed_result_count: usize,
+    ) {
         self.finish_with_error(
             item,
             success,
             (!success).then(|| "one or more LSP operations failed".to_string()),
             edges,
             nodes,
+            observed_result_count,
         )
         .await;
     }
 
     async fn finish_failed(&self, item: &LspPass1WorkItem, error: impl Into<String>) {
-        self.finish_with_error(item, false, Some(error.into()), &[], &[])
+        self.finish_with_error(item, false, Some(error.into()), &[], &[], 0)
             .await;
     }
 
@@ -467,6 +492,7 @@ impl LspPass1Diagnostics {
         error: Option<String>,
         edges: &[Edge],
         nodes: &[Node],
+        observed_result_count: usize,
     ) {
         {
             let mut in_flight = self.in_flight.lock().await;
@@ -486,7 +512,12 @@ impl LspPass1Diagnostics {
         if let Some(work_items) = &self.work_items {
             let result = if success {
                 work_items
-                    .mark_completed_with_output(item.id, edges, nodes)
+                    .mark_completed_with_output(
+                        item.id,
+                        edges,
+                        nodes,
+                        observed_result_count.try_into().unwrap_or(u64::MAX),
+                    )
                     .await
             } else {
                 work_items
@@ -663,6 +694,7 @@ impl LspEnricher {
                     NodeKind::Function
                         | NodeKind::Trait
                         | NodeKind::Other(_)
+                        | NodeKind::MarkdownSection
                         | NodeKind::Struct
                         | NodeKind::Enum
                         | NodeKind::TypeAlias
@@ -688,30 +720,65 @@ impl LspEnricher {
             .copied()
             .collect();
 
-        let mut document_link_files = HashSet::new();
-        let admitted_nodes: Vec<(&Node, LspQueryOperation)> = candidate_nodes
-            .into_iter()
-            .filter_map(|node| {
-                let operation = match node.id.kind {
-                    NodeKind::Function if capabilities.call_hierarchy => {
-                        Some(LspQueryOperation::CallHierarchy)
+        let mut admitted_nodes: Vec<(&Node, LspQueryOperation)> = Vec::new();
+        if capabilities.document_symbols {
+            let mut document_representatives = BTreeMap::<PathBuf, Vec<&Node>>::new();
+            for node in matching_nodes {
+                document_representatives
+                    .entry(node.id.file.clone())
+                    .or_default()
+                    .push(*node);
+            }
+            for mut candidates in document_representatives.into_values() {
+                candidates.sort_by_key(|node| node.stable_id());
+                for node in candidates {
+                    if self.query_profile.admits(
+                        node,
+                        LspQueryOperation::DocumentSymbols,
+                        capabilities,
+                        budget,
+                    ) {
+                        admitted_nodes.push((node, LspQueryOperation::DocumentSymbols));
+                        break;
                     }
-                    NodeKind::Function => Some(LspQueryOperation::References),
-                    NodeKind::Trait => Some(LspQueryOperation::Implementations),
-                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                        Some(LspQueryOperation::References)
-                    }
-                    NodeKind::Other(_) => Some(LspQueryOperation::DocumentLinks),
-                    _ => None,
-                }?;
-                if !retain_unique_document_link_file(node, operation, &mut document_link_files) {
-                    return None;
                 }
-                self.query_profile
-                    .admits(node, operation, capabilities, budget)
-                    .then_some((node, operation))
-            })
-            .collect();
+            }
+        }
+
+        let mut document_link_files = HashSet::new();
+        for node in candidate_nodes {
+            let operations: &[LspQueryOperation] = match node.id.kind {
+                NodeKind::Function if capabilities.call_hierarchy => {
+                    &[LspQueryOperation::CallHierarchy]
+                }
+                NodeKind::Function => &[LspQueryOperation::References],
+                NodeKind::Trait => &[LspQueryOperation::Implementations],
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                    &[LspQueryOperation::References]
+                }
+                NodeKind::MarkdownSection
+                    if node.metadata.get("markdown_kind").map(String::as_str) == Some("link") =>
+                {
+                    &[
+                        LspQueryOperation::DocumentLinks,
+                        LspQueryOperation::Definitions,
+                        LspQueryOperation::References,
+                    ]
+                }
+                NodeKind::MarkdownSection => &[LspQueryOperation::DocumentLinks],
+                NodeKind::Other(_) => &[LspQueryOperation::DocumentLinks],
+                _ => &[],
+            };
+            for &operation in operations {
+                if retain_unique_document_link_file(node, operation, &mut document_link_files)
+                    && self
+                        .query_profile
+                        .admits(node, operation, capabilities, budget)
+                {
+                    admitted_nodes.push((node, operation));
+                }
+            }
+        }
 
         let ref_eligible = admitted_nodes
             .iter()
@@ -801,6 +868,14 @@ impl LspEnricher {
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
         let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        let edge_producing_total = work_items
+            .iter()
+            .filter(|item| {
+                item.requested_operations
+                    .first()
+                    .is_some_and(|operation| *operation != LspQueryOperation::DocumentSymbols)
+            })
+            .count();
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
@@ -822,19 +897,26 @@ impl LspEnricher {
                 let did_open = Arc::clone(&did_open);
                 let telemetry = Arc::clone(&worker_telemetry);
                 async move {
-                    let registered = if let (Some(operation), Some(declaration)) = (
-                        item.requested_operations.first().copied(),
-                        LspDeclarationClass::from_kind(&item.node.id.kind),
-                    ) {
-                        telemetry.register_work_item(item.id, operation, declaration)
-                    } else {
-                        false
-                    };
+                    let operation = item.requested_operations.first().copied();
+                    let declaration =
+                        LspDeclarationClass::from_kind(&item.node.id.kind).or_else(|| {
+                            (operation == Some(LspQueryOperation::DocumentSymbols))
+                                .then_some(LspDeclarationClass::Other)
+                        });
+                    let registered =
+                        if let (Some(operation), Some(declaration)) = (operation, declaration) {
+                            telemetry.register_work_item(item.id, operation, declaration)
+                        } else {
+                            false
+                        };
                     if !registered {
                         return Pass1TaskResult {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: operation.is_some_and(|operation| {
+                                operation != LspQueryOperation::DocumentSymbols
+                            }),
                         };
                     }
                     Self::run_pass1_work_item(
@@ -858,6 +940,7 @@ impl LspEnricher {
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
         // by phase/file instead of waiting for the outer 30-minute job watchdog.
         let mut attempted = 0u32;
+        let mut edge_attempted = 0u32;
         let mut errors = 0u32;
         let mut aborted = false;
         let mut abort_diagnostic = None;
@@ -888,6 +971,7 @@ impl LspEnricher {
                         break;
                     };
                     attempted += 1;
+                    edge_attempted += u32::from(task_result.edge_producing);
                     if task_result.had_error {
                         errors += 1;
                     }
@@ -988,24 +1072,25 @@ impl LspEnricher {
             // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
             // OR spent >= 2 minutes with 0 edges, the language server is likely
             // misconfigured.
-            if result.added_edges.len() == pass1_edge_baseline
-                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD
-                    && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
-                    || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
-            {
+            if should_abort_zero_edge_pass(
+                edge_producing_total,
+                edge_attempted,
+                result.added_edges.len() != pass1_edge_baseline,
+                pass1_start.elapsed(),
+            ) {
                 let snapshot = diagnostics.snapshot().await;
                 let rendered_snapshot = snapshot.render();
                 tracing::warn!(
-                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) -- aborting. Diagnostic snapshot: {}",
+                    "LSP: {} produced 0 edges after {}/{} edge-producing requests ({:.1}s) -- aborting. Diagnostic snapshot: {}",
                     self.server_command,
-                    attempted,
-                    total_nodes,
+                    edge_attempted,
+                    edge_producing_total,
                     pass1_start.elapsed().as_secs_f64(),
                     rendered_snapshot,
                 );
                 aborted = true;
                 abort_diagnostic = Some(format!(
-                    "zero LSP edges after {attempted}/{total_nodes} nodes; {rendered_snapshot}"
+                    "zero LSP edges after {edge_attempted}/{edge_producing_total} edge-producing requests; {rendered_snapshot}"
                 ));
                 join_set.abort_all();
                 break;
@@ -1070,6 +1155,8 @@ impl LspEnricher {
     ) -> Pass1TaskResult {
         let started_at = Instant::now();
         let operation = item.requested_operations.first().copied();
+        let edge_producing =
+            operation.is_some_and(|operation| operation != LspQueryOperation::DocumentSymbols);
         diagnostics.set_phase(item, "resolving_file_uri").await;
         let node = &item.node;
         let abs_path = root.join(&node.id.file);
@@ -1089,6 +1176,7 @@ impl LspEnricher {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
                     had_error: true,
+                    edge_producing,
                 };
             }
         };
@@ -1117,6 +1205,7 @@ impl LspEnricher {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
                 had_error: true,
+                edge_producing,
             };
         }
 
@@ -1131,47 +1220,46 @@ impl LspEnricher {
         let mut edges = Vec::new();
         let mut new_nodes = Vec::new();
         let mut had_error = false;
-        let observation = match node.id.kind {
-            NodeKind::Function => {
-                Self::enrich_function_node(
-                    transport,
-                    &file_uri,
-                    line,
-                    col,
-                    node,
-                    matching_owned,
-                    refs_by_file,
-                    root,
-                    language,
-                    operation == Some(LspQueryOperation::References),
-                    operation == Some(LspQueryOperation::CallHierarchy),
-                    item.id,
-                    telemetry,
-                    &mut edges,
-                    &mut new_nodes,
-                    &mut had_error,
-                    error_count,
-                )
-                .await
-            }
-            NodeKind::Trait => {
-                Self::enrich_trait_node(
-                    transport,
-                    &file_uri,
-                    line,
-                    col,
-                    node,
-                    matching_owned,
-                    root,
-                    item.id,
-                    telemetry,
-                    &mut edges,
-                )
-                .await
-            }
-            NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                if operation == Some(LspQueryOperation::References) {
-                    Self::enrich_type_references(
+        let observation = if operation == Some(LspQueryOperation::DocumentSymbols) {
+            Self::enrich_document_symbols(
+                transport,
+                &file_uri,
+                language,
+                refs_by_file,
+                root,
+                item.id,
+                telemetry,
+                &mut new_nodes,
+                &mut had_error,
+                error_count,
+            )
+            .await
+        } else {
+            match node.id.kind {
+                NodeKind::Function => {
+                    Self::enrich_function_node(
+                        transport,
+                        &file_uri,
+                        line,
+                        col,
+                        node,
+                        matching_owned,
+                        refs_by_file,
+                        root,
+                        language,
+                        operation == Some(LspQueryOperation::References),
+                        operation == Some(LspQueryOperation::CallHierarchy),
+                        item.id,
+                        telemetry,
+                        &mut edges,
+                        &mut new_nodes,
+                        &mut had_error,
+                        error_count,
+                    )
+                    .await
+                }
+                NodeKind::Trait => {
+                    Self::enrich_trait_node(
                         transport,
                         &file_uri,
                         line,
@@ -1182,24 +1270,71 @@ impl LspEnricher {
                         item.id,
                         telemetry,
                         &mut edges,
-                        &mut had_error,
-                        error_count,
                     )
                     .await
-                } else {
-                    QueryObservation::default()
                 }
-            }
-            _ => {
-                if matches!(node.id.kind, NodeKind::Other(_))
-                    && operation == Some(LspQueryOperation::DocumentLinks)
-                {
-                    Self::enrich_document_links(
-                        transport, &file_uri, node, root, item.id, telemetry, &mut edges,
-                    )
-                    .await
-                } else {
-                    QueryObservation::default()
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                    if operation == Some(LspQueryOperation::References) {
+                        Self::enrich_type_references(
+                            transport,
+                            &file_uri,
+                            line,
+                            col,
+                            node,
+                            matching_owned,
+                            root,
+                            item.id,
+                            telemetry,
+                            &mut edges,
+                            &mut had_error,
+                            error_count,
+                        )
+                        .await
+                    } else {
+                        QueryObservation::default()
+                    }
+                }
+                NodeKind::MarkdownSection => match operation {
+                    Some(LspQueryOperation::DocumentLinks) => {
+                        Self::enrich_document_links(
+                            transport, &file_uri, node, root, item.id, telemetry, &mut edges,
+                        )
+                        .await
+                    }
+                    Some(
+                        operation
+                        @ (LspQueryOperation::Definitions | LspQueryOperation::References),
+                    ) => {
+                        Self::enrich_document_locations(
+                            transport,
+                            &file_uri,
+                            line,
+                            col,
+                            node,
+                            refs_by_file,
+                            root,
+                            operation,
+                            item.id,
+                            telemetry,
+                            &mut edges,
+                            &mut had_error,
+                            error_count,
+                        )
+                        .await
+                    }
+                    _ => QueryObservation::default(),
+                },
+                _ => {
+                    if matches!(node.id.kind, NodeKind::Other(_))
+                        && operation == Some(LspQueryOperation::DocumentLinks)
+                    {
+                        Self::enrich_document_links(
+                            transport, &file_uri, node, root, item.id, telemetry, &mut edges,
+                        )
+                        .await
+                    } else {
+                        QueryObservation::default()
+                    }
                 }
             }
         };
@@ -1215,12 +1350,19 @@ impl LspEnricher {
         );
 
         diagnostics
-            .finish(item, !had_error, &edges, &new_nodes)
+            .finish(
+                item,
+                !had_error,
+                &edges,
+                &new_nodes,
+                observation.result_count,
+            )
             .await;
         Pass1TaskResult {
             edges,
             new_nodes,
             had_error,
+            edge_producing,
         }
     }
 
@@ -1260,13 +1402,13 @@ impl LspEnricher {
                         {
                             continue;
                         }
-
                         if ref_path == node.id.file
                             && ref_line >= node.line_start
                             && ref_line <= node.line_end
                         {
                             continue;
                         }
+                        observation.result_count += 1;
 
                         let referrer_id =
                             refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
@@ -1345,6 +1487,10 @@ impl LspEnricher {
                                     if caller_path.to_string_lossy().contains(".cargo") {
                                         continue;
                                     }
+                                    if caller_path == node.id.file && caller_name == node.id.name {
+                                        continue;
+                                    }
+                                    observation.result_count += 1;
 
                                     let key = (caller_path.clone(), caller_name.to_string());
                                     let caller_id = match refs_by_file_name.get(&key) {
@@ -1417,6 +1563,7 @@ impl LspEnricher {
                                         if fqn.is_empty() {
                                             continue;
                                         }
+                                        observation.result_count += 1;
 
                                         let package =
                                             fqn.split("::").next().unwrap_or(fqn).to_string();
@@ -1452,6 +1599,10 @@ impl LspEnricher {
                                         });
                                         continue;
                                     }
+                                    if callee_path == node.id.file && callee_name == node.id.name {
+                                        continue;
+                                    }
+                                    observation.result_count += 1;
 
                                     let key = (callee_path.clone(), callee_name.to_string());
                                     let callee_id = match refs_by_file_name.get(&key) {
@@ -1535,6 +1686,7 @@ impl LspEnricher {
                     if impl_path.to_string_lossy().contains(".cargo") {
                         continue;
                     }
+                    observation.result_count += 1;
 
                     let impl_id = matching_refs
                         .iter()
@@ -1609,6 +1761,7 @@ impl LspEnricher {
                     {
                         continue;
                     }
+                    observation.result_count += 1;
 
                     let referrer_id = refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
                         find_enclosing_symbol(candidates, &ref_path, ref_line)
@@ -1669,6 +1822,7 @@ impl LspEnricher {
                         if rel_target.to_string_lossy().starts_with("http") {
                             continue;
                         }
+                        observation.result_count += 1;
 
                         let target_id = NodeId {
                             root: node.id.root.clone(),
@@ -1693,6 +1847,140 @@ impl LspEnricher {
                 }
             }
             Err(e) => observation.record_error(&e),
+        }
+        observation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enrich_document_symbols(
+        transport: &PipelinedTransport,
+        file_uri: &lsp_types::Uri,
+        language: &str,
+        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+        root: &Path,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
+        new_nodes: &mut Vec<Node>,
+        had_error: &mut bool,
+        error_count: &AtomicI64,
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
+        let response = transport
+            .request(
+                "textDocument/documentSymbol",
+                serde_json::json!({ "textDocument": { "uri": file_uri.to_string() } }),
+            )
+            .await
+            .and_then(|response| {
+                normalized_document_symbol_evidence(&response, &file_uri.to_string())
+            });
+        match response {
+            Ok(mut symbols) => {
+                observation.non_empty_responses += usize::from(!symbols.is_empty());
+                observation.result_count = symbols.len();
+                match materialize_document_symbols(language, &mut symbols, root, |file| {
+                    refs_by_file
+                        .get(file)
+                        .and_then(|nodes| nodes.first())
+                        .map(|node| node.id.root.clone())
+                }) {
+                    Ok(nodes) => new_nodes.extend(nodes),
+                    Err(error) => {
+                        *had_error = true;
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        observation.record_error(&error);
+                    }
+                }
+            }
+            Err(error) => {
+                *had_error = true;
+                error_count.fetch_add(1, Ordering::Relaxed);
+                observation.record_error(&error);
+            }
+        }
+        observation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enrich_document_locations(
+        transport: &PipelinedTransport,
+        file_uri: &lsp_types::Uri,
+        line: u32,
+        col: u32,
+        node: &Node,
+        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+        root: &Path,
+        operation: LspQueryOperation,
+        work_item_id: usize,
+        telemetry: &LspQueryTelemetry,
+        edges: &mut Vec<Edge>,
+        had_error: &mut bool,
+        error_count: &AtomicI64,
+    ) -> QueryObservation {
+        let mut observation = QueryObservation {
+            scheduled_requests: 1,
+            ..Default::default()
+        };
+        telemetry.note_requests_started(work_item_id, 1);
+        let response = match operation {
+            LspQueryOperation::Definitions => {
+                Self::find_definitions_p(transport, file_uri, line, col).await
+            }
+            LspQueryOperation::References => {
+                Self::find_references_p(transport, file_uri, line, col).await
+            }
+            _ => return observation,
+        };
+        match response {
+            Ok(locations) => {
+                observation.non_empty_responses += usize::from(!locations.is_empty());
+                for location in locations {
+                    observation.result_count += 1;
+                    let target_path = uri_to_relative_path(&location.uri, root);
+                    let target_line = location.range.start.line as usize + 1;
+                    let target = refs_by_file
+                        .get(&target_path)
+                        .and_then(|nodes| find_enclosing_symbol_in_file(nodes, target_line))
+                        .unwrap_or_else(|| NodeId {
+                            root: node.id.root.clone(),
+                            file: target_path.clone(),
+                            name: target_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            kind: NodeKind::Module,
+                        });
+                    let (from, to, kind) = match operation {
+                        LspQueryOperation::Definitions => {
+                            (node.id.clone(), target, EdgeKind::Implements)
+                        }
+                        LspQueryOperation::References => {
+                            (target, node.id.clone(), EdgeKind::ReferencedBy)
+                        }
+                        _ => unreachable!("document location operation checked above"),
+                    };
+                    if from != to {
+                        edges.push(Edge {
+                            from,
+                            to,
+                            kind,
+                            source: ExtractionSource::Lsp,
+                            confidence: Confidence::Confirmed,
+                            evidence: Vec::new(),
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                *had_error = true;
+                error_count.fetch_add(1, Ordering::Relaxed);
+                observation.record_error(&error);
+            }
         }
         observation
     }
@@ -2119,6 +2407,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn document_symbol_only_work_never_trips_zero_edge_watchdog() {
+        assert!(!should_abort_zero_edge_pass(
+            0,
+            0,
+            false,
+            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+        ));
+        assert!(should_abort_zero_edge_pass(
+            1,
+            ZERO_EDGE_ABORT_THRESHOLD,
+            false,
+            ZERO_EDGE_MIN_WARMUP,
+        ));
+        assert!(!should_abort_zero_edge_pass(
+            1,
+            ZERO_EDGE_ABORT_THRESHOLD,
+            true,
+            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
     fn type_hierarchy_telemetry_uses_all_observed_requests() {
         let profile = super::super::policy::LspQueryProfile::new("rust", "rust-analyzer");
         let telemetry = LspQueryTelemetry::new(&profile);
@@ -2392,7 +2702,7 @@ mod tests {
             evidence: Vec::new(),
         };
         initial
-            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[])
+            .mark_completed_with_output(0, std::slice::from_ref(&recovered_edge), &[], 1)
             .await
             .unwrap();
         initial
@@ -2416,6 +2726,7 @@ mod tests {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: true,
                         }
                     }
                 }
@@ -2491,6 +2802,7 @@ mod tests {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: true,
                         }
                     }
                 }

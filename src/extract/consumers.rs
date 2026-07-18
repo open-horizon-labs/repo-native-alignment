@@ -1576,7 +1576,7 @@ impl ExtractionConsumer for LspConsumer {
                         remediation: self.enricher.toolchain_remediation().map(str::to_string),
                         aborted: enrichment.aborted,
                         diagnostic: enrichment.diagnostic,
-                        validation: enrichment.lsp_validation,
+                        validation: enrichment.lsp_validation.map(Box::new),
                     },
                     ExtractionEvent::LspQueryMetrics {
                         slug: slug.clone(),
@@ -1624,13 +1624,13 @@ impl ExtractionConsumer for LspConsumer {
                         slug,
                         err_text
                     )),
-                    validation: Some(
+                    validation: Some(Box::new(
                         crate::extract::scan_stats::LspValidationEvidence::not_validated(
                             self.language.clone(),
                             self.enricher.name(),
                             err_text,
                         ),
-                    ),
+                    )),
                 }])
             }
         }
@@ -2680,7 +2680,7 @@ async fn emit_enrichment_pipeline_inner(
             ExtractionEvent::EnrichmentComplete {
                 validation: Some(validation),
                 ..
-            } => Some(validation.clone()),
+            } => Some(validation.as_ref().clone()),
             _ => None,
         })
         .collect::<Vec<_>>();

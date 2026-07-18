@@ -10,8 +10,10 @@ use crate::graph::{Node, NodeKind};
 pub enum LspQueryOperation {
     CallHierarchy,
     References,
+    Definitions,
     Implementations,
     TypeHierarchy,
+    DocumentSymbols,
     DocumentLinks,
 }
 
@@ -20,8 +22,10 @@ impl LspQueryOperation {
         match self {
             Self::CallHierarchy => "call_hierarchy",
             Self::References => "references",
+            Self::Definitions => "definitions",
             Self::Implementations => "implementations",
             Self::TypeHierarchy => "type_hierarchy",
+            Self::DocumentSymbols => "document_symbols",
             Self::DocumentLinks => "document_links",
         }
     }
@@ -30,8 +34,10 @@ impl LspQueryOperation {
         match self {
             Self::CallHierarchy => "requesting_call_hierarchy",
             Self::References => "requesting_references",
+            Self::Definitions => "requesting_definitions",
             Self::Implementations => "requesting_implementations",
             Self::TypeHierarchy => "requesting_type_hierarchy",
+            Self::DocumentSymbols => "requesting_document_symbols",
             Self::DocumentLinks => "requesting_document_links",
         }
     }
@@ -76,7 +82,7 @@ impl LspDeclarationClass {
             NodeKind::Enum => Some(Self::Enum),
             NodeKind::TypeAlias => Some(Self::TypeAlias),
             NodeKind::Const => Some(Self::Const),
-            NodeKind::Other(_) => Some(Self::Other),
+            NodeKind::Other(_) | NodeKind::MarkdownSection => Some(Self::Other),
             _ => None,
         }
     }
@@ -93,8 +99,10 @@ impl std::fmt::Display for LspDeclarationClass {
 pub(crate) struct LspServerCapabilities {
     pub references: bool,
     pub call_hierarchy: bool,
+    pub definitions: bool,
     pub implementations: bool,
     pub type_hierarchy: bool,
+    pub document_symbols: bool,
     pub document_links: bool,
 }
 
@@ -103,8 +111,10 @@ impl LspServerCapabilities {
         match operation {
             LspQueryOperation::CallHierarchy => self.call_hierarchy,
             LspQueryOperation::References => self.references,
+            LspQueryOperation::Definitions => self.definitions,
             LspQueryOperation::Implementations => self.implementations,
             LspQueryOperation::TypeHierarchy => self.type_hierarchy,
+            LspQueryOperation::DocumentSymbols => self.document_symbols,
             LspQueryOperation::DocumentLinks => self.document_links,
         }
     }
@@ -333,6 +343,13 @@ impl LspQueryProfile {
             return false;
         }
 
+        // documentSymbol is scoped to a text document, not a declaration.
+        // Any admitted non-synthetic node can represent its file, and the
+        // scheduler deduplicates this operation to one request per file.
+        if operation == LspQueryOperation::DocumentSymbols {
+            return budget.reserve(operation);
+        }
+
         if self
             .allowed_kinds
             .as_ref()
@@ -366,9 +383,11 @@ impl LspQueryProfile {
                         | LspDeclarationClass::Enum
                         | LspDeclarationClass::TypeAlias
                         | LspDeclarationClass::Const
+                        | LspDeclarationClass::Other
                 ) && (declaration != LspDeclarationClass::Const
                     || self.allow_declared_const_references)
             }
+            LspQueryOperation::Definitions => declaration == LspDeclarationClass::Other,
             LspQueryOperation::Implementations => declaration == LspDeclarationClass::Trait,
             LspQueryOperation::TypeHierarchy => matches!(
                 declaration,
@@ -376,6 +395,7 @@ impl LspQueryProfile {
                     | LspDeclarationClass::Struct
                     | LspDeclarationClass::Enum
             ),
+            LspQueryOperation::DocumentSymbols => unreachable!("handled before declaration policy"),
             LspQueryOperation::DocumentLinks => declaration == LspDeclarationClass::Other,
         };
 

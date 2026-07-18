@@ -80,6 +80,30 @@ pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -
         .map(|n| n.id.clone())
 }
 
+/// Find the narrowest enclosing symbol in a pre-indexed, single-file node set.
+///
+/// The Pass 1 file index keeps these nodes ordered by increasing source span, so
+/// the first containing symbol is the same narrowest match as
+/// [`find_enclosing_symbol`] without rescanning every node in the graph.
+pub(super) fn find_enclosing_symbol_in_file(nodes: &[Node], line: usize) -> Option<NodeId> {
+    nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.id.kind,
+                NodeKind::Function
+                    | NodeKind::Impl
+                    | NodeKind::Struct
+                    | NodeKind::Trait
+                    | NodeKind::Enum
+                    | NodeKind::TypeAlias
+                    | NodeKind::Const
+            )
+        })
+        .find(|node| node.line_start <= line && node.line_end >= line)
+        .map(|node| node.id.clone())
+}
+
 /// Extract a relative file path from an LSP URI, relative to a given root.
 ///
 /// Uses `url::Url::to_file_path()` to properly percent-decode URI segments

@@ -501,6 +501,11 @@ fn make_body_node(
     }
     if open.kind == "link"
         && let Some(destination) = open.target.as_deref()
+    {
+        metadata.insert("link_target".into(), destination.to_string());
+    }
+    if open.kind == "link"
+        && let Some(destination) = open.target.as_deref()
         && let Some((file, anchor)) = destination.split_once('#')
         && !anchor.is_empty()
         && !destination.starts_with("http://")
@@ -607,6 +612,13 @@ fn selector_metadata(
     );
     metadata.insert("byte_start".into(), start.to_string());
     metadata.insert("byte_end".into(), end.to_string());
+    let line_start = content[..start.min(content.len())]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let name_col = content[line_start..start.min(content.len())]
+        .encode_utf16()
+        .count();
+    metadata.insert("name_col".into(), name_col.to_string());
     metadata.insert(
         "snippet_hash".into(),
         blake3::hash(&content.as_bytes()[start..end])
@@ -3186,6 +3198,21 @@ The manuscript uses the proxy-risk claim in the opening argument.
         assert_eq!(captions.len(), 1);
         assert_eq!(captions[0].body, "caption");
         assert_eq!(captions[0].line_start, 1);
+    }
+
+    #[test]
+    fn selector_name_col_uses_lsp_utf16_code_units() {
+        let result = MarkdownExtractor::new()
+            .extract(Path::new("doc.md"), "🚀 Follow [source](src/app.py)\n")
+            .unwrap();
+        let link = result
+            .nodes
+            .iter()
+            .find(|node| node.metadata.get("markdown_kind") == Some(&"link".to_string()))
+            .unwrap();
+
+        assert_eq!(link.metadata.get("name_col"), Some(&"10".to_string()));
+        assert_ne!(link.metadata.get("name_col"), Some(&"12".to_string()));
     }
 
     #[test]

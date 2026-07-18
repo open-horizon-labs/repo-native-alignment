@@ -48,5 +48,6 @@ pub mod smoke_test;
 pub mod types;
 pub mod walk;
 
+pub mod lsp_completeness;
 pub mod open_viewer;
 pub mod setup;
