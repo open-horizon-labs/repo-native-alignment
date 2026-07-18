@@ -1492,6 +1492,7 @@ pub fn current_report_identity(
     Ok(identity)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_report(
     repo_root: &Path,
     identity: ReportIdentity,

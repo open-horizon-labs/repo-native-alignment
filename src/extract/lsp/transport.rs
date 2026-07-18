@@ -229,10 +229,7 @@ impl LspTransport {
         let stderr_tail_writer = Arc::clone(&stderr_tail);
         let stderr_handle = tokio::spawn(async move {
             let mut chunk = [0_u8; 4096];
-            loop {
-                let Ok(read) = stderr.read(&mut chunk).await else {
-                    break;
-                };
+            while let Ok(read) = stderr.read(&mut chunk).await {
                 if read == 0 {
                     break;
                 }
