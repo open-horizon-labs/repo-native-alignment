@@ -1942,10 +1942,17 @@ impl RnaHandler {
             .cloned()
             .map(|file| (primary_slug.clone(), file))
             .collect();
-        let lsp_node_filter = super::changed_file_plan::plan_lsp_node_ids_for_touched_files(
-            &touched_files,
-            &all_nodes,
-        )?;
+        let empty_rebuilt_partitions = BTreeSet::new();
+        let rebuilt_partitions = cache_plan
+            .as_ref()
+            .map(|plan| &plan.escalated_partitions)
+            .unwrap_or(&empty_rebuilt_partitions);
+        let lsp_node_filter =
+            super::changed_file_plan::plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+                &touched_files,
+                &all_nodes,
+                rebuilt_partitions,
+            )?;
         let purged_lsp_edge_ids = purge_existing_scoped_lsp_output(
             &mut all_nodes,
             &mut all_edges,

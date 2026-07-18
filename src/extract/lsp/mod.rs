@@ -53,6 +53,9 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 
 pub const CSHARP_TOOLCHAIN_REMEDIATION: &str = "C# LSP needs dotnet, csharp-ls, and a visible .NET root. Install .NET (brew install --cask dotnet-sdk, mise use dotnet@latest, asdf install dotnet latest, or Microsoft installer), install csharp-ls with `dotnet tool install -g csharp-ls`, add `$HOME/.dotnet/tools` to PATH, and set DOTNET_ROOT/DOTNET_ROOT_ARM64 to the installed .NET root for MCP stdio env.";
 
+pub(crate) const MAX_INCREMENTAL_LSP_NODES: usize = 4_096;
+pub(crate) const MAX_INCREMENTAL_LSP_OPERATIONS: usize = 12_288;
+
 type InitSettingsFactory = fn() -> serde_json::Value;
 
 #[derive(Clone, Copy)]

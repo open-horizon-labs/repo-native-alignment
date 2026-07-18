@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, Repository};
 
 use crate::extract::lsp::{
-    planned_operations_for_node, planned_operations_for_node_with_broad_references,
+    MAX_INCREMENTAL_LSP_NODES, MAX_INCREMENTAL_LSP_OPERATIONS, planned_operations_for_node,
+    planned_operations_for_node_with_broad_references,
 };
 use crate::graph::Node;
 
-pub(crate) const MAX_CHANGED_LSP_NODES: usize = 4_096;
-pub(crate) const MAX_CHANGED_LSP_OPERATIONS: usize = 12_288;
+pub(crate) const MAX_CHANGED_LSP_NODES: usize = MAX_INCREMENTAL_LSP_NODES;
+pub(crate) const MAX_CHANGED_LSP_OPERATIONS: usize = MAX_INCREMENTAL_LSP_OPERATIONS;
 
 const SCOPE_HELP: &str = "use `--scope root --root <slug>` or `--scope repo` when bounded changed-file planning is unavailable";
 
@@ -297,6 +298,18 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
     touched_files: &HashSet<(String, PathBuf)>,
     cached_nodes: &[Node],
 ) -> Result<Arc<HashSet<String>>> {
+    plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+        touched_files,
+        cached_nodes,
+        &BTreeSet::new(),
+    )
+}
+
+pub(crate) fn plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+    touched_files: &HashSet<(String, PathBuf)>,
+    cached_nodes: &[Node],
+    rebuilt_partitions: &BTreeSet<String>,
+) -> Result<Arc<HashSet<String>>> {
     let supported_languages =
         crate::extract::EnricherRegistry::with_builtins().supported_languages();
     let touched_roots: HashSet<&str> = touched_files
@@ -304,6 +317,8 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
         .map(|(root, _)| root.as_str())
         .collect();
     let mut planned_node_ids = HashSet::new();
+    let mut planned_languages = BTreeSet::new();
+    let mut eligible_rebuild_node_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut operation_count = 0usize;
 
     for node in cached_nodes {
@@ -315,24 +330,52 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
             continue;
         }
         let file = normalize_relative(&node.id.file)?;
-        if !touched_files.contains(&(node.id.root.clone(), file)) {
-            continue;
-        }
-
         let requested_operations = planned_operations_for_node(node);
-        if requested_operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
+        if requested_operations.is_empty() {
             continue;
         }
+        let stable_id = node.stable_id();
+        if rebuilt_partitions.contains(&node.language) {
+            eligible_rebuild_node_ids
+                .entry(node.language.clone())
+                .or_default()
+                .insert(stable_id.clone());
+        }
+        if !touched_files.contains(&(node.id.root.clone(), file))
+            || !planned_node_ids.insert(stable_id)
+        {
+            continue;
+        }
+        planned_languages.insert(node.language.clone());
         operation_count = operation_count
             .checked_add(requested_operations.len())
             .context("changed-file LSP operation count overflowed")?;
-        if planned_node_ids.len() > MAX_CHANGED_LSP_NODES
-            || operation_count > MAX_CHANGED_LSP_OPERATIONS
+    }
+
+    for (partition, expected_node_ids) in eligible_rebuild_node_ids {
+        if let Some(missing_node_id) = expected_node_ids
+            .iter()
+            .find(|node_id| !planned_node_ids.contains(*node_id))
         {
             anyhow::bail!(
-                "changed-file LSP plan exceeds its bound (max {} nodes / {} operations); {SCOPE_HELP}",
+                "descriptor-owned LSP partition rebuild for {partition} is incomplete (missing {missing_node_id}); {SCOPE_HELP}"
+            );
+        }
+    }
+
+    if planned_node_ids.len() > MAX_CHANGED_LSP_NODES
+        || operation_count > MAX_CHANGED_LSP_OPERATIONS
+    {
+        let unrebuilt_languages = planned_languages
+            .difference(rebuilt_partitions)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unrebuilt_languages.is_empty() {
+            anyhow::bail!(
+                "changed-file LSP plan exceeds its bound (max {} nodes / {} operations) and affected descriptor partition(s) were not rebuilt: {}; {SCOPE_HELP}",
                 MAX_CHANGED_LSP_NODES,
-                MAX_CHANGED_LSP_OPERATIONS
+                MAX_CHANGED_LSP_OPERATIONS,
+                unrebuilt_languages.join(", ")
             );
         }
     }
@@ -561,6 +604,48 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
+    }
+
+    #[test]
+    fn over_bound_plan_requires_and_accepts_complete_descriptor_partition_rebuild() {
+        let mut nodes = (0..=MAX_CHANGED_LSP_NODES)
+            .map(|index| {
+                node(
+                    "src/dense.rs",
+                    &format!("symbol_{index}"),
+                    NodeKind::Function,
+                )
+            })
+            .collect::<Vec<_>>();
+        let touched_files = HashSet::from([("fixture".to_string(), PathBuf::from("src/dense.rs"))]);
+
+        let bounded_error =
+            plan_lsp_node_ids_for_touched_files(&touched_files, &nodes).unwrap_err();
+        assert!(bounded_error.to_string().contains("exceeds its bound"));
+        assert!(bounded_error.to_string().contains("rust"));
+
+        let rebuilt_partitions = BTreeSet::from(["rust".to_string()]);
+        let ids = plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+            &touched_files,
+            &nodes,
+            &rebuilt_partitions,
+        )
+        .unwrap();
+        assert_eq!(ids.len(), MAX_CHANGED_LSP_NODES + 1);
+
+        nodes.push(node(
+            "src/not-selected.rs",
+            "not_selected",
+            NodeKind::Function,
+        ));
+        let incomplete_error = plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+            &touched_files,
+            &nodes,
+            &rebuilt_partitions,
+        )
+        .unwrap_err();
+        assert!(incomplete_error.to_string().contains("is incomplete"));
+        assert!(incomplete_error.to_string().contains("not-selected.rs"));
     }
 
     #[test]
