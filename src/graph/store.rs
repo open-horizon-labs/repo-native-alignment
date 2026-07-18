@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 24; // persist content-derived edge evidence
+pub const SCHEMA_VERSION: u32 = 25; // persist exact structured edge endpoint identities
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -181,8 +181,13 @@ pub fn edges_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("source_id", DataType::Utf8, false),
+        Field::new("source_file", DataType::Utf8, false),
+        Field::new("source_name", DataType::Utf8, false),
         Field::new("source_type", DataType::Utf8, false),
         Field::new("target_id", DataType::Utf8, false),
+        Field::new("target_root_id", DataType::Utf8, false),
+        Field::new("target_file", DataType::Utf8, false),
+        Field::new("target_name", DataType::Utf8, false),
         Field::new("target_type", DataType::Utf8, false),
         Field::new("edge_type", DataType::Utf8, false),
         Field::new("edge_source", DataType::Utf8, false),
@@ -274,7 +279,12 @@ mod tests {
     fn test_edges_schema_has_expected_fields() {
         let schema = edges_schema();
         assert!(schema.field_with_name("source_id").is_ok());
+        assert!(schema.field_with_name("source_file").is_ok());
+        assert!(schema.field_with_name("source_name").is_ok());
         assert!(schema.field_with_name("target_id").is_ok());
+        assert!(schema.field_with_name("target_root_id").is_ok());
+        assert!(schema.field_with_name("target_file").is_ok());
+        assert!(schema.field_with_name("target_name").is_ok());
         assert!(schema.field_with_name("edge_type").is_ok());
     }
 }
