@@ -250,12 +250,35 @@ fn purge_existing_scoped_lsp_output(
     node_filter: &HashSet<String>,
     file_filter: &HashSet<PathBuf>,
 ) -> Vec<String> {
+    let directly_impacted_lsp_node_ids = nodes
+        .iter()
+        .filter(|node| {
+            node.source == crate::graph::ExtractionSource::Lsp
+                && (node_filter.contains(&node.stable_id()) || file_filter.contains(&node.id.file))
+        })
+        .map(Node::stable_id)
+        .collect::<HashSet<_>>();
+    let is_impacted_edge = |edge: &Edge| {
+        directly_impacted_lsp_node_ids.contains(&edge.from.to_stable_id())
+            || directly_impacted_lsp_node_ids.contains(&edge.to.to_stable_id())
+            || is_scoped_lsp_edge(edge, node_filter)
+    };
     let impacted_lsp_node_ids = edges
         .iter()
-        .filter(|edge| is_scoped_lsp_edge(edge, node_filter))
+        .filter(|edge| is_impacted_edge(edge))
         .flat_map(|edge| [edge.from.to_stable_id(), edge.to.to_stable_id()])
         .collect::<HashSet<_>>();
-    let removed_edge_ids = remove_existing_scoped_lsp_edges(edges, node_filter);
+    let mut removed_edge_ids = Vec::new();
+    edges.retain(|edge| {
+        if is_impacted_edge(edge) {
+            removed_edge_ids.push(edge.stable_id());
+            false
+        } else {
+            true
+        }
+    });
+    removed_edge_ids.sort();
+    removed_edge_ids.dedup();
     let retained_endpoint_ids = edges
         .iter()
         .flat_map(|edge| [edge.from.to_stable_id(), edge.to.to_stable_id()])
@@ -265,9 +288,10 @@ fn purge_existing_scoped_lsp_output(
             return true;
         }
         let stable_id = node.stable_id();
-        let impacted = node_filter.contains(&stable_id)
-            || file_filter.contains(&node.id.file)
-            || impacted_lsp_node_ids.contains(&stable_id);
+        if directly_impacted_lsp_node_ids.contains(&stable_id) {
+            return false;
+        }
+        let impacted = impacted_lsp_node_ids.contains(&stable_id);
         !impacted || retained_endpoint_ids.contains(&stable_id)
     });
     removed_edge_ids
@@ -3829,7 +3853,7 @@ impl RnaHandler {
 mod tests {
     use super::*;
     use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     fn make_node(name: &str, kind: NodeKind) -> Node {
@@ -4136,6 +4160,142 @@ mod tests {
                 .iter()
                 .any(|node| node.stable_id() == shared.stable_id())
         );
+    }
+
+    #[tokio::test]
+    async fn deleted_or_old_rename_document_symbols_cannot_survive_persisted_readiness_purge() {
+        let repo = tempfile::tempdir().unwrap();
+        let stale_path = PathBuf::from("astropy/io/fits/src/compressionmodule.c");
+        let mut stale_document_symbol = make_node_in_file(
+            stale_path.to_str().unwrap(),
+            "compress@discarded",
+            NodeKind::Other("lsp_document_symbol".to_string()),
+        );
+        stale_document_symbol.source = ExtractionSource::Lsp;
+        let module = make_node_in_file(
+            "astropy/io/fits/src",
+            "astropy.io.fits.src",
+            NodeKind::Module,
+        );
+        let subsystem = make_node_in_file(
+            "subsystems/tests",
+            "tests",
+            NodeKind::Other("subsystem".to_string()),
+        );
+        let mut live_document_symbol = make_node_in_file(
+            "astropy/io/fits/src/live.c",
+            "live@retained",
+            NodeKind::Other("lsp_document_symbol".to_string()),
+        );
+        live_document_symbol.source = ExtractionSource::Lsp;
+        let edge = |from: &Node, to: &Node, kind: EdgeKind, source: ExtractionSource| Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            kind,
+            source,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let stale_module_edge = edge(
+            &stale_document_symbol,
+            &module,
+            EdgeKind::BelongsTo,
+            ExtractionSource::TreeSitter,
+        );
+        let stale_subsystem_edge = edge(
+            &stale_document_symbol,
+            &subsystem,
+            EdgeKind::BelongsTo,
+            ExtractionSource::TreeSitter,
+        );
+        let stale_cross_file_edge = edge(
+            &live_document_symbol,
+            &stale_document_symbol,
+            EdgeKind::Calls,
+            ExtractionSource::Lsp,
+        );
+        let retained_unrelated_edge = edge(
+            &live_document_symbol,
+            &module,
+            EdgeKind::BelongsTo,
+            ExtractionSource::TreeSitter,
+        );
+        let mut nodes = vec![
+            stale_document_symbol.clone(),
+            module,
+            subsystem,
+            live_document_symbol.clone(),
+        ];
+        let mut edges = vec![
+            stale_module_edge.clone(),
+            stale_subsystem_edge.clone(),
+            stale_cross_file_edge.clone(),
+            retained_unrelated_edge.clone(),
+        ];
+        let stale_paths = BTreeSet::from([stale_path.clone()]);
+
+        persist_graph_to_lance(repo.path(), &nodes, &edges)
+            .await
+            .expect("persist stale fixture graph");
+        let rejected = crate::structural_cache::validate_persisted_target(
+            repo.path(),
+            &nodes,
+            &edges,
+            &stale_paths,
+        )
+        .await
+        .expect_err("persisted readiness must reject a stale path");
+        assert!(
+            rejected
+                .to_string()
+                .contains("retains a deleted/old-rename path")
+        );
+
+        let removed = purge_existing_scoped_lsp_output(
+            &mut nodes,
+            &mut edges,
+            &HashSet::new(),
+            &HashSet::from([stale_path.clone()]),
+        );
+
+        assert_eq!(
+            removed.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                stale_module_edge.stable_id(),
+                stale_subsystem_edge.stable_id(),
+                stale_cross_file_edge.stable_id(),
+            ])
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), retained_unrelated_edge.stable_id());
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| node.stable_id() == stale_document_symbol.stable_id())
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.stable_id() == live_document_symbol.stable_id())
+        );
+        assert!(nodes.iter().all(|node| node.id.file != stale_path));
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.from.file != stale_path && edge.to.file != stale_path)
+        );
+
+        persist_graph_to_lance(repo.path(), &nodes, &edges)
+            .await
+            .expect("persist purged fixture graph");
+        crate::structural_cache::validate_persisted_target(
+            repo.path(),
+            &nodes,
+            &edges,
+            &stale_paths,
+        )
+        .await
+        .expect("purged graph survives reopen and persisted readiness validation");
     }
 
     #[test]

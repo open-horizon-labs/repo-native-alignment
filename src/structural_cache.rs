@@ -1366,6 +1366,81 @@ mod tests {
         assert!(!pattern_matches("requirements*.txt", "src/main.py"));
     }
 
+    fn influence_entries(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(path, blob)| ((*path).to_string(), (*blob).to_string()))
+            .collect()
+    }
+
+    fn changed_partition_signatures(
+        base: &[(String, String)],
+        target: &[(String, String)],
+    ) -> BTreeSet<String> {
+        let base = partition_identities(base).unwrap();
+        let target = partition_identities(target).unwrap();
+        base.into_iter()
+            .filter_map(|(language, partition)| {
+                (target[&language].signature != partition.signature).then_some(language)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn python_project_config_changes_only_python_owned_partitions() {
+        let base = influence_entries(&[
+            ("pyproject.toml", "base-pyproject"),
+            ("setup.cfg", "base-setup-cfg"),
+            ("setup.py", "base-setup-py"),
+            ("tox.ini", "base-tox"),
+        ]);
+        let target = influence_entries(&[
+            ("pyproject.toml", "target-pyproject"),
+            ("setup.cfg", "target-setup-cfg"),
+            ("setup.py", "target-setup-py"),
+            ("tox.ini", "target-tox"),
+        ]);
+
+        assert_eq!(
+            changed_partition_signatures(&base, &target),
+            BTreeSet::from(["cython".to_string(), "python".to_string()])
+        );
+    }
+
+    #[test]
+    fn ci_yaml_and_test_json_do_not_invalidate_unrelated_partitions() {
+        let base = influence_entries(&[
+            (".github/workflows/ci.yml", "base-ci"),
+            ("tests/fixtures/snapshot.json", "base-snapshot"),
+        ]);
+        let target = influence_entries(&[
+            (".github/workflows/ci.yml", "target-ci"),
+            ("tests/fixtures/snapshot.json", "target-snapshot"),
+        ]);
+
+        assert!(changed_partition_signatures(&base, &target).is_empty());
+    }
+
+    #[test]
+    fn true_shared_config_invalidates_all_partitions() {
+        let base = influence_entries(&[(".oh/config.toml", "base-config")]);
+        let target = influence_entries(&[(".oh/config.toml", "target-config")]);
+        let base_partitions = partition_identities(&base).unwrap();
+        let target_partitions = partition_identities(&target).unwrap();
+        let shared_changed = influence_digest(&base, SHARED_INFLUENCE_PATTERNS)
+            != influence_digest(&target, SHARED_INFLUENCE_PATTERNS);
+        let invalidated = base_partitions
+            .iter()
+            .filter_map(|(language, partition)| {
+                (shared_changed || target_partitions[language].signature != partition.signature)
+                    .then_some(language.clone())
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert!(shared_changed);
+        assert_eq!(invalidated, base_partitions.into_keys().collect());
+    }
+
     #[test]
     fn execution_digest_detects_copied_or_modified_plan() {
         let mut execution = StructuralCacheExecution {

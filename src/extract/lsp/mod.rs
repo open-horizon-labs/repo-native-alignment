@@ -86,89 +86,6 @@ pub(crate) struct BuiltinLspDescriptor {
     allow_declared_const_references: bool,
 }
 
-/// Project/dependency inputs whose language ownership is ambiguous from a path
-/// alone. Every descriptor includes them conservatively, so a change rebuilds
-/// all language partitions instead of silently inheriting stale server state.
-const SHARED_PROJECT_INFLUENCE_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.*",
-    ".tool-versions",
-    "*.cabal",
-    "*.cfg",
-    "*.conf",
-    "*.csproj",
-    "*.fsproj",
-    "*.gradle",
-    "*.gradle.kts",
-    "*.ini",
-    "*.json",
-    "*.jsonc",
-    "*.lock",
-    "*.nimble",
-    "*.opam",
-    "*.properties",
-    "*.sbt",
-    "*.sln",
-    "*.tf",
-    "*.tfvars",
-    "*.toml",
-    "*.vbproj",
-    "*.yaml",
-    "*.yml",
-    "BUILD",
-    "BUILD.bazel",
-    "CMakeLists.txt",
-    "DESCRIPTION",
-    "Directory.Build.props",
-    "Directory.Build.targets",
-    "Dockerfile",
-    "Gemfile",
-    "Makefile",
-    "MODULE.bazel",
-    "Manifest.toml",
-    "Package.resolved",
-    "Package.swift",
-    "Project.toml",
-    "WORKSPACE",
-    "WORKSPACE.bazel",
-    "babel.cfg",
-    "build.zig",
-    "build.zig.zon",
-    "cabal.project",
-    "composer.json",
-    "composer.lock",
-    "deps.edn",
-    "dune",
-    "dune-project",
-    "flake.lock",
-    "flake.nix",
-    "gleam.toml",
-    "go.mod",
-    "go.sum",
-    "go.work",
-    "gradle.properties",
-    "manifest.toml",
-    "mix.exs",
-    "mix.lock",
-    "package-lock.json",
-    "package.json",
-    "pnpm-lock.yaml",
-    "pom.xml",
-    "project.clj",
-    "pubspec.lock",
-    "pubspec.yaml",
-    "pyproject.toml",
-    "rebar.config",
-    "rebar.lock",
-    "renv.lock",
-    "requirements*.txt",
-    "setup.cfg",
-    "setup.py",
-    "stack.yaml",
-    "tox.ini",
-    "yarn.lock",
-];
-
 impl BuiltinLspDescriptor {
     pub(crate) fn language(&self) -> &'static str {
         self.language
@@ -203,8 +120,7 @@ impl BuiltinLspDescriptor {
     }
 
     pub(crate) fn partition_influence_patterns(&self) -> Vec<&'static str> {
-        let mut patterns = SHARED_PROJECT_INFLUENCE_PATTERNS.to_vec();
-        patterns.extend(self.partition_influence_patterns);
+        let mut patterns = self.partition_influence_patterns.to_vec();
         if let Some(config_file) = self.config_file {
             patterns.push(config_file);
         }
@@ -267,6 +183,13 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
     BuiltinLspDescriptor {
         init_settings: None,
         config_file: Some("Cargo.toml"),
+        partition_influence_patterns: &[
+            "Cargo.lock",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            ".cargo/config",
+            ".cargo/config.toml",
+        ],
         allow_declared_const_references: true,
         ..builtin_lsp!("rust", "rust-analyzer", &[], &["rs"])
     },
@@ -330,28 +253,34 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         partition_influence_patterns: &["go.sum", "go.work", "**/go.mod"],
         ..builtin_lsp!("go", "gopls", &["serve"], &["go"])
     },
-    builtin_lsp!("markdown", "marksman", &["server"], &["md", "markdown"]),
-    builtin_lsp!(
-        "restructuredtext",
-        "esbonio",
-        &["server"],
-        &[
-            "rst",
-            "rst_t",
-            "inc",
-            "breaking",
-            "bugfix",
-            "extension",
-            "false_negative",
-            "false_positive",
-            "feature",
-            "internal",
-            "new_check",
-            "other",
-            "performance",
-            "user_action"
-        ]
-    ),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[".marksman.toml"],
+        ..builtin_lsp!("markdown", "marksman", &["server"], &["md", "markdown"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["conf.py"],
+        ..builtin_lsp!(
+            "restructuredtext",
+            "esbonio",
+            &["server"],
+            &[
+                "rst",
+                "rst_t",
+                "inc",
+                "breaking",
+                "bugfix",
+                "extension",
+                "false_negative",
+                "false_positive",
+                "feature",
+                "internal",
+                "new_check",
+                "other",
+                "performance",
+                "user_action"
+            ]
+        )
+    },
     builtin_lsp!(
         "plaintext",
         "rna-cohort-language-server",
@@ -399,12 +328,34 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ],
         ..builtin_lsp!("java", "jdtls", &[], &["java"])
     },
-    builtin_lsp!("ruby", "solargraph", &["stdio"], &["rb"]),
     BuiltinLspDescriptor {
+        partition_influence_patterns: &[
+            "Gemfile",
+            "Gemfile.lock",
+            ".ruby-version",
+            ".solargraph.yml",
+        ],
+        ..builtin_lsp!("ruby", "solargraph", &["stdio"], &["rb"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[
+            "*.csproj",
+            "*.fsproj",
+            "*.vbproj",
+            "*.sln",
+            "Directory.Build.props",
+            "Directory.Build.targets",
+            "global.json",
+            "NuGet.config",
+            "packages.lock.json",
+        ],
         toolchain_remediation: Some(CSHARP_TOOLCHAIN_REMEDIATION),
         ..builtin_lsp!("csharp", "csharp-ls", &[], &["cs"])
     },
-    builtin_lsp!("swift", "sourcekit-lsp", &[], &["swift"]),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["Package.swift", "Package.resolved"],
+        ..builtin_lsp!("swift", "sourcekit-lsp", &[], &["swift"])
+    },
     BuiltinLspDescriptor {
         config_file: Some("build.gradle.kts"),
         partition_influence_patterns: &[
@@ -415,30 +366,60 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ],
         ..builtin_lsp!("kotlin", "kotlin-language-server", &[], &["kt", "kts"])
     },
-    builtin_lsp!("lua", "lua-language-server", &[], &["lua"]),
-    builtin_lsp!("zig", "zls", &[], &["zig"]),
-    builtin_lsp!("elixir", "elixir-ls", &[], &["ex", "exs"]),
-    builtin_lsp!("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
-    builtin_lsp!("ocaml", "ocamllsp", &[], &["ml", "mli"]),
-    builtin_lsp!("scala", "metals", &[], &["scala", "sc"]),
-    builtin_lsp!("dart", "dart", &["language-server"], &["dart"]),
-    builtin_lsp!(
-        "r",
-        "R",
-        &["--no-echo", "-e", "languageserver::run()"],
-        &["r", "R"]
-    ),
-    builtin_lsp!(
-        "julia",
-        "julia",
-        &[
-            "--startup-file=no",
-            "-e",
-            "using LanguageServer; runserver()"
-        ],
-        &["jl"]
-    ),
-    builtin_lsp!("php", "intelephense", &["--stdio"], &["php"]),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[".luarc.json", ".luarc.jsonc"],
+        ..builtin_lsp!("lua", "lua-language-server", &[], &["lua"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["build.zig", "build.zig.zon"],
+        ..builtin_lsp!("zig", "zls", &[], &["zig"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["mix.exs", "mix.lock"],
+        ..builtin_lsp!("elixir", "elixir-ls", &[], &["ex", "exs"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["*.cabal", "cabal.project", "stack.yaml", "hie.yaml"],
+        ..builtin_lsp!("haskell", "haskell-language-server", &["--lsp"], &["hs"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["*.opam", "dune", "dune-project"],
+        ..builtin_lsp!("ocaml", "ocamllsp", &[], &["ml", "mli"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["*.sbt", "build.sc"],
+        ..builtin_lsp!("scala", "metals", &[], &["scala", "sc"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["pubspec.yaml", "pubspec.lock", "analysis_options.yaml"],
+        ..builtin_lsp!("dart", "dart", &["language-server"], &["dart"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["DESCRIPTION", "renv.lock", ".Rprofile"],
+        ..builtin_lsp!(
+            "r",
+            "R",
+            &["--no-echo", "-e", "languageserver::run()"],
+            &["r", "R"]
+        )
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["Project.toml", "Manifest.toml"],
+        ..builtin_lsp!(
+            "julia",
+            "julia",
+            &[
+                "--startup-file=no",
+                "-e",
+                "using LanguageServer; runserver()"
+            ],
+            &["jl"]
+        )
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["composer.json", "composer.lock"],
+        ..builtin_lsp!("php", "intelephense", &["--stdio"], &["php"])
+    },
     builtin_lsp!(
         "css",
         "vscode-css-language-server",
@@ -479,13 +460,19 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             "stp"
         ]
     ),
-    builtin_lsp!(
-        "latex",
-        "texlab",
-        &[],
-        &["tex", "bib", "sty", "cls", "tex_t", "sty_t", "xdy", "ist"]
-    ),
-    builtin_lsp!("gettext", "babel-lsp", &[], &["po", "pot", "pot_t"]),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["texlab.toml", ".latexmkrc"],
+        ..builtin_lsp!(
+            "latex",
+            "texlab",
+            &[],
+            &["tex", "bib", "sty", "cls", "tex_t", "sty_t", "xdy", "ist"]
+        )
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["babel.cfg"],
+        ..builtin_lsp!("gettext", "babel-lsp", &[], &["po", "pot", "pot_t"])
+    },
     builtin_lsp!(
         "config",
         "rna-config-language-server",
@@ -567,14 +554,52 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         &["--language", "cohort-text"],
         &[]
     ),
-    builtin_lsp!("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
-    builtin_lsp!("nix", "nil", &[], &["nix"]),
-    builtin_lsp!("vue", "vue-language-server", &["--stdio"], &["vue"]),
-    builtin_lsp!("svelte", "svelteserver", &["--stdio"], &["svelte"]),
-    builtin_lsp!("erlang", "erlang_ls", &[], &["erl", "hrl"]),
-    builtin_lsp!("gleam", "gleam", &["lsp"], &["gleam"]),
-    builtin_lsp!("nim", "nimlsp", &[], &["nim"]),
-    builtin_lsp!("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[".terraform.lock.hcl", ".terraformrc", "terraform.rc"],
+        ..builtin_lsp!("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["flake.nix", "flake.lock"],
+        ..builtin_lsp!("nix", "nil", &[], &["nix"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "tsconfig.json",
+            "jsconfig.json",
+        ],
+        ..builtin_lsp!("vue", "vue-language-server", &["--stdio"], &["vue"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &[
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "tsconfig.json",
+            "jsconfig.json",
+        ],
+        ..builtin_lsp!("svelte", "svelteserver", &["--stdio"], &["svelte"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["rebar.config", "rebar.lock"],
+        ..builtin_lsp!("erlang", "erlang_ls", &[], &["erl", "hrl"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["gleam.toml", "manifest.toml"],
+        ..builtin_lsp!("gleam", "gleam", &["lsp"], &["gleam"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["*.nimble"],
+        ..builtin_lsp!("nim", "nimlsp", &[], &["nim"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["deps.edn", "project.clj"],
+        ..builtin_lsp!("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"])
+    },
     BuiltinLspDescriptor {
         config_file: Some("tsconfig.json"),
         partition_influence_patterns: &[
@@ -587,8 +612,14 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ],
         ..builtin_lsp!("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"])
     },
-    builtin_lsp!("protobuf", "buf", &["lsp"], &["proto"]),
-    builtin_lsp!("typst", "tinymist", &[], &["typ"]),
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["buf.yaml", "buf.work.yaml", "buf.lock"],
+        ..builtin_lsp!("protobuf", "buf", &["lsp"], &["proto"])
+    },
+    BuiltinLspDescriptor {
+        partition_influence_patterns: &["typst.toml"],
+        ..builtin_lsp!("typst", "tinymist", &[], &["typ"])
+    },
 ];
 
 pub(crate) fn builtin_lsp_descriptors() -> &'static [BuiltinLspDescriptor] {
