@@ -25,10 +25,10 @@ fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
 fs.writeFileSync(
   workItemLedgerPath,
   JSON.stringify({
-    schema_version: 3,
+    schema_version: 4,
     records: {
       "mcp-smoke:0": {
-        schema_version: 3,
+        schema_version: 4,
         job_id: "mcp-smoke",
         item_id: 0,
         repo: repoPath,
