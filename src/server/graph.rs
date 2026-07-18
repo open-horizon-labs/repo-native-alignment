@@ -806,6 +806,8 @@ impl RnaHandler {
                                 lance_repo_root: None,
                                 skip_lsp: false, // incremental background path: LSP runs inline
                                 lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                                file_readiness: false,
+                                file_readiness_filter: None,
                                 broad_reference_budget: None,
                             },
                             dirty_slugs,
@@ -1855,6 +1857,8 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                         skip_lsp: spawn_background || !enrichment.runs_lsp(),
                         lsp_node_filter: None,
+                        file_readiness: !spawn_background && enrichment.runs_lsp(),
+                        file_readiness_filter: None,
                         broad_reference_budget: None,
                     },
                     dirty_slugs,
@@ -2548,6 +2552,8 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                         skip_lsp: !enrichment.runs_lsp(),
                         lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                        file_readiness: false,
+                        file_readiness_filter: None,
                         broad_reference_budget: None,
                     },
                     dirty_slugs,

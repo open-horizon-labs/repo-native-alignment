@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Edge, Node};
 
-const STORE_SCHEMA_VERSION: u32 = 3;
+pub(crate) const STORE_SCHEMA_VERSION: u32 = 4;
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
@@ -98,6 +98,11 @@ pub struct LspWorkItemRecord {
     pub output_edges: Vec<Edge>,
     #[serde(default)]
     pub output_nodes: Vec<Node>,
+    /// Exact stable graph result IDs emitted by this producer. This durable
+    /// lineage lets verified structural-cache reuse retain a shared result only
+    /// while at least one authenticated producer remains valid.
+    #[serde(default)]
+    pub produced_result_ids: Vec<String>,
     /// Number of raw, applicable LSP results observed before graph mapping.
     /// This remains non-zero when a server response cannot be mapped to a
     /// persistable graph node or edge, allowing readiness to fail closed.
@@ -511,6 +516,13 @@ impl LspWorkItemLedger {
         self.update(item_id, |record| {
             record.output_edges = edges.to_vec();
             record.output_nodes = nodes.to_vec();
+            record.produced_result_ids = edges
+                .iter()
+                .map(Edge::stable_id)
+                .chain(nodes.iter().map(Node::stable_id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             record.observed_result_count = observed_result_count;
         })?;
         self.mark_terminal(item_id, LspWorkItemState::Completed, None)
@@ -657,6 +669,7 @@ fn new_record(
         recovery: LspWorkItemRecovery::New,
         output_edges: Vec::new(),
         output_nodes: Vec::new(),
+        produced_result_ids: Vec::new(),
         observed_result_count: 0,
     }
 }
@@ -786,6 +799,32 @@ pub(crate) fn load_records_since(
 
 pub(crate) fn load_all_records(repo_root: &Path) -> Result<Vec<LspWorkItemRecord>> {
     load_records_since(repo_root, 0)
+}
+
+/// Remove carried work for files that the structural-cache impact plan will
+/// execute again. This operates only on the injected mutable copy; the base
+/// archive remains immutable. Returning the removed producer IDs lets callers
+/// audit that unchanged files were not accidentally invalidated.
+pub(crate) fn purge_records_for_paths(
+    repo_root: &Path,
+    paths: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _file_lock = WorkItemFileLock::acquire(repo_root);
+    let mut store = load_store(repo_root)?;
+    let removed = store
+        .records
+        .iter()
+        .filter(|(_, record)| paths.contains(&record.file))
+        .map(|(record_id, _)| record_id.clone())
+        .collect::<Vec<_>>();
+    store
+        .records
+        .retain(|_, record| !paths.contains(&record.file));
+    write_store(repo_root, &store)?;
+    Ok(removed)
 }
 
 pub fn load_queue_snapshots_since(

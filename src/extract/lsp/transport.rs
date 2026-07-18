@@ -6,7 +6,7 @@
 //!
 //! Also provides URI helper functions shared by both transports and the enricher.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,16 +26,30 @@ use crate::graph::{NodeId, NodeKind};
 // URI helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a file path to a `file://` URI string, then parse as lsp_types::Uri.
+/// Convert a file path to a percent-encoded `file://` URI.
 pub(super) fn path_to_uri(path: &Path) -> Result<Uri> {
-    // Canonicalize to absolute path
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let uri_string = format!("file://{}", abs.display());
-    Uri::from_str(&uri_string).map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))
+    let file_url = url::Url::from_file_path(&abs)
+        .map_err(|()| anyhow::anyhow!("Invalid file path for URI: {}", abs.display()))?;
+    // WHATWG file URLs leave these characters raw in path segments, while
+    // lsp_types::Uri uses a strict RFC 3986 parser that rejects them there.
+    let encoded_path = file_url[url::Position::BeforePath..url::Position::AfterPath]
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('^', "%5E")
+        .replace('|', "%7C");
+    let uri_string = format!(
+        "{}{}{}",
+        &file_url[..url::Position::BeforePath],
+        encoded_path,
+        &file_url[url::Position::AfterPath..]
+    );
+    Uri::from_str(&uri_string)
+        .map_err(|e| anyhow::anyhow!("Invalid URI {}: {}", uri_string, e))
 }
 
 /// Find the narrowest enclosing function/impl/struct at a given file + line.
@@ -192,6 +206,8 @@ pub(super) struct LspTransport {
     pub(super) child: Child,
     pub(super) reader: BufReader<tokio::process::ChildStdout>,
     pub(super) next_id: i64,
+    stderr_tail: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    stderr_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LspTransport {
@@ -208,12 +224,33 @@ impl LspTransport {
             .context(format!("Failed to spawn {}", command))?;
 
         let stdout = child.stdout.take().context("No stdout from LSP process")?;
+        let mut stderr = child.stderr.take().context("No stderr from LSP process")?;
+        let stderr_tail = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(8192)));
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
+        let stderr_handle = tokio::spawn(async move {
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let Ok(read) = stderr.read(&mut chunk).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                let mut tail = stderr_tail_writer.lock().unwrap();
+                tail.extend(&chunk[..read]);
+                while tail.len() > 8192 {
+                    tail.pop_front();
+                }
+            }
+        });
         let reader = BufReader::new(stdout);
 
         Ok(Self {
             child,
             reader,
             next_id: 1,
+            stderr_tail,
+            stderr_handle: Some(stderr_handle),
         })
     }
 
@@ -347,6 +384,9 @@ impl LspTransport {
         let _ = self.notify("exit", serde_json::Value::Null).await;
         // Wait for process to exit
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), self.child.wait()).await;
+        if let Some(stderr_handle) = self.stderr_handle.take() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), stderr_handle).await;
+        }
         Ok(())
     }
 }
@@ -388,6 +428,8 @@ pub(super) struct PipelinedTransport {
     pub quiescent_flag: Arc<AtomicBool>,
     /// Handle to the background reader task (for cleanup).
     _reader_handle: tokio::task::JoinHandle<()>,
+    _stderr_tail: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    _stderr_handle: Option<tokio::task::JoinHandle<()>>,
     /// The child process (kept alive; kill_on_drop).
     _child: Arc<Mutex<Child>>,
 }
@@ -407,6 +449,8 @@ impl PipelinedTransport {
         let stdin = transport.child.stdin.take().expect("stdin already taken");
         let reader = transport.reader;
         let next_id = transport.next_id;
+        let stderr_tail = Arc::clone(&transport.stderr_tail);
+        let stderr_handle = transport.stderr_handle.take();
 
         let pending: Arc<
             std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
@@ -428,6 +472,8 @@ impl PipelinedTransport {
             diagnostics_sink,
             quiescent_flag,
             _reader_handle: reader_handle,
+            _stderr_tail: stderr_tail,
+            _stderr_handle: stderr_handle,
             _child: Arc::new(Mutex::new(transport.child)),
         }
     }
@@ -656,11 +702,7 @@ impl PipelinedTransport {
     }
 
     /// Send a JSON-RPC notification (no response expected).
-    pub(super) async fn notify<P: serde::Serialize>(
-        &self,
-        method: &str,
-        params: P,
-    ) -> Result<()> {
+    pub(super) async fn notify<P: serde::Serialize>(&self, method: &str, params: P) -> Result<()> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -673,5 +715,82 @@ impl PipelinedTransport {
         writer.write_all(body.as_bytes()).await?;
         writer.flush().await?;
         Ok(())
+    }
+}
+
+impl Drop for PipelinedTransport {
+    fn drop(&mut self) {
+        if let Some(stderr_handle) = self._stderr_handle.take() {
+            stderr_handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_to_uri_percent_encodes_cohort_special_paths() {
+        let cases = [
+            (
+                "tests/template_tests/templates/ssi include with spaces.html",
+                "ssi%20include%20with%20spaces.html",
+            ),
+            (
+                "tests/fixtures/fixtures/fixture_with[special]chars.json",
+                "fixture_with%5Bspecial%5Dchars.json",
+            ),
+            (
+                "tests/staticfiles_tests/apps/test/static/test/%2F^|中文.txt",
+                "%252F%5E%7C%E4%B8%AD%E6%96%87.txt",
+            ),
+        ];
+        for (relative, encoded_suffix) in cases {
+            let path = std::env::current_dir().unwrap().join(relative);
+            let uri = path_to_uri(Path::new(relative)).unwrap();
+            assert!(uri.as_str().ends_with(encoded_suffix), "{uri:?}");
+            assert_eq!(
+                url::Url::parse(uri.as_str())
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap(),
+                path
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_pipe_is_continuously_drained_with_bounded_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let script = concat!(
+            "i=0; ",
+            "while [ \"$i\" -lt 256 ]; do ",
+            "printf '%01024d' 0 >&2; ",
+            "i=$((i+1)); ",
+            "done"
+        );
+        let mut transport = LspTransport::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            root.path(),
+        )
+        .await
+        .unwrap();
+
+        let status =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), transport.child.wait())
+                .await
+                .expect("server blocked on a full stderr pipe")
+                .unwrap();
+        assert!(status.success());
+        if let Some(handle) = transport.stderr_handle.take() {
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), handle)
+                .await
+                .expect("stderr drain did not terminate")
+                .unwrap();
+        }
+        assert_eq!(transport.stderr_tail.lock().unwrap().len(), 8192);
     }
 }

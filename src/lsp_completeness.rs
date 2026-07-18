@@ -26,10 +26,10 @@ use crate::server::{
     LspEvidenceReadiness,
 };
 
-pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 4;
+pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 6;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
-const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v1";
+const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
 const FROZEN_POPULATION_JSON: &[u8] =
     include_bytes!("../benchmark/swebench-act-context/population.json");
 const FROZEN_PROTOCOL_LOCK_JSON: &[u8] =
@@ -46,6 +46,8 @@ pub enum FileRole {
     ExcludedGenerated,
     ExcludedBinary,
     ExcludedVendor,
+    ExcludedData,
+    ExcludedAsset,
 }
 
 impl FileRole {
@@ -62,6 +64,8 @@ impl FileRole {
             Self::ExcludedGenerated => "excluded_generated",
             Self::ExcludedBinary => "excluded_binary",
             Self::ExcludedVendor => "excluded_vendor",
+            Self::ExcludedData => "excluded_data",
+            Self::ExcludedAsset => "excluded_asset",
         }
     }
 }
@@ -73,6 +77,8 @@ pub enum ExclusionReasonCode {
     Binary,
     Vendor,
     ConfiguredPolicy,
+    NonLanguageData,
+    Asset,
     Other,
 }
 
@@ -305,6 +311,7 @@ pub enum ReadinessViolationCode {
     UnsupportedRelevantExtension,
     NotProcessed,
     MissingExpectedResult,
+    InvalidEvidenceProvenance,
     MissingExclusionReason,
     IdentityMismatch,
     StaleReport,
@@ -330,6 +337,51 @@ pub struct ReportSummary {
     pub by_extension: BTreeMap<String, u64>,
 }
 
+/// Normalized proof for the current report generation. Inherited evidence is
+/// portable only through a verified archive authorization; historical checkout
+/// paths are deliberately absent from this identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum LspEvidenceDisposition {
+    Executed,
+    VerifiedInherited,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LspFileEvidence {
+    pub path: String,
+    pub disposition: LspEvidenceDisposition,
+    pub generation: String,
+    pub blob: String,
+    pub partition_signature: String,
+    #[serde(default)]
+    pub input_hashes: Vec<String>,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub result_ids: Vec<String>,
+    #[serde(default)]
+    pub result_producers: Vec<crate::structural_cache::InheritedResultProducer>,
+    pub base_archive_sha256: Option<String>,
+    pub base_report_digest: Option<String>,
+}
+
+impl LspFileEvidence {
+    fn canonicalize(&mut self) {
+        if let Ok(path) = normalize_repo_relative_path(&self.path) {
+            self.path = path;
+        }
+        self.input_hashes.sort();
+        self.input_hashes.dedup();
+        self.operations.sort();
+        self.operations.dedup();
+        self.result_ids.sort();
+        self.result_ids.dedup();
+        self.result_producers
+            .sort_by(|left, right| left.result_id.cmp(&right.result_id));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LspCompletenessReport {
     pub identity: ReportIdentity,
@@ -339,6 +391,16 @@ pub struct LspCompletenessReport {
     pub graph_snapshot_digest: String,
     #[serde(default)]
     pub files: Vec<FileCoverageRecord>,
+    /// One current-generation evidence record per included file. Empty is
+    /// accepted only for legacy/unit construction; producer reports always
+    /// populate and validate this union.
+    #[serde(default)]
+    pub evidence: Vec<LspFileEvidence>,
+    /// Exact readiness-validation requests represented by this report, keyed
+    /// by descriptor language. Graph-enrichment operations remain separately
+    /// accountable in the durable work ledger/execution receipt.
+    #[serde(default)]
+    pub readiness_validation_requests_by_language: BTreeMap<String, u64>,
     #[serde(default)]
     pub summary: ReportSummary,
     #[serde(default)]
@@ -361,6 +423,29 @@ impl LspCompletenessReport {
             identity,
             graph_snapshot_digest: graph_snapshot_digest(nodes, edges),
             files,
+            evidence: Vec::new(),
+            readiness_validation_requests_by_language: BTreeMap::new(),
+            summary: ReportSummary::default(),
+            violations: Vec::new(),
+            digest: String::new(),
+        };
+        report.finalize();
+        report
+    }
+
+    fn new_bound_with_evidence(
+        identity: ReportIdentity,
+        files: Vec<FileCoverageRecord>,
+        evidence: Vec<LspFileEvidence>,
+        nodes: &[Node],
+        edges: &[Edge],
+    ) -> Self {
+        let mut report = Self {
+            identity,
+            graph_snapshot_digest: graph_snapshot_digest(nodes, edges),
+            files,
+            evidence,
+            readiness_validation_requests_by_language: BTreeMap::new(),
             summary: ReportSummary::default(),
             violations: Vec::new(),
             digest: String::new(),
@@ -374,8 +459,16 @@ impl LspCompletenessReport {
             file.canonicalize();
         }
         self.files.sort();
+        for evidence in &mut self.evidence {
+            evidence.canonicalize();
+        }
+        self.evidence.sort();
         self.summary = summarize(&self.files);
         self.violations = evaluate_files(&self.files);
+        if !self.evidence.is_empty() {
+            self.violations
+                .extend(evaluate_evidence(&self.files, &self.evidence));
+        }
         self.violations.sort();
         self.digest = self.compute_digest();
     }
@@ -390,6 +483,8 @@ impl LspCompletenessReport {
             identity: &'a ReportIdentity,
             graph_snapshot_digest: &'a str,
             files: &'a [FileCoverageRecord],
+            evidence: &'a [LspFileEvidence],
+            readiness_validation_requests_by_language: &'a BTreeMap<String, u64>,
             summary: &'a ReportSummary,
             violations: &'a [ReadinessViolation],
         }
@@ -398,6 +493,9 @@ impl LspCompletenessReport {
             identity: &self.identity,
             graph_snapshot_digest: &self.graph_snapshot_digest,
             files: &self.files,
+            evidence: &self.evidence,
+            readiness_validation_requests_by_language: &self
+                .readiness_validation_requests_by_language,
             summary: &self.summary,
             violations: &self.violations,
         })
@@ -422,6 +520,26 @@ impl LspCompletenessReport {
                 code: ReadinessViolationCode::StaleReport,
                 path: None,
                 detail: "report digest does not match its canonical contents".to_string(),
+            });
+        }
+        let expected_summary = summarize(&self.files);
+        let mut expected_violations = evaluate_files(&self.files);
+        if self.files.iter().any(|file| file.role.is_included()) && self.evidence.is_empty() {
+            expected_violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                path: None,
+                detail: "current-schema report has no per-file LSP evidence".to_string(),
+            });
+        } else {
+            expected_violations.extend(evaluate_evidence(&self.files, &self.evidence));
+        }
+        expected_violations.sort();
+        if self.summary != expected_summary || self.violations != expected_violations {
+            violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::StaleReport,
+                path: None,
+                detail: "report summary/violations are not derived from current file evidence"
+                    .to_string(),
             });
         }
         violations
@@ -686,6 +804,111 @@ fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
         }
     }
 
+    violations
+}
+
+fn evaluate_evidence(
+    files: &[FileCoverageRecord],
+    evidence: &[LspFileEvidence],
+) -> Vec<ReadinessViolation> {
+    let included = files
+        .iter()
+        .filter(|file| file.role.is_included())
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut by_path = BTreeMap::<&str, Vec<&LspFileEvidence>>::new();
+    for item in evidence {
+        by_path.entry(&item.path).or_default().push(item);
+    }
+    let mut violations = Vec::new();
+    for (path, file) in included {
+        let records = by_path.get(path).cloned().unwrap_or_default();
+        if records.len() != 1 {
+            violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                path: Some(path.to_string()),
+                detail: format!(
+                    "included file requires exactly one current-generation evidence record; found {}",
+                    records.len()
+                ),
+            });
+            continue;
+        }
+        let record = records[0];
+        if record.generation.is_empty()
+            || record.blob.len() != 40
+            || !record.blob.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || record.partition_signature.len() != 64
+            || !record
+                .partition_signature
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || record.result_ids.iter().collect::<BTreeSet<_>>().len() != record.result_ids.len()
+            || !file
+                .expected_result_ids
+                .iter()
+                .all(|result| record.result_ids.contains(result))
+        {
+            violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                path: Some(path.to_string()),
+                detail: "file evidence identity/result binding is incomplete".to_string(),
+            });
+        }
+        match record.disposition {
+            LspEvidenceDisposition::Executed => {
+                if record.base_archive_sha256.is_some() || record.base_report_digest.is_some() {
+                    violations.push(ReadinessViolation {
+                        code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                        path: Some(path.to_string()),
+                        detail: "executed evidence cannot claim an inherited base".to_string(),
+                    });
+                }
+            }
+            LspEvidenceDisposition::VerifiedInherited => {
+                let archive_valid = record.base_archive_sha256.as_deref().is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                let producers = record
+                    .result_producers
+                    .iter()
+                    .map(|lineage| (&lineage.result_id, &lineage.producer_ids))
+                    .collect::<BTreeMap<_, _>>();
+                let lineage_valid = record.result_ids.iter().all(|result| {
+                    producers
+                        .get(result)
+                        .is_some_and(|producer_ids| !producer_ids.is_empty())
+                });
+                if !archive_valid
+                    || record
+                        .base_report_digest
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                    || !lineage_valid
+                {
+                    violations.push(ReadinessViolation {
+                        code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                        path: Some(path.to_string()),
+                        detail:
+                            "inherited evidence lacks verifier-bound archive/report/result lineage"
+                                .to_string(),
+                    });
+                }
+            }
+        }
+    }
+    for item in evidence {
+        if !files
+            .iter()
+            .any(|file| file.role.is_included() && file.path == item.path)
+        {
+            violations.push(ReadinessViolation {
+                code: ReadinessViolationCode::InvalidEvidenceProvenance,
+                path: Some(item.path.clone()),
+                detail: "evidence path is not in the current included inventory".to_string(),
+            });
+        }
+    }
     violations
 }
 
@@ -1062,6 +1285,30 @@ pub fn build_and_persist_report(
     related_job_ids: &[String],
     scan_started_at_ms: u64,
 ) -> Result<LspCompletenessReport> {
+    let inheritance = crate::structural_cache::load_verified_authorization(repo_root)?;
+    let execution = crate::structural_cache::load_execution(repo_root)?;
+    match (&inheritance, &execution) {
+        (Some(authorization), Some(execution)) => {
+            if execution.base_archive_sha256 != authorization.authorization.base_archive_sha256
+                || execution.base_sidecar_sha256 != authorization.authorization.base_sidecar_sha256
+                || execution.base_report_digest != authorization.authorization.base_report_digest
+                || execution.target_commit != authorization.authorization.target_commit
+                || execution.target_tree != authorization.authorization.target_tree
+                || execution
+                    .execution_job_id
+                    .as_ref()
+                    .is_some_and(|job_id| !related_job_ids.contains(job_id))
+            {
+                anyhow::bail!(
+                    "structural cache execution evidence does not match authorization/current scan"
+                );
+            }
+        }
+        (None, None) => {}
+        _ => anyhow::bail!(
+            "structural cache authorization/execution evidence must be present as a verified pair"
+        ),
+    }
     let related_ids = related_job_ids
         .iter()
         .map(String::as_str)
@@ -1087,6 +1334,8 @@ pub fn build_and_persist_report(
         lsp_entries,
         &work_items,
         &jobs,
+        inheritance.as_ref(),
+        execution.as_ref(),
     )?;
     persist_report(repo_root, &report)?;
     Ok(report)
@@ -1251,6 +1500,8 @@ fn build_report(
     lsp_entries: &[LspEnrichmentEntry],
     work_items: &[LspWorkItemRecord],
     jobs: &[EnrichmentJobRecord],
+    inheritance: Option<&crate::structural_cache::VerifiedStructuralCacheAuthorization>,
+    execution: Option<&crate::structural_cache::StructuralCacheExecution>,
 ) -> Result<LspCompletenessReport> {
     let paths = inventory_paths(repo_root)?;
     let extracted_paths = nodes
@@ -1273,7 +1524,72 @@ fn build_report(
     }
     let mut server_identities = BTreeMap::new();
     let persisted_by_path = persisted_results_by_path(nodes, edges);
+    let blob_ids = crate::structural_cache::current_blob_ids(repo_root)?;
+    let cache_identity =
+        crate::structural_cache::current_identity(repo_root, BusinessContextMode::Disabled)?;
+    let inherited_paths = execution
+        .map(|execution| {
+            execution
+                .inherited_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let base_files = inheritance
+        .map(|inheritance| {
+            inheritance
+                .base_report
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut readiness_validation_requests_by_language = BTreeMap::<String, u64>::new();
+    for validation in jobs
+        .iter()
+        .filter_map(|job| job.lsp_evidence.as_ref())
+        .flat_map(|evidence| evidence.validations.iter())
+        .filter(|validation| validation.method.is_some())
+    {
+        *readiness_validation_requests_by_language
+            .entry(validation.language.clone())
+            .or_default() += 1;
+    }
+    if let (Some(inheritance), Some(execution)) = (inheritance, execution) {
+        let inherited_languages = execution
+            .inherited_paths
+            .iter()
+            .filter_map(|path| inheritance.inherited_by_path.get(path))
+            .map(|file| file.language.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut inherited_request_count = 0_u64;
+        for (language, count) in &inheritance
+            .base_report
+            .readiness_validation_requests_by_language
+        {
+            if inherited_languages.contains(language.as_str()) {
+                inherited_request_count += count;
+                *readiness_validation_requests_by_language
+                    .entry(language.clone())
+                    .or_default() += count;
+            }
+        }
+        let executed_request_count = jobs
+            .iter()
+            .filter_map(|job| job.lsp_evidence.as_ref())
+            .flat_map(|evidence| evidence.validations.iter())
+            .filter(|validation| validation.method.is_some())
+            .count() as u64;
+        if inherited_request_count != execution.inherited_readiness_validation_request_count
+            || executed_request_count != execution.executed_readiness_validation_request_count
+        {
+            anyhow::bail!("structural cache readiness-validation request accounting mismatch");
+        }
+    }
     let mut files = Vec::with_capacity(paths.len());
+    let mut evidence = Vec::new();
 
     for path in paths {
         let normalized =
@@ -1299,7 +1615,8 @@ fn build_report(
             continue;
         }
 
-        let descriptor = crate::extract::lsp::builtin_lsp_descriptor_for_path(&path);
+        let descriptor =
+            crate::extract::lsp::builtin_lsp_descriptor_for_inventory_file(&path, &absolute);
         let Some(descriptor) = descriptor else {
             files.push(FileCoverageRecord {
                 path: normalized,
@@ -1331,13 +1648,79 @@ fn build_report(
             .cloned()
             .unwrap_or_default();
         let records = work_by_path.get(&normalized).cloned().unwrap_or_default();
-        let validations = job_validations_for_language(jobs, descriptor.language());
+        let language_validations = job_validations_for_language(jobs, descriptor.language());
+        let validations = language_validations
+            .into_iter()
+            .filter(|validation| validation_applies_to_path(validation, repo_root, &normalized))
+            .collect::<Vec<_>>();
         let (advertised_capabilities, requests_attempted) =
             evidence_from_work_items(&records, &language_entries, &validations);
         let persisted_results = persisted_by_path
             .get(&normalized)
             .cloned()
             .unwrap_or_default();
+        if inherited_paths.contains(&normalized) {
+            let authorized = inheritance
+                .and_then(|inheritance| inheritance.inherited_by_path.get(&normalized))
+                .with_context(|| {
+                    format!("execution inherited {normalized} without verified authorization")
+                })?;
+            let base = base_files.get(normalized.as_str()).with_context(|| {
+                format!("base report has no inherited evidence for {normalized}")
+            })?;
+            if crate::structural_cache::canonical_json_sha256(*base)? != authorized.base_file_sha256
+            {
+                anyhow::bail!("inherited base file evidence digest mismatch for {normalized}");
+            }
+            let authorized_result_ids = authorized
+                .expected_result_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if base.language.as_deref() != Some(descriptor.language())
+                || base.role != role
+                || base.expected_result_ids != authorized_result_ids
+            {
+                anyhow::bail!("inherited file evidence identity mismatch for {normalized}");
+            }
+            let partition_signature = cache_identity
+                .partitions
+                .get(descriptor.language())
+                .map(|partition| partition.signature.clone())
+                .with_context(|| format!("missing partition for {}", descriptor.language()))?;
+            if partition_signature != authorized.partition_signature {
+                anyhow::bail!("inherited partition changed for {normalized}");
+            }
+            files.push(FileCoverageRecord {
+                path: normalized.clone(),
+                role,
+                language: Some(descriptor.language().to_string()),
+                expected_server: Some(server),
+                advertised_capabilities: base.advertised_capabilities.clone(),
+                requests_attempted: base.requests_attempted.clone(),
+                expected_results: base.expected_results.clone(),
+                expected_result_ids: base.expected_result_ids.clone(),
+                persisted_results,
+                terminal_status: base.terminal_status.clone(),
+                exclusion: None,
+            });
+            evidence.push(LspFileEvidence {
+                path: normalized,
+                disposition: LspEvidenceDisposition::VerifiedInherited,
+                generation: identity.enrichment_generation.clone(),
+                blob: authorized.blob.clone(),
+                partition_signature,
+                input_hashes: authorized.input_hashes.clone(),
+                operations: authorized.operations.clone(),
+                result_ids: authorized.expected_result_ids.clone(),
+                result_producers: authorized.result_producers.clone(),
+                base_archive_sha256: inheritance
+                    .map(|inheritance| inheritance.authorization.base_archive_sha256.clone()),
+                base_report_digest: inheritance
+                    .map(|inheritance| inheritance.authorization.base_report_digest.clone()),
+            });
+            continue;
+        }
         let (mut expected_results, expected_result_ids) =
             expected_evidence_from_work_items(&records, &validations, &normalized);
         if role == FileRole::Docs && docs_with_applicable_links.contains(&normalized) {
@@ -1357,6 +1740,55 @@ fn build_report(
             jobs,
             &validations,
         );
+        let producer_ids = records
+            .iter()
+            .map(|record| format!("{}:{}", record.job_id, record.item_id))
+            .chain(
+                jobs.iter()
+                    .map(|job| format!("enrichment-job:{}", job.job_id)),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        evidence.push(LspFileEvidence {
+            path: normalized.clone(),
+            disposition: LspEvidenceDisposition::Executed,
+            generation: identity.enrichment_generation.clone(),
+            blob: blob_ids
+                .get(&normalized)
+                .cloned()
+                .unwrap_or_else(|| "0".repeat(40)),
+            partition_signature: cache_identity
+                .partitions
+                .get(descriptor.language())
+                .map(|partition| partition.signature.clone())
+                .unwrap_or_default(),
+            input_hashes: records
+                .iter()
+                .map(|record| record.input_hash.clone())
+                .collect(),
+            operations: records
+                .iter()
+                .flat_map(|record| record.requested_operations.clone())
+                .chain(
+                    requests_attempted
+                        .iter()
+                        .map(|request| request.method.clone()),
+                )
+                .collect(),
+            result_ids: expected_result_ids.iter().cloned().collect(),
+            result_producers: expected_result_ids
+                .iter()
+                .map(
+                    |result_id| crate::structural_cache::InheritedResultProducer {
+                        result_id: result_id.clone(),
+                        producer_ids: producer_ids.clone(),
+                    },
+                )
+                .collect(),
+            base_archive_sha256: None,
+            base_report_digest: None,
+        });
         files.push(FileCoverageRecord {
             path: normalized,
             role,
@@ -1372,9 +1804,11 @@ fn build_report(
         });
     }
 
-    Ok(LspCompletenessReport::new_bound(
-        identity, files, nodes, edges,
-    ))
+    let mut report =
+        LspCompletenessReport::new_bound_with_evidence(identity, files, evidence, nodes, edges);
+    report.readiness_validation_requests_by_language = readiness_validation_requests_by_language;
+    report.finalize();
+    Ok(report)
 }
 
 fn applicable_document_link_paths(repo_root: &Path, nodes: &[Node]) -> BTreeSet<String> {
@@ -1437,6 +1871,7 @@ fn evidence_from_work_items(
                 "documentSymbolProvider",
                 negotiated.document_symbol_provider,
             ),
+            ("codeActionProvider", negotiated.code_action_provider),
         ] {
             capabilities.insert(AdvertisedCapability {
                 name: name.to_string(),
@@ -1456,16 +1891,24 @@ fn evidence_from_work_items(
         insert_negotiated_capabilities(&mut capabilities, validation);
         if validation.status == LspValidationStatus::Processed
             && let Some(method) = validation.method.as_deref()
-            // The one initialization warm-up document is language readiness
-            // evidence. Per-file documentSymbol requests are represented by
-            // their exact file-scoped durable work items below.
-            && method != "textDocument/documentSymbol"
+            // A graph-backed work item already supplies the exact request and
+            // result evidence for this file. Keep the validation's negotiated
+            // capabilities, but do not project the initialization/readiness
+            // request as a second attempt. Inventory-only files have no work
+            // item, so their file-scoped validation remains the durable proof.
+            && !(method == "textDocument/documentSymbol"
+                && records.iter().any(|record| {
+                    record
+                        .requested_operations
+                        .iter()
+                        .any(|operation| operation == "document_symbols")
+                }))
         {
             requests.push(RequestAttempt {
                 method: method.to_string(),
                 outcome: RequestOutcome::Completed,
                 result_count: validation.symbol_count.map(|count| count as u64),
-                duration_ms: None,
+                duration_ms: validation.duration_ms,
                 detail: validation.detail.clone(),
             });
         }
@@ -1546,6 +1989,11 @@ fn lsp_method(operation: &str) -> &'static str {
 
 fn persisted_results_by_path(nodes: &[Node], edges: &[Edge]) -> BTreeMap<String, PersistedResults> {
     let mut by_path = BTreeMap::<String, PersistedResults>::new();
+    let persisted_lsp_node_ids = nodes
+        .iter()
+        .filter(|node| node.source == ExtractionSource::Lsp)
+        .map(Node::stable_id)
+        .collect::<BTreeSet<_>>();
     for node in nodes
         .iter()
         .filter(|node| node.source == ExtractionSource::Lsp)
@@ -1579,9 +2027,21 @@ fn persisted_results_by_path(nodes: &[Node], edges: &[Edge]) -> BTreeMap<String,
         endpoint_paths.sort();
         endpoint_paths.dedup();
         let stable_id = edge.stable_id();
+        let persisted_endpoint_ids = [&edge.from, &edge.to]
+            .into_iter()
+            .map(|endpoint| endpoint.to_stable_id())
+            .filter(|endpoint_id| persisted_lsp_node_ids.contains(endpoint_id))
+            .collect::<Vec<_>>();
         for path in endpoint_paths {
             let results = by_path.entry(path).or_default();
             results.provenance.insert(stable_id.clone());
+            // A call-hierarchy work item can materialize an endpoint in a
+            // different file or with a path-free external identity. Attribute
+            // only actually persisted LSP endpoint IDs through the exact
+            // persisted LSP edge to each normalized non-empty endpoint path.
+            // The node and edge remain independently required; no identity or
+            // result count is changed by this evidence join.
+            results.provenance.extend(persisted_endpoint_ids.clone());
             match edge.kind {
                 EdgeKind::Calls => results.call_hierarchy_edges += 1,
                 EdgeKind::ReferencedBy => results.references += 1,
@@ -1613,6 +2073,27 @@ fn job_validations_for_language<'a>(
         .flat_map(|evidence| evidence.validations.iter())
         .filter(|validation| validation.language == language)
         .collect()
+}
+
+fn validation_applies_to_path(
+    validation: &LspValidationEvidence,
+    repo_root: &Path,
+    normalized_path: &str,
+) -> bool {
+    let Some(request_uri) = validation.request_uri.as_deref() else {
+        return true;
+    };
+    let Ok(url) = url::Url::parse(request_uri) else {
+        return false;
+    };
+    let Ok(absolute) = url.to_file_path() else {
+        return false;
+    };
+    let Ok(relative) = absolute.strip_prefix(repo_root) else {
+        return false;
+    };
+    normalize_repo_relative_path(&relative.to_string_lossy())
+        .is_ok_and(|path| path == normalized_path)
 }
 
 fn runtime_compatibility_violations(
@@ -1831,8 +2312,7 @@ fn terminal_status_for_file(
             })
     }) {
         return FileTerminalStatus::Degraded {
-            detail: "document-symbol response evidence was not mapped completely to graph results"
-                .to_string(),
+            detail: "file-scoped response evidence failed integrity validation".to_string(),
         };
     }
     if validations
@@ -1877,12 +2357,28 @@ fn terminal_status_for_file(
         .iter()
         .filter(|record| record.state == LspWorkItemState::Completed)
         .collect::<Vec<_>>();
-    if !completed.is_empty() {
+    let file_probe_count = validations
+        .iter()
+        .find(|validation| {
+            validation.status == LspValidationStatus::Processed && validation.request_uri.is_some()
+        })
+        .and_then(|validation| validation.symbol_count)
+        .filter(|_| {
+            !completed.iter().any(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "document_symbols")
+            })
+        })
+        .map(|count| count as u64);
+    if !completed.is_empty() || file_probe_count.is_some() {
         return FileTerminalStatus::Processed {
             result_count: completed
                 .iter()
                 .map(|record| record.observed_result_count)
-                .sum(),
+                .sum::<u64>()
+                .saturating_add(file_probe_count.unwrap_or_default()),
         };
     }
     FileTerminalStatus::NeverProcessed {
@@ -1968,13 +2464,79 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             "file is binary by suffix or contains a NUL byte in its prefix",
         );
     }
+    if is_text_asset_extension(&extension) {
+        return excluded(
+            FileRole::ExcludedAsset,
+            ExclusionReasonCode::Asset,
+            "presentation or secret-test asset has no language-server semantics",
+        );
+    }
+    if is_text_data_extension(&extension) {
+        return excluded(
+            FileRole::ExcludedData,
+            ExclusionReasonCode::NonLanguageData,
+            "structured or tabular data has no language-server semantics",
+        );
+    }
     let filename = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if matches!(extension.as_str(), "md" | "markdown" | "rst") || filename.starts_with("readme") {
+    if matches!(filename.as_str(), ".gitkeep" | ".keep" | "py.typed") {
+        return excluded(
+            FileRole::ExcludedData,
+            ExclusionReasonCode::NonLanguageData,
+            "empty version-control or typing marker has no language-server semantics",
+        );
+    }
+    if matches!(extension.as_str(), "mmd" | "vcg")
+        || (matches!(extension.as_str(), "dot" | "puml")
+            && components.iter().any(|component| component == "pyreverse"))
+    {
+        return excluded(
+            FileRole::ExcludedData,
+            ExclusionReasonCode::NonLanguageData,
+            "frozen-cohort path is a generated graph output fixture",
+        );
+    }
+    if filename == "not_utf8.sample" {
+        return excluded(
+            FileRole::ExcludedData,
+            ExclusionReasonCode::NonLanguageData,
+            "frozen-cohort path is a deliberate non-UTF-8 encoding fixture",
+        );
+    }
+    if extension == "txt" {
+        if filename.starts_with("requirements") {
+            return (FileRole::Config, None);
+        }
+        if components
+            .iter()
+            .any(|component| matches!(component.as_str(), "doc" | "docs"))
+            || is_project_document_filename(&filename)
+        {
+            return (FileRole::Docs, None);
+        }
+        return excluded(
+            FileRole::ExcludedData,
+            ExclusionReasonCode::NonLanguageData,
+            "plain text outside project documentation/configuration is a dataset or fixture payload",
+        );
+    }
+    if is_document_extension(&extension) || is_project_document_filename(&filename) {
         return (FileRole::Docs, None);
+    }
+    if is_config_extension(&extension)
+        || is_config_filename(&filename)
+        || filename.starts_with("requirements")
+        || filename == "manifest.in"
+        || filename == "tox.ini.sample"
+    {
+        return (FileRole::Config, None);
+    }
+    if extension.is_empty() && file_starts_with_shebang(absolute) {
+        return (FileRole::Source, None);
     }
     if components
         .iter()
@@ -1984,24 +2546,29 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         || filename.contains(".spec.")
         || filename.contains(".test.")
     {
+        if is_known_test_fixture_extension(&extension) {
+            return excluded(
+                FileRole::ExcludedData,
+                ExclusionReasonCode::NonLanguageData,
+                "suffix is used by the cohort as a deliberate non-language test fixture",
+            );
+        }
+        if extension.is_empty()
+            && matches!(
+                filename.as_str(),
+                ".dot-file" | ".hidden" | "backup~" | "cvs" | "file_txt" | "visible"
+            )
+        {
+            return excluded(
+                FileRole::ExcludedData,
+                ExclusionReasonCode::NonLanguageData,
+                "extensionless frozen-cohort path is a deliberate test sentinel payload",
+            );
+        }
         return (FileRole::Test, None);
     }
-    if matches!(
-        extension.as_str(),
-        "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf"
-    ) || matches!(
-        filename.as_str(),
-        "makefile"
-            | "dockerfile"
-            | "pyproject.toml"
-            | "setup.cfg"
-            | "tox.ini"
-            | "cargo.toml"
-            | "package.json"
-    ) || filename.starts_with("requirements")
-    {
-        return (FileRole::Config, None);
-    }
+    // Unknown and uncommon text stays mandatory. This fail-closed fallback is
+    // what prevents a missing server from reclassifying real source as data.
     (FileRole::Source, None)
 }
 
@@ -2062,6 +2629,138 @@ fn is_binary_extension(extension: &str) -> bool {
     )
 }
 
+fn is_text_data_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "62-now"
+            | "afm"
+            | "csv"
+            | "dat"
+            | "dbout"
+            | "ecsv"
+            | "eml"
+            | "fits"
+            | "geojson"
+            | "hdr"
+            | "ict"
+            | "interp"
+            | "list"
+            | "map"
+            | "pristine"
+            | "prj"
+            | "rdb"
+            | "tab"
+            | "tokens"
+            | "vrt"
+    )
+}
+
+fn is_text_asset_extension(extension: &str) -> bool {
+    matches!(extension, "enc" | "eps" | "graffle" | "pem" | "svg")
+}
+
+fn is_document_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "1" | "bib"
+            | "breaking"
+            | "bugfix"
+            | "eopc04_iau2000"
+            | "extension"
+            | "false_negative"
+            | "false_positive"
+            | "feature"
+            | "finals2000a"
+            | "inc"
+            | "internal"
+            | "lesser"
+            | "license"
+            | "md"
+            | "markdown"
+            | "new_check"
+            | "old"
+            | "other"
+            | "performance"
+            | "pil"
+            | "rst"
+            | "rst_t"
+            | "user_action"
+            | "wx"
+    )
+}
+
+fn is_config_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "cff"
+            | "cfg"
+            | "conf"
+            | "ini"
+            | "json"
+            | "lock"
+            | "mplstyle"
+            | "rc"
+            | "toml"
+            | "yaml"
+            | "yml"
+    )
+}
+
+fn is_config_filename(filename: &str) -> bool {
+    matches!(
+        filename,
+        "cargo.toml"
+            | "dockerfile"
+            | "makefile"
+            | "package.json"
+            | "pyproject.toml"
+            | "setup.cfg"
+            | "tox.ini"
+    )
+}
+
+fn is_project_document_filename(filename: &str) -> bool {
+    [
+        "authors",
+        "changes",
+        "changelog",
+        "copying",
+        "history",
+        "license",
+        "news",
+        "readme",
+    ]
+    .iter()
+    .any(|prefix| filename.starts_with(prefix))
+}
+
+pub(crate) fn is_plaintext_document_path(path: &Path) -> bool {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+        || is_project_document_filename(&filename)
+}
+
+fn is_known_test_fixture_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "foo" | "ignoreme" | "out" | "tmp" | "unkn" | "unknown" | "xyz"
+    )
+}
+
+fn file_starts_with_shebang(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0_u8; 2];
+    file.read_exact(&mut prefix).is_ok() && prefix == *b"#!"
+}
+
 fn file_contains_nul(path: &Path) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
@@ -2070,6 +2769,32 @@ fn file_contains_nul(path: &Path) -> bool {
     file.read(&mut prefix)
         .ok()
         .is_some_and(|read| prefix[..read].contains(&0))
+}
+
+pub(crate) fn included_lsp_paths_by_language(
+    repo_root: &Path,
+) -> Result<BTreeMap<String, Vec<PathBuf>>> {
+    let mut by_language: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for path in inventory_paths(repo_root)? {
+        let absolute = repo_root.join(&path);
+        let (role, _) = classify_file(&path, &absolute);
+        if !role.is_included() {
+            continue;
+        }
+        if let Some(descriptor) =
+            crate::extract::lsp::builtin_lsp_descriptor_for_inventory_file(&path, &absolute)
+        {
+            by_language
+                .entry(descriptor.language().to_string())
+                .or_default()
+                .push(path);
+        }
+    }
+    for paths in by_language.values_mut() {
+        paths.sort();
+        paths.dedup();
+    }
+    Ok(by_language)
 }
 
 fn inventory_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
@@ -2124,9 +2849,19 @@ fn checkout_identity(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
         && let Ok(head) = repository.head()
         && let Some(target) = head.target()
     {
+        let mut status_options = git2::StatusOptions::new();
+        status_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false);
         let dirty = repository
-            .statuses(None)
-            .map(|statuses| !statuses.is_empty())
+            .statuses(Some(&mut status_options))
+            .map(|statuses| {
+                statuses.iter().any(|entry| match entry.path() {
+                    Ok(path) => path != ".oh/.cache" && !path.starts_with(".oh/.cache/"),
+                    Err(_) => true,
+                })
+            })
             .unwrap_or(true);
         if !dirty {
             return Ok(target.to_string());
@@ -2377,7 +3112,58 @@ mod tests {
     }
 
     fn report(files: Vec<FileCoverageRecord>) -> LspCompletenessReport {
-        LspCompletenessReport::new(identity("generation-1"), files)
+        let evidence = files
+            .iter()
+            .filter(|file| file.role.is_included())
+            .map(|file| LspFileEvidence {
+                path: file.path.clone(),
+                disposition: LspEvidenceDisposition::Executed,
+                generation: "generation-1".to_string(),
+                blob: "a".repeat(40),
+                partition_signature: "b".repeat(64),
+                input_hashes: vec!["input".to_string()],
+                operations: file
+                    .requests_attempted
+                    .iter()
+                    .map(|request| request.method.clone())
+                    .collect(),
+                result_ids: file.expected_result_ids.iter().cloned().collect(),
+                result_producers: Vec::new(),
+                base_archive_sha256: None,
+                base_report_digest: None,
+            })
+            .collect();
+        LspCompletenessReport::new_bound_with_evidence(
+            identity("generation-1"),
+            files,
+            evidence,
+            &[],
+            &[],
+        )
+    }
+
+    fn inherited_evidence(path: &str, result_ids: Vec<String>) -> LspFileEvidence {
+        LspFileEvidence {
+            path: path.to_string(),
+            disposition: LspEvidenceDisposition::VerifiedInherited,
+            generation: "generation-1".to_string(),
+            blob: "a".repeat(40),
+            partition_signature: "b".repeat(64),
+            input_hashes: vec!["input".to_string()],
+            operations: vec!["textDocument/references".to_string()],
+            result_producers: result_ids
+                .iter()
+                .map(
+                    |result_id| crate::structural_cache::InheritedResultProducer {
+                        result_id: result_id.clone(),
+                        producer_ids: vec!["job:1".to_string()],
+                    },
+                )
+                .collect(),
+            result_ids,
+            base_archive_sha256: Some("c".repeat(64)),
+            base_report_digest: Some("base-report".to_string()),
+        }
     }
 
     fn cohort_case(
@@ -2412,6 +3198,103 @@ mod tests {
         assert_eq!(left.files, right.files);
         assert_eq!(left.digest, right.digest);
         assert!(left.is_ready());
+    }
+
+    #[test]
+    fn identical_tree_inherited_evidence_reaches_fresh_ready_generation() {
+        let file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        );
+        let report = LspCompletenessReport::new_bound_with_evidence(
+            identity("generation-1"),
+            vec![file],
+            vec![inherited_evidence("src/a.py", Vec::new())],
+            &[],
+            &[],
+        );
+
+        assert!(report.is_ready(), "{:?}", report.violations);
+        assert_eq!(
+            report.evidence[0].disposition,
+            LspEvidenceDisposition::VerifiedInherited
+        );
+        assert_eq!(
+            report.evidence[0].base_archive_sha256.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+    }
+
+    #[test]
+    fn current_schema_report_without_evidence_is_not_verifier_clean() {
+        let report = LspCompletenessReport::new(
+            identity("generation-1"),
+            vec![included(
+                "src/a.py",
+                FileTerminalStatus::Processed { result_count: 0 },
+            )],
+        );
+
+        assert!(!report.integrity_violations().is_empty());
+    }
+
+    #[test]
+    fn inherited_provenance_cannot_mask_discarded_or_unpersisted_results() {
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        file.expected_result_ids.insert("result-1".to_string());
+        let report = LspCompletenessReport::new_bound_with_evidence(
+            identity("generation-1"),
+            vec![file],
+            vec![inherited_evidence("src/a.py", vec!["result-1".to_string()])],
+            &[],
+            &[],
+        );
+
+        assert!(!report.is_ready());
+        assert!(report.violations.iter().any(|violation| {
+            violation.code == ReadinessViolationCode::MissingExpectedResult
+                && violation.path.as_deref() == Some("src/a.py")
+        }));
+    }
+
+    #[test]
+    fn missing_or_unlineaged_inherited_evidence_fails_closed() {
+        let file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        );
+        let missing = LspCompletenessReport::new_bound_with_evidence(
+            identity("generation-1"),
+            vec![file.clone()],
+            vec![inherited_evidence("src/other.py", Vec::new())],
+            &[],
+            &[],
+        );
+        assert!(missing.violations.iter().any(|violation| {
+            violation.code == ReadinessViolationCode::InvalidEvidenceProvenance
+        }));
+
+        let mut expected = file;
+        expected.expected_result_ids.insert("result-1".to_string());
+        expected
+            .persisted_results
+            .provenance
+            .insert("result-1".to_string());
+        let mut evidence = inherited_evidence("src/a.py", vec!["result-1".to_string()]);
+        evidence.result_producers.clear();
+        let unlineaged = LspCompletenessReport::new_bound_with_evidence(
+            identity("generation-1"),
+            vec![expected],
+            vec![evidence],
+            &[],
+            &[],
+        );
+        assert!(unlineaged.violations.iter().any(|violation| {
+            violation.code == ReadinessViolationCode::InvalidEvidenceProvenance
+        }));
     }
 
     #[test]
@@ -2484,6 +3367,80 @@ mod tests {
                 .iter()
                 .any(|v| v.code == ReadinessViolationCode::NotProcessed)
         );
+    }
+
+    #[test]
+    fn file_scoped_zero_result_is_durable_success_without_extracted_nodes() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("docs")).unwrap();
+        fs::write(repo.path().join("docs/empty.rst"), "").unwrap();
+        let uri = url::Url::from_file_path(repo.path().join("docs/empty.rst"))
+            .unwrap()
+            .to_string();
+        let validation = LspValidationEvidence::processed(
+            "restructuredtext",
+            "esbonio",
+            "textDocument/documentSymbol",
+            0,
+        )
+        .with_request_uri(Some(uri))
+        .with_duration_ms(7)
+        .with_negotiated_capabilities(
+            crate::extract::scan_stats::LspNegotiatedCapabilities {
+                document_symbol_provider: true,
+                ..Default::default()
+            },
+        );
+        let jobs = vec![completed_job(vec![validation.clone()])];
+        let validations = job_validations_for_language(&jobs, "restructuredtext")
+            .into_iter()
+            .filter(|candidate| {
+                validation_applies_to_path(candidate, repo.path(), "docs/empty.rst")
+            })
+            .collect::<Vec<_>>();
+        let status = terminal_status_for_file(
+            "docs/empty.rst",
+            &[],
+            &[],
+            false,
+            &server(),
+            &jobs,
+            &validations,
+        );
+        assert_eq!(status, FileTerminalStatus::Processed { result_count: 0 });
+        let (_, requests) = evidence_from_work_items(&[], &[], &validations);
+        assert!(requests.iter().any(|request| {
+            request.method == "textDocument/documentSymbol"
+                && request.outcome == RequestOutcome::Completed
+                && request.result_count == Some(0)
+                && request.duration_ms == Some(7)
+        }));
+    }
+
+    #[test]
+    fn file_scoped_validation_cannot_cover_a_different_path() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("docs")).unwrap();
+        let uri = url::Url::from_file_path(repo.path().join("docs/one.rst"))
+            .unwrap()
+            .to_string();
+        let validation = LspValidationEvidence::processed(
+            "restructuredtext",
+            "esbonio",
+            "textDocument/documentSymbol",
+            0,
+        )
+        .with_request_uri(Some(uri));
+        assert!(validation_applies_to_path(
+            &validation,
+            repo.path(),
+            "docs/one.rst"
+        ));
+        assert!(!validation_applies_to_path(
+            &validation,
+            repo.path(),
+            "docs/two.rst"
+        ));
     }
 
     #[test]
@@ -2596,6 +3553,194 @@ mod tests {
 
         file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge]);
         assert!(report(vec![file]).is_ready());
+    }
+
+    #[test]
+    fn materialized_call_hierarchy_output_satisfies_persistence_gate() {
+        let target = NodeId {
+            root: "root".to_string(),
+            file: PathBuf::from("src/a.py"),
+            name: "target".to_string(),
+            kind: NodeKind::Function,
+        };
+        let materialized = Node {
+            id: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/generated.py"),
+                name: "generated_target".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 50,
+            line_end: 51,
+            signature: "module.generated_target".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::from([
+                ("virtual".to_string(), "true".to_string()),
+                ("lsp_call_hierarchy".to_string(), "true".to_string()),
+            ]),
+            source: ExtractionSource::Lsp,
+        };
+        let edge = Edge {
+            from: target,
+            to: materialized.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let record = LspWorkItemRecord {
+            file: "src/a.py".to_string(),
+            node_kind: "function".to_string(),
+            requested_operations: vec!["call_hierarchy".to_string()],
+            state: LspWorkItemState::Completed,
+            observed_result_count: 1,
+            output_edges: vec![edge.clone()],
+            output_nodes: vec![materialized.clone()],
+            ..LspWorkItemRecord::default()
+        };
+        let records = vec![&record];
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        (file.expected_results, file.expected_result_ids) =
+            expected_evidence_from_work_items(&records, &[], "src/a.py");
+
+        file.persisted_results =
+            persisted_results_for_path("src/a.py", &[materialized.clone()], &[edge.clone()]);
+        assert!(report(vec![file.clone()]).is_ready());
+
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge.clone()]);
+        assert!(
+            report(vec![file.clone()])
+                .violations
+                .iter()
+                .any(|violation| {
+                    violation.code == ReadinessViolationCode::MissingExpectedResult
+                })
+        );
+
+        file.persisted_results = persisted_results_for_path("src/a.py", &[materialized], &[]);
+        assert!(
+            report(vec![file]).violations.iter().any(|violation| {
+                violation.code == ReadinessViolationCode::MissingExpectedResult
+            })
+        );
+    }
+
+    #[test]
+    fn pathless_external_call_endpoint_is_proven_by_its_local_lsp_edge() {
+        let local = NodeId {
+            root: "root".to_string(),
+            file: PathBuf::from("src/a.py"),
+            name: "target".to_string(),
+            kind: NodeKind::Function,
+        };
+        let external = Node {
+            id: NodeId {
+                root: "external".to_string(),
+                file: PathBuf::new(),
+                name: "builtins.open".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: "builtins.open".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::from([
+                ("virtual".to_string(), "true".to_string()),
+                ("external".to_string(), "true".to_string()),
+                ("lsp_call_hierarchy".to_string(), "true".to_string()),
+            ]),
+            source: ExtractionSource::Lsp,
+        };
+        let edge = Edge {
+            from: local,
+            to: external.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let record = LspWorkItemRecord {
+            file: "src/a.py".to_string(),
+            node_kind: "function".to_string(),
+            requested_operations: vec!["call_hierarchy".to_string()],
+            state: LspWorkItemState::Completed,
+            observed_result_count: 1,
+            output_edges: vec![edge.clone()],
+            output_nodes: vec![external.clone()],
+            ..LspWorkItemRecord::default()
+        };
+        let records = vec![&record];
+        let mut file = included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        (file.expected_results, file.expected_result_ids) =
+            expected_evidence_from_work_items(&records, &[], "src/a.py");
+
+        file.persisted_results =
+            persisted_results_for_path("src/a.py", &[external.clone()], &[edge.clone()]);
+        assert!(report(vec![file.clone()]).is_ready());
+        assert!(
+            file.persisted_results
+                .provenance
+                .contains(&external.stable_id())
+        );
+
+        file.persisted_results = persisted_results_for_path("src/a.py", &[], &[edge.clone()]);
+        assert!(
+            report(vec![file.clone()])
+                .violations
+                .iter()
+                .any(|violation| {
+                    violation.code == ReadinessViolationCode::MissingExpectedResult
+                })
+        );
+
+        file.persisted_results = persisted_results_for_path("src/a.py", &[external.clone()], &[]);
+        assert!(
+            report(vec![file.clone()])
+                .violations
+                .iter()
+                .any(|violation| {
+                    violation.code == ReadinessViolationCode::MissingExpectedResult
+                })
+        );
+
+        let mut non_lsp_external = external.clone();
+        non_lsp_external.source = ExtractionSource::TreeSitter;
+        file.persisted_results =
+            persisted_results_for_path("src/a.py", &[non_lsp_external], &[edge.clone()]);
+        assert!(
+            report(vec![file.clone()])
+                .violations
+                .iter()
+                .any(|violation| {
+                    violation.code == ReadinessViolationCode::MissingExpectedResult
+                })
+        );
+
+        let unrelated_edge = Edge {
+            from: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/b.py"),
+                name: "other".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: external.id.clone(),
+            ..edge
+        };
+        file.persisted_results =
+            persisted_results_for_path("src/a.py", &[external], &[unrelated_edge]);
+        assert!(
+            report(vec![file]).violations.iter().any(|violation| {
+                violation.code == ReadinessViolationCode::MissingExpectedResult
+            })
+        );
     }
 
     #[test]
@@ -2814,6 +3959,39 @@ mod tests {
     }
 
     #[test]
+    fn checkout_identity_ignores_only_rna_internal_cache_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = git2::Repository::init(root.path()).unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.py"), "VALUE = 1\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("src/a.py")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("RNA Fixture", "fixture@example.invalid").unwrap();
+        let commit = repository
+            .commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        std::fs::create_dir_all(root.path().join(".oh/.cache/lance")).unwrap();
+        std::fs::write(root.path().join(".oh/.cache/lance/schema_version"), "24\n").unwrap();
+        let paths = inventory_paths(root.path()).unwrap();
+        assert_eq!(
+            checkout_identity(root.path(), &paths).unwrap(),
+            commit.to_string()
+        );
+
+        std::fs::write(root.path().join("untracked.txt"), "real worktree change\n").unwrap();
+        assert!(
+            checkout_identity(root.path(), &paths)
+                .unwrap()
+                .starts_with(&format!("{commit}+worktree:"))
+        );
+    }
+
+    #[test]
     fn malformed_paths_are_rejected() {
         for path in ["", "/absolute.py", "../../escape.py", "C:\\outside.py"] {
             assert!(normalize_repo_relative_path(path).is_err(), "{path:?}");
@@ -2885,7 +4063,11 @@ mod tests {
         }
         for (path, contents) in [
             ("src/app.py", "def app(): pass\n"),
+            ("src/kernel.pyx", "cdef int value = 1\n"),
+            ("src/unknown.language", "real source\n"),
             ("tests/test_app.py", "def test_app(): pass\n"),
+            ("tests/data.txt", "1 2 3\n"),
+            ("tests/bad.unknown", "fixture\n"),
             ("README.md", "# README\n"),
             ("docs/broken.rst", "Broken `link <missing\n"),
             ("pyproject.toml", "[project]\nname='fixture'\n"),
@@ -2909,7 +4091,11 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(roles["src/app.py"], FileRole::Source);
+        assert_eq!(roles["src/kernel.pyx"], FileRole::Source);
+        assert_eq!(roles["src/unknown.language"], FileRole::Source);
         assert_eq!(roles["tests/test_app.py"], FileRole::Test);
+        assert_eq!(roles["tests/data.txt"], FileRole::ExcludedData);
+        assert_eq!(roles["tests/bad.unknown"], FileRole::ExcludedData);
         assert_eq!(roles["README.md"], FileRole::Docs);
         assert_eq!(roles["docs/broken.rst"], FileRole::Docs);
         assert_eq!(roles["pyproject.toml"], FileRole::Config);
@@ -3421,6 +4607,7 @@ mod tests {
                         implementation_provider: true,
                         document_link_provider: false,
                         document_symbol_provider: true,
+                        code_action_provider: false,
                     },
                 );
         let (capabilities, requests) = evidence_from_work_items(&[], &[], &[&validation]);

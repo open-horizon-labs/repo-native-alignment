@@ -26,14 +26,128 @@ use super::transport::{
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
-    ZERO_EDGE_TIMEOUT, lsp_job_timeout, materialize_document_symbols,
-    normalized_document_symbol_evidence,
+    ZERO_EDGE_TIMEOUT, lsp_job_timeout, lsp_language_id, materialize_document_symbols,
+    normalized_document_symbol_evidence, read_lsp_text,
 };
 use crate::scanner::LspConfig;
 
 const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn resolve_or_materialize_call_hierarchy_endpoint(
+    item: &serde_json::Value,
+    endpoint: &str,
+    root: &Path,
+    local_root: &str,
+    language: &str,
+    refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+) -> Option<(NodeId, Option<Node>, Confidence)> {
+    let endpoint = item.get(endpoint)?;
+    let uri: lsp_types::Uri = endpoint.get("uri")?.as_str()?.parse().ok()?;
+    let path = uri_to_relative_path(&uri, root);
+    let name = endpoint
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let detail = endpoint
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let line_start = endpoint["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
+    let line_end = endpoint["range"]["end"]["line"].as_u64().unwrap_or(0) as usize + 1;
+
+    if !path.is_absolute() {
+        let candidates = refs_by_file.get(&path).map(Vec::as_slice).unwrap_or(&[]);
+        let exact = candidates
+            .iter()
+            .filter(|node| node.id.name == name && node.id.kind == NodeKind::Function)
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            return Some((exact[0].clone(), None, Confidence::Confirmed));
+        }
+        let candidate_refs = candidates.iter().collect::<Vec<_>>();
+        if let Some(existing) = find_enclosing_symbol(&candidate_refs, &path, line_start) {
+            return Some((existing, None, Confidence::Confirmed));
+        }
+
+        let base_name = if name.is_empty() { detail } else { name };
+        if base_name.is_empty() {
+            return None;
+        }
+        let node_name = if exact.is_empty() {
+            base_name.to_string()
+        } else {
+            format!("{base_name}@lsp:{line_start}")
+        };
+        let id = NodeId {
+            root: local_root.to_string(),
+            file: path,
+            name: node_name,
+            kind: NodeKind::Function,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("virtual".to_string(), "true".to_string());
+        metadata.insert("lsp_call_hierarchy".to_string(), "true".to_string());
+        if !name.is_empty() {
+            metadata.insert("lsp_name".to_string(), name.to_string());
+        }
+        return Some((
+            id.clone(),
+            Some(Node {
+                id,
+                language: language.to_string(),
+                line_start,
+                line_end: line_end.max(line_start),
+                signature: detail.to_string(),
+                body: String::new(),
+                metadata,
+                source: ExtractionSource::Lsp,
+            }),
+            Confidence::Detected,
+        ));
+    }
+
+    let fqn = if detail.is_empty() { name } else { detail };
+    if fqn.is_empty() {
+        return None;
+    }
+    let id = NodeId {
+        root: "external".to_string(),
+        file: PathBuf::new(),
+        name: fqn.to_string(),
+        kind: NodeKind::Function,
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "package".to_string(),
+        fqn.split("::")
+            .next()
+            .unwrap_or(fqn)
+            .split('.')
+            .next()
+            .unwrap_or(fqn)
+            .to_string(),
+    );
+    metadata.insert("virtual".to_string(), "true".to_string());
+    metadata.insert("external".to_string(), "true".to_string());
+    metadata.insert("lsp_call_hierarchy".to_string(), "true".to_string());
+    Some((
+        id.clone(),
+        Some(Node {
+            id,
+            language: language.to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: fqn.to_string(),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::Lsp,
+        }),
+        Confidence::Detected,
+    ))
+}
 
 fn should_abort_zero_edge_pass(
     edge_producing_total: usize,
@@ -71,13 +185,15 @@ impl DidOpenEntry {
 
 struct DidOpenCoordinator {
     server: String,
+    inventory_language: String,
     files: Mutex<HashMap<PathBuf, Arc<DidOpenEntry>>>,
 }
 
 impl DidOpenCoordinator {
-    fn new(server: String) -> Self {
+    fn new(server: String, inventory_language: String) -> Self {
         Self {
             server,
+            inventory_language,
             files: Mutex::new(HashMap::new()),
         }
     }
@@ -146,14 +262,14 @@ impl DidOpenCoordinator {
         file_uri: &lsp_types::Uri,
     ) -> Result<()> {
         let abs_path = root.join(rel_path);
-        let content = std::fs::read_to_string(&abs_path).with_context(|| {
+        let content = read_lsp_text(&abs_path).with_context(|| {
             format!(
                 "LSP didOpen failed: server={} file={} phase=read_file",
                 self.server,
                 rel_path.display()
             )
         })?;
-        let lang_id = language_id_for_path(&abs_path);
+        let lang_id = lsp_language_id(&self.inventory_language, &abs_path);
         let notify = transport.notify(
             "textDocument/didOpen",
             serde_json::json!({
@@ -579,19 +695,6 @@ impl LspPass1Diagnostics {
     }
 }
 
-fn language_id_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("py") => "python",
-        Some("ts") => "typescript",
-        Some("tsx") => "typescriptreact",
-        Some("js") => "javascript",
-        Some("jsx") => "javascriptreact",
-        Some("rs") => "rust",
-        Some("go") => "go",
-        _ => "plaintext",
-    }
-}
-
 fn did_open_timeout() -> Duration {
     duration_from_env("RNA_LSP_DID_OPEN_TIMEOUT_MS", DID_OPEN_DEFAULT_TIMEOUT)
 }
@@ -876,7 +979,10 @@ impl LspEnricher {
                     .is_some_and(|operation| *operation != LspQueryOperation::DocumentSymbols)
             })
             .count();
-        let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
+        let did_open = Arc::new(DidOpenCoordinator::new(
+            self.server_command.clone(),
+            self.language.clone(),
+        ));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
@@ -1243,7 +1349,6 @@ impl LspEnricher {
                         line,
                         col,
                         node,
-                        matching_owned,
                         refs_by_file,
                         root,
                         language,
@@ -1373,7 +1478,6 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_owned: &Arc<Vec<Node>>,
         refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
         root: &Path,
         language: &str,
@@ -1451,78 +1555,38 @@ impl LspEnricher {
                         Self::outgoing_calls_p(transport, &item),
                     );
 
-                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                    let mut refs_by_file_name: std::collections::HashMap<
-                        (PathBuf, String),
-                        Vec<NodeId>,
-                    > = std::collections::HashMap::new();
-                    for n in &matching_refs {
-                        refs_by_file_name
-                            .entry((n.id.file.clone(), n.id.name.clone()))
-                            .or_default()
-                            .push(n.id.clone());
-                    }
-
                     // Process incoming calls
                     match incoming_result {
                         Ok(calls) => {
                             observation.non_empty_responses += usize::from(!calls.is_empty());
                             for call in &calls {
-                                let caller_uri = &call["from"]["uri"];
-                                let caller_name = call["from"]["name"].as_str().unwrap_or("");
-                                let caller_line =
-                                    call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0)
-                                        as usize
-                                        + 1;
-
-                                if let Some(uri_str) = caller_uri.as_str() {
-                                    let caller_path =
-                                        if let Some(p) = uri_str.strip_prefix("file://") {
-                                            let abs = PathBuf::from(p);
-                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                        } else {
-                                            continue;
-                                        };
-
-                                    if caller_path.to_string_lossy().contains(".cargo") {
-                                        continue;
-                                    }
-                                    if caller_path == node.id.file && caller_name == node.id.name {
-                                        continue;
-                                    }
-                                    observation.result_count += 1;
-
-                                    let key = (caller_path.clone(), caller_name.to_string());
-                                    let caller_id = match refs_by_file_name.get(&key) {
-                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                        Some(_) => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &caller_path,
-                                            caller_line,
-                                        ),
-                                        None => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &caller_path,
-                                            caller_line,
-                                        ),
-                                    };
-
-                                    if let Some(caller) = caller_id {
-                                        if caller.name == node.id.name
-                                            && caller.file == node.id.file
-                                        {
-                                            continue;
-                                        }
-                                        edges.push(Edge {
-                                            from: caller,
-                                            to: node.id.clone(),
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Confirmed,
-                                            evidence: Vec::new(),
-                                        });
-                                    }
+                                let Some((caller, materialized, confidence)) =
+                                    resolve_or_materialize_call_hierarchy_endpoint(
+                                        call,
+                                        "from",
+                                        root,
+                                        &node.id.root,
+                                        language,
+                                        refs_by_file,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if caller == node.id {
+                                    continue;
                                 }
+                                observation.result_count += 1;
+                                if let Some(materialized) = materialized {
+                                    new_nodes.push(materialized);
+                                }
+                                edges.push(Edge {
+                                    from: caller,
+                                    to: node.id.clone(),
+                                    kind: EdgeKind::Calls,
+                                    source: ExtractionSource::Lsp,
+                                    confidence,
+                                    evidence: Vec::new(),
+                                });
                             }
                         }
                         Err(e) => {
@@ -1538,103 +1602,33 @@ impl LspEnricher {
                         Ok(calls) => {
                             observation.non_empty_responses += usize::from(!calls.is_empty());
                             for call in &calls {
-                                let callee_uri = &call["to"]["uri"];
-                                let callee_name = call["to"]["name"].as_str().unwrap_or("");
-                                let callee_line =
-                                    call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0)
-                                        as usize
-                                        + 1;
-
-                                if let Some(uri_str) = callee_uri.as_str() {
-                                    let callee_path =
-                                        if let Some(p) = uri_str.strip_prefix("file://") {
-                                            let abs = PathBuf::from(p);
-                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                        } else {
-                                            continue;
-                                        };
-
-                                    if callee_path.to_string_lossy().contains(".cargo") {
-                                        let fqn = call["to"]["detail"]
-                                            .as_str()
-                                            .filter(|s| !s.is_empty())
-                                            .unwrap_or(callee_name);
-
-                                        if fqn.is_empty() {
-                                            continue;
-                                        }
-                                        observation.result_count += 1;
-
-                                        let package =
-                                            fqn.split("::").next().unwrap_or(fqn).to_string();
-
-                                        let virtual_id = NodeId {
-                                            root: "external".to_string(),
-                                            file: PathBuf::new(),
-                                            name: fqn.to_string(),
-                                            kind: NodeKind::Function,
-                                        };
-
-                                        let mut meta = std::collections::BTreeMap::new();
-                                        meta.insert("package".to_string(), package.clone());
-                                        meta.insert("virtual".to_string(), "true".to_string());
-                                        new_nodes.push(Node {
-                                            id: virtual_id.clone(),
-                                            language: language.to_string(),
-                                            line_start: 0,
-                                            line_end: 0,
-                                            signature: fqn.to_string(),
-                                            body: String::new(),
-                                            metadata: meta,
-                                            source: ExtractionSource::Lsp,
-                                        });
-
-                                        edges.push(Edge {
-                                            from: node.id.clone(),
-                                            to: virtual_id,
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Detected,
-                                            evidence: Vec::new(),
-                                        });
-                                        continue;
-                                    }
-                                    if callee_path == node.id.file && callee_name == node.id.name {
-                                        continue;
-                                    }
-                                    observation.result_count += 1;
-
-                                    let key = (callee_path.clone(), callee_name.to_string());
-                                    let callee_id = match refs_by_file_name.get(&key) {
-                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                        Some(_) => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &callee_path,
-                                            callee_line,
-                                        ),
-                                        None => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &callee_path,
-                                            callee_line,
-                                        ),
-                                    };
-
-                                    if let Some(callee) = callee_id {
-                                        if callee.name == node.id.name
-                                            && callee.file == node.id.file
-                                        {
-                                            continue;
-                                        }
-                                        edges.push(Edge {
-                                            from: node.id.clone(),
-                                            to: callee,
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Confirmed,
-                                            evidence: Vec::new(),
-                                        });
-                                    }
+                                let Some((callee, materialized, confidence)) =
+                                    resolve_or_materialize_call_hierarchy_endpoint(
+                                        call,
+                                        "to",
+                                        root,
+                                        &node.id.root,
+                                        language,
+                                        refs_by_file,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if callee == node.id {
+                                    continue;
                                 }
+                                observation.result_count += 1;
+                                if let Some(materialized) = materialized {
+                                    new_nodes.push(materialized);
+                                }
+                                edges.push(Edge {
+                                    from: node.id.clone(),
+                                    to: callee,
+                                    kind: EdgeKind::Calls,
+                                    source: ExtractionSource::Lsp,
+                                    confidence,
+                                    evidence: Vec::new(),
+                                });
                             }
                         }
                         Err(e) => {
@@ -2406,6 +2400,137 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn call_hierarchy_item(
+        endpoint: &str,
+        uri: &str,
+        name: &str,
+        detail: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            endpoint: {
+                "uri": uri,
+                "name": name,
+                "detail": detail,
+                "range": {
+                    "start": { "line": 7, "character": 0 },
+                    "end": { "line": 9, "character": 1 }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn call_hierarchy_endpoint_resolves_against_unscheduled_graph_nodes() {
+        let existing = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/caller.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 8,
+            line_end: 10,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let refs = HashMap::from([(existing.id.file.clone(), vec![existing.clone()])]);
+        let item = call_hierarchy_item(
+            "from",
+            "file:///tmp/rna-call-hierarchy/src/caller.py",
+            "caller",
+            "caller",
+        );
+
+        let (resolved, materialized, confidence) = resolve_or_materialize_call_hierarchy_endpoint(
+            &item,
+            "from",
+            Path::new("/tmp/rna-call-hierarchy"),
+            "repo",
+            "python",
+            &refs,
+        )
+        .expect("existing endpoint must resolve");
+
+        assert_eq!(resolved, existing.id);
+        assert!(materialized.is_none());
+        assert_eq!(confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn unresolved_local_call_hierarchy_endpoint_materializes_stably() {
+        let item = call_hierarchy_item(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+        );
+        let resolve = || {
+            resolve_or_materialize_call_hierarchy_endpoint(
+                &item,
+                "to",
+                Path::new("/tmp/rna-call-hierarchy"),
+                "repo",
+                "python",
+                &HashMap::new(),
+            )
+            .expect("valid local endpoint must materialize")
+        };
+
+        let (first_id, first_node, confidence) = resolve();
+        let (second_id, _, _) = resolve();
+        let first_node = first_node.expect("unresolved endpoint must produce a node");
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(first_id.file, PathBuf::from("src/generated.py"));
+        assert_eq!(first_id.name, "generated_target");
+        assert_eq!(confidence, Confidence::Detected);
+        assert_eq!(first_node.source, ExtractionSource::Lsp);
+        assert_eq!(
+            first_node
+                .metadata
+                .get("lsp_call_hierarchy")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn external_call_hierarchy_endpoint_uses_path_free_stable_identity() {
+        let item = call_hierarchy_item(
+            "to",
+            "file:///opt/venv/lib/python3.13/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+        );
+        let (id, node, confidence) = resolve_or_materialize_call_hierarchy_endpoint(
+            &item,
+            "to",
+            Path::new("/tmp/rna-call-hierarchy"),
+            "repo",
+            "python",
+            &HashMap::new(),
+        )
+        .expect("valid external endpoint must materialize");
+        let node = node.expect("external endpoint must produce a node");
+
+        assert_eq!(id.root, "external");
+        assert!(id.file.as_os_str().is_empty());
+        assert_eq!(id.name, "pkg.api.target");
+        assert_eq!(confidence, Confidence::Detected);
+        assert!(!id.to_stable_id().contains("/opt/venv"));
+        assert_eq!(
+            node.metadata.get("package").map(String::as_str),
+            Some("pkg")
+        );
+        assert_eq!(
+            node.metadata.get("external").map(String::as_str),
+            Some("true")
+        );
+    }
+
     #[test]
     fn document_symbol_only_work_never_trips_zero_edge_watchdog() {
         assert!(!should_abort_zero_edge_pass(
@@ -2504,7 +2629,10 @@ mod tests {
 
     #[tokio::test]
     async fn did_open_coordinator_dedupes_concurrent_same_file() {
-        let coordinator = Arc::new(DidOpenCoordinator::new("test-lsp".to_string()));
+        let coordinator = Arc::new(DidOpenCoordinator::new(
+            "test-lsp".to_string(),
+            "rust".to_string(),
+        ));
         let attempts = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut tasks = tokio::task::JoinSet::new();
@@ -2552,7 +2680,7 @@ mod tests {
 
     #[tokio::test]
     async fn did_open_failure_does_not_suppress_retry() {
-        let coordinator = DidOpenCoordinator::new("test-lsp".to_string());
+        let coordinator = DidOpenCoordinator::new("test-lsp".to_string(), "rust".to_string());
         let attempts = AtomicUsize::new(0);
 
         let first = coordinator

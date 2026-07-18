@@ -48,6 +48,9 @@ enum Commands {
     Scan(ScanArgs),
     /// Verify persisted per-file LSP completeness before benchmark/model access.
     LspReadiness(LspReadinessArgs),
+    /// Print the exact producer/schema and target-tree identity used for
+    /// verifier-clean structural-cache reuse.
+    StructuralCacheIdentity(StructuralCacheIdentityArgs),
     Enrich(EnrichArgs),
     Search(SearchArgs),
     Graph(GraphArgs),
@@ -111,6 +114,12 @@ struct LspReadinessArgs {
     /// Destination for the deterministic aggregate manifest.
     #[arg(long, requires = "cohort_manifest")]
     aggregate_output: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct StructuralCacheIdentityArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -736,6 +745,15 @@ async fn async_main() -> anyhow::Result<()> {
             init_tracing("info", log_path.as_deref());
             let passed = smoke_test::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
+        }
+        Some(Commands::StructuralCacheIdentity(args)) => {
+            let repo_root = args.repo.canonicalize()?;
+            let identity = repo_native_alignment::structural_cache::current_identity(
+                &repo_root,
+                business_context_mode,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&identity)?);
+            return Ok(());
         }
         Some(Commands::Scan(args)) => {
             init_tracing("info", log_path.as_deref());

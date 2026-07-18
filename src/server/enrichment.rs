@@ -6,8 +6,8 @@
 //! - `scan_roots()` -- resolve workspace roots, detect file changes
 //! - `update_graph()` -- apply changes, run enrichment pipeline
 //! - `persist_deltas()` -- write to LanceDB, commit scanner state
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -244,6 +244,54 @@ fn remove_existing_scoped_lsp_edges(
     removed
 }
 
+fn purge_existing_scoped_lsp_output(
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    node_filter: &HashSet<String>,
+    file_filter: &HashSet<PathBuf>,
+) -> Vec<String> {
+    let impacted_lsp_node_ids = edges
+        .iter()
+        .filter(|edge| is_scoped_lsp_edge(edge, node_filter))
+        .flat_map(|edge| [edge.from.to_stable_id(), edge.to.to_stable_id()])
+        .collect::<HashSet<_>>();
+    let removed_edge_ids = remove_existing_scoped_lsp_edges(edges, node_filter);
+    let retained_endpoint_ids = edges
+        .iter()
+        .flat_map(|edge| [edge.from.to_stable_id(), edge.to.to_stable_id()])
+        .collect::<HashSet<_>>();
+    nodes.retain(|node| {
+        if node.source != crate::graph::ExtractionSource::Lsp {
+            return true;
+        }
+        let stable_id = node.stable_id();
+        let impacted = node_filter.contains(&stable_id)
+            || file_filter.contains(&node.id.file)
+            || impacted_lsp_node_ids.contains(&stable_id);
+        !impacted || retained_endpoint_ids.contains(&stable_id)
+    });
+    removed_edge_ids
+}
+
+fn dedup_edges_preserving_lsp_evidence(edges: &mut Vec<Edge>) {
+    let mut positions = std::collections::HashMap::<String, usize>::new();
+    let mut deduplicated: Vec<Edge> = Vec::with_capacity(edges.len());
+    for edge in edges.drain(..) {
+        let stable_id = edge.stable_id();
+        if let Some(&position) = positions.get(&stable_id) {
+            if edge.source == crate::graph::ExtractionSource::Lsp
+                && deduplicated[position].source != crate::graph::ExtractionSource::Lsp
+            {
+                deduplicated[position] = edge;
+            }
+        } else {
+            positions.insert(stable_id, deduplicated.len());
+            deduplicated.push(edge);
+        }
+    }
+    *edges = deduplicated;
+}
+
 fn scoped_lsp_persistence_delta(
     enriched_nodes: &[Node],
     enriched_edges: &[Edge],
@@ -311,6 +359,7 @@ struct LspPipelineInput {
     skip_lsp: bool,
     dirty_slugs: Option<HashSet<String>>,
     lsp_node_filter: Option<Arc<HashSet<String>>>,
+    file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
     broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
 }
 
@@ -427,6 +476,9 @@ async fn emit_lsp_pipeline_with_budget(
             embed_idx: None,
             lance_repo_root: None,
             skip_lsp: input.skip_lsp,
+            file_readiness: !input.skip_lsp
+                && (input.lsp_node_filter.is_none() || input.file_readiness_filter.is_some()),
+            file_readiness_filter: input.file_readiness_filter,
             lsp_node_filter: input.lsp_node_filter,
             broad_reference_budget: input.broad_reference_budget,
         },
@@ -715,6 +767,7 @@ impl RnaHandler {
                 skip_lsp: false,
                 dirty_slugs: Some(dirty_slugs),
                 lsp_node_filter: None,
+                file_readiness_filter: None,
                 broad_reference_budget: None,
             })
             .await;
@@ -1224,6 +1277,7 @@ impl RnaHandler {
                 skip_lsp: false,
                 dirty_slugs: None,
                 lsp_node_filter: None,
+                file_readiness_filter: None,
                 broad_reference_budget: None,
             })
             .await;
@@ -1532,6 +1586,17 @@ impl RnaHandler {
 
         let change_count =
             scan.changed_files.len() + scan.new_files.len() + scan.deleted_files.len();
+        let cache_authorization =
+            crate::structural_cache::load_verified_authorization(&self.repo_root)?;
+        let preliminary_cache_plan = cache_authorization.as_ref().map(|authorization| {
+            crate::structural_cache::plan_incremental_impact(
+                authorization,
+                &cached_state.nodes,
+                &cached_state.edges,
+                &cached_state.nodes,
+                &cached_state.edges,
+            )
+        });
 
         on_progress(&format!(
             "Scan: {} changed, {} new, {} deleted in {:.1}s",
@@ -1541,7 +1606,11 @@ impl RnaHandler {
             scan_time.as_secs_f64(),
         ));
 
-        if change_count == 0 {
+        if change_count == 0
+            && preliminary_cache_plan
+                .as_ref()
+                .is_none_or(|plan| plan.executed_paths.is_empty())
+        {
             // FIX(#601): check if the cached graph is missing enrichment output
             // (e.g., framework nodes). Caches built before the event bus was wired
             // (pre-v2-rc) or by a binary that skipped post-extraction passes may lack
@@ -1617,6 +1686,62 @@ impl RnaHandler {
             };
 
             scanner.commit_state()?;
+
+            if let (Some(authorization), Some(plan)) = (
+                cache_authorization.as_ref(),
+                preliminary_cache_plan.as_ref(),
+            ) {
+                crate::structural_cache::write_execution(
+                    &self.repo_root,
+                    &crate::structural_cache::StructuralCacheExecution {
+                        schema_version:
+                            crate::structural_cache::STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
+                        offline_preprocessing: true,
+                        base_archive_sha256: authorization
+                            .authorization
+                            .base_archive_sha256
+                            .clone(),
+                        base_sidecar_sha256: authorization
+                            .authorization
+                            .base_sidecar_sha256
+                            .clone(),
+                        base_report_digest: authorization.authorization.base_report_digest.clone(),
+                        target_commit: authorization.authorization.target_commit.clone(),
+                        target_tree: authorization.authorization.target_tree.clone(),
+                        inherited_paths: plan
+                            .inherited_paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .collect(),
+                        executed_paths: Vec::new(),
+                        invalidated_partitions: authorization
+                            .authorization
+                            .invalidated_partitions
+                            .clone(),
+                        escalated_partitions: Vec::new(),
+                        changed_file_count: 0,
+                        invalidated_file_count: 0,
+                        inherited_graph_enrichment_operation_count: plan
+                            .inherited_paths
+                            .iter()
+                            .filter_map(|path| {
+                                authorization
+                                    .inherited_by_path
+                                    .get(path.to_string_lossy().as_ref())
+                            })
+                            .map(|file| file.producer_graph_enrichment_operation_count)
+                            .sum(),
+                        executed_graph_enrichment_operation_count: 0,
+                        inherited_readiness_validation_request_count: authorization
+                            .inherited_readiness_validation_request_count(&plan.inherited_paths),
+                        executed_readiness_validation_request_count: 0,
+                        executed_producer_work_ids: Vec::new(),
+                        closure_edge_count: plan.closure_edge_count as u64,
+                        execution_job_id: None,
+                        digest: String::new(),
+                    },
+                )?;
+            }
 
             // Read final counts (may have changed after LSP enrichment).
             let (total_node_count, total_edge_count) = {
@@ -1718,6 +1843,8 @@ impl RnaHandler {
             .chain(scan.new_files.iter())
             .cloned()
             .collect();
+        let old_nodes = cached_state.nodes.clone();
+        let old_edges = cached_state.edges.clone();
 
         // Rebuild the index before update_graph_with_scan (it expects a valid index).
         cached_state.index = crate::graph::index::GraphIndex::new();
@@ -1728,9 +1855,21 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        let incremental_update = self
-            .update_graph_with_scan_outcome(&mut cached_state, Some(scan), enrichment)
+        // The outer foreground bus below is the sole LSP owner for an
+        // incremental target. The graph update still performs extraction and
+        // structural post-passes, but cannot execute the same LSP plan twice.
+        let _incremental_update = self
+            .update_graph_with_scan_outcome(&mut cached_state, Some(scan), enrichment.without_lsp())
             .await?;
+        let cache_plan = cache_authorization.as_ref().map(|authorization| {
+            crate::structural_cache::plan_incremental_impact(
+                authorization,
+                &old_nodes,
+                &old_edges,
+                &cached_state.nodes,
+                &cached_state.edges,
+            )
+        });
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
         let extract_time = t1.elapsed();
@@ -1758,7 +1897,7 @@ impl RnaHandler {
         // Route through emit_enrichment_pipeline instead of calling
         // EnricherRegistry::enrich_all() directly. Pass the full graph;
         // dirty_slugs scopes LSP to only the primary root (changed files).
-        let (all_nodes, all_edges) = {
+        let (mut all_nodes, mut all_edges) = {
             let snap = self.graph.load_full();
             let gs = snap.as_ref().as_ref().unwrap();
             (gs.nodes.clone(), gs.edges.clone())
@@ -1778,7 +1917,27 @@ impl RnaHandler {
         ));
 
         let (root_pairs, primary_slug) = self.build_bus_root_pairs();
-        let touched_files: std::collections::HashSet<(String, PathBuf)> = changed_file_set
+        let lsp_execution_files = cache_plan
+            .as_ref()
+            .map(|plan| plan.executed_paths.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_else(|| changed_file_set.clone());
+        if cache_plan.is_some() {
+            let purge_paths = lsp_execution_files
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>();
+            let purged_work = crate::extract::lsp::work_items::purge_records_for_paths(
+                &self.repo_root,
+                &purge_paths,
+            )?;
+            if !purged_work.is_empty() {
+                on_progress(&format!(
+                    "LSP: invalidated {} carried work records before incremental execution",
+                    purged_work.len()
+                ));
+            }
+        }
+        let touched_files: std::collections::HashSet<(String, PathBuf)> = lsp_execution_files
             .iter()
             .cloned()
             .map(|file| (primary_slug.clone(), file))
@@ -1787,9 +1946,41 @@ impl RnaHandler {
             &touched_files,
             &all_nodes,
         )?;
+        let purged_lsp_edge_ids = purge_existing_scoped_lsp_output(
+            &mut all_nodes,
+            &mut all_edges,
+            &lsp_node_filter,
+            &lsp_execution_files,
+        );
+        if !purged_lsp_edge_ids.is_empty() {
+            on_progress(&format!(
+                "LSP: invalidated {} cached scoped edges before incremental execution",
+                purged_lsp_edge_ids.len()
+            ));
+        }
         // Only the primary root has changes in the incremental path.
         let dirty_slugs: Option<std::collections::HashSet<String>> =
             Some(std::iter::once(primary_slug.clone()).collect());
+        let incremental_lsp_job_id = if enrichment.runs_lsp() && !lsp_execution_files.is_empty() {
+            let job_id = match self.enrichment_jobs.begin_job(
+                &self.repo_root,
+                EnrichmentCapability::CallReferences,
+                EnrichmentScope::ChangedFiles,
+                EnrichmentTrigger::IncrementalRefresh,
+                None,
+            )? {
+                JobStart::Started(job) => job.job_id,
+                JobStart::Joined { existing_job_id } => existing_job_id,
+            };
+            self.enrichment_jobs.mark_running(
+                &self.repo_root,
+                &job_id,
+                "incremental_call_references",
+            );
+            Some(job_id)
+        } else {
+            None
+        };
 
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
@@ -1802,9 +1993,10 @@ impl RnaHandler {
             primary_slug,
             repo_root: self.repo_root.clone(),
             scan_stats: Arc::clone(&self.scan_stats),
-            skip_lsp: !enrichment.runs_lsp(),
+            skip_lsp: !enrichment.runs_lsp() || incremental_lsp_job_id.is_none(),
             dirty_slugs,
             lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+            file_readiness_filter: Some(Arc::new(lsp_execution_files.clone())),
             broad_reference_budget: None,
         })
         .await;
@@ -1827,8 +2019,7 @@ impl RnaHandler {
                     enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
                     enriched_nodes.reverse();
 
-                    let mut seen_edges = std::collections::HashSet::new();
-                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    dedup_edges_preserving_lsp_evidence(&mut enriched_edges);
                 }
 
                 lsp_edge_count = enriched_edges
@@ -1902,7 +2093,7 @@ impl RnaHandler {
                     } else {
                         self.lsp_status.set_unavailable();
                     }
-                    if let Some(job_id) = incremental_update.lsp_job_id.as_deref() {
+                    if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                         if e.is_timeout() {
                             self.enrichment_jobs.mark_timed_out(
                                 &self.repo_root,
@@ -1951,17 +2142,12 @@ impl RnaHandler {
                 );
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground incremental persist failed: {}", e);
-                    if lsp_stage_completed
-                        && let Some(job_id) = incremental_update.lsp_job_id.as_deref()
-                    {
+                    if lsp_stage_completed && let Some(job_id) = incremental_lsp_job_id.as_deref() {
                         let detail = format!(
                             "full persist failed during incremental foreground pipeline: {e}"
                         );
-                        self.enrichment_jobs.mark_failed(
-                            &self.repo_root,
-                            job_id,
-                            detail.clone(),
-                        );
+                        self.enrichment_jobs
+                            .mark_failed(&self.repo_root, job_id, detail.clone());
                         self.enrichment_jobs.record_lsp_evidence(
                             &self.repo_root,
                             job_id,
@@ -1989,9 +2175,7 @@ impl RnaHandler {
                 } else {
                     super::sentinel::clear_lsp_sentinel(&self.repo_root);
                 }
-                if lsp_stage_completed
-                    && let Some(job_id) = incremental_update.lsp_job_id.as_deref()
-                {
+                if lsp_stage_completed && let Some(job_id) = incremental_lsp_job_id.as_deref() {
                     if let Some(detail) = lsp_degraded_detail.as_deref() {
                         self.enrichment_jobs.mark_degraded(
                             &self.repo_root,
@@ -2024,6 +2208,134 @@ impl RnaHandler {
                             lsp_validations.clone(),
                         ),
                     );
+                }
+                if let (Some(authorization), Some(plan)) =
+                    (cache_authorization.as_ref(), cache_plan.as_ref())
+                {
+                    let stale_paths = authorization
+                        .authorization
+                        .deleted_paths
+                        .iter()
+                        .map(PathBuf::from)
+                        .chain(
+                            authorization
+                                .authorization
+                                .renamed_paths
+                                .iter()
+                                .map(|rename| PathBuf::from(&rename[0])),
+                        )
+                        .collect::<BTreeSet<_>>();
+                    crate::structural_cache::validate_persisted_target(
+                        &self.repo_root,
+                        &nodes,
+                        &edges,
+                        &stale_paths,
+                    )
+                    .await?;
+                    let changed_paths = authorization
+                        .authorization
+                        .changed_paths
+                        .iter()
+                        .chain(authorization.authorization.added_paths.iter())
+                        .chain(authorization.authorization.deleted_paths.iter())
+                        .map(PathBuf::from)
+                        .chain(authorization.authorization.renamed_paths.iter().flat_map(
+                            |rename| [PathBuf::from(&rename[0]), PathBuf::from(&rename[1])],
+                        ))
+                        .collect::<BTreeSet<_>>();
+                    let base_producers = authorization
+                        .inherited_by_path
+                        .values()
+                        .flat_map(|file| file.producer_work_ids.iter().cloned())
+                        .collect::<BTreeSet<_>>();
+                    let executed_records =
+                        crate::extract::lsp::work_items::load_all_records(&self.repo_root)?
+                            .into_iter()
+                            .filter(|record| {
+                                plan.executed_paths.contains(Path::new(&record.file))
+                            && !base_producers
+                                .contains(&format!("{}:{}", record.job_id, record.item_id))
+                            && record.state
+                                == crate::extract::lsp::work_items::LspWorkItemState::Completed
+                            })
+                            .collect::<Vec<_>>();
+                    let executed_graph_enrichment_operation_count = executed_records
+                        .iter()
+                        .map(|record| record.requested_operations.len() as u64)
+                        .sum();
+                    let executed_producer_work_ids = executed_records
+                        .iter()
+                        .map(|record| format!("{}:{}", record.job_id, record.item_id))
+                        .collect();
+                    crate::structural_cache::write_execution(
+                        &self.repo_root,
+                        &crate::structural_cache::StructuralCacheExecution {
+                            schema_version: crate::structural_cache::
+                                STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
+                            offline_preprocessing: true,
+                            base_archive_sha256: authorization
+                                .authorization
+                                .base_archive_sha256
+                                .clone(),
+                            base_sidecar_sha256: authorization
+                                .authorization
+                                .base_sidecar_sha256
+                                .clone(),
+                            base_report_digest: authorization
+                                .authorization
+                                .base_report_digest
+                                .clone(),
+                            target_commit: authorization.authorization.target_commit.clone(),
+                            target_tree: authorization.authorization.target_tree.clone(),
+                            inherited_paths: plan
+                                .inherited_paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect(),
+                            executed_paths: plan
+                                .executed_paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect(),
+                            invalidated_partitions: authorization
+                                .authorization
+                                .invalidated_partitions
+                                .clone(),
+                            escalated_partitions: plan
+                                .escalated_partitions
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            changed_file_count: changed_paths.len() as u64,
+                            invalidated_file_count: plan
+                                .executed_paths
+                                .difference(&changed_paths)
+                                .count() as u64,
+                            inherited_graph_enrichment_operation_count: plan
+                                .inherited_paths
+                                .iter()
+                                .filter_map(|path| {
+                                    authorization
+                                        .inherited_by_path
+                                        .get(path.to_string_lossy().as_ref())
+                                })
+                                .map(|file| file.producer_graph_enrichment_operation_count)
+                                .sum(),
+                            executed_graph_enrichment_operation_count,
+                            inherited_readiness_validation_request_count: authorization
+                                .inherited_readiness_validation_request_count(
+                                    &plan.inherited_paths,
+                                ),
+                            executed_readiness_validation_request_count: lsp_validations
+                                .iter()
+                                .filter(|validation| validation.method.is_some())
+                                .count() as u64,
+                            executed_producer_work_ids,
+                            closure_edge_count: plan.closure_edge_count as u64,
+                            execution_job_id: incremental_lsp_job_id.clone(),
+                            digest: String::new(),
+                        },
+                    )?;
                 }
             }
         }
@@ -2073,11 +2385,7 @@ impl RnaHandler {
                 "skipped by scan options",
             ));
         }
-        let related_job_ids = incremental_update
-            .lsp_job_id
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let related_job_ids = incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>();
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
@@ -2322,6 +2630,7 @@ impl RnaHandler {
                 skip_lsp: !run_lsp_in_bus,
                 dirty_slugs: None,
                 lsp_node_filter: None,
+                file_readiness_filter: None,
                 broad_reference_budget: None,
             })
             .await;
@@ -2358,8 +2667,7 @@ impl RnaHandler {
                     enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
                     enriched_nodes.reverse();
 
-                    let mut seen_edges = std::collections::HashSet::new();
-                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    dedup_edges_preserving_lsp_evidence(&mut enriched_edges);
                 }
 
                 lsp_edge_count = enriched_edges
@@ -2503,11 +2811,8 @@ impl RnaHandler {
                     tracing::error!("Foreground full persist failed: {}", e);
                     if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                         let detail = format!("Full persist failed during foreground pipeline: {e}");
-                        self.enrichment_jobs.mark_failed(
-                            &self.repo_root,
-                            job_id,
-                            detail.clone(),
-                        );
+                        self.enrichment_jobs
+                            .mark_failed(&self.repo_root, job_id, detail.clone());
                         self.enrichment_jobs.record_lsp_evidence(
                             &self.repo_root,
                             job_id,
@@ -2779,6 +3084,7 @@ impl RnaHandler {
             skip_lsp: false,
             dirty_slugs,
             lsp_node_filter,
+            file_readiness_filter: None,
             broad_reference_budget: broad_reference_budget.clone(),
         })
         .await;
@@ -2798,8 +3104,7 @@ impl RnaHandler {
                     enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
                     enriched_nodes.reverse();
 
-                    let mut seen_edges = std::collections::HashSet::new();
-                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    dedup_edges_preserving_lsp_evidence(&mut enriched_edges);
                 }
 
                 let scoped_delta = persistence_node_filter.as_deref().map(|node_filter| {
@@ -3650,6 +3955,32 @@ mod tests {
     }
 
     #[test]
+    fn final_edge_dedup_preserves_lsp_confirmation_over_extraction_duplicate() {
+        let caller = make_node("caller", NodeKind::Function);
+        let callee = make_node("callee", NodeKind::Function);
+        let extracted = Edge {
+            from: caller.id.clone(),
+            to: callee.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let mut confirmed = extracted.clone();
+        confirmed.source = ExtractionSource::Lsp;
+        confirmed.confidence = Confidence::Confirmed;
+        let stable_id = confirmed.stable_id();
+        let mut edges = vec![extracted, confirmed];
+
+        dedup_edges_preserving_lsp_evidence(&mut edges);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), stable_id);
+        assert_eq!(edges[0].source, ExtractionSource::Lsp);
+        assert_eq!(edges[0].confidence, Confidence::Confirmed);
+    }
+
+    #[test]
     fn scoped_lsp_persistence_replaces_only_planned_edges() {
         let planned = make_node("planned", NodeKind::Function);
         let unrelated = make_node("unrelated", NodeKind::Function);
@@ -3744,6 +4075,59 @@ mod tests {
         assert_eq!(
             upsert_node_ids,
             HashSet::from([new_target.stable_id(), new_non_lsp_node.stable_id()])
+        );
+    }
+
+    #[test]
+    fn incremental_scope_purges_stale_edges_and_only_orphaned_lsp_nodes() {
+        let planned = make_node_in_file("src/changed.py", "planned", NodeKind::Function);
+        let unrelated = make_node_in_file("src/unchanged.py", "unrelated", NodeKind::Function);
+        let mut orphaned = make_node_in_file("<external>", "orphaned", NodeKind::Function);
+        orphaned.id.root = "external".to_string();
+        orphaned.source = ExtractionSource::Lsp;
+        let mut shared = make_node_in_file("<external>", "shared", NodeKind::Function);
+        shared.id.root = "external".to_string();
+        shared.source = ExtractionSource::Lsp;
+        let edge = |from: &Node, to: &Node| Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let stale_orphan_edge = edge(&planned, &orphaned);
+        let stale_shared_edge = edge(&planned, &shared);
+        let retained_shared_edge = edge(&unrelated, &shared);
+        let mut nodes = vec![planned.clone(), unrelated, orphaned.clone(), shared.clone()];
+        let mut edges = vec![
+            stale_orphan_edge.clone(),
+            stale_shared_edge.clone(),
+            retained_shared_edge.clone(),
+        ];
+
+        let removed = purge_existing_scoped_lsp_output(
+            &mut nodes,
+            &mut edges,
+            &HashSet::from([planned.stable_id()]),
+            &HashSet::from([PathBuf::from("src/changed.py")]),
+        );
+
+        assert_eq!(
+            removed.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([stale_orphan_edge.stable_id(), stale_shared_edge.stable_id()])
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), retained_shared_edge.stable_id());
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| node.stable_id() == orphaned.stable_id())
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.stable_id() == shared.stable_id())
         );
     }
 
@@ -3883,6 +4267,7 @@ mod tests {
             skip_lsp: true,
             dirty_slugs: None,
             lsp_node_filter: None,
+            file_readiness_filter: None,
             broad_reference_budget: None,
         })
         .await

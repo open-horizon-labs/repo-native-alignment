@@ -1,0 +1,40 @@
+name: SWE-bench LSP toolchain contract
+
+on:
+  pull_request:
+    paths:
+      - "scripts/swebench_lsp_toolchain.py"
+      - "scripts/tests/test_swebench_lsp_toolchain.py"
+      - "src/extract/lsp/mod.rs"
+      - "benchmark/swebench-act-context/lsp-toolchain/**"
+      - ".github/workflows/swebench-lsp-toolchain.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/swebench_lsp_toolchain.py"
+      - "scripts/tests/test_swebench_lsp_toolchain.py"
+      - "src/extract/lsp/mod.rs"
+      - "benchmark/swebench-act-context/lsp-toolchain/**"
+      - ".github/workflows/swebench-lsp-toolchain.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile fail-closed toolchain scripts
+        run: python3 -m py_compile scripts/swebench_lsp_toolchain.py scripts/tests/test_swebench_lsp_toolchain.py
+      - name: Test inventory, cache drift, digest drift, and descriptor drift
+        run: python3 -m unittest scripts.tests.test_swebench_lsp_toolchain -v
+      - name: Verify frozen inventory, lock, and RNA descriptor parity
+        run: >-
+          python3 scripts/swebench_lsp_toolchain.py verify-lock
+          --lock benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json
+          --inventory benchmark/swebench-act-context/lsp-toolchain/inventory.json
+          --descriptors benchmark/swebench-act-context/lsp-toolchain/descriptor-inventory.json

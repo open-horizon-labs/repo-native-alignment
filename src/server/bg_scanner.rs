@@ -265,6 +265,8 @@ pub(super) async fn update_graph(
                 lance_repo_root: None,
                 skip_lsp: false, // background scanner: LSP runs inline
                 lsp_node_filter: None,
+                file_readiness: false,
+                file_readiness_filter: None,
                 broad_reference_budget: None,
             },
             dirty_slugs,

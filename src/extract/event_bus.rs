@@ -130,6 +130,11 @@ pub enum ExtractionEvent {
         validation: Option<Box<crate::extract::scan_stats::LspValidationEvidence>>,
     },
 
+    /// Exact file-scoped LSP request evidence.
+    LspFileValidation {
+        validation: Box<crate::extract::scan_stats::LspValidationEvidence>,
+    },
+
     /// Query-yield measurements emitted separately from graph enrichment output.
     LspQueryMetrics {
         slug: String,
@@ -236,6 +241,7 @@ pub enum ExtractionEventKind {
     RootExtracted,
     LanguageDetected,
     EnrichmentComplete,
+    LspFileValidation,
     LspQueryMetrics,
     FrameworkDetected,
     PassComplete,
@@ -253,6 +259,9 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => ExtractionEventKind::RootExtracted,
             ExtractionEvent::LanguageDetected { .. } => ExtractionEventKind::LanguageDetected,
             ExtractionEvent::EnrichmentComplete { .. } => ExtractionEventKind::EnrichmentComplete,
+            ExtractionEvent::LspFileValidation { .. } => {
+                ExtractionEventKind::LspFileValidation
+            }
             ExtractionEvent::LspQueryMetrics { .. } => ExtractionEventKind::LspQueryMetrics,
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
             ExtractionEvent::PassComplete { .. } => ExtractionEventKind::PassComplete,
@@ -428,6 +437,12 @@ impl ExtractionEvent {
                     buf.push(b'\t');
                     buf.extend_from_slice(validation.detail.as_deref().unwrap_or("-").as_bytes());
                 }
+            }
+            ExtractionEvent::LspFileValidation { validation } => {
+                buf.extend_from_slice(
+                    &serde_json::to_vec(validation)
+                        .expect("LSP file validation serialization cannot fail"),
+                );
             }
             ExtractionEvent::LspQueryMetrics {
                 slug,
@@ -652,6 +667,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. } => "root_extracted",
             ExtractionEvent::LanguageDetected { .. } => "language_detected",
             ExtractionEvent::EnrichmentComplete { .. } => "enrichment_complete",
+            ExtractionEvent::LspFileValidation { .. } => "lsp_file_validation",
             ExtractionEvent::LspQueryMetrics { .. } => "lsp_query_metrics",
             ExtractionEvent::FrameworkDetected { .. } => "framework_detected",
             ExtractionEvent::PassComplete { .. } => "pass_complete",

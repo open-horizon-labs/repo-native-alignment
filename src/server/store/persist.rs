@@ -359,9 +359,9 @@ async fn persist_graph_incremental_with_retry_limit(
                     })
                     .reduce(DfExpr::or)
                     .expect("non-empty deleted-files chunk");
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete symbols for removed files: {}", e);
-                }
+                tbl.delete(&predicate)
+                    .await
+                    .context("Failed to delete symbols for removed files")?;
             }
         }
 
@@ -440,9 +440,9 @@ async fn persist_graph_incremental_with_retry_limit(
         {
             for chunk in deleted_edge_ids.chunks(PREDICATE_BATCH_SIZE) {
                 let predicate = string_isin("id", chunk.iter().cloned());
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete edges for removed files: {}", e);
-                }
+                tbl.delete(&predicate)
+                    .await
+                    .context("Failed to delete edges for removed files")?;
             }
         }
 

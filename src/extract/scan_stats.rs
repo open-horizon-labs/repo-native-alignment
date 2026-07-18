@@ -74,7 +74,7 @@ pub enum LspValidationStatus {
     NotValidated,
 }
 
-pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+pub const LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 5;
 
 /// Exact per-file operation capabilities negotiated in the initialize response.
 /// Readiness/quiescence methods deliberately do not appear here.
@@ -87,6 +87,7 @@ pub struct LspNegotiatedCapabilities {
     pub implementation_provider: bool,
     pub document_link_provider: bool,
     pub document_symbol_provider: bool,
+    pub code_action_provider: bool,
 }
 
 /// Normalized document-symbol payload retained across the durable job-evidence seam.
@@ -121,6 +122,9 @@ pub struct LspValidationEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_uri: Option<String>,
     pub symbol_count: Option<usize>,
+    /// Wall-clock duration of this exact readiness request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negotiated_capabilities: Option<LspNegotiatedCapabilities>,
@@ -146,6 +150,7 @@ impl LspValidationEvidence {
             method: Some(method.into()),
             request_uri: None,
             symbol_count: Some(symbol_count),
+            duration_ms: None,
             detail: None,
             negotiated_capabilities: None,
             document_symbols: Box::default(),
@@ -165,6 +170,7 @@ impl LspValidationEvidence {
             method: None,
             request_uri: None,
             symbol_count: None,
+            duration_ms: None,
             detail: Some(detail.into()),
             negotiated_capabilities: None,
             document_symbols: Box::default(),
@@ -184,6 +190,7 @@ impl LspValidationEvidence {
             method: Some(method.into()),
             request_uri: None,
             symbol_count: None,
+            duration_ms: None,
             detail: None,
             negotiated_capabilities: None,
             document_symbols: Box::default(),
@@ -197,6 +204,11 @@ impl LspValidationEvidence {
 
     pub fn with_request_uri(mut self, uri: Option<String>) -> Self {
         self.request_uri = uri;
+        self
+    }
+
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
         self
     }
 
