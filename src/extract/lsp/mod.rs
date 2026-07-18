@@ -645,20 +645,27 @@ fn materialize_document_symbol_nodes(
     repo_root: &Path,
     matching_nodes: &[&Node],
 ) -> Result<Vec<Node>> {
+    let roots_by_file = matching_nodes
+        .iter()
+        .map(|node| (node.id.file.clone(), node.id.root.clone()))
+        .collect::<HashMap<_, _>>();
     materialize_document_symbols(
         &validation.language,
         &mut validation.document_symbols,
         repo_root,
-        matching_nodes,
+        |file| roots_by_file.get(file).cloned(),
     )
 }
 
-fn materialize_document_symbols(
+fn materialize_document_symbols<F>(
     language: &str,
     symbols: &mut [LspDocumentSymbolEvidence],
     repo_root: &Path,
-    matching_nodes: &[&Node],
-) -> Result<Vec<Node>> {
+    root_for_file: F,
+) -> Result<Vec<Node>>
+where
+    F: Fn(&Path) -> Option<String>,
+{
     let mut nodes = Vec::with_capacity(symbols.len());
     for symbol in symbols {
         let uri = Uri::from_str(&symbol.uri)
@@ -672,16 +679,12 @@ fn materialize_document_symbols(
             "documentSymbol URI {} is outside the repository",
             symbol.uri
         );
-        let root = matching_nodes
-            .iter()
-            .find(|node| node.id.file == file)
-            .map(|node| node.id.root.clone())
-            .with_context(|| {
-                format!(
-                    "documentSymbol response for {} has no matching extracted file",
-                    file.display()
-                )
-            })?;
+        let root = root_for_file(&file).with_context(|| {
+            format!(
+                "documentSymbol response for {} has no matching extracted file",
+                file.display()
+            )
+        })?;
         let normalized_file = file.to_string_lossy().replace('\\', "/");
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("lsp_document_symbol_name".to_string(), symbol.name.clone());
@@ -3284,6 +3287,9 @@ impl Enricher for LspEnricher {
             let mut map: HashMap<std::path::PathBuf, Vec<Node>> = HashMap::new();
             for n in matching_nodes_owned.iter() {
                 map.entry(n.id.file.clone()).or_default().push(n.clone());
+            }
+            for nodes in map.values_mut() {
+                nodes.sort_by_key(|node| node.line_end.saturating_sub(node.line_start));
             }
             Arc::new(map)
         };

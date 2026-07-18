@@ -20,7 +20,8 @@ use super::policy::{
     LspServerCapabilities,
 };
 use super::transport::{
-    PipelinedTransport, find_enclosing_symbol, path_to_uri, uri_to_relative_path,
+    PipelinedTransport, find_enclosing_symbol, find_enclosing_symbol_in_file, path_to_uri,
+    uri_to_relative_path,
 };
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
@@ -33,6 +34,18 @@ use crate::scanner::LspConfig;
 const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn should_abort_zero_edge_pass(
+    edge_producing_total: usize,
+    edge_attempted: u32,
+    emitted_edges: bool,
+    elapsed: Duration,
+) -> bool {
+    edge_producing_total > 0
+        && !emitted_edges
+        && ((edge_attempted >= ZERO_EDGE_ABORT_THRESHOLD && elapsed >= ZERO_EDGE_MIN_WARMUP)
+            || elapsed > ZERO_EDGE_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DidOpenStatus {
@@ -185,6 +198,7 @@ struct Pass1TaskResult {
     edges: Vec<Edge>,
     new_nodes: Vec<Node>,
     had_error: bool,
+    edge_producing: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -854,6 +868,14 @@ impl LspEnricher {
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
         let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        let edge_producing_total = work_items
+            .iter()
+            .filter(|item| {
+                item.requested_operations
+                    .first()
+                    .is_some_and(|operation| *operation != LspQueryOperation::DocumentSymbols)
+            })
+            .count();
         let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
@@ -892,6 +914,9 @@ impl LspEnricher {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: operation.is_some_and(|operation| {
+                                operation != LspQueryOperation::DocumentSymbols
+                            }),
                         };
                     }
                     Self::run_pass1_work_item(
@@ -915,6 +940,7 @@ impl LspEnricher {
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
         // by phase/file instead of waiting for the outer 30-minute job watchdog.
         let mut attempted = 0u32;
+        let mut edge_attempted = 0u32;
         let mut errors = 0u32;
         let mut aborted = false;
         let mut abort_diagnostic = None;
@@ -945,6 +971,7 @@ impl LspEnricher {
                         break;
                     };
                     attempted += 1;
+                    edge_attempted += u32::from(task_result.edge_producing);
                     if task_result.had_error {
                         errors += 1;
                     }
@@ -1045,24 +1072,25 @@ impl LspEnricher {
             // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
             // OR spent >= 2 minutes with 0 edges, the language server is likely
             // misconfigured.
-            if result.added_edges.len() == pass1_edge_baseline
-                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD
-                    && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
-                    || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
-            {
+            if should_abort_zero_edge_pass(
+                edge_producing_total,
+                edge_attempted,
+                result.added_edges.len() != pass1_edge_baseline,
+                pass1_start.elapsed(),
+            ) {
                 let snapshot = diagnostics.snapshot().await;
                 let rendered_snapshot = snapshot.render();
                 tracing::warn!(
-                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) -- aborting. Diagnostic snapshot: {}",
+                    "LSP: {} produced 0 edges after {}/{} edge-producing requests ({:.1}s) -- aborting. Diagnostic snapshot: {}",
                     self.server_command,
-                    attempted,
-                    total_nodes,
+                    edge_attempted,
+                    edge_producing_total,
                     pass1_start.elapsed().as_secs_f64(),
                     rendered_snapshot,
                 );
                 aborted = true;
                 abort_diagnostic = Some(format!(
-                    "zero LSP edges after {attempted}/{total_nodes} nodes; {rendered_snapshot}"
+                    "zero LSP edges after {edge_attempted}/{edge_producing_total} edge-producing requests; {rendered_snapshot}"
                 ));
                 join_set.abort_all();
                 break;
@@ -1127,6 +1155,8 @@ impl LspEnricher {
     ) -> Pass1TaskResult {
         let started_at = Instant::now();
         let operation = item.requested_operations.first().copied();
+        let edge_producing =
+            operation.is_some_and(|operation| operation != LspQueryOperation::DocumentSymbols);
         diagnostics.set_phase(item, "resolving_file_uri").await;
         let node = &item.node;
         let abs_path = root.join(&node.id.file);
@@ -1146,6 +1176,7 @@ impl LspEnricher {
                     edges: Vec::new(),
                     new_nodes: Vec::new(),
                     had_error: true,
+                    edge_producing,
                 };
             }
         };
@@ -1174,6 +1205,7 @@ impl LspEnricher {
                 edges: Vec::new(),
                 new_nodes: Vec::new(),
                 had_error: true,
+                edge_producing,
             };
         }
 
@@ -1193,7 +1225,7 @@ impl LspEnricher {
                 transport,
                 &file_uri,
                 language,
-                matching_owned,
+                refs_by_file,
                 root,
                 item.id,
                 telemetry,
@@ -1279,7 +1311,7 @@ impl LspEnricher {
                             line,
                             col,
                             node,
-                            matching_owned,
+                            refs_by_file,
                             root,
                             operation,
                             item.id,
@@ -1328,6 +1360,7 @@ impl LspEnricher {
             edges,
             new_nodes,
             had_error,
+            edge_producing,
         }
     }
 
@@ -1821,7 +1854,7 @@ impl LspEnricher {
         transport: &PipelinedTransport,
         file_uri: &lsp_types::Uri,
         language: &str,
-        matching_nodes: &[Node],
+        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
         root: &Path,
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
@@ -1847,8 +1880,12 @@ impl LspEnricher {
             Ok(mut symbols) => {
                 observation.non_empty_responses += usize::from(!symbols.is_empty());
                 observation.result_count = symbols.len();
-                let matching_refs = matching_nodes.iter().collect::<Vec<_>>();
-                match materialize_document_symbols(language, &mut symbols, root, &matching_refs) {
+                match materialize_document_symbols(language, &mut symbols, root, |file| {
+                    refs_by_file
+                        .get(file)
+                        .and_then(|nodes| nodes.first())
+                        .map(|node| node.id.root.clone())
+                }) {
                     Ok(nodes) => new_nodes.extend(nodes),
                     Err(error) => {
                         *had_error = true;
@@ -1873,7 +1910,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_nodes: &[Node],
+        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
         root: &Path,
         operation: LspQueryOperation,
         work_item_id: usize,
@@ -1897,12 +1934,13 @@ impl LspEnricher {
         match response {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
-                let matching_refs = matching_nodes.iter().collect::<Vec<_>>();
                 for location in locations {
                     observation.result_count += 1;
                     let target_path = uri_to_relative_path(&location.uri, root);
                     let target_line = location.range.start.line as usize + 1;
-                    let target = find_enclosing_symbol(&matching_refs, &target_path, target_line)
+                    let target = refs_by_file
+                        .get(&target_path)
+                        .and_then(|nodes| find_enclosing_symbol_in_file(nodes, target_line))
                         .unwrap_or_else(|| NodeId {
                             root: node.id.root.clone(),
                             file: target_path.clone(),
@@ -2361,6 +2399,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn document_symbol_only_work_never_trips_zero_edge_watchdog() {
+        assert!(!should_abort_zero_edge_pass(
+            0,
+            0,
+            false,
+            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+        ));
+        assert!(should_abort_zero_edge_pass(
+            1,
+            ZERO_EDGE_ABORT_THRESHOLD,
+            false,
+            ZERO_EDGE_MIN_WARMUP,
+        ));
+        assert!(!should_abort_zero_edge_pass(
+            1,
+            ZERO_EDGE_ABORT_THRESHOLD,
+            true,
+            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
     fn type_hierarchy_telemetry_uses_all_observed_requests() {
         let profile = super::super::policy::LspQueryProfile::new("rust", "rust-analyzer");
         let telemetry = LspQueryTelemetry::new(&profile);
@@ -2658,6 +2718,7 @@ mod tests {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: true,
                         }
                     }
                 }
@@ -2733,6 +2794,7 @@ mod tests {
                             edges: Vec::new(),
                             new_nodes: Vec::new(),
                             had_error: false,
+                            edge_producing: true,
                         }
                     }
                 }

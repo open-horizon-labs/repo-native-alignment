@@ -10,8 +10,10 @@ reference evidence without provisioning a real server.
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
+from urllib.parse import unquote, urlparse
 
 
 def read_message():
@@ -50,6 +52,42 @@ def rpc_error(request_id, code, message):
             "error": {"code": code, "message": message},
         }
     )
+
+
+def lsp_character(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def document_link_result(uri):
+    """Return the src/app.py link at its exact range in the requested document."""
+    if not uri:
+        return []
+    path = Path(unquote(urlparse(uri).path))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+    pattern = re.compile(r"\[[^\]]+\]\((?:\.\./)?src/app\.py\)")
+    for line_number, line in enumerate(lines):
+        match = pattern.search(line)
+        if match is None:
+            continue
+        return [
+            {
+                "range": {
+                    "start": {
+                        "line": line_number,
+                        "character": lsp_character(line[: match.start()]),
+                    },
+                    "end": {
+                        "line": line_number,
+                        "character": lsp_character(line[: match.end()]),
+                    },
+                },
+                "target": (Path.cwd() / "src/app.py").as_uri(),
+            }
+        ]
+    return []
 
 
 def main():
@@ -104,10 +142,8 @@ def main():
             else:
                 result(request_id, [])
         elif method == "textDocument/documentLink" and scenario == "document_features":
-            result(
-                request_id,
-                [{"range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 16}}, "target": (Path.cwd() / "src/app.py").as_uri()}],
-            )
+            uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
+            result(request_id, document_link_result(uri))
         elif method == "textDocument/definition" and scenario == "document_features":
             result(
                 request_id,
