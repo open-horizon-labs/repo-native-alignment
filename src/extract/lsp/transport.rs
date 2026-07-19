@@ -621,23 +621,23 @@ impl PipelinedTransport {
             }
 
             // Check if this is a response (has "id" field and no "method" field)
-            if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
-                if msg.get("method").is_none() {
-                    // This is a response — dispatch to waiting caller
-                    let mut map = pending.lock().unwrap();
-                    if let Some(sender) = map.remove(&id) {
-                        let result = if let Some(error) = msg.get("error") {
-                            Err(anyhow::anyhow!("LSP error: {}", error))
-                        } else {
-                            Ok(msg
-                                .get("result")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null))
-                        };
-                        let _ = sender.send(result);
-                    }
-                    continue;
+            if let Some(id) = msg.get("id").and_then(|v| v.as_i64())
+                && msg.get("method").is_none()
+            {
+                // This is a response — dispatch to waiting caller
+                let mut map = pending.lock().unwrap();
+                if let Some(sender) = map.remove(&id) {
+                    let result = if let Some(error) = msg.get("error") {
+                        Err(anyhow::anyhow!("LSP error: {}", error))
+                    } else {
+                        Ok(msg
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null))
+                    };
+                    let _ = sender.send(result);
                 }
+                continue;
             }
 
             // Notifications: log progress, capture diagnostics, ignore the rest
