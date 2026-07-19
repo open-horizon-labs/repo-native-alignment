@@ -863,10 +863,6 @@ async fn async_main() -> anyhow::Result<()> {
             }
             if args.full {
                 eprintln!("Full pipeline scan: {}", repo_root.display());
-                let scan_started_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
                 let handler = RnaHandler {
                     repo_root: repo_root.clone(),
                     business_context: BusinessContextAdmission::new(business_context_mode),
@@ -899,26 +895,25 @@ async fn async_main() -> anyhow::Result<()> {
                     let graph = graph_snapshot.as_ref().as_ref().ok_or_else(|| {
                         anyhow::anyhow!("full scan completed without a graph snapshot")
                     })?;
-                    let completeness =
-                        repo_native_alignment::lsp_completeness::build_and_persist_report(
+                    let readiness =
+                        repo_native_alignment::lsp_completeness::load_readiness_check_with_graph(
                             &repo_root,
                             business_context_mode,
                             &graph.nodes,
                             &graph.edges,
-                            &result.lsp_entries,
-                            &result.report.related_job_ids,
-                            scan_started_at_ms,
                         )?;
+                    let completeness = &readiness.report;
                     eprintln!(
                         "LSP completeness: {} included file(s), {} violation(s), digest={}",
                         completeness.summary.included_files,
                         completeness.violations.len(),
                         completeness.digest,
                     );
-                    if !completeness.is_ready() {
+                    if !readiness.ready {
                         anyhow::bail!(
-                            "benchmark LSP completeness blocked by {} per-file violation(s); inspect {}",
+                            "benchmark LSP completeness blocked by {} per-file and {} compatibility violation(s); inspect {}",
                             completeness.violations.len(),
+                            readiness.compatibility_violations.len(),
                             repo_native_alignment::lsp_completeness::report_path(&repo_root)
                                 .display(),
                         );

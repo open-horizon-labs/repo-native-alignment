@@ -200,7 +200,12 @@ pub struct Search {
     /// Batch-retrieve multiple node IDs in one call
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
-    /// Ranking: "hybrid" (default), "keyword", "semantic"
+    /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict".
+    /// "strict" is the SWE-bench qualification lane: it requires the exact
+    /// CI semantic bundle, a ready embedding index, observed Metal execution,
+    /// hybrid retrieval without fallback, and successful reranking. It forces
+    /// reranking even when `rerank` was omitted. Flat queries from that sealed
+    /// bundle enter the same strict lane by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
     /// Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false

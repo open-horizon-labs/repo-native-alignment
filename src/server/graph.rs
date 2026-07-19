@@ -1321,24 +1321,11 @@ impl RnaHandler {
             tracing::info!("Schema migrated to v{} -- cache rebuilt", SCHEMA_VERSION);
         }
 
-        // Clean up stale cache directories from previous schema versions (#298).
-        // The old `.oh/.cache/embeddings/` directory is a dead copy from before
-        // lance path consolidation. Remove it if the lance path exists.
-        let stale_embeddings_dir = self.repo_root.join(".oh").join(".cache").join("embeddings");
-        let lance_dir = self.repo_root.join(".oh").join(".cache").join("lance");
-        if lance_dir.exists() && stale_embeddings_dir.exists() {
-            match std::fs::remove_dir_all(&stale_embeddings_dir) {
-                Ok(()) => tracing::info!(
-                    "Cleaned up stale cache directory: {}",
-                    stale_embeddings_dir.display()
-                ),
-                Err(e) => tracing::warn!(
-                    "Failed to remove stale cache directory {}: {}",
-                    stale_embeddings_dir.display(),
-                    e
-                ),
-            }
-        }
+        // `.oh/.cache/embeddings/` is the live immutable semantic-generation
+        // store. Never delete it merely because the structural Lance cache is
+        // present: branch-switch and SWE-bench incremental reconciliation reuse
+        // those verified vectors. Semantic identity/schema validation owns any
+        // required partition rebuild; migrations remain forbidden.
 
         // Load workspace config and merge with --repo as primary root.
         // Also auto-detect any live git worktrees, Claude Code memory,

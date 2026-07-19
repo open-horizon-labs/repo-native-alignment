@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use crate::embed::EmbeddingIndex;
 use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig};
@@ -27,7 +29,7 @@ use super::operation_report::{
     lsp_capability_from_status, scan_capability_reports,
 };
 use super::state::GraphState;
-use super::store::{persist_graph_incremental, persist_graph_to_lance};
+use super::store::{load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
 use super::{PipelineResult, RnaHandler};
 
 /// Check if a cached graph is missing enrichment passes output that should exist.
@@ -1136,7 +1138,7 @@ impl RnaHandler {
         let bg_embed_index = self.embed_index.clone();
         let bg_embed_status = self.embed_status.clone();
         let bg_business_context = self.business_context.clone();
-        let bg_nodes = all_nodes.to_vec();
+        let expected_node_count = all_nodes.len();
         let job_id = match self.enrichment_jobs.begin_job(
             &self.repo_root,
             EnrichmentCapability::Embeddings,
@@ -1161,19 +1163,58 @@ impl RnaHandler {
 
         tokio::spawn(async move {
             bg_jobs.mark_running(&bg_repo_root, &job_id, "embedding");
-            let embeddable_nodes: Vec<Node> = bg_nodes
-                .iter()
-                .filter(|n| n.id.root != "external")
-                .cloned()
-                .collect();
+
+            // The graph builder starts background LSP immediately before this
+            // task. Wait for that structural producer to reach a terminal state,
+            // then reopen its persisted output. Embedding an earlier in-memory
+            // snapshot would recreate the pre-#786 graph/vector race.
+            let wait_started = std::time::Instant::now();
+            let wait_budget = LspBudget::from_env().max_duration;
+            loop {
+                let lsp_is_active = bg_jobs.all_jobs(&bg_repo_root).into_iter().any(|job| {
+                    job.capability == EnrichmentCapability::CallReferences
+                        && !job.state.is_terminal()
+                });
+                if !lsp_is_active {
+                    break;
+                }
+                if wait_started.elapsed() >= wait_budget {
+                    let detail = format!(
+                        "background embedding timed out waiting for structural LSP persistence after {:.1}s",
+                        wait_started.elapsed().as_secs_f64()
+                    );
+                    bg_embed_status.set_failed(detail.clone());
+                    bg_jobs.mark_failed(&bg_repo_root, &job_id, detail);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            let persisted_graph = match load_graph_from_lance(&bg_repo_root).await {
+                Ok(graph) => graph,
+                Err(error) => {
+                    let detail = format!(
+                        "background embedding could not reopen the persisted structural graph: {error:#}"
+                    );
+                    bg_embed_status.set_failed(detail.clone());
+                    bg_jobs.mark_failed(&bg_repo_root, &job_id, detail);
+                    return;
+                }
+            };
 
             let embed_repo_root = bg_repo_root.clone();
             let embed_index_ref = bg_embed_index.clone();
             let embed_status = bg_embed_status;
-            let embeddable_count = embeddable_nodes
+            let embeddable_count = persisted_graph
+                .nodes
                 .iter()
-                .filter(|n| n.id.kind.is_embeddable())
+                .filter(|n| n.id.root != "external" && n.id.kind.is_embeddable())
                 .count();
+            tracing::debug!(
+                "[background] reopened {} persisted nodes ({} initially supplied)",
+                persisted_graph.nodes.len(),
+                expected_node_count
+            );
             embed_status.set_building(embeddable_count);
             bg_jobs.mark_progress(
                 &bg_repo_root,
@@ -1184,38 +1225,50 @@ impl RnaHandler {
             );
 
             let embed_fut = async move {
-                // Use BLAKE3 incremental reindex: hash-skip unchanged items
-                // instead of dropping and rebuilding the entire table.
-                // Falls back to full rebuild only if the table doesn't exist yet.
                 match EmbeddingIndex::new(&embed_repo_root).await {
                     Ok(idx) => {
-                        let result = match idx.has_table().await {
-                            Ok(true) => {
-                                // Table exists -- use incremental reindex with BLAKE3 hash-skipping
-                                idx.reindex_nodes(&embeddable_nodes).await
-                            }
-                            Ok(false) => {
-                                // Table missing -- full build needed
-                                idx.index_all_with_symbols_and_business_context(
-                                    &embed_repo_root,
-                                    &embeddable_nodes,
-                                    &bg_business_context,
-                                )
-                                .await
-                            }
-                            Err(e) => {
-                                tracing::warn!("[background] Embedding table check failed: {}", e);
-                                embed_status.set_failed(format!("{}", e));
-                                return;
-                            }
-                        };
+                        let result = idx
+                            .index_all_with_persisted_graph_and_business_context(
+                                &embed_repo_root,
+                                &persisted_graph.nodes,
+                                &persisted_graph.edges,
+                                &bg_business_context,
+                            )
+                            .await;
                         match result {
                             Ok(count) => {
                                 tracing::info!("[background] Embedded {} items", count);
-                                embed_status.set_complete(count);
+                                if let Err(error) = embed_status
+                                    .set_complete_from_index_for_persisted_graph(
+                                        &idx,
+                                        &persisted_graph.nodes,
+                                        &persisted_graph.edges,
+                                        &bg_business_context,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "[background] Embedding verification failed: {error:#}"
+                                    );
+                                    embed_status.set_failed(format!("{error:#}"));
+                                    bg_jobs.mark_failed(
+                                        &embed_repo_root,
+                                        &job_id,
+                                        format!("{error:#}"),
+                                    );
+                                    return;
+                                }
+                                let ready_count = idx
+                                    .active_generation_manifest()
+                                    .map_or(count, |manifest| manifest.row_count);
                                 // Atomic store -- no mutex needed
                                 embed_index_ref.store(Arc::new(Some(idx)));
-                                bg_jobs.mark_completed(&bg_repo_root, &job_id, count, count);
+                                bg_jobs.mark_completed(
+                                    &bg_repo_root,
+                                    &job_id,
+                                    ready_count,
+                                    ready_count,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding failed: {}", e);
@@ -1547,6 +1600,10 @@ impl RnaHandler {
         F: Fn(&str) + Send + Sync,
     {
         let pipeline_start = std::time::Instant::now();
+        let scan_started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         // The foreground pipeline has its own Lance cache-load path instead of
         // delegating to `build_full_graph_inner`. Validate the requested mode
@@ -1584,14 +1641,20 @@ impl RnaHandler {
                     cached_state,
                     on_progress,
                     pipeline_start,
+                    scan_started_at_ms,
                     enrichment,
                 )
                 .await;
         }
 
         // No cache -- full rebuild path.
-        self.run_pipeline_foreground_full(on_progress, pipeline_start, enrichment)
-            .await
+        self.run_pipeline_foreground_full(
+            on_progress,
+            pipeline_start,
+            scan_started_at_ms,
+            enrichment,
+        )
+        .await
     }
 
     /// Incremental foreground pipeline: load from cache, extract only changed files,
@@ -1601,6 +1664,7 @@ impl RnaHandler {
         mut cached_state: GraphState,
         on_progress: F,
         pipeline_start: std::time::Instant,
+        scan_started_at_ms: u64,
         enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<PipelineResult>
     where
@@ -1618,7 +1682,12 @@ impl RnaHandler {
             // Clear sentinels -- they reference the old schema version and are now stale.
             super::sentinel::clear_sentinels(&self.repo_root);
             return self
-                .run_pipeline_foreground_full(on_progress, pipeline_start, enrichment)
+                .run_pipeline_foreground_full(
+                    on_progress,
+                    pipeline_start,
+                    scan_started_at_ms,
+                    enrichment,
+                )
                 .await;
         }
 
@@ -1676,14 +1745,6 @@ impl RnaHandler {
 
             // Store graph atomically and set up embedding index.
             self.graph.store(Arc::new(Some(Arc::new(cached_state))));
-
-            // Reuse existing embedding index.
-            if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await
-                && let Ok(true) = idx.has_table().await
-            {
-                idx.ensure_fts_index().await;
-                self.embed_index.store(Arc::new(Some(idx)));
-            }
 
             // Check if LSP enrichment has been durably persisted via the completion
             // sentinel. This replaces the `has_call_edges` heuristic, which fails
@@ -1797,6 +1858,32 @@ impl RnaHandler {
                 )?;
             }
 
+            let lsp_related_job_ids = if cache_authorization.is_some() {
+                let execution = crate::structural_cache::load_execution(&self.repo_root)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "incremental structural-cache execution evidence is missing"
+                        )
+                    })?;
+                crate::structural_cache::execution_related_job_ids(&execution)?
+            } else {
+                lsp_job_id.iter().cloned().collect::<Vec<_>>()
+            };
+            self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
+                .await?;
+
+            let (embed_count, embed_time, embed_job_id) = if enrichment.runs_embeddings() {
+                let (encoded, elapsed, job_id) = self
+                    .reconcile_persisted_embeddings(
+                        EnrichmentTrigger::IncrementalRefresh,
+                        &on_progress,
+                    )
+                    .await?;
+                (encoded, elapsed, Some(job_id))
+            } else {
+                (0, Duration::ZERO, None)
+            };
+
             // Read final counts (may have changed after LSP enrichment).
             let (total_node_count, total_edge_count) = {
                 let snap = self.graph.load_full();
@@ -1829,8 +1916,13 @@ impl RnaHandler {
                     PhaseKind::Embeddings,
                     "skipped by scan options",
                 ));
+            } else {
+                phases.push(PhaseReport::ran(PhaseKind::Embeddings, embed_time));
             }
-            let related_job_ids = lsp_job_id.into_iter().collect::<Vec<_>>();
+            let mut related_job_ids = lsp_related_job_ids;
+            if let Some(embed_job_id) = embed_job_id {
+                related_job_ids.push(embed_job_id);
+            }
             let (lsp_state, lsp_detail) = lsp_capability_from_status(
                 enrichment,
                 self.lsp_status.current_state(),
@@ -1866,7 +1958,7 @@ impl RnaHandler {
                     lsp_edge_count,
                     lsp_state,
                     lsp_detail,
-                    embedding_count: 0,
+                    embedding_count: embed_count,
                     embeddings_attached: self.embed_index.load().is_some(),
                     phases,
                     related_job_ids,
@@ -1879,7 +1971,7 @@ impl RnaHandler {
                 edge_count: total_edge_count,
                 file_count: 0,
                 lsp_edge_count,
-                embed_count: 0,
+                embed_count,
                 total_time,
                 lsp_entries: vec![],
                 encoding_stats: crate::extract::EncodingStats::default(),
@@ -2214,6 +2306,7 @@ impl RnaHandler {
         }
 
         // Phase 4: Full persist with LSP edges included.
+        let persist_started = std::time::Instant::now();
         {
             let snapshot = {
                 let snap = self.graph.load_full();
@@ -2331,6 +2424,44 @@ impl RnaHandler {
                 }
             }
         }
+        let persist_time = persist_started.elapsed();
+
+        let lsp_related_job_ids = if cache_authorization.is_some() {
+            let execution =
+                crate::structural_cache::load_execution(&self.repo_root)?.ok_or_else(|| {
+                    anyhow::anyhow!("incremental structural-cache execution evidence is missing")
+                })?;
+            crate::structural_cache::execution_related_job_ids(&execution)?
+        } else {
+            incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>()
+        };
+        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
+            .await?;
+
+        if enrichment.runs_lsp() && enrichment.runs_embeddings() {
+            if !lsp_stage_completed {
+                anyhow::bail!(
+                    "refusing semantic reconciliation because required incremental LSP work did not complete"
+                );
+            }
+            if let Some(detail) = lsp_degraded_detail.as_deref() {
+                anyhow::bail!(
+                    "refusing semantic reconciliation because required incremental LSP work degraded: {detail}"
+                );
+            }
+        }
+
+        // Reconcile the complete semantic target only after the updated LSP graph
+        // is durably persisted and freshly reopened. The immutable generation
+        // reuses exact vectors and encodes only changed/new canonical inputs.
+        let (embed_count, embed_time, embed_job_id) = if enrichment.runs_embeddings() {
+            let (encoded, elapsed, job_id) = self
+                .reconcile_persisted_embeddings(EnrichmentTrigger::IncrementalRefresh, &on_progress)
+                .await?;
+            (encoded, elapsed, Some(job_id))
+        } else {
+            (0, Duration::ZERO, None)
+        };
 
         // Commit scanner state after successful persist.
         scanner.commit_state()?;
@@ -2359,10 +2490,7 @@ impl RnaHandler {
         let mut phases = vec![
             PhaseReport::ran(PhaseKind::Extract, extract_time),
             PhaseReport::ran(PhaseKind::PostPasses, bus_time),
-            PhaseReport::ran(
-                PhaseKind::PersistGraph,
-                total_time.saturating_sub(extract_time + bus_time),
-            ),
+            PhaseReport::ran(PhaseKind::PersistGraph, persist_time),
             PhaseReport::ran(PhaseKind::Total, total_time),
         ];
         if !enrichment.runs_lsp() {
@@ -2376,16 +2504,13 @@ impl RnaHandler {
                 PhaseKind::Embeddings,
                 "skipped by scan options",
             ));
-        }
-        let related_job_ids = if cache_authorization.is_some() {
-            let execution =
-                crate::structural_cache::load_execution(&self.repo_root)?.ok_or_else(|| {
-                    anyhow::anyhow!("incremental structural-cache execution evidence is missing")
-                })?;
-            crate::structural_cache::execution_related_job_ids(&execution)?
         } else {
-            incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>()
-        };
+            phases.push(PhaseReport::ran(PhaseKind::Embeddings, embed_time));
+        }
+        let mut related_job_ids = lsp_related_job_ids;
+        if let Some(embed_job_id) = embed_job_id {
+            related_job_ids.push(embed_job_id);
+        }
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
@@ -2421,7 +2546,7 @@ impl RnaHandler {
                 lsp_edge_count,
                 lsp_state,
                 lsp_detail,
-                embedding_count: 0,
+                embedding_count: embed_count,
                 embeddings_attached: self.embed_index.load().is_some(),
                 phases,
                 related_job_ids,
@@ -2434,7 +2559,7 @@ impl RnaHandler {
             edge_count: total_edge_count,
             file_count,
             lsp_edge_count,
-            embed_count: 0,
+            embed_count,
             total_time,
             lsp_entries: vec![],
             encoding_stats,
@@ -2449,19 +2574,22 @@ impl RnaHandler {
         &self,
         on_progress: F,
         pipeline_start: std::time::Instant,
+        scan_started_at_ms: u64,
         enrichment: ScanEnrichmentOptions,
     ) -> anyhow::Result<PipelineResult>
     where
         F: Fn(&str) + Send + Sync,
     {
-        // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
+        // Phase 1: Scan + Extract (reuses build_full_graph without background tasks).
+        // Both LSP and embeddings are owned below so semantic reconciliation can
+        // consume the freshly persisted/reopened LSP-enriched graph.
         let t0 = std::time::Instant::now();
         // Phase 2 below owns foreground LSP execution and its durable job/status
         // contract. Keep the initial full build extraction-only for LSP so one
         // invocation cannot abort here and then have a second successful/empty
         // pass overwrite the degraded result.
         let graph_state = self
-            .build_full_graph_inner(false, enrichment.without_lsp())
+            .build_full_graph_inner(false, enrichment.without_lsp().without_embeddings())
             .await?;
         let scan_extract_time = t0.elapsed();
 
@@ -2495,13 +2623,8 @@ impl RnaHandler {
             )))));
         }
 
-        // Phase 2: Embed + LSP enrichment (parallel -- they use independent data stores)
-        let embeddable_nodes: Vec<Node> = graph_state
-            .nodes
-            .iter()
-            .filter(|n| n.id.root != "external")
-            .cloned()
-            .collect();
+        // Phase 2: LSP enrichment. Embeddings must wait for structural persist
+        // and fresh reopen; running them here would bind vectors to the pre-LSP graph.
 
         let (lsp_job_id, run_lsp_in_bus) = if enrichment.runs_lsp() {
             let server_name = self.lsp_status.server_name();
@@ -2531,80 +2654,6 @@ impl RnaHandler {
             }
         } else {
             (None, false)
-        };
-
-        let embed_repo_root = self.repo_root.clone();
-        let embed_index_ref = self.embed_index.clone();
-        let embed_business_context = self.business_context.clone();
-        let (embed_job_id, run_embed_job) = if enrichment.runs_embeddings() {
-            match self.enrichment_jobs.begin_job(
-                &self.repo_root,
-                EnrichmentCapability::Embeddings,
-                EnrichmentScope::Repo,
-                EnrichmentTrigger::ForegroundScan,
-                None,
-            )? {
-                JobStart::Started(job) => {
-                    self.enrichment_jobs
-                        .mark_running(&self.repo_root, &job.job_id, "embedding");
-                    (Some(job.job_id), true)
-                }
-                JobStart::Joined { existing_job_id } => {
-                    on_progress(&format!(
-                        "Embed: joined active enrichment job {}; skipping duplicate foreground embedding",
-                        existing_job_id
-                    ));
-                    (Some(existing_job_id), false)
-                }
-            }
-        } else {
-            (None, false)
-        };
-        let embed_jobs = Arc::clone(&self.enrichment_jobs);
-        let embed_fut = async {
-            let t1 = std::time::Instant::now();
-            if !run_embed_job {
-                return (0, t1.elapsed());
-            }
-            let count = match EmbeddingIndex::new(&embed_repo_root).await {
-                Ok(idx) => {
-                    match idx
-                        .index_all_with_symbols_and_business_context(
-                            &embed_repo_root,
-                            &embeddable_nodes,
-                            &embed_business_context,
-                        )
-                        .await
-                    {
-                        Ok(count) => {
-                            if let Some(job_id) = embed_job_id.as_deref() {
-                                embed_jobs.mark_persisting(&embed_repo_root, job_id, count, count);
-                            }
-                            embed_index_ref.store(Arc::new(Some(idx)));
-                            if let Some(job_id) = embed_job_id.as_deref() {
-                                embed_jobs.mark_completed(&embed_repo_root, job_id, count, count);
-                            }
-                            count
-                        }
-                        Err(e) => {
-                            tracing::warn!("Embed: failed -- {}", e);
-                            if let Some(job_id) = embed_job_id.as_deref() {
-                                embed_jobs.mark_failed(&embed_repo_root, job_id, format!("{}", e));
-                            }
-                            0
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Embed: init failed -- {}", e);
-                    if let Some(job_id) = embed_job_id.as_deref() {
-                        embed_jobs.mark_failed(&embed_repo_root, job_id, format!("{}", e));
-                    }
-                    0
-                }
-            };
-            let elapsed = t1.elapsed();
-            (count, elapsed)
         };
 
         on_progress("Enrichment: running pipeline via event bus...");
@@ -2641,13 +2690,7 @@ impl RnaHandler {
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
         let lsp_validations;
-        let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
-
-        on_progress(&format!(
-            "Embed: {} items in {:.1}s",
-            embed_count,
-            embed_time.as_secs_f64(),
-        ));
+        let (bus_result, bus_time) = bus_fut.await;
 
         let lsp_edge_count;
 
@@ -2788,6 +2831,7 @@ impl RnaHandler {
         // Phase 3: Full persist — write the complete graph (tree-sitter + LSP edges)
         // to LanceDB. build_full_graph_inner(false) deferred persistence so we can
         // include LSP edges in a single atomic write (#311).
+        let persist_started = std::time::Instant::now();
         {
             let snapshot = {
                 let snap = self.graph.load_full();
@@ -2882,8 +2926,38 @@ impl RnaHandler {
                 }
             }
         }
+        let persist_time = persist_started.elapsed();
 
-        // Phase 4: Summary
+        let lsp_related_job_ids = lsp_job_id.iter().cloned().collect::<Vec<_>>();
+        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
+            .await?;
+
+        if enrichment.runs_lsp() && enrichment.runs_embeddings() {
+            if !lsp_stage_completed {
+                anyhow::bail!(
+                    "refusing semantic reconciliation because required full LSP work did not complete"
+                );
+            }
+            if let Some(detail) = lsp_degraded_detail.as_deref() {
+                anyhow::bail!(
+                    "refusing semantic reconciliation because required full LSP work degraded: {detail}"
+                );
+            }
+        }
+
+        // Phase 4: fresh-reopen the persisted LSP graph and reconcile one complete
+        // immutable semantic generation. Exact vector reuse keeps this incremental
+        // even though validation covers the full target.
+        let (embed_count, embed_time, embed_job_id) = if enrichment.runs_embeddings() {
+            let (encoded, elapsed, job_id) = self
+                .reconcile_persisted_embeddings(EnrichmentTrigger::ForegroundScan, &on_progress)
+                .await?;
+            (encoded, elapsed, Some(job_id))
+        } else {
+            (0, Duration::ZERO, None)
+        };
+
+        // Phase 5: Summary
         let (total_node_count, total_edge_count) = {
             let snap = self.graph.load_full();
             match snap.as_ref().as_ref() {
@@ -2900,10 +2974,10 @@ impl RnaHandler {
             agg
         };
         let total_time = pipeline_start.elapsed();
-        let related_job_ids = [lsp_job_id.clone(), embed_job_id.clone()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let mut related_job_ids = lsp_related_job_ids;
+        if let Some(embed_job_id) = embed_job_id {
+            related_job_ids.push(embed_job_id);
+        }
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
@@ -2914,6 +2988,7 @@ impl RnaHandler {
         let mut phases = vec![
             PhaseReport::ran(PhaseKind::Extract, scan_extract_time),
             PhaseReport::ran(PhaseKind::PostPasses, bus_time),
+            PhaseReport::ran(PhaseKind::PersistGraph, persist_time),
             PhaseReport::ran(PhaseKind::Total, total_time),
         ];
         if enrichment.runs_embeddings() {
@@ -3566,6 +3641,221 @@ impl RnaHandler {
         Ok(related_job_ids)
     }
 
+    /// Persist the full per-file LSP report at the structural/semantic seam.
+    ///
+    /// Benchmark-mode completeness used to be written by the CLI only after the
+    /// foreground pipeline returned. A strict semantic generation therefore could
+    /// not bind its vectors to the report for the graph it was about to consume.
+    /// Writing the report immediately after structural persistence makes the same
+    /// fresh graph snapshot authoritative for both readiness and embeddings.
+    async fn persist_foreground_lsp_completeness(
+        &self,
+        lsp_entries: &[crate::extract::scan_stats::LspEnrichmentEntry],
+        related_job_ids: &[String],
+        scan_started_at_ms: u64,
+    ) -> anyhow::Result<()> {
+        if !self.business_context.mode().is_disabled() {
+            return Ok(());
+        }
+        let reopened = load_graph_from_lance(&self.repo_root)
+            .await
+            .context("failed to fresh-reopen persisted graph before LSP completeness")?;
+        let has_inheritance_evidence =
+            crate::structural_cache::load_verified_authorization(&self.repo_root)?.is_some()
+                || crate::structural_cache::load_execution(&self.repo_root)?.is_some();
+        if related_job_ids.is_empty() && !has_inheritance_evidence {
+            // An unchanged graph (or an embeddings-only refresh) may retain an
+            // already verifier-clean report. Rebuilding it from this invocation's
+            // empty work window would erase valid persistence evidence. Any stale,
+            // missing, or blocked report falls through and is replaced by a current
+            // fail-closed report with empty executed evidence.
+            if crate::lsp_completeness::load_readiness_check_with_graph(
+                &self.repo_root,
+                self.business_context.mode(),
+                &reopened.nodes,
+                &reopened.edges,
+            )
+            .is_ok_and(|check| check.ready)
+            {
+                return Ok(());
+            }
+        }
+        crate::lsp_completeness::build_and_persist_report(
+            &self.repo_root,
+            self.business_context.mode(),
+            &reopened.nodes,
+            &reopened.edges,
+            lsp_entries,
+            related_job_ids,
+            scan_started_at_ms,
+        )?;
+        Ok(())
+    }
+
+    /// Reconcile the complete semantic index from a freshly reopened persisted graph.
+    ///
+    /// Embeddings deliberately run after structural persistence. This keeps the
+    /// immutable semantic generation bound to the graph agents will reopen, rather
+    /// than to a pre-LSP or in-memory intermediate snapshot. The generation builder
+    /// performs exact vector reuse, so a full target reconciliation does not imply
+    /// re-encoding unchanged rows.
+    async fn reconcile_persisted_embeddings<F>(
+        &self,
+        trigger: EnrichmentTrigger,
+        on_progress: &F,
+    ) -> anyhow::Result<(usize, Duration, String)>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        let started = std::time::Instant::now();
+        let job_id = match self.enrichment_jobs.begin_job(
+            &self.repo_root,
+            EnrichmentCapability::Embeddings,
+            EnrichmentScope::Repo,
+            trigger,
+            None,
+        )? {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { existing_job_id } => {
+                on_progress(&format!(
+                    "Embed: joined active reconciliation job {}; waiting for completion",
+                    existing_job_id
+                ));
+                self.wait_for_joined_enrichment_job(
+                    &existing_job_id,
+                    EnrichmentCapability::Embeddings,
+                )
+                .await?;
+                let index = EmbeddingIndex::new(&self.repo_root).await?;
+                if !index.has_table().await? {
+                    anyhow::bail!(
+                        "joined embedding reconciliation completed without a published table"
+                    );
+                }
+                let reopened = load_graph_from_lance(&self.repo_root).await.context(
+                    "failed to fresh-reopen persisted graph after joined embedding reconciliation",
+                )?;
+                self.embed_status
+                    .set_complete_from_index_for_persisted_graph(
+                        &index,
+                        &reopened.nodes,
+                        &reopened.edges,
+                        &self.business_context,
+                    )
+                    .await?;
+                self.embed_index.store(Arc::new(Some(index)));
+                return Ok((0, started.elapsed(), existing_job_id));
+            }
+        };
+
+        self.enrichment_jobs
+            .mark_running(&self.repo_root, &job_id, "embedding_reconcile");
+
+        let result = async {
+            let reopened = load_graph_from_lance(&self.repo_root).await.context(
+                "failed to fresh-reopen persisted graph before embedding reconciliation",
+            )?;
+            let target_nodes = reopened.nodes;
+            let target_edges = reopened.edges;
+            let expected_embeddable = target_nodes
+                .iter()
+                .filter(|node| node.id.root != "external" && node.id.kind.is_embeddable())
+                .count();
+            self.embed_status.set_building(expected_embeddable);
+            self.enrichment_jobs.mark_progress(
+                &self.repo_root,
+                &job_id,
+                "embedding_reconcile",
+                0,
+                Some(expected_embeddable),
+            );
+
+            let index = EmbeddingIndex::new(&self.repo_root).await?;
+            #[cfg(feature = "embeddings")]
+            let prior_generation_digest = index
+                .active_generation_manifest()
+                .map(|manifest| manifest.generation_digest);
+            let encoded = index
+                .index_all_with_persisted_graph_and_business_context(
+                    &self.repo_root,
+                    &target_nodes,
+                    &target_edges,
+                    &self.business_context,
+                )
+                .await?;
+
+            #[cfg(feature = "embeddings")]
+            let ready_rows = {
+                let manifest = index.active_generation_manifest().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "embedding reconciliation returned without a published generation manifest"
+                    )
+                })?;
+                let reused_existing_generation = encoded == 0
+                    && prior_generation_digest.as_deref()
+                        == Some(manifest.generation_digest.as_str());
+                if !reused_existing_generation && manifest.encoded_vector_count != encoded {
+                    anyhow::bail!(
+                        "embedding reconciliation count mismatch: returned {}, manifest encoded {}",
+                        encoded,
+                        manifest.encoded_vector_count
+                    );
+                }
+                manifest.row_count
+            };
+            #[cfg(not(feature = "embeddings"))]
+            let ready_rows = encoded;
+
+            if !index.has_table().await? {
+                anyhow::bail!(
+                    "embedding reconciliation completed without a freshly reopened published table"
+                );
+            }
+            anyhow::Ok((index, encoded, ready_rows, target_nodes, target_edges))
+        }
+        .await;
+
+        match result {
+            Ok((index, encoded, ready_rows, target_nodes, target_edges)) => {
+                self.enrichment_jobs.mark_persisting(
+                    &self.repo_root,
+                    &job_id,
+                    ready_rows,
+                    ready_rows,
+                );
+                self.embed_status
+                    .set_complete_from_index_for_persisted_graph(
+                        &index,
+                        &target_nodes,
+                        &target_edges,
+                        &self.business_context,
+                    )
+                    .await?;
+                self.embed_index.store(Arc::new(Some(index)));
+                self.enrichment_jobs.mark_completed(
+                    &self.repo_root,
+                    &job_id,
+                    ready_rows,
+                    ready_rows,
+                );
+                on_progress(&format!(
+                    "Embed: semantic generation READY with {} rows ({} encoded, {} reused) in {:.1}s",
+                    ready_rows,
+                    encoded,
+                    ready_rows.saturating_sub(encoded),
+                    started.elapsed().as_secs_f64(),
+                ));
+                Ok((encoded, started.elapsed(), job_id))
+            }
+            Err(error) => {
+                self.embed_status.set_failed(format!("{error:#}"));
+                self.enrichment_jobs
+                    .mark_failed(&self.repo_root, &job_id, format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
     async fn run_explicit_embedding_enrichment<F>(
         &self,
         all_nodes: &[Node],
@@ -3619,7 +3909,19 @@ impl RnaHandler {
     where
         F: Fn(&str) + Send + Sync,
     {
-        let selected_nodes = self.cached_nodes_for_scope(all_nodes, &scope)?;
+        let reopened = load_graph_from_lance(&self.repo_root)
+            .await
+            .context("failed to fresh-reopen persisted graph before explicit embedding")?;
+        let persisted_nodes = reopened.nodes;
+        let persisted_edges = reopened.edges;
+        let authoritative_nodes = if matches!(scope, EnrichmentScope::Repo) {
+            persisted_nodes.as_slice()
+        } else {
+            // Scoped legacy enrichment retains its existing selection semantics;
+            // strict immutable generations reject the in-place scoped API below.
+            all_nodes
+        };
+        let selected_nodes = self.cached_nodes_for_scope(authoritative_nodes, &scope)?;
         let embeddable_count = selected_nodes
             .iter()
             .filter(|n| n.id.kind.is_embeddable())
@@ -3642,6 +3944,20 @@ impl RnaHandler {
                     EnrichmentCapability::Embeddings,
                 )
                 .await?;
+                let idx = EmbeddingIndex::new(&self.repo_root).await?;
+                if matches!(scope, EnrichmentScope::Repo) {
+                    self.embed_status
+                        .set_complete_from_index_for_persisted_graph(
+                            &idx,
+                            &persisted_nodes,
+                            &persisted_edges,
+                            &self.business_context,
+                        )
+                        .await?;
+                } else {
+                    self.embed_status.set_complete_from_index(&idx)?;
+                }
+                self.embed_index.store(Arc::new(Some(idx)));
                 return Ok(existing_job_id);
             }
         };
@@ -3666,9 +3982,10 @@ impl RnaHandler {
                 );
             }
             let count = if matches!(scope, EnrichmentScope::Repo) {
-                idx.index_all_with_symbols_and_business_context(
+                idx.index_all_with_persisted_graph_and_business_context(
                     &self.repo_root,
-                    &selected_nodes,
+                    &persisted_nodes,
+                    &persisted_edges,
                     &self.business_context,
                 )
                 .await?
@@ -3683,8 +4000,19 @@ impl RnaHandler {
             Ok((idx, count)) => {
                 self.enrichment_jobs
                     .mark_persisting(&self.repo_root, &job_id, count, count);
+                if matches!(scope, EnrichmentScope::Repo) {
+                    self.embed_status
+                        .set_complete_from_index_for_persisted_graph(
+                            &idx,
+                            &persisted_nodes,
+                            &persisted_edges,
+                            &self.business_context,
+                        )
+                        .await?;
+                } else {
+                    self.embed_status.set_complete_from_index(&idx)?;
+                }
                 self.embed_index.store(Arc::new(Some(idx)));
-                self.embed_status.set_complete(count);
                 self.enrichment_jobs
                     .mark_completed(&self.repo_root, &job_id, count, count);
                 on_progress(&format!(

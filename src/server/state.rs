@@ -346,6 +346,37 @@ impl CapabilityReadiness {
 
 // ── Embedding build status ───────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticGenerationReadiness {
+    pub generation_digest: String,
+    pub structural_graph_snapshot_digest: String,
+    pub coverage_digest: String,
+    pub row_count: usize,
+}
+
+impl SemanticGenerationReadiness {
+    pub fn from_verified(
+        manifest: &crate::embed::generation::GenerationManifest,
+        verification: &crate::embed::generation::SemanticVerificationReceipt,
+    ) -> anyhow::Result<Self> {
+        manifest.validate()?;
+        verification.validate_against(manifest)?;
+        if !verification.one_to_one_coverage || !verification.fresh_reopen_ready {
+            anyhow::bail!("semantic generation verification is not READY");
+        }
+        Ok(Self {
+            generation_digest: manifest.generation_digest.clone(),
+            structural_graph_snapshot_digest: manifest.structural_graph_snapshot_digest.clone(),
+            coverage_digest: manifest.coverage_digest.clone(),
+            row_count: manifest.row_count,
+        })
+    }
+}
+
+fn sealed_semantic_bundle_build() -> bool {
+    option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
+}
+
 /// Tracks embedding build progress so the search footer can show
 /// `embedding... (N/M)` during build and just the count when done.
 pub struct EmbeddingStatus {
@@ -358,6 +389,7 @@ pub struct EmbeddingStatus {
     /// Final count after completion.
     completed_count: std::sync::atomic::AtomicUsize,
     last_error: std::sync::Mutex<Option<String>>,
+    verified_generation: std::sync::Mutex<Option<SemanticGenerationReadiness>>,
 }
 
 impl Default for EmbeddingStatus {
@@ -368,6 +400,7 @@ impl Default for EmbeddingStatus {
             total: std::sync::atomic::AtomicUsize::new(0),
             completed_count: std::sync::atomic::AtomicUsize::new(0),
             last_error: std::sync::Mutex::new(None),
+            verified_generation: std::sync::Mutex::new(None),
         }
     }
 }
@@ -379,6 +412,8 @@ impl EmbeddingStatus {
             .store(total, std::sync::atomic::Ordering::Release);
         self.current.store(0, std::sync::atomic::Ordering::Release);
         *self.last_error.lock().unwrap() = None;
+        // Retain the previously verified immutable generation while a replacement
+        // builds. Readiness deliberately reports it as usable-but-stale.
         self.state.store(1, std::sync::atomic::Ordering::Release);
     }
 
@@ -392,7 +427,54 @@ impl EmbeddingStatus {
     pub fn set_complete(&self, count: usize) {
         self.completed_count
             .store(count, std::sync::atomic::Ordering::Release);
+        if sealed_semantic_bundle_build() {
+            *self.verified_generation.lock().unwrap() = None;
+        }
         self.state.store(2, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_complete_verified(
+        &self,
+        manifest: &crate::embed::generation::GenerationManifest,
+        verification: &crate::embed::generation::SemanticVerificationReceipt,
+    ) -> anyhow::Result<()> {
+        let readiness = SemanticGenerationReadiness::from_verified(manifest, verification)?;
+        self.completed_count
+            .store(readiness.row_count, std::sync::atomic::Ordering::Release);
+        *self.verified_generation.lock().unwrap() = Some(readiness);
+        self.state.store(2, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn set_complete_from_index(
+        &self,
+        index: &crate::embed::EmbeddingIndex,
+    ) -> anyhow::Result<()> {
+        if sealed_semantic_bundle_build() {
+            anyhow::bail!(
+                "sealed semantic readiness requires the current persisted graph and completeness report"
+            );
+        }
+        let (manifest, verification) = index.verified_generation_evidence()?.ok_or_else(|| {
+            anyhow::anyhow!("semantic index has no published verified generation")
+        })?;
+        self.set_complete_verified(&manifest, &verification)
+    }
+
+    pub async fn set_complete_from_index_for_persisted_graph(
+        &self,
+        index: &crate::embed::EmbeddingIndex,
+        nodes: &[crate::graph::Node],
+        edges: &[crate::graph::Edge],
+        business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> anyhow::Result<()> {
+        let (manifest, verification) = index
+            .verified_generation_evidence_for_persisted_graph(nodes, edges, business_context)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("semantic index has no published verified generation")
+            })?;
+        self.set_complete_verified(&manifest, &verification)
     }
 
     pub fn set_failed(&self, error: String) {
@@ -405,11 +487,30 @@ impl EmbeddingStatus {
         semantic_index_attached: bool,
         semantic_index_available: bool,
     ) -> CapabilityReadiness {
+        let verified_generation = self.verified_generation.lock().unwrap().clone();
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            0 if semantic_index_available
+                && sealed_semantic_bundle_build()
+                && verified_generation.is_none() =>
+            {
+                CapabilityReadiness::new(
+                    "embeddings / semantic search",
+                    CapabilityReadinessState::Failed,
+                    "sealed semantic index is queryable but lacks verifier-clean generation coverage",
+                )
+            }
             0 if semantic_index_available => CapabilityReadiness::new(
                 "embeddings / semantic search",
                 CapabilityReadinessState::Ready,
-                "semantic index is loaded",
+                verified_generation.as_ref().map_or_else(
+                    || "semantic index is loaded".to_string(),
+                    |generation| {
+                        format!(
+                            "verified semantic generation {} is loaded with {} one-to-one rows",
+                            generation.generation_digest, generation.row_count
+                        )
+                    },
+                ),
             ),
             0 if semantic_index_attached => CapabilityReadiness::new(
                 "embeddings / semantic search",
@@ -443,11 +544,28 @@ impl EmbeddingStatus {
                 let count = self
                     .completed_count
                     .load(std::sync::atomic::Ordering::Acquire);
-                if semantic_index_available {
+                if semantic_index_available
+                    && sealed_semantic_bundle_build()
+                    && verified_generation.is_none()
+                {
+                    CapabilityReadiness::new(
+                        "embeddings / semantic search",
+                        CapabilityReadinessState::Failed,
+                        "embedding work completed without verifier-clean immutable generation evidence",
+                    )
+                } else if semantic_index_available {
                     CapabilityReadiness::new(
                         "embeddings / semantic search",
                         CapabilityReadinessState::Ready,
-                        format!("{} embedded items available", count),
+                        verified_generation.as_ref().map_or_else(
+                            || format!("{} embedded items available", count),
+                            |generation| {
+                                format!(
+                                    "verified semantic generation {} READY with {} one-to-one rows",
+                                    generation.generation_digest, generation.row_count
+                                )
+                            },
+                        ),
                     )
                 } else {
                     CapabilityReadiness::new(

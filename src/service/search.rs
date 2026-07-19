@@ -43,6 +43,111 @@ const MAX_SOURCE_SPAN_LINES: u32 = 200;
 const MAX_SOURCE_SPAN_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_PATH_ENTRIES: usize = 50_000;
 const MAX_SOURCE_CANDIDATES: usize = 20;
+const STRICT_SEMANTIC_MODE: &str = "strict";
+
+fn sealed_semantic_bundle() -> bool {
+    cfg!(feature = "swebench-semantic-bundle")
+        && option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
+}
+
+fn semantic_asset_seeding() -> bool {
+    std::env::var("RNA_SEMANTIC_ASSET_SEEDING").as_deref() == Ok("1")
+}
+
+fn strict_semantic_requested(params: &SearchParams) -> bool {
+    // CI asset acquisition is deliberately non-qualifying. The embedding
+    // layer refuses publication in this mode; service search must likewise
+    // never emit the strict READY sentinel for its discarded seed state.
+    if semantic_asset_seeding() {
+        return false;
+    }
+    let explicit = params
+        .search_mode
+        .as_deref()
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case(STRICT_SEMANTIC_MODE));
+    let sealed_bundle_default = sealed_semantic_bundle()
+        && params.normalized_mode().is_none()
+        && params
+            .query
+            .as_deref()
+            .is_some_and(|query| !query.trim().is_empty())
+        && params
+            .node
+            .as_deref()
+            .is_none_or(|node| node.trim().is_empty())
+        && params.nodes.as_ref().is_none_or(|nodes| nodes.is_empty());
+    explicit || sealed_bundle_default
+}
+
+fn strict_semantic_failure(reason: &str) -> String {
+    format!(
+        "Strict semantic qualification FAILED: `{reason}`. No lexical, graph, vector-only, CPU, or original-order fallback results were returned."
+    )
+}
+
+fn candle_metal_fast_math_enabled() -> bool {
+    std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").as_deref() == Ok("1")
+}
+
+async fn strict_semantic_preflight(
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Result<(), &'static str> {
+    if params.normalized_mode().is_some()
+        || params
+            .node
+            .as_deref()
+            .is_some_and(|node| !node.trim().is_empty())
+        || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
+        || params.line.is_some()
+        || params.end_line.is_some()
+        || compiler_location(&params.file).is_some()
+    {
+        return Err("strict mode accepts only a flat query");
+    }
+    if params
+        .query
+        .as_deref()
+        .is_none_or(|query| query.trim().is_empty())
+    {
+        return Err("strict mode requires a non-empty query");
+    }
+    if params.sort_by.is_some() {
+        return Err("strict mode forbids a non-relevance sort override");
+    }
+    if params.search_mode.as_deref().is_some_and(|mode| {
+        let mode = mode.trim();
+        !mode.eq_ignore_ascii_case("hybrid") && !mode.eq_ignore_ascii_case(STRICT_SEMANTIC_MODE)
+    }) {
+        return Err("sealed bundle requires hybrid retrieval");
+    }
+    if !sealed_semantic_bundle() {
+        return Err("binary is not the sealed CI SWE-bench semantic bundle");
+    }
+    if option_env!("RNA_METAL_KERNEL_PROFILE") != Some("release-fast-math")
+        || !candle_metal_fast_math_enabled()
+    {
+        return Err("release Metal kernel optimization is not active");
+    }
+    let Some(index) = ctx.embed_index else {
+        return Err("embedding index is not attached");
+    };
+    match index.has_table().await {
+        Ok(true) => {}
+        Ok(false) => return Err("embedding index is not ready"),
+        Err(_) => return Err("embedding readiness validation failed"),
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        crate::embed::require_metal_device().map_err(|_| "Metal device attestation failed")?;
+        Ok(())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        Err("Metal support is not compiled in")
+    }
+}
 
 fn read_bounded_source_lines(path: &Path, start: u32, end: u32) -> Result<Vec<String>, String> {
     let mut file = fs::File::open(path).map_err(|error| format!("cannot read file: {error}"))?;
@@ -678,6 +783,12 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
 
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    if strict_semantic_requested(params)
+        && let Err(reason) = strict_semantic_preflight(params, ctx).await
+    {
+        return strict_semantic_failure(reason);
+    }
+
     if params.line.is_some()
         || params.end_line.is_some()
         || compiler_location(&params.file).is_some()
@@ -916,6 +1027,7 @@ fn test_embedding_scorer_panic_payload() -> Option<String> {
 struct FlatCodeSymbolSearch<'a> {
     matches: Vec<&'a Node>,
     scorer_diagnostic: Option<EmbeddingScorerDiagnostic>,
+    strict_failure: Option<&'static str>,
 }
 
 async fn search_flat(
@@ -940,7 +1052,12 @@ async fn search_flat(
         return "Empty query. Please describe what you're looking for (or use kind, file, synthetic, min_complexity, sort_by=\"complexity\", or sort_by=\"importance\").".to_string();
     }
 
-    let search_mode = parse_search_mode(params.search_mode.as_deref());
+    let strict_semantic = strict_semantic_requested(params);
+    let search_mode = if strict_semantic {
+        SearchMode::Hybrid
+    } else {
+        parse_search_mode(params.search_mode.as_deref())
+    };
     let limit = params.limit.unwrap_or(10);
     let mut sections: Vec<String> = Vec::new();
     let graph_state = ctx.graph_state;
@@ -949,6 +1066,7 @@ async fn search_flat(
     let FlatCodeSymbolSearch {
         matches,
         mut scorer_diagnostic,
+        strict_failure,
     } = flat_code_symbol_search_with_diagnostics(
         query_str,
         search_mode,
@@ -960,6 +1078,9 @@ async fn search_flat(
         sort_by_importance,
     )
     .await;
+    if let Some(reason) = strict_failure {
+        return strict_semantic_failure(reason);
+    }
 
     if !matches.is_empty() {
         let strip = ctx.root_filter.as_deref();
@@ -984,7 +1105,12 @@ async fn search_flat(
         ));
     }
 
-    if params.include_artifacts
+    // Strict qualification emits only the candidate set that passed both
+    // hybrid retrieval and the cross-encoder. Ordinary search can still add
+    // artifact and Markdown result classes, whose independent renderers do not
+    // currently participate in that one-to-one rerank contract.
+    if !strict_semantic
+        && params.include_artifacts
         && !query_str.is_empty()
         && let Some(embed_idx) = ctx.embed_index
     {
@@ -1033,7 +1159,16 @@ async fn search_flat(
         sections.push(diagnostic.render());
     }
 
-    if params.include_markdown
+    if strict_semantic {
+        sections.push(
+            "### Strict semantic qualification\n\n\
+             `status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`"
+                .to_string(),
+        );
+    }
+
+    if !strict_semantic
+        && params.include_markdown
         && !query_str.is_empty()
         && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root)
     {
@@ -1154,6 +1289,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     sort_by_complexity: bool,
     sort_by_importance: bool,
 ) -> FlatCodeSymbolSearch<'a> {
+    let strict_semantic = strict_semantic_requested(params);
     let query_lower = query_str.to_lowercase();
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
 
@@ -1247,7 +1383,11 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
 
     // When reranking is requested, over-fetch more candidates so the
     // cross-encoder has a wider pool to re-score.
-    let rerank_over_fetch = if params.rerank { limit.max(20) } else { limit };
+    let rerank_over_fetch = if strict_semantic || params.rerank {
+        limit.max(20)
+    } else {
+        limit
+    };
 
     // Build scalar pre-filters for LanceDB (#400).
     // When filters are active, LanceDB applies them before vector scoring so
@@ -1275,7 +1415,16 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                 Ok(SearchOutcome::NotReady)
             };
             match isolate_embedding_scorer(scorer, search_mode).await {
-                Err(diagnostic) => scorer_diagnostic = Some(diagnostic),
+                Err(diagnostic) => {
+                    if strict_semantic {
+                        return FlatCodeSymbolSearch {
+                            matches: Vec::new(),
+                            scorer_diagnostic: None,
+                            strict_failure: Some("embedding scorer panicked"),
+                        };
+                    }
+                    scorer_diagnostic = Some(diagnostic);
+                }
                 Ok(_) => unreachable!("injected scorer panic must degrade"),
             }
             Vec::new()
@@ -1294,15 +1443,27 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                 let embed_query = embed_query_str.to_string();
                 let embed_filters = embed_filters.clone();
                 async move {
-                    embed_idx
-                        .search_with_filters(
-                            &embed_query,
-                            None,
-                            over_fetch,
-                            search_mode,
-                            &embed_filters,
-                        )
-                        .await
+                    if strict_semantic {
+                        embed_idx
+                            .search_with_filters_strict(
+                                &embed_query,
+                                None,
+                                over_fetch,
+                                SearchMode::Hybrid,
+                                &embed_filters,
+                            )
+                            .await
+                    } else {
+                        embed_idx
+                            .search_with_filters(
+                                &embed_query,
+                                None,
+                                over_fetch,
+                                search_mode,
+                                &embed_filters,
+                            )
+                            .await
+                    }
                 }
             };
             match isolate_embedding_scorer(scorer, search_mode).await {
@@ -1318,9 +1479,26 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                         .take(rerank_over_fetch)
                         .collect()
                 }
-                // Embedding index not ready -- fall through to name/signature fallback.
-                Ok(SearchOutcome::NotReady) => Vec::new(),
+                // Embedding index not ready -- ordinary search falls through to
+                // name/signature matching; strict qualification stops here.
+                Ok(SearchOutcome::NotReady) => {
+                    if strict_semantic {
+                        return FlatCodeSymbolSearch {
+                            matches: Vec::new(),
+                            scorer_diagnostic: None,
+                            strict_failure: Some("embedding index is not ready"),
+                        };
+                    }
+                    Vec::new()
+                }
                 Err(diagnostic) => {
+                    if strict_semantic {
+                        return FlatCodeSymbolSearch {
+                            matches: Vec::new(),
+                            scorer_diagnostic: None,
+                            strict_failure: Some("strict hybrid embedding search failed"),
+                        };
+                    }
                     scorer_diagnostic = Some(diagnostic);
                     Vec::new()
                 }
@@ -1340,6 +1518,13 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     // and extraction metadata. Function bodies stay out of generic symbol search.
     let text_terms = query_terms(query_str);
     if !used_embed {
+        if strict_semantic {
+            return FlatCodeSymbolSearch {
+                matches: Vec::new(),
+                scorer_diagnostic: None,
+                strict_failure: Some("embedding search produced no admissible code results"),
+            };
+        }
         matches = graph_state
             .nodes
             .iter()
@@ -1357,7 +1542,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                 node_passes_filters(n)
             })
             .collect();
-    } else if !query_lower.is_empty() {
+    } else if !strict_semantic && !query_lower.is_empty() {
         // Embed search was used -- supplement with name/signature matches
         // that the embedding missed. Deduplicate by stable_id so embed-ranked
         // results keep their position; supplements are appended at the end.
@@ -1458,8 +1643,20 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     // Skip reranking when an explicit sort_by mode is active (complexity,
     // importance) -- the caller's sort request takes precedence.
     let use_relevance_sort = !sort_by_complexity && !sort_by_importance;
-    if params.rerank && use_relevance_sort && !query_str.is_empty() && matches.len() > 1 {
-        use crate::rerank::{RerankCandidate, rerank_results};
+    if strict_semantic && matches.is_empty() {
+        return FlatCodeSymbolSearch {
+            matches: Vec::new(),
+            scorer_diagnostic: None,
+            strict_failure: Some("strict embedding search produced no admissible code results"),
+        };
+    }
+    let should_rerank = if strict_semantic {
+        !matches.is_empty()
+    } else {
+        params.rerank && matches.len() > 1
+    };
+    if should_rerank && use_relevance_sort && !query_str.is_empty() {
+        use crate::rerank::{RerankCandidate, rerank_results, rerank_results_strict};
 
         let candidates: Vec<RerankCandidate> = matches
             .iter()
@@ -1483,8 +1680,14 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // executor during ONNX model inference (and possible first-time
         // model download/initialization).
         let query_owned = query_str.to_string();
-        let rerank_result =
-            tokio::task::spawn_blocking(move || rerank_results(&query_owned, &candidates)).await;
+        let rerank_result = tokio::task::spawn_blocking(move || {
+            if strict_semantic {
+                rerank_results_strict(&query_owned, &candidates)
+            } else {
+                rerank_results(&query_owned, &candidates)
+            }
+        })
+        .await;
 
         match rerank_result {
             Ok(Ok(reranked)) => {
@@ -1500,6 +1703,13 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                 );
             }
             Ok(Err(e)) => {
+                if strict_semantic {
+                    return FlatCodeSymbolSearch {
+                        matches: Vec::new(),
+                        scorer_diagnostic: None,
+                        strict_failure: Some("strict cross-encoder reranking failed"),
+                    };
+                }
                 tracing::warn!(
                     "Cross-encoder reranking failed, using original order: {}",
                     e
@@ -1507,6 +1717,13 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                 // Fall through with original ordering -- reranking is best-effort.
             }
             Err(e) => {
+                if strict_semantic {
+                    return FlatCodeSymbolSearch {
+                        matches: Vec::new(),
+                        scorer_diagnostic: None,
+                        strict_failure: Some("strict reranking task panicked"),
+                    };
+                }
                 tracing::warn!("Reranking task panicked, using original order: {}", e);
             }
         }
@@ -1516,6 +1733,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     FlatCodeSymbolSearch {
         matches,
         scorer_diagnostic,
+        strict_failure: None,
     }
 }
 
@@ -4396,6 +4614,56 @@ mod tests {
             parse_search_mode(Some("unknown")),
             SearchMode::Hybrid
         ));
+        let strict = SearchParams {
+            search_mode: Some("  STRICT  ".to_string()),
+            ..Default::default()
+        };
+        assert!(strict_semantic_requested(&strict));
+    }
+
+    #[tokio::test]
+    async fn strict_semantic_search_rejects_an_unsealed_binary_without_fallback() {
+        let gs = make_graph_state(vec![make_node(
+            "auth_handler",
+            NodeKind::Function,
+            "src/auth.rs",
+        )]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            search_mode: Some("strict".into()),
+            rerank: false,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("Strict semantic qualification FAILED"));
+        assert!(result.contains("binary is not the sealed CI SWE-bench semantic bundle"));
+        assert!(!result.contains("auth_handler"));
+        assert!(result.contains("No lexical, graph, vector-only, CPU"));
+    }
+
+    #[tokio::test]
+    async fn strict_semantic_search_accepts_only_flat_code_queries() {
+        let gs = make_graph_state(vec![make_node("target", NodeKind::Function, "src/lib.rs")]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("target".into()),
+            mode: Some("neighbors".into()),
+            search_mode: Some("strict".into()),
+            rerank: true,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("accepts only a flat query"));
+        assert!(!result.contains("target"));
     }
 
     /// Empty query with no filters returns empty results (via the search function).
