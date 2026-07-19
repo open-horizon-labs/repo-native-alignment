@@ -576,11 +576,14 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 artifact_sha256=artifact_digest, languages=["python"]
             )
             entry["artifact"] = "fixture-bundle.tar.gz"
-            entry["executable_sha256"] = source_digest
             entry["launcher"] = {
-                "kind": "direct",
+                "kind": "repo-python",
                 "target": "servers/fixture-bundle/server",
             }
+            wrapper_bytes = TOOLCHAIN._wrapper(
+                "repo-python", "servers/fixture-bundle/server"
+            )
+            entry["executable_sha256"] = TOOLCHAIN.sha256_bytes(wrapper_bytes)
             entry["install"] = {
                 "kind": "tar",
                 "destination": "servers",
@@ -636,7 +639,59 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             )
             self.assertTrue(receipt["offline"])
             self.assertEqual(
-                TOOLCHAIN.sha256_file(toolchain_root / "bin/server"), source_digest
+                TOOLCHAIN.sha256_file(toolchain_root / "bin/server"),
+                TOOLCHAIN.sha256_bytes(wrapper_bytes),
+            )
+            provisioned_identity = TOOLCHAIN._validate_provisioned_toolchain(
+                lock_path, inventory_path, toolchain_root
+            )
+            self.assertEqual(
+                provisioned_identity["toolchain_root"], str(toolchain_root.resolve())
+            )
+            self.assertEqual(
+                provisioned_identity["inventory_sha256"],
+                TOOLCHAIN.sha256_file(inventory_path),
+            )
+            self.assertEqual(len(provisioned_identity["installed"]), 1)
+            self.assertEqual(len(provisioned_identity["launchers"]), 1)
+
+            launcher = toolchain_root / "bin/server"
+            launcher.unlink()
+            launcher.write_text("#!/bin/sh\nexit 1\n")
+            launcher.chmod(0o755)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "executable digest mismatch"
+            ):
+                TOOLCHAIN._validate_provisioned_toolchain(
+                    lock_path, inventory_path, toolchain_root
+                )
+            launcher.unlink()
+            launcher.write_bytes(wrapper_bytes)
+            launcher.chmod(0o755)
+            self.assertEqual(
+                TOOLCHAIN._validate_provisioned_toolchain(
+                    lock_path, inventory_path, toolchain_root
+                ),
+                provisioned_identity,
+            )
+            installed_executable = (
+                toolchain_root / "servers/fixture-bundle/server"
+            )
+            installed_bytes = installed_executable.read_bytes()
+            installed_executable.write_bytes(b"tampered installed executable\n")
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "launcher target digest mismatch"
+            ):
+                TOOLCHAIN._validate_provisioned_toolchain(
+                    lock_path, inventory_path, toolchain_root
+                )
+            installed_executable.write_bytes(installed_bytes)
+            installed_executable.chmod(0o755)
+            self.assertEqual(
+                TOOLCHAIN._validate_provisioned_toolchain(
+                    lock_path, inventory_path, toolchain_root
+                ),
+                provisioned_identity,
             )
 
             source.write_text("drifted\n")
@@ -646,6 +701,49 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 TOOLCHAIN.verify_lock(
                     lock_path, inventory_path, cache, None, root
                 )
+
+    def test_toolchain_environment_is_closed_and_uses_isolated_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            toolchain_root = root / "toolchain"
+            isolation_root = root / "isolation"
+            hostile_environment = {
+                "PATH": "/host/bin",
+                "HOME": "/host/home",
+                "PYTHONPATH": "/host/python",
+                "NODE_OPTIONS": "--require=/host/inject.js",
+                "JAVA_TOOL_OPTIONS": "-javaagent:/host/inject.jar",
+                "DYLD_INSERT_LIBRARIES": "/host/inject.dylib",
+                "AWS_SECRET_ACCESS_KEY": "must-not-propagate",
+            }
+            with mock.patch.dict(os.environ, hostile_environment, clear=True):
+                environment = TOOLCHAIN.toolchain_environment(
+                    toolchain_root, isolation_root
+                )
+
+            self.assertNotIn("PYTHONPATH", environment)
+            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertNotIn("JAVA_TOOL_OPTIONS", environment)
+            self.assertNotIn("DYLD_INSERT_LIBRARIES", environment)
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
+            self.assertEqual(environment["LANG"], "C")
+            self.assertEqual(environment["LC_ALL"], "C")
+            self.assertEqual(environment["TZ"], "UTC")
+            self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+            for key in (
+                "HOME",
+                "TMPDIR",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "PIP_CACHE_DIR",
+                "npm_config_cache",
+            ):
+                path = Path(environment[key])
+                self.assertTrue(path.is_dir(), key)
+                self.assertTrue(path.is_relative_to(isolation_root.resolve()), key)
 
     def test_probe_server_requests_use_initialized_workspace_and_sections(self) -> None:
         rpc = object.__new__(TOOLCHAIN.JsonRpcProcess)
@@ -706,6 +804,8 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 "languages": ["python"],
                 "command": "pyrefly",
                 "args": ["lsp", "--threads", "1"],
+                "executable": "bin/pyrefly",
+                "executable_sha256": "a" * 64,
                 "expected_capabilities": expected_capabilities,
                 "probe": {"operation": "textDocument/documentSymbol"},
             }
@@ -726,6 +826,8 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 "languages": lock_server["languages"],
                 "command": lock_server["command"],
                 "args": lock_server["args"],
+                "executable": lock_server["executable"],
+                "executable_sha256": lock_server["executable_sha256"],
                 "negotiated_capabilities": expected_capabilities,
                 "negotiated_operation_capabilities": operation_evidence,
                 "operation": "textDocument/documentSymbol",
@@ -738,12 +840,36 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 "stderr_tail": "",
                 "status": "ready",
             }
+            provisioned_identity = {
+                "toolchain_root": str((root / "toolchain").resolve()),
+                "inventory_sha256": "b" * 64,
+                "provision_receipt_digest": "c" * 64,
+                "provision_receipt_sha256": "d" * 64,
+                "installed": [
+                    {
+                        "name": "pyrefly",
+                        "executable": "bin/pyrefly",
+                        "sha256": "a" * 64,
+                    }
+                ],
+                "launchers": [
+                    {
+                        "name": "pyrefly",
+                        "command": "pyrefly",
+                        "path": "bin/pyrefly",
+                        "sha256": "a" * 64,
+                        "target_path": "bin/pyrefly",
+                        "target_sha256": "a" * 64,
+                    }
+                ],
+            }
 
             def publish_probe(receipt: dict[str, object]) -> Path:
                 path = root / "probe.json"
                 probe = {
                     "schema_version": TOOLCHAIN.SCHEMA_VERSION,
                     "lock_sha256": TOOLCHAIN.sha256_file(lock_path),
+                    **provisioned_identity,
                     "server_count": 1,
                     "servers": [receipt],
                 }
@@ -754,7 +880,9 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 return path
 
             probe_path = publish_probe(server_receipt)
-            TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+            TOOLCHAIN._validate_toolchain_probe_evidence(
+                probe_path, lock_path, provisioned_identity
+            )
 
             stale_pyright = copy.deepcopy(server_receipt)
             stale_pyright.update(
@@ -769,7 +897,9 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 TOOLCHAIN.ToolchainError, "server identity mismatch"
             ):
-                TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, provisioned_identity
+                )
 
             probe_path = publish_probe(server_receipt)
             tampered = TOOLCHAIN.load_json_object(probe_path, "test probe")
@@ -778,7 +908,68 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 TOOLCHAIN.ToolchainError, "self-digest mismatch"
             ):
-                TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, provisioned_identity
+                )
+
+            probe_path = publish_probe(server_receipt)
+            wrong_provision = copy.deepcopy(provisioned_identity)
+            wrong_provision["provision_receipt_sha256"] = "e" * 64
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "lock/server identity mismatch"
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, wrong_provision
+                )
+
+    def test_probe_rejects_toolchain_mutation_during_last_server(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock_path = root / "lock.json"
+            inventory_path = root / "inventory.json"
+            output_path = root / "probe.json"
+            TOOLCHAIN.write_canonical_json(
+                lock_path, {"servers": [{"name": "pyrefly"}]}
+            )
+            TOOLCHAIN.write_canonical_json(inventory_path, {})
+            identity = {
+                "toolchain_root": str((root / "toolchain").resolve()),
+                "inventory_sha256": "a" * 64,
+                "provision_receipt_digest": "b" * 64,
+                "provision_receipt_sha256": "c" * 64,
+                "installed": [],
+                "launchers": [],
+            }
+            changed_identity = copy.deepcopy(identity)
+            changed_identity["provision_receipt_sha256"] = "d" * 64
+            with (
+                mock.patch.object(
+                    TOOLCHAIN,
+                    "verify_lock",
+                    return_value={"compatible": True},
+                ),
+                mock.patch.object(
+                    TOOLCHAIN,
+                    "_validate_provisioned_toolchain",
+                    side_effect=[identity, identity, changed_identity],
+                ),
+                mock.patch.object(
+                    TOOLCHAIN,
+                    "probe_server",
+                    return_value={"name": "pyrefly", "status": "ready"},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    TOOLCHAIN.ToolchainError, "identity changed during probe"
+                ):
+                    TOOLCHAIN.probe_toolchain(
+                        lock_path,
+                        inventory_path,
+                        root / "toolchain",
+                        output_path,
+                        1.0,
+                    )
+            self.assertFalse(output_path.exists())
 
     def test_json_rpc_partial_body_obeys_receive_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1938,8 +2129,21 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             TOOLCHAIN._validate_ready_aggregate(
                 aggregate,
                 manifest,
+                recomputed_aggregate=copy.deepcopy(aggregate),
                 expected_population_digest=population_digest,
             )
+
+            tampered_digest = copy.deepcopy(aggregate)
+            tampered_digest["digest"] = "0" * 64
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "independently recomputed producer output"
+            ):
+                TOOLCHAIN._validate_ready_aggregate(
+                    tampered_digest,
+                    manifest,
+                    recomputed_aggregate=aggregate,
+                    expected_population_digest=population_digest,
+                )
 
             blocked_counts = copy.deepcopy(aggregate)
             blocked_counts["counts"]["ready_checkouts"] = 1
@@ -1949,6 +2153,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 TOOLCHAIN._validate_ready_aggregate(
                     blocked_counts,
                     manifest,
+                    recomputed_aggregate=copy.deepcopy(blocked_counts),
                     expected_population_digest=population_digest,
                 )
 
@@ -1960,6 +2165,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 TOOLCHAIN._validate_ready_aggregate(
                     blocked_checkout,
                     manifest,
+                    recomputed_aggregate=copy.deepcopy(blocked_checkout),
                     expected_population_digest=population_digest,
                 )
 
@@ -1971,6 +2177,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 TOOLCHAIN._validate_ready_aggregate(
                     fabricated_checkout,
                     manifest,
+                    recomputed_aggregate=copy.deepcopy(fabricated_checkout),
                     expected_population_digest=population_digest,
                 )
 
@@ -1982,6 +2189,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 TOOLCHAIN._validate_ready_aggregate(
                     fabricated_cohort,
                     manifest,
+                    recomputed_aggregate=copy.deepcopy(fabricated_cohort),
                     expected_population_digest=population_digest,
                 )
 

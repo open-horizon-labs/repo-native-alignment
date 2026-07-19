@@ -115,6 +115,7 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust".to_string(),
         Some("py") => "python".to_string(),
+        Some("pyx") | Some("pxd") | Some("pxi") | Some("tp") => "cython".to_string(),
         Some("ts") | Some("tsx") => "typescript".to_string(),
         Some("js") | Some("jsx") => "javascript".to_string(),
         Some("go") => "go".to_string(),
@@ -151,7 +152,9 @@ mod tests {
         NodeKind, ValidationStatus,
     };
 
-    use super::{load_graph_from_lance, parse_edge_kind, persist_graph_to_lance};
+    use super::{
+        infer_language_from_path, load_graph_from_lance, parse_edge_kind, persist_graph_to_lance,
+    };
 
     fn node(kind: &str, name: &str, file: &str) -> Node {
         Node {
@@ -179,6 +182,51 @@ mod tests {
             Some(EdgeKind::Other("supports".to_string()))
         );
         assert_eq!(parse_edge_kind("  "), None);
+    }
+
+    #[tokio::test]
+    async fn cython_inventory_extensions_survive_persist_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extensions = ["pyx", "pxd", "pxi", "tp"];
+        let nodes = extensions
+            .iter()
+            .map(|extension| Node {
+                id: NodeId {
+                    root: "repo".to_string(),
+                    file: PathBuf::from(format!("src/kernel.{extension}")),
+                    name: format!("kernel_{extension}"),
+                    kind: NodeKind::Function,
+                },
+                language: "cython".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: format!("def kernel_{extension}():"),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            })
+            .collect::<Vec<_>>();
+
+        persist_graph_to_lance(dir.path(), &nodes, &[])
+            .await
+            .expect("persist Cython graph");
+        let state = load_graph_from_lance(dir.path())
+            .await
+            .expect("reopen Cython graph");
+
+        for extension in extensions {
+            let path = PathBuf::from(format!("src/kernel.{extension}"));
+            assert_eq!(infer_language_from_path(&path), "cython");
+            assert_eq!(
+                state
+                    .nodes
+                    .iter()
+                    .find(|node| node.id.file == path)
+                    .map(|node| node.language.as_str()),
+                Some("cython"),
+                "reopened {extension} node must remain eligible for Cython planning"
+            );
+        }
     }
 
     #[tokio::test]

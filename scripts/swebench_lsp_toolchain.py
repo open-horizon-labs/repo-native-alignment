@@ -39,6 +39,7 @@ from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
+PROVISION_RECEIPT_FILE = ".rna-provision-receipt.json"
 STRUCTURAL_CACHE_SCHEMA_VERSION = 1
 STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION = 2
 STRUCTURAL_CACHE_ROOT = "cache"
@@ -2666,9 +2667,19 @@ def build_repo_parser_bundle(repo_root: Path, output: Path) -> dict[str, Any]:
         return receipt
 
 
-def run_checked(args: Sequence[str], *, cwd: Path | None = None) -> str:
+def run_checked(
+    args: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str:
     completed = subprocess.run(
-        list(args), cwd=cwd, check=False, capture_output=True, text=True
+        list(args),
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=dict(environment) if environment is not None else None,
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
@@ -4375,21 +4386,67 @@ def _install_launcher(entry: Mapping[str, Any], toolchain_root: Path) -> None:
         command_path.chmod(0o755)
 
 
-def toolchain_environment(toolchain_root: Path) -> dict[str, str]:
-    environment = dict(os.environ)
+def toolchain_environment(
+    toolchain_root: Path, isolation_root: Path
+) -> dict[str, str]:
+    toolchain_root = toolchain_root.resolve()
+    isolation_root = isolation_root.resolve()
+    home = isolation_root / "home"
+    temporary = isolation_root / "tmp"
+    xdg_config = isolation_root / "xdg-config"
+    xdg_cache = isolation_root / "xdg-cache"
+    xdg_data = isolation_root / "xdg-data"
+    xdg_state = isolation_root / "xdg-state"
+    pip_cache = isolation_root / "pip-cache"
+    npm_cache = isolation_root / "npm-cache"
+    for directory in (
+        home,
+        temporary,
+        xdg_config,
+        xdg_cache,
+        xdg_data,
+        xdg_state,
+        pip_cache,
+        npm_cache,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     paths = [
         toolchain_root / "bin",
         toolchain_root / "runtimes/node-v22.12.0-darwin-arm64/bin",
         toolchain_root / "runtimes/python/bin",
         toolchain_root / "runtimes/jdk-21.0.11+10-jre/Contents/Home/bin",
     ]
-    environment["PATH"] = os.pathsep.join(str(path) for path in paths)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PIP_NO_INDEX"] = "1"
-    environment["npm_config_offline"] = "true"
-    environment["NO_PROXY"] = "*"
-    environment["no_proxy"] = "*"
-    return environment
+    return {
+        "PATH": os.pathsep.join(str(path) for path in paths),
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "XDG_CONFIG_HOME": str(xdg_config),
+        "XDG_CACHE_HOME": str(xdg_cache),
+        "XDG_DATA_HOME": str(xdg_data),
+        "XDG_STATE_HOME": str(xdg_state),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PIP_NO_INDEX": "1",
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_CACHE_DIR": str(pip_cache),
+        "npm_config_offline": "true",
+        "npm_config_userconfig": os.devnull,
+        "npm_config_cache": str(npm_cache),
+        "JAVA_HOME": str(
+            toolchain_root / "runtimes/jdk-21.0.11+10-jre/Contents/Home"
+        ),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_PROXY": "*",
+        "no_proxy": "*",
+    }
 
 
 def provision_toolchain(
@@ -4429,7 +4486,13 @@ def provision_toolchain(
     wheelhouse = toolchain_root / "servers/issue785-python-wheelhouse"
     if wheelhouse.is_dir():
         python_env = toolchain_root / "servers/python-env"
-        run_checked([str(python_runtime), "-m", "venv", str(python_env)])
+        provision_environment = toolchain_environment(
+            toolchain_root, toolchain_root / ".provision-environment"
+        )
+        run_checked(
+            [str(python_runtime), "-m", "venv", str(python_env)],
+            environment=provision_environment,
+        )
         completed = subprocess.run(
             [
                 str(python_env / "bin/python"),
@@ -4444,7 +4507,7 @@ def provision_toolchain(
             check=False,
             capture_output=True,
             text=True,
-            env=toolchain_environment(toolchain_root),
+            env=provision_environment,
         )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -4471,6 +4534,40 @@ def provision_toolchain(
                 "sha256": actual_digest,
             }
         )
+    launcher_entries = []
+    for entry in lock["servers"]:
+        launcher_path = _safe_destination(
+            toolchain_root, f"bin/{entry['command']}"
+        )
+        launcher_target_path = _safe_destination(
+            toolchain_root, entry["launcher"]["target"]
+        )
+        if not launcher_path.is_file():
+            raise ToolchainError(
+                f"installed launcher is missing: {entry['command']}"
+            )
+        if not launcher_target_path.is_file():
+            raise ToolchainError(
+                f"installed launcher target is missing: {entry['name']}"
+            )
+        try:
+            launcher_path.resolve(strict=True).relative_to(toolchain_root)
+            launcher_target_path.resolve(strict=True).relative_to(toolchain_root)
+        except (OSError, ValueError) as error:
+            raise ToolchainError(
+                f"installed launcher or target escapes toolchain root: "
+                f"{entry['command']}"
+            ) from error
+        launcher_entries.append(
+            {
+                "name": entry["name"],
+                "command": entry["command"],
+                "path": f"bin/{entry['command']}",
+                "sha256": sha256_file(launcher_path),
+                "target_path": entry["launcher"]["target"],
+                "target_sha256": sha256_file(launcher_target_path),
+            }
+        )
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "offline": True,
@@ -4478,10 +4575,219 @@ def provision_toolchain(
         "lock_sha256": sha256_file(lock_path),
         "inventory_sha256": sha256_file(inventory_path),
         "installed": sorted(installed_entries, key=lambda item: item["name"]),
+        "launchers": sorted(
+            launcher_entries, key=lambda item: (item["name"], item["command"])
+        ),
     }
     receipt["receipt_digest"] = sha256_bytes(canonical_json(receipt))
+    embedded_receipt_path = toolchain_root / PROVISION_RECEIPT_FILE
+    write_canonical_json(embedded_receipt_path, receipt)
+    if receipt_path.resolve() == embedded_receipt_path.resolve():
+        return receipt
     write_canonical_json(receipt_path, receipt)
     return receipt
+
+
+def _validate_provisioned_toolchain(
+    lock_path: Path,
+    inventory_path: Path,
+    toolchain_root: Path,
+) -> dict[str, Any]:
+    if toolchain_root.is_symlink() or not toolchain_root.is_dir():
+        raise ToolchainError("provisioned toolchain root must be a real directory")
+    toolchain_root = toolchain_root.resolve()
+    receipt_path = toolchain_root / PROVISION_RECEIPT_FILE
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ToolchainError("embedded provision receipt must be a regular file")
+    receipt = load_json_object(receipt_path, "embedded provision receipt")
+    _require_exact_fields(
+        receipt,
+        {
+            "schema_version",
+            "offline",
+            "platform",
+            "lock_sha256",
+            "inventory_sha256",
+            "installed",
+            "launchers",
+            "receipt_digest",
+        },
+        "embedded provision receipt",
+    )
+    receipt_digest = _require_sha256(
+        receipt.get("receipt_digest"), "embedded provision receipt digest"
+    )
+    digest_payload = dict(receipt)
+    digest_payload.pop("receipt_digest")
+    if sha256_bytes(canonical_json(digest_payload)) != receipt_digest:
+        raise ToolchainError("embedded provision receipt self-digest mismatch")
+
+    lock = load_json_object(lock_path, "toolchain lock for provision validation")
+    expected_entries = sorted(
+        [*lock.get("runtimes", []), *lock.get("servers", [])],
+        key=lambda entry: (
+            _require_string(entry.get("name"), "locked executable name"),
+            _require_string(entry.get("executable"), "locked executable path"),
+        ),
+    )
+    installed = receipt.get("installed")
+    launchers = receipt.get("launchers")
+    if (
+        receipt.get("schema_version") != SCHEMA_VERSION
+        or receipt.get("offline") is not True
+        or receipt.get("platform") != lock.get("platform")
+        or receipt.get("lock_sha256") != sha256_file(lock_path)
+        or receipt.get("inventory_sha256") != sha256_file(inventory_path)
+        or not isinstance(installed, list)
+        or len(installed) != len(expected_entries)
+        or not isinstance(launchers, list)
+        or len(launchers) != len(lock.get("servers", []))
+    ):
+        raise ToolchainError("embedded provision receipt identity mismatch")
+
+    verified_installed = []
+    ordered_installed = sorted(
+        installed,
+        key=lambda record: (
+            _require_string(
+                record.get("name") if isinstance(record, dict) else None,
+                "provisioned executable name",
+            ),
+            _require_string(
+                record.get("executable") if isinstance(record, dict) else None,
+                "provisioned executable path",
+            ),
+        ),
+    )
+    for record, entry in zip(ordered_installed, expected_entries, strict=True):
+        if not isinstance(record, dict):
+            raise ToolchainError("provisioned executable receipt is malformed")
+        _require_exact_fields(
+            record,
+            {"name", "executable", "sha256"},
+            "provisioned executable receipt",
+        )
+        expected_digest = _require_sha256(
+            entry.get("executable_sha256"), "locked executable digest"
+        )
+        if (
+            record.get("name") != entry.get("name")
+            or record.get("executable") != entry.get("executable")
+            or record.get("sha256") != expected_digest
+        ):
+            raise ToolchainError(
+                f"provisioned executable identity mismatch: {entry.get('name')}"
+            )
+        executable = _safe_destination(toolchain_root, entry["executable"])
+        if not executable.is_file():
+            raise ToolchainError(
+                f"provisioned executable is missing: {entry.get('name')}"
+            )
+        actual_digest = sha256_file(executable)
+        if actual_digest != expected_digest:
+            raise ToolchainError(
+                f"provisioned executable digest mismatch: {entry.get('name')} "
+                f"expected={expected_digest} actual={actual_digest}"
+            )
+        verified_installed.append(
+            {
+                "name": entry["name"],
+                "executable": entry["executable"],
+                "sha256": actual_digest,
+            }
+        )
+    expected_servers = sorted(
+        lock.get("servers", []),
+        key=lambda entry: (
+            _require_string(entry.get("name"), "locked launcher server name"),
+            _require_string(entry.get("command"), "locked launcher command"),
+        ),
+    )
+    verified_launchers = []
+    ordered_launchers = sorted(
+        launchers,
+        key=lambda record: (
+            _require_string(
+                record.get("name") if isinstance(record, dict) else None,
+                "provisioned launcher server name",
+            ),
+            _require_string(
+                record.get("command") if isinstance(record, dict) else None,
+                "provisioned launcher command",
+            ),
+        ),
+    )
+    for record, entry in zip(ordered_launchers, expected_servers, strict=True):
+        if not isinstance(record, dict):
+            raise ToolchainError("provisioned launcher receipt is malformed")
+        _require_exact_fields(
+            record,
+            {
+                "name",
+                "command",
+                "path",
+                "sha256",
+                "target_path",
+                "target_sha256",
+            },
+            "provisioned launcher receipt",
+        )
+        expected_path = f"bin/{entry['command']}"
+        expected_target_path = _require_string(
+            entry.get("launcher", {}).get("target")
+            if isinstance(entry.get("launcher"), dict)
+            else None,
+            "locked launcher target",
+        )
+        launcher = _safe_destination(toolchain_root, expected_path)
+        launcher_target = _safe_destination(toolchain_root, expected_target_path)
+        if (
+            record.get("name") != entry.get("name")
+            or record.get("command") != entry.get("command")
+            or record.get("path") != expected_path
+            or record.get("target_path") != expected_target_path
+            or not launcher.is_file()
+            or not launcher_target.is_file()
+        ):
+            raise ToolchainError(
+                f"provisioned launcher identity mismatch: {entry.get('name')}"
+            )
+        try:
+            launcher.resolve(strict=True).relative_to(toolchain_root)
+            launcher_target.resolve(strict=True).relative_to(toolchain_root)
+        except (OSError, ValueError) as error:
+            raise ToolchainError(
+                f"provisioned launcher or target escapes toolchain root: "
+                f"{entry.get('name')}"
+            ) from error
+        actual_digest = sha256_file(launcher)
+        actual_target_digest = sha256_file(launcher_target)
+        if record.get("sha256") != actual_digest:
+            raise ToolchainError(
+                f"provisioned launcher digest mismatch: {entry.get('name')}"
+            )
+        if record.get("target_sha256") != actual_target_digest:
+            raise ToolchainError(
+                f"provisioned launcher target digest mismatch: {entry.get('name')}"
+            )
+        verified_launchers.append(
+            {
+                "name": entry["name"],
+                "command": entry["command"],
+                "path": expected_path,
+                "sha256": actual_digest,
+                "target_path": expected_target_path,
+                "target_sha256": actual_target_digest,
+            }
+        )
+    return {
+        "toolchain_root": str(toolchain_root),
+        "inventory_sha256": sha256_file(inventory_path),
+        "provision_receipt_digest": receipt_digest,
+        "provision_receipt_sha256": sha256_file(receipt_path),
+        "installed": verified_installed,
+        "launchers": verified_launchers,
+    }
 
 
 class JsonRpcProcess:
@@ -4750,7 +5056,9 @@ def probe_server(
 ) -> dict[str, Any]:
     command = [str(toolchain_root / "bin" / entry["command"]), *entry["args"]]
     with tempfile.TemporaryDirectory(prefix="rna-lsp-probe-") as temporary:
-        root = Path(temporary)
+        sandbox = Path(temporary)
+        root = sandbox / "workspace"
+        root.mkdir()
         probe = entry["probe"]
         document = root / probe["file_name"]
         document.parent.mkdir(parents=True, exist_ok=True)
@@ -4760,7 +5068,7 @@ def probe_server(
         rpc = JsonRpcProcess(
             command,
             root,
-            toolchain_environment(toolchain_root),
+            toolchain_environment(toolchain_root, sandbox / "environment"),
             configuration if isinstance(configuration, dict) else None,
         )
         started = time.monotonic()
@@ -4861,6 +5169,8 @@ def probe_server(
                 "languages": entry["languages"],
                 "command": entry["command"],
                 "args": entry["args"],
+                "executable": entry["executable"],
+                "executable_sha256": entry["executable_sha256"],
                 "negotiated_capabilities": operations,
                 "negotiated_operation_capabilities": (
                     operation_capability_evidence
@@ -4892,14 +5202,28 @@ def probe_server(
 
 
 def _validate_toolchain_probe_evidence(
-    probe_path: Path, lock_path: Path
+    probe_path: Path,
+    lock_path: Path,
+    provisioned_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     if probe_path.is_symlink() or not probe_path.is_file():
         raise ToolchainError("toolchain probe evidence must be a regular file")
     probe = load_json_object(probe_path, "toolchain probe evidence")
     _require_exact_fields(
         probe,
-        {"schema_version", "lock_sha256", "server_count", "servers", "probe_digest"},
+        {
+            "schema_version",
+            "lock_sha256",
+            "toolchain_root",
+            "inventory_sha256",
+            "provision_receipt_digest",
+            "provision_receipt_sha256",
+            "installed",
+            "launchers",
+            "server_count",
+            "servers",
+            "probe_digest",
+        },
         "toolchain probe evidence",
     )
     stored_digest = _require_sha256(
@@ -4921,6 +5245,15 @@ def _validate_toolchain_probe_evidence(
         or type(probe.get("server_count")) is not int
         or probe["schema_version"] != SCHEMA_VERSION
         or probe["lock_sha256"] != sha256_file(lock_path)
+        or probe.get("toolchain_root") != provisioned_identity.get("toolchain_root")
+        or probe.get("inventory_sha256")
+        != provisioned_identity.get("inventory_sha256")
+        or probe.get("provision_receipt_digest")
+        != provisioned_identity.get("provision_receipt_digest")
+        or probe.get("provision_receipt_sha256")
+        != provisioned_identity.get("provision_receipt_sha256")
+        or probe.get("installed") != provisioned_identity.get("installed")
+        or probe.get("launchers") != provisioned_identity.get("launchers")
         or probe["server_count"] != len(lock_servers)
         or len(probe_servers) != len(lock_servers)
     ):
@@ -4944,6 +5277,8 @@ def _validate_toolchain_probe_evidence(
                 "languages",
                 "command",
                 "args",
+                "executable",
+                "executable_sha256",
                 "negotiated_capabilities",
                 "negotiated_operation_capabilities",
                 "operation",
@@ -4958,7 +5293,15 @@ def _validate_toolchain_probe_evidence(
             },
             "toolchain probe server receipt",
         )
-        for field in ("name", "version", "languages", "command", "args"):
+        for field in (
+            "name",
+            "version",
+            "languages",
+            "command",
+            "args",
+            "executable",
+            "executable_sha256",
+        ):
             if receipt.get(field) != locked.get(field):
                 raise ToolchainError(
                     f"toolchain probe server identity mismatch: {locked.get('name')} {field}"
@@ -5059,22 +5402,43 @@ def probe_toolchain(
     verification = verify_lock(lock_path, inventory_path, None, None, repo_root)
     if not verification["compatible"]:
         raise ToolchainError("cannot probe a lock with unsupported languages")
+    provisioned_identity = _validate_provisioned_toolchain(
+        lock_path, inventory_path, toolchain_root
+    )
+    toolchain_root = Path(provisioned_identity["toolchain_root"])
     lock = load_json_object(lock_path, "toolchain lock")
     receipts = []
     for entry in sorted(lock["servers"], key=lambda item: item["name"]):
+        if (
+            _validate_provisioned_toolchain(
+                lock_path, inventory_path, toolchain_root
+            )
+            != provisioned_identity
+        ):
+            raise ToolchainError(
+                f"provisioned toolchain identity changed before {entry['name']} probe"
+            )
         try:
             receipts.append(probe_server(entry, toolchain_root, timeout))
         except ToolchainError as error:
             raise ToolchainError(f"{entry['name']} probe failed: {error}") from error
+    if (
+        _validate_provisioned_toolchain(lock_path, inventory_path, toolchain_root)
+        != provisioned_identity
+    ):
+        raise ToolchainError("provisioned toolchain identity changed during probe")
     result = {
         "schema_version": SCHEMA_VERSION,
         "lock_sha256": sha256_file(lock_path),
+        **provisioned_identity,
         "server_count": len(receipts),
         "servers": receipts,
     }
     result["probe_digest"] = sha256_bytes(canonical_json(result))
     write_canonical_json(output_path, result)
-    return _validate_toolchain_probe_evidence(output_path, lock_path)
+    return _validate_toolchain_probe_evidence(
+        output_path, lock_path, provisioned_identity
+    )
 
 
 def _run_logged(
@@ -6246,8 +6610,14 @@ def _validate_ready_aggregate(
     aggregate: Mapping[str, Any],
     cohort_manifest: Mapping[str, Any],
     *,
+    recomputed_aggregate: Mapping[str, Any],
     expected_population_digest: str,
 ) -> None:
+    if aggregate != recomputed_aggregate:
+        raise ToolchainError(
+            "aggregate readiness evidence differs from independently recomputed "
+            "producer output"
+        )
     _require_exact_fields(
         aggregate,
         {"schema_version", "cohort_digest", "checkouts", "counts", "digest"},
@@ -6505,6 +6875,10 @@ def qualify_population(
     if set(inventory_cases) != {instance["instance_id"] for instance in instances}:
         raise ToolchainError("frozen inventory/population case identities differ")
     toolchain_lock_digest = sha256_file(lock_path)
+    provisioned_identity = _validate_provisioned_toolchain(
+        lock_path, inventory_path, toolchain_root
+    )
+    toolchain_root = Path(provisioned_identity["toolchain_root"])
     indexed_instances = _select_qualification_instances(
         instances,
         instance_ids,
@@ -6598,7 +6972,12 @@ def qualify_population(
     logs_root.mkdir(exist_ok=True)
     archives_root = output_root / "structural-caches"
     archives_root.mkdir(exist_ok=True)
-    environment = toolchain_environment(toolchain_root)
+    qualification_environment_directory = tempfile.TemporaryDirectory(
+        prefix="rna-lsp-qualification-environment-"
+    )
+    environment = toolchain_environment(
+        toolchain_root, Path(qualification_environment_directory.name)
+    )
     probe_path = output_root / "probe.json"
     probe_seconds = 0.0
     probe_performed = False
@@ -6688,7 +7067,11 @@ def qualify_population(
                     environment,
                     checkout_log_path,
                 )
-                actual = run_checked([git_binary, "rev-parse", "HEAD"], cwd=checkout)
+                actual = run_checked(
+                    [git_binary, "rev-parse", "HEAD"],
+                    cwd=checkout,
+                    environment=environment,
+                )
                 if actual != instance["base_commit"]:
                     raise ToolchainError(
                         f"checkout identity drift for {instance_id}: {actual}"
@@ -6704,6 +7087,7 @@ def qualify_population(
                         f"https://github.com/{instance['repo']}.git",
                     ],
                     cwd=checkout,
+                    environment=environment,
                 )
             except Exception as error:
                 failure_log = checkout_log_path if checkout_log_path.is_file() else clone_log_path
@@ -6889,10 +7273,21 @@ def qualify_population(
             sidecar_path = archives_root / f"{attempt_slug}.manifest.json"
             try:
                 if not probe_performed:
+                    current_provisioned_identity = _validate_provisioned_toolchain(
+                        lock_path, inventory_path, toolchain_root
+                    )
+                    if current_provisioned_identity != provisioned_identity:
+                        raise ToolchainError(
+                            "provisioned toolchain identity changed before probe"
+                        )
                     if probe_path.is_symlink():
-                        _validate_toolchain_probe_evidence(probe_path, lock_path)
+                        _validate_toolchain_probe_evidence(
+                            probe_path, lock_path, provisioned_identity
+                        )
                     elif probe_path.is_file():
-                        _validate_toolchain_probe_evidence(probe_path, lock_path)
+                        _validate_toolchain_probe_evidence(
+                            probe_path, lock_path, provisioned_identity
+                        )
                     else:
                         probe_started = time.monotonic()
                         probe_toolchain(
@@ -6905,6 +7300,15 @@ def qualify_population(
                         )
                         probe_seconds = time.monotonic() - probe_started
                     probe_performed = True
+                if (
+                    _validate_provisioned_toolchain(
+                        lock_path, inventory_path, toolchain_root
+                    )
+                    != provisioned_identity
+                ):
+                    raise ToolchainError(
+                        "provisioned toolchain identity changed before qualification scan"
+                    )
                 scan_seconds = _run_logged(
                     [
                         str(rna_binary),
@@ -6991,6 +7395,16 @@ def qualify_population(
                     if injection_receipt is None
                     else 0
                 )
+                if (
+                    _validate_provisioned_toolchain(
+                        lock_path, inventory_path, toolchain_root
+                    )
+                    != provisioned_identity
+                ):
+                    raise ToolchainError(
+                        "provisioned toolchain identity changed during "
+                        "qualification scan/readiness"
+                    )
                 archive_started = time.monotonic()
                 archive_receipt = archive_structural_cache(
                     checkout,
@@ -7204,7 +7618,14 @@ def qualify_population(
             "sha256": sha256_file(isolated_manifest_path),
         }
 
-    _validate_toolchain_probe_evidence(probe_path, lock_path)
+    if (
+        _validate_provisioned_toolchain(lock_path, inventory_path, toolchain_root)
+        != provisioned_identity
+    ):
+        raise ToolchainError("provisioned toolchain identity changed before finalization")
+    _validate_toolchain_probe_evidence(
+        probe_path, lock_path, provisioned_identity
+    )
     cohort_manifest = _build_frozen_cohort_manifest(cohort_cases)
     manifest_path = output_root / "cohort-manifest.json"
     write_canonical_json(manifest_path, cohort_manifest)
@@ -7225,9 +7646,34 @@ def qualify_population(
         aggregate_log,
     )
     aggregate = load_json_object(aggregate_path, "aggregate readiness report")
+    with tempfile.TemporaryDirectory(
+        prefix="rna-lsp-aggregate-verification-"
+    ) as aggregate_verification_directory:
+        recomputed_aggregate_path = (
+            Path(aggregate_verification_directory) / "aggregate.json"
+        )
+        _run_logged(
+            [
+                str(rna_binary),
+                "lsp-readiness",
+                "--cohort-manifest",
+                str(manifest_path),
+                "--aggregate-output",
+                str(recomputed_aggregate_path),
+                "--json",
+            ],
+            output_root,
+            environment,
+            logs_root / "aggregate-verification.log",
+        )
+        recomputed_aggregate = load_json_object(
+            recomputed_aggregate_path,
+            "independently recomputed aggregate readiness report",
+        )
     _validate_ready_aggregate(
         aggregate,
         cohort_manifest,
+        recomputed_aggregate=recomputed_aggregate,
         expected_population_digest=sha256_file(population_path),
     )
     timings = {
