@@ -226,6 +226,7 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
         if node.id.root != input.root_slug
             || node.language.is_empty()
             || !supported_languages.contains(&node.language)
+            || node.source == crate::graph::ExtractionSource::Lsp
         {
             continue;
         }
@@ -366,6 +367,11 @@ fn plan_lsp_node_ids_for_touched_files_with_bounds(
             || node.id.file.as_os_str().is_empty()
             || node.language.is_empty()
             || !supported_languages.contains(&node.language)
+            // LSP-produced nodes are persisted results, not query seeds. They
+            // may remain in the graph as evidence and edge endpoints, but
+            // scheduling them recursively re-queries carried output and
+            // inflates the operation bound with work that is not executable.
+            || node.source == crate::graph::ExtractionSource::Lsp
         {
             continue;
         }
@@ -632,6 +638,33 @@ mod tests {
             .find(|node| node.stable_id.contains("Thing"))
             .expect("type hierarchy remains high-signal default work");
         assert_eq!(broad_type.requested_operations, vec!["type_hierarchy"]);
+    }
+
+    #[test]
+    fn carried_lsp_output_is_not_planned_as_fresh_changed_file_work() {
+        let seed = node("src/changed.rs", "changed", NodeKind::Function);
+        let seed_id = seed.stable_id();
+        let mut carried_output = node("src/changed.rs", "carried", NodeKind::Function);
+        carried_output.source = ExtractionSource::Lsp;
+        let nodes = vec![seed, carried_output];
+
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: Some(PathBuf::from("src/changed.rs")),
+                new_path: Some(PathBuf::from("src/changed.rs")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: 16,
+            max_operations: 48,
+            allow_broad_references: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.planned_node_ids().as_ref(), &HashSet::from([seed_id]));
+        assert_eq!(plan.operation_count, 1);
     }
 
     #[test]

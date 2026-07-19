@@ -877,6 +877,11 @@ pub fn plan_incremental_impact(
                 || node.id.file.as_os_str().is_empty()
                 || !target_paths.contains(&node.id.file)
                 || !executed.contains(&node.id.file)
+                // Persisted LSP output nodes are carried evidence and graph
+                // closure endpoints, never fresh query seeds. Counting them
+                // here recursively schedules prior results and can falsely
+                // escalate an otherwise verifier-bounded file plan.
+                || node.source == crate::graph::ExtractionSource::Lsp
             {
                 continue;
             }
@@ -2112,6 +2117,74 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("exceeds its bound"));
         assert!(error.to_string().contains("python"));
+    }
+
+    #[test]
+    fn carried_lsp_nodes_do_not_escalate_verified_impact_plan() {
+        let changed = node("src/changed.py", "python");
+        let unchanged = node("src/unchanged.py", "python");
+        let authorization = verified_authorization(
+            &[("src/unchanged.py", "python")],
+            &["src/changed.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut new_nodes = vec![changed.clone(), unchanged.clone()];
+        new_nodes.extend((0..=MAX_INCREMENTAL_LSP_OPERATIONS).map(|index| {
+            let mut output = node("src/changed.py", "python");
+            output.id.name = format!("persisted_lsp_output_{index}");
+            output.source = ExtractionSource::Lsp;
+            output
+        }));
+
+        let plan =
+            plan_incremental_impact(&authorization, &[changed, unchanged], &[], &new_nodes, &[]);
+
+        assert_eq!(
+            plan.executed_paths,
+            BTreeSet::from([PathBuf::from("src/changed.py")])
+        );
+        assert_eq!(
+            plan.inherited_paths,
+            BTreeSet::from([PathBuf::from("src/unchanged.py")])
+        );
+        assert!(plan.escalated_partitions.is_empty());
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn verified_changed_file_scheduler_excludes_carried_lsp_nodes() {
+        let authorization =
+            verified_authorization(&[], &["src/changed.py"], &[], &[], &[], &[], &[]);
+        let plan = IncrementalImpactPlan {
+            executed_paths: BTreeSet::from([PathBuf::from("src/changed.py")]),
+            inherited_paths: BTreeSet::new(),
+            escalated_partitions: BTreeSet::new(),
+            closure_edge_count: 0,
+        };
+        let seed = node("src/changed.py", "python");
+        let seed_id = seed.stable_id();
+        let mut nodes = vec![seed];
+        nodes.extend(
+            (0..=crate::extract::lsp::MAX_INCREMENTAL_LSP_OPERATIONS).map(|index| {
+                let mut output = node("src/changed.py", "python");
+                output.id.name = format!("persisted_lsp_output_{index}");
+                output.source = ExtractionSource::Lsp;
+                output
+            }),
+        );
+
+        let ids = crate::server::plan_lsp_node_ids_for_verified_structural_cache(
+            &authorization,
+            &plan,
+            &nodes,
+        )
+        .unwrap();
+
+        assert_eq!(ids.as_ref(), &std::collections::HashSet::from([seed_id]));
     }
 
     #[test]
