@@ -1630,15 +1630,19 @@ impl RnaHandler {
             scan.changed_files.len() + scan.new_files.len() + scan.deleted_files.len();
         let cache_authorization =
             crate::structural_cache::load_verified_authorization(&self.repo_root)?;
-        let preliminary_cache_plan = cache_authorization.as_ref().map(|authorization| {
-            crate::structural_cache::plan_incremental_impact(
+        let preliminary_cache_plan = if let Some(authorization) = cache_authorization.as_ref() {
+            let plan = crate::structural_cache::plan_incremental_impact(
                 authorization,
                 &cached_state.nodes,
                 &cached_state.edges,
                 &cached_state.nodes,
                 &cached_state.edges,
-            )
-        });
+            );
+            crate::structural_cache::validate_runtime_plan_handoff(authorization, &plan)?;
+            Some(plan)
+        } else {
+            None
+        };
 
         on_progress(&format!(
             "Scan: {} changed, {} new, {} deleted in {:.1}s",
@@ -1909,15 +1913,19 @@ impl RnaHandler {
         let _incremental_update = self
             .update_graph_with_scan_outcome(&mut cached_state, Some(scan), enrichment.without_lsp())
             .await?;
-        let cache_plan = cache_authorization.as_ref().map(|authorization| {
-            crate::structural_cache::plan_incremental_impact(
+        let cache_plan = if let Some(authorization) = cache_authorization.as_ref() {
+            let plan = crate::structural_cache::plan_incremental_impact(
                 authorization,
                 &old_nodes,
                 &old_edges,
                 &cached_state.nodes,
                 &cached_state.edges,
-            )
-        });
+            );
+            crate::structural_cache::validate_runtime_plan_handoff(authorization, &plan)?;
+            Some(plan)
+        } else {
+            None
+        };
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
         let extract_time = t1.elapsed();

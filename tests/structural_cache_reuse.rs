@@ -498,8 +498,20 @@ async fn verified_cache_chain_reuses_then_incrementally_refreshes_real_persisted
         "tests/test_renamed.py",
     );
     let renamed_paths = string_set(&renamed_execution["executed_paths"]);
-    assert!(renamed_paths.contains("tests/test_app.py"));
-    assert!(renamed_paths.contains("tests/test_renamed.py"));
+    assert_eq!(
+        renamed_paths,
+        BTreeSet::from([
+            "src/app.py".to_string(),
+            "tests/test_app.py".to_string(),
+            "tests/test_renamed.py".to_string(),
+        ]),
+        "rename executes only stale/new paths plus the persisted cross-file impact closure"
+    );
+    assert_eq!(
+        renamed_execution["escalated_partitions"],
+        serde_json::json!([]),
+        "a bounded rename closure must not rebuild the Python partition"
+    );
     assert_fresh_graph_has_no_path(&renamed, "tests/test_app.py").await;
     let (renamed_archive, renamed_sidecar) =
         archive_case(&rna, &renamed, &evidence, "renamed", &fixture_path_env);

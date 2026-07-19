@@ -1256,6 +1256,48 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 },
             )
 
+    def test_direct_lsp_impact_paths_are_one_hop_and_target_bounded(self) -> None:
+        a_to_b = "checkout:src/a.py:a:function->calls->checkout:src/b.py:b:function"
+        b_to_c = "checkout:src/b.py:b:function->calls->checkout:src/c.py:c:function"
+        files = [
+            {
+                "path": "src/a.py",
+                "expected_result_ids": [a_to_b],
+                "persisted_results": {"provenance": [a_to_b]},
+            },
+            {
+                "path": "src/b.py",
+                "expected_result_ids": [b_to_c],
+                "persisted_results": {"provenance": [a_to_b, b_to_c]},
+            },
+            {
+                "path": "src/c.py",
+                "expected_result_ids": [b_to_c],
+                "persisted_results": {"provenance": [b_to_c]},
+            },
+            {
+                "path": "src/d.py",
+                "expected_result_ids": [
+                    "external:builtins.py:len:function->calls->checkout:src/d.py:d:function"
+                ],
+                "persisted_results": {
+                    "provenance": [
+                        "external:builtins.py:len:function->calls->checkout:src/d.py:d:function"
+                    ]
+                },
+            },
+        ]
+
+        self.assertEqual(
+            TOOLCHAIN._direct_lsp_impact_paths(
+                files,
+                root_slug="checkout",
+                direct_paths={"src/a.py"},
+                target_paths={"src/a.py", "src/b.py", "src/c.py", "src/d.py"},
+            ),
+            ["src/b.py"],
+        )
+
     def test_cache_preflight_rejects_unexpected_all_partition_invalidation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, identity = self.structural_cache_fixture(Path(temporary))

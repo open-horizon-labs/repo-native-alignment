@@ -52,6 +52,15 @@ STRUCTURAL_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
 STRUCTURAL_CACHE_FORBIDDEN_COMPONENTS = frozenset(
     {"embedding", "embeddings", "rerank", "reranker", "vectors", "vector-index"}
 )
+STRUCTURAL_CACHE_LSP_IMPACT_MARKERS = (
+    "->calls->",
+    "->referenced_by->",
+    "->references->",
+    "->depends_on->",
+    "->implements->",
+    "->re_exports->",
+    "->tested_by->",
+)
 QUALIFICATION_SCAN_FLAGS = [
     "--business-context=disabled",
     "scan",
@@ -1615,6 +1624,95 @@ def select_structural_cache(
     }
 
 
+def _direct_lsp_impact_paths(
+    files: Sequence[Mapping[str, Any]],
+    *,
+    root_slug: str,
+    direct_paths: set[str],
+    target_paths: set[str],
+) -> list[str]:
+    """Return the target-bounded one-hop neighborhood of persisted OLD LSP edges.
+
+    Result ownership identifies which request produced an edge, not both files
+    the persisted edge can invalidate. Resolve the global union of carried LSP
+    result IDs to their two target-inventory endpoints so either endpoint can
+    be a direct diff seed. Impact paths never become transitive seeds.
+    """
+
+    if not direct_paths:
+        return []
+    known_paths = set(target_paths) | set(direct_paths)
+    path_trie: dict[str, Any] = {}
+    terminal = ""
+    for path in sorted(known_paths):
+        node = path_trie
+        for character in f"{path}:":
+            node = node.setdefault(character, {})
+        node[terminal] = path
+
+    def endpoint_path(stable_id: str) -> str | None:
+        prefix = f"{root_slug}:"
+        if not stable_id.startswith(prefix):
+            return None
+        node = path_trie
+        resolved: set[str] = set()
+        for character in stable_id[len(prefix) :]:
+            child = node.get(character)
+            if not isinstance(child, dict):
+                break
+            node = child
+            candidate = node.get(terminal)
+            if isinstance(candidate, str):
+                resolved.add(candidate)
+        if len(resolved) > 1:
+            raise ToolchainError(
+                "base completeness persisted LSP endpoint is ambiguous"
+            )
+        return next(iter(resolved), None)
+
+    persisted_edge_ids: set[str] = set()
+    for file_record in files:
+        if not isinstance(file_record, Mapping):
+            raise ToolchainError("base completeness file record is malformed")
+        path = file_record.get("path")
+        persisted_results = file_record.get("persisted_results")
+        provenance = (
+            persisted_results.get("provenance")
+            if isinstance(persisted_results, Mapping)
+            else None
+        )
+        if not isinstance(path, str) or not isinstance(provenance, list):
+            raise ToolchainError("base completeness persisted LSP evidence is malformed")
+        for result_id in provenance:
+            if not isinstance(result_id, str):
+                raise ToolchainError("base completeness persisted LSP ID is malformed")
+            if any(
+                marker in result_id for marker in STRUCTURAL_CACHE_LSP_IMPACT_MARKERS
+            ):
+                persisted_edge_ids.add(result_id)
+
+    impacted: set[str] = set()
+    for result_id in sorted(persisted_edge_ids):
+        markers = [
+            candidate
+            for candidate in STRUCTURAL_CACHE_LSP_IMPACT_MARKERS
+            if candidate in result_id
+        ]
+        if len(markers) != 1 or result_id.count(markers[0]) != 1:
+            raise ToolchainError(
+                "base completeness persisted LSP edge ID is ambiguous"
+            )
+        endpoints = result_id.split(markers[0])
+        from_path = endpoint_path(endpoints[0])
+        to_path = endpoint_path(endpoints[1])
+        if from_path in direct_paths and to_path in target_paths:
+            impacted.add(to_path)
+        if to_path in direct_paths and from_path in target_paths:
+            impacted.add(from_path)
+    impacted.difference_update(direct_paths)
+    return sorted(impacted)
+
+
 def inject_structural_cache(
     selection: Mapping[str, Any],
     checkout: Path,
@@ -1778,6 +1876,14 @@ def inject_structural_cache(
         if language in target_identity["partitions"]:
             path_partitions[path] = language
 
+    impact_closure_paths = _direct_lsp_impact_paths(
+        files,
+        root_slug=target_identity["root_slug"],
+        direct_paths=touched,
+        target_paths=set(path_partitions),
+    )
+    touched_for_inheritance = touched | set(impact_closure_paths)
+
     # A cached result without a durable producer cannot be selectively
     # invalidated. Escalate its whole language partition before authorizing any
     # inheritance, then rebuild the inherited set once with the final partition set.
@@ -1816,7 +1922,7 @@ def inject_structural_cache(
         if (
             not isinstance(path, str)
             or not isinstance(language, str)
-            or path in touched
+            or path in touched_for_inheritance
             or path not in target_blobs
             or language in invalidated
             or not isinstance(terminal, dict)
@@ -1922,7 +2028,8 @@ def inject_structural_cache(
     write_canonical_json(work_path, work_store)
 
     invalidated_paths = sorted(
-        {
+        set(impact_closure_paths)
+        | {
             file_record["path"]
             for file_record in files
             if isinstance(file_record, dict)
@@ -2012,6 +2119,8 @@ def inject_structural_cache(
             inherited_work_count + predicted_executed_work_count
         ),
         "predicted_operation_estimated_file_count": estimated_operation_file_count,
+        "impact_closure_basis": "verified_base_persisted_old_lsp_edge_one_hop",
+        "impact_closure_paths": impact_closure_paths,
         "changed_file_count": diff["distance"],
         "invalidated_partitions": sorted(invalidated),
         "compatible_partitions": sorted(
@@ -2070,6 +2179,8 @@ def build_structural_cache_preflight(
             "basis": "cold_no_base_work_ledger",
             "estimated_file_count": target_file_count,
         }
+        impact_closure_paths: list[str] = []
+        impact_closure_basis = "cold_no_base_persisted_old_lsp_edge"
     else:
         if injection_receipt is None:
             raise ToolchainError("selected cache preflight has no injection receipt")
@@ -2129,6 +2240,8 @@ def build_structural_cache_preflight(
                 "predicted_operation_estimated_file_count"
             ],
         }
+        impact_closure_paths = list(injection_receipt["impact_closure_paths"])
+        impact_closure_basis = injection_receipt["impact_closure_basis"]
     invalidated_partitions = [
         {
             "language": language,
@@ -2161,6 +2274,12 @@ def build_structural_cache_preflight(
             "executed": executed_file_count,
         },
         "expected_operation_count": expected_operation_count,
+        "impact_closure": {
+            "basis": impact_closure_basis,
+            "paths": impact_closure_paths,
+            "path_count": len(impact_closure_paths),
+            "paths_digest": sha256_bytes(canonical_json(impact_closure_paths)),
+        },
         "digest": "",
     }
     preflight["digest"] = sha256_bytes(canonical_json(preflight))
@@ -2187,6 +2306,7 @@ def validate_structural_cache_preflight(
             "invalidated_partitions",
             "predicted_file_counts",
             "expected_operation_count",
+            "impact_closure",
             "digest",
         },
         "structural-cache preflight",
@@ -2284,6 +2404,40 @@ def validate_structural_cache_preflight(
         counts["inherited"] + counts["executed"] != counts["target"]
     ):
         raise ToolchainError("structural-cache preflight file counts are inconsistent")
+    impact_closure = preflight["impact_closure"]
+    if not isinstance(impact_closure, dict) or set(impact_closure) != {
+        "basis",
+        "paths",
+        "path_count",
+        "paths_digest",
+    }:
+        raise ToolchainError("structural-cache preflight impact closure is malformed")
+    impact_paths = impact_closure["paths"]
+    if (
+        not isinstance(impact_closure["basis"], str)
+        or not impact_closure["basis"]
+        or not isinstance(impact_paths, list)
+        or impact_paths != sorted(set(impact_paths))
+        or type(impact_closure["path_count"]) is not int
+        or impact_closure["path_count"] != len(impact_paths)
+        or sha256_bytes(canonical_json(impact_paths))
+        != _require_sha256(
+            impact_closure["paths_digest"],
+            "structural-cache preflight impact closure digest",
+        )
+    ):
+        raise ToolchainError("structural-cache preflight impact closure is invalid")
+    for path in impact_paths:
+        pure = PurePosixPath(path) if isinstance(path, str) else None
+        if (
+            pure is None
+            or pure.is_absolute()
+            or not pure.parts
+            or any(component in {"", ".", ".."} for component in pure.parts)
+        ):
+            raise ToolchainError("structural-cache preflight impact path is invalid")
+    if selected is None and impact_paths:
+        raise ToolchainError("cold structural-cache preflight cannot carry impact paths")
     operations = preflight["expected_operation_count"]
     if not isinstance(operations, dict) or set(operations) != {
         "inherited_exact",

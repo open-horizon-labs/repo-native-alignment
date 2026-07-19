@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -700,21 +700,34 @@ pub fn plan_incremental_impact(
     old_nodes: &[Node],
     old_edges: &[Edge],
     new_nodes: &[Node],
-    new_edges: &[Edge],
+    _new_edges: &[Edge],
 ) -> IncrementalImpactPlan {
-    let mut executed = authorization
+    let target_paths = authorization
+        .authorization
+        .path_partitions
+        .keys()
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    let mut direct_seeds = authorization
         .authorization
         .changed_paths
         .iter()
         .chain(authorization.authorization.added_paths.iter())
         .chain(authorization.authorization.deleted_paths.iter())
-        .chain(authorization.authorization.invalidated_paths.iter())
         .map(PathBuf::from)
         .collect::<BTreeSet<_>>();
     for rename in &authorization.authorization.renamed_paths {
-        executed.insert(PathBuf::from(&rename[0]));
-        executed.insert(PathBuf::from(&rename[1]));
+        direct_seeds.insert(PathBuf::from(&rename[0]));
+        direct_seeds.insert(PathBuf::from(&rename[1]));
     }
+    let mut executed = direct_seeds.clone();
+    executed.extend(
+        authorization
+            .authorization
+            .invalidated_paths
+            .iter()
+            .map(PathBuf::from),
+    );
 
     let invalidated = authorization
         .authorization
@@ -722,57 +735,49 @@ pub fn plan_incremental_impact(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    for node in old_nodes.iter().chain(new_nodes.iter()) {
-        if invalidated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
-            executed.insert(node.id.file.clone());
+    for (path, language) in &authorization.authorization.path_partitions {
+        if invalidated.contains(language) {
+            executed.insert(PathBuf::from(path));
         }
     }
 
-    let mut adjacency = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+    // Impact propagation is deliberately one hop from the verifier-authorized
+    // direct seeds. Walking the graph transitively turns shared framework and
+    // external-library hubs into a repository-wide connected component. Only
+    // the target inventory may be added to the execution set; deleted and old
+    // rename paths remain seeds so their direct surviving neighbors are still
+    // refreshed.
+    let root_slug = authorization.authorization.root_slug.as_str();
     let mut closure_edge_count = 0usize;
-    for edge in old_edges.iter().chain(new_edges.iter()) {
-        if !is_impact_edge(&edge.kind)
+    for edge in old_edges {
+        if edge.source != crate::graph::ExtractionSource::Lsp
+            || !is_impact_edge(&edge.kind)
             || edge.from.file == edge.to.file
             || edge.from.file.as_os_str().is_empty()
             || edge.to.file.as_os_str().is_empty()
         {
             continue;
         }
-        adjacency
-            .entry(edge.from.file.clone())
-            .or_default()
-            .insert(edge.to.file.clone());
-        adjacency
-            .entry(edge.to.file.clone())
-            .or_default()
-            .insert(edge.from.file.clone());
+        let from_is_seed = edge.from.root == root_slug && direct_seeds.contains(&edge.from.file);
+        let to_is_seed = edge.to.root == root_slug && direct_seeds.contains(&edge.to.file);
+        let from_is_target = edge.from.root == root_slug && target_paths.contains(&edge.from.file);
+        let to_is_target = edge.to.root == root_slug && target_paths.contains(&edge.to.file);
+        let directly_impacts_target =
+            (from_is_seed && to_is_target) || (to_is_seed && from_is_target);
+        if !directly_impacts_target {
+            continue;
+        }
         closure_edge_count += 1;
-    }
-    let mut queue = executed.iter().cloned().collect::<VecDeque<_>>();
-    while let Some(path) = queue.pop_front() {
-        if let Some(neighbors) = adjacency.get(&path) {
-            for neighbor in neighbors {
-                if executed.insert(neighbor.clone()) {
-                    queue.push_back(neighbor.clone());
-                }
-            }
+        if from_is_seed && to_is_target {
+            executed.insert(edge.to.file.clone());
+        }
+        if to_is_seed && from_is_target {
+            executed.insert(edge.from.file.clone());
         }
     }
 
-    let all_current_paths = new_nodes
-        .iter()
-        .filter(|node| !node.id.file.as_os_str().is_empty())
-        .map(|node| node.id.file.clone())
-        .chain(
-            authorization
-                .authorization
-                .path_partitions
-                .keys()
-                .map(PathBuf::from),
-        )
-        .collect::<BTreeSet<_>>();
     let limit = MAX_IMPACT_FILES.min(
-        all_current_paths
+        target_paths
             .len()
             .saturating_mul(MAX_IMPACT_FRACTION_NUMERATOR)
             .checked_div(MAX_IMPACT_FRACTION_DENOMINATOR)
@@ -781,8 +786,8 @@ pub fn plan_incremental_impact(
     );
     let mut escalated = BTreeSet::new();
     // Ordinary source additions, renames, and declaration changes stay within
-    // the bidirectional graph impact closure above. Partition identities
-    // already fail closed for configuration, dependency, toolchain,
+    // the direct bidirectional graph impact neighborhood above. Partition
+    // identities already fail closed for configuration, dependency, toolchain,
     // inventory, schema, and scan-policy changes; only the safety bounds may
     // promote an otherwise compatible source update to a partition rebuild.
     if executed.len() > limit {
@@ -796,13 +801,8 @@ pub fn plan_incremental_impact(
             }
         }
         for node in old_nodes.iter().chain(new_nodes.iter()) {
-            if executed.contains(&node.id.file) {
+            if node.id.root == root_slug && executed.contains(&node.id.file) {
                 escalated.insert(node.language.clone());
-            }
-        }
-        for node in new_nodes {
-            if escalated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
-                executed.insert(node.id.file.clone());
             }
         }
         for (path, language) in &authorization.authorization.path_partitions {
@@ -823,6 +823,7 @@ pub fn plan_incremental_impact(
     for node in new_nodes {
         if node.id.root != authorization.authorization.root_slug
             || node.id.file.as_os_str().is_empty()
+            || !target_paths.contains(&node.id.file)
             || !executed.contains(&node.id.file)
         {
             continue;
@@ -838,11 +839,6 @@ pub fn plan_incremental_impact(
         || planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS
     {
         escalated.extend(planned_languages);
-        for node in new_nodes {
-            if escalated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
-                executed.insert(node.id.file.clone());
-            }
-        }
         for (path, language) in &authorization.authorization.path_partitions {
             if escalated.contains(language) {
                 executed.insert(PathBuf::from(path));
@@ -862,6 +858,82 @@ pub fn plan_incremental_impact(
         escalated_partitions: escalated,
         closure_edge_count,
     }
+}
+
+pub fn validate_runtime_plan_handoff(
+    authorization: &VerifiedStructuralCacheAuthorization,
+    plan: &IncrementalImpactPlan,
+) -> Result<()> {
+    let mut expected_executed = authorization
+        .authorization
+        .path_partitions
+        .keys()
+        .filter(|path| !authorization.inherited_by_path.contains_key(path.as_str()))
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    expected_executed.extend(
+        authorization
+            .authorization
+            .changed_paths
+            .iter()
+            .chain(authorization.authorization.added_paths.iter())
+            .chain(authorization.authorization.deleted_paths.iter())
+            .map(PathBuf::from),
+    );
+    for rename in &authorization.authorization.renamed_paths {
+        expected_executed.insert(PathBuf::from(&rename[0]));
+        expected_executed.insert(PathBuf::from(&rename[1]));
+    }
+
+    if plan.executed_paths != expected_executed {
+        let first_unexpected = plan
+            .executed_paths
+            .difference(&expected_executed)
+            .next()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        let first_missing = expected_executed
+            .difference(&plan.executed_paths)
+            .next()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        bail!(
+            "runtime structural-cache execution differs from verifier authorization: expected={} actual={} first_unexpected={} first_missing={}",
+            expected_executed.len(),
+            plan.executed_paths.len(),
+            first_unexpected,
+            first_missing,
+        );
+    }
+
+    let expected_inherited = authorization
+        .inherited_by_path
+        .keys()
+        .map(PathBuf::from)
+        .filter(|path| !expected_executed.contains(path))
+        .collect::<BTreeSet<_>>();
+    if plan.inherited_paths != expected_inherited {
+        let first_unexpected = plan
+            .inherited_paths
+            .difference(&expected_inherited)
+            .next()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        let first_missing = expected_inherited
+            .difference(&plan.inherited_paths)
+            .next()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        bail!(
+            "runtime structural-cache inheritance differs from verifier authorization: expected={} actual={} first_unexpected={} first_missing={}",
+            expected_inherited.len(),
+            plan.inherited_paths.len(),
+            first_unexpected,
+            first_missing,
+        );
+    }
+
+    Ok(())
 }
 
 pub fn write_execution(repo_root: &Path, execution: &StructuralCacheExecution) -> Result<()> {
@@ -1764,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_python_file_reprocesses_only_transitive_cross_file_closure() {
+    fn changed_python_file_reprocesses_only_direct_cross_file_neighborhood() {
         let nodes = [
             node("src/a.py", "python"),
             node("src/b.py", "python"),
@@ -1798,13 +1870,164 @@ mod tests {
 
         assert_eq!(
             plan.executed_paths,
-            ["src/a.py", "src/b.py", "src/c.py"]
+            ["src/a.py", "src/b.py"]
                 .into_iter()
                 .map(PathBuf::from)
                 .collect()
         );
+        assert!(plan.inherited_paths.contains(Path::new("src/c.py")));
         assert!(plan.inherited_paths.contains(Path::new("src/d.py")));
         assert!(!plan.escalated_partitions.contains("python"));
+    }
+
+    #[test]
+    fn runtime_plan_handoff_accepts_exact_precomputed_one_hop_set() {
+        let nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+        ];
+        let edges = [edge(&nodes[0], &nodes[1])];
+        let mut authorization = verified_authorization(
+            &[
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["src/b.py"],
+        );
+        authorization
+            .authorization
+            .path_partitions
+            .insert("src/b.py".to_string(), "python".to_string());
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn runtime_plan_handoff_rejects_unplanned_direct_neighbor() {
+        let nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+        ];
+        let edges = [edge(&nodes[0], &nodes[1])];
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+        let error = validate_runtime_plan_handoff(&authorization, &plan).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected=1 actual=2 first_unexpected=src/b.py first_missing=-")
+        );
+    }
+
+    #[test]
+    fn only_direct_diff_seeds_and_carried_lsp_edges_expand_impact() {
+        let nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+            node("src/f.py", "python"),
+        ];
+        let direct_lsp_edge = edge(&nodes[0], &nodes[1]);
+        let second_hop_lsp_edge = edge(&nodes[1], &nodes[2]);
+        let mut old_static_edge = edge(&nodes[0], &nodes[3]);
+        old_static_edge.source = ExtractionSource::TreeSitter;
+        let new_lsp_edge = edge(&nodes[0], &nodes[4]);
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+                ("src/f.py", "python"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["src/b.py"],
+        );
+
+        let plan = plan_incremental_impact(
+            &authorization,
+            &nodes,
+            &[direct_lsp_edge, second_hop_lsp_edge, old_static_edge],
+            &nodes,
+            &[new_lsp_edge],
+        );
+
+        assert_eq!(
+            plan.executed_paths,
+            ["src/a.py", "src/b.py"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert!(plan.inherited_paths.contains(Path::new("src/c.py")));
+        assert!(plan.inherited_paths.contains(Path::new("src/d.py")));
+        assert!(plan.inherited_paths.contains(Path::new("src/e.py")));
+        assert_eq!(plan.closure_edge_count, 1);
+    }
+
+    #[test]
+    fn non_inventory_external_hub_cannot_expand_direct_impact() {
+        let changed = node("src/a.py", "python");
+        let inherited = node("src/b.py", "python");
+        let mut external_hub = node("builtins.py", "python");
+        external_hub.id.root = "external".to_string();
+        external_hub.source = ExtractionSource::Lsp;
+        let nodes = [changed, inherited, external_hub];
+        let edges = [edge(&nodes[0], &nodes[2]), edge(&nodes[2], &nodes[1])];
+        let authorization = verified_authorization(
+            &[("src/b.py", "python")],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            BTreeSet::from([PathBuf::from("src/a.py")])
+        );
+        assert!(plan.inherited_paths.contains(Path::new("src/b.py")));
+        assert!(!plan.executed_paths.contains(Path::new("builtins.py")));
+        assert_eq!(plan.closure_edge_count, 0);
     }
 
     #[test]
@@ -1883,6 +2106,12 @@ mod tests {
         assert_eq!(
             plan.escalated_partitions,
             BTreeSet::from(["python".to_string()])
+        );
+        let error = validate_runtime_plan_handoff(&authorization, &plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("first_unexpected=src/unchanged.py")
         );
     }
 
