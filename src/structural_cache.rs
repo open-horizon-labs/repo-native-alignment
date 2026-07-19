@@ -14,9 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::business_context::BusinessContextMode;
-use crate::extract::lsp::{
-    MAX_INCREMENTAL_LSP_NODES, MAX_INCREMENTAL_LSP_OPERATIONS, planned_operations_for_node,
-};
+use crate::extract::lsp::{MAX_INCREMENTAL_LSP_OPERATIONS, planned_operations_for_node};
 use crate::graph::{Edge, EdgeKind, Node};
 use crate::roots::RootConfig;
 
@@ -813,10 +811,11 @@ pub fn plan_incremental_impact(
     }
 
     // The graph closure is bounded by files, while actual LSP cost is bounded
-    // by descriptor-owned node operations. A symbol-dense file can therefore
-    // remain below the file bound but exceed the changed-file executor bound.
-    // Escalate every affected language partition before scheduling so the
-    // executor can only cross its bound for a complete partition rebuild.
+    // by descriptor-owned node operations. Every planned node contributes at
+    // least one operation, so the operation ceiling also bounds the number of
+    // executable nodes. Escalate every affected language partition only when
+    // that cost ceiling is exceeded; the ordinary changed-file executor owns
+    // its separate node ceiling outside this verifier-authorized cache path.
     let mut planned_node_ids = BTreeSet::new();
     let mut planned_operation_count = 0usize;
     let mut planned_languages = BTreeSet::new();
@@ -835,9 +834,7 @@ pub fn plan_incremental_impact(
         planned_operation_count = planned_operation_count.saturating_add(operations.len());
         planned_languages.insert(node.language.clone());
     }
-    if planned_node_ids.len() > MAX_INCREMENTAL_LSP_NODES
-        || planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS
-    {
+    if planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS {
         escalated.extend(planned_languages);
         for (path, language) in &authorization.authorization.path_partitions {
             if escalated.contains(language) {
@@ -2073,8 +2070,42 @@ mod tests {
     }
 
     #[test]
-    fn symbol_dense_over_bound_update_escalates_descriptor_partition() {
-        let mut nodes = (0..=MAX_INCREMENTAL_LSP_NODES)
+    fn symbol_dense_above_node_ceiling_below_operation_ceiling_remains_incremental() {
+        let nodes = (0..=4_096)
+            .map(|index| {
+                let mut dense = node("src/dense.py", "python");
+                dense.id.name = format!("symbol_{index}");
+                dense.signature = format!("def symbol_{index}():");
+                dense
+            })
+            .collect::<Vec<_>>();
+        let authorization = verified_authorization(
+            &[("src/unchanged.py", "python")],
+            &["src/dense.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &[], &nodes, &[]);
+
+        assert_eq!(
+            plan.executed_paths,
+            BTreeSet::from([PathBuf::from("src/dense.py")])
+        );
+        assert_eq!(
+            plan.inherited_paths,
+            BTreeSet::from([PathBuf::from("src/unchanged.py")])
+        );
+        assert!(plan.escalated_partitions.is_empty());
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn operation_over_bound_update_escalates_descriptor_partition() {
+        let mut nodes = (0..=MAX_INCREMENTAL_LSP_OPERATIONS)
             .map(|index| {
                 let mut dense = node("src/dense.py", "python");
                 dense.id.name = format!("symbol_{index}");
