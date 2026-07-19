@@ -491,7 +491,13 @@ fn plan_lsp_node_ids_for_touched_files_with_bounds(
             ..
         } => (false, operation_count.max(*signed_operation_count)),
     };
-    if exceeds_node_bound || bounded_operation_count > MAX_CHANGED_LSP_OPERATIONS {
+    if bounded_operation_count > MAX_CHANGED_LSP_OPERATIONS {
+        anyhow::bail!(
+            "changed-file LSP plan exceeds its bound (max {} operations); {SCOPE_HELP}",
+            MAX_CHANGED_LSP_OPERATIONS,
+        );
+    }
+    if exceeds_node_bound {
         let unrebuilt_languages = planned_languages
             .difference(rebuilt_partitions)
             .cloned()
@@ -823,12 +829,24 @@ mod tests {
             &BTreeSet::new(),
             ChangedFileNodeBound::AuthorizedStructuralCache {
                 signed_operation_count: 0,
-                authorized_operations_by_language,
+                authorized_operations_by_language: authorized_operations_by_language.clone(),
             },
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("exceeds its bound"));
+
+        let rebuilt_error = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::from(["rust".to_string()]),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 0,
+                authorized_operations_by_language,
+            },
+        )
+        .unwrap_err();
+        assert!(rebuilt_error.to_string().contains("exceeds its bound"));
     }
 
     #[test]

@@ -280,6 +280,8 @@ pub(crate) fn purge_existing_scoped_lsp_output(
         directly_impacted_lsp_node_ids.contains(&edge.from.to_stable_id())
             || directly_impacted_lsp_node_ids.contains(&edge.to.to_stable_id())
             || is_scoped_lsp_edge(edge, node_filter)
+            || (edge.source == crate::graph::ExtractionSource::Lsp
+                && (file_filter.contains(&edge.from.file) || file_filter.contains(&edge.to.file)))
     };
     let impacted_lsp_node_ids = edges
         .iter()
@@ -4132,6 +4134,39 @@ mod tests {
                 .iter()
                 .any(|node| node.stable_id() == shared.stable_id())
         );
+    }
+
+    #[test]
+    fn incremental_scope_purges_lsp_edges_for_executed_files_with_parser_endpoints() {
+        let test_endpoint =
+            make_node_in_file("tests/test_changed.py", "test_changed", NodeKind::Function);
+        let source_endpoint = make_node_in_file("src/changed.py", "changed", NodeKind::Function);
+        let unrelated_source =
+            make_node_in_file("src/unchanged.py", "unchanged", NodeKind::Function);
+        let edge = |from: &Node, to: &Node| Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let stale_executed_edge = edge(&test_endpoint, &source_endpoint);
+        let retained_unrelated_edge = edge(&unrelated_source, &source_endpoint);
+        let mut nodes = vec![test_endpoint, source_endpoint, unrelated_source];
+        let mut edges = vec![stale_executed_edge.clone(), retained_unrelated_edge.clone()];
+
+        let removed = purge_existing_scoped_lsp_output(
+            &mut nodes,
+            &mut edges,
+            &HashSet::new(),
+            &HashSet::from([PathBuf::from("tests/test_changed.py")]),
+        );
+
+        assert_eq!(removed, vec![stale_executed_edge.stable_id()]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].stable_id(), retained_unrelated_edge.stable_id());
+        assert_eq!(nodes.len(), 3, "parser-owned endpoints must be retained");
     }
 
     #[tokio::test]
