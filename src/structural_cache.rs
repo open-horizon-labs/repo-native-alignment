@@ -388,6 +388,67 @@ pub fn execution_path(repo_root: &Path) -> PathBuf {
     repo_root.join(STRUCTURAL_CACHE_EXECUTION_PATH)
 }
 
+fn verifier_authorized_executed_paths(
+    authorization: &StructuralCacheAuthorization,
+    inherited_by_path: &BTreeMap<String, InheritedFileAuthorization>,
+) -> BTreeSet<PathBuf> {
+    let mut executed = authorization
+        .path_partitions
+        .keys()
+        .filter(|path| !inherited_by_path.contains_key(path.as_str()))
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    executed.extend(
+        authorization
+            .changed_paths
+            .iter()
+            .chain(authorization.added_paths.iter())
+            .chain(authorization.deleted_paths.iter())
+            .chain(authorization.invalidated_paths.iter())
+            .map(PathBuf::from),
+    );
+    for rename in &authorization.renamed_paths {
+        executed.insert(PathBuf::from(&rename[0]));
+        executed.insert(PathBuf::from(&rename[1]));
+    }
+    executed
+}
+
+fn retained_output_touching_executed_path(
+    record: &crate::extract::lsp::work_items::LspWorkItemRecord,
+    root_slug: &str,
+    executed_paths: &BTreeSet<PathBuf>,
+) -> Option<String> {
+    if let Some(node) = record
+        .output_nodes
+        .iter()
+        .find(|node| node.id.root == root_slug && executed_paths.contains(&node.id.file))
+    {
+        return Some(format!(
+            "typed output node {} touches {}",
+            node.stable_id(),
+            node.id.file.display()
+        ));
+    }
+    for edge in &record.output_edges {
+        if edge.from.root == root_slug && executed_paths.contains(&edge.from.file) {
+            return Some(format!(
+                "typed output edge {} touches from path {}",
+                edge.stable_id(),
+                edge.from.file.display()
+            ));
+        }
+        if edge.to.root == root_slug && executed_paths.contains(&edge.to.file) {
+            return Some(format!(
+                "typed output edge {} touches to path {}",
+                edge.stable_id(),
+                edge.to.file.display()
+            ));
+        }
+    }
+    None
+}
+
 pub fn load_verified_authorization(
     repo_root: &Path,
 ) -> Result<Option<VerifiedStructuralCacheAuthorization>> {
@@ -686,6 +747,21 @@ pub fn load_verified_authorization(
     if completed_records.keys().cloned().collect::<BTreeSet<_>>() != authorized_current_producers {
         bail!("structural cache work ledger contains unauthenticated producer records");
     }
+    let planned_executed_paths =
+        verifier_authorized_executed_paths(&authorization, &inherited_by_path);
+    for (producer_id, record) in completed_records.iter().filter(|(_, record)| {
+        inherited_by_path.contains_key(&record.file) && !executed_paths.contains(&record.file)
+    }) {
+        if let Some(detail) = retained_output_touching_executed_path(
+            record,
+            &authorization.root_slug,
+            &planned_executed_paths,
+        ) {
+            bail!(
+                "retained structural-cache producer {producer_id} crosses the signed execution path set: {detail}"
+            );
+        }
+    }
     Ok(Some(VerifiedStructuralCacheAuthorization {
         authorization,
         inherited_by_path,
@@ -739,41 +815,7 @@ pub fn plan_incremental_impact(
         }
     }
 
-    // Impact propagation is deliberately one hop from the verifier-authorized
-    // direct seeds. Walking the graph transitively turns shared framework and
-    // external-library hubs into a repository-wide connected component. Only
-    // the target inventory may be added to the execution set; deleted and old
-    // rename paths remain seeds so their direct surviving neighbors are still
-    // refreshed.
     let root_slug = authorization.authorization.root_slug.as_str();
-    let mut closure_edge_count = 0usize;
-    for edge in old_edges {
-        if edge.source != crate::graph::ExtractionSource::Lsp
-            || !is_impact_edge(&edge.kind)
-            || edge.from.file == edge.to.file
-            || edge.from.file.as_os_str().is_empty()
-            || edge.to.file.as_os_str().is_empty()
-        {
-            continue;
-        }
-        let from_is_seed = edge.from.root == root_slug && direct_seeds.contains(&edge.from.file);
-        let to_is_seed = edge.to.root == root_slug && direct_seeds.contains(&edge.to.file);
-        let from_is_target = edge.from.root == root_slug && target_paths.contains(&edge.from.file);
-        let to_is_target = edge.to.root == root_slug && target_paths.contains(&edge.to.file);
-        let directly_impacts_target =
-            (from_is_seed && to_is_target) || (to_is_seed && from_is_target);
-        if !directly_impacts_target {
-            continue;
-        }
-        closure_edge_count += 1;
-        if from_is_seed && to_is_target {
-            executed.insert(edge.to.file.clone());
-        }
-        if to_is_seed && from_is_target {
-            executed.insert(edge.from.file.clone());
-        }
-    }
-
     let limit = MAX_IMPACT_FILES.min(
         target_paths
             .len()
@@ -783,63 +825,80 @@ pub fn plan_incremental_impact(
             .max(1),
     );
     let mut escalated = BTreeSet::new();
-    // Ordinary source additions, renames, and declaration changes stay within
-    // the direct bidirectional graph impact neighborhood above. Partition
-    // identities already fail closed for configuration, dependency, toolchain,
-    // inventory, schema, and scan-policy changes; only the safety bounds may
-    // promote an otherwise compatible source update to a partition rebuild.
-    if executed.len() > limit {
-        for path in &executed {
-            if let Some(language) = authorization
-                .authorization
-                .path_partitions
-                .get(path.to_string_lossy().as_ref())
-            {
-                escalated.insert(language.clone());
-            }
-        }
-        for node in old_nodes.iter().chain(new_nodes.iter()) {
-            if node.id.root == root_slug && executed.contains(&node.id.file) {
-                escalated.insert(node.language.clone());
-            }
-        }
-        for (path, language) in &authorization.authorization.path_partitions {
-            if escalated.contains(language) {
-                executed.insert(PathBuf::from(path));
-            }
-        }
-    }
+    let mut closure_edge_ids = BTreeSet::new();
 
-    // The graph closure is bounded by files, while actual LSP cost is bounded
-    // by descriptor-owned node operations. Every planned node contributes at
-    // least one operation, so the operation ceiling also bounds the number of
-    // executable nodes. Escalate every affected language partition only when
-    // that cost ceiling is exceeded; the ordinary changed-file executor owns
-    // its separate node ceiling outside this verifier-authorized cache path.
-    let mut planned_node_ids = BTreeSet::new();
-    let mut planned_operation_count = 0usize;
-    let mut planned_languages = BTreeSet::new();
-    for node in new_nodes {
-        if node.id.root != authorization.authorization.root_slug
-            || node.id.file.as_os_str().is_empty()
-            || !target_paths.contains(&node.id.file)
-            || !executed.contains(&node.id.file)
-        {
-            continue;
+    // The verifier independently signs this same fixed-point path set. Propagate
+    // only persisted LSP impact relations whose endpoints are expressible as
+    // target-inventory paths in this root. External and pathless hubs therefore
+    // cannot turn a local update into an unbounded repository traversal.
+    //
+    // Bounds retain their existing partition-escalation semantics. Escalation
+    // itself may expose a crossing carried edge, so closure and both bounds are
+    // recomputed until neither the execution set nor the escalated partitions
+    // can grow further.
+    loop {
+        let executed_before = executed.len();
+        let escalated_before = escalated.len();
+
+        expand_persisted_lsp_impact_closure(
+            root_slug,
+            &target_paths,
+            old_edges,
+            &mut executed,
+            &mut closure_edge_ids,
+        );
+
+        if executed.len() > limit {
+            for path in &executed {
+                if let Some(language) = authorization
+                    .authorization
+                    .path_partitions
+                    .get(path.to_string_lossy().as_ref())
+                {
+                    escalated.insert(language.clone());
+                }
+            }
+            for node in old_nodes.iter().chain(new_nodes.iter()) {
+                if node.id.root == root_slug && executed.contains(&node.id.file) {
+                    escalated.insert(node.language.clone());
+                }
+            }
         }
-        let operations = planned_operations_for_node(node);
-        if operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
-            continue;
+
+        // The graph closure is bounded by files, while actual LSP cost is
+        // bounded by descriptor-owned node operations. Every planned node
+        // contributes at least one operation, so this also bounds executable
+        // nodes without reintroducing the ordinary changed-file node ceiling.
+        let mut planned_node_ids = BTreeSet::new();
+        let mut planned_operation_count = 0usize;
+        let mut planned_languages = BTreeSet::new();
+        for node in new_nodes {
+            if node.id.root != root_slug
+                || node.id.file.as_os_str().is_empty()
+                || !target_paths.contains(&node.id.file)
+                || !executed.contains(&node.id.file)
+            {
+                continue;
+            }
+            let operations = planned_operations_for_node(node);
+            if operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
+                continue;
+            }
+            planned_operation_count = planned_operation_count.saturating_add(operations.len());
+            planned_languages.insert(node.language.clone());
         }
-        planned_operation_count = planned_operation_count.saturating_add(operations.len());
-        planned_languages.insert(node.language.clone());
-    }
-    if planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS {
-        escalated.extend(planned_languages);
+        if planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS {
+            escalated.extend(planned_languages);
+        }
+
         for (path, language) in &authorization.authorization.path_partitions {
             if escalated.contains(language) {
                 executed.insert(PathBuf::from(path));
             }
+        }
+
+        if executed.len() == executed_before && escalated.len() == escalated_before {
+            break;
         }
     }
 
@@ -853,7 +912,49 @@ pub fn plan_incremental_impact(
         executed_paths: executed,
         inherited_paths: inherited,
         escalated_partitions: escalated,
-        closure_edge_count,
+        closure_edge_count: closure_edge_ids.len(),
+    }
+}
+
+fn expand_persisted_lsp_impact_closure(
+    root_slug: &str,
+    target_paths: &BTreeSet<PathBuf>,
+    old_edges: &[Edge],
+    executed: &mut BTreeSet<PathBuf>,
+    closure_edge_ids: &mut BTreeSet<String>,
+) {
+    loop {
+        let mut additions = BTreeSet::new();
+        for edge in old_edges {
+            if edge.source != crate::graph::ExtractionSource::Lsp
+                || !is_impact_edge(&edge.kind)
+                || edge.from.file == edge.to.file
+                || edge.from.file.as_os_str().is_empty()
+                || edge.to.file.as_os_str().is_empty()
+            {
+                continue;
+            }
+            let from_is_executed =
+                edge.from.root == root_slug && executed.contains(&edge.from.file);
+            let to_is_executed = edge.to.root == root_slug && executed.contains(&edge.to.file);
+            let from_is_target =
+                edge.from.root == root_slug && target_paths.contains(&edge.from.file);
+            let to_is_target = edge.to.root == root_slug && target_paths.contains(&edge.to.file);
+            if (from_is_executed && to_is_target) || (to_is_executed && from_is_target) {
+                closure_edge_ids.insert(edge.stable_id());
+            }
+            if from_is_executed && to_is_target {
+                additions.insert(edge.to.file.clone());
+            }
+            if to_is_executed && from_is_target {
+                additions.insert(edge.from.file.clone());
+            }
+        }
+        let before = executed.len();
+        executed.extend(additions);
+        if executed.len() == before {
+            break;
+        }
     }
 }
 
@@ -861,26 +962,10 @@ pub fn validate_runtime_plan_handoff(
     authorization: &VerifiedStructuralCacheAuthorization,
     plan: &IncrementalImpactPlan,
 ) -> Result<()> {
-    let mut expected_executed = authorization
-        .authorization
-        .path_partitions
-        .keys()
-        .filter(|path| !authorization.inherited_by_path.contains_key(path.as_str()))
-        .map(PathBuf::from)
-        .collect::<BTreeSet<_>>();
-    expected_executed.extend(
-        authorization
-            .authorization
-            .changed_paths
-            .iter()
-            .chain(authorization.authorization.added_paths.iter())
-            .chain(authorization.authorization.deleted_paths.iter())
-            .map(PathBuf::from),
+    let expected_executed = verifier_authorized_executed_paths(
+        &authorization.authorization,
+        &authorization.inherited_by_path,
     );
-    for rename in &authorization.authorization.renamed_paths {
-        expected_executed.insert(PathBuf::from(&rename[0]));
-        expected_executed.insert(PathBuf::from(&rename[1]));
-    }
 
     if plan.executed_paths != expected_executed {
         let first_unexpected = plan
@@ -1481,8 +1566,17 @@ mod tests {
         invalidated_partitions: &[&str],
         invalidated_paths: &[&str],
     ) -> VerifiedStructuralCacheAuthorization {
+        let invalidated_path_set = invalidated_paths.iter().copied().collect::<BTreeSet<_>>();
+        let invalidated_partition_set = invalidated_partitions
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let inherited_files = inherited
             .iter()
+            .filter(|(path, language)| {
+                !invalidated_path_set.contains(path)
+                    && !invalidated_partition_set.contains(language)
+            })
             .map(|(path, language)| InheritedFileAuthorization {
                 path: (*path).to_string(),
                 blob: "a".repeat(40),
@@ -1833,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_python_file_reprocesses_only_direct_cross_file_neighborhood() {
+    fn changed_python_file_reprocesses_transitive_cross_file_closure() {
         let nodes = [
             node("src/a.py", "python"),
             node("src/b.py", "python"),
@@ -1860,38 +1954,90 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
+            &["src/b.py", "src/c.py"],
         );
 
         let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
 
         assert_eq!(
             plan.executed_paths,
-            ["src/a.py", "src/b.py"]
+            ["src/a.py", "src/b.py", "src/c.py"]
                 .into_iter()
                 .map(PathBuf::from)
                 .collect()
         );
-        assert!(plan.inherited_paths.contains(Path::new("src/c.py")));
         assert!(plan.inherited_paths.contains(Path::new("src/d.py")));
         assert!(!plan.escalated_partitions.contains("python"));
+        assert_eq!(plan.closure_edge_count, 2);
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
     }
 
     #[test]
-    fn runtime_plan_handoff_accepts_exact_precomputed_one_hop_set() {
+    fn reverse_then_forward_edges_reach_the_signed_fixed_point() {
         let nodes = [
             node("src/a.py", "python"),
             node("src/b.py", "python"),
             node("src/c.py", "python"),
             node("src/d.py", "python"),
             node("src/e.py", "python"),
+            node("src/f.py", "python"),
+            node("src/g.py", "python"),
+            node("src/h.py", "python"),
         ];
-        let edges = [edge(&nodes[0], &nodes[1])];
-        let mut authorization = verified_authorization(
+        let edges = [edge(&nodes[1], &nodes[0]), edge(&nodes[1], &nodes[2])];
+        let authorization = verified_authorization(
             &[
+                ("src/b.py", "python"),
                 ("src/c.py", "python"),
                 ("src/d.py", "python"),
                 ("src/e.py", "python"),
+                ("src/f.py", "python"),
+                ("src/g.py", "python"),
+                ("src/h.py", "python"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["src/b.py", "src/c.py"],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            ["src/a.py", "src/b.py", "src/c.py"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert_eq!(plan.closure_edge_count, 2);
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn runtime_plan_handoff_rejects_one_hop_under_authorized_fixed_point() {
+        let nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+            node("src/f.py", "python"),
+            node("src/g.py", "python"),
+            node("src/h.py", "python"),
+        ];
+        let edges = [edge(&nodes[0], &nodes[1]), edge(&nodes[1], &nodes[2])];
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+                ("src/f.py", "python"),
+                ("src/g.py", "python"),
+                ("src/h.py", "python"),
             ],
             &["src/a.py"],
             &[],
@@ -1900,40 +2046,6 @@ mod tests {
             &[],
             &["src/b.py"],
         );
-        authorization
-            .authorization
-            .path_partitions
-            .insert("src/b.py".to_string(), "python".to_string());
-
-        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
-
-        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
-    }
-
-    #[test]
-    fn runtime_plan_handoff_rejects_unplanned_direct_neighbor() {
-        let nodes = [
-            node("src/a.py", "python"),
-            node("src/b.py", "python"),
-            node("src/c.py", "python"),
-            node("src/d.py", "python"),
-            node("src/e.py", "python"),
-        ];
-        let edges = [edge(&nodes[0], &nodes[1])];
-        let authorization = verified_authorization(
-            &[
-                ("src/b.py", "python"),
-                ("src/c.py", "python"),
-                ("src/d.py", "python"),
-                ("src/e.py", "python"),
-            ],
-            &["src/a.py"],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-        );
 
         let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
         let error = validate_runtime_plan_handoff(&authorization, &plan).unwrap_err();
@@ -1941,7 +2053,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("expected=1 actual=2 first_unexpected=src/b.py first_missing=-")
+                .contains("expected=2 actual=3 first_unexpected=src/c.py first_missing=-")
         );
     }
 
@@ -2027,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn only_direct_diff_seeds_and_carried_lsp_edges_expand_impact() {
+    fn only_carried_lsp_edges_expand_the_fixed_point() {
         let nodes = [
             node("src/a.py", "python"),
             node("src/b.py", "python"),
@@ -2054,7 +2166,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &["src/b.py"],
+            &["src/b.py", "src/c.py"],
         );
 
         let plan = plan_incremental_impact(
@@ -2067,15 +2179,161 @@ mod tests {
 
         assert_eq!(
             plan.executed_paths,
-            ["src/a.py", "src/b.py"]
+            ["src/a.py", "src/b.py", "src/c.py"]
                 .into_iter()
                 .map(PathBuf::from)
                 .collect()
         );
-        assert!(plan.inherited_paths.contains(Path::new("src/c.py")));
         assert!(plan.inherited_paths.contains(Path::new("src/d.py")));
         assert!(plan.inherited_paths.contains(Path::new("src/e.py")));
-        assert_eq!(plan.closure_edge_count, 1);
+        assert_eq!(plan.closure_edge_count, 2);
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn materialized_lsp_endpoint_with_inventory_path_is_in_fixed_point() {
+        let changed = node("src/a.py", "python");
+        let mut materialized_endpoint = node("src/b.py", "python");
+        materialized_endpoint.id.name = "synthetic::target".to_string();
+        materialized_endpoint.source = ExtractionSource::Lsp;
+        let downstream = node("src/c.py", "python");
+        let remaining = [
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+            node("src/f.py", "python"),
+            node("src/g.py", "python"),
+            node("src/h.py", "python"),
+        ];
+        let mut nodes = vec![changed, materialized_endpoint, downstream];
+        nodes.extend(remaining);
+        let edges = [edge(&nodes[0], &nodes[1]), edge(&nodes[1], &nodes[2])];
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+                ("src/f.py", "python"),
+                ("src/g.py", "python"),
+                ("src/h.py", "python"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["src/b.py", "src/c.py"],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            ["src/a.py", "src/b.py", "src/c.py"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert_eq!(plan.closure_edge_count, 2);
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
+    fn partition_escalation_recloses_crossing_lsp_edges_until_stable() {
+        let nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+            node("src/f.py", "python"),
+            node("src/r.rs", "rust"),
+            node("src/s.rs", "rust"),
+        ];
+        let edges = [
+            edge(&nodes[0], &nodes[1]),
+            edge(&nodes[1], &nodes[2]),
+            edge(&nodes[2], &nodes[3]),
+            edge(&nodes[3], &nodes[4]),
+            edge(&nodes[5], &nodes[6]),
+        ];
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+                ("src/f.py", "python"),
+                ("src/r.rs", "rust"),
+                ("src/s.rs", "rust"),
+            ],
+            &["src/a.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["src/b.py", "src/c.py", "src/d.py", "src/e.py"],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            [
+                "src/a.py", "src/b.py", "src/c.py", "src/d.py", "src/e.py", "src/f.py", "src/r.rs",
+                "src/s.rs",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+        );
+        assert_eq!(
+            plan.escalated_partitions,
+            BTreeSet::from(["python".to_string(), "rust".to_string()])
+        );
+        assert_eq!(plan.closure_edge_count, 5);
+        let error = validate_runtime_plan_handoff(&authorization, &plan).unwrap_err();
+        assert!(error.to_string().contains("first_unexpected=src/f.py"));
+    }
+
+    #[test]
+    fn retained_typed_output_node_cannot_touch_signed_execution_path() {
+        let mut output = node("src/executed.py", "python");
+        output.source = ExtractionSource::Lsp;
+        let record = crate::extract::lsp::work_items::LspWorkItemRecord {
+            file: "src/inherited.py".to_string(),
+            output_nodes: vec![output],
+            ..Default::default()
+        };
+
+        let detail = retained_output_touching_executed_path(
+            &record,
+            "fixture",
+            &BTreeSet::from([PathBuf::from("src/executed.py")]),
+        )
+        .expect("crossing typed node must fail closed");
+
+        assert!(detail.contains("typed output node"));
+        assert!(detail.contains("src/executed.py"));
+    }
+
+    #[test]
+    fn retained_typed_output_edges_cannot_cross_in_either_orientation() {
+        let inherited = node("src/inherited.py", "python");
+        let executed = node("src/executed.py", "python");
+        let executed_paths = BTreeSet::from([PathBuf::from("src/executed.py")]);
+        for crossing in [edge(&inherited, &executed), edge(&executed, &inherited)] {
+            let record = crate::extract::lsp::work_items::LspWorkItemRecord {
+                file: "src/inherited.py".to_string(),
+                output_edges: vec![crossing],
+                ..Default::default()
+            };
+            let detail =
+                retained_output_touching_executed_path(&record, "fixture", &executed_paths)
+                    .expect("crossing typed edge must fail closed");
+            assert!(detail.contains("typed output edge"));
+            assert!(detail.contains("src/executed.py"));
+        }
     }
 
     #[test]

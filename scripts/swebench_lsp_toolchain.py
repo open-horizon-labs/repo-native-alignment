@@ -1624,19 +1624,21 @@ def select_structural_cache(
     }
 
 
-def _direct_lsp_impact_paths(
+def _fixed_point_lsp_impact_paths(
     files: Sequence[Mapping[str, Any]],
     *,
     root_slug: str,
     direct_paths: set[str],
     target_paths: set[str],
 ) -> list[str]:
-    """Return the target-bounded one-hop neighborhood of persisted OLD LSP edges.
+    """Return the target-bounded fixed-point closure of persisted OLD LSP edges.
 
     Result ownership identifies which request produced an edge, not both files
     the persisted edge can invalidate. Resolve the global union of carried LSP
-    result IDs to their two target-inventory endpoints so either endpoint can
-    be a direct diff seed. Impact paths never become transitive seeds.
+    result IDs to their two target-inventory endpoints, then traverse those
+    edges bidirectionally from every direct seed until no target path is added.
+    Endpoints outside ``root_slug`` and paths outside the target inventory can
+    never enter or bridge the closure.
     """
 
     if not direct_paths:
@@ -1691,7 +1693,7 @@ def _direct_lsp_impact_paths(
             ):
                 persisted_edge_ids.add(result_id)
 
-    impacted: set[str] = set()
+    adjacency: dict[str, set[str]] = collections.defaultdict(set)
     for result_id in sorted(persisted_edge_ids):
         markers = [
             candidate
@@ -1705,12 +1707,72 @@ def _direct_lsp_impact_paths(
         endpoints = result_id.split(markers[0])
         from_path = endpoint_path(endpoints[0])
         to_path = endpoint_path(endpoints[1])
-        if from_path in direct_paths and to_path in target_paths:
-            impacted.add(to_path)
-        if to_path in direct_paths and from_path in target_paths:
-            impacted.add(from_path)
+        if from_path is None or to_path is None or from_path == to_path:
+            continue
+        adjacency[from_path].add(to_path)
+        adjacency[to_path].add(from_path)
+
+    impacted: set[str] = set()
+    visited = set(direct_paths)
+    frontier = collections.deque(sorted(direct_paths))
+    while frontier:
+        path = frontier.popleft()
+        for neighbor in sorted(adjacency.get(path, ())):
+            if neighbor not in target_paths or neighbor in visited:
+                continue
+            visited.add(neighbor)
+            impacted.add(neighbor)
+            frontier.append(neighbor)
+
     impacted.difference_update(direct_paths)
     return sorted(impacted)
+
+
+def _bounded_fixed_point_lsp_impact_paths(
+    files: Sequence[Mapping[str, Any]],
+    *,
+    root_slug: str,
+    direct_paths: set[str],
+    path_partitions: Mapping[str, str],
+    base_languages: Mapping[str, str],
+    invalidated_partitions: set[str],
+) -> list[str]:
+    """Return the signed executed-minus-direct plan at graph/partition fixed point."""
+
+    target_paths = set(path_partitions)
+    executed = set(direct_paths)
+    executed.update(
+        path
+        for path, language in path_partitions.items()
+        if language in invalidated_partitions
+    )
+    impact_limit = min(4_096, max(1, len(path_partitions) // 2))
+    while True:
+        previous = set(executed)
+        executed.update(
+            _fixed_point_lsp_impact_paths(
+                files,
+                root_slug=root_slug,
+                direct_paths=executed,
+                target_paths=target_paths,
+            )
+        )
+        if len(executed) > impact_limit:
+            escalated_languages = {
+                language
+                for path in executed
+                for language in (
+                    path_partitions.get(path) or base_languages.get(path),
+                )
+                if isinstance(language, str) and language
+            }
+            executed.update(
+                path
+                for path, language in path_partitions.items()
+                if language in escalated_languages
+            )
+        if executed == previous:
+            return sorted(executed - direct_paths)
 
 
 def inject_structural_cache(
@@ -1876,17 +1938,9 @@ def inject_structural_cache(
         if language in target_identity["partitions"]:
             path_partitions[path] = language
 
-    impact_closure_paths = _direct_lsp_impact_paths(
-        files,
-        root_slug=target_identity["root_slug"],
-        direct_paths=touched,
-        target_paths=set(path_partitions),
-    )
-    touched_for_inheritance = touched | set(impact_closure_paths)
-
     # A cached result without a durable producer cannot be selectively
-    # invalidated. Escalate its whole language partition before authorizing any
-    # inheritance, then rebuild the inherited set once with the final partition set.
+    # invalidated. Establish every lineage-driven partition rebuild before
+    # signing the impact closure so those partitions are closure roots too.
     for file_record in files:
         if not isinstance(file_record, dict):
             raise ToolchainError("base completeness file record is malformed")
@@ -1912,6 +1966,16 @@ def inject_structural_cache(
                     if reason not in invalidation_reasons.setdefault(language, []):
                         invalidation_reasons[language].append(reason)
                     break
+
+    impact_closure_paths = _bounded_fixed_point_lsp_impact_paths(
+        files,
+        root_slug=target_identity["root_slug"],
+        direct_paths=touched,
+        path_partitions=path_partitions,
+        base_languages=base_languages,
+        invalidated_partitions=invalidated,
+    )
+    touched_for_inheritance = touched | set(impact_closure_paths)
 
     inherited_files = []
     inherited_work_count = 0
@@ -2119,7 +2183,7 @@ def inject_structural_cache(
             inherited_work_count + predicted_executed_work_count
         ),
         "predicted_operation_estimated_file_count": estimated_operation_file_count,
-        "impact_closure_basis": "verified_base_persisted_old_lsp_edge_one_hop",
+        "impact_closure_basis": "verified_base_persisted_old_lsp_edge_fixed_point",
         "impact_closure_paths": impact_closure_paths,
         "changed_file_count": diff["distance"],
         "invalidated_partitions": sorted(invalidated),
@@ -2180,7 +2244,7 @@ def build_structural_cache_preflight(
             "estimated_file_count": target_file_count,
         }
         impact_closure_paths: list[str] = []
-        impact_closure_basis = "cold_no_base_persisted_old_lsp_edge"
+        impact_closure_basis = "cold_no_base_persisted_old_lsp_edge_fixed_point"
     else:
         if injection_receipt is None:
             raise ToolchainError("selected cache preflight has no injection receipt")

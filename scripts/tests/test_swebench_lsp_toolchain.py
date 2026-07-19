@@ -1256,7 +1256,123 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 },
             )
 
-    def test_direct_lsp_impact_paths_are_one_hop_and_target_bounded(self) -> None:
+    def test_lineage_invalidated_partition_is_a_fixed_point_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            self.git(source, "init", "--quiet")
+            self.git(source, "config", "user.name", "Fixture")
+            self.git(source, "config", "user.email", "fixture@example.invalid")
+            (source / "src").mkdir()
+            (source / "src/a.py").write_text("VALUE = 1\n")
+            (source / "src/b.rs").write_text("fn b() {}\n")
+            self.git(source, "add", "--all")
+            self.git(source, "commit", "--quiet", "-m", "base")
+            commit = self.git(source, "rev-parse", "HEAD")
+            tree = self.git(source, "rev-parse", "HEAD^{tree}")
+            git_dir = root / "owner__repo.git"
+            subprocess.run(
+                ["git", "clone", "--quiet", "--bare", str(source), str(git_dir)],
+                check=True,
+            )
+
+            checkout, identity = self.structural_cache_fixture(root)
+            cache = checkout / ".oh/.cache"
+            report = TOOLCHAIN.load_json_object(
+                cache / "lsp_completeness.json", "fixture completeness report"
+            )
+            crossing = (
+                "checkout:src/a.py:a:function->calls->"
+                "checkout:src/b.rs:b:function"
+            )
+            python_file = report["files"][0]
+            python_file["expected_result_ids"] = [crossing]
+            python_file["persisted_results"]["provenance"] = [crossing]
+            rust_file = copy.deepcopy(python_file)
+            rust_file["path"] = "src/b.rs"
+            rust_file["language"] = "rust"
+            rust_file["expected_server"] = {
+                "command": "rust-analyzer",
+                "version": "1",
+                "digest": "y",
+            }
+            report["files"].append(rust_file)
+            report["readiness_validation_requests_by_language"]["rust"] = 1
+            TOOLCHAIN.write_canonical_json(cache / "lsp_completeness.json", report)
+
+            work_path = cache / "lsp_pass1_work_items.json"
+            work = TOOLCHAIN.load_json_object(work_path, "fixture work ledger")
+            work["records"]["job:2"] = {
+                "job_id": "job",
+                "item_id": 2,
+                "state": "completed",
+                "file": "src/b.rs",
+                "input_hash": "input-2",
+                "requested_operations": ["callHierarchy/outgoingCalls"],
+                "produced_result_ids": [crossing],
+            }
+            TOOLCHAIN.write_canonical_json(work_path, work)
+
+            rust_partition = copy.deepcopy(identity["partitions"]["python"])
+            rust_partition["language"] = "rust"
+            rust_partition["descriptor_signature"] = "a" * 64
+            rust_partition["influence_patterns"] = ["Cargo.toml"]
+            rust_partition["influence_digest"] = "b" * 64
+            rust_partition["signature"] = "c" * 64
+            identity["partitions"]["rust"] = rust_partition
+            identity["commit"] = commit
+            identity["tree"] = tree
+
+            archive = root / "base.tar.gz"
+            sidecar = root / "base.manifest.json"
+            self.archive_fixture(checkout, identity, archive, sidecar)
+            materialized = root / "materialized"
+            verified = TOOLCHAIN.verify_structural_cache_archive(
+                archive, sidecar, materialize_cache=materialized
+            )
+            selection = {
+                "entry": {
+                    "instance_id": "owner__repo-1",
+                    "attempt_index": 1,
+                    "archive_path": str(archive),
+                    "sidecar_path": str(sidecar),
+                },
+                "verified": verified,
+                "diff": TOOLCHAIN._git_diff_paths(git_dir, commit, commit),
+                "invalidated_partitions": [],
+                "compatible_partitions": ["python", "rust"],
+                "invalidated_partition_reasons": {},
+            }
+            target = root / "target"
+            target.mkdir()
+
+            receipt = TOOLCHAIN.inject_structural_cache(
+                selection,
+                target,
+                identity,
+                git_dir,
+                toolchain_lock_digest="a" * 64,
+                inventory_digest="b" * 64,
+                inventory_file_sha256="c" * 64,
+                verified=verified,
+                materialized_cache=materialized,
+            )
+            authorization = TOOLCHAIN.load_json_object(
+                Path(receipt["authorization_path"]), "target authorization"
+            )
+
+            self.assertEqual(receipt["invalidated_partitions"], ["python"])
+            self.assertEqual(
+                receipt["impact_closure_paths"], ["src/a.py", "src/b.rs"]
+            )
+            self.assertEqual(
+                authorization["invalidated_paths"], ["src/a.py", "src/b.rs"]
+            )
+            self.assertEqual(receipt["inherited_file_count"], 0)
+            self.assertEqual(receipt["predicted_executed_file_count"], 2)
+
+    def test_lsp_impact_paths_reach_bidirectional_fixed_point(self) -> None:
         a_to_b = "checkout:src/a.py:a:function->calls->checkout:src/b.py:b:function"
         b_to_c = "checkout:src/b.py:b:function->calls->checkout:src/c.py:c:function"
         files = [
@@ -1289,13 +1405,119 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         ]
 
         self.assertEqual(
-            TOOLCHAIN._direct_lsp_impact_paths(
+            TOOLCHAIN._fixed_point_lsp_impact_paths(
                 files,
                 root_slug="checkout",
                 direct_paths={"src/a.py"},
                 target_paths={"src/a.py", "src/b.py", "src/c.py", "src/d.py"},
             ),
+            ["src/b.py", "src/c.py"],
+        )
+        self.assertEqual(
+            TOOLCHAIN._fixed_point_lsp_impact_paths(
+                files,
+                root_slug="checkout",
+                direct_paths={"src/c.py"},
+                target_paths={"src/a.py", "src/b.py", "src/c.py", "src/d.py"},
+            ),
+            ["src/a.py", "src/b.py"],
+        )
+
+    def test_lsp_impact_paths_cannot_cross_target_or_root_boundary(self) -> None:
+        a_to_b = "checkout:src/a.py:a:function->calls->checkout:src/b.py:b:function"
+        b_to_c = "checkout:src/b.py:b:function->calls->checkout:src/c.py:c:function"
+        b_to_external = (
+            "checkout:src/b.py:b:function->calls->external:src/d.py:d:function"
+        )
+        other_to_target = (
+            "other-root:src/b.py:b:function->calls->checkout:src/d.py:d:function"
+        )
+        files = [
+            {
+                "path": "src/a.py",
+                "persisted_results": {"provenance": [a_to_b]},
+            },
+            {
+                "path": "src/b.py",
+                "persisted_results": {
+                    "provenance": [a_to_b, b_to_c, b_to_external, other_to_target]
+                },
+            },
+            {
+                "path": "src/c.py",
+                "persisted_results": {"provenance": [b_to_c]},
+            },
+            {
+                "path": "src/d.py",
+                "persisted_results": {"provenance": [other_to_target]},
+            },
+        ]
+
+        self.assertEqual(
+            TOOLCHAIN._fixed_point_lsp_impact_paths(
+                files,
+                root_slug="checkout",
+                direct_paths={"src/a.py"},
+                target_paths={"src/a.py", "src/b.py", "src/d.py"},
+            ),
             ["src/b.py"],
+        )
+
+    def test_bound_partition_expansion_recloses_cross_language_edges(self) -> None:
+        edges = [
+            "checkout:src/a.py:a:function->calls->checkout:src/b.py:b:function",
+            "checkout:src/b.py:b:function->calls->checkout:src/c.py:c:function",
+            "checkout:src/c.py:c:function->calls->checkout:src/d.py:d:function",
+            "checkout:src/x.py:x:function->calls->checkout:src/y.rs:y:function",
+        ]
+        files = [
+            {
+                "path": path,
+                "persisted_results": {
+                    "provenance": [
+                        edge
+                        for edge in edges
+                        if f"checkout:{path}:" in edge
+                    ]
+                },
+            }
+            for path in (
+                "src/a.py",
+                "src/b.py",
+                "src/c.py",
+                "src/d.py",
+                "src/x.py",
+                "src/y.rs",
+                "src/z.rs",
+            )
+        ]
+        path_partitions = {
+            "src/a.py": "python",
+            "src/b.py": "python",
+            "src/c.py": "python",
+            "src/d.py": "python",
+            "src/x.py": "python",
+            "src/y.rs": "rust",
+            "src/z.rs": "rust",
+        }
+
+        self.assertEqual(
+            TOOLCHAIN._bounded_fixed_point_lsp_impact_paths(
+                files,
+                root_slug="checkout",
+                direct_paths={"src/a.py"},
+                path_partitions=path_partitions,
+                base_languages=path_partitions,
+                invalidated_partitions=set(),
+            ),
+            [
+                "src/b.py",
+                "src/c.py",
+                "src/d.py",
+                "src/x.py",
+                "src/y.rs",
+                "src/z.rs",
+            ],
         )
 
     def test_cache_preflight_rejects_unexpected_all_partition_invalidation(self) -> None:
