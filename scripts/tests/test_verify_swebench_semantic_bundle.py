@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
 import stat
 import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import verify_swebench_semantic_bundle as verifier  # noqa: E402
+import swebench_lsp_toolchain as structural  # noqa: E402
 
 
 class SemanticBundleVerifierTests(unittest.TestCase):
@@ -24,6 +25,7 @@ class SemanticBundleVerifierTests(unittest.TestCase):
             try:
                 path.chmod(0o755 if path.is_dir() else 0o644)
             except FileNotFoundError:
+                # A parent removed during cleanup can make a listed child vanish.
                 pass
         import shutil
 
@@ -61,15 +63,77 @@ class SemanticBundleVerifierTests(unittest.TestCase):
         self._write(reranker_root, "model.onnx", b"onnx")
         self._write(reranker_root, "tokenizer.json", b'{"tokenizer":2}')
         self._write(reranker_root, "config.json", b"{}")
-        for name in (
-            "toolchain-lock.json",
-            "inventory.json",
+        runtime_bytes = b"fixture-offline-runtime"
+        runtime_digest = verifier.sha256_bytes(runtime_bytes)
+        runtime_path = "runtimes/fixture/bin/runtime"
+        lock = {
+            "platform": "darwin-arm64",
+            "runtimes": [
+                {
+                    "name": "fixture-runtime",
+                    "artifact": "runtime.bin",
+                    "artifact_sha256": runtime_digest,
+                    "install": {
+                        "kind": "copy",
+                        "destination": runtime_path,
+                        "member": "",
+                    },
+                    "executable": runtime_path,
+                    "executable_sha256": runtime_digest,
+                }
+            ],
+            "servers": [],
+        }
+        inventory = {"fixture": True}
+        lock_path = self._write(
+            lsp_root, "toolchain-lock.json", verifier.canonical_json(lock)
+        )
+        inventory_path = self._write(
+            lsp_root, "inventory.json", verifier.canonical_json(inventory)
+        )
+        self._write(
+            lsp_root,
             "descriptor-inventory.json",
+            verifier.canonical_json({"servers": []}),
+        )
+        provision_receipt = {
+            "schema_version": structural.SCHEMA_VERSION,
+            "offline": True,
+            "platform": lock["platform"],
+            "lock_sha256": verifier.sha256_file(lock_path),
+            "inventory_sha256": verifier.sha256_file(inventory_path),
+            "installed": [
+                {
+                    "name": "fixture-runtime",
+                    "executable": runtime_path,
+                    "sha256": runtime_digest,
+                }
+            ],
+            "launchers": [],
+        }
+        provision_receipt["receipt_digest"] = structural.sha256_bytes(
+            structural.canonical_json(provision_receipt)
+        )
+        self._write(
+            lsp_root,
             "provision-receipt.json",
+            structural.canonical_json(provision_receipt),
+        )
+        self._write(
+            lsp_root,
             "probe-receipt.json",
-        ):
-            self._write(lsp_root, name, f'{{"name":"{name}"}}'.encode())
-        self._write(lsp_root, "artifact-cache.tar.gz", b"lsp-cache")
+            verifier.canonical_json({"fixture": True}),
+        )
+        artifact_source = self.temporary / (
+            f"artifact-source-{len(list(self.temporary.iterdir()))}"
+        )
+        artifact_source.mkdir()
+        (artifact_source / "runtime.bin").write_bytes(runtime_bytes)
+        structural.seal_directory(
+            artifact_source,
+            lsp_root / "artifact-cache.tar.gz",
+            "lsp-artifact-cache",
+        )
         profiler = self._write(bundle, "evidence/apple-system-profiler.json", b'{"chip":"M4"}')
         readiness = self._write(bundle, "evidence/offline-lsp-readiness.json", b'{"ready":true}')
         self._write(bundle, "evidence/offline-full-scan.stdout", b"READY")
@@ -252,10 +316,30 @@ class SemanticBundleVerifierTests(unittest.TestCase):
         )
 
     def test_verifies_and_extracts_exact_runtime_bytes(self) -> None:
-        receipt = self._verify(self._fixture(), "valid")
+        fixture = self._fixture()
+        receipt = self._verify(fixture, "valid")
         self.assertEqual(receipt["schema"], verifier.RECEIPT_SCHEMA)
-        model = self.temporary / "verified-valid/rna-semantic-bundle/components/models/huggingface"
+        bundle = self.temporary / "verified-valid/rna-semantic-bundle"
+        model = bundle / "components/models/huggingface"
         self.assertEqual(stat.S_IMODE(model.stat().st_mode), 0o555)
+        with mock.patch.object(
+            structural, "verify_lock", return_value={"compatible": True}
+        ):
+            identity = structural._materialize_verified_bundle_toolchain(
+                bundle,
+                bundle / "components/lsp/toolchain-lock.json",
+                bundle / "components/lsp/inventory.json",
+                self.temporary / "private-verified-lsp",
+                self.temporary,
+            )
+        toolchain_root = Path(identity["toolchain_root"])
+        self.assertEqual(
+            (toolchain_root / "runtimes/fixture/bin/runtime").read_bytes(),
+            b"fixture-offline-runtime",
+        )
+        self.assertTrue(
+            (toolchain_root / structural.PROVISION_RECEIPT_FILE).is_file()
+        )
 
     def test_rejects_traversal_even_when_archive_digest_is_anchored(self) -> None:
         fixture = self._fixture(hostile_member="../escape")

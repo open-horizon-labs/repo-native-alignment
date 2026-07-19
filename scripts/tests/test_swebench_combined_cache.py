@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 from scripts import swebench_combined_cache as COMBINED
@@ -15,6 +16,63 @@ from scripts import swebench_lsp_toolchain as STRUCTURAL
 
 
 class SwebenchCombinedCacheTests(unittest.TestCase):
+    def test_fresh_reopen_query_probe_set_is_fail_closed_and_archivable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selected = "src/lib.rs:fixture:function"
+
+            def fake_profiled_query(
+                args: list[str],
+                _cwd: Path,
+                _environment: dict[str, str],
+                stdout_path: Path,
+                stderr_path: Path,
+                *,
+                timeout_seconds: float = 300.0,
+            ) -> dict[str, object]:
+                self.assertEqual(timeout_seconds, 300.0)
+                if "--mode" in args:
+                    stdout = f"Graph neighbors of `{selected}`\n1 result(s)\n"
+                elif "--include-body" in args:
+                    stdout = f"`{selected}`\n```rust\nfn fixture() {{}}\n```\n"
+                else:
+                    stdout = (
+                        f"{STRUCTURAL.COMBINED_STRICT_SEARCH_SENTINEL}\n"
+                        f"`{selected}`\n"
+                    )
+                stdout_path.write_text(stdout)
+                stderr_path.write_bytes(b"")
+                return {
+                    "duration_ms": 3,
+                    "ttfe_ms": 1,
+                    "peak_memory_bytes": 1024,
+                    "stdout_file": stdout_path.name,
+                    "stdout_sha256": STRUCTURAL.sha256_file(stdout_path),
+                    "stderr_file": stderr_path.name,
+                    "stderr_sha256": STRUCTURAL.sha256_file(stderr_path),
+                }
+
+            with mock.patch.object(
+                STRUCTURAL,
+                "_run_profiled_query",
+                side_effect=fake_profiled_query,
+            ):
+                result = STRUCTURAL._run_combined_query_probes(
+                    combined=COMBINED,
+                    rna_binary=root / "rna",
+                    checkout=root,
+                    environment={},
+                    evidence_root=root / "query-evidence",
+                    case_identity={
+                        "case_index": 1,
+                        "attempt_index": 1,
+                        "instance_id": "owner__repo-1",
+                    },
+                )
+            verified = COMBINED._validate_query_evidence_root(result["root"])
+            self.assertEqual(verified["evidence_digest"], result["evidence_digest"])
+            self.assertEqual(set(result["probes"]), set(COMBINED.QUERY_PROBE_NAMES))
+
     def test_qualifier_combined_mode_is_explicit_and_projects_structural_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -57,6 +115,11 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
                         "phases": [
                             {"phase": "lsp", "state": "ran", "duration_ms": 75},
                             {
+                                "phase": "persist_graph",
+                                "state": "ran",
+                                "duration_ms": 10,
+                            },
+                            {
                                 "phase": "embeddings",
                                 "state": "ran",
                                 "duration_ms": 40,
@@ -75,6 +138,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
                     "total_ms": 125,
                     "structural_ms": 85,
                     "semantic_ms": 40,
+                    "persistence_ms": 10,
                 },
             )
 
@@ -331,11 +395,102 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
             verified2 = COMBINED.verify_combined_cache_archive(
                 Path(receipt2["archive_path"]), Path(receipt2["sidecar_path"])
             )
+            verified1 = COMBINED.verify_combined_cache_archive(
+                Path(receipt1["archive_path"]), Path(receipt1["sidecar_path"])
+            )
+            STRUCTURAL._require_actual_combined_incremental_lineage(
+                COMBINED, receipt1, verified1, receipt2, verified2
+            )
+            catalog_root = root / "lineage-catalog"
+            catalog_root.mkdir()
+            COMBINED.publish_combined_cache_receipt(catalog_root, receipt1)
+            runtime = COMBINED._project_runtime_manifest(fixture1["runtime_manifest"])
+            STRUCTURAL._require_combined_case2_selection(
+                COMBINED,
+                output_root=catalog_root,
+                first_case_index=1,
+                first_instance={
+                    "instance_id": "owner__repo-1",
+                    "repo": "owner/repo",
+                    "base_commit": commit1,
+                },
+                runtime=runtime,
+                selection=selection,
+            )
+            COMBINED.publish_combined_cache_receipt(catalog_root, receipt2)
+            STRUCTURAL._require_combined_pair_ready(
+                COMBINED,
+                output_root=catalog_root,
+                indexed_instances=[
+                    (
+                        1,
+                        {
+                            "instance_id": "owner__repo-1",
+                            "repo": "owner/repo",
+                            "base_commit": commit1,
+                        },
+                    ),
+                    (
+                        2,
+                        {
+                            "instance_id": "owner__repo-2",
+                            "repo": "owner/repo",
+                            "base_commit": commit2,
+                        },
+                    ),
+                ],
+                runtime=runtime,
+            )
             self.assertEqual(verified2["core"]["base_combined_cache"], base)
             self.assertEqual(
                 verified2["core"]["semantic"]["prior_generation_digest"],
                 fixture1["generation_digest"],
             )
+
+            null_receipt = copy.deepcopy(receipt2)
+            null_verified = copy.deepcopy(verified2)
+            null_receipt["base_combined_cache"] = None
+            null_verified["core"]["base_combined_cache"] = None
+            with self.assertRaisesRegex(STRUCTURAL.ToolchainError, "null case-1"):
+                STRUCTURAL._require_actual_combined_incremental_lineage(
+                    COMBINED,
+                    receipt1,
+                    verified1,
+                    null_receipt,
+                    null_verified,
+                )
+
+            wrong_receipt = copy.deepcopy(receipt2)
+            wrong_verified = copy.deepcopy(verified2)
+            wrong_base = copy.deepcopy(base)
+            wrong_base["archive_sha256"] = "0" * 64
+            wrong_receipt["base_combined_cache"] = wrong_base
+            wrong_verified["core"]["base_combined_cache"] = wrong_base
+            with self.assertRaisesRegex(STRUCTURAL.ToolchainError, "wrong immutable"):
+                STRUCTURAL._require_actual_combined_incremental_lineage(
+                    COMBINED,
+                    receipt1,
+                    verified1,
+                    wrong_receipt,
+                    wrong_verified,
+                )
+
+            cold_verified = copy.deepcopy(verified2)
+            cold_verified["core"]["work"].update(
+                {
+                    "structural_inherited_file_count": 0,
+                    "structural_inherited_operation_count": 0,
+                    "vector_inherited_count": 0,
+                }
+            )
+            with self.assertRaisesRegex(STRUCTURAL.ToolchainError, "cold instead"):
+                STRUCTURAL._require_actual_combined_incremental_lineage(
+                    COMBINED,
+                    receipt1,
+                    verified1,
+                    receipt2,
+                    cold_verified,
+                )
 
     def fixture(
         self,
@@ -698,11 +853,18 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         inherited_vectors: int = 0,
         encoded_vectors: int = 1,
     ) -> dict[str, object]:
+        query_evidence = archive.with_name(f"{archive.name}.query-evidence")
+        self.query_evidence_fixture(
+            query_evidence,
+            case_index=case_index,
+            instance_id=f"owner__repo-{case_index}",
+        )
         return COMBINED.archive_combined_cache(
             fixture["structural_archive"],
             fixture["structural_sidecar"],
             fixture["semantic_root"],
             fixture["runtime_manifest"],
+            query_evidence,
             archive,
             sidecar,
             case_identity={
@@ -725,7 +887,54 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
                 "vector_purged_count": 0,
             },
             timings_ms={field: 1 for field in COMBINED.TIMING_FIELDS},
+            peak_memory_bytes={
+                field: 1 for field in COMBINED.PEAK_MEMORY_FIELDS
+            },
             base_combined_cache=base,
+        )
+
+    @staticmethod
+    def query_evidence_fixture(
+        root: Path, *, case_index: int, instance_id: str
+    ) -> None:
+        root.mkdir()
+        probes: dict[str, dict[str, object]] = {}
+        for name in COMBINED.QUERY_PROBE_NAMES:
+            stdout = root / f"{name}.stdout"
+            stderr = root / f"{name}.stderr"
+            stdout.write_text(f"{name} output\n")
+            stderr.write_bytes(b"")
+            probes[name] = {
+                "duration_ms": 1,
+                "ttfe_ms": 1,
+                "peak_memory_bytes": 1,
+                "stdout_file": stdout.name,
+                "stdout_sha256": STRUCTURAL.sha256_file(stdout),
+                "stderr_file": stderr.name,
+                "stderr_sha256": STRUCTURAL.sha256_file(stderr),
+            }
+        receipt = {
+            "schema_version": COMBINED.QUERY_EVIDENCE_SCHEMA_VERSION,
+            "status": "ready",
+            "case": {
+                "case_index": case_index,
+                "attempt_index": 1,
+                "instance_id": instance_id,
+            },
+            "query": STRUCTURAL.COMBINED_QUERY,
+            "retrieval": {"mode": "hybrid", "fusion": "rrf", "rerank": True},
+            "selected_node_id": "src/lib.rs:fixture:function",
+            "strict_sentinel": STRUCTURAL.COMBINED_STRICT_SEARCH_SENTINEL,
+            "repeat_stable": True,
+            "probes": probes,
+            "peak_memory_bytes": 1,
+            "evidence_digest": "",
+        }
+        receipt["evidence_digest"] = STRUCTURAL.sha256_bytes(
+            STRUCTURAL.canonical_json(receipt)
+        )
+        STRUCTURAL.write_canonical_json(
+            root / COMBINED.QUERY_EVIDENCE_RECEIPT, receipt
         )
 
     @staticmethod

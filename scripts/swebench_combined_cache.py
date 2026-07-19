@@ -13,7 +13,9 @@ import hashlib
 import io
 import json
 import os
+import resource
 import shutil
+import sys
 import tarfile
 import tempfile
 import time
@@ -51,6 +53,18 @@ MAX_TOTAL_BYTES = STRUCTURAL.STRUCTURAL_CACHE_MAX_TOTAL_BYTES * 2
 
 RUNTIME_MANIFEST_MEMBER = "components/runtime/semantic-bundle-manifest.json"
 SEMANTIC_MEMBER_ROOT = "components/semantic/embeddings"
+QUERY_EVIDENCE_SCHEMA_VERSION = 1
+QUERY_EVIDENCE_RECEIPT = "query-probes.json"
+QUERY_EVIDENCE_MEMBER_ROOT = "components/evidence/query-probes"
+QUERY_PROBE_NAMES = (
+    "first_hybrid_rerank",
+    "graph_traversal",
+    "full_body",
+    "minified_body",
+    "repeat_hybrid_1",
+    "repeat_hybrid_2",
+    "warm_hybrid_rerank",
+)
 
 WORK_FIELDS = {
     "structural_inherited_file_count",
@@ -66,11 +80,33 @@ TIMING_FIELDS = {
     "cache_selection_ms",
     "cache_verification_ms",
     "cache_injection_ms",
+    "initialization_ms",
     "structural_update_ms",
     "semantic_update_ms",
+    "persistence_ms",
     "full_readiness_validation_ms",
-    "archive_ms",
+    "query_hybrid_rrf_ms",
+    "query_graph_traversal_ms",
+    "query_full_body_ms",
+    "query_minified_body_ms",
+    "query_repeat_stability_ms",
+    "first_query_ttfe_ms",
+    "first_rerank_ms",
+    "warm_query_ms",
+    "structural_cache_archive_ms",
+    "prepublication_total_ms",
+}
+PEAK_MEMORY_FIELDS = {
+    "initialization_bytes",
+    "scan_update_bytes",
+    "persistence_bytes",
+    "query_rerank_bytes",
+}
+PUBLICATION_METRIC_FIELDS = {
+    "combined_archive_ms",
     "total_ms",
+    "archive_peak_memory_bytes",
+    "total_peak_memory_bytes",
 }
 
 
@@ -194,6 +230,120 @@ def _regular_tree(root: Path, label: str) -> list[dict[str, Any]]:
 
 def _tree_digest(members: Sequence[Mapping[str, Any]]) -> str:
     return STRUCTURAL.sha256_bytes(STRUCTURAL.canonical_json(list(members)))
+
+
+def _peak_memory_bytes() -> int:
+    observed = max(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+    )
+    return int(observed if sys.platform == "darwin" else observed * 1024)
+
+
+def _validate_query_evidence_root(root: Path) -> dict[str, Any]:
+    members = _regular_tree(root, "combined query evidence")
+    by_path = {member["path"]: member for member in members}
+    receipt_member = by_path.get(QUERY_EVIDENCE_RECEIPT)
+    if receipt_member is None:
+        raise ToolchainError("combined query evidence receipt is missing")
+    receipt = _load_canonical_json(
+        root / QUERY_EVIDENCE_RECEIPT,
+        "combined query evidence receipt",
+        semantic=False,
+    )
+    _require_exact_fields(
+        receipt,
+        {
+            "schema_version",
+            "status",
+            "case",
+            "query",
+            "retrieval",
+            "selected_node_id",
+            "strict_sentinel",
+            "repeat_stable",
+            "probes",
+            "peak_memory_bytes",
+            "evidence_digest",
+        },
+        "combined query evidence receipt",
+    )
+    if (
+        receipt["schema_version"] != QUERY_EVIDENCE_SCHEMA_VERSION
+        or receipt["status"] != "ready"
+        or receipt["query"] != STRUCTURAL.COMBINED_QUERY
+        or receipt["retrieval"]
+        != {"mode": "hybrid", "fusion": "rrf", "rerank": True}
+        or receipt["strict_sentinel"] != STRUCTURAL.COMBINED_STRICT_SEARCH_SENTINEL
+        or receipt["repeat_stable"] is not True
+    ):
+        raise ToolchainError("combined query evidence is not strict READY evidence")
+    case = _validate_case_identity(receipt["case"])
+    _require_string(receipt["selected_node_id"], "query evidence selected node")
+    peak_memory = _require_count(
+        receipt["peak_memory_bytes"], "query evidence peak memory"
+    )
+    if peak_memory <= 0:
+        raise ToolchainError("query evidence peak memory must be positive")
+    probes = receipt["probes"]
+    if not isinstance(probes, dict) or set(probes) != set(QUERY_PROBE_NAMES):
+        raise ToolchainError("combined query evidence probe set/order is invalid")
+    observed_peak = 0
+    for name in QUERY_PROBE_NAMES:
+        probe = probes[name]
+        if not isinstance(probe, dict):
+            raise ToolchainError(f"combined query probe is malformed: {name}")
+        _require_exact_fields(
+            probe,
+            {
+                "duration_ms",
+                "ttfe_ms",
+                "peak_memory_bytes",
+                "stdout_file",
+                "stdout_sha256",
+                "stderr_file",
+                "stderr_sha256",
+            },
+            f"combined query probe {name}",
+        )
+        duration = _require_count(probe["duration_ms"], f"{name} duration")
+        ttfe = _require_count(probe["ttfe_ms"], f"{name} TTFE")
+        memory = _require_count(probe["peak_memory_bytes"], f"{name} peak memory")
+        if ttfe > duration or memory <= 0:
+            raise ToolchainError(f"combined query probe timing/memory is invalid: {name}")
+        observed_peak = max(observed_peak, memory)
+        for stream in ("stdout", "stderr"):
+            filename = _normalized_path(
+                probe[f"{stream}_file"], f"{name} {stream} file"
+            )
+            if PurePosixPath(filename).parent != PurePosixPath("."):
+                raise ToolchainError(f"combined query probe output is not flat: {filename}")
+            member = by_path.get(filename)
+            if member is None or member["sha256"] != _require_sha256(
+                probe[f"{stream}_sha256"], f"{name} {stream} digest"
+            ):
+                raise ToolchainError(f"combined query probe output mismatch: {filename}")
+            if stream == "stdout" and member["size_bytes"] <= 0:
+                raise ToolchainError(f"combined query probe stdout is empty: {name}")
+    if observed_peak != peak_memory:
+        raise ToolchainError("combined query evidence peak memory is inconsistent")
+    evidence_digest = _require_sha256(
+        receipt["evidence_digest"], "combined query evidence digest"
+    )
+    digest_payload = dict(receipt)
+    digest_payload["evidence_digest"] = ""
+    if STRUCTURAL.sha256_bytes(STRUCTURAL.canonical_json(digest_payload)) != evidence_digest:
+        raise ToolchainError("combined query evidence self-digest mismatch")
+    return {
+        "schema_version": QUERY_EVIDENCE_SCHEMA_VERSION,
+        "status": "ready",
+        "case": case,
+        "receipt_sha256": receipt_member["sha256"],
+        "evidence_digest": evidence_digest,
+        "tree_digest": _tree_digest(members),
+        "peak_memory_bytes": peak_memory,
+        "members": members,
+    }
 
 
 def _lance_tree_digest(members: Sequence[Mapping[str, Any]]) -> str:
@@ -1169,6 +1319,7 @@ def archive_combined_cache(
     structural_sidecar_path: Path,
     semantic_root: Path,
     runtime_manifest_path: Path,
+    query_evidence_root: Path,
     archive_path: Path,
     sidecar_path: Path,
     *,
@@ -1179,6 +1330,7 @@ def archive_combined_cache(
     scan_flags: Sequence[str],
     work: Mapping[str, Any],
     timings_ms: Mapping[str, Any],
+    peak_memory_bytes: Mapping[str, Any],
     base_combined_cache: Mapping[str, Any] | None,
     expected_structural: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1192,6 +1344,11 @@ def archive_combined_cache(
     flags = _validate_scan_flags(scan_flags)
     validated_work = _validate_counts(work, WORK_FIELDS, "combined cache work")
     validated_timings = _validate_counts(timings_ms, TIMING_FIELDS, "combined cache timings")
+    validated_peak_memory = _validate_counts(
+        peak_memory_bytes, PEAK_MEMORY_FIELDS, "combined cache peak memory"
+    )
+    if any(value <= 0 for value in validated_peak_memory.values()):
+        raise ToolchainError("combined cache peak-memory evidence must be positive")
     base = _validate_base_identity(base_combined_cache)
 
     structural_before = STRUCTURAL.sha256_file(structural_archive_path)
@@ -1201,6 +1358,9 @@ def archive_combined_cache(
     )
     semantic = verify_semantic_cache_root(semantic_root)
     runtime = _project_runtime_manifest(runtime_manifest_path)
+    query_evidence = _validate_query_evidence_root(query_evidence_root)
+    if query_evidence["case"] != case:
+        raise ToolchainError("combined query evidence belongs to a different case")
     _validate_cross_binding(
         repository=repository,
         commit=commit,
@@ -1231,6 +1391,14 @@ def archive_combined_cache(
                 mode=semantic_member["mode"],
             )
         )
+    for evidence_member in query_evidence["members"]:
+        sources.append(
+            _member(
+                f"{QUERY_EVIDENCE_MEMBER_ROOT}/{evidence_member['path']}",
+                query_evidence_root / evidence_member["path"],
+                mode=evidence_member["mode"],
+            )
+        )
     sources.sort(key=lambda pair: pair[0]["path"])
     members = [dict(member) for member, _ in sources]
     if len(members) > MAX_MEMBERS or sum(member["size_bytes"] for member in members) > MAX_TOTAL_BYTES:
@@ -1238,6 +1406,9 @@ def archive_combined_cache(
     if len({member["path"].casefold() for member in members}) != len(members):
         raise ToolchainError("combined cache member paths collide")
     semantic_summary = {key: value for key, value in semantic.items() if key != "members"}
+    query_evidence_summary = {
+        key: value for key, value in query_evidence.items() if key != "members"
+    }
     core = {
         "schema_version": COMBINED_CACHE_SCHEMA_VERSION,
         "status": "ready",
@@ -1254,13 +1425,27 @@ def archive_combined_cache(
         ),
         "semantic": semantic_summary,
         "runtime": runtime,
+        "query_evidence": query_evidence_summary,
         "base_combined_cache": base,
         "work": validated_work,
         "timings_ms": validated_timings,
+        "peak_memory_bytes": validated_peak_memory,
         "members": members,
         "combined_cache_tree_digest": _tree_digest(members),
     }
+    archive_started = time.monotonic()
     _write_combined_archive(sources, core, archive_path)
+    combined_archive_ms = int((time.monotonic() - archive_started) * 1000)
+    archive_peak_memory_bytes = _peak_memory_bytes()
+    publication_metrics = {
+        "combined_archive_ms": combined_archive_ms,
+        "total_ms": validated_timings["prepublication_total_ms"]
+        + combined_archive_ms,
+        "archive_peak_memory_bytes": archive_peak_memory_bytes,
+        "total_peak_memory_bytes": max(
+            archive_peak_memory_bytes, *validated_peak_memory.values()
+        ),
+    }
     sidecar = {
         "schema_version": COMBINED_CACHE_SCHEMA_VERSION,
         "publication_status": "ready",
@@ -1268,6 +1453,7 @@ def archive_combined_cache(
         "archive_size_bytes": archive_path.stat().st_size,
         "archive_sha256": STRUCTURAL.sha256_file(archive_path),
         "core_sha256": STRUCTURAL.sha256_bytes(STRUCTURAL.canonical_json(core)),
+        "publication_metrics": publication_metrics,
         "core": core,
     }
     staged_sidecar = sidecar_path.with_name(f".{sidecar_path.name}.verify-{os.getpid()}")
@@ -1305,9 +1491,14 @@ def archive_combined_cache(
         "semantic_manifest_sha256": semantic["manifest_sha256"],
         "semantic_verification_sha256": semantic["verification_sha256"],
         "runtime_manifest_sha256": runtime["manifest_sha256"],
+        "query_evidence_receipt_sha256": query_evidence["receipt_sha256"],
+        "query_evidence_digest": query_evidence["evidence_digest"],
+        "query_evidence_tree_digest": query_evidence["tree_digest"],
         "base_combined_cache": base,
         "work": validated_work,
         "timings_ms": validated_timings,
+        "peak_memory_bytes": validated_peak_memory,
+        "publication_metrics": publication_metrics,
     }
 
 
@@ -1326,9 +1517,11 @@ def _validate_core(value: Any) -> dict[str, Any]:
         "structural",
         "semantic",
         "runtime",
+        "query_evidence",
         "base_combined_cache",
         "work",
         "timings_ms",
+        "peak_memory_bytes",
         "members",
         "combined_cache_tree_digest",
     }
@@ -1348,11 +1541,18 @@ def _validate_core(value: Any) -> dict[str, Any]:
         raise ToolchainError("combined semantic identity must be an object")
     if not isinstance(value["runtime"], dict):
         raise ToolchainError("combined runtime identity must be an object")
+    if not isinstance(value["query_evidence"], dict):
+        raise ToolchainError("combined query evidence identity must be an object")
     value["base_combined_cache"] = _validate_base_identity(value["base_combined_cache"])
     value["work"] = _validate_counts(value["work"], WORK_FIELDS, "combined cache work")
     value["timings_ms"] = _validate_counts(
         value["timings_ms"], TIMING_FIELDS, "combined cache timings"
     )
+    value["peak_memory_bytes"] = _validate_counts(
+        value["peak_memory_bytes"], PEAK_MEMORY_FIELDS, "combined cache peak memory"
+    )
+    if any(count <= 0 for count in value["peak_memory_bytes"].values()):
+        raise ToolchainError("combined cache peak-memory evidence must be positive")
     members = value["members"]
     if not isinstance(members, list) or not members:
         raise ToolchainError("combined cache core has no members")
@@ -1398,6 +1598,7 @@ def _validate_core(value: Any) -> dict[str, Any]:
         structural_sidecar_member,
         RUNTIME_MANIFEST_MEMBER,
         f"{SEMANTIC_MEMBER_ROOT}/current.json",
+        f"{QUERY_EVIDENCE_MEMBER_ROOT}/{QUERY_EVIDENCE_RECEIPT}",
     ):
         if required not in seen:
             raise ToolchainError(f"combined cache is missing required member: {required}")
@@ -1422,6 +1623,7 @@ def _validate_sidecar(sidecar_path: Path, archive_path: Path) -> tuple[dict[str,
             "archive_size_bytes",
             "archive_sha256",
             "core_sha256",
+            "publication_metrics",
             "core",
         },
         "combined cache sidecar",
@@ -1442,6 +1644,23 @@ def _validate_sidecar(sidecar_path: Path, archive_path: Path) -> tuple[dict[str,
     ):
         raise ToolchainError("combined cache archive digest mismatch")
     core = _validate_core(sidecar["core"])
+    publication_metrics = _validate_counts(
+        sidecar["publication_metrics"],
+        PUBLICATION_METRIC_FIELDS,
+        "combined cache publication metrics",
+    )
+    if (
+        publication_metrics["total_ms"]
+        != core["timings_ms"]["prepublication_total_ms"]
+        + publication_metrics["combined_archive_ms"]
+        or publication_metrics["archive_peak_memory_bytes"] <= 0
+        or publication_metrics["total_peak_memory_bytes"]
+        != max(
+            publication_metrics["archive_peak_memory_bytes"],
+            *core["peak_memory_bytes"].values(),
+        )
+    ):
+        raise ToolchainError("combined cache publication timing/memory is inconsistent")
     if STRUCTURAL.sha256_bytes(STRUCTURAL.canonical_json(core)) != _require_sha256(
         sidecar["core_sha256"], "combined core digest"
     ):
@@ -1582,6 +1801,9 @@ def _verify_components(staging: Path, core: Mapping[str, Any]) -> dict[str, Any]
     )
     semantic = verify_semantic_cache_root(staging / SEMANTIC_MEMBER_ROOT)
     runtime = _project_runtime_manifest(staging / RUNTIME_MANIFEST_MEMBER)
+    query_evidence = _validate_query_evidence_root(
+        staging / QUERY_EVIDENCE_MEMBER_ROOT
+    )
     if _structural_summary(
         structural_verified, archive_member=archive_member, sidecar_member=sidecar_member
     ) != core["structural"]:
@@ -1591,6 +1813,13 @@ def _verify_components(staging: Path, core: Mapping[str, Any]) -> dict[str, Any]
         raise ToolchainError("embedded semantic identity differs from combined core")
     if runtime != core["runtime"]:
         raise ToolchainError("embedded runtime identity differs from combined core")
+    query_evidence_summary = {
+        key: value for key, value in query_evidence.items() if key != "members"
+    }
+    if query_evidence_summary != core["query_evidence"]:
+        raise ToolchainError("embedded query evidence differs from combined core")
+    if query_evidence["case"] != core["case"]:
+        raise ToolchainError("embedded query evidence belongs to another case")
     _validate_cross_binding(
         repository=core["repository"],
         commit=core["commit"],
@@ -1601,7 +1830,12 @@ def _verify_components(staging: Path, core: Mapping[str, Any]) -> dict[str, Any]
         work=core["work"],
         base=core["base_combined_cache"],
     )
-    return {"structural": structural_verified, "semantic": semantic, "runtime": runtime}
+    return {
+        "structural": structural_verified,
+        "semantic": semantic,
+        "runtime": runtime,
+        "query_evidence": query_evidence,
+    }
 
 
 def _compose_cache(staging: Path, destination: Path, core: Mapping[str, Any]) -> None:
@@ -1675,10 +1909,12 @@ def verify_combined_cache_archive(
         "archive_size_bytes": sidecar["archive_size_bytes"],
         "sidecar_sha256": sidecar_before,
         "core_sha256": sidecar["core_sha256"],
+        "publication_metrics": sidecar["publication_metrics"],
         "combined_cache_tree_digest": core["combined_cache_tree_digest"],
         "structural_archive_sha256": components["structural"]["archive_sha256"],
         "structural_core": components["structural"]["core"],
         "semantic_generation_digest": components["semantic"]["generation_digest"],
+        "query_evidence_digest": components["query_evidence"]["evidence_digest"],
     }
 
 
@@ -1718,9 +1954,14 @@ def _validate_receipt(value: Mapping[str, Any], *, verify_bytes: bool) -> dict[s
         "semantic_manifest_sha256",
         "semantic_verification_sha256",
         "runtime_manifest_sha256",
+        "query_evidence_receipt_sha256",
+        "query_evidence_digest",
+        "query_evidence_tree_digest",
         "base_combined_cache",
         "work",
         "timings_ms",
+        "peak_memory_bytes",
+        "publication_metrics",
     }
     _require_exact_fields(value, fields, "combined cache receipt")
     if value["schema_version"] != COMBINED_CACHE_SCHEMA_VERSION or value["status"] != "ready":
@@ -1741,6 +1982,9 @@ def _validate_receipt(value: Mapping[str, Any], *, verify_bytes: bool) -> dict[s
         "semantic_manifest_sha256",
         "semantic_verification_sha256",
         "runtime_manifest_sha256",
+        "query_evidence_receipt_sha256",
+        "query_evidence_digest",
+        "query_evidence_tree_digest",
     ):
         _require_sha256(value[field], f"receipt {field}")
     if type(value["archive_size_bytes"]) is not int or value["archive_size_bytes"] <= 0:
@@ -1748,6 +1992,27 @@ def _validate_receipt(value: Mapping[str, Any], *, verify_bytes: bool) -> dict[s
     value["base_combined_cache"] = _validate_base_identity(value["base_combined_cache"])
     value["work"] = _validate_counts(value["work"], WORK_FIELDS, "receipt work")
     value["timings_ms"] = _validate_counts(value["timings_ms"], TIMING_FIELDS, "receipt timings")
+    value["peak_memory_bytes"] = _validate_counts(
+        value["peak_memory_bytes"], PEAK_MEMORY_FIELDS, "receipt peak memory"
+    )
+    value["publication_metrics"] = _validate_counts(
+        value["publication_metrics"],
+        PUBLICATION_METRIC_FIELDS,
+        "receipt publication metrics",
+    )
+    if (
+        any(count <= 0 for count in value["peak_memory_bytes"].values())
+        or value["publication_metrics"]["archive_peak_memory_bytes"] <= 0
+        or value["publication_metrics"]["total_ms"]
+        != value["timings_ms"]["prepublication_total_ms"]
+        + value["publication_metrics"]["combined_archive_ms"]
+        or value["publication_metrics"]["total_peak_memory_bytes"]
+        != max(
+            value["publication_metrics"]["archive_peak_memory_bytes"],
+            *value["peak_memory_bytes"].values(),
+        )
+    ):
+        raise ToolchainError("receipt timing/peak-memory evidence is inconsistent")
     if verify_bytes:
         if STRUCTURAL.sha256_file(archive_path) != value["archive_sha256"]:
             raise ToolchainError("receipt/archive digest mismatch")
@@ -1762,12 +2027,19 @@ def _validate_receipt(value: Mapping[str, Any], *, verify_bytes: bool) -> dict[s
             "semantic_manifest_sha256": core["semantic"]["manifest_sha256"],
             "semantic_verification_sha256": core["semantic"]["verification_sha256"],
             "runtime_manifest_sha256": core["runtime"]["manifest_sha256"],
+            "query_evidence_receipt_sha256": core["query_evidence"][
+                "receipt_sha256"
+            ],
+            "query_evidence_digest": core["query_evidence"]["evidence_digest"],
+            "query_evidence_tree_digest": core["query_evidence"]["tree_digest"],
             "repository": core["repository"],
             "commit": core["commit"],
             "tree": core["tree"],
             "base_combined_cache": core["base_combined_cache"],
             "work": core["work"],
             "timings_ms": core["timings_ms"],
+            "peak_memory_bytes": core["peak_memory_bytes"],
+            "publication_metrics": verified["publication_metrics"],
         }
         for field, actual in comparisons.items():
             if value[field] != actual:

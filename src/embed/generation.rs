@@ -650,7 +650,7 @@ pub fn vector_sha256(vector: &[f32], expected_dimension: usize) -> Result<String
             vector.len()
         );
     }
-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
         if !value.is_finite() {
             bail!("semantic vector contains a non-finite value");
@@ -868,7 +868,7 @@ pub fn publish_current_generation(
         verification_sha256: sha256_bytes(&verification_bytes),
     };
     let bytes = canonical_json_bytes(&pointer)?;
-    write_atomic_bytes(&current_pointer_path(repo_root), &bytes)
+    write_current_pointer_atomic(&current_pointer_path(repo_root), &bytes)
 }
 
 pub fn write_verification_evidence(
@@ -973,7 +973,7 @@ fn write_canonical_json_value(value: &serde_json::Value, output: &mut String) ->
         serde_json::Value::Object(values) => {
             output.push('{');
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(key, _)| *key);
             for (index, (key, value)) in entries.into_iter().enumerate() {
                 if index > 0 {
                     output.push(',');
@@ -1034,6 +1034,53 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
         fs::rename(&temp, path)?;
         sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_current_pointer_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_current_pointer_atomic_with_sync(path, bytes, |directory| directory.sync_all())
+}
+
+fn write_current_pointer_atomic_with_sync<F>(path: &Path, bytes: &[u8], sync: F) -> Result<()>
+where
+    F: FnOnce(&File) -> std::io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("semantic current pointer path has no parent"))?;
+    fs::create_dir_all(parent)?;
+
+    // Open the directory before the rename so every operation that can prevent
+    // publication fails while the prior pointer is still active.
+    let directory = File::open(parent)?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("semantic-current"),
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+
+        // The rename is the publication commit point. Directory fsync improves
+        // crash durability, but after the rename succeeds there is no reliable
+        // rollback to the prior pointer. Consequently a post-commit fsync error
+        // must not turn a successful pointer change into a reported failure.
+        fs::rename(&temp, path)?;
+        let _ = sync(&directory);
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -1344,6 +1391,22 @@ mod tests {
         };
         assert!(publish_current_generation(root, &digest(8), &digest(9), &verification).is_err());
         assert_eq!(fs::read(pointer_path).unwrap(), b"prior-pointer\n");
+    }
+
+    #[test]
+    fn post_rename_directory_sync_failure_is_committed_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let pointer_path = current_pointer_path(temp.path());
+        fs::create_dir_all(pointer_path.parent().unwrap()).unwrap();
+        fs::write(&pointer_path, b"prior-pointer\n").unwrap();
+
+        let result =
+            write_current_pointer_atomic_with_sync(&pointer_path, b"new-pointer\n", |_| {
+                Err(std::io::Error::other("injected post-rename sync failure"))
+            });
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(pointer_path).unwrap(), b"new-pointer\n");
     }
 
     #[test]

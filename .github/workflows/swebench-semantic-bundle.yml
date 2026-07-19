@@ -13,6 +13,8 @@ on:
       - "scripts/swebench_combined_cache.py"
       - "scripts/tests/test_swebench_combined_cache.py"
       - "scripts/swebench_lsp_toolchain.py"
+      - "scripts/verify_swebench_semantic_bundle.py"
+      - "scripts/tests/test_verify_swebench_semantic_bundle.py"
       - "scripts/lsp/**"
       - "benchmark/swebench-act-context/lsp-toolchain/**"
       - ".github/workflows/swebench-semantic-bundle.yml"

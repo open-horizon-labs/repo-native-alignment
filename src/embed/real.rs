@@ -101,6 +101,21 @@ fn requires_sealed_query_validation(require_metal: bool, _mode: SearchMode) -> b
     require_metal
 }
 
+/// Keep `current.json` as the final commit point for an immutable generation.
+///
+/// The validator closure deliberately runs immediately before publication so
+/// any late asset-integrity failure leaves the previously published pointer
+/// untouched. All asynchronous table/vector/graph reopen checks must already
+/// have completed before this helper is called.
+fn publish_generation_after_final_validation<V, P>(validate: V, publish: P) -> Result<()>
+where
+    V: FnOnce() -> Result<()>,
+    P: FnOnce() -> Result<()>,
+{
+    validate()?;
+    publish()
+}
+
 /// Adaptive batch sizing constants (TCP slow-start style).
 /// Instead of a fixed batch size that may saturate unified memory bandwidth
 /// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
@@ -1981,14 +1996,9 @@ impl EmbeddingIndex {
             "asset_seeding".to_string(),
             generation::semantic_asset_seeding().to_string(),
         );
-        let structural_graph_snapshot_digest = if require_metal
-            && !generation::semantic_asset_seeding()
+        let structural_graph_snapshot_digest = if !generation::semantic_asset_seeding()
+            && let Some(persisted_edges) = persisted_edges
         {
-            let persisted_edges = persisted_edges.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "sealed semantic generation requires freshly reopened persisted nodes and edges"
-                )
-            })?;
             let readiness = crate::lsp_completeness::load_readiness_check_with_graph(
                 repo_root,
                 business_context.mode(),
@@ -1996,11 +2006,11 @@ impl EmbeddingIndex {
                 persisted_edges,
             )
             .context(
-                "sealed semantic generation requires a fresh full-graph LSP completeness report",
+                "authoritative semantic generation requires a fresh full-graph LSP completeness report",
             )?;
             if !readiness.ready {
                 anyhow::bail!(
-                    "sealed semantic generation requires full LSP READY: {}",
+                    "authoritative semantic generation requires full LSP READY: {}",
                     readiness.human_summary()
                 );
             }
@@ -2033,6 +2043,10 @@ impl EmbeddingIndex {
                 );
             }
             readiness.report.graph_snapshot_digest
+        } else if require_metal && !generation::semantic_asset_seeding() {
+            anyhow::bail!(
+                "sealed semantic generation requires freshly reopened persisted nodes and edges"
+            )
         } else {
             contract
                 .as_ref()
@@ -2347,17 +2361,24 @@ impl EmbeddingIndex {
             &current_graph.edges,
             &manifest,
         )?;
-        generation::publish_current_generation(
-            repo_root,
-            &generation_digest,
-            &manifest_sha256,
-            &verification,
+        publish_generation_after_final_validation(
+            || {
+                if require_metal {
+                    // This is the last fallible external-input validation. It
+                    // must finish before current.json can name the generation.
+                    generation::verify_runtime_encoder_assets()?;
+                }
+                Ok(())
+            },
+            || {
+                generation::publish_current_generation(
+                    repo_root,
+                    &generation_digest,
+                    &manifest_sha256,
+                    &verification,
+                )
+            },
         )?;
-        if require_metal {
-            // Publication is the final commit point. Reverify the external
-            // model bytes before exposing the generation through this handle.
-            generation::verify_runtime_encoder_assets()?;
-        }
         self.replace_active_generation(final_db, manifest);
         Ok(encoded_vector_count)
     }
@@ -3226,8 +3247,9 @@ mod tests {
         EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, MaterializedEmbeddingRow,
         SearchFilters, SearchMode, SearchResult, build_artifact_embedding_text,
         build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
-        node_scalar_filters, required_string_column, requires_sealed_query_validation,
-        single_query_embedding, truncate_chars, verify_materialized_rows,
+        node_scalar_filters, publish_generation_after_final_validation, required_string_column,
+        requires_sealed_query_validation, single_query_embedding, truncate_chars,
+        verify_materialized_rows,
     };
 
     #[test]
@@ -3310,6 +3332,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("vector payload mismatch"));
+    }
+
+    #[test]
+    fn failed_final_validation_preserves_the_previous_current_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current = tmp.path().join("current.json");
+        std::fs::write(&current, b"previous-generation").unwrap();
+        let publication_attempted = std::cell::Cell::new(false);
+
+        let error = publish_generation_after_final_validation(
+            || anyhow::bail!("late asset digest mismatch"),
+            || {
+                publication_attempted.set(true);
+                std::fs::write(&current, b"new-generation")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("asset digest mismatch"));
+        assert!(!publication_attempted.get());
+        assert_eq!(std::fs::read(&current).unwrap(), b"previous-generation");
     }
     use std::collections::BTreeMap;
 

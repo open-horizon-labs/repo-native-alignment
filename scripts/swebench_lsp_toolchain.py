@@ -21,7 +21,10 @@ import json
 import math
 import os
 import platform
+import re
+import resource
 import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -92,6 +95,20 @@ COMBINED_QUALIFICATION_SCAN_FLAGS = [
     "--full",
     "--timings",
 ]
+COMBINED_QUERY = "function returns value"
+COMBINED_STRICT_SEARCH_SENTINEL = (
+    "status=READY embeddings=true retrieval=hybrid rerank=true "
+    "metal=true fallback=false"
+)
+COMBINED_QUERY_PROBE_NAMES = (
+    "first_hybrid_rerank",
+    "graph_traversal",
+    "full_body",
+    "minified_body",
+    "repeat_hybrid_1",
+    "repeat_hybrid_2",
+    "warm_hybrid_rerank",
+)
 REPLAY_RECEIPT_FIELDS = {
     "schema_version",
     "diagnostic_only",
@@ -4270,6 +4287,141 @@ def _extract_tar(artifact: Path, destination: Path) -> None:
         archive.extractall(destination, filter="data")
 
 
+def _extract_verified_lsp_artifact_cache(
+    archive_path: Path, destination: Path
+) -> Path:
+    """Extract the CI-bundled artifact cache without trusting tar metadata."""
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise ToolchainError("verified LSP artifact cache must be a regular file")
+    if destination.exists() or destination.is_symlink():
+        raise ToolchainError("verified LSP artifact-cache destination must be absent")
+    archive_sha256 = sha256_file(archive_path)
+    destination.mkdir(parents=True)
+    seen: set[str] = set()
+    seen_casefold: set[str] = set()
+    total_size = 0
+    directory_modes: list[tuple[Path, int]] = []
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if not members or len(members) > STRUCTURAL_CACHE_MAX_MEMBERS:
+                raise ToolchainError("verified LSP artifact cache entry count is invalid")
+            for member in members:
+                name = member.name
+                pure = PurePosixPath(name)
+                if (
+                    "\\" in name
+                    or "\0" in name
+                    or pure.is_absolute()
+                    or not pure.parts
+                    or pure.parts[0] != "lsp-artifact-cache"
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                ):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is unsafe: {name}"
+                    )
+                normalized = pure.as_posix()
+                folded = normalized.casefold()
+                if normalized in seen or folded in seen_casefold:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is duplicated: {name}"
+                    )
+                seen.add(normalized)
+                seen_casefold.add(folded)
+                if not (member.isdir() or member.isfile()):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache contains a link or special file: {name}"
+                    )
+                if getattr(member, "sparse", None):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache contains a sparse member: {name}"
+                    )
+                if member.size < 0 or member.size > STRUCTURAL_CACHE_MAX_MEMBER_BYTES:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member size is invalid: {name}"
+                    )
+                total_size += member.size
+                if total_size > STRUCTURAL_CACHE_MAX_TOTAL_BYTES:
+                    raise ToolchainError("verified LSP artifact cache is oversized")
+
+            for member in members:
+                target = destination.joinpath(*PurePosixPath(member.name).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.isdir():
+                    target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    directory_modes.append((target, 0o755))
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is partial: {member.name}"
+                    )
+                written = 0
+                with target.open("xb") as output:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        output.write(chunk)
+                        written += len(chunk)
+                if written != member.size:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is truncated: {member.name}"
+                    )
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+        for directory, mode in sorted(
+            directory_modes, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            directory.chmod(mode)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    if sha256_file(archive_path) != archive_sha256:
+        raise ToolchainError("verified LSP artifact cache changed during extraction")
+    cache_root = destination / "lsp-artifact-cache"
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise ToolchainError("verified LSP artifact cache root is missing")
+    return cache_root
+
+
+def _materialize_verified_bundle_toolchain(
+    bundle_root: Path,
+    lock_path: Path,
+    inventory_path: Path,
+    private_root: Path,
+    repo_root: Path | None,
+) -> dict[str, Any]:
+    """Offline-provision a private LSP root from the verifier-clean CI bundle."""
+    if private_root.exists() or private_root.is_symlink():
+        raise ToolchainError("private verified LSP materialization root must be absent")
+    private_root.mkdir(parents=True)
+    component_root = bundle_root / "components/lsp"
+    artifact_cache_archive = component_root / "artifact-cache.tar.gz"
+    cache_root = _extract_verified_lsp_artifact_cache(
+        artifact_cache_archive, private_root / "artifact-cache"
+    )
+    toolchain_root = private_root / "provisioned"
+    receipt = provision_toolchain(
+        lock_path,
+        inventory_path,
+        cache_root,
+        toolchain_root,
+        toolchain_root / PROVISION_RECEIPT_FILE,
+        offline=True,
+        repo_root=repo_root,
+    )
+    ci_receipt_path = component_root / "provision-receipt.json"
+    if ci_receipt_path.is_symlink() or not ci_receipt_path.is_file():
+        raise ToolchainError("verified bundle CI provision receipt is missing")
+    if load_json_object(ci_receipt_path, "verified bundle CI provision receipt") != receipt:
+        raise ToolchainError(
+            "private offline provision receipt differs from the CI-qualified toolchain"
+        )
+    identity = _validate_provisioned_toolchain(
+        lock_path, inventory_path, toolchain_root
+    )
+    if identity["provision_receipt_digest"] != receipt["receipt_digest"]:
+        raise ToolchainError("private verified LSP provision identity drifted")
+    return identity
+
+
 def _install_artifact(
     artifact: Path, install: Mapping[str, str], toolchain_root: Path
 ) -> None:
@@ -5505,6 +5657,275 @@ def _run_logged(
             f"command failed ({' '.join(args)}), log={log_path}: {detail[-2000:]}"
         )
     return duration
+
+
+def _peak_memory_bytes() -> int:
+    """Return the largest observed RSS for this qualifier or a completed child."""
+    observed = max(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+    )
+    # Darwin reports bytes; Linux and the other supported Unix CI hosts report KiB.
+    return int(observed if sys.platform == "darwin" else observed * 1024)
+
+
+def _run_profiled_query(
+    args: Sequence[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Run one fresh-process query while measuring first stdout and total time."""
+    if stdout_path.exists() or stderr_path.exists():
+        raise ToolchainError("query probe output paths must be absent")
+    started = time.monotonic()
+    process = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        env=dict(environment),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:  # pragma: no cover
+        raise ToolchainError("query probe pipes were not created")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    streams: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    first_stdout_seconds: float | None = None
+    timed_out = False
+    try:
+        while selector.get_map():
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                # A final read after exit drains any bytes buffered in the pipes.
+                events = [
+                    (key, selectors.EVENT_READ)
+                    for key in list(selector.get_map().values())
+                ]
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                observed = time.monotonic()
+                label = str(key.data)
+                streams[label].extend(chunk)
+                if label == "stdout" and first_stdout_seconds is None:
+                    first_stdout_seconds = observed - started
+        if timed_out:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        else:
+            process.wait()
+    finally:
+        selector.close()
+    duration_seconds = time.monotonic() - started
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.write_bytes(bytes(streams["stdout"]))
+    stderr_path.write_bytes(bytes(streams["stderr"]))
+    if timed_out:
+        raise ToolchainError(
+            f"query probe timed out after {timeout_seconds:.0f}s: {stdout_path.name}"
+        )
+    if process.returncode != 0:
+        detail = bytes(streams["stderr"]).decode(errors="replace").strip()
+        raise ToolchainError(
+            f"query probe failed: {stdout_path.name}: {detail[-2000:]}"
+        )
+    if first_stdout_seconds is None or not streams["stdout"]:
+        raise ToolchainError(f"query probe produced no stdout: {stdout_path.name}")
+    return {
+        "duration_ms": int(duration_seconds * 1000),
+        "ttfe_ms": int(first_stdout_seconds * 1000),
+        "peak_memory_bytes": _peak_memory_bytes(),
+        "stdout_file": stdout_path.name,
+        "stdout_sha256": sha256_file(stdout_path),
+        "stderr_file": stderr_path.name,
+        "stderr_sha256": sha256_file(stderr_path),
+    }
+
+
+def _selected_query_node(stdout: bytes) -> str:
+    text = stdout.decode("utf-8", errors="strict")
+    for match in re.finditer(r"(?m)^\s*`([^`\r\n]+)`\s*$", text):
+        candidate = match.group(1)
+        if (
+            candidate.count(":") >= 2
+            and candidate.rsplit(":", 1)[-1] in {"function", "method"}
+            and not candidate.startswith(("http:", "https:"))
+        ):
+            return candidate
+    raise ToolchainError("strict hybrid query returned no stable node identity")
+
+
+def _run_combined_query_probes(
+    *,
+    combined: Any,
+    rna_binary: Path,
+    checkout: Path,
+    environment: Mapping[str, str],
+    evidence_root: Path,
+    case_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Exercise every benchmark query path against a fresh-reopened READY cache."""
+    if evidence_root.exists() or evidence_root.is_symlink():
+        raise ToolchainError("combined query-evidence root must be absent")
+    evidence_root.mkdir(parents=True)
+    hybrid_command = [
+        str(rna_binary),
+        "--business-context",
+        "disabled",
+        "search",
+        "--repo",
+        str(checkout),
+        "--search-mode",
+        "hybrid",
+        "--rerank",
+        "--limit",
+        "10",
+        "--compact",
+        COMBINED_QUERY,
+    ]
+    probes: dict[str, dict[str, Any]] = {}
+
+    def run(name: str, command: Sequence[str]) -> bytes:
+        stdout_path = evidence_root / f"{name}.stdout"
+        stderr_path = evidence_root / f"{name}.stderr"
+        probes[name] = _run_profiled_query(
+            command,
+            checkout,
+            environment,
+            stdout_path,
+            stderr_path,
+        )
+        return stdout_path.read_bytes()
+
+    first_output = run("first_hybrid_rerank", hybrid_command)
+    first_text = first_output.decode("utf-8", errors="strict")
+    first_stderr = (evidence_root / "first_hybrid_rerank.stderr").read_text(
+        errors="replace"
+    ).lower()
+    if COMBINED_STRICT_SEARCH_SENTINEL not in first_text:
+        raise ToolchainError("strict hybrid/RRF/rerank readiness sentinel is missing")
+    if any(
+        marker in first_stderr
+        for marker in ("falling back", "using cpu", "original order")
+    ):
+        raise ToolchainError("strict hybrid/RRF/rerank query used a forbidden fallback")
+    selected_node_id = _selected_query_node(first_output)
+
+    graph_output = run(
+        "graph_traversal",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--mode",
+            "neighbors",
+            "--direction",
+            "both",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if "0 result(s)" in graph_output or selected_node_id not in graph_output:
+        raise ToolchainError("fresh-reopen graph traversal returned no persisted neighbors")
+
+    full_output = run(
+        "full_body",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--include-body",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if selected_node_id not in full_output or "```" not in full_output:
+        raise ToolchainError("fresh-reopen full-body retrieval returned no persisted body")
+
+    minified_output = run(
+        "minified_body",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--include-body",
+            "--minify-body",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if selected_node_id not in minified_output or "```" not in minified_output:
+        raise ToolchainError("fresh-reopen minified-body retrieval returned no body")
+
+    repeat_1 = run("repeat_hybrid_1", hybrid_command)
+    repeat_2 = run("repeat_hybrid_2", hybrid_command)
+    warm = run("warm_hybrid_rerank", hybrid_command)
+    if repeat_1 != repeat_2 or repeat_2 != warm:
+        raise ToolchainError("fresh-reopen hybrid/RRF/rerank output is not repeat-stable")
+    for name in ("repeat_hybrid_1", "repeat_hybrid_2", "warm_hybrid_rerank"):
+        stdout = (evidence_root / f"{name}.stdout").read_text(errors="strict")
+        stderr = (evidence_root / f"{name}.stderr").read_text(
+            errors="replace"
+        ).lower()
+        if COMBINED_STRICT_SEARCH_SENTINEL not in stdout or any(
+            marker in stderr
+            for marker in ("falling back", "using cpu", "original order")
+        ):
+            raise ToolchainError(f"{name} did not remain strict and fallback-free")
+
+    peak_memory = max(profile["peak_memory_bytes"] for profile in probes.values())
+    receipt = {
+        "schema_version": combined.QUERY_EVIDENCE_SCHEMA_VERSION,
+        "status": "ready",
+        "case": dict(case_identity),
+        "query": COMBINED_QUERY,
+        "retrieval": {"mode": "hybrid", "fusion": "rrf", "rerank": True},
+        "selected_node_id": selected_node_id,
+        "strict_sentinel": COMBINED_STRICT_SEARCH_SENTINEL,
+        "repeat_stable": True,
+        "probes": probes,
+        "peak_memory_bytes": peak_memory,
+        "evidence_digest": "",
+    }
+    receipt["evidence_digest"] = sha256_bytes(canonical_json(receipt))
+    receipt_path = evidence_root / combined.QUERY_EVIDENCE_RECEIPT
+    _publish_canonical_json_exclusive(receipt_path, receipt)
+    return {
+        "root": evidence_root,
+        "receipt_path": receipt_path,
+        "receipt_sha256": sha256_file(receipt_path),
+        "evidence_digest": receipt["evidence_digest"],
+        "probes": probes,
+        "peak_memory_bytes": peak_memory,
+    }
 
 
 def _load_logged_json_object(log_path: Path, label: str) -> dict[str, Any]:
@@ -6890,6 +7311,19 @@ def _scan_phase_timings(checkout: Path) -> dict[str, int | str]:
         raise ToolchainError("combined scan embeddings phase did not run with timing evidence")
     if semantic_ms < 0 or semantic_ms > total_ms:
         raise ToolchainError("combined scan embeddings timing exceeds total scan time")
+    persistence_phases = [
+        phase
+        for phase in phases
+        if isinstance(phase, dict) and phase.get("phase") == "persist_graph"
+    ]
+    if len(persistence_phases) != 1:
+        raise ToolchainError("combined scan must persist one graph-persistence timing phase")
+    persistence_phase = persistence_phases[0]
+    persistence_ms = persistence_phase.get("duration_ms")
+    if persistence_phase.get("state") != "ran" or type(persistence_ms) is not int:
+        raise ToolchainError("combined scan graph-persistence phase did not run")
+    if persistence_ms < 0 or persistence_ms > total_ms:
+        raise ToolchainError("combined scan persistence timing exceeds total scan time")
     return {
         "operation_id": _require_string(
             report.get("operation_id"), "combined scan operation ID"
@@ -6897,6 +7331,7 @@ def _scan_phase_timings(checkout: Path) -> dict[str, int | str]:
         "total_ms": total_ms,
         "structural_ms": total_ms - semantic_ms,
         "semantic_ms": semantic_ms,
+        "persistence_ms": persistence_ms,
     }
 
 
@@ -6968,6 +7403,120 @@ def _require_resumed_combined_cache(
     return validated
 
 
+def _latest_verified_combined_case(
+    combined: Any,
+    *,
+    output_root: Path,
+    case_index: int,
+    instance: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    catalog = combined.load_combined_cache_catalog(output_root)
+    matches = [
+        entry
+        for entry in catalog["entries"]
+        if entry["case"]["case_index"] == case_index
+        and entry["case"]["instance_id"] == instance["instance_id"]
+        and entry["repository"] == instance["repo"]
+        and entry["commit"] == instance["base_commit"]
+    ]
+    if not matches:
+        raise ToolchainError(
+            f"combined qualification case {case_index} has no verifier-clean READY cache"
+        )
+    matches.sort(key=lambda entry: entry["case"]["attempt_index"])
+    receipt = combined._validate_receipt(matches[-1], verify_bytes=True)
+    verified = combined.verify_combined_cache_archive(
+        Path(receipt["archive_path"]),
+        Path(receipt["sidecar_path"]),
+        expected={
+            "repository": instance["repo"],
+            "commit": instance["base_commit"],
+            "scan_flags": COMBINED_QUALIFICATION_SCAN_FLAGS,
+            "runtime": runtime,
+        },
+    )
+    if verified["core"]["case"] != receipt["case"]:
+        raise ToolchainError(
+            f"combined qualification case {case_index} receipt/archive identity mismatch"
+        )
+    return receipt, verified
+
+
+def _require_actual_combined_incremental_lineage(
+    combined: Any,
+    first_receipt: Mapping[str, Any],
+    first_verified: Mapping[str, Any],
+    second_receipt: Mapping[str, Any],
+    second_verified: Mapping[str, Any],
+) -> None:
+    first_core = first_verified["core"]
+    second_core = second_verified["core"]
+    if (
+        first_receipt.get("base_combined_cache") is not None
+        or first_core.get("base_combined_cache") is not None
+    ):
+        raise ToolchainError("combined qualification case 1 must be a cold cache")
+    expected_base = combined.combined_base_identity(first_verified)
+    second_bases = (
+        second_receipt.get("base_combined_cache"),
+        second_core.get("base_combined_cache"),
+    )
+    if any(base is None for base in second_bases):
+        raise ToolchainError(
+            "combined qualification case 2 has null case-1 cache lineage"
+        )
+    if any(base != expected_base for base in second_bases):
+        raise ToolchainError(
+            "combined qualification case 2 names the wrong immutable case-1 cache"
+        )
+    work = second_core["work"]
+    if (
+        work["structural_inherited_file_count"] <= 0
+        or work["structural_inherited_operation_count"] <= 0
+        or work["vector_inherited_count"] <= 0
+    ):
+        raise ToolchainError(
+            "combined qualification case 2 is cold instead of incrementally inherited"
+        )
+
+
+def _require_combined_case2_selection(
+    combined: Any,
+    *,
+    output_root: Path,
+    first_case_index: int,
+    first_instance: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
+) -> None:
+    first_receipt, first_verified = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=first_case_index,
+        instance=first_instance,
+        runtime=runtime,
+    )
+    if (
+        first_receipt["base_combined_cache"] is not None
+        or first_verified["core"]["base_combined_cache"] is not None
+    ):
+        raise ToolchainError("combined qualification case 1 must be a cold cache")
+    if selection is None:
+        raise ToolchainError(
+            "combined qualification case 2 cannot cold-rebuild without case-1 lineage"
+        )
+    expected_base = combined.combined_base_identity(first_verified)
+    if (
+        selection.get("base_combined_cache") != expected_base
+        or combined.combined_base_identity(selection["verified"]) != expected_base
+        or selection["receipt"] != first_receipt
+    ):
+        raise ToolchainError(
+            "combined qualification case 2 selected the wrong immutable case-1 cache"
+        )
+
+
 def _require_combined_pair_ready(
     combined: Any,
     *,
@@ -6977,32 +7526,23 @@ def _require_combined_pair_ready(
 ) -> None:
     if len(indexed_instances) < 2:
         raise ToolchainError("combined qualification has no frozen case-1/case-2 pair")
-    catalog = combined.load_combined_cache_catalog(output_root)
-    for case_index, instance in indexed_instances[:2]:
-        matches = [
-            entry
-            for entry in catalog["entries"]
-            if entry["case"]["case_index"] == case_index
-            and entry["case"]["instance_id"] == instance["instance_id"]
-            and entry["repository"] == instance["repo"]
-            and entry["commit"] == instance["base_commit"]
-        ]
-        if not matches:
-            raise ToolchainError(
-                f"combined qualification cannot pass case 2: case {case_index} is not READY"
-            )
-        matches.sort(key=lambda entry: entry["case"]["attempt_index"])
-        selected = combined._validate_receipt(matches[-1], verify_bytes=True)
-        combined.verify_combined_cache_archive(
-            Path(selected["archive_path"]),
-            Path(selected["sidecar_path"]),
-            expected={
-                "repository": instance["repo"],
-                "commit": instance["base_commit"],
-                "scan_flags": COMBINED_QUALIFICATION_SCAN_FLAGS,
-                "runtime": runtime,
-            },
-        )
+    first_case = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=indexed_instances[0][0],
+        instance=indexed_instances[0][1],
+        runtime=runtime,
+    )
+    second_case = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=indexed_instances[1][0],
+        instance=indexed_instances[1][1],
+        runtime=runtime,
+    )
+    _require_actual_combined_incremental_lineage(
+        combined, *first_case, *second_case
+    )
 
 
 def qualify_population(
@@ -7063,6 +7603,7 @@ def qualify_population(
     combined_bundle_root = None
     combined_bundle_verification_receipt = None
     combined_bundle_verification_directory = None
+    combined_initialization_seconds = 0.0
     combined_options = (
         combined_runtime_manifest,
         combined_bundle_archive,
@@ -7077,6 +7618,7 @@ def qualify_population(
     ):
         raise ToolchainError("all combined CI bundle verification options are required")
     if combined_runtime_manifest is not None:
+        combined_initialization_started = time.monotonic()
         if isolated_micro_qualification or instance_ids:
             raise ToolchainError(
                 "combined qualification must preserve the full frozen population order"
@@ -7115,7 +7657,6 @@ def qualify_population(
             raise ToolchainError(f"combined CI bundle verification failed: {error}") from error
         combined_bundle_root = verified_output / bundle_verifier.ARCHIVE_ROOT
         rna_binary = combined_bundle_root / "repo-native-alignment"
-        toolchain_root = combined_bundle_root / "components/lsp"
         combined_runtime = combined._project_runtime_manifest(
             combined_runtime_manifest
         )
@@ -7127,6 +7668,18 @@ def qualify_population(
             raise ToolchainError(
                 "combined CI bundle LSP lock/inventory differs from frozen qualification inputs"
             )
+        provisioned_identity = _materialize_verified_bundle_toolchain(
+            combined_bundle_root,
+            lock_path,
+            inventory_path,
+            Path(combined_bundle_verification_directory.name)
+            / "private-verified-lsp",
+            repo_root,
+        )
+        toolchain_root = Path(provisioned_identity["toolchain_root"])
+        combined_initialization_seconds = (
+            time.monotonic() - combined_initialization_started
+        )
     if not rna_binary.is_file():
         raise ToolchainError(f"RNA binary is missing: {rna_binary}")
     provisioned_identity = _validate_provisioned_toolchain(
@@ -7329,8 +7882,15 @@ def qualify_population(
                     "semantic_update_ms"
                 ]
                 timing_case["combined_cache_archive_ms"] = combined_receipt[
-                    "timings_ms"
-                ]["archive_ms"]
+                    "publication_metrics"
+                ]["combined_archive_ms"]
+                if index == indexed_instances[1][0]:
+                    _require_combined_pair_ready(
+                        combined,
+                        output_root=output_root,
+                        indexed_instances=indexed_instances,
+                        runtime=combined_runtime,
+                    )
             cohort_cases.append(cohort_case)
             timing_cases.append(timing_case)
             if stop_after_case == index:
@@ -7377,6 +7937,7 @@ def qualify_population(
             )
         attempt_index = _next_case_attempt_index(output_root, instance_id)
         attempt_slug = f"{instance_id}-attempt-{attempt_index:03d}"
+        case_started = time.monotonic()
         git_dir = git_cache_path(git_cache_root, instance["repo"])
         if not git_dir.is_dir():
             raise ToolchainError(f"missing git cache for {instance['repo']}")
@@ -7494,6 +8055,15 @@ def qualify_population(
                         inventory_file_sha256=inventory_file_sha256,
                         diagnostics=selection_diagnostics,
                     )
+                    if index == indexed_instances[1][0]:
+                        _require_combined_case2_selection(
+                            combined,
+                            output_root=output_root,
+                            first_case_index=indexed_instances[0][0],
+                            first_instance=indexed_instances[0][1],
+                            runtime=combined_runtime,
+                            selection=combined_selection,
+                        )
                     selection = (
                         combined_selection["structural_selection"]
                         if combined_selection is not None
@@ -7660,12 +8230,21 @@ def qualify_population(
                 else None
             )
             combined_archive_receipt = None
-            combined_archive_seconds = 0.0
             semantic_summary = None
             combined_work = None
             combined_timings = None
+            combined_peak_memory = None
+            query_evidence = None
+            query_evidence_root = logs_root / f"{attempt_slug}-query-evidence"
+            case_initialization_seconds = (
+                combined_initialization_seconds
+                if combined is not None and index == indexed_instances[0][0]
+                else 0.0
+            )
+            initialization_peak_memory = _peak_memory_bytes()
             try:
-                if not probe_performed:
+                probe_pending = not probe_performed
+                if probe_pending:
                     current_provisioned_identity = _validate_provisioned_toolchain(
                         lock_path, inventory_path, toolchain_root
                     )
@@ -7693,6 +8272,8 @@ def qualify_population(
                         )
                         probe_seconds = time.monotonic() - probe_started
                     probe_performed = True
+                    case_initialization_seconds += probe_seconds
+                initialization_peak_memory = _peak_memory_bytes()
                 if (
                     _validate_provisioned_toolchain(
                         lock_path, inventory_path, toolchain_root
@@ -7718,6 +8299,7 @@ def qualify_population(
                 scan_phase_timings = (
                     _scan_phase_timings(checkout) if combined is not None else None
                 )
+                scan_peak_memory = _peak_memory_bytes()
                 readiness_log_path = logs_root / f"{attempt_slug}-readiness.log"
                 readiness_seconds = _run_logged(
                     [
@@ -7877,6 +8459,18 @@ def qualify_population(
                         "vector_encoded_count": vector_encoded_count,
                         "vector_purged_count": vector_purged_count,
                     }
+                    query_evidence = _run_combined_query_probes(
+                        combined=combined,
+                        rna_binary=rna_binary,
+                        checkout=checkout,
+                        environment=case_environment,
+                        evidence_root=query_evidence_root,
+                        case_identity={
+                            "case_index": index,
+                            "attempt_index": attempt_index,
+                            "instance_id": instance_id,
+                        },
+                    )
                 archive_started = time.monotonic()
                 archive_checkout = checkout
                 if combined is not None:
@@ -7914,31 +8508,78 @@ def qualify_population(
                 )
                 archive_seconds = time.monotonic() - archive_started
                 if combined is not None:
+                    if query_evidence is None:
+                        raise ToolchainError("combined query evidence was not produced")
+                    query_probes = query_evidence["probes"]
+                    prepublication_total_ms = int(
+                        (
+                            time.monotonic()
+                            - case_started
+                            + (
+                                combined_initialization_seconds
+                                if index == indexed_instances[0][0]
+                                else 0.0
+                            )
+                        )
+                        * 1000
+                    )
                     combined_timings = {
                         "cache_selection_ms": int(selection_seconds * 1000),
                         "cache_verification_ms": int(verification_seconds * 1000),
                         "cache_injection_ms": int(injection_seconds * 1000),
+                        "initialization_ms": int(
+                            case_initialization_seconds * 1000
+                        ),
                         "structural_update_ms": scan_phase_timings["structural_ms"],
                         "semantic_update_ms": scan_phase_timings["semantic_ms"],
+                        "persistence_ms": scan_phase_timings["persistence_ms"],
                         "full_readiness_validation_ms": int(
                             readiness_seconds * 1000
                         ),
-                        "archive_ms": int(archive_seconds * 1000),
-                        "total_ms": (
-                            int(selection_seconds * 1000)
-                            + int(verification_seconds * 1000)
-                            + int(injection_seconds * 1000)
-                            + int(scan_seconds * 1000)
-                            + int(readiness_seconds * 1000)
-                            + int(archive_seconds * 1000)
+                        "query_hybrid_rrf_ms": query_probes[
+                            "first_hybrid_rerank"
+                        ]["duration_ms"],
+                        "query_graph_traversal_ms": query_probes[
+                            "graph_traversal"
+                        ]["duration_ms"],
+                        "query_full_body_ms": query_probes["full_body"][
+                            "duration_ms"
+                        ],
+                        "query_minified_body_ms": query_probes["minified_body"][
+                            "duration_ms"
+                        ],
+                        "query_repeat_stability_ms": (
+                            query_probes["repeat_hybrid_1"]["duration_ms"]
+                            + query_probes["repeat_hybrid_2"]["duration_ms"]
                         ),
+                        "first_query_ttfe_ms": query_probes[
+                            "first_hybrid_rerank"
+                        ]["ttfe_ms"],
+                        "first_rerank_ms": query_probes["first_hybrid_rerank"][
+                            "duration_ms"
+                        ],
+                        "warm_query_ms": query_probes["warm_hybrid_rerank"][
+                            "duration_ms"
+                        ],
+                        "structural_cache_archive_ms": int(
+                            archive_seconds * 1000
+                        ),
+                        "prepublication_total_ms": prepublication_total_ms,
                     }
-                    combined_archive_started = time.monotonic()
+                    combined_peak_memory = {
+                        "initialization_bytes": initialization_peak_memory,
+                        "scan_update_bytes": scan_peak_memory,
+                        "persistence_bytes": scan_peak_memory,
+                        "query_rerank_bytes": query_evidence[
+                            "peak_memory_bytes"
+                        ],
+                    }
                     combined_archive_receipt = combined.archive_combined_cache(
                         archive_path,
                         sidecar_path,
                         checkout / ".oh/.cache/embeddings",
                         combined_runtime_manifest,
+                        query_evidence_root,
                         combined_archive_path,
                         combined_sidecar_path,
                         case_identity={
@@ -7952,10 +8593,8 @@ def qualify_population(
                         scan_flags=COMBINED_QUALIFICATION_SCAN_FLAGS,
                         work=combined_work,
                         timings_ms=combined_timings,
+                        peak_memory_bytes=combined_peak_memory,
                         base_combined_cache=base_combined_cache,
-                    )
-                    combined_archive_seconds = (
-                        time.monotonic() - combined_archive_started
                     )
             except Exception as error:
                 _raise_archive_failure(
@@ -7968,10 +8607,17 @@ def qualify_population(
                     archive_path=archive_path,
                     sidecar_path=sidecar_path,
                     additional_artifacts=(
-                        [combined_archive_path, combined_sidecar_path]
-                        if combined_archive_path is not None
-                        and combined_sidecar_path is not None
-                        else []
+                        (
+                            [combined_archive_path, combined_sidecar_path]
+                            if combined_archive_path is not None
+                            and combined_sidecar_path is not None
+                            else []
+                        )
+                        + (
+                            sorted(query_evidence_root.iterdir())
+                            if query_evidence_root.is_dir()
+                            else []
+                        )
                     ),
                 )
             publication_artifacts = [archive_path, sidecar_path]
@@ -7979,6 +8625,8 @@ def qualify_population(
                 publication_artifacts.extend(
                     [combined_archive_path, combined_sidecar_path]
                 )
+            if query_evidence_root.is_dir():
+                publication_artifacts.extend(sorted(query_evidence_root.iterdir()))
             publication_log_path = logs_root / f"{attempt_slug}-publication.log"
             try:
                 report_path = cases_root / f"{attempt_slug}.json"
@@ -8080,16 +8728,70 @@ def qualify_population(
                         "bundle_verification_sha256": sha256_file(
                             combined_bundle_verification_path
                         ),
+                        "query_evidence_path": str(
+                            query_evidence["receipt_path"].resolve()
+                        ),
+                        "query_evidence_sha256": query_evidence[
+                            "receipt_sha256"
+                        ],
+                        "query_evidence_digest": query_evidence[
+                            "evidence_digest"
+                        ],
+                        "query_evidence_tree_digest": combined_archive_receipt[
+                            "query_evidence_tree_digest"
+                        ],
                     }
-                    case_receipt["timings_ms"]["structural_update"] = (
-                        scan_phase_timings["structural_ms"]
+                    case_receipt["timings_ms"].update(
+                        {
+                            "initialization": combined_timings[
+                                "initialization_ms"
+                            ],
+                            "structural_update": combined_timings[
+                                "structural_update_ms"
+                            ],
+                            "semantic_update": combined_timings[
+                                "semantic_update_ms"
+                            ],
+                            "persistence": combined_timings["persistence_ms"],
+                            "query_hybrid_rrf": combined_timings[
+                                "query_hybrid_rrf_ms"
+                            ],
+                            "query_graph_traversal": combined_timings[
+                                "query_graph_traversal_ms"
+                            ],
+                            "query_full_body": combined_timings[
+                                "query_full_body_ms"
+                            ],
+                            "query_minified_body": combined_timings[
+                                "query_minified_body_ms"
+                            ],
+                            "query_repeat_stability": combined_timings[
+                                "query_repeat_stability_ms"
+                            ],
+                            "first_query_ttfe": combined_timings[
+                                "first_query_ttfe_ms"
+                            ],
+                            "first_rerank": combined_timings[
+                                "first_rerank_ms"
+                            ],
+                            "warm_query": combined_timings["warm_query_ms"],
+                            "combined_cache_archive": combined_archive_receipt[
+                                "publication_metrics"
+                            ]["combined_archive_ms"],
+                            "total": combined_archive_receipt[
+                                "publication_metrics"
+                            ]["total_ms"],
+                        }
                     )
-                    case_receipt["timings_ms"]["semantic_update"] = (
-                        scan_phase_timings["semantic_ms"]
-                    )
-                    case_receipt["timings_ms"]["combined_cache_archive"] = int(
-                        combined_archive_seconds * 1000
-                    )
+                    case_receipt["peak_memory_bytes"] = {
+                        **combined_peak_memory,
+                        "archive_bytes": combined_archive_receipt[
+                            "publication_metrics"
+                        ]["archive_peak_memory_bytes"],
+                        "total_bytes": combined_archive_receipt[
+                            "publication_metrics"
+                        ]["total_peak_memory_bytes"],
+                    }
                 case_receipt["receipt_digest"] = sha256_bytes(
                     canonical_json(case_receipt)
                 )
@@ -8124,6 +8826,13 @@ def qualify_population(
                         output_root, combined_archive_receipt
                     )
                     publication_artifacts.append(combined_catalog_path)
+                    if index == indexed_instances[1][0]:
+                        _require_combined_pair_ready(
+                            combined,
+                            output_root=output_root,
+                            indexed_instances=indexed_instances,
+                            runtime=combined_runtime,
+                        )
                 cohort_cases.append(
                     {
                         "instance_id": instance_id,
@@ -8171,9 +8880,27 @@ def qualify_population(
                                 "semantic_update_ms": scan_phase_timings[
                                     "semantic_ms"
                                 ],
-                                "combined_cache_archive_ms": int(
-                                    combined_archive_seconds * 1000
-                                ),
+                                "persistence_ms": scan_phase_timings[
+                                    "persistence_ms"
+                                ],
+                                "first_query_ttfe_ms": combined_timings[
+                                    "first_query_ttfe_ms"
+                                ],
+                                "first_rerank_ms": combined_timings[
+                                    "first_rerank_ms"
+                                ],
+                                "warm_query_ms": combined_timings[
+                                    "warm_query_ms"
+                                ],
+                                "combined_cache_archive_ms": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["combined_archive_ms"],
+                                "total_ms": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["total_ms"],
+                                "peak_memory_bytes": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["total_peak_memory_bytes"],
                                 "semantic_generation_digest": semantic_summary[
                                     "generation_digest"
                                 ],

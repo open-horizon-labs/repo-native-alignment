@@ -179,6 +179,8 @@ repo-native-alignment scan --repo . --full
 Runs the complete release-binary pipeline: scan → extract → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries are degraded until call/reference enrichment completes. Release binaries do not include embedding/reranking support; builds compiled with `--features embeddings` or `--features metal` also run embedding enrichment. Subsequent scans are incremental (~0.1s on no-change runs).
 OperationReport output tells you which capabilities are ready, which query classes are degraded, and which `enrich` command can close any remaining gap.
 
+Embedding-enabled builds publish immutable semantic generations under `.oh/.cache/embeddings/`. Repeat scans and branch switches rebuild target metadata and full-text state from the current graph, reuse vectors only when the node ID, canonical input, model, tokenizer, schema, dimension, and flags still match, re-encode changed or new rows, and purge deleted rows. A new generation becomes current only after a fresh reopen proves exact graph-to-vector coverage; schema mismatches rebuild rather than migrate.
+
 **Why run this before starting the MCP server?** The MCP server pre-warms the graph automatically at startup, but building from scratch can take 10-30s on large repos. Running `scan` first populates `.oh/.cache/lance/` so the server loads the cached graph in seconds.
 
 ### 4. Verify

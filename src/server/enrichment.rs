@@ -201,6 +201,68 @@ fn should_continue_lsp_enrichment(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingReconciliationMode {
+    /// Reconcile the complete freshly reopened graph and require graph-aware
+    /// readiness. This is mandatory for repo scope and sealed generations.
+    AuthoritativePersistedGraph,
+    /// Reconcile a complete immutable generation without imposing the sealed
+    /// full-LSP contract on an ordinary scoped request.
+    OrdinaryImmutableGeneration,
+    /// Preserve the legacy targeted in-place update for an ordinary mutable
+    /// index that predates immutable generations.
+    OrdinaryTargeted,
+}
+
+fn embedding_reconciliation_mode(
+    scope: &EnrichmentScope,
+    active_generation_requires_metal: Option<bool>,
+) -> EmbeddingReconciliationMode {
+    if matches!(scope, EnrichmentScope::Repo)
+        || active_generation_requires_metal.is_some_and(|required| required)
+    {
+        EmbeddingReconciliationMode::AuthoritativePersistedGraph
+    } else if active_generation_requires_metal.is_some() {
+        EmbeddingReconciliationMode::OrdinaryImmutableGeneration
+    } else {
+        EmbeddingReconciliationMode::OrdinaryTargeted
+    }
+}
+
+fn generation_requires_metal(manifest: &crate::embed::generation::GenerationManifest) -> bool {
+    manifest
+        .semantic_identity
+        .flags
+        .get("require_metal")
+        .is_some_and(|value| value == "true")
+}
+
+fn active_generation_execution_policy(
+    manifest: Option<&crate::embed::generation::GenerationManifest>,
+) -> Option<bool> {
+    if option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1") {
+        // A sealed binary remains authoritative even before its first
+        // generation exists; it may never enter the mutable targeted path.
+        Some(true)
+    } else {
+        manifest.map(generation_requires_metal)
+    }
+}
+
+/// Project a post-persistence semantic verification error into both observable
+/// status surfaces. Keeping these transitions together prevents a durable job
+/// from remaining `persisting` while the in-memory capability has failed (or
+/// vice versa).
+fn record_embedding_failure<S, J>(error: &anyhow::Error, set_status_failed: S, mark_job_failed: J)
+where
+    S: FnOnce(&str),
+    J: FnOnce(&str),
+{
+    let detail = format!("{error:#}");
+    set_status_failed(&detail);
+    mark_job_failed(&detail);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LspBudget {
     pub max_duration: Duration,
 }
@@ -3692,6 +3754,18 @@ impl RnaHandler {
         Ok(())
     }
 
+    /// Fail the in-memory capability and its durable job as one transition.
+    fn record_embedding_job_failure(&self, job_id: &str, error: &anyhow::Error) {
+        record_embedding_failure(
+            error,
+            |detail| self.embed_status.set_failed(detail.to_string()),
+            |detail| {
+                self.enrichment_jobs
+                    .mark_failed(&self.repo_root, job_id, detail.to_string())
+            },
+        );
+    }
+
     /// Reconcile the complete semantic index from a freshly reopened persisted graph.
     ///
     /// Embeddings deliberately run after structural persistence. This keeps the
@@ -3726,24 +3800,32 @@ impl RnaHandler {
                     EnrichmentCapability::Embeddings,
                 )
                 .await?;
-                let index = EmbeddingIndex::new(&self.repo_root).await?;
-                if !index.has_table().await? {
-                    anyhow::bail!(
-                        "joined embedding reconciliation completed without a published table"
-                    );
+                let joined_validation = async {
+                    let index = EmbeddingIndex::new(&self.repo_root).await?;
+                    if !index.has_table().await? {
+                        anyhow::bail!(
+                            "joined embedding reconciliation completed without a published table"
+                        );
+                    }
+                    let reopened = load_graph_from_lance(&self.repo_root).await.context(
+                        "failed to fresh-reopen persisted graph after joined embedding reconciliation",
+                    )?;
+                    self.embed_status
+                        .set_complete_from_index_for_persisted_graph(
+                            &index,
+                            &reopened.nodes,
+                            &reopened.edges,
+                            &self.business_context,
+                        )
+                        .await?;
+                    self.embed_index.store(Arc::new(Some(index)));
+                    anyhow::Ok(())
                 }
-                let reopened = load_graph_from_lance(&self.repo_root).await.context(
-                    "failed to fresh-reopen persisted graph after joined embedding reconciliation",
-                )?;
-                self.embed_status
-                    .set_complete_from_index_for_persisted_graph(
-                        &index,
-                        &reopened.nodes,
-                        &reopened.edges,
-                        &self.business_context,
-                    )
-                    .await?;
-                self.embed_index.store(Arc::new(Some(index)));
+                .await;
+                if let Err(error) = joined_validation {
+                    self.record_embedding_job_failure(&existing_job_id, &error);
+                    return Err(error);
+                }
                 return Ok((0, started.elapsed(), existing_job_id));
             }
         };
@@ -3823,14 +3905,19 @@ impl RnaHandler {
                     ready_rows,
                     ready_rows,
                 );
-                self.embed_status
+                if let Err(error) = self
+                    .embed_status
                     .set_complete_from_index_for_persisted_graph(
                         &index,
                         &target_nodes,
                         &target_edges,
                         &self.business_context,
                     )
-                    .await?;
+                    .await
+                {
+                    self.record_embedding_job_failure(&job_id, &error);
+                    return Err(error);
+                }
                 self.embed_index.store(Arc::new(Some(index)));
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
@@ -3848,9 +3935,7 @@ impl RnaHandler {
                 Ok((encoded, started.elapsed(), job_id))
             }
             Err(error) => {
-                self.embed_status.set_failed(format!("{error:#}"));
-                self.enrichment_jobs
-                    .mark_failed(&self.repo_root, &job_id, format!("{error:#}"));
+                self.record_embedding_job_failure(&job_id, &error);
                 Err(error)
             }
         }
@@ -3917,8 +4002,9 @@ impl RnaHandler {
         let authoritative_nodes = if matches!(scope, EnrichmentScope::Repo) {
             persisted_nodes.as_slice()
         } else {
-            // Scoped legacy enrichment retains its existing selection semantics;
-            // strict immutable generations reject the in-place scoped API below.
+            // Scoped legacy enrichment retains its existing selection semantics.
+            // An active immutable generation is detected below and reconciled
+            // from the full persisted graph instead of mutating this subset.
             all_nodes
         };
         let selected_nodes = self.cached_nodes_for_scope(authoritative_nodes, &scope)?;
@@ -3939,25 +4025,50 @@ impl RnaHandler {
                     "Embed: joined active enrichment job {}; waiting for completion",
                     existing_job_id
                 ));
-                self.wait_for_joined_enrichment_job(
-                    &existing_job_id,
-                    EnrichmentCapability::Embeddings,
-                )
-                .await?;
-                let idx = EmbeddingIndex::new(&self.repo_root).await?;
-                if matches!(scope, EnrichmentScope::Repo) {
-                    self.embed_status
-                        .set_complete_from_index_for_persisted_graph(
-                            &idx,
-                            &persisted_nodes,
-                            &persisted_edges,
-                            &self.business_context,
-                        )
-                        .await?;
-                } else {
-                    self.embed_status.set_complete_from_index(&idx)?;
+                let joined_count = self
+                    .wait_for_joined_enrichment_job(
+                        &existing_job_id,
+                        EnrichmentCapability::Embeddings,
+                    )
+                    .await?;
+                let joined_validation = async {
+                    let idx = EmbeddingIndex::new(&self.repo_root).await?;
+                    if !idx.has_table().await? {
+                        anyhow::bail!(
+                            "joined embedding enrichment completed without a published table"
+                        );
+                    }
+                    let active_manifest = idx.active_generation_manifest();
+                    let mode = embedding_reconciliation_mode(
+                        &scope,
+                        active_generation_execution_policy(active_manifest.as_ref()),
+                    );
+                    match mode {
+                        EmbeddingReconciliationMode::AuthoritativePersistedGraph => {
+                            self.embed_status
+                                .set_complete_from_index_for_persisted_graph(
+                                    &idx,
+                                    &persisted_nodes,
+                                    &persisted_edges,
+                                    &self.business_context,
+                                )
+                                .await?;
+                        }
+                        EmbeddingReconciliationMode::OrdinaryImmutableGeneration => {
+                            self.embed_status.set_complete_from_index(&idx)?;
+                        }
+                        EmbeddingReconciliationMode::OrdinaryTargeted => {
+                            self.embed_status.set_complete(joined_count);
+                        }
+                    }
+                    self.embed_index.store(Arc::new(Some(idx)));
+                    anyhow::Ok(())
                 }
-                self.embed_index.store(Arc::new(Some(idx)));
+                .await;
+                if let Err(error) = joined_validation {
+                    self.record_embedding_job_failure(&existing_job_id, &error);
+                    return Err(error);
+                }
                 return Ok(existing_job_id);
             }
         };
@@ -3975,42 +4086,69 @@ impl RnaHandler {
 
         let result = async {
             let idx = EmbeddingIndex::new(&self.repo_root).await?;
-            if !matches!(scope, EnrichmentScope::Repo) && !idx.has_table().await? {
+            let active_manifest = idx.active_generation_manifest();
+            let mode = embedding_reconciliation_mode(
+                &scope,
+                active_generation_execution_policy(active_manifest.as_ref()),
+            );
+            if mode == EmbeddingReconciliationMode::OrdinaryTargeted && !idx.has_table().await? {
                 anyhow::bail!(
                     "embedding table is missing; run `repo-native-alignment enrich --capability embeddings --scope repo --repo {}` before scoped embedding enrichment",
                     self.repo_root.display()
                 );
             }
-            let count = if matches!(scope, EnrichmentScope::Repo) {
-                idx.index_all_with_persisted_graph_and_business_context(
-                    &self.repo_root,
-                    &persisted_nodes,
-                    &persisted_edges,
-                    &self.business_context,
-                )
-                .await?
-            } else {
-                idx.reindex_nodes(&selected_nodes).await?
+            let count = match mode {
+                EmbeddingReconciliationMode::AuthoritativePersistedGraph => {
+                    idx.index_all_with_persisted_graph_and_business_context(
+                        &self.repo_root,
+                        &persisted_nodes,
+                        &persisted_edges,
+                        &self.business_context,
+                    )
+                    .await?
+                }
+                EmbeddingReconciliationMode::OrdinaryImmutableGeneration => {
+                    idx.index_all_with_symbols_and_business_context(
+                        &self.repo_root,
+                        &persisted_nodes,
+                        &self.business_context,
+                    )
+                    .await?
+                }
+                EmbeddingReconciliationMode::OrdinaryTargeted => {
+                    idx.reindex_nodes(&selected_nodes).await?
+                }
             };
-            anyhow::Ok((idx, count))
+            anyhow::Ok((idx, count, mode))
         }
         .await;
 
         match result {
-            Ok((idx, count)) => {
+            Ok((idx, count, mode)) => {
                 self.enrichment_jobs
                     .mark_persisting(&self.repo_root, &job_id, count, count);
-                if matches!(scope, EnrichmentScope::Repo) {
-                    self.embed_status
-                        .set_complete_from_index_for_persisted_graph(
-                            &idx,
-                            &persisted_nodes,
-                            &persisted_edges,
-                            &self.business_context,
-                        )
-                        .await?;
-                } else {
-                    self.embed_status.set_complete_from_index(&idx)?;
+                let readiness = match mode {
+                    EmbeddingReconciliationMode::AuthoritativePersistedGraph => {
+                        self.embed_status
+                            .set_complete_from_index_for_persisted_graph(
+                                &idx,
+                                &persisted_nodes,
+                                &persisted_edges,
+                                &self.business_context,
+                            )
+                            .await
+                    }
+                    EmbeddingReconciliationMode::OrdinaryImmutableGeneration => {
+                        self.embed_status.set_complete_from_index(&idx)
+                    }
+                    EmbeddingReconciliationMode::OrdinaryTargeted => {
+                        self.embed_status.set_complete(count);
+                        Ok(())
+                    }
+                };
+                if let Err(error) = readiness {
+                    self.record_embedding_job_failure(&job_id, &error);
+                    return Err(error);
                 }
                 self.embed_index.store(Arc::new(Some(idx)));
                 self.enrichment_jobs
@@ -4022,9 +4160,7 @@ impl RnaHandler {
                 Ok(job_id)
             }
             Err(e) => {
-                self.embed_status.set_failed(format!("{}", e));
-                self.enrichment_jobs
-                    .mark_failed(&self.repo_root, &job_id, format!("{}", e));
+                self.record_embedding_job_failure(&job_id, &e);
                 Err(e)
             }
         }
@@ -4268,6 +4404,48 @@ mod tests {
                 .unwrap()
                 .saturating_sub(report.started_at),
             duration.as_secs()
+        );
+    }
+
+    #[test]
+    fn post_persistence_embedding_failure_updates_status_and_durable_job() {
+        let status_failure = std::cell::RefCell::new(None);
+        let job_failure = std::cell::RefCell::new(None);
+        let error = anyhow::anyhow!("fresh-reopen graph binding failed");
+
+        record_embedding_failure(
+            &error,
+            |detail| *status_failure.borrow_mut() = Some(detail.to_string()),
+            |detail| *job_failure.borrow_mut() = Some(detail.to_string()),
+        );
+
+        let status_failure = status_failure.into_inner();
+        let job_failure = job_failure.into_inner();
+        assert_eq!(status_failure, job_failure);
+        assert_eq!(
+            job_failure,
+            Some("fresh-reopen graph binding failed".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_embedding_preserves_strict_and_ordinary_immutable_contracts() {
+        let scoped = EnrichmentScope::ChangedFiles;
+        assert_eq!(
+            embedding_reconciliation_mode(&scoped, Some(true)),
+            EmbeddingReconciliationMode::AuthoritativePersistedGraph
+        );
+        assert_eq!(
+            embedding_reconciliation_mode(&scoped, Some(false)),
+            EmbeddingReconciliationMode::OrdinaryImmutableGeneration
+        );
+        assert_eq!(
+            embedding_reconciliation_mode(&scoped, None),
+            EmbeddingReconciliationMode::OrdinaryTargeted
+        );
+        assert_eq!(
+            embedding_reconciliation_mode(&EnrichmentScope::Repo, None),
+            EmbeddingReconciliationMode::AuthoritativePersistedGraph
         );
     }
 
