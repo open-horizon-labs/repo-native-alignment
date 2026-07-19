@@ -429,6 +429,292 @@ fn pass1_work_item_files(work_items: &[LspPass1WorkItem]) -> Vec<PathBuf> {
     files
 }
 
+fn sort_document_symbol_candidates(candidates: &mut [&Node]) {
+    // Persisted LSP document-symbol nodes are valid graph output, but they must
+    // not replace the parser-owned representative that produced that output on
+    // a resumed run. Keep the representative stable across reopen/recovery,
+    // with deterministic LSP fallback for files that have no non-LSP node.
+    candidates.sort_by_key(|node| (node.source == ExtractionSource::Lsp, node.stable_id()));
+}
+
+fn is_document_symbol_transport_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("LSP request textDocument/documentSymbol timed out after")
+    })
+}
+
+struct DocumentSymbolBarrierAttempts<T> {
+    attempts: usize,
+    timeouts: usize,
+    result: Result<T>,
+}
+
+async fn retry_document_symbol_barrier<Request, RequestFuture, Output>(
+    job_deadline: tokio::time::Instant,
+    mut request: Request,
+) -> DocumentSymbolBarrierAttempts<Output>
+where
+    Request: FnMut() -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<Output>>,
+{
+    let mut attempts = 0usize;
+    let mut timeouts = 0usize;
+    loop {
+        if tokio::time::Instant::now() >= job_deadline {
+            return DocumentSymbolBarrierAttempts {
+                attempts,
+                timeouts,
+                result: Err(anyhow::anyhow!(
+                    "LSP Pass 1 documentSymbol barrier reached the enrichment deadline before a request completed"
+                )),
+            };
+        }
+        attempts += 1;
+        match request().await {
+            Ok(output) => {
+                return DocumentSymbolBarrierAttempts {
+                    attempts,
+                    timeouts,
+                    result: Ok(output),
+                };
+            }
+            Err(error)
+                if is_document_symbol_transport_timeout(&error)
+                    && tokio::time::Instant::now() < job_deadline =>
+            {
+                timeouts += 1;
+                tracing::warn!(
+                    attempts,
+                    %error,
+                    "LSP Pass 1 persisted documentSymbol item timed out; retrying before worker launch"
+                );
+            }
+            Err(error) => {
+                timeouts += usize::from(is_document_symbol_transport_timeout(&error));
+                return DocumentSymbolBarrierAttempts {
+                    attempts,
+                    timeouts,
+                    result: Err(error),
+                };
+            }
+        }
+    }
+}
+
+fn take_pass1_document_symbol_barrier_item(
+    work_items: &mut Vec<LspPass1WorkItem>,
+) -> Option<LspPass1WorkItem> {
+    let index = work_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.requested_operations
+                .first()
+                .is_some_and(|operation| *operation == LspQueryOperation::DocumentSymbols)
+        })
+        .map(|(index, item)| {
+            (
+                (item.node.id.file.clone(), item.node.stable_id(), item.id),
+                index,
+            )
+        })
+        .min()
+        .map(|(_, index)| index)?;
+    Some(work_items.remove(index))
+}
+
+async fn execute_pass1_document_symbol_barrier_item(
+    item: &LspPass1WorkItem,
+    transport: &Arc<PipelinedTransport>,
+    root: &Path,
+    language: &str,
+    refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+    did_open: &DidOpenCoordinator,
+    work_item_ledger: &Arc<LspWorkItemLedger>,
+    telemetry: &Arc<LspQueryTelemetry>,
+    job_deadline: tokio::time::Instant,
+) -> Result<Pass1TaskResult> {
+    let rel_path = &item.node.id.file;
+    let file_uri = path_to_uri(&root.join(rel_path)).with_context(|| {
+        format!(
+            "LSP Pass 1 persisted documentSymbol item could not resolve {}",
+            rel_path.display()
+        )
+    })?;
+    let request_uri = file_uri.to_string();
+    let started = Instant::now();
+    anyhow::ensure!(
+        telemetry.register_work_item(
+            item.id,
+            LspQueryOperation::DocumentSymbols,
+            LspDeclarationClass::from_kind(&item.node.id.kind)
+                .unwrap_or(LspDeclarationClass::Other),
+        ),
+        "LSP Pass 1 persisted documentSymbol item could not register before the job deadline"
+    );
+    work_item_ledger
+        .mark_phase(item.id, "sending_did_open")
+        .await?;
+    if let Err(error) = did_open
+        .ensure_open(transport, root, rel_path, &file_uri)
+        .await
+    {
+        let timed_out = error
+            .chain()
+            .any(|cause| cause.to_string().contains("timed out"));
+        let telemetry_recorded =
+            telemetry.record_work_item(item.id, 0, 0, started.elapsed(), 1, usize::from(timed_out));
+        let detail = format!(
+            "persisted documentSymbol startup item could not open {}: {error:#}",
+            rel_path.display()
+        );
+        work_item_ledger.mark_failed(item.id, &detail).await?;
+        work_item_ledger.flush().await?;
+        anyhow::ensure!(
+            telemetry_recorded,
+            "{detail}; telemetry completion was rejected"
+        );
+        anyhow::bail!(detail);
+    }
+    work_item_ledger
+        .mark_phase(item.id, LspQueryOperation::DocumentSymbols.phase())
+        .await?;
+
+    let attempt_result = retry_document_symbol_barrier(job_deadline, || {
+        telemetry.note_requests_started(item.id, 1);
+        let transport = Arc::clone(transport);
+        let request_uri = request_uri.clone();
+        async move {
+            let response = transport
+                .request(
+                    "textDocument/documentSymbol",
+                    serde_json::json!({ "textDocument": { "uri": request_uri.clone() } }),
+                )
+                .await?;
+            normalized_document_symbol_evidence(&response, &request_uri)
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let mut symbols = match attempt_result.result {
+        Ok(symbols) => symbols,
+        Err(error) => {
+            let telemetry_recorded = telemetry.record_work_item(
+                item.id,
+                0,
+                0,
+                elapsed,
+                attempt_result.attempts,
+                attempt_result.timeouts,
+            );
+            let detail = format!(
+                "persisted documentSymbol startup item failed for {} after {} attempt(s): {error:#}",
+                rel_path.display(),
+                attempt_result.attempts,
+            );
+            work_item_ledger.mark_failed(item.id, &detail).await?;
+            work_item_ledger.flush().await?;
+            anyhow::ensure!(
+                telemetry_recorded,
+                "{detail}; telemetry completion was rejected"
+            );
+            anyhow::bail!(detail);
+        }
+    };
+    let observed_result_count = symbols.len();
+    let nodes = materialize_document_symbols(language, &mut symbols, root, |file| {
+        refs_by_file
+            .get(file)
+            .and_then(|nodes| nodes.first())
+            .map(|node| node.id.root.clone())
+    })
+    .with_context(|| {
+        format!(
+            "persisted documentSymbol startup item could not materialize {}",
+            rel_path.display()
+        )
+    });
+    let nodes = match nodes {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            let telemetry_recorded = telemetry.record_work_item(
+                item.id,
+                usize::from(observed_result_count > 0),
+                0,
+                elapsed,
+                attempt_result.timeouts.saturating_add(1),
+                attempt_result.timeouts,
+            );
+            let detail = format!("{error:#}");
+            work_item_ledger.mark_failed(item.id, &detail).await?;
+            work_item_ledger.flush().await?;
+            anyhow::ensure!(
+                telemetry_recorded,
+                "{detail}; telemetry completion was rejected"
+            );
+            anyhow::bail!(detail);
+        }
+    };
+    if nodes.len() != observed_result_count {
+        let telemetry_recorded = telemetry.record_work_item(
+            item.id,
+            usize::from(observed_result_count > 0),
+            0,
+            elapsed,
+            attempt_result.timeouts.saturating_add(1),
+            attempt_result.timeouts,
+        );
+        let detail = format!(
+            "persisted documentSymbol startup item mapped {} response item(s) to {} graph node(s)",
+            observed_result_count,
+            nodes.len(),
+        );
+        work_item_ledger.mark_failed(item.id, &detail).await?;
+        work_item_ledger.flush().await?;
+        anyhow::ensure!(
+            telemetry_recorded,
+            "{detail}; telemetry completion was rejected"
+        );
+        anyhow::bail!(detail);
+    }
+    anyhow::ensure!(
+        telemetry.record_work_item(
+            item.id,
+            usize::from(observed_result_count > 0),
+            0,
+            elapsed,
+            attempt_result.timeouts,
+            attempt_result.timeouts,
+        ),
+        "persisted documentSymbol startup item telemetry completion was rejected"
+    );
+    work_item_ledger
+        .mark_completed_with_output(
+            item.id,
+            &[],
+            &nodes,
+            observed_result_count.try_into().unwrap_or(u64::MAX),
+        )
+        .await?;
+    work_item_ledger.flush().await?;
+    tracing::info!(
+        file = %rel_path.display(),
+        attempts = attempt_result.attempts,
+        timeouts = attempt_result.timeouts,
+        result_count = observed_result_count,
+        elapsed_ms = elapsed.as_millis(),
+        "LSP Pass 1 persisted documentSymbol item completed before worker launch"
+    );
+    Ok(Pass1TaskResult {
+        edges: Vec::new(),
+        new_nodes: nodes,
+        had_error: false,
+        edge_producing: false,
+    })
+}
+
 #[derive(Debug)]
 struct Pass1TaskResult {
     edges: Vec<Edge>,
@@ -559,14 +845,28 @@ where
 
 fn recovery_failure_state(ledger: &LspWorkItemLedger) -> (u32, bool, Option<String>) {
     let exhausted = ledger.exhausted_count();
-    if exhausted == 0 {
+    let unmatched_required = ledger.unmatched_required_count();
+    let failures = exhausted.saturating_add(unmatched_required);
+    if failures == 0 {
         return (0, false, None);
     }
+    let mut details = Vec::new();
+    if exhausted > 0 {
+        details.push(format!(
+            "{exhausted} exhausted the retry budget; inspect list_roots for the failed phase"
+        ));
+    }
+    if unmatched_required > 0 {
+        details.push(format!(
+            "{unmatched_required} required persisted item(s) no longer matched the enrichable node set"
+        ));
+    }
     (
-        exhausted.try_into().unwrap_or(u32::MAX),
+        failures.try_into().unwrap_or(u32::MAX),
         true,
         Some(format!(
-            "{exhausted} LSP work item(s) exhausted the retry budget; inspect list_roots for the failed phase, then retry with narrower scope or fix the language server"
+            "LSP work-item recovery failed closed: {}; retry after correcting the graph/work-item identity or language server",
+            details.join("; ")
         )),
     )
 }
@@ -953,7 +1253,7 @@ impl LspEnricher {
                     .push(*node);
             }
             for mut candidates in document_representatives.into_values() {
-                candidates.sort_by_key(|node| node.stable_id());
+                sort_document_symbol_candidates(&mut candidates);
                 for node in candidates {
                     if self.query_profile.admits(
                         node,
@@ -1090,7 +1390,7 @@ impl LspEnricher {
         let pass1_edge_baseline = result.added_edges.len();
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
-        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        let mut work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
         let edge_producing_total = work_items
             .iter()
             .filter(|item| {
@@ -1134,6 +1434,43 @@ impl LspEnricher {
                 tracing::warn!("LSP Pass 1 pre-open failed: {error}");
             }
         }
+        let mut barrier_attempted = 0u32;
+        if let Some(barrier_item) = take_pass1_document_symbol_barrier_item(&mut work_items) {
+            match execute_pass1_document_symbol_barrier_item(
+                &barrier_item,
+                transport,
+                root,
+                &language,
+                refs_by_file_shared,
+                &did_open,
+                &work_item_ledger,
+                telemetry,
+                job_deadline,
+            )
+            .await
+            {
+                Ok(task_result) => {
+                    barrier_attempted = 1;
+                    extend_unique_edges(
+                        &mut result.added_edges,
+                        &mut seen_edge_ids,
+                        task_result.edges,
+                    );
+                    extend_unique_nodes(
+                        &mut result.new_nodes,
+                        &mut seen_virtual_ids,
+                        task_result.new_nodes,
+                    );
+                }
+                Err(error) => {
+                    let diagnostic = format!(
+                        "LSP Pass 1 aborted before worker launch because the persisted startup documentSymbol item failed: {error:#}"
+                    );
+                    tracing::warn!("{diagnostic}");
+                    return (1, recovery_errors.saturating_add(1), true, Some(diagnostic));
+                }
+            }
+        }
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
@@ -1141,7 +1478,7 @@ impl LspEnricher {
         let refs_by_file = Arc::clone(refs_by_file_shared);
         let endpoint_index = Arc::new(EndpointLookupIndex::build(refs_by_file_shared));
         let worker_telemetry = Arc::clone(telemetry);
-        let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
+        let (worker_total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
             PIPELINE_MAX_CONCURRENCY,
@@ -1195,11 +1532,12 @@ impl LspEnricher {
                 }
             },
         );
+        let total_nodes = worker_total_nodes.saturating_add(barrier_attempted as usize);
 
         // Collect results from all queued work items. A no-progress watchdog emits
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
         // by phase/file instead of waiting for the outer 30-minute job watchdog.
-        let mut attempted = 0u32;
+        let mut attempted = barrier_attempted;
         let mut edge_attempted = 0u32;
         let mut errors = 0u32;
         let mut aborted = false;
@@ -1297,7 +1635,8 @@ impl LspEnricher {
             }
 
             // Log progress every 1,000 nodes or every 30 seconds (whichever comes first)
-            let done = diagnostics.completed.load(Ordering::Relaxed).max(0) as u64;
+            let done = diagnostics.completed.load(Ordering::Relaxed).max(0) as u64
+                + u64::from(barrier_attempted);
             let elapsed_since_log = last_progress_log.elapsed().as_secs();
             let nodes_since_log = done.saturating_sub(last_logged_count);
             if done > 0
@@ -2898,6 +3237,37 @@ mod tests {
     }
 
     #[test]
+    fn document_symbol_representative_prefers_non_lsp_source_with_lsp_fallback() {
+        let make_node = |name: &str, source| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/module.py"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source,
+        };
+        let lsp_first = make_node("<module>@lsp", ExtractionSource::Lsp);
+        let lsp_second = make_node("generated@lsp", ExtractionSource::Lsp);
+        let extracted = make_node("source_symbol", ExtractionSource::TreeSitter);
+        assert!(lsp_first.stable_id() < extracted.stable_id());
+
+        let mut mixed = vec![&lsp_first, &extracted];
+        sort_document_symbol_candidates(&mut mixed);
+        assert_eq!(mixed[0].stable_id(), extracted.stable_id());
+
+        let mut lsp_only = vec![&lsp_second, &lsp_first];
+        sort_document_symbol_candidates(&mut lsp_only);
+        assert_eq!(lsp_only[0].stable_id(), lsp_first.stable_id());
+    }
+
+    #[test]
     fn pass1_preopen_files_are_deterministic_and_deduplicated() {
         let item = |id: usize, file: &str, operation| LspPass1WorkItem {
             id,
@@ -2919,7 +3289,7 @@ mod tests {
             requested_operations: vec![operation],
             attempt_count: 1,
         };
-        let work_items = vec![
+        let mut work_items = vec![
             item(0, "tests/test_app.py", LspQueryOperation::DocumentSymbols),
             item(1, "src/app.py", LspQueryOperation::CallHierarchy),
             item(2, "src/app.py", LspQueryOperation::DocumentSymbols),
@@ -2932,6 +3302,68 @@ mod tests {
                 PathBuf::from("tests/test_app.py")
             ]
         );
+        let barrier = take_pass1_document_symbol_barrier_item(&mut work_items)
+            .expect("the lexicographically first documentSymbol item is the startup item");
+        assert_eq!(barrier.id, 2);
+        assert_eq!(barrier.node.id.file, PathBuf::from("src/app.py"));
+        assert_eq!(work_items.len(), 2);
+        assert!(work_items.iter().all(|item| item.id != barrier.id));
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_some());
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_none());
+    }
+
+    #[tokio::test]
+    async fn document_symbol_barrier_retries_transport_timeout_without_sleeping() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed =
+            retry_document_symbol_barrier(tokio::time::Instant::now() + Duration::from_secs(1), {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if attempt == 1 {
+                            anyhow::bail!(
+                                "LSP request textDocument/documentSymbol timed out after 30s (id=1)"
+                            );
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        completed
+            .result
+            .expect("a normal transport timeout should retry before the deadline");
+        assert_eq!(completed.attempts, 2);
+        assert_eq!(completed.timeouts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn document_symbol_barrier_does_not_retry_invalid_response() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed =
+            retry_document_symbol_barrier(tokio::time::Instant::now() + Duration::from_secs(1), {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Err::<(), _>(anyhow::anyhow!(
+                            "documentSymbol response must be an array or null"
+                        ))
+                    }
+                }
+            })
+            .await;
+        let error = completed
+            .result
+            .expect_err("a malformed response must fail the barrier closed");
+
+        assert!(error.to_string().contains("array or null"));
+        assert_eq!(completed.attempts, 1);
+        assert_eq!(completed.timeouts, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

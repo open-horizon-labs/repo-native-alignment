@@ -59,7 +59,7 @@ pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
     !result.detected_frameworks.is_empty()
 }
 
-fn lsp_abort_failures_for_slugs(
+fn lsp_required_failures_for_slugs(
     stats: &crate::extract::scan_stats::ScanStats,
     participating_slugs: &HashSet<String>,
 ) -> Vec<String> {
@@ -69,7 +69,7 @@ fn lsp_abort_failures_for_slugs(
         .filter(|(slug, _)| participating_slugs.contains(*slug))
         .flat_map(|(slug, by_language)| {
             by_language.iter().filter_map(move |(language, stat)| {
-                if stat.aborted {
+                if stat.aborted || stat.error_count > 0 {
                     Some(format!(
                         "{slug}/{language} via {}: {} error(s), aborted={}",
                         stat.server_name, stat.error_count, stat.aborted
@@ -80,6 +80,24 @@ fn lsp_abort_failures_for_slugs(
             })
         })
         .collect()
+}
+
+fn incremental_lsp_degraded_detail(
+    diagnostics: &[String],
+    stats: &crate::extract::scan_stats::ScanStats,
+    participating_slugs: &HashSet<String>,
+) -> Option<String> {
+    (!diagnostics.is_empty())
+        .then(|| diagnostics.join("; "))
+        .or_else(|| {
+            let failures = lsp_required_failures_for_slugs(stats, participating_slugs);
+            (!failures.is_empty()).then(|| {
+                format!(
+                    "incremental LSP enrichment failed or aborted: {}",
+                    failures.join("; ")
+                )
+            })
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -2018,6 +2036,10 @@ impl RnaHandler {
         } else {
             None
         };
+        let participating_lsp_slugs = incremental_lsp_job_id
+            .as_ref()
+            .map(|_| dirty_slugs.clone().unwrap_or_default())
+            .unwrap_or_default();
 
         let mut lsp_stage_completed = false;
         let mut lsp_degraded_detail = None;
@@ -2094,7 +2116,21 @@ impl RnaHandler {
                     }
                 }
                 if enrichment.runs_lsp() {
-                    let degraded_detail = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
+                    let degraded_detail = self
+                        .scan_stats
+                        .read()
+                        .map(|stats| {
+                            incremental_lsp_degraded_detail(
+                                &diagnostics,
+                                &stats,
+                                &participating_lsp_slugs,
+                            )
+                        })
+                        .unwrap_or_else(|_| {
+                            Some(
+                                "incremental LSP scan stats unavailable: lock poisoned".to_string(),
+                            )
+                        });
                     if let Some(detail) = degraded_detail.as_deref() {
                         let existing_coverage = self.lsp_status.coverage_edge_count();
                         self.lsp_status.set_degraded_scoped(
@@ -2643,14 +2679,17 @@ impl RnaHandler {
                                 .scan_stats
                                 .read()
                                 .map(|stats| {
-                                    lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                                    lsp_required_failures_for_slugs(
+                                        &stats,
+                                        &participating_lsp_slugs,
+                                    )
                                 })
                                 .unwrap_or_else(|_| {
                                     vec!["scan stats unavailable: lock poisoned".to_string()]
                                 });
                             (!lsp_failures.is_empty()).then(|| {
                                 format!(
-                                    "LSP call-reference enrichment aborted: {}",
+                                    "LSP call-reference enrichment failed or aborted: {}",
                                     lsp_failures.join("; ")
                                 )
                             })
@@ -3097,10 +3136,12 @@ impl RnaHandler {
                     .or(budget_abort_detail)
                     .or_else(|| {
                         let stats = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
-                        lsp_abort_failures_for_slugs(&stats, &participating_lsp_slugs)
+                        lsp_required_failures_for_slugs(&stats, &participating_lsp_slugs)
                             .into_iter()
                             .next()
-                            .map(|failure| format!("LSP enrichment aborted for {failure}"))
+                            .map(|failure| {
+                                format!("LSP enrichment failed or aborted for {failure}")
+                            })
                     });
                 if let Some(detail) = lsp_abort_detail.as_deref() {
                     on_progress(&format!("Enrichment: {detail}"));
@@ -4257,7 +4298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lsp_abort_failures_are_scoped_to_participating_slugs() {
+    fn test_required_lsp_failures_include_non_aborted_errors_and_scope_to_current_slugs() {
         let mut stats = crate::extract::scan_stats::ScanStats::default();
         stats.lsp_stats.insert(
             "current".to_string(),
@@ -4269,7 +4310,7 @@ mod tests {
                     node_count: 0,
                     duration: Duration::from_secs(1),
                     error_count: 2,
-                    aborted: true,
+                    aborted: false,
                     server_missing: false,
                     remediation: None,
                     query_metrics: Vec::new(),
@@ -4301,11 +4342,44 @@ mod tests {
         );
 
         let participating_slugs = HashSet::from(["current".to_string()]);
-        let failures = lsp_abort_failures_for_slugs(&stats, &participating_slugs);
+        let failures = lsp_required_failures_for_slugs(&stats, &participating_slugs);
 
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("current/rust"));
+        assert!(failures[0].contains("2 error(s), aborted=false"));
         assert!(!failures[0].contains("stale/rust"));
+    }
+
+    #[test]
+    fn incremental_lsp_non_aborted_required_error_is_degraded() {
+        let mut stats = crate::extract::scan_stats::ScanStats::default();
+        stats.lsp_stats.insert(
+            "current".to_string(),
+            [(
+                "python".to_string(),
+                crate::extract::scan_stats::LspLanguageStats {
+                    server_name: "pyrefly".to_string(),
+                    edge_count: 0,
+                    node_count: 0,
+                    duration: Duration::from_secs(1),
+                    error_count: 1,
+                    aborted: false,
+                    server_missing: false,
+                    remediation: None,
+                    query_metrics: Vec::new(),
+                    validation: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let detail =
+            incremental_lsp_degraded_detail(&[], &stats, &HashSet::from(["current".to_string()]))
+                .expect("required non-aborted errors must block incremental LSP completion");
+
+        assert!(detail.contains("current/python via pyrefly"));
+        assert!(detail.contains("1 error(s), aborted=false"));
     }
 
     #[tokio::test]

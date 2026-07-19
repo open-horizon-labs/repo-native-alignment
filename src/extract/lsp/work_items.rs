@@ -21,6 +21,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const OLDEST_SAMPLE_LIMIT: usize = 5;
 const LOCK_OWNER_INITIALIZATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: u32 = 3;
+const UNMATCHED_REQUIRED_WORK_ERROR: &str =
+    "persisted work item is no longer present in the enrichable node set; skipped";
 
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
@@ -406,10 +408,7 @@ impl LspWorkItemLedger {
             record.updated_at_ms = now;
             record.output_edges.clear();
             record.output_nodes.clear();
-            record.last_error = Some(
-                "persisted work item is no longer present in the enrichable node set; skipped"
-                    .to_string(),
-            );
+            record.last_error = Some(UNMATCHED_REQUIRED_WORK_ERROR.to_string());
             store
                 .records
                 .insert(record_key(&job_id, next_item_id), record);
@@ -484,6 +483,22 @@ impl LspWorkItemLedger {
                     .records
                     .values()
                     .filter(|record| record.state == LspWorkItemState::Exhausted)
+                    .count()
+            })
+            .unwrap_or(1)
+    }
+
+    pub(crate) fn unmatched_required_count(&self) -> usize {
+        self.store
+            .lock()
+            .map(|store| {
+                store
+                    .records
+                    .values()
+                    .filter(|record| {
+                        record.state == LspWorkItemState::Skipped
+                            && record.last_error.as_deref() == Some(UNMATCHED_REQUIRED_WORK_ERROR)
+                    })
                     .count()
             })
             .unwrap_or(1)
@@ -1223,6 +1238,11 @@ mod tests {
         assert_eq!(snapshot.phase_counts["sending_did_open"], 1);
         assert!(snapshot.oldest_in_flight[0].contains("node=item_0"));
         assert!(snapshot.render().contains("skipped=1"));
+        assert_eq!(
+            ledger.unmatched_required_count(),
+            0,
+            "an intentional runtime skip is not an unmatched required recovery record"
+        );
         assert!(
             render_queue_snapshots_markdown(repo.path(), 1).contains("## LSP Pass 1 Work Queues")
         );
@@ -1440,6 +1460,51 @@ mod tests {
         assert!(resumed.recovered_output().0.is_empty());
         let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
         assert_eq!(snapshot.total, changed.len());
+    }
+
+    #[tokio::test]
+    async fn unmatched_required_work_remains_skipped_during_recovery() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut initial = seeds(2);
+        initial[0].requested_operations = vec!["document_symbols".to_string()];
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "removed-work-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut remaining = initial[1].clone();
+        remaining.item_id = 0;
+        let resumed = LspWorkItemLedger::begin(repo.path(), &[remaining])
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "removed-work-job");
+        assert!(resumed.should_run(0));
+        let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.pending, 1);
+        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(resumed.unmatched_required_count(), 1);
+        let store = resumed.store.lock().unwrap();
+        let skipped = store
+            .records
+            .values()
+            .find(|record| record.state == LspWorkItemState::Skipped)
+            .expect("removed required work must remain visible as skipped");
+        assert_eq!(skipped.requested_operations, ["document_symbols"]);
+        assert!(
+            skipped
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("no longer present")
+        );
     }
 
     #[tokio::test]
