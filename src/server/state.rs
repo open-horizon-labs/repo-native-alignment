@@ -1196,7 +1196,7 @@ impl LspEnrichmentStatus {
         // so list_roots can show relevant servers that could be installed.
         let known_servers = [
             "rust-analyzer",
-            "pyright-langserver",
+            "pyrefly",
             "typescript-language-server",
             "gopls",
             "clangd",

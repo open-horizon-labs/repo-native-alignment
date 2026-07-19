@@ -217,6 +217,9 @@ pub struct EnrichmentResult {
     pub lsp_query_metrics: Vec<lsp::LspQueryMetric>,
     /// Capability-driven readiness evidence for the language server.
     pub lsp_validation: Option<scan_stats::LspValidationEvidence>,
+    /// File-scoped document-symbol probes used by the strict completeness gate.
+    /// These are durable job evidence even when a file has no extracted symbols.
+    pub lsp_file_validations: Vec<scan_stats::LspValidationEvidence>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -265,7 +268,7 @@ pub trait Enricher: Send + Sync {
     ///
     /// Used by `enrich_all` to prefer lsp_roots that contain this file when selecting
     /// the LSP server startup directory. For example, typescript-language-server relies
-    /// on `tsconfig.json`, pyright on `pyproject.toml`.
+    /// on `tsconfig.json`, Pyrefly on `pyproject.toml`.
     ///
     /// Returns `None` if the enricher has no specific config file preference
     /// (it will fall back to the node-count heuristic).
@@ -737,6 +740,7 @@ impl EnricherRegistry {
                     let error_count = enrichment.error_count;
                     let query_metrics = enrichment.lsp_query_metrics;
                     let validation = enrichment.lsp_validation;
+                    let file_validations = enrichment.lsp_file_validations;
                     let status = if enrichment.aborted {
                         scan_stats::LspStatus::Aborted
                     } else {
@@ -746,6 +750,7 @@ impl EnricherRegistry {
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
                     result.lsp_query_metrics.extend(query_metrics.clone());
+                    result.lsp_file_validations.extend(file_validations);
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
                         language: lang,
                         server_name: server,

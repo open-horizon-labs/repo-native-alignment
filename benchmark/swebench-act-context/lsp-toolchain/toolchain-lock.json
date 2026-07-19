@@ -1,0 +1,1546 @@
+{
+  "schema_version": 1,
+  "platform": {
+    "os": "macos",
+    "architecture": "arm64"
+  },
+  "inventory_sha256": "500ff11ba916a697fcdac0747d25d3094b81ab4c816f38df43540fd5018bb5d7",
+  "inventory_digest": "2b52991f0dd3e6b2ebf34053dc59e77ab9e85bb022d154911dfc521cc35009a9",
+  "acquisition": {
+    "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/recipes.json",
+    "sha256": "a6073c405e637346c4d8d0de1ada73ead13d2c019c6f73ce884bf655da8b4a1a"
+  },
+  "repo_parser_bundle": {
+    "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+    "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+    "sources": [
+      {
+        "path": "scripts/lsp/config_language_server.py",
+        "sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651"
+      },
+      {
+        "path": "scripts/lsp/cohort_language_server.py",
+        "sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce"
+      }
+    ]
+  },
+  "runtimes": [
+    {
+      "name": "node-22.12.0",
+      "version": "22.12.0",
+      "license": "MIT",
+      "source_url": "https://nodejs.org/dist/v22.12.0/node-v22.12.0-darwin-arm64.tar.gz",
+      "artifact": "node-v22.12.0-darwin-arm64.tar.gz",
+      "artifact_sha256": "293dcc6c2408da21562d135b0412525e381bb6fe150d688edb58fe850d0f3e13",
+      "executable": "runtimes/node-v22.12.0-darwin-arm64/bin/node",
+      "executable_sha256": "53dc65febda99ecaafe692de5ec60efdc2f7bd4fb14d1ba8cd30dc2af103953f",
+      "command": "node",
+      "args": [],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "install": {
+        "kind": "tar",
+        "destination": "runtimes",
+        "member": ""
+      }
+    },
+    {
+      "name": "python-3.12.13",
+      "version": "3.12.13+20260623",
+      "license": "PSF-2.0",
+      "source_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.12.13%2B20260623-aarch64-apple-darwin-install_only.tar.gz",
+      "artifact": "python-3.12.13.tar.gz",
+      "artifact_sha256": "3724aa4dafb5f7b6c2cf98e89914e4248dc6bd2fe40407df4a2d73de99615f16",
+      "executable": "runtimes/python/bin/python3.12",
+      "executable_sha256": "76fd6f7d3a2dbe85118338ddf62be42205971a84683ca89066092ad1f3a74b96",
+      "command": "python3.12",
+      "args": [],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "install": {
+        "kind": "tar",
+        "destination": "runtimes",
+        "member": ""
+      }
+    },
+    {
+      "name": "temurin-jre-21",
+      "version": "21.0.11+10",
+      "license": "GPL-2.0 WITH Classpath-exception",
+      "source_url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jre_aarch64_mac_hotspot_21.0.11_10.tar.gz",
+      "artifact": "OpenJDK21U-jre_aarch64_mac_hotspot_21.0.11_10.tar.gz",
+      "artifact_sha256": "4b7a8cd23102c251c8b8be42a9a5f1263fb337cf1037f6f64b25f3070efe4b76",
+      "executable": "runtimes/jdk-21.0.11+10-jre/Contents/Home/bin/java",
+      "executable_sha256": "afb8ed976e06d85c89192312923301959535169abe087d70166cd00fb96de2e5",
+      "command": "java",
+      "args": [],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "install": {
+        "kind": "tar",
+        "destination": "runtimes",
+        "member": ""
+      }
+    }
+  ],
+  "servers": [
+    {
+      "name": "antlr-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "antlr"
+      ],
+      "languages": [
+        "antlr"
+      ],
+      "extensions": [
+        "g4"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.g4",
+        "language_id": "antlr",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "autolev-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "autolev"
+      ],
+      "languages": [
+        "autolev"
+      ],
+      "extensions": [
+        "al"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.al",
+        "language_id": "autolev",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "autotools-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "autotools"
+      ],
+      "languages": [
+        "autotools"
+      ],
+      "extensions": [
+        "ac",
+        "am"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "configure.ac",
+        "language_id": "autotools",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "babel-lsp",
+      "version": "0.2.1",
+      "license": "MIT",
+      "source_url": "https://files.pythonhosted.org/packages/9a/e6/40c15f64f1121d36ed0e81346e395b4ccd3e7ef8729f3219b6f03049d6f7/babel_lsp-0.2.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact": "babel_lsp-0.2.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact_sha256": "f4641fe7de1d4fa39a88d5cf4aaa89df7912897f34cb824805671b99e90de089",
+      "executable": "bin/babel-lsp",
+      "executable_sha256": "f168ad850d9e92d711fe285ce75f54e9303bdbec415da4572433243011953660",
+      "command": "babel-lsp",
+      "args": [],
+      "languages": [
+        "gettext"
+      ],
+      "extensions": [
+        "po",
+        "pot",
+        "pot_t"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "zip-member",
+        "destination": "bin/babel-lsp",
+        "member": "babel_lsp-0.2.1.data/scripts/babel-lsp"
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "bin/babel-lsp"
+      },
+      "probe": {
+        "file_name": "probe.po",
+        "language_id": "gettext",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "bash-language-server",
+      "version": "5.6.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/bash-language-server/-/bash-language-server-5.6.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/bash-language-server",
+      "executable_sha256": "90419f24f837d3883264478f66b1eafebe6283f8641dda3893bd81f040a404d8",
+      "command": "bash-language-server",
+      "args": [
+        "start"
+      ],
+      "languages": [
+        "shell"
+      ],
+      "extensions": [
+        "<none>",
+        "guess",
+        "sh",
+        "sub",
+        "xsh"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/bash-language-server/out/cli.js"
+      },
+      "probe": {
+        "file_name": "probe.sh",
+        "language_id": "shellscript",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "batch-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "batch"
+      ],
+      "languages": [
+        "batch"
+      ],
+      "extensions": [
+        "bat",
+        "bat_t",
+        "cmd",
+        "new_t"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.bat",
+        "language_id": "bat",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "clangd",
+      "version": "22.1.8",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "source_url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz",
+      "artifact": "LLVM-22.1.8-macOS-ARM64.tar.xz",
+      "artifact_sha256": "f260f4f7c0d430828a81ae8a3826a1d63fc0963ec2459489308cc23b1f7eab4f",
+      "executable": "bin/clangd",
+      "executable_sha256": "a7beae415c60bc487cdeca0bddf568be9b6162381addf420f1131e9568b1a9a8",
+      "command": "clangd",
+      "args": [],
+      "languages": [
+        "c-cpp"
+      ],
+      "extensions": [
+        "c",
+        "cpp",
+        "h",
+        "in",
+        "m"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "tar-member",
+        "destination": "bin/clangd",
+        "member": "LLVM-22.1.8-macOS-ARM64/bin/clangd"
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "bin/clangd"
+      },
+      "probe": {
+        "file_name": "probe.c",
+        "language_id": "c",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "cohort-text-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "cohort-text"
+      ],
+      "languages": [
+        "cohort-text"
+      ],
+      "extensions": [
+        "<none>"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "PROBE",
+        "language_id": "plaintext",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "cyright",
+      "version": "1e055084408cbef84bdbab6a34d3771775eb5a2d",
+      "license": "MIT",
+      "source_url": "https://github.com/whoami730/cyright/commit/1e055084408cbef84bdbab6a34d3771775eb5a2d",
+      "artifact": "cyright-1e055084.tar.gz",
+      "artifact_sha256": "f78160a80b4f57c8e5f875c11da371e8f7fbced4b66eaa5b4f027d4f13f4fc02",
+      "executable": "bin/cyright-langserver",
+      "executable_sha256": "21f72a15e7606f5b8f8a6e60bd094dd44a5b10827cc9c07e2a717d9496665d45",
+      "command": "cyright-langserver",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "cython"
+      ],
+      "extensions": [
+        "pxd",
+        "pxi",
+        "pyx",
+        "tp"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-cyright-bundle/dist/pyright-langserver.js"
+      },
+      "probe": {
+        "file_name": "probe.pyx",
+        "language_id": "cython",
+        "operation": "textDocument/documentSymbol",
+        "configuration": {}
+      }
+    },
+    {
+      "name": "dot-language-server",
+      "version": "3.1.2",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/dot-language-server/-/dot-language-server-3.1.2.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/dot-language-server",
+      "executable_sha256": "01cb5f4da4952d8d3b028e8eff19d78ad6fdfae5d5e5aab77cdc8e4f9c949284",
+      "command": "dot-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "graphviz"
+      ],
+      "extensions": [
+        "dot"
+      ],
+      "expected_capabilities": [
+        "textDocument/codeAction"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/dot-language-server/bin/server.js"
+      },
+      "probe": {
+        "file_name": "probe.dot",
+        "language_id": "dot",
+        "operation": "textDocument/codeAction"
+      }
+    },
+    {
+      "name": "emacs-lisp-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "emacs-lisp"
+      ],
+      "languages": [
+        "emacs-lisp"
+      ],
+      "extensions": [
+        "el"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.el",
+        "language_id": "elisp",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "esbonio",
+      "version": "2.1.0",
+      "license": "MIT",
+      "source_url": "https://files.pythonhosted.org/project/esbonio/2.1.0/",
+      "artifact": "python-wheelhouse-1.0.0.tar.gz",
+      "artifact_sha256": "fb12835461b96db29599f5b70ca37655e4be22109be5289b6b0469514222283e",
+      "executable": "bin/esbonio",
+      "executable_sha256": "ffd94889b869c4dcd43c7e41c0473d6f0fc528c00ea6c3368fa762182f590c2c",
+      "command": "esbonio",
+      "args": [
+        "server"
+      ],
+      "languages": [
+        "restructuredtext"
+      ],
+      "extensions": [
+        "breaking",
+        "bugfix",
+        "extension",
+        "false_negative",
+        "false_positive",
+        "feature",
+        "inc",
+        "internal",
+        "new_check",
+        "other",
+        "performance",
+        "rst",
+        "rst_t",
+        "user_action"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "python-entry",
+        "target": "servers/python-env/bin/esbonio"
+      },
+      "probe": {
+        "file_name": "probe.rst",
+        "language_id": "restructuredtext",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "plaintext-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "plaintext"
+      ],
+      "languages": [
+        "plaintext"
+      ],
+      "extensions": [
+        "<none>",
+        "eopc04_iau2000",
+        "finals2000a",
+        "lesser",
+        "license",
+        "old",
+        "pil",
+        "python",
+        "txt",
+        "wx"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "README.txt",
+        "language_id": "plaintext",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "lemminx",
+      "version": "0.3.0",
+      "license": "EPL-2.0",
+      "source_url": "https://github.com/eclipse-lemminx/lemminx/releases/download/0.3.0/org.eclipse.lsp4xml-0.3.0-uber.jar",
+      "artifact": "lemminx-0.3.0-uber.jar",
+      "artifact_sha256": "cb253c10d0af4c1b38bd0f51edf76bb555ca64bb49f50717d8116b403c221835",
+      "executable": "bin/lemminx",
+      "executable_sha256": "282a6aee46a27286ff1026d55c2c3067dc077e613dce5e4360cc3ae08147c6bd",
+      "command": "lemminx",
+      "args": [],
+      "languages": [
+        "xml"
+      ],
+      "extensions": [
+        "dtd",
+        "glade",
+        "hhc",
+        "kml",
+        "ncx_t",
+        "opf_t",
+        "stp",
+        "xhtml_t",
+        "xml",
+        "xrc",
+        "xsd",
+        "xsl"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "temurin-jre-21"
+      ],
+      "install": {
+        "kind": "copy",
+        "destination": "servers/lemminx.jar",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "java-jar",
+        "target": "servers/lemminx.jar"
+      },
+      "probe": {
+        "file_name": "probe.xml",
+        "language_id": "xml",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "lex-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "lex"
+      ],
+      "languages": [
+        "lex"
+      ],
+      "extensions": [
+        "l"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.l",
+        "language_id": "lex",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "lua-language-server",
+      "version": "3.18.2",
+      "license": "MIT",
+      "source_url": "https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-darwin-arm64.tar.gz",
+      "artifact": "lua-language-server-3.18.2-darwin-arm64.tar.gz",
+      "artifact_sha256": "cec99d70b1f612acec4a10a79a03664e3aa0c229d4d8a586cb3f928ec37d509e",
+      "executable": "bin/lua-language-server",
+      "executable_sha256": "eca4579233ed459ec4472c70b6fca4b23f93cae942dfdca67fd4d429e5fd7c21",
+      "command": "lua-language-server",
+      "args": [],
+      "languages": [
+        "lua"
+      ],
+      "extensions": [
+        "lua"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "tar",
+        "destination": "servers/lua",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "lua",
+        "target": "servers/lua/bin/lua-language-server"
+      },
+      "probe": {
+        "file_name": "probe.lua",
+        "language_id": "lua",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "marksman",
+      "version": "2026-02-08",
+      "license": "MIT",
+      "source_url": "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos",
+      "artifact": "marksman-macos",
+      "artifact_sha256": "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b",
+      "executable": "bin/marksman",
+      "executable_sha256": "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b",
+      "command": "marksman",
+      "args": [
+        "server"
+      ],
+      "languages": [
+        "markdown"
+      ],
+      "extensions": [
+        "md"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "copy",
+        "destination": "bin/marksman",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "bin/marksman"
+      },
+      "probe": {
+        "file_name": "probe.md",
+        "language_id": "markdown",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "plantuml-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "plantuml"
+      ],
+      "languages": [
+        "plantuml"
+      ],
+      "extensions": [
+        "puml"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.puml",
+        "language_id": "plantuml",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "powershell-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "powershell"
+      ],
+      "languages": [
+        "powershell"
+      ],
+      "extensions": [
+        "ps1"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.ps1",
+        "language_id": "powershell",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "pyrefly",
+      "version": "1.1.1",
+      "license": "MIT",
+      "source_url": "https://files.pythonhosted.org/packages/71/47/7a3457dbbddb513a83cf4fe527d5d5ebda5201a1010ad2a6034030e3e358/pyrefly-1.1.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact": "pyrefly-1.1.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact_sha256": "d6b238e1362622d47a6eb5af704fd8b613c94e8c303386efd6350e3da59fecc8",
+      "executable": "bin/pyrefly",
+      "executable_sha256": "d471718bb618c4e6e7c30549da6efdd8eca8abea138dc1dec1524564bc4da396",
+      "command": "pyrefly",
+      "args": [
+        "lsp",
+        "--verbose",
+        "--indexing-mode",
+        "lazy-blocking",
+        "--threads",
+        "1",
+        "--workspace-indexing-limit",
+        "5000",
+        "--build-system-blocking",
+        "--color",
+        "never"
+      ],
+      "languages": [
+        "python"
+      ],
+      "extensions": [
+        "<none>",
+        "bench",
+        "py",
+        "py-tpl",
+        "py_t",
+        "pyi",
+        "sample"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol",
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/prepareCallHierarchy",
+        "callHierarchy/incomingCalls",
+        "callHierarchy/outgoingCalls"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "zip-member",
+        "destination": "bin/pyrefly",
+        "member": "pyrefly-1.1.1.data/scripts/pyrefly"
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "bin/pyrefly"
+      },
+      "probe": {
+        "file_name": "probe.py",
+        "language_id": "python",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "rna-config-language-server",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-config-language-server",
+      "executable_sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651",
+      "command": "rna-config-language-server",
+      "args": [],
+      "languages": [
+        "config"
+      ],
+      "extensions": [
+        "<none>",
+        "cfg",
+        "conf",
+        "def",
+        "hhp",
+        "in",
+        "ini",
+        "mplstyle",
+        "new_t",
+        "rc",
+        "sample",
+        "template"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-config-language-server"
+      },
+      "probe": {
+        "file_name": "probe.cfg",
+        "language_id": "ini",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "roff-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "roff"
+      ],
+      "languages": [
+        "roff"
+      ],
+      "extensions": [
+        "1"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.1",
+        "language_id": "roff",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "scheme-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "scheme"
+      ],
+      "languages": [
+        "scheme"
+      ],
+      "extensions": [
+        "scm"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.scm",
+        "language_id": "scheme",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "starlark-rna-cohort",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-cohort-language-server",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
+      "command": "rna-cohort-language-server",
+      "args": [
+        "--language",
+        "starlark"
+      ],
+      "languages": [
+        "starlark"
+      ],
+      "extensions": [
+        "star"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-cohort-language-server"
+      },
+      "probe": {
+        "file_name": "probe.star",
+        "language_id": "starlark",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "toml-rna-config",
+      "version": "1.0.0",
+      "license": "MIT",
+      "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "executable": "bin/rna-config-language-server",
+      "executable_sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651",
+      "command": "rna-config-language-server",
+      "args": [],
+      "languages": [
+        "toml"
+      ],
+      "extensions": [
+        "toml"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "python-3.12.13"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "servers/issue785-repo-servers/rna-config-language-server"
+      },
+      "probe": {
+        "file_name": "probe.toml",
+        "language_id": "toml",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "texlab",
+      "version": "5.26.0",
+      "license": "GPL-3.0",
+      "source_url": "https://github.com/latex-lsp/texlab/releases/download/v5.26.0/texlab-aarch64-macos.tar.gz",
+      "artifact": "texlab-aarch64-macos.tar.gz",
+      "artifact_sha256": "af7972ffd230711ba04ada9b69cc32ce9111d9196ba69538062872faefdbee56",
+      "executable": "bin/texlab",
+      "executable_sha256": "8a88be127caaf4da8197076efae6b953f5e00f5ca9d5fc6edb41ddb3acd41514",
+      "command": "texlab",
+      "args": [],
+      "languages": [
+        "latex"
+      ],
+      "extensions": [
+        "bib",
+        "cls",
+        "ist",
+        "sty",
+        "sty_t",
+        "tex",
+        "tex_t",
+        "xdy"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [],
+      "install": {
+        "kind": "tar",
+        "destination": "bin",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "direct",
+        "target": "bin/texlab"
+      },
+      "probe": {
+        "file_name": "probe.tex",
+        "language_id": "latex",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "typescript-language-server",
+      "version": "5.3.0",
+      "license": "Apache-2.0",
+      "source_url": "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-5.3.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/typescript-language-server",
+      "executable_sha256": "191f7bad6b4f6ca943bebf76caa9fa486bb790333cba087b345edd176e114d66",
+      "command": "typescript-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "typescript"
+      ],
+      "extensions": [
+        "js",
+        "js_t"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/typescript-language-server/lib/cli.mjs"
+      },
+      "probe": {
+        "file_name": "probe.js",
+        "language_id": "javascript",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "vscode-css-language-server",
+      "version": "4.10.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/vscode-css-language-server",
+      "executable_sha256": "f9bacb87b974f1e72efbdf255829c08f0ab6f2e9372c5a102f2cb726ec8de51c",
+      "command": "vscode-css-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "css"
+      ],
+      "extensions": [
+        "css",
+        "css_t"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/vscode-langservers-extracted/bin/vscode-css-language-server"
+      },
+      "probe": {
+        "file_name": "probe.css",
+        "language_id": "css",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "vscode-html-language-server",
+      "version": "4.10.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/vscode-html-language-server",
+      "executable_sha256": "8ff58f1bf4033168558b3d46e47a2eb59804203aa33ff8fc52ccedbd717d7b86",
+      "command": "vscode-html-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "html"
+      ],
+      "extensions": [
+        "djtpl",
+        "html",
+        "html_t",
+        "thtml",
+        "tpl"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/vscode-langservers-extracted/bin/vscode-html-language-server"
+      },
+      "probe": {
+        "file_name": "probe.html",
+        "language_id": "html",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "vscode-json-language-server",
+      "version": "4.10.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/vscode-json-language-server",
+      "executable_sha256": "c5417bff21eb9f0313e66ac114030ff2e389927cb69bf8d9ce7b1cb02425873e",
+      "command": "vscode-json-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "json"
+      ],
+      "extensions": [
+        "ipynb",
+        "json"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/vscode-langservers-extracted/bin/vscode-json-language-server"
+      },
+      "probe": {
+        "file_name": "probe.json",
+        "language_id": "json",
+        "operation": "textDocument/documentSymbol"
+      }
+    },
+    {
+      "name": "yaml-language-server",
+      "version": "1.24.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/yaml-language-server/-/yaml-language-server-1.24.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/yaml-language-server",
+      "executable_sha256": "4531cb2ac8e089373282b099e9df1729a7814d2eaeeddcc96bd3aadaa8da290d",
+      "command": "yaml-language-server",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "yaml"
+      ],
+      "extensions": [
+        "cff",
+        "lock",
+        "yaml",
+        "yml"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/yaml-language-server/bin/yaml-language-server"
+      },
+      "probe": {
+        "file_name": "probe.yaml",
+        "language_id": "yaml",
+        "operation": "textDocument/documentSymbol"
+      }
+    }
+  ],
+  "unsupported_languages": []
+}

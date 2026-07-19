@@ -102,6 +102,18 @@ fn scoped_lsp_call_edge_count(
         .count()
 }
 
+fn plan_inner_incremental_lsp_node_filter(
+    enrichment: ScanEnrichmentOptions,
+    touched_files: &std::collections::HashSet<(String, PathBuf)>,
+    nodes: &[Node],
+) -> anyhow::Result<Arc<std::collections::HashSet<String>>> {
+    if !enrichment.runs_lsp() {
+        return Ok(Arc::new(std::collections::HashSet::new()));
+    }
+    plan_lsp_node_ids_for_touched_files(touched_files, nodes)
+        .context("failed to plan changed-file LSP nodes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +421,48 @@ mod tests {
         let planned = std::collections::HashSet::from([changed.to_stable_id()]);
 
         assert_eq!(scoped_lsp_call_edge_count(&edges, &planned), 1);
+    }
+
+    #[test]
+    fn extract_only_inner_update_skips_over_bound_lsp_planning() {
+        let nodes = (0..=crate::extract::lsp::MAX_INCREMENTAL_LSP_NODES)
+            .map(|index| Node {
+                id: crate::graph::NodeId {
+                    root: "fixture".to_string(),
+                    file: PathBuf::from("src/dense.rs"),
+                    name: format!("symbol_{index}"),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: format!("fn symbol_{index}()"),
+                body: String::new(),
+                metadata: std::collections::BTreeMap::new(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            })
+            .collect::<Vec<_>>();
+        let touched_files = std::collections::HashSet::from([(
+            "fixture".to_string(),
+            PathBuf::from("src/dense.rs"),
+        )]);
+
+        let skipped = plan_inner_incremental_lsp_node_filter(
+            ScanEnrichmentOptions::extract_only(),
+            &touched_files,
+            &nodes,
+        )
+        .unwrap();
+        assert!(skipped.is_empty());
+
+        let error = plan_inner_incremental_lsp_node_filter(
+            ScanEnrichmentOptions::all(),
+            &touched_files,
+            &nodes,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to plan changed-file LSP nodes"));
+        assert!(format!("{error:#}").contains("exceeds its bound"));
     }
 }
 
@@ -806,6 +860,8 @@ impl RnaHandler {
                                 lance_repo_root: None,
                                 skip_lsp: false, // incremental background path: LSP runs inline
                                 lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                                file_readiness: false,
+                                file_readiness_filter: None,
                                 broad_reference_budget: None,
                             },
                             dirty_slugs,
@@ -1855,6 +1911,8 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                         skip_lsp: spawn_background || !enrichment.runs_lsp(),
                         lsp_node_filter: None,
+                        file_readiness: !spawn_background && enrichment.runs_lsp(),
+                        file_readiness_filter: None,
                         broad_reference_budget: None,
                     },
                     dirty_slugs,
@@ -2530,9 +2588,11 @@ impl RnaHandler {
             // when there are changed/new/deleted files in the primary root).
             let dirty_slugs: Option<std::collections::HashSet<String>> =
                 Some(std::iter::once(primary_slug.clone()).collect());
-            let lsp_node_filter =
-                plan_lsp_node_ids_for_touched_files(&files_to_remove, &graph.nodes)
-                    .context("failed to plan changed-file LSP nodes")?;
+            let lsp_node_filter = plan_inner_incremental_lsp_node_filter(
+                enrichment,
+                &files_to_remove,
+                &graph.nodes,
+            )?;
 
             let pipeline_result =
                 crate::extract::consumers::emit_enrichment_pipeline_with_validations(
@@ -2548,6 +2608,8 @@ impl RnaHandler {
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                         skip_lsp: !enrichment.runs_lsp(),
                         lsp_node_filter: Some(Arc::clone(&lsp_node_filter)),
+                        file_readiness: false,
+                        file_readiness_filter: None,
                         broad_reference_budget: None,
                     },
                     dirty_slugs,

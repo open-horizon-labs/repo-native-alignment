@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use lancedb::expr::{DfExpr, col, is_in, lit};
 
-use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
+use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeKind};
 
 // ── Re-exports ────────────────────────────────────────────────────────
 
@@ -110,66 +110,12 @@ pub(crate) fn parse_confidence(s: &str) -> Confidence {
     }
 }
 
-/// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
-/// Falls back to using the type hint and root if parsing is ambiguous.
-pub(crate) fn parse_node_id_from_stable(
-    stable_id: &str,
-    kind_hint: &str,
-    root_hint: &str,
-) -> NodeId {
-    // stable_id format: "root:file:name:kind"
-    // We need to handle the case where file or name might contain ':'
-    // Strategy: split from the end to get kind, then from the start to get root,
-    // the middle is file:name which we split on the last ':'
-    let parts: Vec<&str> = stable_id.splitn(2, ':').collect();
-    if parts.len() < 2 {
-        return NodeId {
-            root: root_hint.to_string(),
-            file: PathBuf::from(stable_id),
-            name: String::new(),
-            kind: parse_node_kind(kind_hint),
-        };
-    }
-
-    let root = parts[0].to_string();
-    let rest = parts[1]; // "file:name:kind"
-
-    // Split from the end to get kind
-    if let Some(last_colon) = rest.rfind(':') {
-        let before_kind = &rest[..last_colon]; // "file:name"
-        // Split file:name on the last colon
-        if let Some(name_colon) = before_kind.rfind(':') {
-            let file = &before_kind[..name_colon];
-            let name = &before_kind[name_colon + 1..];
-            return NodeId {
-                root,
-                file: PathBuf::from(file),
-                name: name.to_string(),
-                kind: parse_node_kind(kind_hint),
-            };
-        }
-        // Only one segment -- treat as file with empty name
-        return NodeId {
-            root,
-            file: PathBuf::from(before_kind),
-            name: String::new(),
-            kind: parse_node_kind(kind_hint),
-        };
-    }
-
-    NodeId {
-        root: root_hint.to_string(),
-        file: PathBuf::from(rest),
-        name: String::new(),
-        kind: parse_node_kind(kind_hint),
-    }
-}
-
 /// Infer programming language from file extension.
 pub(crate) fn infer_language_from_path(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust".to_string(),
         Some("py") => "python".to_string(),
+        Some("pyx") | Some("pxd") | Some("pxi") | Some("tp") => "cython".to_string(),
         Some("ts") | Some("tsx") => "typescript".to_string(),
         Some("js") | Some("jsx") => "javascript".to_string(),
         Some("go") => "go".to_string(),
@@ -206,7 +152,9 @@ mod tests {
         NodeKind, ValidationStatus,
     };
 
-    use super::{load_graph_from_lance, parse_edge_kind, persist_graph_to_lance};
+    use super::{
+        infer_language_from_path, load_graph_from_lance, parse_edge_kind, persist_graph_to_lance,
+    };
 
     fn node(kind: &str, name: &str, file: &str) -> Node {
         Node {
@@ -234,6 +182,51 @@ mod tests {
             Some(EdgeKind::Other("supports".to_string()))
         );
         assert_eq!(parse_edge_kind("  "), None);
+    }
+
+    #[tokio::test]
+    async fn cython_inventory_extensions_survive_persist_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extensions = ["pyx", "pxd", "pxi", "tp"];
+        let nodes = extensions
+            .iter()
+            .map(|extension| Node {
+                id: NodeId {
+                    root: "repo".to_string(),
+                    file: PathBuf::from(format!("src/kernel.{extension}")),
+                    name: format!("kernel_{extension}"),
+                    kind: NodeKind::Function,
+                },
+                language: "cython".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: format!("def kernel_{extension}():"),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            })
+            .collect::<Vec<_>>();
+
+        persist_graph_to_lance(dir.path(), &nodes, &[])
+            .await
+            .expect("persist Cython graph");
+        let state = load_graph_from_lance(dir.path())
+            .await
+            .expect("reopen Cython graph");
+
+        for extension in extensions {
+            let path = PathBuf::from(format!("src/kernel.{extension}"));
+            assert_eq!(infer_language_from_path(&path), "cython");
+            assert_eq!(
+                state
+                    .nodes
+                    .iter()
+                    .find(|node| node.id.file == path)
+                    .map(|node| node.language.as_str()),
+                Some("cython"),
+                "reopened {extension} node must remain eligible for Cython planning"
+            );
+        }
     }
 
     #[tokio::test]

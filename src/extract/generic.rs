@@ -186,13 +186,12 @@ pub struct LangConfig {
     /// Defaults to `None` = all enrichable kinds (Function, Trait, Struct, Enum, TypeAlias, Const).
     /// When `Some(&[...])`, only the listed kinds are enriched via LSP.
     ///
-    /// Python sets this to `&[Function, Trait]` because pyright's textDocument/references
-    /// hangs on class/enum/const lookups (30s timeout per node), triggering the error-rate
-    /// abort and killing the entire enrichment pass before any functions get processed.
+    /// Python keeps this bounded to `&[Function, Trait]`; widening the declaration
+    /// surface requires separate evidence because it materially increases LSP work.
     pub lsp_enrichable_kinds: Option<&'static [NodeKind]>,
     /// Virtual environment directory names to look for in the startup root.
-    /// When found, these are passed to the LSP server as venvPath/venv in
-    /// initializationOptions so it can resolve installed packages.
+    /// When found, these are passed to compatible LSP servers as venvPath/venv
+    /// initializationOptions so they can resolve installed packages.
     /// `None` = no venv detection for this language.
     pub venv_candidates: Option<&'static [&'static str]>,
     /// Whether this language's LSP server supports a custom `parentModule`

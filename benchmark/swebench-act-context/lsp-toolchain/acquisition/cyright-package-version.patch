@@ -1,0 +1,12 @@
+diff --git a/packages/pyright-internal/src/server.ts b/packages/pyright-internal/src/server.ts
+--- a/packages/pyright-internal/src/server.ts
++++ b/packages/pyright-internal/src/server.ts
+@@ -48,7 +48,7 @@ export class PyrightServer extends LanguageServerBase {
+ 
+         // ! Cython
+         // eslint-disable-next-line @typescript-eslint/no-var-requires
+-        const cythonVSVersion = require('../../../../package.json').version || undefined;
++        const cythonVSVersion = undefined;
+         const cythonVersion = '2.0.0';
+         version = `${version}_cython-${cythonVersion}${cythonVSVersion ? '_vscode-' + cythonVSVersion : ''}`;
+ 

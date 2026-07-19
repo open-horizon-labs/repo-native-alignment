@@ -4,7 +4,7 @@
 //! appends results to the `EnrichmentResult`. The top-level `enrich()` orchestrates
 //! them in sequence: Pass 0 -> Pass 1 -> Pass 2 -> Pass 4 -> Pass 5 -> Pass 3.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -19,21 +19,245 @@ use super::policy::{
     LspDeclarationClass, LspQueryBudget, LspQueryOperation, LspQueryTelemetry,
     LspServerCapabilities,
 };
-use super::transport::{
-    PipelinedTransport, find_enclosing_symbol, find_enclosing_symbol_in_file, path_to_uri,
-    uri_to_relative_path,
-};
+use super::transport::{PipelinedTransport, path_to_uri, uri_to_relative_path};
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
-    ZERO_EDGE_TIMEOUT, lsp_job_timeout, materialize_document_symbols,
-    normalized_document_symbol_evidence,
+    ZERO_EDGE_TIMEOUT, lsp_job_timeout, lsp_language_id, materialize_document_symbols,
+    normalized_document_symbol_evidence, read_lsp_text,
 };
 use crate::scanner::LspConfig;
 
 const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct EndpointLookupIndex {
+    functions_by_file_and_name: HashMap<PathBuf, HashMap<String, Vec<NodeId>>>,
+    enclosing_by_file: HashMap<PathBuf, EnclosingLineIndex>,
+}
+
+#[derive(Debug, Default)]
+struct EnclosingLineIndex {
+    changes: Vec<(usize, Option<NodeId>)>,
+}
+
+impl EnclosingLineIndex {
+    fn build(nodes: &[Node]) -> Self {
+        let indexed = nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.id.kind,
+                    NodeKind::Function
+                        | NodeKind::Impl
+                        | NodeKind::Struct
+                        | NodeKind::Trait
+                        | NodeKind::Enum
+                        | NodeKind::TypeAlias
+                        | NodeKind::Const
+                )
+            })
+            .map(|node| {
+                let line_end = node.line_end.max(node.line_start);
+                (
+                    line_end.saturating_sub(node.line_start),
+                    node.stable_id(),
+                    node.id.clone(),
+                    node.line_start,
+                    line_end,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut events = BTreeMap::<usize, (Vec<usize>, Vec<usize>)>::new();
+        for (index, (_, _, _, line_start, line_end)) in indexed.iter().enumerate() {
+            events.entry(*line_start).or_default().1.push(index);
+            if let Some(after_end) = line_end.checked_add(1) {
+                events.entry(after_end).or_default().0.push(index);
+            }
+        }
+
+        let mut active = BTreeSet::<(usize, String, usize)>::new();
+        let mut changes = Vec::new();
+        for (line, (removals, additions)) in events {
+            for index in removals {
+                active.remove(&(indexed[index].0, indexed[index].1.clone(), index));
+            }
+            for index in additions {
+                active.insert((indexed[index].0, indexed[index].1.clone(), index));
+            }
+            let selected = active
+                .iter()
+                .next()
+                .map(|(_, _, index)| indexed[*index].2.clone());
+            if changes
+                .last()
+                .is_none_or(|(_, previous)| previous != &selected)
+            {
+                changes.push((line, selected));
+            }
+        }
+        Self { changes }
+    }
+
+    fn resolve(&self, line: usize) -> Option<NodeId> {
+        let insertion = self
+            .changes
+            .partition_point(|(change_line, _)| *change_line <= line);
+        insertion
+            .checked_sub(1)
+            .and_then(|index| self.changes[index].1.clone())
+    }
+}
+
+impl EndpointLookupIndex {
+    fn build(nodes_by_file: &HashMap<PathBuf, Vec<Node>>) -> Self {
+        let mut functions_by_file_and_name = HashMap::new();
+        let mut enclosing_by_file = HashMap::new();
+        for (file, nodes) in nodes_by_file {
+            let mut functions = HashMap::<String, Vec<NodeId>>::new();
+            for node in nodes
+                .iter()
+                .filter(|node| node.id.kind == NodeKind::Function)
+            {
+                functions
+                    .entry(node.id.name.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+            for ids in functions.values_mut() {
+                ids.sort_by_key(NodeId::to_stable_id);
+                ids.dedup();
+            }
+            functions_by_file_and_name.insert(file.clone(), functions);
+            enclosing_by_file.insert(file.clone(), EnclosingLineIndex::build(nodes));
+        }
+        Self {
+            functions_by_file_and_name,
+            enclosing_by_file,
+        }
+    }
+
+    fn unique_function(&self, file: &Path, name: &str) -> Option<NodeId> {
+        let ids = self.functions_by_file_and_name.get(file)?.get(name)?;
+        (ids.len() == 1).then(|| ids[0].clone())
+    }
+
+    fn enclosing_symbol(&self, file: &Path, line: usize) -> Option<NodeId> {
+        self.enclosing_by_file.get(file)?.resolve(line)
+    }
+}
+
+fn resolve_or_materialize_call_hierarchy_endpoint(
+    item: &serde_json::Value,
+    endpoint: &str,
+    root: &Path,
+    local_root: &str,
+    language: &str,
+    endpoint_index: &EndpointLookupIndex,
+) -> Option<(NodeId, Option<Node>, Confidence)> {
+    let endpoint = item.get(endpoint)?;
+    let uri: lsp_types::Uri = endpoint.get("uri")?.as_str()?.parse().ok()?;
+    let path = uri_to_relative_path(&uri, root);
+    let name = endpoint
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let detail = endpoint
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let start_line = endpoint["range"]["start"]["line"].as_u64().unwrap_or(0);
+    let start_character = endpoint["range"]["start"]["character"]
+        .as_u64()
+        .unwrap_or(0);
+    let end_line = endpoint["range"]["end"]["line"].as_u64().unwrap_or(0);
+    let end_character = endpoint["range"]["end"]["character"].as_u64().unwrap_or(0);
+    let line_start = start_line as usize + 1;
+    let line_end = end_line as usize + 1;
+    let range_disambiguator = format!("{start_line}:{start_character}-{end_line}:{end_character}");
+
+    if !path.is_absolute() {
+        if let Some(exact) = endpoint_index.unique_function(&path, name) {
+            return Some((exact, None, Confidence::Confirmed));
+        }
+        if let Some(existing) = endpoint_index.enclosing_symbol(&path, line_start) {
+            return Some((existing, None, Confidence::Confirmed));
+        }
+
+        let base_name = if name.is_empty() { detail } else { name };
+        if base_name.is_empty() {
+            return None;
+        }
+        let node_name = format!("{base_name}@lsp:{range_disambiguator}");
+        let id = NodeId {
+            root: local_root.to_string(),
+            file: path,
+            name: node_name,
+            kind: NodeKind::Function,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("virtual".to_string(), "true".to_string());
+        metadata.insert("lsp_call_hierarchy".to_string(), "true".to_string());
+        if !name.is_empty() {
+            metadata.insert("lsp_name".to_string(), name.to_string());
+        }
+        return Some((
+            id.clone(),
+            Some(Node {
+                id,
+                language: language.to_string(),
+                line_start,
+                line_end: line_end.max(line_start),
+                signature: detail.to_string(),
+                body: String::new(),
+                metadata,
+                source: ExtractionSource::Lsp,
+            }),
+            Confidence::Detected,
+        ));
+    }
+
+    let fqn = if detail.is_empty() { name } else { detail };
+    if fqn.is_empty() {
+        return None;
+    }
+    let id = NodeId {
+        root: "external".to_string(),
+        file: PathBuf::new(),
+        name: format!("{fqn}@lsp:{range_disambiguator}"),
+        kind: NodeKind::Function,
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "package".to_string(),
+        fqn.split("::")
+            .next()
+            .unwrap_or(fqn)
+            .split('.')
+            .next()
+            .unwrap_or(fqn)
+            .to_string(),
+    );
+    metadata.insert("virtual".to_string(), "true".to_string());
+    metadata.insert("external".to_string(), "true".to_string());
+    metadata.insert("lsp_call_hierarchy".to_string(), "true".to_string());
+    Some((
+        id.clone(),
+        Some(Node {
+            id,
+            language: language.to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: fqn.to_string(),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::Lsp,
+        }),
+        Confidence::Detected,
+    ))
+}
 
 fn should_abort_zero_edge_pass(
     edge_producing_total: usize,
@@ -71,13 +295,15 @@ impl DidOpenEntry {
 
 struct DidOpenCoordinator {
     server: String,
+    inventory_language: String,
     files: Mutex<HashMap<PathBuf, Arc<DidOpenEntry>>>,
 }
 
 impl DidOpenCoordinator {
-    fn new(server: String) -> Self {
+    fn new(server: String, inventory_language: String) -> Self {
         Self {
             server,
+            inventory_language,
             files: Mutex::new(HashMap::new()),
         }
     }
@@ -146,14 +372,14 @@ impl DidOpenCoordinator {
         file_uri: &lsp_types::Uri,
     ) -> Result<()> {
         let abs_path = root.join(rel_path);
-        let content = std::fs::read_to_string(&abs_path).with_context(|| {
+        let content = read_lsp_text(&abs_path).with_context(|| {
             format!(
                 "LSP didOpen failed: server={} file={} phase=read_file",
                 self.server,
                 rel_path.display()
             )
         })?;
-        let lang_id = language_id_for_path(&abs_path);
+        let lang_id = lsp_language_id(&self.inventory_language, &abs_path);
         let notify = transport.notify(
             "textDocument/didOpen",
             serde_json::json!({
@@ -191,6 +417,319 @@ struct LspPass1WorkItem {
     node: Node,
     requested_operations: Vec<LspQueryOperation>,
     attempt_count: u32,
+}
+
+fn validate_structural_cache_runtime_operation_plan(
+    admission: Option<&crate::structural_cache::RuntimeStructuralCacheOperationAdmission>,
+    operations: &[LspQueryOperation],
+) -> Result<Option<usize>> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    let operation_names = operations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    admission
+        .validate_exact_plan(operation_names.iter().map(String::as_str))
+        .map(Some)
+}
+
+fn pass1_work_item_files(work_items: &[LspPass1WorkItem]) -> Vec<PathBuf> {
+    let mut files = work_items
+        .iter()
+        .map(|item| item.node.id.file.clone())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+fn sort_document_symbol_candidates(candidates: &mut [&Node]) {
+    // Persisted LSP document-symbol nodes are valid graph output, but they must
+    // not replace the parser-owned representative that produced that output on
+    // a resumed run. Keep the representative stable across reopen/recovery,
+    // with deterministic LSP fallback for files that have no non-LSP node.
+    candidates.sort_by_key(|node| (node.source == ExtractionSource::Lsp, node.stable_id()));
+}
+
+fn is_document_symbol_transport_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("LSP request textDocument/documentSymbol timed out after")
+    })
+}
+
+struct DocumentSymbolBarrierAttempts<T> {
+    attempts: usize,
+    timeouts: usize,
+    result: Result<T>,
+}
+
+async fn retry_document_symbol_barrier<Request, RequestFuture, Output>(
+    job_deadline: tokio::time::Instant,
+    mut request: Request,
+) -> DocumentSymbolBarrierAttempts<Output>
+where
+    Request: FnMut() -> RequestFuture,
+    RequestFuture: std::future::Future<Output = Result<Output>>,
+{
+    let mut attempts = 0usize;
+    let mut timeouts = 0usize;
+    loop {
+        if tokio::time::Instant::now() >= job_deadline {
+            return DocumentSymbolBarrierAttempts {
+                attempts,
+                timeouts,
+                result: Err(anyhow::anyhow!(
+                    "LSP Pass 1 documentSymbol barrier reached the enrichment deadline before a request completed"
+                )),
+            };
+        }
+        attempts += 1;
+        match request().await {
+            Ok(output) => {
+                return DocumentSymbolBarrierAttempts {
+                    attempts,
+                    timeouts,
+                    result: Ok(output),
+                };
+            }
+            Err(error)
+                if is_document_symbol_transport_timeout(&error)
+                    && tokio::time::Instant::now() < job_deadline =>
+            {
+                timeouts += 1;
+                tracing::warn!(
+                    attempts,
+                    %error,
+                    "LSP Pass 1 persisted documentSymbol item timed out; retrying before worker launch"
+                );
+            }
+            Err(error) => {
+                timeouts += usize::from(is_document_symbol_transport_timeout(&error));
+                return DocumentSymbolBarrierAttempts {
+                    attempts,
+                    timeouts,
+                    result: Err(error),
+                };
+            }
+        }
+    }
+}
+
+fn take_pass1_document_symbol_barrier_item(
+    work_items: &mut Vec<LspPass1WorkItem>,
+) -> Option<LspPass1WorkItem> {
+    let index = work_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.requested_operations
+                .first()
+                .is_some_and(|operation| *operation == LspQueryOperation::DocumentSymbols)
+        })
+        .map(|(index, item)| {
+            (
+                (item.node.id.file.clone(), item.node.stable_id(), item.id),
+                index,
+            )
+        })
+        .min()
+        .map(|(_, index)| index)?;
+    Some(work_items.remove(index))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_pass1_document_symbol_barrier_item(
+    item: &LspPass1WorkItem,
+    transport: &Arc<PipelinedTransport>,
+    root: &Path,
+    language: &str,
+    refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+    did_open: &DidOpenCoordinator,
+    work_item_ledger: &Arc<LspWorkItemLedger>,
+    telemetry: &Arc<LspQueryTelemetry>,
+    job_deadline: tokio::time::Instant,
+) -> Result<Pass1TaskResult> {
+    let rel_path = &item.node.id.file;
+    let file_uri = path_to_uri(&root.join(rel_path)).with_context(|| {
+        format!(
+            "LSP Pass 1 persisted documentSymbol item could not resolve {}",
+            rel_path.display()
+        )
+    })?;
+    let request_uri = file_uri.to_string();
+    let started = Instant::now();
+    anyhow::ensure!(
+        telemetry.register_work_item(
+            item.id,
+            LspQueryOperation::DocumentSymbols,
+            LspDeclarationClass::from_kind(&item.node.id.kind)
+                .unwrap_or(LspDeclarationClass::Other),
+        ),
+        "LSP Pass 1 persisted documentSymbol item could not register before the job deadline"
+    );
+    work_item_ledger
+        .mark_phase(item.id, "sending_did_open")
+        .await?;
+    if let Err(error) = did_open
+        .ensure_open(transport, root, rel_path, &file_uri)
+        .await
+    {
+        let timed_out = error
+            .chain()
+            .any(|cause| cause.to_string().contains("timed out"));
+        let telemetry_recorded =
+            telemetry.record_work_item(item.id, 0, 0, started.elapsed(), 1, usize::from(timed_out));
+        let detail = format!(
+            "persisted documentSymbol startup item could not open {}: {error:#}",
+            rel_path.display()
+        );
+        work_item_ledger.mark_failed(item.id, &detail).await?;
+        work_item_ledger.flush().await?;
+        anyhow::ensure!(
+            telemetry_recorded,
+            "{detail}; telemetry completion was rejected"
+        );
+        anyhow::bail!(detail);
+    }
+    work_item_ledger
+        .mark_phase(item.id, LspQueryOperation::DocumentSymbols.phase())
+        .await?;
+
+    let attempt_result = retry_document_symbol_barrier(job_deadline, || {
+        telemetry.note_requests_started(item.id, 1);
+        let transport = Arc::clone(transport);
+        let request_uri = request_uri.clone();
+        async move {
+            let response = transport
+                .request(
+                    "textDocument/documentSymbol",
+                    serde_json::json!({ "textDocument": { "uri": request_uri.clone() } }),
+                )
+                .await?;
+            normalized_document_symbol_evidence(&response, &request_uri)
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let mut symbols = match attempt_result.result {
+        Ok(symbols) => symbols,
+        Err(error) => {
+            let telemetry_recorded = telemetry.record_work_item(
+                item.id,
+                0,
+                0,
+                elapsed,
+                attempt_result.attempts,
+                attempt_result.timeouts,
+            );
+            let detail = format!(
+                "persisted documentSymbol startup item failed for {} after {} attempt(s): {error:#}",
+                rel_path.display(),
+                attempt_result.attempts,
+            );
+            work_item_ledger.mark_failed(item.id, &detail).await?;
+            work_item_ledger.flush().await?;
+            anyhow::ensure!(
+                telemetry_recorded,
+                "{detail}; telemetry completion was rejected"
+            );
+            anyhow::bail!(detail);
+        }
+    };
+    let observed_result_count = symbols.len();
+    let nodes = materialize_document_symbols(language, &mut symbols, root, |file| {
+        refs_by_file
+            .get(file)
+            .and_then(|nodes| nodes.first())
+            .map(|node| node.id.root.clone())
+    })
+    .with_context(|| {
+        format!(
+            "persisted documentSymbol startup item could not materialize {}",
+            rel_path.display()
+        )
+    });
+    let nodes = match nodes {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            let telemetry_recorded = telemetry.record_work_item(
+                item.id,
+                usize::from(observed_result_count > 0),
+                0,
+                elapsed,
+                attempt_result.timeouts.saturating_add(1),
+                attempt_result.timeouts,
+            );
+            let detail = format!("{error:#}");
+            work_item_ledger.mark_failed(item.id, &detail).await?;
+            work_item_ledger.flush().await?;
+            anyhow::ensure!(
+                telemetry_recorded,
+                "{detail}; telemetry completion was rejected"
+            );
+            anyhow::bail!(detail);
+        }
+    };
+    if nodes.len() != observed_result_count {
+        let telemetry_recorded = telemetry.record_work_item(
+            item.id,
+            usize::from(observed_result_count > 0),
+            0,
+            elapsed,
+            attempt_result.timeouts.saturating_add(1),
+            attempt_result.timeouts,
+        );
+        let detail = format!(
+            "persisted documentSymbol startup item mapped {} response item(s) to {} graph node(s)",
+            observed_result_count,
+            nodes.len(),
+        );
+        work_item_ledger.mark_failed(item.id, &detail).await?;
+        work_item_ledger.flush().await?;
+        anyhow::ensure!(
+            telemetry_recorded,
+            "{detail}; telemetry completion was rejected"
+        );
+        anyhow::bail!(detail);
+    }
+    anyhow::ensure!(
+        telemetry.record_work_item(
+            item.id,
+            usize::from(observed_result_count > 0),
+            0,
+            elapsed,
+            attempt_result.timeouts,
+            attempt_result.timeouts,
+        ),
+        "persisted documentSymbol startup item telemetry completion was rejected"
+    );
+    work_item_ledger
+        .mark_completed_with_output(
+            item.id,
+            &[],
+            &nodes,
+            observed_result_count.try_into().unwrap_or(u64::MAX),
+        )
+        .await?;
+    work_item_ledger.flush().await?;
+    tracing::info!(
+        file = %rel_path.display(),
+        attempts = attempt_result.attempts,
+        timeouts = attempt_result.timeouts,
+        result_count = observed_result_count,
+        elapsed_ms = elapsed.as_millis(),
+        "LSP Pass 1 persisted documentSymbol item completed before worker launch"
+    );
+    Ok(Pass1TaskResult {
+        edges: Vec::new(),
+        new_nodes: nodes,
+        had_error: false,
+        edge_producing: false,
+    })
 }
 
 #[derive(Debug)]
@@ -323,14 +862,28 @@ where
 
 fn recovery_failure_state(ledger: &LspWorkItemLedger) -> (u32, bool, Option<String>) {
     let exhausted = ledger.exhausted_count();
-    if exhausted == 0 {
+    let unmatched_required = ledger.unmatched_required_count();
+    let failures = exhausted.saturating_add(unmatched_required);
+    if failures == 0 {
         return (0, false, None);
     }
+    let mut details = Vec::new();
+    if exhausted > 0 {
+        details.push(format!(
+            "{exhausted} exhausted the retry budget; inspect list_roots for the failed phase"
+        ));
+    }
+    if unmatched_required > 0 {
+        details.push(format!(
+            "{unmatched_required} required persisted item(s) no longer matched the enrichable node set"
+        ));
+    }
     (
-        exhausted.try_into().unwrap_or(u32::MAX),
+        failures.try_into().unwrap_or(u32::MAX),
         true,
         Some(format!(
-            "{exhausted} LSP work item(s) exhausted the retry budget; inspect list_roots for the failed phase, then retry with narrower scope or fix the language server"
+            "LSP work-item recovery failed closed: {}; retry after correcting the graph/work-item identity or language server",
+            details.join("; ")
         )),
     )
 }
@@ -579,19 +1132,6 @@ impl LspPass1Diagnostics {
     }
 }
 
-fn language_id_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("py") => "python",
-        Some("ts") => "typescript",
-        Some("tsx") => "typescriptreact",
-        Some("js") => "javascript",
-        Some("jsx") => "javascriptreact",
-        Some("rs") => "rust",
-        Some("go") => "go",
-        _ => "plaintext",
-    }
-}
-
 fn did_open_timeout() -> Duration {
     duration_from_env("RNA_LSP_DID_OPEN_TIMEOUT_MS", DID_OPEN_DEFAULT_TIMEOUT)
 }
@@ -678,6 +1218,18 @@ impl LspEnricher {
     ) -> (u32, u32, bool, Option<String>) {
         let pass1_start = std::time::Instant::now();
         let language = self.language.clone();
+        let runtime_admission = match crate::structural_cache::load_runtime_operation_admission(
+            root, &language,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let diagnostic = format!(
+                    "structural-cache runtime LSP admission failed before Pass 1 requests: {error:#}"
+                );
+                tracing::warn!("{diagnostic}");
+                return (0, 1, true, Some(diagnostic));
+            }
+        };
 
         // Filter to only nodes that need LSP requests:
         // Functions (call hierarchy), Traits (implementations), and Other (document links).
@@ -702,21 +1254,7 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            .filter(|n| {
-                // Skip test functions (have #[test] or #[tokio::test] decorator)
-                if n.id.kind == NodeKind::Function {
-                    if let Some(decorators) = n.metadata.get("decorators")
-                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]"))
-                    {
-                        return false;
-                    }
-                    // Also skip functions in test files
-                    if crate::ranking::is_test_file(n) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|n| !crate::ranking::is_test_function(n))
             .copied()
             .collect();
 
@@ -730,7 +1268,7 @@ impl LspEnricher {
                     .push(*node);
             }
             for mut candidates in document_representatives.into_values() {
-                candidates.sort_by_key(|node| node.stable_id());
+                sort_document_symbol_candidates(&mut candidates);
                 for node in candidates {
                     if self.query_profile.admits(
                         node,
@@ -778,6 +1316,28 @@ impl LspEnricher {
                     admitted_nodes.push((node, operation));
                 }
             }
+        }
+
+        if let Some(admission) = runtime_admission.as_ref() {
+            let operations = admitted_nodes
+                .iter()
+                .map(|(_, operation)| *operation)
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                validate_structural_cache_runtime_operation_plan(Some(admission), &operations)
+            {
+                let diagnostic = format!(
+                    "structural-cache runtime LSP plan failed closed before Pass 1 requests: {error:#}"
+                );
+                tracing::warn!("{diagnostic}");
+                return (0, 1, true, Some(diagnostic));
+            }
+            tracing::info!(
+                language = %language,
+                actual_operations = operations.len(),
+                signed_estimate = admission.signed_estimate(),
+                "Verified exact structural-cache Pass 1 runtime operation plan"
+            );
         }
 
         let ref_eligible = admitted_nodes
@@ -867,7 +1427,7 @@ impl LspEnricher {
         let pass1_edge_baseline = result.added_edges.len();
         let (recovery_errors, recovery_aborted, recovery_diagnostic) =
             recovery_failure_state(&work_item_ledger);
-        let work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
+        let mut work_items = runnable_pass1_work_items(work_items, &work_item_ledger);
         let edge_producing_total = work_items
             .iter()
             .filter(|item| {
@@ -876,14 +1436,86 @@ impl LspEnricher {
                     .is_some_and(|operation| *operation != LspQueryOperation::DocumentSymbols)
             })
             .count();
-        let did_open = Arc::new(DidOpenCoordinator::new(self.server_command.clone()));
+        let did_open = Arc::new(DidOpenCoordinator::new(
+            self.server_command.clone(),
+            self.language.clone(),
+        ));
+        // Send every document mutation before issuing any concurrent request.
+        // Some standards-compliant servers cancel outstanding requests when a
+        // later didOpen changes workspace state. Lazy per-worker opens therefore
+        // make unrelated file requests race each other. Pre-opening the bounded,
+        // deterministic file set preserves pipelined query concurrency without
+        // interleaving mutations and requests.
+        for rel_path in pass1_work_item_files(&work_items) {
+            if tokio::time::Instant::now() >= job_deadline {
+                break;
+            }
+            let file_uri = match path_to_uri(&root.join(&rel_path)) {
+                Ok(uri) => uri,
+                Err(error) => {
+                    tracing::warn!(
+                        "LSP Pass 1 pre-open skipped {} after URI failure: {}",
+                        rel_path.display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = did_open
+                .ensure_open(transport, root, &rel_path, &file_uri)
+                .await
+            {
+                // The owning work item retries through the same coordinator so
+                // the durable ledger, error accounting, and fail-closed behavior
+                // remain unchanged.
+                tracing::warn!("LSP Pass 1 pre-open failed: {error}");
+            }
+        }
+        let mut barrier_attempted = 0u32;
+        if let Some(barrier_item) = take_pass1_document_symbol_barrier_item(&mut work_items) {
+            match execute_pass1_document_symbol_barrier_item(
+                &barrier_item,
+                transport,
+                root,
+                &language,
+                refs_by_file_shared,
+                &did_open,
+                &work_item_ledger,
+                telemetry,
+                job_deadline,
+            )
+            .await
+            {
+                Ok(task_result) => {
+                    barrier_attempted = 1;
+                    extend_unique_edges(
+                        &mut result.added_edges,
+                        &mut seen_edge_ids,
+                        task_result.edges,
+                    );
+                    extend_unique_nodes(
+                        &mut result.new_nodes,
+                        &mut seen_virtual_ids,
+                        task_result.new_nodes,
+                    );
+                }
+                Err(error) => {
+                    let diagnostic = format!(
+                        "LSP Pass 1 aborted before worker launch because the persisted startup documentSymbol item failed: {error:#}"
+                    );
+                    tracing::warn!("{diagnostic}");
+                    return (1, recovery_errors.saturating_add(1), true, Some(diagnostic));
+                }
+            }
+        }
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
         let matching_owned = Arc::clone(matching_nodes_owned);
         let refs_by_file = Arc::clone(refs_by_file_shared);
+        let endpoint_index = Arc::new(EndpointLookupIndex::build(refs_by_file_shared));
         let worker_telemetry = Arc::clone(telemetry);
-        let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
+        let (worker_total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
             PIPELINE_MAX_CONCURRENCY,
@@ -892,6 +1524,7 @@ impl LspEnricher {
                 let root = root.clone();
                 let matching_owned = Arc::clone(&matching_owned);
                 let refs_by_file = Arc::clone(&refs_by_file);
+                let endpoint_index = Arc::clone(&endpoint_index);
                 let language = language.clone();
                 let error_count = Arc::clone(&error_count);
                 let did_open = Arc::clone(&did_open);
@@ -925,6 +1558,7 @@ impl LspEnricher {
                         &root,
                         &matching_owned,
                         &refs_by_file,
+                        &endpoint_index,
                         &language,
                         &did_open,
                         &diagnostics,
@@ -935,11 +1569,12 @@ impl LspEnricher {
                 }
             },
         );
+        let total_nodes = worker_total_nodes.saturating_add(barrier_attempted as usize);
 
         // Collect results from all queued work items. A no-progress watchdog emits
         // a bounded diagnostic snapshot before aborting workers, so stalls surface
         // by phase/file instead of waiting for the outer 30-minute job watchdog.
-        let mut attempted = 0u32;
+        let mut attempted = barrier_attempted;
         let mut edge_attempted = 0u32;
         let mut errors = 0u32;
         let mut aborted = false;
@@ -1037,7 +1672,8 @@ impl LspEnricher {
             }
 
             // Log progress every 1,000 nodes or every 30 seconds (whichever comes first)
-            let done = diagnostics.completed.load(Ordering::Relaxed).max(0) as u64;
+            let done = diagnostics.completed.load(Ordering::Relaxed).max(0) as u64
+                + u64::from(barrier_attempted);
             let elapsed_since_log = last_progress_log.elapsed().as_secs();
             let nodes_since_log = done.saturating_sub(last_logged_count);
             if done > 0
@@ -1147,6 +1783,7 @@ impl LspEnricher {
         root: &Path,
         matching_owned: &Arc<Vec<Node>>,
         refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        endpoint_index: &EndpointLookupIndex,
         language: &str,
         did_open: &DidOpenCoordinator,
         diagnostics: &LspPass1Diagnostics,
@@ -1243,8 +1880,7 @@ impl LspEnricher {
                         line,
                         col,
                         node,
-                        matching_owned,
-                        refs_by_file,
+                        endpoint_index,
                         root,
                         language,
                         operation == Some(LspQueryOperation::References),
@@ -1281,7 +1917,7 @@ impl LspEnricher {
                             line,
                             col,
                             node,
-                            matching_owned,
+                            endpoint_index,
                             root,
                             item.id,
                             telemetry,
@@ -1311,7 +1947,7 @@ impl LspEnricher {
                             line,
                             col,
                             node,
-                            refs_by_file,
+                            endpoint_index,
                             root,
                             operation,
                             item.id,
@@ -1373,8 +2009,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_owned: &Arc<Vec<Node>>,
-        refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         language: &str,
         has_references: bool,
@@ -1411,10 +2046,7 @@ impl LspEnricher {
                         observation.result_count += 1;
 
                         let referrer_id =
-                            refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
-                                let refs: Vec<&Node> = candidates.iter().collect();
-                                find_enclosing_symbol(&refs, &ref_path, ref_line)
-                            });
+                            endpoint_index.enclosing_symbol(ref_path.as_path(), ref_line);
 
                         if let Some(referrer) = referrer_id {
                             if referrer == node.id {
@@ -1451,78 +2083,38 @@ impl LspEnricher {
                         Self::outgoing_calls_p(transport, &item),
                     );
 
-                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                    let mut refs_by_file_name: std::collections::HashMap<
-                        (PathBuf, String),
-                        Vec<NodeId>,
-                    > = std::collections::HashMap::new();
-                    for n in &matching_refs {
-                        refs_by_file_name
-                            .entry((n.id.file.clone(), n.id.name.clone()))
-                            .or_default()
-                            .push(n.id.clone());
-                    }
-
                     // Process incoming calls
                     match incoming_result {
                         Ok(calls) => {
                             observation.non_empty_responses += usize::from(!calls.is_empty());
                             for call in &calls {
-                                let caller_uri = &call["from"]["uri"];
-                                let caller_name = call["from"]["name"].as_str().unwrap_or("");
-                                let caller_line =
-                                    call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0)
-                                        as usize
-                                        + 1;
-
-                                if let Some(uri_str) = caller_uri.as_str() {
-                                    let caller_path =
-                                        if let Some(p) = uri_str.strip_prefix("file://") {
-                                            let abs = PathBuf::from(p);
-                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                        } else {
-                                            continue;
-                                        };
-
-                                    if caller_path.to_string_lossy().contains(".cargo") {
-                                        continue;
-                                    }
-                                    if caller_path == node.id.file && caller_name == node.id.name {
-                                        continue;
-                                    }
-                                    observation.result_count += 1;
-
-                                    let key = (caller_path.clone(), caller_name.to_string());
-                                    let caller_id = match refs_by_file_name.get(&key) {
-                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                        Some(_) => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &caller_path,
-                                            caller_line,
-                                        ),
-                                        None => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &caller_path,
-                                            caller_line,
-                                        ),
-                                    };
-
-                                    if let Some(caller) = caller_id {
-                                        if caller.name == node.id.name
-                                            && caller.file == node.id.file
-                                        {
-                                            continue;
-                                        }
-                                        edges.push(Edge {
-                                            from: caller,
-                                            to: node.id.clone(),
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Confirmed,
-                                            evidence: Vec::new(),
-                                        });
-                                    }
+                                let Some((caller, materialized, confidence)) =
+                                    resolve_or_materialize_call_hierarchy_endpoint(
+                                        call,
+                                        "from",
+                                        root,
+                                        &node.id.root,
+                                        language,
+                                        endpoint_index,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if caller == node.id {
+                                    continue;
                                 }
+                                observation.result_count += 1;
+                                if let Some(materialized) = materialized {
+                                    new_nodes.push(materialized);
+                                }
+                                edges.push(Edge {
+                                    from: caller,
+                                    to: node.id.clone(),
+                                    kind: EdgeKind::Calls,
+                                    source: ExtractionSource::Lsp,
+                                    confidence,
+                                    evidence: Vec::new(),
+                                });
                             }
                         }
                         Err(e) => {
@@ -1538,103 +2130,33 @@ impl LspEnricher {
                         Ok(calls) => {
                             observation.non_empty_responses += usize::from(!calls.is_empty());
                             for call in &calls {
-                                let callee_uri = &call["to"]["uri"];
-                                let callee_name = call["to"]["name"].as_str().unwrap_or("");
-                                let callee_line =
-                                    call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0)
-                                        as usize
-                                        + 1;
-
-                                if let Some(uri_str) = callee_uri.as_str() {
-                                    let callee_path =
-                                        if let Some(p) = uri_str.strip_prefix("file://") {
-                                            let abs = PathBuf::from(p);
-                                            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
-                                        } else {
-                                            continue;
-                                        };
-
-                                    if callee_path.to_string_lossy().contains(".cargo") {
-                                        let fqn = call["to"]["detail"]
-                                            .as_str()
-                                            .filter(|s| !s.is_empty())
-                                            .unwrap_or(callee_name);
-
-                                        if fqn.is_empty() {
-                                            continue;
-                                        }
-                                        observation.result_count += 1;
-
-                                        let package =
-                                            fqn.split("::").next().unwrap_or(fqn).to_string();
-
-                                        let virtual_id = NodeId {
-                                            root: "external".to_string(),
-                                            file: PathBuf::new(),
-                                            name: fqn.to_string(),
-                                            kind: NodeKind::Function,
-                                        };
-
-                                        let mut meta = std::collections::BTreeMap::new();
-                                        meta.insert("package".to_string(), package.clone());
-                                        meta.insert("virtual".to_string(), "true".to_string());
-                                        new_nodes.push(Node {
-                                            id: virtual_id.clone(),
-                                            language: language.to_string(),
-                                            line_start: 0,
-                                            line_end: 0,
-                                            signature: fqn.to_string(),
-                                            body: String::new(),
-                                            metadata: meta,
-                                            source: ExtractionSource::Lsp,
-                                        });
-
-                                        edges.push(Edge {
-                                            from: node.id.clone(),
-                                            to: virtual_id,
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Detected,
-                                            evidence: Vec::new(),
-                                        });
-                                        continue;
-                                    }
-                                    if callee_path == node.id.file && callee_name == node.id.name {
-                                        continue;
-                                    }
-                                    observation.result_count += 1;
-
-                                    let key = (callee_path.clone(), callee_name.to_string());
-                                    let callee_id = match refs_by_file_name.get(&key) {
-                                        Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                        Some(_) => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &callee_path,
-                                            callee_line,
-                                        ),
-                                        None => find_enclosing_symbol(
-                                            &matching_refs,
-                                            &callee_path,
-                                            callee_line,
-                                        ),
-                                    };
-
-                                    if let Some(callee) = callee_id {
-                                        if callee.name == node.id.name
-                                            && callee.file == node.id.file
-                                        {
-                                            continue;
-                                        }
-                                        edges.push(Edge {
-                                            from: node.id.clone(),
-                                            to: callee,
-                                            kind: EdgeKind::Calls,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Confirmed,
-                                            evidence: Vec::new(),
-                                        });
-                                    }
+                                let Some((callee, materialized, confidence)) =
+                                    resolve_or_materialize_call_hierarchy_endpoint(
+                                        call,
+                                        "to",
+                                        root,
+                                        &node.id.root,
+                                        language,
+                                        endpoint_index,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if callee == node.id {
+                                    continue;
                                 }
+                                observation.result_count += 1;
+                                if let Some(materialized) = materialized {
+                                    new_nodes.push(materialized);
+                                }
+                                edges.push(Edge {
+                                    from: node.id.clone(),
+                                    to: callee,
+                                    kind: EdgeKind::Calls,
+                                    source: ExtractionSource::Lsp,
+                                    confidence,
+                                    evidence: Vec::new(),
+                                });
                             }
                         }
                         Err(e) => {
@@ -1723,7 +2245,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_owned: &Arc<Vec<Node>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
@@ -1739,14 +2261,6 @@ impl LspEnricher {
         match Self::find_references_p(transport, file_uri, line, col).await {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
-                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
-                for n in &matching_refs {
-                    refs_by_file
-                        .entry(n.id.file.as_path())
-                        .or_default()
-                        .push(*n);
-                }
                 for loc in &locations {
                     let ref_path = uri_to_relative_path(&loc.uri, root);
                     let ref_line = loc.range.start.line as usize + 1;
@@ -1763,9 +2277,7 @@ impl LspEnricher {
                     }
                     observation.result_count += 1;
 
-                    let referrer_id = refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
-                        find_enclosing_symbol(candidates, &ref_path, ref_line)
-                    });
+                    let referrer_id = endpoint_index.enclosing_symbol(ref_path.as_path(), ref_line);
 
                     if let Some(referrer) = referrer_id {
                         if referrer == node.id {
@@ -1912,7 +2424,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         operation: LspQueryOperation,
         work_item_id: usize,
@@ -1942,9 +2454,8 @@ impl LspEnricher {
                     observation.result_count += 1;
                     let target_path = uri_to_relative_path(&location.uri, root);
                     let target_line = location.range.start.line as usize + 1;
-                    let target = refs_by_file
-                        .get(&target_path)
-                        .and_then(|nodes| find_enclosing_symbol_in_file(nodes, target_line))
+                    let target = endpoint_index
+                        .enclosing_symbol(&target_path, target_line)
                         .unwrap_or_else(|| NodeId {
                             root: node.id.root.clone(),
                             file: target_path.clone(),
@@ -2005,6 +2516,21 @@ impl LspEnricher {
             return (has_type_hierarchy, type_hierarchy_strikes);
         }
 
+        let runtime_admission = match crate::structural_cache::load_runtime_operation_admission(
+            root,
+            &self.language,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "structural-cache runtime LSP admission failed before Pass 2 requests: {error:#}"
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                return (false, type_hierarchy_strikes.saturating_add(1));
+            }
+        };
         let type_nodes: Vec<&Node> = matching_nodes
             .iter()
             .filter(|n| {
@@ -2023,6 +2549,21 @@ impl LspEnricher {
             })
             .copied()
             .collect();
+
+        if let Some(admission) = runtime_admission.as_ref() {
+            let operations = vec![LspQueryOperation::TypeHierarchy; type_nodes.len()];
+            if let Err(error) =
+                validate_structural_cache_runtime_operation_plan(Some(admission), &operations)
+            {
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "structural-cache runtime LSP plan failed closed before Pass 2 requests: {error:#}"
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                return (false, type_hierarchy_strikes.saturating_add(1));
+            }
+        }
 
         if !type_nodes.is_empty() {
             tracing::debug!("Type hierarchy pass: {} eligible nodes", type_nodes.len());
@@ -2407,6 +2948,315 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn signed_runtime_plan_rejects_unsigned_document_symbols_and_reference_fallback() {
+        let admission = crate::structural_cache::RuntimeStructuralCacheOperationAdmission::for_test(
+            &["call_hierarchy"],
+            8,
+        );
+
+        let document_symbol_error = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::DocumentSymbols],
+        )
+        .unwrap_err();
+        assert!(
+            document_symbol_error
+                .to_string()
+                .contains("document_symbols")
+        );
+
+        let fallback_error = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::References],
+        )
+        .unwrap_err();
+        assert!(fallback_error.to_string().contains("references"));
+    }
+
+    #[test]
+    fn signed_runtime_plan_accepts_signed_fallback_and_rejects_exact_overflow() {
+        let admission = crate::structural_cache::RuntimeStructuralCacheOperationAdmission::for_test(
+            &["references"],
+            1,
+        );
+
+        assert_eq!(
+            validate_structural_cache_runtime_operation_plan(
+                Some(&admission),
+                &[LspQueryOperation::References],
+            )
+            .unwrap(),
+            Some(1)
+        );
+        let overflow = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::References, LspQueryOperation::References],
+        )
+        .unwrap_err();
+        assert!(overflow.to_string().contains("actual=2 max=1"));
+    }
+
+    fn call_hierarchy_item(
+        endpoint: &str,
+        uri: &str,
+        name: &str,
+        detail: &str,
+    ) -> serde_json::Value {
+        call_hierarchy_item_at(endpoint, uri, name, detail, 7, 0, 9, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_hierarchy_item_at(
+        endpoint: &str,
+        uri: &str,
+        name: &str,
+        detail: &str,
+        start_line: u64,
+        start_character: u64,
+        end_line: u64,
+        end_character: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            endpoint: {
+                "uri": uri,
+                "name": name,
+                "detail": detail,
+                "range": {
+                    "start": { "line": start_line, "character": start_character },
+                    "end": { "line": end_line, "character": end_character }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn call_hierarchy_endpoint_resolves_against_unscheduled_graph_nodes() {
+        let existing = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/caller.py"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 8,
+            line_end: 10,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let refs = HashMap::from([(existing.id.file.clone(), vec![existing.clone()])]);
+        let endpoint_index = EndpointLookupIndex::build(&refs);
+        let item = call_hierarchy_item(
+            "from",
+            "file:///tmp/rna-call-hierarchy/src/caller.py",
+            "caller",
+            "caller",
+        );
+
+        let (resolved, materialized, confidence) = resolve_or_materialize_call_hierarchy_endpoint(
+            &item,
+            "from",
+            Path::new("/tmp/rna-call-hierarchy"),
+            "repo",
+            "python",
+            &endpoint_index,
+        )
+        .expect("existing endpoint must resolve");
+
+        assert_eq!(resolved, existing.id);
+        assert!(materialized.is_none());
+        assert_eq!(confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn unresolved_local_call_hierarchy_endpoint_materializes_stably() {
+        let item = call_hierarchy_item(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+        );
+        let endpoint_index = EndpointLookupIndex::default();
+        let resolve = || {
+            resolve_or_materialize_call_hierarchy_endpoint(
+                &item,
+                "to",
+                Path::new("/tmp/rna-call-hierarchy"),
+                "repo",
+                "python",
+                &endpoint_index,
+            )
+            .expect("valid local endpoint must materialize")
+        };
+
+        let (first_id, first_node, confidence) = resolve();
+        let (second_id, _, _) = resolve();
+        let first_node = first_node.expect("unresolved endpoint must produce a node");
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(first_id.file, PathBuf::from("src/generated.py"));
+        assert_eq!(first_id.name, "generated_target@lsp:7:0-9:1");
+        assert_eq!(confidence, Confidence::Detected);
+        assert_eq!(first_node.source, ExtractionSource::Lsp);
+        assert_eq!(
+            first_node
+                .metadata
+                .get("lsp_call_hierarchy")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn external_call_hierarchy_endpoint_uses_path_free_stable_identity() {
+        let item = call_hierarchy_item(
+            "to",
+            "file:///opt/venv/lib/python3.13/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+        );
+        let endpoint_index = EndpointLookupIndex::default();
+        let (id, node, confidence) = resolve_or_materialize_call_hierarchy_endpoint(
+            &item,
+            "to",
+            Path::new("/tmp/rna-call-hierarchy"),
+            "repo",
+            "python",
+            &endpoint_index,
+        )
+        .expect("valid external endpoint must materialize");
+        let node = node.expect("external endpoint must produce a node");
+
+        assert_eq!(id.root, "external");
+        assert!(id.file.as_os_str().is_empty());
+        assert_eq!(id.name, "pkg.api.target@lsp:7:0-9:1");
+        assert_eq!(confidence, Confidence::Detected);
+        assert!(!id.to_stable_id().contains("/opt/venv"));
+        assert_eq!(
+            node.metadata.get("package").map(String::as_str),
+            Some("pkg")
+        );
+        assert_eq!(
+            node.metadata.get("external").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn same_name_unresolved_endpoints_use_range_disambiguators() {
+        let index = EndpointLookupIndex::default();
+        let local_first = call_hierarchy_item_at(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+            7,
+            0,
+            9,
+            1,
+        );
+        let local_second = call_hierarchy_item_at(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+            17,
+            2,
+            19,
+            3,
+        );
+        let external_first = call_hierarchy_item_at(
+            "to",
+            "file:///opt/venv/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+            3,
+            0,
+            4,
+            1,
+        );
+        let external_second = call_hierarchy_item_at(
+            "to",
+            "file:///opt/venv/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+            13,
+            4,
+            14,
+            5,
+        );
+        let resolve = |item: &serde_json::Value| {
+            resolve_or_materialize_call_hierarchy_endpoint(
+                item,
+                "to",
+                Path::new("/tmp/rna-call-hierarchy"),
+                "repo",
+                "python",
+                &index,
+            )
+            .expect("valid unresolved endpoint must materialize")
+            .0
+        };
+
+        let local_first = resolve(&local_first);
+        let local_second = resolve(&local_second);
+        let external_first = resolve(&external_first);
+        let external_second = resolve(&external_second);
+        assert_ne!(local_first, local_second);
+        assert_ne!(external_first, external_second);
+        assert_eq!(local_first.name, "generated_target@lsp:7:0-9:1");
+        assert_eq!(local_second.name, "generated_target@lsp:17:2-19:3");
+        assert_eq!(external_first.name, "pkg.api.target@lsp:3:0-4:1");
+        assert_eq!(external_second.name, "pkg.api.target@lsp:13:4-14:5");
+    }
+
+    #[test]
+    fn endpoint_lookup_index_resolves_narrowest_enclosing_symbol() {
+        let make_node = |name: &str, kind: NodeKind, start: usize, end: usize| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/nested.py"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "python".to_string(),
+            line_start: start,
+            line_end: end,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let outer = make_node("Outer", NodeKind::Struct, 1, 20);
+        let inner = make_node("inner", NodeKind::Function, 5, 10);
+        let nodes = HashMap::from([(
+            PathBuf::from("src/nested.py"),
+            vec![outer.clone(), inner.clone()],
+        )]);
+        let index = EndpointLookupIndex::build(&nodes);
+
+        assert_eq!(
+            index.enclosing_symbol(Path::new("src/nested.py"), 7),
+            Some(inner.id)
+        );
+        assert_eq!(
+            index.enclosing_symbol(Path::new("src/nested.py"), 15),
+            Some(outer.id)
+        );
+        assert_eq!(
+            index.unique_function(Path::new("src/nested.py"), "inner"),
+            Some(NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/nested.py"),
+                name: "inner".to_string(),
+                kind: NodeKind::Function,
+            })
+        );
+    }
+
+    #[test]
     fn document_symbol_only_work_never_trips_zero_edge_watchdog() {
         assert!(!should_abort_zero_edge_pass(
             0,
@@ -2502,9 +3352,142 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn document_symbol_representative_prefers_non_lsp_source_with_lsp_fallback() {
+        let make_node = |name: &str, source| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/module.py"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source,
+        };
+        let lsp_first = make_node("<module>@lsp", ExtractionSource::Lsp);
+        let lsp_second = make_node("generated@lsp", ExtractionSource::Lsp);
+        let extracted = make_node("source_symbol", ExtractionSource::TreeSitter);
+        assert!(lsp_first.stable_id() < extracted.stable_id());
+
+        let mut mixed = vec![&lsp_first, &extracted];
+        sort_document_symbol_candidates(&mut mixed);
+        assert_eq!(mixed[0].stable_id(), extracted.stable_id());
+
+        let mut lsp_only = vec![&lsp_second, &lsp_first];
+        sort_document_symbol_candidates(&mut lsp_only);
+        assert_eq!(lsp_only[0].stable_id(), lsp_first.stable_id());
+    }
+
+    #[test]
+    fn pass1_preopen_files_are_deterministic_and_deduplicated() {
+        let item = |id: usize, file: &str, operation| LspPass1WorkItem {
+            id,
+            node: Node {
+                id: NodeId {
+                    root: "repo".to_string(),
+                    file: PathBuf::from(file),
+                    name: format!("symbol-{id}"),
+                    kind: NodeKind::Function,
+                },
+                language: "python".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: String::new(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            },
+            requested_operations: vec![operation],
+            attempt_count: 1,
+        };
+        let mut work_items = vec![
+            item(0, "tests/test_app.py", LspQueryOperation::DocumentSymbols),
+            item(1, "src/app.py", LspQueryOperation::CallHierarchy),
+            item(2, "src/app.py", LspQueryOperation::DocumentSymbols),
+        ];
+
+        assert_eq!(
+            pass1_work_item_files(&work_items),
+            [
+                PathBuf::from("src/app.py"),
+                PathBuf::from("tests/test_app.py")
+            ]
+        );
+        let barrier = take_pass1_document_symbol_barrier_item(&mut work_items)
+            .expect("the lexicographically first documentSymbol item is the startup item");
+        assert_eq!(barrier.id, 2);
+        assert_eq!(barrier.node.id.file, PathBuf::from("src/app.py"));
+        assert_eq!(work_items.len(), 2);
+        assert!(work_items.iter().all(|item| item.id != barrier.id));
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_some());
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_none());
+    }
+
+    #[tokio::test]
+    async fn document_symbol_barrier_retries_transport_timeout_without_sleeping() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed =
+            retry_document_symbol_barrier(tokio::time::Instant::now() + Duration::from_secs(1), {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if attempt == 1 {
+                            anyhow::bail!(
+                                "LSP request textDocument/documentSymbol timed out after 30s (id=1)"
+                            );
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        completed
+            .result
+            .expect("a normal transport timeout should retry before the deadline");
+        assert_eq!(completed.attempts, 2);
+        assert_eq!(completed.timeouts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn document_symbol_barrier_does_not_retry_invalid_response() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed =
+            retry_document_symbol_barrier(tokio::time::Instant::now() + Duration::from_secs(1), {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Err::<(), _>(anyhow::anyhow!(
+                            "documentSymbol response must be an array or null"
+                        ))
+                    }
+                }
+            })
+            .await;
+        let error = completed
+            .result
+            .expect_err("a malformed response must fail the barrier closed");
+
+        assert!(error.to_string().contains("array or null"));
+        assert_eq!(completed.attempts, 1);
+        assert_eq!(completed.timeouts, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn did_open_coordinator_dedupes_concurrent_same_file() {
-        let coordinator = Arc::new(DidOpenCoordinator::new("test-lsp".to_string()));
+        let coordinator = Arc::new(DidOpenCoordinator::new(
+            "test-lsp".to_string(),
+            "rust".to_string(),
+        ));
         let attempts = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut tasks = tokio::task::JoinSet::new();
@@ -2552,7 +3535,7 @@ mod tests {
 
     #[tokio::test]
     async fn did_open_failure_does_not_suppress_retry() {
-        let coordinator = DidOpenCoordinator::new("test-lsp".to_string());
+        let coordinator = DidOpenCoordinator::new("test-lsp".to_string(), "rust".to_string());
         let attempts = AtomicUsize::new(0);
 
         let first = coordinator

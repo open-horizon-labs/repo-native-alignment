@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, Repository};
 
 use crate::extract::lsp::{
-    planned_operations_for_node, planned_operations_for_node_with_broad_references,
+    MAX_INCREMENTAL_LSP_NODES, MAX_INCREMENTAL_LSP_OPERATIONS, planned_operations_for_node,
+    planned_operations_for_node_with_broad_references,
 };
 use crate::graph::Node;
 
-pub(crate) const MAX_CHANGED_LSP_NODES: usize = 4_096;
-pub(crate) const MAX_CHANGED_LSP_OPERATIONS: usize = 12_288;
+pub(crate) const MAX_CHANGED_LSP_NODES: usize = MAX_INCREMENTAL_LSP_NODES;
+pub(crate) const MAX_CHANGED_LSP_OPERATIONS: usize = MAX_INCREMENTAL_LSP_OPERATIONS;
 
 const SCOPE_HELP: &str = "use `--scope root --root <slug>` or `--scope repo` when bounded changed-file planning is unavailable";
 
@@ -225,6 +226,8 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
         if node.id.root != input.root_slug
             || node.language.is_empty()
             || !supported_languages.contains(&node.language)
+            || node.source == crate::graph::ExtractionSource::Lsp
+            || crate::ranking::is_test_function(node)
         {
             continue;
         }
@@ -297,6 +300,92 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
     touched_files: &HashSet<(String, PathBuf)>,
     cached_nodes: &[Node],
 ) -> Result<Arc<HashSet<String>>> {
+    plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+        touched_files,
+        cached_nodes,
+        &BTreeSet::new(),
+    )
+}
+
+pub(crate) fn plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+    touched_files: &HashSet<(String, PathBuf)>,
+    cached_nodes: &[Node],
+    rebuilt_partitions: &BTreeSet<String>,
+) -> Result<Arc<HashSet<String>>> {
+    plan_lsp_node_ids_for_touched_files_with_bounds(
+        touched_files,
+        cached_nodes,
+        rebuilt_partitions,
+        ChangedFileNodeBound::Enforce,
+    )
+}
+
+pub(crate) fn plan_lsp_node_ids_for_verified_structural_cache(
+    authorization: &crate::structural_cache::VerifiedStructuralCacheAuthorization,
+    plan: &crate::structural_cache::IncrementalImpactPlan,
+    cached_nodes: &[Node],
+) -> Result<Arc<HashSet<String>>> {
+    crate::structural_cache::validate_runtime_plan_handoff(authorization, plan)?;
+    let signed_budget = authorization.signed_operation_budget()?;
+    let touched_files = plan
+        .executed_paths
+        .iter()
+        .cloned()
+        .map(|path| (authorization.authorization.root_slug.clone(), path))
+        .collect::<HashSet<_>>();
+    plan_lsp_node_ids_for_touched_files_with_bounds(
+        &touched_files,
+        cached_nodes,
+        &plan.escalated_partitions,
+        ChangedFileNodeBound::AuthorizedStructuralCache {
+            signed_operation_count: usize::try_from(signed_budget.executed_estimate)
+                .context("signed structural-cache operation estimate does not fit usize")?,
+            authorized_operations_by_language: signed_budget
+                .authorized_operations_by_language
+                .clone(),
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChangedFileNodeBound {
+    Enforce,
+    AuthorizedStructuralCache {
+        signed_operation_count: usize,
+        authorized_operations_by_language: BTreeMap<String, Vec<String>>,
+    },
+}
+
+fn authorized_operations_for_node(node: &Node, authorized: &[String]) -> Vec<String> {
+    let mut requested = planned_operations_for_node(node);
+    if node.id.kind == crate::graph::NodeKind::Function
+        && requested
+            .iter()
+            .any(|operation| operation == "call_hierarchy")
+        && authorized
+            .binary_search_by(|operation| operation.as_str().cmp("call_hierarchy"))
+            .is_err()
+        && authorized
+            .binary_search_by(|operation| operation.as_str().cmp("references"))
+            .is_ok()
+    {
+        // Runtime uses references when the negotiated server capabilities do
+        // not include call hierarchy. The signed operation set records those
+        // negotiated operations, so preserve the same fallback at the
+        // verifier-to-runtime planning handoff.
+        requested.retain(|operation| operation != "call_hierarchy");
+        requested.push("references".to_string());
+    }
+    requested.retain(|operation| authorized.binary_search(operation).is_ok());
+    requested
+}
+
+fn plan_lsp_node_ids_for_touched_files_with_bounds(
+    touched_files: &HashSet<(String, PathBuf)>,
+    cached_nodes: &[Node],
+    rebuilt_partitions: &BTreeSet<String>,
+    node_bound: ChangedFileNodeBound,
+) -> Result<Arc<HashSet<String>>> {
     let supported_languages =
         crate::extract::EnricherRegistry::with_builtins().supported_languages();
     let touched_roots: HashSet<&str> = touched_files
@@ -304,6 +393,9 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
         .map(|(root, _)| root.as_str())
         .collect();
     let mut planned_node_ids = HashSet::new();
+    let mut planned_languages = BTreeSet::new();
+    let mut document_symbol_files = BTreeSet::<(String, String, PathBuf)>::new();
+    let mut eligible_rebuild_node_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut operation_count = 0usize;
 
     for node in cached_nodes {
@@ -311,28 +403,111 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files(
             || node.id.file.as_os_str().is_empty()
             || node.language.is_empty()
             || !supported_languages.contains(&node.language)
+            // LSP-produced nodes are persisted results, not query seeds. They
+            // may remain in the graph as evidence and edge endpoints, but
+            // scheduling them recursively re-queries carried output and
+            // inflates the operation bound with work that is not executable.
+            || node.source == crate::graph::ExtractionSource::Lsp
         {
             continue;
         }
         let file = normalize_relative(&node.id.file)?;
-        if !touched_files.contains(&(node.id.root.clone(), file)) {
+        let touched = touched_files.contains(&(node.id.root.clone(), file.clone()));
+        let stable_id = node.stable_id();
+        let mut requested_operations = planned_operations_for_node(node);
+        if let ChangedFileNodeBound::AuthorizedStructuralCache {
+            authorized_operations_by_language,
+            ..
+        } = &node_bound
+        {
+            let authorized = authorized_operations_by_language
+                .get(&node.language)
+                .context("signed structural-cache operation budget lacks a target language")?;
+            if touched
+                && authorized
+                    .binary_search_by(|operation| operation.as_str().cmp("document_symbols"))
+                    .is_ok()
+            {
+                let key = (node.id.root.clone(), node.language.clone(), file.clone());
+                document_symbol_files.insert(key);
+            }
+            requested_operations = authorized_operations_for_node(node, authorized);
+        }
+        if crate::ranking::is_test_function(node) || requested_operations.is_empty() {
             continue;
         }
-
-        let requested_operations = planned_operations_for_node(node);
-        if requested_operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
+        if rebuilt_partitions.contains(&node.language) {
+            eligible_rebuild_node_ids
+                .entry(node.language.clone())
+                .or_default()
+                .insert(stable_id.clone());
+        }
+        if !touched || !planned_node_ids.insert(stable_id) {
             continue;
         }
+        planned_languages.insert(node.language.clone());
         operation_count = operation_count
             .checked_add(requested_operations.len())
             .context("changed-file LSP operation count overflowed")?;
-        if planned_node_ids.len() > MAX_CHANGED_LSP_NODES
-            || operation_count > MAX_CHANGED_LSP_OPERATIONS
+    }
+
+    // Runtime Pass 1 emits one document-symbol work item for each admitted file.
+    // Count the signed per-file document-symbol work independently of query
+    // node IDs. Endpoint-only source/test context is attached by the language
+    // accumulator without making those nodes schedulable.
+    if !document_symbol_files.is_empty() {
+        let document_symbol_count = document_symbol_files.len();
+        for (_root, language, _file) in document_symbol_files {
+            planned_languages.insert(language);
+        }
+        operation_count = operation_count
+            .checked_add(document_symbol_count)
+            .context("changed-file LSP document-symbol operation count overflowed")?;
+    }
+
+    for (partition, expected_node_ids) in eligible_rebuild_node_ids {
+        if let Some(missing_node_id) = expected_node_ids
+            .iter()
+            .find(|node_id| !planned_node_ids.contains(*node_id))
         {
             anyhow::bail!(
-                "changed-file LSP plan exceeds its bound (max {} nodes / {} operations); {SCOPE_HELP}",
+                "descriptor-owned LSP partition rebuild for {partition} is incomplete (missing {missing_node_id}); {SCOPE_HELP}"
+            );
+        }
+    }
+
+    // The structural-cache verifier already bounds the exact authorized file
+    // plan by operations. A dense file may legitimately contain more nodes
+    // than the ordinary changed-file ceiling while remaining below that same
+    // operation ceiling, so only the verifier-bound path may skip the
+    // redundant node-count check.
+    let (exceeds_node_bound, bounded_operation_count) = match &node_bound {
+        ChangedFileNodeBound::Enforce => (
+            planned_node_ids.len() > MAX_CHANGED_LSP_NODES,
+            operation_count,
+        ),
+        ChangedFileNodeBound::AuthorizedStructuralCache {
+            signed_operation_count,
+            ..
+        } => (false, operation_count.max(*signed_operation_count)),
+    };
+    if bounded_operation_count > MAX_CHANGED_LSP_OPERATIONS {
+        anyhow::bail!(
+            "changed-file LSP plan exceeds its bound (max {} operations); {SCOPE_HELP}",
+            MAX_CHANGED_LSP_OPERATIONS,
+        );
+    }
+    if exceeds_node_bound {
+        let unrebuilt_languages = planned_languages
+            .difference(rebuilt_partitions)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unrebuilt_languages.is_empty() {
+            anyhow::bail!(
+                "changed-file LSP plan exceeds its bound (max {} nodes / {} operations) and affected descriptor partition(s) were not rebuilt: {}; {SCOPE_HELP}",
                 MAX_CHANGED_LSP_NODES,
-                MAX_CHANGED_LSP_OPERATIONS
+                MAX_CHANGED_LSP_OPERATIONS,
+                unrebuilt_languages.join(", ")
             );
         }
     }
@@ -547,6 +722,70 @@ mod tests {
     }
 
     #[test]
+    fn carried_lsp_output_is_not_planned_as_fresh_changed_file_work() {
+        let seed = node("src/changed.rs", "changed", NodeKind::Function);
+        let seed_id = seed.stable_id();
+        let mut carried_output = node("src/changed.rs", "carried", NodeKind::Function);
+        carried_output.source = ExtractionSource::Lsp;
+        let nodes = vec![seed, carried_output];
+
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: Some(PathBuf::from("src/changed.rs")),
+                new_path: Some(PathBuf::from("src/changed.rs")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: 16,
+            max_operations: 48,
+            allow_broad_references: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.planned_node_ids().as_ref(), &HashSet::from([seed_id]));
+        assert_eq!(plan.operation_count, 1);
+    }
+
+    #[test]
+    fn test_file_function_fanout_above_operation_ceiling_is_not_planned() {
+        let nodes = (0..=MAX_CHANGED_LSP_OPERATIONS)
+            .map(|index| {
+                let mut test = node(
+                    "tests/test_dense.py",
+                    &format!("test_symbol_{index}"),
+                    NodeKind::Function,
+                );
+                test.language = "python".to_string();
+                test
+            })
+            .collect::<Vec<_>>();
+
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: Some(PathBuf::from("tests/test_dense.py")),
+                new_path: Some(PathBuf::from("tests/test_dense.py")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: MAX_CHANGED_LSP_NODES,
+            max_operations: MAX_CHANGED_LSP_OPERATIONS,
+            allow_broad_references: false,
+        })
+        .unwrap();
+
+        assert!(plan.planned_nodes.is_empty());
+        assert_eq!(plan.operation_count, 0);
+        assert_eq!(
+            plan.unmapped_files,
+            vec![PathBuf::from("tests/test_dense.py")]
+        );
+    }
+
+    #[test]
     fn scanner_touched_files_plan_only_stable_ids_from_touched_paths() {
         let nodes = vec![
             node("src/changed.rs", "changed", NodeKind::Function),
@@ -561,6 +800,140 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
+    }
+
+    #[test]
+    fn verified_plan_counts_one_signed_document_symbol_operation_per_file() {
+        let file_count = (MAX_CHANGED_LSP_OPERATIONS / 2) + 1;
+        let nodes = (0..file_count)
+            .map(|index| {
+                node(
+                    &format!("src/file_{index}.rs"),
+                    &format!("symbol_{index}"),
+                    NodeKind::Function,
+                )
+            })
+            .collect::<Vec<_>>();
+        let touched_files = nodes
+            .iter()
+            .map(|node| ("fixture".to_string(), node.id.file.clone()))
+            .collect::<HashSet<_>>();
+        let authorized_operations_by_language = BTreeMap::from([(
+            "rust".to_string(),
+            vec!["call_hierarchy".to_string(), "document_symbols".to_string()],
+        )]);
+
+        let error = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::new(),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 0,
+                authorized_operations_by_language: authorized_operations_by_language.clone(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds its bound"));
+
+        let rebuilt_error = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::from(["rust".to_string()]),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 0,
+                authorized_operations_by_language,
+            },
+        )
+        .unwrap_err();
+        assert!(rebuilt_error.to_string().contains("exceeds its bound"));
+    }
+
+    #[test]
+    fn verified_plan_preserves_negotiated_reference_fallback_and_test_document_symbols() {
+        let mut source = node("src/app.py", "greet", NodeKind::Function);
+        source.language = "python".to_string();
+        let source_id = source.stable_id();
+        let mut test = node("tests/test_app.py", "test_greet", NodeKind::Function);
+        test.language = "python".to_string();
+        let test_id = test.stable_id();
+        let mut import = node(
+            "tests/test_app.py",
+            "from src.app import greet",
+            NodeKind::Import,
+        );
+        import.language = "python".to_string();
+        let import_id = import.stable_id();
+        let nodes = vec![source.clone(), test, import];
+        let touched_files = nodes
+            .iter()
+            .map(|node| ("fixture".to_string(), node.id.file.clone()))
+            .collect::<HashSet<_>>();
+        let authorized = vec!["document_symbols".to_string(), "references".to_string()];
+
+        assert_eq!(
+            authorized_operations_for_node(&source, &authorized),
+            vec!["references"]
+        );
+        let ids = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::new(),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 3,
+                authorized_operations_by_language: BTreeMap::from([(
+                    "python".to_string(),
+                    authorized,
+                )]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids.as_ref(), &HashSet::from([source_id]));
+        assert!(!ids.contains(&test_id));
+        assert!(!ids.contains(&import_id));
+    }
+
+    #[test]
+    fn over_bound_plan_requires_and_accepts_complete_descriptor_partition_rebuild() {
+        let mut nodes = (0..=MAX_CHANGED_LSP_NODES)
+            .map(|index| {
+                node(
+                    "src/dense.rs",
+                    &format!("symbol_{index}"),
+                    NodeKind::Function,
+                )
+            })
+            .collect::<Vec<_>>();
+        let touched_files = HashSet::from([("fixture".to_string(), PathBuf::from("src/dense.rs"))]);
+
+        let bounded_error =
+            plan_lsp_node_ids_for_touched_files(&touched_files, &nodes).unwrap_err();
+        assert!(bounded_error.to_string().contains("exceeds its bound"));
+        assert!(bounded_error.to_string().contains("rust"));
+
+        let rebuilt_partitions = BTreeSet::from(["rust".to_string()]);
+        let ids = plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+            &touched_files,
+            &nodes,
+            &rebuilt_partitions,
+        )
+        .unwrap();
+        assert_eq!(ids.len(), MAX_CHANGED_LSP_NODES + 1);
+
+        nodes.push(node(
+            "src/not-selected.rs",
+            "not_selected",
+            NodeKind::Function,
+        ));
+        let incomplete_error = plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
+            &touched_files,
+            &nodes,
+            &rebuilt_partitions,
+        )
+        .unwrap_err();
+        assert!(incomplete_error.to_string().contains("is incomplete"));
+        assert!(incomplete_error.to_string().contains("not-selected.rs"));
     }
 
     #[test]

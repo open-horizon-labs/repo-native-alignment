@@ -697,8 +697,8 @@ mod tests {
     #[test]
     fn server_profile_applies_to_references_implementations_and_type_hierarchy() {
         static FUNCTION_AND_TRAIT: &[NodeKind] = &[NodeKind::Function, NodeKind::Trait];
-        let profile = LspQueryProfile::new("python", "pyright-langserver")
-            .with_allowed_kinds(FUNCTION_AND_TRAIT);
+        let profile =
+            LspQueryProfile::new("python", "pyrefly").with_allowed_kinds(FUNCTION_AND_TRAIT);
         let capabilities = LspServerCapabilities {
             references: true,
             implementations: true,

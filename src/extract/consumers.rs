@@ -223,11 +223,29 @@ impl ExtractionConsumer for TreeSitterConsumer {
 #[derive(Default)]
 pub struct LanguageAccumulatorConsumer {
     planned_node_ids: Option<Arc<HashSet<String>>>,
+    file_readiness: bool,
+    file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
 }
 
 impl LanguageAccumulatorConsumer {
     pub fn with_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
-        Self { planned_node_ids }
+        Self {
+            planned_node_ids,
+            file_readiness: false,
+            file_readiness_filter: None,
+        }
+    }
+
+    fn with_planned_nodes_and_file_readiness(
+        planned_node_ids: Option<Arc<HashSet<String>>>,
+        file_readiness: bool,
+        file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
+    ) -> Self {
+        Self {
+            planned_node_ids,
+            file_readiness,
+            file_readiness_filter,
+        }
     }
 }
 
@@ -257,6 +275,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootExtracted {
             slug,
+            path,
             nodes,
             dirty_slugs,
             ..
@@ -297,6 +316,92 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
                 .entry(node.language.clone())
                 .or_default()
                 .push(node.clone());
+        }
+        if self.planned_node_ids.is_some()
+            && let Some(file_filter) = self.file_readiness_filter.as_deref()
+            && !by_lang.is_empty()
+        {
+            let active_languages = by_lang.keys().cloned().collect::<HashSet<_>>();
+            for node in nodes.iter() {
+                if node.language.is_empty()
+                    || !active_languages.contains(&node.language)
+                    || node.source == crate::graph::ExtractionSource::Lsp
+                    || !file_filter.contains(&node.id.file)
+                    || dirty_set.is_some_and(|dirty| !dirty.contains(&node.id.root))
+                    || !emitted_planned_ids.insert(node.stable_id())
+                {
+                    continue;
+                }
+                // Reference/call results must resolve against precise nodes in
+                // every executed impact-closure file, including tests. Carry
+                // them as event-local, empty-language endpoint context so the
+                // LSP resolver can see their NodeIds while query admission can
+                // never schedule them as additional work.
+                let mut endpoint = node.clone();
+                endpoint.language.clear();
+                by_lang
+                    .get_mut(&node.language)
+                    .expect("active language bucket disappeared")
+                    .push(endpoint);
+            }
+        }
+        let scoped_readiness_anchors = self.planned_node_ids.as_ref().map(|_| {
+            let mut anchors_by_language_and_file =
+                std::collections::BTreeMap::<(String, PathBuf), Node>::new();
+            for node in nodes.iter().filter(|node| {
+                !node.language.is_empty()
+                    && node.source != crate::graph::ExtractionSource::Lsp
+                    && dirty_set.is_none_or(|dirty| dirty.contains(&node.id.root))
+                    && self
+                        .file_readiness_filter
+                        .as_deref()
+                        .is_none_or(|filter| filter.contains(&node.id.file))
+            }) {
+                let key = (node.language.clone(), node.id.file.clone());
+                let stable_id = node.stable_id();
+                let should_replace = anchors_by_language_and_file
+                    .get(&key)
+                    .is_none_or(|existing| stable_id < existing.stable_id());
+                if should_replace {
+                    anchors_by_language_and_file.insert(key, node.clone());
+                }
+            }
+
+            let mut anchors_by_language = std::collections::BTreeMap::<String, Vec<Node>>::new();
+            for ((language, _file), mut anchor) in anchors_by_language_and_file {
+                // A planned scope must never broaden back to the full graph merely
+                // to carry each executed file into inventory-only readiness. These
+                // event-local clones cannot become LSP query seeds because their
+                // language is empty; RootExtracted retains the real nodes.
+                anchor.language.clear();
+                anchors_by_language
+                    .entry(language)
+                    .or_default()
+                    .push(anchor);
+            }
+            anchors_by_language
+        });
+        if self.file_readiness && dirty_slugs.as_ref().is_none_or(|dirty| !dirty.is_empty()) {
+            for (language, paths) in crate::lsp_completeness::included_lsp_paths_by_language(path)?
+            {
+                if self
+                    .file_readiness_filter
+                    .as_deref()
+                    .is_some_and(|filter| !paths.iter().any(|path| filter.contains(path)))
+                {
+                    continue;
+                }
+                // Inventory-only languages need root and file identity for returned
+                // document symbols. An explicit planned scope receives one inert
+                // real anchor per filtered file; passing the complete graph here
+                // would bypass the signed node plan and schedule uncounted LSP work.
+                by_lang.entry(language.clone()).or_insert_with(|| {
+                    scoped_readiness_anchors
+                        .as_ref()
+                        .and_then(|anchors| anchors.get(&language).cloned())
+                        .unwrap_or_else(|| nodes.to_vec())
+                });
+            }
         }
 
         let mut events: Vec<ExtractionEvent> = Vec::with_capacity(by_lang.len());
@@ -1552,7 +1657,7 @@ impl ExtractionConsumer for LspConsumer {
         };
 
         match enrichment_result {
-            Ok(enrichment) => {
+            Ok(mut enrichment) => {
                 let server_missing = !enrichment.any_enricher_ran;
                 tracing::info!(
                     "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes, {} patches",
@@ -1563,27 +1668,33 @@ impl ExtractionConsumer for LspConsumer {
                     enrichment.updated_nodes.len(),
                 );
                 let metrics = Arc::from(enrichment.lsp_query_metrics.into_boxed_slice());
-                Ok(vec![
-                    ExtractionEvent::EnrichmentComplete {
-                        slug: slug.clone(),
-                        language: language.clone(),
-                        added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
-                        new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
-                        updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
-                        server_name: Some(self.enricher.name().to_string()),
-                        error_count: enrichment.error_count,
-                        server_missing,
-                        remediation: self.enricher.toolchain_remediation().map(str::to_string),
-                        aborted: enrichment.aborted,
-                        diagnostic: enrichment.diagnostic,
-                        validation: enrichment.lsp_validation.map(Box::new),
-                    },
-                    ExtractionEvent::LspQueryMetrics {
-                        slug: slug.clone(),
-                        language: language.clone(),
-                        metrics,
-                    },
-                ])
+                let mut events = enrichment
+                    .lsp_file_validations
+                    .drain(..)
+                    .map(|validation| ExtractionEvent::LspFileValidation {
+                        validation: Box::new(validation),
+                    })
+                    .collect::<Vec<_>>();
+                events.push(ExtractionEvent::EnrichmentComplete {
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
+                    new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                    updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
+                    server_name: Some(self.enricher.name().to_string()),
+                    error_count: enrichment.error_count,
+                    server_missing,
+                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
+                    aborted: enrichment.aborted,
+                    diagnostic: enrichment.diagnostic,
+                    validation: enrichment.lsp_validation.map(Box::new),
+                });
+                events.push(ExtractionEvent::LspQueryMetrics {
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    metrics,
+                });
+                Ok(events)
             }
             Err(e) => {
                 // LSP enrichment failure is non-fatal: emit EnrichmentComplete with
@@ -1672,6 +1783,8 @@ pub struct AllEnrichmentsGate {
     skip_lsp: bool,
     /// Optional stable-node-ID set for bounded changed-file LSP scheduling.
     planned_node_ids: Option<Arc<HashSet<String>>>,
+    file_readiness: bool,
+    file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
 }
 
 struct GateState {
@@ -1704,6 +1817,15 @@ impl AllEnrichmentsGate {
     }
 
     pub fn with_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
+        Self::with_options(planned_node_ids, false, false, None)
+    }
+
+    fn with_options(
+        planned_node_ids: Option<Arc<HashSet<String>>>,
+        skip_lsp: bool,
+        file_readiness: bool,
+        file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
+    ) -> Self {
         Self {
             state: Mutex::new(GateState {
                 expected: 0,
@@ -1717,8 +1839,10 @@ impl AllEnrichmentsGate {
                 enrichment_diagnostics: Vec::new(),
                 fired: false,
             }),
-            skip_lsp: false,
+            skip_lsp,
             planned_node_ids,
+            file_readiness,
+            file_readiness_filter,
         }
     }
 
@@ -1729,22 +1853,7 @@ impl AllEnrichmentsGate {
     }
 
     pub fn with_skip_lsp_and_planned_nodes(planned_node_ids: Option<Arc<HashSet<String>>>) -> Self {
-        Self {
-            state: Mutex::new(GateState {
-                expected: 0,
-                received: 0,
-                base_nodes: None,
-                base_edges: None,
-                slug: None,
-                lsp_edges: Vec::new(),
-                lsp_nodes: Vec::new(),
-                updated_nodes: Vec::new(),
-                enrichment_diagnostics: Vec::new(),
-                fired: false,
-            }),
-            skip_lsp: true,
-            planned_node_ids,
-        }
+        Self::with_options(planned_node_ids, true, false, None)
     }
 }
 
@@ -1776,6 +1885,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
         match event {
             ExtractionEvent::RootExtracted {
                 slug,
+                path,
                 nodes,
                 edges,
                 dirty_slugs,
@@ -1823,6 +1933,21 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         {
                             seen.insert(n.language.clone());
                         }
+                    }
+                    if self.file_readiness
+                        && dirty_slugs.as_ref().is_none_or(|dirty| !dirty.is_empty())
+                    {
+                        seen.extend(
+                            crate::lsp_completeness::included_lsp_paths_by_language(path)?
+                                .into_iter()
+                                .filter(|(language, paths)| {
+                                    supported.contains(language)
+                                        && self.file_readiness_filter.as_deref().is_none_or(
+                                            |filter| paths.iter().any(|path| filter.contains(path)),
+                                        )
+                                })
+                                .map(|(language, _)| language),
+                        );
                     }
                     seen.len()
                 };
@@ -2318,6 +2443,11 @@ pub struct BusOptions {
     /// When present, only these stable node IDs may emit LSP work. The full graph
     /// still flows through finalization and persistence.
     pub lsp_node_filter: Option<Arc<HashSet<String>>>,
+    /// Validate and seed every included inventory file. This is enabled only for
+    /// explicit full/repo LSP qualification, never for stub or scoped pipelines.
+    pub file_readiness: bool,
+    /// Exact repository-relative files to validate during incremental reuse.
+    pub file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
     /// Enables otherwise default-denied broad reference operations and enforces
     /// one global request/time circuit across every language server.
     pub(crate) broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
@@ -2371,6 +2501,8 @@ pub fn build_builtin_bus(
         lance_repo_root,
         skip_lsp,
         lsp_node_filter,
+        file_readiness,
+        file_readiness_filter,
         broad_reference_budget,
     } = opts;
     use crate::extract::event_bus::EventBus;
@@ -2396,9 +2528,14 @@ pub fn build_builtin_bus(
     // --- RootExtracted consumers ---
     // LanguageAccumulatorConsumer must run first (emits LanguageDetected which
     // triggers LspConsumers, then AllEnrichmentsGate counts up).
-    bus.register(Box::new(LanguageAccumulatorConsumer::with_planned_nodes(
-        lsp_node_filter.clone(),
-    )));
+    let file_readiness = file_readiness && !skip_lsp;
+    bus.register(Box::new(
+        LanguageAccumulatorConsumer::with_planned_nodes_and_file_readiness(
+            lsp_node_filter.clone(),
+            file_readiness,
+            file_readiness_filter.clone(),
+        ),
+    ));
 
     // AllEnrichmentsGate: must subscribe to RootExtracted BEFORE LspConsumers
     // fire so it captures the language count before any EnrichmentComplete arrives.
@@ -2406,9 +2543,14 @@ pub fn build_builtin_bus(
     // When skip_lsp=true (#574), the gate forces expected=0 so AllEnrichmentsDone
     // fires immediately without waiting for EnrichmentComplete events.
     bus.register(Box::new(if skip_lsp {
-        AllEnrichmentsGate::with_skip_lsp_and_planned_nodes(lsp_node_filter)
+        AllEnrichmentsGate::with_skip_lsp_and_planned_nodes(lsp_node_filter.clone())
     } else {
-        AllEnrichmentsGate::with_planned_nodes(lsp_node_filter)
+        AllEnrichmentsGate::with_options(
+            lsp_node_filter.clone(),
+            false,
+            file_readiness,
+            file_readiness_filter.clone(),
+        )
     }));
 
     // OpenApi, gRPC, Embedding — subscribe to RootExtracted independently.
@@ -2438,8 +2580,12 @@ pub fn build_builtin_bus(
         supported_languages.sort(); // deterministic registration order
 
         for lang in &supported_languages {
-            let single_lang_enricher =
-                build_single_language_enricher(lang, broad_reference_budget.clone());
+            let single_lang_enricher = build_single_language_enricher(
+                lang,
+                broad_reference_budget.clone(),
+                file_readiness,
+                file_readiness_filter.clone(),
+            );
             bus.register(Box::new(LspConsumer {
                 language: lang.clone(),
                 enricher: single_lang_enricher,
@@ -2496,8 +2642,15 @@ pub fn build_builtin_bus(
 fn build_single_language_enricher(
     language: &str,
     broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+    file_readiness: bool,
+    file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
 ) -> Arc<dyn crate::extract::Enricher> {
-    if let Some(enricher) = build_single_language_lsp_enricher(language, broad_reference_budget) {
+    if let Some(enricher) = build_single_language_lsp_enricher(
+        language,
+        broad_reference_budget,
+        file_readiness,
+        file_readiness_filter,
+    ) {
         return Arc::new(enricher);
     }
 
@@ -2515,11 +2668,17 @@ fn build_single_language_enricher(
 fn build_single_language_lsp_enricher(
     language: &str,
     broad_reference_budget: Option<Arc<crate::extract::lsp::LspBroadReferenceBudget>>,
+    file_readiness: bool,
+    file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
 ) -> Option<crate::extract::lsp::LspEnricher> {
-    crate::extract::lsp::builtin_lsp_enricher(language).map(|enricher| match broad_reference_budget
-    {
-        Some(budget) => enricher.with_broad_references(budget),
-        None => enricher,
+    crate::extract::lsp::builtin_lsp_enricher(language).map(|enricher| {
+        let enricher = enricher
+            .with_file_readiness(file_readiness)
+            .with_file_readiness_filter(file_readiness_filter);
+        match broad_reference_budget {
+            Some(budget) => enricher.with_broad_references(budget),
+            None => enricher,
+        }
     })
 }
 
@@ -2676,12 +2835,15 @@ async fn emit_enrichment_pipeline_inner(
 
     let mut validations = events
         .iter()
-        .filter_map(|event| match event {
+        .flat_map(|event| match event {
             ExtractionEvent::EnrichmentComplete {
                 validation: Some(validation),
                 ..
-            } => Some(validation.as_ref().clone()),
-            _ => None,
+            } => vec![validation.as_ref().clone()],
+            ExtractionEvent::LspFileValidation { validation } => {
+                vec![validation.as_ref().clone()]
+            }
+            _ => Vec::new(),
         })
         .collect::<Vec<_>>();
     validations.sort_by(|left, right| {
@@ -3059,6 +3221,163 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn planned_file_readiness_keeps_every_test_only_file_inert_and_scoped() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_one.py"),
+            "def test_one():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_two.py"),
+            "def test_two():\n    assert True\n",
+        )
+        .unwrap();
+        let make_test_node = |file: &str, name: &str| Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from(file),
+                name: name.into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 2,
+            signature: format!("def {name}()"),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: repo.path().to_path_buf(),
+            dirty_slugs: None,
+            nodes: Arc::from(
+                vec![
+                    make_test_node("tests/test_one.py", "test_one"),
+                    make_test_node("tests/test_two.py", "test_two"),
+                ]
+                .into_boxed_slice(),
+            ),
+            edges: Arc::from([]),
+        };
+        let consumer = LanguageAccumulatorConsumer::with_planned_nodes_and_file_readiness(
+            Some(Arc::new(HashSet::new())),
+            true,
+            Some(Arc::new(HashSet::from([
+                PathBuf::from("tests/test_one.py"),
+                PathBuf::from("tests/test_two.py"),
+            ]))),
+        );
+
+        let events = consumer.on_event(&event).await.unwrap();
+        let python_nodes = events
+            .iter()
+            .find_map(|event| match event {
+                ExtractionEvent::LanguageDetected {
+                    language, nodes, ..
+                } if language == "python" => Some(nodes),
+                _ => None,
+            })
+            .expect("Python inventory readiness event");
+
+        assert_eq!(python_nodes.len(), 2);
+        assert!(
+            python_nodes.iter().all(|node| node.language.is_empty()),
+            "event-local file anchors must not become LSP query seeds"
+        );
+        assert_eq!(
+            python_nodes
+                .iter()
+                .map(|node| node.id.file.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                PathBuf::from("tests/test_one.py"),
+                PathBuf::from("tests/test_two.py"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_file_readiness_carries_unscheduled_cross_file_endpoint_context() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        std::fs::write(
+            repo.path().join("src/app.py"),
+            "def greet():\n    return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_app.py"),
+            "def test_greet():\n    assert True\n",
+        )
+        .unwrap();
+        let make_node = |file: &str, name: &str| Node {
+            id: NodeId {
+                root: "fixture".into(),
+                file: PathBuf::from(file),
+                name: name.into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 2,
+            signature: format!("def {name}()"),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let source = make_node("src/app.py", "greet");
+        let test = make_node("tests/test_app.py", "test_greet");
+        let event = ExtractionEvent::RootExtracted {
+            slug: "fixture".into(),
+            path: repo.path().to_path_buf(),
+            dirty_slugs: None,
+            nodes: Arc::from(vec![source.clone(), test.clone()].into_boxed_slice()),
+            edges: Arc::from([]),
+        };
+        let consumer = LanguageAccumulatorConsumer::with_planned_nodes_and_file_readiness(
+            Some(Arc::new(HashSet::from([source.stable_id()]))),
+            true,
+            Some(Arc::new(HashSet::from([
+                PathBuf::from("src/app.py"),
+                PathBuf::from("tests/test_app.py"),
+            ]))),
+        );
+
+        let events = consumer.on_event(&event).await.unwrap();
+        let python_nodes = events
+            .iter()
+            .find_map(|event| match event {
+                ExtractionEvent::LanguageDetected {
+                    language, nodes, ..
+                } if language == "python" => Some(nodes),
+                _ => None,
+            })
+            .expect("Python planned event");
+
+        assert_eq!(python_nodes.len(), 2);
+        assert!(
+            python_nodes
+                .iter()
+                .any(|node| { node.id == source.id && node.language == "python" })
+        );
+        assert!(
+            python_nodes
+                .iter()
+                .any(|node| { node.id == test.id && node.language.is_empty() })
+        );
+    }
+
     /// Verify TreeSitterConsumer skips lsp_only roots.
     #[tokio::test]
     async fn test_tree_sitter_consumer_skips_lsp_only() {
@@ -3180,8 +3499,8 @@ mod tests {
             .find(|descriptor| descriptor.language() == "python")
             .expect("python descriptor");
         let registry_path = descriptor.build();
-        let event_bus_path =
-            build_single_language_lsp_enricher("python", None).expect("python EventBus enricher");
+        let event_bus_path = build_single_language_lsp_enricher("python", None, false, None)
+            .expect("python EventBus enricher");
 
         assert_eq!(
             event_bus_path.enrichable_kinds(),
@@ -3201,7 +3520,7 @@ mod tests {
         );
         assert!(
             !event_bus_path.allows_declared_const_references(),
-            "Pyright declared-Const references remain disabled after the #768 probe"
+            "Python declared-Const references remain disabled without a qualifying probe"
         );
         assert_eq!(
             crate::extract::Enricher::name(&event_bus_path),

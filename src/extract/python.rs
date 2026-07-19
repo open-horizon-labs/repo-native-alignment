@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
-use super::configs::PYTHON_CONFIG;
+use super::configs::{CYTHON_CONFIG, PYTHON_CONFIG};
 use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
@@ -30,7 +30,7 @@ impl PythonExtractor {
 
 impl Extractor for PythonExtractor {
     fn extensions(&self) -> &[&str] {
-        &["py"]
+        &["py", "pyx", "pxd", "pxi", "tp"]
     }
 
     fn name(&self) -> &str {
@@ -38,7 +38,12 @@ impl Extractor for PythonExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
-        let mut result = GenericExtractor::new(&PYTHON_CONFIG).run(path, content)?;
+        let config = if path.extension().and_then(|extension| extension.to_str()) == Some("py") {
+            &PYTHON_CONFIG
+        } else {
+            &CYTHON_CONFIG
+        };
+        let mut result = GenericExtractor::new(config).run(path, content)?;
 
         // Python-specific: ALL_CAPS module-level assignments as Const nodes.
         let mut parser = tree_sitter::Parser::new();
@@ -49,6 +54,7 @@ impl Extractor for PythonExtractor {
                 path,
                 content.as_bytes(),
                 &mut result.nodes,
+                config.language_name,
             );
         }
 
@@ -62,6 +68,7 @@ fn collect_allcaps_consts(
     path: &Path,
     source: &[u8],
     nodes: &mut Vec<Node>,
+    language: &str,
 ) {
     if node.kind() == "expression_statement" {
         for i in 0..node.child_count() {
@@ -102,7 +109,7 @@ fn collect_allcaps_consts(
                             name: name_str,
                             kind: NodeKind::Const,
                         },
-                        language: "python".to_string(),
+                        language: language.to_string(),
                         line_start: child.start_position().row + 1,
                         line_end: child.end_position().row + 1,
                         signature,
@@ -117,7 +124,7 @@ fn collect_allcaps_consts(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_allcaps_consts(child, path, source, nodes);
+            collect_allcaps_consts(child, path, source, nodes, language);
         }
     }
 }
@@ -126,6 +133,26 @@ fn collect_allcaps_consts(
 mod tests {
     use super::*;
     use crate::graph::EdgeKind;
+
+    #[test]
+    fn cython_source_extensions_use_the_python_structural_extractor() {
+        let extractor = PythonExtractor::new();
+        for extension in ["pyx", "pxd", "pxi", "tp"] {
+            assert!(extractor.extensions().contains(&extension));
+        }
+
+        let result = extractor
+            .extract(
+                Path::new("src/kernel.pyx"),
+                "def kernel(value):\n    return value\n",
+            )
+            .unwrap();
+        assert!(result.nodes.iter().any(|node| {
+            node.id.name == "kernel"
+                && node.id.kind == NodeKind::Function
+                && node.language == "cython"
+        }));
+    }
 
     #[test]
     fn test_extract_python_functions_and_classes() {

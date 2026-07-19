@@ -359,9 +359,9 @@ async fn persist_graph_incremental_with_retry_limit(
                     })
                     .reduce(DfExpr::or)
                     .expect("non-empty deleted-files chunk");
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete symbols for removed files: {}", e);
-                }
+                tbl.delete(&predicate)
+                    .await
+                    .context("Failed to delete symbols for removed files")?;
             }
         }
 
@@ -440,9 +440,9 @@ async fn persist_graph_incremental_with_retry_limit(
         {
             for chunk in deleted_edge_ids.chunks(PREDICATE_BATCH_SIZE) {
                 let predicate = string_isin("id", chunk.iter().cloned());
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete edges for removed files: {}", e);
-                }
+                tbl.delete(&predicate)
+                    .await
+                    .context("Failed to delete edges for removed files")?;
             }
         }
 
@@ -1546,6 +1546,168 @@ mod tests {
         assert!(
             !groups.contains_key(&EdgeKind::References),
             "metadata-only workaround must not satisfy supports traversal"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_http_path_metadata_round_trips_as_present_empty_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let mut endpoint = make_test_node("PUT ErfaAstromInterpolator::__init__");
+        endpoint.id.file = PathBuf::from("astropy/coordinates/erfa_astrom.py");
+        endpoint.id.kind = NodeKind::ApiEndpoint;
+        endpoint.language = "python".to_string();
+        endpoint.metadata.insert(
+            super::super::metadata_keys::HTTP_METHOD.to_string(),
+            "PUT".to_string(),
+        );
+        endpoint.metadata.insert(
+            super::super::metadata_keys::HTTP_PATH.to_string(),
+            String::new(),
+        );
+
+        persist_graph_to_lance(repo_root, &[endpoint.clone()], &[])
+            .await
+            .expect("persist endpoint");
+
+        let first = load_graph_from_lance(repo_root)
+            .await
+            .expect("first reopen");
+        let second = load_graph_from_lance(repo_root)
+            .await
+            .expect("second reopen");
+        let first_endpoint = first.nodes.first().expect("reloaded endpoint");
+        assert_eq!(first_endpoint.id, endpoint.id);
+        assert_eq!(first_endpoint.metadata, endpoint.metadata);
+        assert_eq!(
+            first_endpoint
+                .metadata
+                .get(super::super::metadata_keys::HTTP_PATH)
+                .map(String::as_str),
+            Some(""),
+            "non-null empty http_path must remain distinguishable from missing metadata"
+        );
+        assert_eq!(
+            serde_json::to_value(&first.nodes).expect("serialize first reopen"),
+            serde_json::to_value(&second.nodes).expect("serialize second reopen"),
+            "reopening the same persisted endpoint must be exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn colonful_markdown_endpoint_and_edge_round_trip_exactly() {
+        use crate::graph::{Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let section = Node {
+            id: NodeId {
+                root: "checkout".to_string(),
+                file: PathBuf::from(".github/PULL_REQUEST_TEMPLATE.md"),
+                name: ".github/PULL_REQUEST_TEMPLATE.md::body::ast:heading[0]".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            signature: "Pull request".to_string(),
+            line_start: 1,
+            line_end: 1,
+            body: "# Pull request".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let module = Node {
+            id: NodeId {
+                root: "checkout".to_string(),
+                file: PathBuf::from(".github"),
+                name: ".github".to_string(),
+                kind: NodeKind::Module,
+            },
+            language: "unknown".to_string(),
+            signature: "module .github".to_string(),
+            line_start: 0,
+            line_end: 0,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Lsp,
+        };
+        let belongs_to = Edge {
+            from: section.id.clone(),
+            to: module.id.clone(),
+            kind: EdgeKind::BelongsTo,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+
+        persist_graph_to_lance(
+            repo_root,
+            &[section.clone(), module.clone()],
+            &[belongs_to.clone()],
+        )
+        .await
+        .expect("persist colonful endpoint graph");
+
+        let first = load_graph_from_lance(repo_root)
+            .await
+            .expect("first reopen");
+        let second = load_graph_from_lance(repo_root)
+            .await
+            .expect("second reopen");
+        assert_eq!(first.edges.len(), 1);
+        assert_eq!(first.edges[0].from, section.id);
+        assert_eq!(first.edges[0].to, module.id);
+        assert_eq!(first.edges[0].stable_id(), belongs_to.stable_id());
+        assert_eq!(
+            serde_json::to_value(&first.edges).expect("serialize first reopen"),
+            serde_json::to_value(&second.edges).expect("serialize second reopen"),
+            "fresh LanceDB reopens must preserve exact structured edge endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_colonful_edge_endpoints_round_trip_exactly() {
+        use crate::graph::{Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let anchor = make_test_node("unrelated_anchor");
+        let dangling_source = NodeId {
+            root: "local".to_string(),
+            file: PathBuf::from("generated:file.rs"),
+            name: "module::body::ast:heading[0]".to_string(),
+            kind: NodeKind::Module,
+        };
+        let dangling_target = NodeId {
+            root: "external:root".to_string(),
+            file: PathBuf::from("package:api"),
+            name: "Type::method:overload[1]".to_string(),
+            kind: NodeKind::Function,
+        };
+        let edge = Edge {
+            from: dangling_source.clone(),
+            to: dangling_target.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        persist_graph_to_lance(dir.path(), &[anchor], &[edge.clone()])
+            .await
+            .expect("persist graph containing dangling endpoints");
+
+        let first = load_graph_from_lance(dir.path())
+            .await
+            .expect("first dangling-edge reopen");
+        let second = load_graph_from_lance(dir.path())
+            .await
+            .expect("second dangling-edge reopen");
+        assert_eq!(first.edges.len(), 1);
+        assert_eq!(first.edges[0].from, dangling_source);
+        assert_eq!(first.edges[0].to, dangling_target);
+        assert_eq!(first.edges[0].stable_id(), edge.stable_id());
+        assert_eq!(
+            serde_json::to_value(&first.edges).expect("serialize first dangling reopen"),
+            serde_json::to_value(&second.edges).expect("serialize second dangling reopen")
         );
     }
 }

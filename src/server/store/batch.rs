@@ -296,8 +296,19 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
 
     let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
     let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
+    let source_files: Vec<String> = edges
+        .iter()
+        .map(|e| e.from.file.display().to_string())
+        .collect();
+    let source_names: Vec<String> = edges.iter().map(|e| e.from.name.clone()).collect();
     let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
     let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
+    let target_root_ids: Vec<String> = edges.iter().map(|e| e.to.root.clone()).collect();
+    let target_files: Vec<String> = edges
+        .iter()
+        .map(|e| e.to.file.display().to_string())
+        .collect();
+    let target_names: Vec<String> = edges.iter().map(|e| e.to.name.clone()).collect();
     let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
     let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
     let edge_sources: Vec<String> = edges.iter().map(|e| e.source.to_string()).collect();
@@ -319,8 +330,13 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
         vec![
             Arc::new(StringArray::from(ids)),
             Arc::new(StringArray::from(source_ids)),
+            Arc::new(StringArray::from(source_files)),
+            Arc::new(StringArray::from(source_names)),
             Arc::new(StringArray::from(source_types)),
             Arc::new(StringArray::from(target_ids)),
+            Arc::new(StringArray::from(target_root_ids)),
+            Arc::new(StringArray::from(target_files)),
+            Arc::new(StringArray::from(target_names)),
             Arc::new(StringArray::from(target_types)),
             Arc::new(StringArray::from(edge_types)),
             Arc::new(StringArray::from(edge_sources)),

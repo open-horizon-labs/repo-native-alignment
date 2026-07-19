@@ -83,8 +83,10 @@ pub fn is_test_function(n: &Node) -> bool {
     // Covers nodes extracted before #390 was deployed. Uses word-boundary
     // matching to avoid false positives on decorators like "attestation".
     if n.metadata.get("decorators").is_some_and(|d| {
-        d.split(|c: char| c == ',' || c.is_whitespace())
-            .any(|token| token.trim() == "test" || token.trim() == "tokio::test")
+        d.contains("#[test]")
+            || d.contains("#[tokio::test]")
+            || d.split(|c: char| c == ',' || c.is_whitespace())
+                .any(|token| token.trim() == "test" || token.trim() == "tokio::test")
     }) {
         return true;
     }
@@ -828,6 +830,19 @@ mod tests {
             is_test_function(&node),
             "function with #[test] decorator should be detected"
         );
+    }
+
+    #[test]
+    fn test_is_test_function_by_literal_decorator() {
+        for decorator in ["#[test]", "#[tokio::test]"] {
+            let mut node = make_node("test_my_feature", NodeKind::Function, "src/main.rs");
+            node.metadata
+                .insert("decorators".to_string(), decorator.to_string());
+            assert!(
+                is_test_function(&node),
+                "literal {decorator} decorator should be detected"
+            );
+        }
     }
 
     #[test]

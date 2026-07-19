@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Edge, Node};
 
-const STORE_SCHEMA_VERSION: u32 = 3;
+pub(crate) const STORE_SCHEMA_VERSION: u32 = 4;
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
@@ -21,6 +21,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const OLDEST_SAMPLE_LIMIT: usize = 5;
 const LOCK_OWNER_INITIALIZATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: u32 = 3;
+const UNMATCHED_REQUIRED_WORK_ERROR: &str =
+    "persisted work item is no longer present in the enrichable node set; skipped";
 
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
@@ -98,6 +100,11 @@ pub struct LspWorkItemRecord {
     pub output_edges: Vec<Edge>,
     #[serde(default)]
     pub output_nodes: Vec<Node>,
+    /// Exact stable graph result IDs emitted by this producer. This durable
+    /// lineage lets verified structural-cache reuse retain a shared result only
+    /// while at least one authenticated producer remains valid.
+    #[serde(default)]
+    pub produced_result_ids: BTreeSet<String>,
     /// Number of raw, applicable LSP results observed before graph mapping.
     /// This remains non-zero when a server response cannot be mapped to a
     /// persistable graph node or edge, allowing readiness to fail closed.
@@ -401,10 +408,7 @@ impl LspWorkItemLedger {
             record.updated_at_ms = now;
             record.output_edges.clear();
             record.output_nodes.clear();
-            record.last_error = Some(
-                "persisted work item is no longer present in the enrichable node set; skipped"
-                    .to_string(),
-            );
+            record.last_error = Some(UNMATCHED_REQUIRED_WORK_ERROR.to_string());
             store
                 .records
                 .insert(record_key(&job_id, next_item_id), record);
@@ -484,6 +488,22 @@ impl LspWorkItemLedger {
             .unwrap_or(1)
     }
 
+    pub(crate) fn unmatched_required_count(&self) -> usize {
+        self.store
+            .lock()
+            .map(|store| {
+                store
+                    .records
+                    .values()
+                    .filter(|record| {
+                        record.state == LspWorkItemState::Skipped
+                            && record.last_error.as_deref() == Some(UNMATCHED_REQUIRED_WORK_ERROR)
+                    })
+                    .count()
+            })
+            .unwrap_or(1)
+    }
+
     pub(crate) async fn mark_phase(&self, item_id: usize, phase: &str) -> Result<()> {
         let now = unix_millis();
         self.update(item_id, |record| {
@@ -511,6 +531,11 @@ impl LspWorkItemLedger {
         self.update(item_id, |record| {
             record.output_edges = edges.to_vec();
             record.output_nodes = nodes.to_vec();
+            record.produced_result_ids = edges
+                .iter()
+                .map(Edge::stable_id)
+                .chain(nodes.iter().map(Node::stable_id))
+                .collect();
             record.observed_result_count = observed_result_count;
         })?;
         self.mark_terminal(item_id, LspWorkItemState::Completed, None)
@@ -657,6 +682,7 @@ fn new_record(
         recovery: LspWorkItemRecovery::New,
         output_edges: Vec::new(),
         output_nodes: Vec::new(),
+        produced_result_ids: BTreeSet::new(),
         observed_result_count: 0,
     }
 }
@@ -786,6 +812,32 @@ pub(crate) fn load_records_since(
 
 pub(crate) fn load_all_records(repo_root: &Path) -> Result<Vec<LspWorkItemRecord>> {
     load_records_since(repo_root, 0)
+}
+
+/// Remove carried work for files that the structural-cache impact plan will
+/// execute again. This operates only on the injected mutable copy; the base
+/// archive remains immutable. Returning the removed producer IDs lets callers
+/// audit that unchanged files were not accidentally invalidated.
+pub(crate) fn purge_records_for_paths(
+    repo_root: &Path,
+    paths: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _file_lock = WorkItemFileLock::acquire(repo_root);
+    let mut store = load_store(repo_root)?;
+    let removed = store
+        .records
+        .iter()
+        .filter(|(_, record)| paths.contains(&record.file))
+        .map(|(record_id, _)| record_id.clone())
+        .collect::<Vec<_>>();
+    store
+        .records
+        .retain(|_, record| !paths.contains(&record.file));
+    write_store(repo_root, &store)?;
+    Ok(removed)
 }
 
 pub fn load_queue_snapshots_since(
@@ -1111,7 +1163,7 @@ fn unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
@@ -1186,6 +1238,11 @@ mod tests {
         assert_eq!(snapshot.phase_counts["sending_did_open"], 1);
         assert!(snapshot.oldest_in_flight[0].contains("node=item_0"));
         assert!(snapshot.render().contains("skipped=1"));
+        assert_eq!(
+            ledger.unmatched_required_count(),
+            0,
+            "an intentional runtime skip is not an unmatched required recovery record"
+        );
         assert!(
             render_queue_snapshots_markdown(repo.path(), 1).contains("## LSP Pass 1 Work Queues")
         );
@@ -1206,6 +1263,24 @@ mod tests {
         .unwrap();
         let snapshots = load_queue_snapshots(older.path(), 1).unwrap();
         assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn produced_result_ids_keep_the_existing_json_array_contract() {
+        let record: LspWorkItemRecord = serde_json::from_value(serde_json::json!({
+            "produced_result_ids": ["result-z", "result-a", "result-z"]
+        }))
+        .unwrap();
+        assert_eq!(
+            record.produced_result_ids,
+            BTreeSet::from(["result-a".to_string(), "result-z".to_string()])
+        );
+
+        let serialized = serde_json::to_value(record).unwrap();
+        assert_eq!(
+            serialized["produced_result_ids"],
+            serde_json::json!(["result-a", "result-z"])
+        );
     }
 
     #[tokio::test]
@@ -1385,6 +1460,51 @@ mod tests {
         assert!(resumed.recovered_output().0.is_empty());
         let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
         assert_eq!(snapshot.total, changed.len());
+    }
+
+    #[tokio::test]
+    async fn unmatched_required_work_remains_skipped_during_recovery() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut initial = seeds(2);
+        initial[0].requested_operations = vec!["document_symbols".to_string()];
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "removed-work-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut remaining = initial[1].clone();
+        remaining.item_id = 0;
+        let resumed = LspWorkItemLedger::begin(repo.path(), &[remaining])
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "removed-work-job");
+        assert!(resumed.should_run(0));
+        let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.pending, 1);
+        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(resumed.unmatched_required_count(), 1);
+        let store = resumed.store.lock().unwrap();
+        let skipped = store
+            .records
+            .values()
+            .find(|record| record.state == LspWorkItemState::Skipped)
+            .expect("removed required work must remain visible as skipped");
+        assert_eq!(skipped.requested_operations, ["document_symbols"]);
+        assert!(
+            skipped
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("no longer present")
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,111 @@
+{
+  "root_name": "issue785-python-wheelhouse",
+  "schema_version": 1,
+  "wheels": [
+    {
+      "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+      "sha256": "21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb",
+      "url": "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl"
+    },
+    {
+      "filename": "attrs-26.1.0-py3-none-any.whl",
+      "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
+      "url": "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl"
+    },
+    {
+      "filename": "autotools_language_server-0.0.23-py3-none-any.whl",
+      "sha256": "a097a066abf3dc634838819e098928d57aa2aa0d9c3b8ed3762b2a5593e2a58e",
+      "url": "https://files.pythonhosted.org/packages/9f/2a/cf467c4885b1745ebadefc053dde20897b0b11e8ceb057136c35b32d381b/autotools_language_server-0.0.23-py3-none-any.whl"
+    },
+    {
+      "filename": "cattrs-26.1.0-py3-none-any.whl",
+      "sha256": "d1e0804c42639494d469d08d4f26d6b9de9b8ab26b446db7b5f8c2e97f7c3096",
+      "url": "https://files.pythonhosted.org/packages/80/56/60547f7801b97c67e97491dc3d9ade9fbccbd0325058fd3dfcb2f5d98d90/cattrs-26.1.0-py3-none-any.whl"
+    },
+    {
+      "filename": "colorama-0.4.6-py2.py3-none-any.whl",
+      "sha256": "4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6",
+      "url": "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl"
+    },
+    {
+      "filename": "docutils-0.23-py3-none-any.whl",
+      "sha256": "25d013af9bf23bc1c7b2b093dff4208166c53a94786c9e447808335ef1185fea",
+      "url": "https://files.pythonhosted.org/packages/32/91/30151a39f7570f448ed84529390628a651d7f27c87d73c9b887f8189695e/docutils-0.23-py3-none-any.whl"
+    },
+    {
+      "filename": "esbonio-2.1.0-py3-none-any.whl",
+      "sha256": "15241d3c6efe5931c0c91acf61afe8bd8059b897e91cd6b737cc1891ba91134f",
+      "url": "https://files.pythonhosted.org/packages/a9/de/776ecca7053984f86e2d9f2447aa7bb06812cc0d92d0459d2fd20a35006b/esbonio-2.1.0-py3-none-any.whl"
+    },
+    {
+      "filename": "jinja2-3.1.6-py3-none-any.whl",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+      "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl"
+    },
+    {
+      "filename": "jsonschema-4.26.0-py3-none-any.whl",
+      "sha256": "d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce",
+      "url": "https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl"
+    },
+    {
+      "filename": "jsonschema_specifications-2025.9.1-py3-none-any.whl",
+      "sha256": "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe",
+      "url": "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl"
+    },
+    {
+      "filename": "lsp_tree_sitter-0.1.1-py3-none-any.whl",
+      "sha256": "eef148b333c95ae1cd58dbf6685029a4e58a806bbffe02367c4bb90d50b0519c",
+      "url": "https://files.pythonhosted.org/packages/b5/c8/b8b772a8c686c912cd5747a2345be7f4fabeab6ddc8d1b8c554162379c59/lsp_tree_sitter-0.1.1-py3-none-any.whl"
+    },
+    {
+      "filename": "lsprotocol-2025.0.0-py3-none-any.whl",
+      "sha256": "f9d78f25221f2a60eaa4a96d3b4ffae011b107537facee61d3da3313880995c7",
+      "url": "https://files.pythonhosted.org/packages/7b/f0/92f2d609d6642b5f30cb50a885d2bf1483301c69d5786286500d15651ef2/lsprotocol-2025.0.0-py3-none-any.whl"
+    },
+    {
+      "filename": "markupsafe-3.0.3-cp312-cp312-macosx_11_0_arm64.whl",
+      "sha256": "1872df69a4de6aead3491198eaf13810b565bdbeec3ae2dc8780f14458ec73ce",
+      "url": "https://files.pythonhosted.org/packages/9a/81/7e4e08678a1f98521201c3079f77db69fb552acd56067661f8c2f534a718/markupsafe-3.0.3-cp312-cp312-macosx_11_0_arm64.whl"
+    },
+    {
+      "filename": "platformdirs-4.10.0-py3-none-any.whl",
+      "sha256": "fb516cdb12eb0d857d0cd85a7c57cea4d060bee4578d6cf5a14dfdf8cbf8784a",
+      "url": "https://files.pythonhosted.org/packages/81/e6/cd9575ac904136b3cbf7aa7ee819ef86eedb7274e46f230e94ea4342e729/platformdirs-4.10.0-py3-none-any.whl"
+    },
+    {
+      "filename": "pygls-2.1.1-py3-none-any.whl",
+      "sha256": "510a6dea2476177230c7d851125e5948efdf3fdb9ebfd8543fc434972f8faed4",
+      "url": "https://files.pythonhosted.org/packages/fd/1a/208293b6c350f5abea6941d5606080d4a492644052504f5312e5de30a902/pygls-2.1.1-py3-none-any.whl"
+    },
+    {
+      "filename": "referencing-0.37.0-py3-none-any.whl",
+      "sha256": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231",
+      "url": "https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl"
+    },
+    {
+      "filename": "rpds_py-2026.6.3-cp312-cp312-macosx_11_0_arm64.whl",
+      "sha256": "538949e262e46caa31ac01bdb3c1e8f642622922cacbabbae6a8445d9dc33eaf",
+      "url": "https://files.pythonhosted.org/packages/a4/73/319dfa745dd668efe89309141ded489126461fcecd2b8f3a3cda185129b6/rpds_py-2026.6.3-cp312-cp312-macosx_11_0_arm64.whl"
+    },
+    {
+      "filename": "tree_sitter-0.26.0-cp312-cp312-macosx_11_0_arm64.whl",
+      "sha256": "918d89529786873f0982a0f59c2a303cd065fbfd1b903d71a8e4e1584f67b42e",
+      "url": "https://files.pythonhosted.org/packages/54/6f/8bb61957f16ec1b1d92410a006cdc84a952b6352a7313b2ad299f2d21484/tree_sitter-0.26.0-cp312-cp312-macosx_11_0_arm64.whl"
+    },
+    {
+      "filename": "tree_sitter_make-1.1.1-cp39-abi3-macosx_11_0_arm64.whl",
+      "sha256": "e2c17b7d5b51cf6eb429dd8117e94cabc76948feb3ddb67eac02fa7189a88310",
+      "url": "https://files.pythonhosted.org/packages/05/ec/aa2b0300613d60222d6e0ef11dd1a40edb73dbf10dd3db188729ca29ce45/tree_sitter_make-1.1.1-cp39-abi3-macosx_11_0_arm64.whl"
+    },
+    {
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl"
+    },
+    {
+      "filename": "websockets-16.1.1-cp312-cp312-macosx_11_0_arm64.whl",
+      "sha256": "01fbdcbac298efe19360b94bc0039c8f746f0220ba570f327577bfee81059175",
+      "url": "https://files.pythonhosted.org/packages/73/e3/fe2d498c64dea0095c9a9f9a351af4cd6eef31b618395582bc1f38ba45ff/websockets-16.1.1-cp312-cp312-macosx_11_0_arm64.whl"
+    }
+  ]
+}

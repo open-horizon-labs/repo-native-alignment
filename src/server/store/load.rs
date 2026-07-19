@@ -1,6 +1,6 @@
 //! Graph loading from LanceDB tables.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -16,7 +16,7 @@ use super::super::state::GraphState;
 use super::migrate::read_committed_scan_version;
 use super::{
     graph_lance_path, infer_language_from_path, parse_confidence, parse_edge_kind,
-    parse_extraction_source, parse_node_id_from_stable, parse_node_kind,
+    parse_extraction_source, parse_node_kind,
 };
 
 fn node_extraction_source_at(
@@ -27,6 +27,26 @@ fn node_extraction_source_at(
         .filter(|col| !col.is_null(row))
         .map(|col| parse_extraction_source(col.value(row)))
         .unwrap_or(ExtractionSource::TreeSitter)
+}
+
+fn required_string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> anyhow::Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .with_context(|| format!("persisted graph is missing required {name:?} column"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .with_context(|| format!("persisted graph column {name:?} is not Utf8"))
+}
+
+fn ensure_persisted_node_identity(persisted_id: &str, node_id: &NodeId) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        node_id.to_stable_id() == persisted_id,
+        "persisted symbol identity mismatch: id={persisted_id:?}, fields={node_id:?}"
+    );
+    Ok(())
 }
 
 /// Load graph nodes and edges from LanceDB tables.
@@ -74,12 +94,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
 
         let mut nodes = Vec::new();
         for batch in &batches {
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let ids = required_string_column(batch, "id")?;
             let root_ids = batch
                 .column_by_name("root_id")
                 .unwrap()
@@ -146,7 +161,6 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
             // Language remains derived from the file extension. Legacy tables may not
             // have extraction_source, so node_extraction_source_at falls back safely.
-            let _ = ids; // ids column exists but we reconstruct from components
 
             // Read optional value and synthetic columns (present after schema migration)
             let value_col = batch
@@ -444,10 +458,10 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = http_path_col
                     && !col.is_null(i)
                 {
-                    let val = col.value(i);
-                    if !val.is_empty() {
-                        metadata.insert(mk::HTTP_PATH.to_owned(), val.to_string());
-                    }
+                    // An empty route path is meaningful extractor output (for
+                    // example, a bare Python route decorator). Preserve the
+                    // distinction between a present empty value and Arrow null.
+                    metadata.insert(mk::HTTP_PATH.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = doc_comment_col
                     && !col.is_null(i)
@@ -490,13 +504,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         metadata.insert(mk::RESPONSE_TYPE.to_owned(), val.to_string());
                     }
                 }
+                let id = NodeId {
+                    root: root_ids.value(i).to_string(),
+                    file: file_path,
+                    name: names.value(i).to_string(),
+                    kind: parse_node_kind(kinds.value(i)),
+                };
+                ensure_persisted_node_identity(ids.value(i), &id)?;
                 nodes.push(Node {
-                    id: NodeId {
-                        root: root_ids.value(i).to_string(),
-                        file: file_path,
-                        name: names.value(i).to_string(),
-                        kind: parse_node_kind(kinds.value(i)),
-                    },
+                    id,
                     language,
                     line_start: line_starts.value(i) as usize,
                     line_end: line_ends.value(i) as usize,
@@ -509,6 +525,24 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         }
         nodes
     };
+
+    // Stable IDs are a compact lookup representation, not a reversible wire
+    // encoding: both file paths and symbol names may contain `:`. Prefer exact
+    // structured identities loaded from `symbols`; schema-v25 edge fields retain
+    // equally exact identities for legitimate dangling endpoints. Fail closed on
+    // ambiguous symbols or disagreement between the two persisted projections.
+    let mut persisted_node_ids = HashMap::with_capacity(nodes.len());
+    for node in &nodes {
+        let stable_id = node.stable_id();
+        if let Some(previous) = persisted_node_ids.insert(stable_id.clone(), node.id.clone())
+            && previous != node.id
+        {
+            anyhow::bail!(
+                "ambiguous persisted node stable ID {stable_id:?}: {previous:?} and {:?}",
+                node.id
+            );
+        }
+    }
 
     // -- Read edges --
     let edges = {
@@ -526,30 +560,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
 
         let mut edges = Vec::new();
         for batch in &batches {
-            let source_ids = batch
-                .column_by_name("source_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let source_types = batch
-                .column_by_name("source_type")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let target_ids = batch
-                .column_by_name("target_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let target_types = batch
-                .column_by_name("target_type")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let source_ids = required_string_column(batch, "source_id")?;
+            let source_files = required_string_column(batch, "source_file")?;
+            let source_names = required_string_column(batch, "source_name")?;
+            let source_types = required_string_column(batch, "source_type")?;
+            let target_ids = required_string_column(batch, "target_id")?;
+            let target_root_ids = required_string_column(batch, "target_root_id")?;
+            let target_files = required_string_column(batch, "target_file")?;
+            let target_names = required_string_column(batch, "target_name")?;
+            let target_types = required_string_column(batch, "target_type")?;
             let edge_types = batch
                 .column_by_name("edge_type")
                 .unwrap()
@@ -596,17 +615,48 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     None => Vec::new(),
                 };
 
-                // Parse NodeId from stable_id format: "root:file:name:kind"
-                let from = parse_node_id_from_stable(
-                    source_ids.value(i),
-                    source_types.value(i),
-                    root_ids.value(i),
+                let source_id = source_ids.value(i);
+                let target_id = target_ids.value(i);
+                let stored_from = NodeId {
+                    root: root_ids.value(i).to_string(),
+                    file: PathBuf::from(source_files.value(i)),
+                    name: source_names.value(i).to_string(),
+                    kind: parse_node_kind(source_types.value(i)),
+                };
+                let stored_to = NodeId {
+                    root: target_root_ids.value(i).to_string(),
+                    file: PathBuf::from(target_files.value(i)),
+                    name: target_names.value(i).to_string(),
+                    kind: parse_node_kind(target_types.value(i)),
+                };
+                anyhow::ensure!(
+                    stored_from.to_stable_id() == source_id,
+                    "persisted edge source identity mismatch: id={source_id:?}, fields={stored_from:?}"
                 );
-                let to = parse_node_id_from_stable(
-                    target_ids.value(i),
-                    target_types.value(i),
-                    root_ids.value(i),
+                anyhow::ensure!(
+                    stored_to.to_stable_id() == target_id,
+                    "persisted edge target identity mismatch: id={target_id:?}, fields={stored_to:?}"
                 );
+                let from = match persisted_node_ids.get(source_id) {
+                    Some(node_id) => {
+                        anyhow::ensure!(
+                            node_id == &stored_from,
+                            "persisted edge source fields disagree with symbol {source_id:?}: edge={stored_from:?}, symbol={node_id:?}"
+                        );
+                        node_id.clone()
+                    }
+                    None => stored_from,
+                };
+                let to = match persisted_node_ids.get(target_id) {
+                    Some(node_id) => {
+                        anyhow::ensure!(
+                            node_id == &stored_to,
+                            "persisted edge target fields disagree with symbol {target_id:?}: edge={stored_to:?}, symbol={node_id:?}"
+                        );
+                        node_id.clone()
+                    }
+                    None => stored_to,
+                };
 
                 edges.push(Edge {
                     from,
@@ -681,6 +731,24 @@ mod tests {
             node_extraction_source_at(None, 0),
             ExtractionSource::TreeSitter,
             "legacy symbols tables without extraction_source must still load"
+        );
+    }
+
+    #[test]
+    fn persisted_symbol_identity_mismatch_fails_closed() {
+        let id = NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/lib.rs"),
+            name: "target".to_string(),
+            kind: crate::graph::NodeKind::Function,
+        };
+
+        assert!(ensure_persisted_node_identity(&id.to_stable_id(), &id).is_ok());
+        let error = ensure_persisted_node_identity("tampered", &id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted symbol identity mismatch")
         );
     }
 }
