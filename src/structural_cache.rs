@@ -1053,9 +1053,7 @@ pub fn plan_incremental_impact(
         verifier_authorized_executed_paths(
             &authorization.authorization,
             &authorization.inherited_by_path,
-        )
-        .into_iter()
-        .map(PathBuf::from),
+        ),
     );
     executed.extend(
         authorization
