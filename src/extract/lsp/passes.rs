@@ -525,6 +525,7 @@ fn take_pass1_document_symbol_barrier_item(
     Some(work_items.remove(index))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_pass1_document_symbol_barrier_item(
     item: &LspPass1WorkItem,
     transport: &Arc<PipelinedTransport>,
