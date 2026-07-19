@@ -780,30 +780,12 @@ pub fn plan_incremental_impact(
             .max(1),
     );
     let mut escalated = BTreeSet::new();
-    let added_or_renamed = !authorization.authorization.added_paths.is_empty()
-        || !authorization.authorization.renamed_paths.is_empty();
-    let surface_changed_languages = authorization
-        .authorization
-        .changed_paths
-        .iter()
-        .filter(|path| declaration_surface(old_nodes, path) != declaration_surface(new_nodes, path))
-        .filter_map(|path| {
-            authorization
-                .authorization
-                .path_partitions
-                .get(path)
-                .cloned()
-                .or_else(|| {
-                    new_nodes
-                        .iter()
-                        .chain(old_nodes.iter())
-                        .find(|node| node.id.file == Path::new(path))
-                        .map(|node| node.language.clone())
-                })
-        })
-        .collect::<BTreeSet<_>>();
-    if executed.len() > limit || added_or_renamed || !surface_changed_languages.is_empty() {
-        escalated.extend(surface_changed_languages);
+    // Ordinary source additions, renames, and declaration changes stay within
+    // the bidirectional graph impact closure above. Partition identities
+    // already fail closed for configuration, dependency, toolchain,
+    // inventory, schema, and scan-policy changes; only the safety bounds may
+    // promote an otherwise compatible source update to a partition rebuild.
+    if executed.len() > limit {
         for path in &executed {
             if let Some(language) = authorization
                 .authorization
@@ -1260,23 +1242,6 @@ fn is_impact_edge(kind: &EdgeKind) -> bool {
             | EdgeKind::ReExports
             | EdgeKind::TestedBy
     )
-}
-
-fn declaration_surface(nodes: &[Node], path: &str) -> BTreeSet<(String, String, String, String)> {
-    nodes
-        .iter()
-        .filter(|node| {
-            node.id.file == Path::new(path) && node.source != crate::graph::ExtractionSource::Lsp
-        })
-        .map(|node| {
-            (
-                node.id.name.clone(),
-                node.id.kind.to_string(),
-                node.language.clone(),
-                node.signature.clone(),
-            )
-        })
-        .collect()
 }
 
 fn require_sha256(value: &str, label: &str) -> Result<()> {
@@ -1922,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_declaration_surface_rebuilds_the_language_partition() {
+    fn changed_declaration_surface_uses_bounded_graph_closure() {
         let old_nodes = [
             node("src/a.py", "python"),
             node("src/b.py", "python"),
@@ -1942,14 +1907,61 @@ mod tests {
 
         let plan = plan_incremental_impact(&authorization, &old_nodes, &[], &new_nodes, &[]);
 
-        assert!(plan.escalated_partitions.contains("python"));
+        assert!(!plan.escalated_partitions.contains("python"));
         assert_eq!(
             plan.executed_paths,
-            ["src/a.py", "src/b.py", "src/c.py"]
+            BTreeSet::from([PathBuf::from("src/a.py")])
+        );
+        assert_eq!(
+            plan.inherited_paths,
+            ["src/b.py", "src/c.py"]
                 .into_iter()
                 .map(PathBuf::from)
                 .collect()
         );
+    }
+
+    #[test]
+    fn added_document_does_not_rebuild_changed_python_partition() {
+        let old_nodes = [
+            node("src/a.py", "python"),
+            node("src/b.py", "python"),
+            node("src/c.py", "python"),
+            node("src/d.py", "python"),
+            node("src/e.py", "python"),
+            node("src/f.py", "python"),
+        ];
+        let mut new_nodes = old_nodes.to_vec();
+        new_nodes[0].signature = "def a(changed):".to_string();
+        new_nodes.push(node("docs/release.txt", "plaintext"));
+        let edges = [edge(&old_nodes[0], &old_nodes[2])];
+        let authorization = verified_authorization(
+            &[
+                ("src/b.py", "python"),
+                ("src/c.py", "python"),
+                ("src/d.py", "python"),
+                ("src/e.py", "python"),
+                ("src/f.py", "python"),
+            ],
+            &["src/a.py"],
+            &["docs/release.txt"],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &old_nodes, &edges, &new_nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            ["docs/release.txt", "src/a.py", "src/c.py"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert!(plan.inherited_paths.contains(Path::new("src/b.py")));
+        assert!(!plan.escalated_partitions.contains("python"));
     }
 
     #[test]
@@ -2021,23 +2033,6 @@ mod tests {
         assert_eq!(
             graph_records_digest(&[first.clone(), second.clone()], Node::stable_id).unwrap(),
             graph_records_digest(&[second, first], Node::stable_id).unwrap()
-        );
-    }
-
-    #[test]
-    fn declaration_surface_is_portable_across_checkout_root_identity() {
-        let mut old = node("src/a.py", "python");
-        old.id.root = "base-checkout".to_string();
-        let mut current = old.clone();
-        current.id.root = "target-checkout".to_string();
-        assert_eq!(
-            declaration_surface(&[old.clone()], "src/a.py"),
-            declaration_surface(&[current.clone()], "src/a.py")
-        );
-        current.signature = "fn changed(value: str)".to_string();
-        assert_ne!(
-            declaration_surface(&[old], "src/a.py"),
-            declaration_surface(&[current], "src/a.py")
         );
     }
 }
