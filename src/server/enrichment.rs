@@ -1977,6 +1977,27 @@ impl RnaHandler {
             .as_ref()
             .map(|plan| plan.executed_paths.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_else(|| changed_file_set.clone());
+        let touched_files: std::collections::HashSet<(String, PathBuf)> = lsp_execution_files
+            .iter()
+            .cloned()
+            .map(|file| (primary_slug.clone(), file))
+            .collect();
+        let lsp_node_filter = match (cache_authorization.as_ref(), cache_plan.as_ref()) {
+            (Some(authorization), Some(plan)) => {
+                super::changed_file_plan::plan_lsp_node_ids_for_verified_structural_cache(
+                    authorization,
+                    plan,
+                    &all_nodes,
+                )?
+            }
+            (None, None) => super::changed_file_plan::plan_lsp_node_ids_for_touched_files(
+                &touched_files,
+                &all_nodes,
+            )?,
+            _ => {
+                anyhow::bail!("structural-cache runtime has an authorization/impact-plan mismatch")
+            }
+        };
         if cache_plan.is_some() {
             let purge_paths = lsp_execution_files
                 .iter()
@@ -1993,22 +2014,6 @@ impl RnaHandler {
                 ));
             }
         }
-        let touched_files: std::collections::HashSet<(String, PathBuf)> = lsp_execution_files
-            .iter()
-            .cloned()
-            .map(|file| (primary_slug.clone(), file))
-            .collect();
-        let empty_rebuilt_partitions = BTreeSet::new();
-        let rebuilt_partitions = cache_plan
-            .as_ref()
-            .map(|plan| &plan.escalated_partitions)
-            .unwrap_or(&empty_rebuilt_partitions);
-        let lsp_node_filter =
-            super::changed_file_plan::plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
-                &touched_files,
-                &all_nodes,
-                rebuilt_partitions,
-            )?;
         let purged_lsp_edge_ids = purge_existing_scoped_lsp_output(
             &mut all_nodes,
             &mut all_edges,

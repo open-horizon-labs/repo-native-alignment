@@ -310,6 +310,46 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
     cached_nodes: &[Node],
     rebuilt_partitions: &BTreeSet<String>,
 ) -> Result<Arc<HashSet<String>>> {
+    plan_lsp_node_ids_for_touched_files_with_bounds(
+        touched_files,
+        cached_nodes,
+        rebuilt_partitions,
+        ChangedFileNodeBound::Enforce,
+    )
+}
+
+pub(crate) fn plan_lsp_node_ids_for_verified_structural_cache(
+    authorization: &crate::structural_cache::VerifiedStructuralCacheAuthorization,
+    plan: &crate::structural_cache::IncrementalImpactPlan,
+    cached_nodes: &[Node],
+) -> Result<Arc<HashSet<String>>> {
+    crate::structural_cache::validate_runtime_plan_handoff(authorization, plan)?;
+    let touched_files = plan
+        .executed_paths
+        .iter()
+        .cloned()
+        .map(|path| (authorization.authorization.root_slug.clone(), path))
+        .collect::<HashSet<_>>();
+    plan_lsp_node_ids_for_touched_files_with_bounds(
+        &touched_files,
+        cached_nodes,
+        &plan.escalated_partitions,
+        ChangedFileNodeBound::AuthorizedStructuralCache,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedFileNodeBound {
+    Enforce,
+    AuthorizedStructuralCache,
+}
+
+fn plan_lsp_node_ids_for_touched_files_with_bounds(
+    touched_files: &HashSet<(String, PathBuf)>,
+    cached_nodes: &[Node],
+    rebuilt_partitions: &BTreeSet<String>,
+    node_bound: ChangedFileNodeBound,
+) -> Result<Arc<HashSet<String>>> {
     let supported_languages =
         crate::extract::EnricherRegistry::with_builtins().supported_languages();
     let touched_roots: HashSet<&str> = touched_files
@@ -363,9 +403,14 @@ pub(crate) fn plan_lsp_node_ids_for_touched_files_with_partition_rebuilds(
         }
     }
 
-    if planned_node_ids.len() > MAX_CHANGED_LSP_NODES
-        || operation_count > MAX_CHANGED_LSP_OPERATIONS
-    {
+    // The structural-cache verifier already bounds the exact authorized file
+    // plan by operations. A dense file may legitimately contain more nodes
+    // than the ordinary changed-file ceiling while remaining below that same
+    // operation ceiling, so only the verifier-bound path may skip the
+    // redundant node-count check.
+    let exceeds_node_bound = node_bound == ChangedFileNodeBound::Enforce
+        && planned_node_ids.len() > MAX_CHANGED_LSP_NODES;
+    if exceeds_node_bound || operation_count > MAX_CHANGED_LSP_OPERATIONS {
         let unrebuilt_languages = planned_languages
             .difference(rebuilt_partitions)
             .cloned()

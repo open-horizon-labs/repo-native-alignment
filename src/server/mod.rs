@@ -13,6 +13,9 @@ pub mod state;
 pub mod store;
 pub mod tools;
 
+#[cfg(test)]
+pub(crate) use changed_file_plan::plan_lsp_node_ids_for_verified_structural_cache;
+
 // Re-export subsystem metadata key for service layer filtering.
 pub(crate) use graph::SUBSYSTEM_KEY;
 

@@ -1946,6 +1946,87 @@ mod tests {
     }
 
     #[test]
+    fn verified_changed_file_scheduler_accepts_node_dense_authorized_plan() {
+        let authorization = verified_authorization(&[], &["src/dense.py"], &[], &[], &[], &[], &[]);
+        let plan = IncrementalImpactPlan {
+            executed_paths: BTreeSet::from([PathBuf::from("src/dense.py")]),
+            inherited_paths: BTreeSet::new(),
+            escalated_partitions: BTreeSet::new(),
+            closure_edge_count: 0,
+        };
+        let nodes = (0..=crate::extract::lsp::MAX_INCREMENTAL_LSP_NODES)
+            .map(|index| {
+                let mut node = node("src/dense.py", "python");
+                node.id.name = format!("symbol_{index}");
+                node
+            })
+            .collect::<Vec<_>>();
+
+        let ids = crate::server::plan_lsp_node_ids_for_verified_structural_cache(
+            &authorization,
+            &plan,
+            &nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            ids.len(),
+            crate::extract::lsp::MAX_INCREMENTAL_LSP_NODES + 1
+        );
+    }
+
+    #[test]
+    fn verified_changed_file_scheduler_still_enforces_operation_ceiling() {
+        let authorization =
+            verified_authorization(&[], &["src/operation-heavy.py"], &[], &[], &[], &[], &[]);
+        let plan = IncrementalImpactPlan {
+            executed_paths: BTreeSet::from([PathBuf::from("src/operation-heavy.py")]),
+            inherited_paths: BTreeSet::new(),
+            escalated_partitions: BTreeSet::new(),
+            closure_edge_count: 0,
+        };
+        let nodes = (0..=crate::extract::lsp::MAX_INCREMENTAL_LSP_OPERATIONS)
+            .map(|index| {
+                let mut node = node("src/operation-heavy.py", "python");
+                node.id.name = format!("symbol_{index}");
+                node
+            })
+            .collect::<Vec<_>>();
+
+        let error = crate::server::plan_lsp_node_ids_for_verified_structural_cache(
+            &authorization,
+            &plan,
+            &nodes,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds its bound"));
+        assert!(error.to_string().contains("python"));
+    }
+
+    #[test]
+    fn verified_changed_file_scheduler_rejects_handoff_mismatch() {
+        let authorization =
+            verified_authorization(&[], &["src/authorized.py"], &[], &[], &[], &[], &[]);
+        let plan = IncrementalImpactPlan {
+            executed_paths: BTreeSet::from([PathBuf::from("src/unexpected.py")]),
+            inherited_paths: BTreeSet::new(),
+            escalated_partitions: BTreeSet::new(),
+            closure_edge_count: 0,
+        };
+
+        let error = crate::server::plan_lsp_node_ids_for_verified_structural_cache(
+            &authorization,
+            &plan,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime structural-cache execution differs from verifier authorization")
+        );
+    }
+
+    #[test]
     fn only_direct_diff_seeds_and_carried_lsp_edges_expand_impact() {
         let nodes = [
             node("src/a.py", "python"),
