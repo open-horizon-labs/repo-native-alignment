@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -58,6 +59,57 @@ QUALIFICATION_SCAN_FLAGS = [
     "--no-embed",
     "--timings",
 ]
+REPLAY_RECEIPT_FIELDS = {
+    "schema_version",
+    "diagnostic_only",
+    "publishable",
+    "checkout_rebuilt",
+    "lsp_calls",
+    "archive_created",
+    "catalog_updated",
+    "failure_receipt_sha256",
+    "failure_digest",
+    "authorization_sha256",
+    "source_producer_commit",
+    "replay_producer_commit",
+    "source_producer",
+    "replay_producer",
+    "target_commit",
+    "target_tree",
+    "target_tree_source",
+    "source_checkout_identity_verified",
+    "source_tree_diff_replayed",
+    "source_rescanned",
+    "full_target_readiness_recomputed",
+    "incremental_enrichment_job_id",
+    "pass1_job_ids",
+    "initial_node_count",
+    "initial_edge_count",
+    "stale_path_count",
+    "stale_node_count_before",
+    "stale_edge_count_before",
+    "removed_node_count",
+    "removed_edge_count",
+    "final_node_count",
+    "final_edge_count",
+    "completed_work_item_count",
+    "executed_operation_count",
+    "readiness_validation_request_count",
+    "base_completeness_digest",
+    "target_inventory_path_count",
+    "validated_inventory_path_count",
+    "observed_result_count",
+    "persisted_observed_result_count",
+    "persisted_result_id_count",
+    "unresolved_endpoint_count",
+    "discarded_required_result_count",
+    "checkpoint_validation_digest",
+    "diagnostic_checkpoint_validation_passed",
+    "target_completeness_digest",
+    "coverage_violation_count",
+    "compatibility_violation_count",
+    "full_target_ready",
+}
 EXPECTED_POPULATION_SIZE = 70
 BINARY_EXTENSIONS = frozenset(
     {
@@ -1255,6 +1307,159 @@ def _next_case_attempt_index(output_root: Path, instance_id: str) -> int:
     return max(prior, default=0) + 1
 
 
+def _partition_invalidation_plan(
+    core: Mapping[str, Any], target_identity: Mapping[str, Any]
+) -> tuple[list[str], list[str], dict[str, list[dict[str, str]]]]:
+    base_signatures = core["partition_signatures"]
+    target_partitions = target_identity["partitions"]
+    shared_changed = (
+        core["shared_influence_digest"]
+        != target_identity["shared_influence_digest"]
+    )
+    configuration_changed = (
+        core["configuration_digest"] != target_identity["configuration_digest"]
+    )
+    invalidated: list[str] = []
+    compatible: list[str] = []
+    reasons: dict[str, list[dict[str, str]]] = {}
+    for language, base_signature in sorted(base_signatures.items()):
+        partition_reasons: list[dict[str, str]] = []
+        target_partition = target_partitions.get(language)
+        if shared_changed:
+            partition_reasons.append(
+                {
+                    "code": "shared_influence_digest_mismatch",
+                    "base_digest": core["shared_influence_digest"],
+                    "target_digest": target_identity["shared_influence_digest"],
+                }
+            )
+        if configuration_changed:
+            partition_reasons.append(
+                {
+                    "code": "configuration_digest_mismatch",
+                    "base_digest": core["configuration_digest"],
+                    "target_digest": target_identity["configuration_digest"],
+                }
+            )
+        if not isinstance(target_partition, dict):
+            partition_reasons.append(
+                {
+                    "code": "target_partition_missing",
+                    "base_digest": base_signature,
+                    "target_digest": "missing",
+                }
+            )
+        elif target_partition["signature"] != base_signature:
+            partition_reasons.append(
+                {
+                    "code": "partition_signature_mismatch",
+                    "base_digest": base_signature,
+                    "target_digest": target_partition["signature"],
+                }
+            )
+        if (
+            shared_changed
+            or configuration_changed
+            or not isinstance(target_partition, dict)
+            or target_partition["signature"] != base_signature
+        ):
+            invalidated.append(language)
+            reasons[language] = partition_reasons
+        else:
+            compatible.append(language)
+    for language in sorted(set(target_partitions) - set(base_signatures)):
+        target_signature = target_partitions[language]["signature"]
+        invalidated.append(language)
+        reasons[language] = [
+            {
+                "code": "base_partition_missing",
+                "base_digest": "missing",
+                "target_digest": target_signature,
+            }
+        ]
+    return invalidated, compatible, reasons
+
+
+def _validate_selected_partition_plan(
+    selection: Mapping[str, Any] | None, target_identity: Mapping[str, Any]
+) -> None:
+    if selection is None:
+        return
+    target_languages = sorted(target_identity["partitions"])
+    invalidated = selection.get("invalidated_partitions")
+    compatible = selection.get("compatible_partitions")
+    reasons = selection.get("invalidated_partition_reasons")
+    if (
+        not isinstance(invalidated, list)
+        or invalidated != sorted(set(invalidated))
+        or not isinstance(compatible, list)
+        or compatible != sorted(set(compatible))
+        or not isinstance(reasons, dict)
+        or set(reasons) != set(invalidated)
+    ):
+        raise ToolchainError("structural-cache partition preflight is malformed")
+    for language in invalidated:
+        language_reasons = reasons.get(language)
+        if not isinstance(language_reasons, list) or not language_reasons:
+            raise ToolchainError(
+                f"structural-cache invalidation reason is missing for {language}"
+            )
+        for reason in language_reasons:
+            if (
+                not isinstance(reason, dict)
+                or set(reason) != {"code", "base_digest", "target_digest"}
+                or not all(isinstance(value, str) and value for value in reason.values())
+            ):
+                raise ToolchainError(
+                    f"structural-cache invalidation reason is malformed for {language}"
+                )
+    if len(target_languages) > 1 and set(target_languages).issubset(set(invalidated)):
+        allowed_global_reasons = {
+            "shared_influence_digest_mismatch",
+            "configuration_digest_mismatch",
+            "producer_identity_mismatch",
+            "graph_schema_signature_mismatch",
+            "toolchain_lock_digest_mismatch",
+            "inventory_digest_mismatch",
+            "inventory_file_sha256_mismatch",
+            "inventory_policy_digest_mismatch",
+            "scan_flags_mismatch",
+        }
+        common_reason_codes = set.intersection(
+            *(
+                {reason["code"] for reason in reasons[language]}
+                for language in target_languages
+            )
+        )
+        if common_reason_codes.isdisjoint(allowed_global_reasons):
+            raise ToolchainError(
+                "structural-cache preflight rejected unexpected all-partition "
+                f"invalidation: partition_count={len(target_languages)} "
+                f"common_reason_codes={sorted(common_reason_codes)}"
+            )
+
+
+def _preflight_reason(
+    code: str, base_value: Any, target_value: Any
+) -> dict[str, str]:
+    def identity_digest(value: Any) -> str:
+        if (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value.lower())
+        ):
+            return value.lower()
+        if value == "missing":
+            return "missing"
+        return sha256_bytes(canonical_json(value))
+
+    return {
+        "code": code,
+        "base_digest": identity_digest(base_value),
+        "target_digest": identity_digest(target_value),
+    }
+
+
 def select_structural_cache(
     output_root: Path,
     repository: str,
@@ -1266,6 +1471,7 @@ def select_structural_cache(
     toolchain_lock_digest: str,
     inventory_digest: str,
     inventory_file_sha256: str,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     catalog = _load_cache_catalog(output_root)
     expected = {
@@ -1279,14 +1485,23 @@ def select_structural_cache(
         "scan_flags": QUALIFICATION_SCAN_FLAGS,
     }
     candidates = []
+    rejection_reasons: list[dict[str, str]] = []
     for entry in catalog["entries"]:
         if (
             entry.get("status") != "ready"
-            or entry.get("schema_version") != STRUCTURAL_CACHE_SCHEMA_VERSION
             or entry.get("repository") != repository
             or type(entry.get("case_index")) is not int
             or entry["case_index"] > case_index
         ):
+            continue
+        if entry.get("schema_version") != STRUCTURAL_CACHE_SCHEMA_VERSION:
+            rejection_reasons.append(
+                _preflight_reason(
+                    "cache_schema_version_mismatch",
+                    entry.get("schema_version"),
+                    STRUCTURAL_CACHE_SCHEMA_VERSION,
+                )
+            )
             continue
         archive_path = Path(_require_string(entry.get("archive_path"), "catalog archive path"))
         sidecar_path = Path(_require_string(entry.get("sidecar_path"), "catalog sidecar path"))
@@ -1305,6 +1520,7 @@ def select_structural_cache(
             entry.get("core_sha256"), "catalog core digest"
         ):
             raise ToolchainError("catalog/core digest mismatch")
+        candidate_mismatches = []
         for field, actual in {
             "repository": core["repository"],
             "root_slug": core["root_slug"],
@@ -1316,8 +1532,30 @@ def select_structural_cache(
             "scan_flags": core["scan_flags"],
         }.items():
             if expected[field] != actual:
-                break
-        else:
+                code = {
+                    "root_slug": "root_slug_mismatch",
+                    "producer": "producer_identity_mismatch",
+                    "toolchain_lock_digest": "toolchain_lock_digest_mismatch",
+                    "inventory_digest": "inventory_digest_mismatch",
+                    "inventory_file_sha256": "inventory_file_sha256_mismatch",
+                    "inventory_policy_digest": "inventory_policy_digest_mismatch",
+                    "scan_flags": "scan_flags_mismatch",
+                }.get(field, f"{field}_mismatch")
+                candidate_mismatches.append(
+                    _preflight_reason(code, actual, expected[field])
+                )
+                if field == "producer" and (
+                    actual.get("graph_schema_signature")
+                    != expected[field].get("graph_schema_signature")
+                ):
+                    candidate_mismatches.append(
+                        _preflight_reason(
+                            "graph_schema_signature_mismatch",
+                            actual.get("graph_schema_signature"),
+                            expected[field].get("graph_schema_signature"),
+                        )
+                    )
+        if not candidate_mismatches:
             verified = {
                 "core": core,
                 "archive_sha256": sidecar["archive_sha256"],
@@ -1339,31 +1577,41 @@ def select_structural_cache(
                 )
             )
             continue
+        rejection_reasons.extend(candidate_mismatches)
         # A globally incompatible candidate is a cold-rebuild choice, not an
         # extraction candidate. Tamper is still fail-closed above because the
         # sidecar/archive publication identities were fully validated.
         continue
     if not candidates:
+        if diagnostics is not None:
+            canonical_reasons = {
+                canonical_json(reason): reason for reason in rejection_reasons
+            }
+            diagnostics["cold_rebuild_reasons"] = [
+                canonical_reasons[key] for key in sorted(canonical_reasons)
+            ] or [
+                _preflight_reason(
+                    "no_repository_cache_available", "missing", target_commit
+                )
+            ]
         return None
     _, _, _, _, entry, verified, diff = min(
         candidates, key=lambda candidate: candidate[:4]
     )
-    invalidate_all = (
-        verified["core"]["shared_influence_digest"]
-        != target_identity["shared_influence_digest"]
-    )
-    invalidated_partitions = sorted(
-        language
-        for language, signature in verified["core"]["partition_signatures"].items()
-        if invalidate_all
-        or language not in target_identity["partitions"]
-        or target_identity["partitions"][language]["signature"] != signature
+    (
+        invalidated_partitions,
+        compatible_partitions,
+        invalidated_partition_reasons,
+    ) = _partition_invalidation_plan(
+        verified["core"], target_identity
     )
     return {
         "entry": entry,
         "verified": verified,
         "diff": diff,
         "invalidated_partitions": invalidated_partitions,
+        "compatible_partitions": compatible_partitions,
+        "invalidated_partition_reasons": invalidated_partition_reasons,
     }
 
 
@@ -1433,6 +1681,65 @@ def inject_structural_cache(
             completed_by_path[record["file"]].append((record_key, record))
     for records in completed_by_path.values():
         records.sort(key=lambda pair: pair[0])
+    validation_producers: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+    jobs_path = cache_root / "enrichment_jobs.json"
+    if jobs_path.is_file():
+        jobs_store = load_json_object(jobs_path, "injected LSP enrichment-job ledger")
+        jobs_value = jobs_store.get("jobs")
+        if not isinstance(jobs_value, list):
+            raise ToolchainError("injected LSP enrichment-job ledger has no jobs list")
+        for job in jobs_value:
+            if not isinstance(job, dict):
+                raise ToolchainError("injected LSP enrichment-job record is malformed")
+            if job.get("state") != "completed" or job.get("capability") != "call_references":
+                continue
+            job_id = job.get("job_id")
+            evidence = job.get("lsp_evidence")
+            if not isinstance(job_id, str) or not job_id or not isinstance(evidence, dict):
+                raise ToolchainError("completed LSP enrichment job lacks durable evidence identity")
+            validations = evidence.get("validations")
+            if not isinstance(validations, list):
+                raise ToolchainError("completed LSP enrichment job has no validations list")
+            producer_id = f"enrichment-job:{job_id}"
+            for validation in validations:
+                if not isinstance(validation, dict):
+                    raise ToolchainError("LSP validation evidence is malformed")
+                if validation.get("status") != "processed":
+                    continue
+                symbols = validation.get("document_symbols", [])
+                if not isinstance(symbols, list):
+                    raise ToolchainError("document-symbol validation evidence is malformed")
+                for symbol in symbols:
+                    if not isinstance(symbol, dict):
+                        raise ToolchainError("document-symbol response evidence is malformed")
+                    path = symbol.get("file")
+                    result_id = symbol.get("graph_result_id")
+                    if isinstance(path, str) and path and isinstance(result_id, str) and result_id:
+                        validation_producers[(path, result_id)].add(producer_id)
+
+    def result_producer_ids(
+        path: str,
+        result_id: str,
+        records: Sequence[tuple[str, Mapping[str, Any]]],
+    ) -> list[str]:
+        work_producers = [
+            record_key
+            for record_key, record in records
+            if isinstance(record.get("produced_result_ids", []), list)
+            and result_id in record.get("produced_result_ids", [])
+        ]
+        return sorted(
+            set(work_producers) | validation_producers.get((path, result_id), set())
+        )
+
+    completed_operation_count_by_path = {
+        path: sum(
+            len(record.get("requested_operations", []))
+            for _, record in records
+            if isinstance(record.get("requested_operations", []), list)
+        )
+        for path, records in completed_by_path.items()
+    }
 
     diff = selection["diff"]
     touched = set(diff["changed_paths"]) | set(diff["added_paths"]) | set(
@@ -1443,6 +1750,12 @@ def inject_structural_cache(
         touched.add(new)
     target_blobs = _git_tree_blobs(git_dir, target_identity["commit"])
     invalidated = set(selection["invalidated_partitions"])
+    invalidation_reasons = {
+        language: [dict(reason) for reason in language_reasons]
+        for language, language_reasons in selection[
+            "invalidated_partition_reasons"
+        ].items()
+    }
     base_languages = {
         file_record["path"]: file_record["language"]
         for file_record in files
@@ -1479,12 +1792,19 @@ def inject_structural_cache(
         ):
             records = completed_by_path.get(path, [])
             for result_id in expected_ids:
-                if not isinstance(result_id, str) or not any(
-                    result_id in record.get("produced_result_ids", [])
-                    for _, record in records
-                    if isinstance(record.get("produced_result_ids", []), list)
+                if not isinstance(result_id, str) or not result_producer_ids(
+                    path, result_id, records
                 ):
                     invalidated.add(language)
+                    reason = {
+                        "code": "missing_producer_lineage",
+                        "base_digest": (
+                            result_id if isinstance(result_id, str) and result_id else "invalid"
+                        ),
+                        "target_digest": "required",
+                    }
+                    if reason not in invalidation_reasons.setdefault(language, []):
+                        invalidation_reasons[language].append(reason)
                     break
 
     inherited_files = []
@@ -1506,6 +1826,13 @@ def inject_structural_cache(
         partition = target_identity["partitions"].get(language)
         if not isinstance(partition, dict):
             invalidated.add(language)
+            reason = {
+                "code": "target_partition_missing",
+                "base_digest": "present",
+                "target_digest": "missing",
+            }
+            if reason not in invalidation_reasons.setdefault(language, []):
+                invalidation_reasons[language].append(reason)
             continue
         records = completed_by_path.get(path, [])
         producer_ids = [record_key for record_key, _ in records]
@@ -1546,11 +1873,7 @@ def inject_structural_cache(
         result_producers = [
             {
                 "result_id": result_id,
-                "producer_ids": [
-                    record_key
-                    for record_key, record in records
-                    if result_id in record.get("produced_result_ids", [])
-                ],
+                "producer_ids": result_producer_ids(path, result_id, records),
             }
             for result_id in expected_ids
         ]
@@ -1608,6 +1931,38 @@ def inject_structural_cache(
             and file_record["path"] in target_blobs
         }
     )
+    inherited_paths = {file_record["path"] for file_record in inherited_files}
+    renamed_source_by_target = {new: old for old, new in diff["renamed_paths"]}
+    operation_counts_by_language: dict[str, list[int]] = collections.defaultdict(list)
+    for file_record in files:
+        if not isinstance(file_record, dict):
+            continue
+        path = file_record.get("path")
+        language = file_record.get("language")
+        if isinstance(path, str) and isinstance(language, str):
+            operation_counts_by_language[language].append(
+                completed_operation_count_by_path.get(path, 0)
+            )
+    for counts in operation_counts_by_language.values():
+        counts.sort()
+    predicted_executed_work_count = 0
+    estimated_operation_file_count = 0
+    for path, language in sorted(path_partitions.items()):
+        if path in inherited_paths:
+            continue
+        prior_path = path if path in completed_operation_count_by_path else (
+            renamed_source_by_target.get(path)
+        )
+        if prior_path in completed_operation_count_by_path:
+            predicted_executed_work_count += completed_operation_count_by_path[prior_path]
+            continue
+        historical_counts = operation_counts_by_language.get(language, [])
+        predicted_executed_work_count += (
+            historical_counts[(len(historical_counts) - 1) // 2]
+            if historical_counts
+            else 0
+        )
+        estimated_operation_file_count += 1
     authorization = {
         "schema_version": STRUCTURAL_CACHE_SCHEMA_VERSION,
         "offline_preprocessing": True,
@@ -1650,9 +2005,333 @@ def inject_structural_cache(
         "authorization_sha256": sha256_file(authorization_path),
         "inherited_file_count": len(inherited_files),
         "inherited_graph_enrichment_operation_count": inherited_work_count,
+        "predicted_executed_graph_enrichment_operation_count": (
+            predicted_executed_work_count
+        ),
+        "predicted_total_graph_enrichment_operation_count": (
+            inherited_work_count + predicted_executed_work_count
+        ),
+        "predicted_operation_estimated_file_count": estimated_operation_file_count,
         "changed_file_count": diff["distance"],
         "invalidated_partitions": sorted(invalidated),
+        "compatible_partitions": sorted(
+            set(selection["compatible_partitions"]) - invalidated
+        ),
+        "invalidated_partition_reasons": {
+            language: sorted(
+                language_reasons,
+                key=lambda reason: (
+                    reason["code"],
+                    reason["base_digest"],
+                    reason["target_digest"],
+                ),
+            )
+            for language, language_reasons in sorted(invalidation_reasons.items())
+            if language in invalidated
+        },
+        "target_file_count": len(path_partitions),
+        "predicted_executed_file_count": len(path_partitions) - len(inherited_files),
     }
+
+
+def build_structural_cache_preflight(
+    *,
+    case_index: int,
+    instance_id: str,
+    inventory_case: Mapping[str, Any],
+    target_identity: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
+    injection_receipt: Mapping[str, Any] | None,
+    cold_rebuild_reasons: Sequence[Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
+    target_file_count = inventory_case.get("included_file_count")
+    if type(target_file_count) is not int or target_file_count < 0:
+        raise ToolchainError(f"{instance_id} inventory file count is invalid")
+    target_languages = sorted(target_identity["partitions"])
+    if selection is None:
+        selected_base_cache = None
+        compatible_partitions: list[str] = []
+        inherited_partitions: list[str] = []
+        reasons = [dict(reason) for reason in cold_rebuild_reasons or []] or [
+            _preflight_reason(
+                "no_repository_cache_available", "missing", target_identity["commit"]
+            )
+        ]
+        invalidated_partition_reasons = {
+            language: [dict(reason) for reason in reasons]
+            for language in target_languages
+        }
+        inherited_file_count = 0
+        executed_file_count = target_file_count
+        expected_operation_count = {
+            "inherited_exact": 0,
+            "executed_estimate": None,
+            "total_estimate": None,
+            "basis": "cold_no_base_work_ledger",
+            "estimated_file_count": target_file_count,
+        }
+    else:
+        if injection_receipt is None:
+            raise ToolchainError("selected cache preflight has no injection receipt")
+        core = selection["verified"]["core"]
+        entry = selection["entry"]
+        selected_base_cache = {
+            "instance_id": entry["instance_id"],
+            "attempt_index": int(entry.get("attempt_index", 0)),
+            "repository": core["repository"],
+            "commit": core["commit"],
+            "tree": core["tree"],
+            "archive_sha256": injection_receipt["base_archive_sha256"],
+            "sidecar_sha256": injection_receipt["base_sidecar_sha256"],
+            "core_sha256": injection_receipt["base_core_sha256"],
+        }
+        compatible_partitions = list(injection_receipt["compatible_partitions"])
+        invalidated_partition_reasons = {
+            language: [dict(reason) for reason in language_reasons]
+            for language, language_reasons in injection_receipt[
+                "invalidated_partition_reasons"
+            ].items()
+        }
+        authorization = load_json_object(
+            Path(injection_receipt["authorization_path"]),
+            f"{instance_id} structural-cache authorization",
+        )
+        inherited_partitions = sorted(
+            {
+                inherited["language"]
+                for inherited in authorization["inherited_files"]
+                if isinstance(inherited, dict)
+                and isinstance(inherited.get("language"), str)
+            }
+        )
+        inherited_file_count = injection_receipt["inherited_file_count"]
+        executed_file_count = injection_receipt["predicted_executed_file_count"]
+        if injection_receipt["target_file_count"] != target_file_count:
+            raise ToolchainError(
+                f"{instance_id} preflight target files differ from frozen inventory: "
+                f"planned={injection_receipt['target_file_count']} "
+                f"inventory={target_file_count}"
+            )
+        expected_operation_count = {
+            "inherited_exact": injection_receipt[
+                "inherited_graph_enrichment_operation_count"
+            ],
+            "executed_estimate": injection_receipt[
+                "predicted_executed_graph_enrichment_operation_count"
+            ],
+            "total_estimate": injection_receipt[
+                "predicted_total_graph_enrichment_operation_count"
+            ],
+            "basis": (
+                "verified_base_per_path_work_ledger_with_language_median_for_unseen_paths"
+            ),
+            "estimated_file_count": injection_receipt[
+                "predicted_operation_estimated_file_count"
+            ],
+        }
+    invalidated_partitions = [
+        {
+            "language": language,
+            "reasons": sorted(
+                invalidated_partition_reasons[language],
+                key=lambda reason: (
+                    reason["code"],
+                    reason["base_digest"],
+                    reason["target_digest"],
+                ),
+            ),
+        }
+        for language in sorted(invalidated_partition_reasons)
+    ]
+    preflight = {
+        "schema_version": STRUCTURAL_CACHE_SCHEMA_VERSION,
+        "status": "ready_to_enrich",
+        "case_index": case_index,
+        "instance_id": instance_id,
+        "repository": target_identity["repository"],
+        "target_commit": target_identity["commit"],
+        "target_tree": target_identity["tree"],
+        "selected_base_cache": selected_base_cache,
+        "compatible_partitions": compatible_partitions,
+        "inherited_partitions": inherited_partitions,
+        "invalidated_partitions": invalidated_partitions,
+        "predicted_file_counts": {
+            "target": target_file_count,
+            "inherited": inherited_file_count,
+            "executed": executed_file_count,
+        },
+        "expected_operation_count": expected_operation_count,
+        "digest": "",
+    }
+    preflight["digest"] = sha256_bytes(canonical_json(preflight))
+    validate_structural_cache_preflight(preflight, target_identity)
+    return preflight
+
+
+def validate_structural_cache_preflight(
+    preflight: Mapping[str, Any], target_identity: Mapping[str, Any]
+) -> None:
+    _require_exact_fields(
+        preflight,
+        {
+            "schema_version",
+            "status",
+            "case_index",
+            "instance_id",
+            "repository",
+            "target_commit",
+            "target_tree",
+            "selected_base_cache",
+            "compatible_partitions",
+            "inherited_partitions",
+            "invalidated_partitions",
+            "predicted_file_counts",
+            "expected_operation_count",
+            "digest",
+        },
+        "structural-cache preflight",
+    )
+    if (
+        preflight["schema_version"] != STRUCTURAL_CACHE_SCHEMA_VERSION
+        or preflight["status"] != "ready_to_enrich"
+        or type(preflight["case_index"]) is not int
+        or preflight["case_index"] <= 0
+        or preflight["repository"] != target_identity["repository"]
+        or preflight["target_commit"] != target_identity["commit"]
+        or preflight["target_tree"] != target_identity["tree"]
+    ):
+        raise ToolchainError("structural-cache preflight target identity is invalid")
+    digest = _require_sha256(preflight["digest"], "structural-cache preflight digest")
+    digest_value = dict(preflight)
+    digest_value["digest"] = ""
+    if sha256_bytes(canonical_json(digest_value)) != digest:
+        raise ToolchainError("structural-cache preflight digest mismatch")
+    compatible = preflight["compatible_partitions"]
+    inherited = preflight["inherited_partitions"]
+    invalidated_records = preflight["invalidated_partitions"]
+    if (
+        not isinstance(compatible, list)
+        or compatible != sorted(set(compatible))
+        or not isinstance(inherited, list)
+        or inherited != sorted(set(inherited))
+        or not isinstance(invalidated_records, list)
+    ):
+        raise ToolchainError("structural-cache preflight partitions are malformed")
+    invalidated_reasons: dict[str, list[dict[str, str]]] = {}
+    for record in invalidated_records:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"language", "reasons"}
+            or not isinstance(record.get("language"), str)
+            or not isinstance(record.get("reasons"), list)
+            or not record["reasons"]
+        ):
+            raise ToolchainError("structural-cache invalidated partition is malformed")
+        language = record["language"]
+        if language in invalidated_reasons:
+            raise ToolchainError("structural-cache invalidated partition is duplicated")
+        for reason in record["reasons"]:
+            if (
+                not isinstance(reason, dict)
+                or set(reason) != {"code", "base_digest", "target_digest"}
+                or not all(
+                    isinstance(value, str) and value for value in reason.values()
+                )
+            ):
+                raise ToolchainError(
+                    "structural-cache invalidation reason is malformed"
+                )
+        invalidated_reasons[language] = record["reasons"]
+    target_languages = sorted(target_identity["partitions"])
+    if sorted(set(compatible) | set(invalidated_reasons)) != target_languages:
+        raise ToolchainError("structural-cache preflight does not cover target partitions")
+    if not set(inherited).issubset(set(compatible)):
+        raise ToolchainError("inherited partitions are not cache-compatible")
+    selected = preflight["selected_base_cache"]
+    if selected is None:
+        cold_reason_codes = {
+            "no_repository_cache_available",
+            "cache_schema_version_mismatch",
+            "root_slug_mismatch",
+            "producer_identity_mismatch",
+            "graph_schema_signature_mismatch",
+            "toolchain_lock_digest_mismatch",
+            "inventory_digest_mismatch",
+            "inventory_file_sha256_mismatch",
+            "inventory_policy_digest_mismatch",
+            "scan_flags_mismatch",
+        }
+        if compatible or inherited or any(
+            reason.get("code") not in cold_reason_codes
+            for reasons in invalidated_reasons.values()
+            for reason in reasons
+            if isinstance(reason, dict)
+        ):
+            raise ToolchainError("cold structural-cache preflight is inconsistent")
+    else:
+        _validate_selected_partition_plan(
+            {
+                "invalidated_partitions": sorted(invalidated_reasons),
+                "compatible_partitions": compatible,
+                "invalidated_partition_reasons": invalidated_reasons,
+            },
+            target_identity,
+        )
+    counts = preflight["predicted_file_counts"]
+    if not isinstance(counts, dict) or set(counts) != {"target", "inherited", "executed"}:
+        raise ToolchainError("structural-cache preflight file counts are malformed")
+    if any(type(value) is not int or value < 0 for value in counts.values()) or (
+        counts["inherited"] + counts["executed"] != counts["target"]
+    ):
+        raise ToolchainError("structural-cache preflight file counts are inconsistent")
+    operations = preflight["expected_operation_count"]
+    if not isinstance(operations, dict) or set(operations) != {
+        "inherited_exact",
+        "executed_estimate",
+        "total_estimate",
+        "basis",
+        "estimated_file_count",
+    }:
+        raise ToolchainError("structural-cache preflight operation count is malformed")
+    if (
+        type(operations["inherited_exact"]) is not int
+        or operations["inherited_exact"] < 0
+        or type(operations["estimated_file_count"]) is not int
+        or operations["estimated_file_count"] < 0
+        or not isinstance(operations["basis"], str)
+        or not operations["basis"]
+    ):
+        raise ToolchainError("structural-cache preflight operation count is invalid")
+    if selected is None:
+        if operations["executed_estimate"] is not None or operations["total_estimate"] is not None:
+            raise ToolchainError("cold operation estimate must be explicitly unknown")
+    elif (
+        type(operations["executed_estimate"]) is not int
+        or operations["executed_estimate"] < 0
+        or type(operations["total_estimate"]) is not int
+        or operations["total_estimate"]
+        != operations["inherited_exact"] + operations["executed_estimate"]
+    ):
+        raise ToolchainError("incremental operation estimate is inconsistent")
+
+
+def publish_structural_cache_preflight(
+    preflight: Mapping[str, Any], path: Path
+) -> None:
+    _publish_canonical_json_exclusive(path, preflight)
+    print(canonical_json(preflight).decode(), flush=True)
+
+
+def require_approved_structural_cache_preflight(
+    actual: Mapping[str, Any], approved_path: Path | None
+) -> None:
+    if approved_path is None:
+        return
+    approved = load_json_object(approved_path, "approved structural-cache preflight")
+    if approved != actual:
+        raise ToolchainError(
+            "approved structural-cache preflight differs from recomputed plan"
+        )
 
 
 def build_repo_parser_bundle(repo_root: Path, output: Path) -> dict[str, Any]:
@@ -2314,15 +2993,319 @@ def validate_hex_digest(value: Any, label: str) -> str:
     return value
 
 
+def _require_https_url(value: Any, label: str) -> str:
+    url = _require_string(value, label)
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ToolchainError(f"{label} must be an exact credential-free HTTPS URL")
+    return url
+
+
+def _repo_contract_file(
+    repo_root: Path, reference: Mapping[str, Any], label: str
+) -> Path:
+    _require_exact_fields(reference, {"path", "sha256"}, label)
+    relative = _normalized_cache_path(
+        _require_string(reference["path"], f"{label}.path"), label
+    )
+    expected_digest = _require_sha256(reference["sha256"], f"{label}.sha256")
+    root = repo_root.resolve()
+    if not root.is_dir():
+        raise ToolchainError(f"repository source root is not a directory: {root}")
+    candidate = root
+    for component in PurePosixPath(relative).parts:
+        candidate = candidate / component
+        if candidate.is_symlink():
+            raise ToolchainError(f"{label} traverses a symlink: {relative}")
+    resolved = candidate.resolve()
+    if root not in resolved.parents or not candidate.is_file():
+        raise ToolchainError(f"{label} is missing or escapes repository root: {relative}")
+    actual_digest = sha256_file(candidate)
+    if actual_digest != expected_digest:
+        raise ToolchainError(
+            f"{label} source digest mismatch: expected={expected_digest} "
+            f"actual={actual_digest}"
+        )
+    return candidate
+
+
+def _validate_recipe_commands(value: Any, label: str) -> list[list[str]]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(argument, str) or not argument for argument in command)
+            for command in value
+        )
+    ):
+        raise ToolchainError(f"{label} must contain nonempty argv arrays")
+    return [list(command) for command in value]
+
+
+def _load_acquisition_recipes(
+    lock: Mapping[str, Any], repo_root: Path
+) -> tuple[dict[str, dict[str, Any]], str]:
+    acquisition = lock.get("acquisition")
+    if not isinstance(acquisition, dict):
+        raise ToolchainError("toolchain acquisition contract must be an object")
+    contract_path = _repo_contract_file(
+        repo_root, acquisition, "toolchain acquisition contract"
+    )
+    document = load_json_object(contract_path, "toolchain acquisition contract")
+    _require_exact_fields(
+        document, {"schema_version", "artifacts"}, "toolchain acquisition contract"
+    )
+    if document["schema_version"] != SCHEMA_VERSION:
+        raise ToolchainError("toolchain acquisition contract schema mismatch")
+    raw_recipes = document["artifacts"]
+    if not isinstance(raw_recipes, list) or not raw_recipes:
+        raise ToolchainError("toolchain acquisition recipes must be nonempty")
+    recipes: dict[str, dict[str, Any]] = {}
+    for index, raw_recipe in enumerate(raw_recipes):
+        label = f"acquisition recipe {index}"
+        if not isinstance(raw_recipe, dict):
+            raise ToolchainError(f"{label} must be an object")
+        recipe = dict(raw_recipe)
+        artifact = _require_string(recipe.get("artifact"), f"{label}.artifact")
+        _normalized_cache_path(artifact, f"{label}.artifact")
+        if "/" in artifact:
+            raise ToolchainError(f"{label}.artifact must be one path component")
+        if artifact in recipes:
+            raise ToolchainError(f"duplicate acquisition recipe: {artifact}")
+        _require_sha256(recipe.get("artifact_sha256"), f"{label}.artifact_sha256")
+        root_name = _require_string(recipe.get("root_name"), f"{label}.root_name")
+        if "/" in root_name or root_name in {".", ".."}:
+            raise ToolchainError(f"{label}.root_name must be one path component")
+        kind = recipe.get("kind")
+        if kind == "node-npm-ci":
+            _require_exact_fields(
+                recipe,
+                {
+                    "artifact",
+                    "artifact_sha256",
+                    "commands",
+                    "kind",
+                    "node_runtime_artifact",
+                    "node_runtime_root",
+                    "package_json",
+                    "package_lock",
+                    "root_name",
+                },
+                label,
+            )
+            _repo_contract_file(repo_root, recipe["package_json"], f"{label}.package_json")
+            package_lock_path = _repo_contract_file(
+                repo_root, recipe["package_lock"], f"{label}.package_lock"
+            )
+            package_lock = load_json_object(package_lock_path, f"{label} package lock")
+            if package_lock.get("lockfileVersion") != 3:
+                raise ToolchainError(f"{label} package lock must use lockfileVersion 3")
+            commands = _validate_recipe_commands(recipe["commands"], f"{label}.commands")
+            if any(command[0] != "npm" for command in commands):
+                raise ToolchainError(f"{label} commands must use the pinned npm runtime")
+            _require_string(
+                recipe["node_runtime_artifact"], f"{label}.node_runtime_artifact"
+            )
+            _require_string(recipe["node_runtime_root"], f"{label}.node_runtime_root")
+        elif kind == "python-wheelhouse":
+            _require_exact_fields(
+                recipe,
+                {
+                    "artifact",
+                    "artifact_sha256",
+                    "kind",
+                    "manifest",
+                    "root_name",
+                },
+                label,
+            )
+            manifest_path = _repo_contract_file(
+                repo_root, recipe["manifest"], f"{label}.manifest"
+            )
+            manifest = load_json_object(manifest_path, f"{label} wheel manifest")
+            _require_exact_fields(
+                manifest,
+                {"schema_version", "root_name", "wheels"},
+                f"{label} wheel manifest",
+            )
+            if (
+                manifest["schema_version"] != SCHEMA_VERSION
+                or manifest["root_name"] != root_name
+            ):
+                raise ToolchainError(f"{label} wheel manifest identity mismatch")
+            wheels = manifest["wheels"]
+            if not isinstance(wheels, list) or not wheels:
+                raise ToolchainError(f"{label} wheel manifest must be nonempty")
+            filenames = []
+            for wheel_index, wheel in enumerate(wheels):
+                wheel_label = f"{label} wheel {wheel_index}"
+                if not isinstance(wheel, dict):
+                    raise ToolchainError(f"{wheel_label} must be an object")
+                _require_exact_fields(
+                    wheel, {"filename", "sha256", "url"}, wheel_label
+                )
+                filename = _normalized_cache_path(
+                    _require_string(wheel["filename"], f"{wheel_label}.filename"),
+                    wheel_label,
+                )
+                if "/" in filename or not filename.endswith(".whl"):
+                    raise ToolchainError(f"{wheel_label} filename is invalid")
+                filenames.append(filename)
+                _require_sha256(wheel["sha256"], f"{wheel_label}.sha256")
+                _require_https_url(wheel["url"], f"{wheel_label}.url")
+            if filenames != sorted(set(filenames)):
+                raise ToolchainError(f"{label} wheel filenames must be sorted and unique")
+        elif kind == "cyright-source":
+            _require_exact_fields(
+                recipe,
+                {
+                    "artifact",
+                    "artifact_sha256",
+                    "commands",
+                    "kind",
+                    "node_runtime_artifact",
+                    "node_runtime_root",
+                    "output_path",
+                    "patches",
+                    "root_name",
+                    "source_root",
+                    "source_sha256",
+                    "source_url",
+                },
+                label,
+            )
+            _require_https_url(recipe["source_url"], f"{label}.source_url")
+            _require_sha256(recipe["source_sha256"], f"{label}.source_sha256")
+            _normalized_cache_path(recipe["source_root"], f"{label}.source_root")
+            _normalized_cache_path(recipe["output_path"], f"{label}.output_path")
+            _require_string(
+                recipe["node_runtime_artifact"], f"{label}.node_runtime_artifact"
+            )
+            _require_string(recipe["node_runtime_root"], f"{label}.node_runtime_root")
+            commands = _validate_recipe_commands(recipe["commands"], f"{label}.commands")
+            if any(command[0] != "npm" for command in commands):
+                raise ToolchainError(f"{label} commands must use the pinned npm runtime")
+            patches = recipe["patches"]
+            if not isinstance(patches, list):
+                raise ToolchainError(f"{label}.patches must be an array")
+            for patch_index, patch_reference in enumerate(patches):
+                if not isinstance(patch_reference, dict):
+                    raise ToolchainError(f"{label} patch {patch_index} must be an object")
+                _repo_contract_file(
+                    repo_root, patch_reference, f"{label} patch {patch_index}"
+                )
+        elif kind == "repo-sources":
+            _require_exact_fields(
+                recipe,
+                {
+                    "artifact",
+                    "artifact_sha256",
+                    "kind",
+                    "root_name",
+                    "sources",
+                },
+                label,
+            )
+            sources = recipe["sources"]
+            if not isinstance(sources, list) or not sources:
+                raise ToolchainError(f"{label}.sources must be nonempty")
+            destinations = []
+            for source_index, source in enumerate(sources):
+                source_label = f"{label} source {source_index}"
+                if not isinstance(source, dict):
+                    raise ToolchainError(f"{source_label} must be an object")
+                _require_exact_fields(
+                    source, {"destination", "path", "sha256"}, source_label
+                )
+                _repo_contract_file(
+                    repo_root,
+                    {"path": source["path"], "sha256": source["sha256"]},
+                    source_label,
+                )
+                destination = _normalized_cache_path(
+                    _require_string(
+                        source["destination"], f"{source_label}.destination"
+                    ),
+                    source_label,
+                )
+                if "/" in destination:
+                    raise ToolchainError(f"{source_label}.destination must be one component")
+                destinations.append(destination)
+            if len(destinations) != len(set(destinations)):
+                raise ToolchainError(
+                    f"{label} source destinations must be unique"
+                )
+        else:
+            raise ToolchainError(f"{label}.kind is unsupported: {kind}")
+        recipes[artifact] = recipe
+    return recipes, sha256_file(contract_path)
+
+
+def _artifact_acquisition_groups(
+    lock: Mapping[str, Any], recipes: Mapping[str, Mapping[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    entries = [*lock.get("runtimes", []), *lock.get("servers", [])]
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ToolchainError(f"toolchain artifact entry {index} must be an object")
+        artifact = _require_string(entry.get("artifact"), f"artifact entry {index}.artifact")
+        _normalized_cache_path(artifact, f"artifact entry {index}.artifact")
+        if "/" in artifact:
+            raise ToolchainError(f"artifact entry {index}.artifact must be one component")
+        digest = _require_sha256(
+            entry.get("artifact_sha256"), f"artifact entry {index}.artifact_sha256"
+        )
+        source_url = _require_https_url(
+            entry.get("source_url"), f"artifact entry {index}.source_url"
+        )
+        group = groups.setdefault(
+            artifact, {"artifact_sha256": digest, "source_urls": set()}
+        )
+        if group["artifact_sha256"] != digest:
+            raise ToolchainError(f"artifact digest disagreement: {artifact}")
+        group["source_urls"].add(source_url)
+    for artifact, recipe in recipes.items():
+        group = groups.get(artifact)
+        if group is None:
+            raise ToolchainError(f"acquisition recipe has no toolchain artifact: {artifact}")
+        if recipe["artifact_sha256"] != group["artifact_sha256"]:
+            raise ToolchainError(f"acquisition recipe digest mismatch: {artifact}")
+    for artifact, group in groups.items():
+        if artifact not in recipes and len(group["source_urls"]) != 1:
+            raise ToolchainError(
+                f"aggregate artifact lacks deterministic recipe: {artifact}"
+            )
+    for artifact, recipe in recipes.items():
+        runtime_artifact = recipe.get("node_runtime_artifact")
+        if runtime_artifact is not None:
+            if runtime_artifact not in groups or runtime_artifact in recipes:
+                raise ToolchainError(
+                    f"{artifact} must reference a directly downloadable node runtime"
+                )
+    return groups
+
+
 def verify_lock(
     lock_path: Path,
     inventory_path: Path,
     cache_root: Path | None,
     descriptor_path: Path | None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     lock = load_json_object(lock_path, "toolchain lock")
     inventory = load_json_object(inventory_path, "inventory")
+    source_root = (repo_root or Path.cwd()).resolve()
     required_lock_keys = {
+        "acquisition",
         "schema_version",
         "platform",
         "inventory_sha256",
@@ -2376,6 +3359,27 @@ def verify_lock(
             raise ToolchainError(f"repo_parser_bundle source {index} path is invalid")
         validate_hex_digest(
             source.get("sha256"), f"repo_parser_bundle source {index}.sha256"
+        )
+        _repo_contract_file(
+            source_root, source, f"repo_parser_bundle source {index}"
+        )
+    acquisition_recipes, acquisition_contract_sha256 = (
+        _load_acquisition_recipes(lock, source_root)
+    )
+    parser_recipe = acquisition_recipes.get(repo_parser_bundle["artifact"])
+    if (
+        parser_recipe is None
+        or parser_recipe.get("kind") != "repo-sources"
+        or parser_recipe.get("artifact_sha256")
+        != repo_parser_bundle["artifact_sha256"]
+        or [
+            {"path": source["path"], "sha256": source["sha256"]}
+            for source in parser_recipe["sources"]
+        ]
+        != sources
+    ):
+        raise ToolchainError(
+            "repo_parser_bundle does not match its deterministic acquisition recipe"
         )
     languages = {
         entry["language"]
@@ -2583,6 +3587,7 @@ def verify_lock(
             raise ToolchainError(
                 f"{entry['name']} has unknown runtime dependencies: {missing_runtime}"
             )
+    acquisition_groups = _artifact_acquisition_groups(lock, acquisition_recipes)
     if descriptor_path is not None:
         descriptors = load_json_object(descriptor_path, "descriptor inventory")
         if set(descriptors) != {"schema_version", "servers"}:
@@ -2673,36 +3678,251 @@ def verify_lock(
         "unsupported_languages": sorted(unsupported_set),
         "cache_verified": cache_root is not None,
         "descriptors_verified": descriptor_path is not None,
+        "repository_sources_verified": True,
+        "acquisition_contract_sha256": acquisition_contract_sha256,
+        "acquisition_recipe_count": len(acquisition_recipes),
+        "acquisition_artifact_count": len(acquisition_groups),
     }
 
 
-def acquire_artifacts(lock_path: Path, cache_root: Path) -> dict[str, Any]:
+def _download_https_artifact(url: str, digest: str, target: Path) -> None:
+    _require_https_url(url, "artifact source URL")
+    _require_sha256(digest, "artifact source digest")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "rna-swebench-lsp-toolchain/1"}
+    )
+    with urllib.request.urlopen(request, timeout=120) as response, target.open("wb") as sink:  # noqa: S310
+        final_url = response.geturl()
+        _require_https_url(final_url, "artifact redirect URL")
+        shutil.copyfileobj(response, sink)
+    actual_digest = sha256_file(target)
+    if actual_digest != digest:
+        raise ToolchainError(
+            f"download digest mismatch: expected={digest} actual={actual_digest}"
+        )
+
+
+def _node_recipe_environment(node_bin: Path, npm_cache: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["PATH"] = os.pathsep.join(
+        [str(node_bin), "/usr/bin", "/bin"]
+    )
+    environment["npm_config_cache"] = str(npm_cache)
+    environment["npm_config_audit"] = "false"
+    environment["npm_config_fund"] = "false"
+    environment["npm_config_update_notifier"] = "false"
+    return environment
+
+
+def _run_node_recipe_commands(
+    recipe: Mapping[str, Any],
+    cache_root: Path,
+    working_directory: Path,
+    staging_root: Path,
+) -> None:
+    runtime_artifact = cache_root / recipe["node_runtime_artifact"]
+    if not runtime_artifact.is_file():
+        raise ToolchainError(
+            f"node recipe runtime is missing: {recipe['node_runtime_artifact']}"
+        )
+    runtime_stage = staging_root / "node-runtime"
+    _extract_tar(runtime_artifact, runtime_stage)
+    node_bin = runtime_stage / recipe["node_runtime_root"] / "bin"
+    npm = node_bin / "npm"
+    node = node_bin / "node"
+    if not npm.is_file() or not node.is_file():
+        raise ToolchainError("pinned node recipe runtime lacks node/npm")
+    environment = _node_recipe_environment(node_bin, staging_root / "npm-cache")
+    for command in recipe["commands"]:
+        completed = subprocess.run(
+            [str(npm), *command[1:]],
+            cwd=working_directory,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise ToolchainError(
+                f"node acquisition recipe failed ({' '.join(command)}): "
+                f"stdout={completed.stdout.strip()[-4000:]} "
+                f"stderr={completed.stderr.strip()[-4000:]}"
+            )
+
+
+def _build_repo_sources_recipe(
+    recipe: Mapping[str, Any], repo_root: Path, output: Path
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="rna-lsp-repo-recipe-") as temporary:
+        source_root = Path(temporary) / recipe["root_name"]
+        source_root.mkdir()
+        for index, source in enumerate(recipe["sources"]):
+            source_path = _repo_contract_file(
+                repo_root,
+                {"path": source["path"], "sha256": source["sha256"]},
+                f"repo acquisition source {index}",
+            )
+            destination = source_root / source["destination"]
+            shutil.copyfile(source_path, destination)
+            destination.chmod(0o755)
+        seal_directory(source_root, output, recipe["root_name"])
+    return len(recipe["sources"])
+
+
+def _build_wheelhouse_recipe(
+    recipe: Mapping[str, Any], repo_root: Path, output: Path
+) -> int:
+    manifest_path = _repo_contract_file(
+        repo_root, recipe["manifest"], "wheelhouse acquisition manifest"
+    )
+    manifest = load_json_object(manifest_path, "wheelhouse acquisition manifest")
+    with tempfile.TemporaryDirectory(prefix="rna-lsp-wheel-recipe-") as temporary:
+        wheelhouse = Path(temporary) / recipe["root_name"]
+        wheelhouse.mkdir()
+        for wheel in manifest["wheels"]:
+            _download_https_artifact(
+                wheel["url"], wheel["sha256"], wheelhouse / wheel["filename"]
+            )
+        seal_directory(wheelhouse, output, recipe["root_name"])
+    return len(manifest["wheels"])
+
+
+def _build_node_bundle_recipe(
+    recipe: Mapping[str, Any], repo_root: Path, cache_root: Path, output: Path
+) -> int:
+    package_json = _repo_contract_file(
+        repo_root, recipe["package_json"], "node recipe package.json"
+    )
+    package_lock = _repo_contract_file(
+        repo_root, recipe["package_lock"], "node recipe package-lock.json"
+    )
+    with tempfile.TemporaryDirectory(prefix="rna-lsp-node-recipe-") as temporary:
+        staging_root = Path(temporary)
+        bundle_root = staging_root / recipe["root_name"]
+        bundle_root.mkdir()
+        shutil.copyfile(package_json, bundle_root / "package.json")
+        shutil.copyfile(package_lock, bundle_root / "package-lock.json")
+        _run_node_recipe_commands(recipe, cache_root, bundle_root, staging_root)
+        seal_directory(bundle_root, output, recipe["root_name"])
+    return 1
+
+
+def _build_cyright_recipe(
+    recipe: Mapping[str, Any], repo_root: Path, cache_root: Path, output: Path
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="rna-lsp-cyright-recipe-") as temporary:
+        staging_root = Path(temporary)
+        source_archive = staging_root / "cyright-source.tar.gz"
+        _download_https_artifact(
+            recipe["source_url"], recipe["source_sha256"], source_archive
+        )
+        extracted = staging_root / "source"
+        _extract_tar(source_archive, extracted)
+        source_root = extracted / recipe["source_root"]
+        if not source_root.is_dir() or source_root.is_symlink():
+            raise ToolchainError("Cyright source archive root is missing")
+        for index, patch_reference in enumerate(recipe["patches"]):
+            patch_path = _repo_contract_file(
+                repo_root, patch_reference, f"Cyright acquisition patch {index}"
+            )
+            completed = subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+                cwd=source_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise ToolchainError(f"Cyright acquisition patch failed: {detail[-4000:]}")
+        _run_node_recipe_commands(recipe, cache_root, source_root, staging_root)
+        built_output = source_root / recipe["output_path"]
+        if not built_output.is_dir() or built_output.is_symlink():
+            raise ToolchainError("Cyright acquisition output is missing")
+        bundle_root = staging_root / recipe["root_name"]
+        bundle_root.mkdir()
+        shutil.copytree(built_output, bundle_root / "dist", symlinks=True)
+        seal_directory(bundle_root, output, recipe["root_name"])
+    return 1
+
+
+def _build_acquisition_recipe(
+    recipe: Mapping[str, Any], repo_root: Path, cache_root: Path, output: Path
+) -> int:
+    kind = recipe["kind"]
+    if kind == "repo-sources":
+        return _build_repo_sources_recipe(recipe, repo_root, output)
+    if kind == "python-wheelhouse":
+        return _build_wheelhouse_recipe(recipe, repo_root, output)
+    if kind == "node-npm-ci":
+        return _build_node_bundle_recipe(recipe, repo_root, cache_root, output)
+    if kind == "cyright-source":
+        return _build_cyright_recipe(recipe, repo_root, cache_root, output)
+    raise ToolchainError(f"unsupported acquisition recipe: {kind}")
+
+
+def acquire_artifacts(
+    lock_path: Path,
+    cache_root: Path,
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
     lock = load_json_object(lock_path, "toolchain lock")
+    source_root = (repo_root or Path.cwd()).resolve()
+    recipes, contract_sha256 = _load_acquisition_recipes(lock, source_root)
+    groups = _artifact_acquisition_groups(lock, recipes)
     cache_root.mkdir(parents=True, exist_ok=True)
     downloaded = 0
-    for entry in [*lock.get("runtimes", []), *lock.get("servers", [])]:
-        if not isinstance(entry, dict):
-            raise ToolchainError("toolchain artifact entry must be an object")
-        artifact = entry.get("artifact")
-        source_url = entry.get("source_url")
-        digest = entry.get("artifact_sha256")
-        if not all(isinstance(value, str) and value for value in (artifact, source_url, digest)):
-            raise ToolchainError("toolchain artifact entry is incomplete")
+    built = 0
+    component_downloads = 0
+
+    # Direct artifacts are acquired first because deterministic build recipes
+    # may depend on the pinned Node runtime among them.
+    for artifact, group in sorted(groups.items()):
+        if artifact in recipes:
+            continue
         target = cache_root / artifact
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_file() and sha256_file(target) == digest:
+        if target.is_file() and sha256_file(target) == group["artifact_sha256"]:
             continue
         temporary = target.with_name(f".{target.name}.download-{os.getpid()}")
         try:
-            with urllib.request.urlopen(source_url) as response, temporary.open("wb") as sink:
-                shutil.copyfileobj(response, sink)
-            if sha256_file(temporary) != digest:
-                raise ToolchainError(f"download digest mismatch: {artifact}")
+            source_url = next(iter(group["source_urls"]))
+            _download_https_artifact(
+                source_url, group["artifact_sha256"], temporary
+            )
             temporary.replace(target)
             downloaded += 1
+            component_downloads += 1
         finally:
             temporary.unlink(missing_ok=True)
-    return {"schema_version": SCHEMA_VERSION, "downloaded": downloaded}
+
+    for artifact, recipe in sorted(recipes.items()):
+        target = cache_root / artifact
+        if target.is_file() and sha256_file(target) == recipe["artifact_sha256"]:
+            continue
+        temporary = target.with_name(f".{target.name}.build-{os.getpid()}")
+        try:
+            component_downloads += _build_acquisition_recipe(
+                recipe, source_root, cache_root, temporary
+            )
+            actual_digest = sha256_file(temporary)
+            if actual_digest != recipe["artifact_sha256"]:
+                raise ToolchainError(
+                    f"built artifact digest mismatch: {artifact} "
+                    f"expected={recipe['artifact_sha256']} actual={actual_digest}"
+                )
+            temporary.replace(target)
+            built += 1
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "acquisition_contract_sha256": contract_sha256,
+        "artifact_count": len(groups),
+        "downloaded": downloaded,
+        "built": built,
+        "component_downloads": component_downloads,
+    }
 
 
 def _safe_destination(root: Path, relative: str) -> Path:
@@ -2874,10 +4094,13 @@ def provision_toolchain(
     receipt_path: Path,
     *,
     offline: bool,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     if not offline:
         raise ToolchainError("provision requires --offline")
-    verification = verify_lock(lock_path, inventory_path, cache_root, None)
+    verification = verify_lock(
+        lock_path, inventory_path, cache_root, None, repo_root
+    )
     if not verification["compatible"]:
         raise ToolchainError("cannot provision a lock with unsupported languages")
     if toolchain_root.exists() and any(toolchain_root.iterdir()):
@@ -2974,6 +4197,7 @@ class JsonRpcProcess:
         )
         self.next_id = 1
         self.configuration = dict(configuration or {})
+        self.workspace_folders: list[dict[str, Any]] = []
 
     def send(self, value: Mapping[str, Any]) -> None:
         if self.process.stdin is None:
@@ -3012,9 +4236,22 @@ class JsonRpcProcess:
             raise ToolchainError("language server response lacks Content-Length") from error
         if self.process.stdout is None:
             raise ToolchainError("language server stdout unavailable")
-        payload = self.process.stdout.read(length)
-        if len(payload) != length:
-            raise ToolchainError("language server emitted truncated JSON-RPC")
+        payload_parts: list[bytes] = []
+        remaining_length = length
+        while remaining_length:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0 or not select.select(
+                [self.process.stdout], [], [], remaining_time
+            )[0]:
+                raise ToolchainError("language server response timed out")
+            chunk = os.read(
+                self.process.stdout.fileno(), min(remaining_length, 64 * 1024)
+            )
+            if not chunk:
+                raise ToolchainError("language server emitted truncated JSON-RPC")
+            payload_parts.append(chunk)
+            remaining_length -= len(chunk)
+        payload = b"".join(payload_parts)
         try:
             message = json.loads(payload)
         except json.JSONDecodeError as error:
@@ -3026,6 +4263,14 @@ class JsonRpcProcess:
     def request(self, method: str, params: Any, timeout: float) -> Any:
         request_id = self.next_id
         self.next_id += 1
+        if method == "initialize" and isinstance(params, Mapping):
+            workspace_folders = params.get("workspaceFolders")
+            self.workspace_folders = (
+                [dict(folder) for folder in workspace_folders]
+                if isinstance(workspace_folders, list)
+                and all(isinstance(folder, dict) for folder in workspace_folders)
+                else []
+            )
         self.send(
             {
                 "jsonrpc": "2.0",
@@ -3085,9 +4330,27 @@ class JsonRpcProcess:
         if message.get("method") == "workspace/configuration":
             params = message.get("params")
             items = params.get("items") if isinstance(params, dict) else None
-            return [self.configuration for _ in items] if isinstance(items, list) else []
+            if not isinstance(items, list):
+                return []
+            results = []
+            for item in items:
+                if not isinstance(item, dict) or "section" not in item:
+                    results.append(self.configuration)
+                    continue
+                section = item.get("section")
+                if not isinstance(section, str) or not section:
+                    results.append(None)
+                    continue
+                value: Any = self.configuration
+                for component in section.split("."):
+                    if not isinstance(value, Mapping) or component not in value:
+                        value = None
+                        break
+                    value = value[component]
+                results.append(value)
+            return results
         if message.get("method") == "workspace/workspaceFolders":
-            return []
+            return self.workspace_folders
         return None
 
     def close(self, timeout: float) -> tuple[int, str]:
@@ -3112,15 +4375,68 @@ class JsonRpcProcess:
         return returncode, stderr[-1000:]
 
 
+OPERATION_CAPABILITY_PROVIDERS = (
+    ("documentSymbolProvider", ("textDocument/documentSymbol",)),
+    ("definitionProvider", ("textDocument/definition",)),
+    ("referencesProvider", ("textDocument/references",)),
+    (
+        "callHierarchyProvider",
+        (
+            "textDocument/prepareCallHierarchy",
+            "callHierarchy/incomingCalls",
+            "callHierarchy/outgoingCalls",
+        ),
+    ),
+    ("codeActionProvider", ("textDocument/codeAction",)),
+)
+
+
+def _probe_client_capabilities() -> dict[str, Any]:
+    return {
+        "workspace": {
+            "configuration": True,
+            "workspaceFolders": True,
+        },
+        "textDocument": {
+            "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+            "definition": {"dynamicRegistration": False},
+            "references": {"dynamicRegistration": False},
+            "callHierarchy": {"dynamicRegistration": False},
+            "codeAction": {
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {"valueSet": ["quickfix"]}
+                }
+            },
+        },
+    }
+
+
+def _operation_capability_evidence(
+    capabilities: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    evidence = []
+    for provider, methods in OPERATION_CAPABILITY_PROVIDERS:
+        advertised_value = capabilities.get(provider)
+        evidence.append(
+            {
+                "provider": provider,
+                "present": provider in capabilities,
+                "advertised_value": advertised_value,
+                "supported": advertised_value is not None
+                and advertised_value is not False,
+                "methods": list(methods),
+            }
+        )
+    return evidence
+
+
 def _operation_capabilities(capabilities: Mapping[str, Any]) -> list[str]:
-    operations = []
-    document_symbols = capabilities.get("documentSymbolProvider")
-    if document_symbols is not None and document_symbols is not False:
-        operations.append("textDocument/documentSymbol")
-    code_actions = capabilities.get("codeActionProvider")
-    if code_actions is not None and code_actions is not False:
-        operations.append("textDocument/codeAction")
-    return operations
+    return [
+        method
+        for evidence in _operation_capability_evidence(capabilities)
+        if evidence["supported"]
+        for method in evidence["methods"]
+    ]
 
 
 def probe_server(
@@ -3150,22 +4466,7 @@ def probe_server(
                     "processId": None,
                     "rootUri": root.resolve().as_uri(),
                     "rootPath": str(root.resolve()),
-                    "capabilities": {
-                        "workspace": {
-                            "configuration": True,
-                            "workspaceFolders": True,
-                        },
-                        "textDocument": {
-                            "documentSymbol": {
-                                "hierarchicalDocumentSymbolSupport": True
-                            },
-                            "codeAction": {
-                                "codeActionLiteralSupport": {
-                                    "codeActionKind": {"valueSet": ["quickfix"]}
-                                }
-                            },
-                        },
-                    },
+                    "capabilities": _probe_client_capabilities(),
                     "workspaceFolders": [
                         {"uri": root.resolve().as_uri(), "name": "probe"}
                     ],
@@ -3179,7 +4480,15 @@ def probe_server(
             ):
                 raise ToolchainError("initialize response lacks capabilities")
             capabilities = initialized["capabilities"]
-            operations = _operation_capabilities(capabilities)
+            operation_capability_evidence = _operation_capability_evidence(
+                capabilities
+            )
+            operations = [
+                method
+                for evidence in operation_capability_evidence
+                if evidence["supported"]
+                for method in evidence["methods"]
+            ]
             missing_capabilities = sorted(
                 set(entry["expected_capabilities"]) - set(operations)
             )
@@ -3247,6 +4556,9 @@ def probe_server(
                 "command": entry["command"],
                 "args": entry["args"],
                 "negotiated_capabilities": operations,
+                "negotiated_operation_capabilities": (
+                    operation_capability_evidence
+                ),
                 "operation": probe["operation"],
                 "result_count": len(result) if isinstance(result, list) else 0,
                 "initialize_ms": initialize_ms,
@@ -3273,14 +4585,172 @@ def probe_server(
             raise
 
 
+def _validate_toolchain_probe_evidence(
+    probe_path: Path, lock_path: Path
+) -> dict[str, Any]:
+    if probe_path.is_symlink() or not probe_path.is_file():
+        raise ToolchainError("toolchain probe evidence must be a regular file")
+    probe = load_json_object(probe_path, "toolchain probe evidence")
+    _require_exact_fields(
+        probe,
+        {"schema_version", "lock_sha256", "server_count", "servers", "probe_digest"},
+        "toolchain probe evidence",
+    )
+    stored_digest = _require_sha256(
+        probe.get("probe_digest"), "toolchain probe digest"
+    )
+    digest_payload = dict(probe)
+    digest_payload.pop("probe_digest")
+    if sha256_bytes(canonical_json(digest_payload)) != stored_digest:
+        raise ToolchainError("toolchain probe self-digest mismatch")
+
+    lock = load_json_object(lock_path, "toolchain lock for probe validation")
+    lock_servers = lock.get("servers")
+    probe_servers = probe.get("servers")
+    if (
+        not isinstance(lock_servers, list)
+        or not lock_servers
+        or any(not isinstance(server, dict) for server in lock_servers)
+        or not isinstance(probe_servers, list)
+        or type(probe.get("server_count")) is not int
+        or probe["schema_version"] != SCHEMA_VERSION
+        or probe["lock_sha256"] != sha256_file(lock_path)
+        or probe["server_count"] != len(lock_servers)
+        or len(probe_servers) != len(lock_servers)
+    ):
+        raise ToolchainError("toolchain probe lock/server identity mismatch")
+    ordered_lock_servers = sorted(
+        lock_servers,
+        key=lambda server: _require_string(server.get("name"), "lock server name"),
+    )
+    lock_names = [server["name"] for server in ordered_lock_servers]
+    if len(set(lock_names)) != len(lock_names):
+        raise ToolchainError("toolchain lock has duplicate probe server names")
+
+    for receipt, locked in zip(probe_servers, ordered_lock_servers, strict=True):
+        if not isinstance(receipt, dict):
+            raise ToolchainError("toolchain probe server receipt is malformed")
+        _require_exact_fields(
+            receipt,
+            {
+                "name",
+                "version",
+                "languages",
+                "command",
+                "args",
+                "negotiated_capabilities",
+                "negotiated_operation_capabilities",
+                "operation",
+                "result_count",
+                "initialize_ms",
+                "workspace_ready_ms",
+                "operation_ms",
+                "shutdown_ms",
+                "quiescence_messages",
+                "stderr_tail",
+                "status",
+            },
+            "toolchain probe server receipt",
+        )
+        for field in ("name", "version", "languages", "command", "args"):
+            if receipt.get(field) != locked.get(field):
+                raise ToolchainError(
+                    f"toolchain probe server identity mismatch: {locked.get('name')} {field}"
+                )
+        operation = _require_string(
+            locked.get("probe", {}).get("operation")
+            if isinstance(locked.get("probe"), dict)
+            else None,
+            "lock probe operation",
+        )
+        expected_capabilities = locked.get("expected_capabilities")
+        negotiated = receipt.get("negotiated_capabilities")
+        evidence = receipt.get("negotiated_operation_capabilities")
+        if (
+            not isinstance(expected_capabilities, list)
+            or any(
+                not isinstance(capability, str) or not capability
+                for capability in expected_capabilities
+            )
+            or not isinstance(negotiated, list)
+            or any(
+                not isinstance(capability, str) or not capability
+                for capability in negotiated
+            )
+            or negotiated != list(dict.fromkeys(negotiated))
+            or not isinstance(evidence, list)
+            or len(evidence) != len(OPERATION_CAPABILITY_PROVIDERS)
+        ):
+            raise ToolchainError(
+                f"toolchain probe capability evidence is malformed: {locked['name']}"
+            )
+        evidenced_operations = []
+        for record, (provider, methods) in zip(
+            evidence, OPERATION_CAPABILITY_PROVIDERS, strict=True
+        ):
+            if not isinstance(record, dict):
+                raise ToolchainError("toolchain probe operation evidence is malformed")
+            _require_exact_fields(
+                record,
+                {"provider", "present", "advertised_value", "supported", "methods"},
+                "toolchain probe operation evidence",
+            )
+            advertised = record["advertised_value"]
+            supported = advertised is not None and advertised is not False
+            if (
+                record.get("provider") != provider
+                or record.get("methods") != list(methods)
+                or type(record.get("present")) is not bool
+                or type(record.get("supported")) is not bool
+                or record["supported"] != supported
+                or (record["supported"] and not record["present"])
+            ):
+                raise ToolchainError(
+                    f"toolchain probe operation evidence drift: {locked['name']} {provider}"
+                )
+            if supported:
+                evidenced_operations.extend(methods)
+        if (
+            negotiated != evidenced_operations
+            or receipt.get("operation") != operation
+            or operation not in negotiated
+            or not set(expected_capabilities).issubset(negotiated)
+            or receipt.get("status") != "ready"
+        ):
+            raise ToolchainError(
+                f"toolchain probe required capability/status drift: {locked['name']}"
+            )
+        timing_fields = (
+            "initialize_ms",
+            "workspace_ready_ms",
+            "operation_ms",
+            "shutdown_ms",
+            "quiescence_messages",
+            "result_count",
+        )
+        if (
+            any(
+                type(receipt.get(field)) is not int or receipt[field] < 0
+                for field in timing_fields
+            )
+            or receipt["workspace_ready_ms"] < receipt["initialize_ms"]
+            or not isinstance(receipt.get("stderr_tail"), str)
+        ):
+            raise ToolchainError(
+                f"toolchain probe timing/result evidence is invalid: {locked['name']}"
+            )
+    return probe
+
+
 def probe_toolchain(
     lock_path: Path,
     inventory_path: Path,
     toolchain_root: Path,
     output_path: Path,
     timeout: float,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
-    verification = verify_lock(lock_path, inventory_path, None, None)
+    verification = verify_lock(lock_path, inventory_path, None, None, repo_root)
     if not verification["compatible"]:
         raise ToolchainError("cannot probe a lock with unsupported languages")
     lock = load_json_object(lock_path, "toolchain lock")
@@ -3298,7 +4768,7 @@ def probe_toolchain(
     }
     result["probe_digest"] = sha256_bytes(canonical_json(result))
     write_canonical_json(output_path, result)
-    return result
+    return _validate_toolchain_probe_evidence(output_path, lock_path)
 
 
 def _run_logged(
@@ -3543,6 +5013,1114 @@ def _preserve_failed_case_evidence(
     return receipt_path
 
 
+def _raise_archive_failure(
+    *,
+    checkout: Path,
+    instance_id: str,
+    cases_root: Path,
+    scan_log_path: Path,
+    error: Exception,
+    attempt_slug: str,
+    archive_path: Path,
+    sidecar_path: Path,
+) -> None:
+    failure_path = _preserve_failed_case_evidence(
+        checkout,
+        instance_id,
+        cases_root,
+        scan_log_path,
+        error,
+        attempt_slug,
+        publication_artifacts=[archive_path, sidecar_path],
+    )
+    raise ToolchainError(f"{error}; failure evidence={failure_path}") from error
+
+
+def _resume_ready_case(
+    *,
+    output_root: Path,
+    case_index: int,
+    instance: Mapping[str, Any],
+    inventory_case: Mapping[str, Any],
+    rna_binary: Path,
+    toolchain_lock_digest: str,
+    inventory_digest: str,
+    inventory_file_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    catalog = _load_cache_catalog(output_root)
+    candidates = [
+        entry
+        for entry in catalog["entries"]
+        if entry.get("status") == "ready"
+        and entry.get("case_index") == case_index
+        and entry.get("instance_id") == instance["instance_id"]
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda entry: int(entry.get("attempt_index", 0)))
+    entry = candidates[-1]
+    if (
+        entry.get("population_index") != case_index
+        or
+        entry.get("repository") != instance["repo"]
+        or entry.get("commit") != instance["base_commit"]
+        or entry.get("tree") != inventory_case.get("tree")
+    ):
+        raise ToolchainError(
+            f"resume receipt catalog identity mismatch for {instance['instance_id']}"
+        )
+    receipt_path = Path(_require_string(entry.get("receipt_path"), "resume receipt path"))
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ToolchainError("resume receipt must be an existing regular file")
+    if sha256_file(receipt_path) != _require_sha256(
+        entry.get("receipt_sha256"), "resume receipt digest"
+    ):
+        raise ToolchainError("resume receipt/catalog digest mismatch")
+    receipt = load_json_object(receipt_path, "resume case receipt")
+    stored_receipt_digest = _require_sha256(
+        receipt.get("receipt_digest"), "resume case receipt digest"
+    )
+    receipt_payload = dict(receipt)
+    receipt_payload.pop("receipt_digest")
+    if sha256_bytes(canonical_json(receipt_payload)) != stored_receipt_digest:
+        raise ToolchainError("resume case receipt self-digest mismatch")
+    producer = _validate_producer_identity(receipt.get("producer"))
+    if (
+        receipt.get("schema_version") != SCHEMA_VERSION
+        or receipt.get("status") != "ready"
+        or receipt.get("offline_preprocessing") is not True
+        or receipt.get("population_index") != case_index
+        or receipt.get("instance_id") != instance["instance_id"]
+        or receipt.get("repository") != instance["repo"]
+        or receipt.get("base_commit") != instance["base_commit"]
+        or receipt.get("tree") != inventory_case.get("tree")
+        or receipt.get("toolchain_lock_digest") != toolchain_lock_digest
+        or receipt.get("inventory_digest") != inventory_digest
+        or receipt.get("inventory_file_sha256") != inventory_file_sha256
+        or receipt.get("case_inventory_digest")
+        != inventory_case.get("per_file_digest")
+        or receipt.get("scan_flags") != QUALIFICATION_SCAN_FLAGS
+    ):
+        raise ToolchainError(
+            f"resume receipt frozen identity mismatch for {instance['instance_id']}"
+        )
+    report_path = Path(_require_string(receipt.get("report_path"), "resume report path"))
+    if report_path.is_symlink() or not report_path.is_file() or (
+        sha256_file(report_path)
+        != _require_sha256(receipt.get("report_sha256"), "resume report digest")
+    ):
+        raise ToolchainError("resume readiness report identity mismatch")
+    report = load_json_object(report_path, "resume readiness report")
+    if (
+        report.get("violations") != []
+        or report.get("digest") != receipt.get("report_digest")
+        or report.get("graph_snapshot_digest") != receipt.get("graph_snapshot_digest")
+        or report.get("digest") != entry.get("report_digest")
+    ):
+        raise ToolchainError("resume readiness report is not verifier-clean READY evidence")
+    preflight_path = Path(
+        _require_string(receipt.get("preflight_path"), "resume preflight path")
+    )
+    if preflight_path.is_symlink() or not preflight_path.is_file() or (
+        sha256_file(preflight_path)
+        != _require_sha256(receipt.get("preflight_sha256"), "resume preflight digest")
+    ):
+        raise ToolchainError("resume preflight evidence identity mismatch")
+    preflight = load_json_object(preflight_path, "resume structural-cache preflight")
+    preflight_digest = _require_sha256(
+        preflight.get("digest"), "resume structural-cache preflight self-digest"
+    )
+    preflight_payload = dict(preflight)
+    preflight_payload["digest"] = ""
+    if (
+        sha256_bytes(canonical_json(preflight_payload)) != preflight_digest
+        or receipt.get("preflight_digest") != preflight_digest
+        or preflight.get("case_index") != case_index
+        or preflight.get("instance_id") != instance["instance_id"]
+        or preflight.get("repository") != instance["repo"]
+        or preflight.get("target_commit") != instance["base_commit"]
+        or preflight.get("target_tree") != inventory_case.get("tree")
+    ):
+        raise ToolchainError("resume preflight evidence is not bound to frozen case")
+    cache = receipt.get("cache")
+    if not isinstance(cache, dict):
+        raise ToolchainError("resume receipt has no structural cache identity")
+    archive_path = Path(_require_string(cache.get("archive_path"), "resume archive path"))
+    sidecar_path = Path(_require_string(cache.get("sidecar_path"), "resume sidecar path"))
+    verified = verify_structural_cache_archive(
+        archive_path,
+        sidecar_path,
+        expected={
+            "repository": instance["repo"],
+            "producer": producer,
+            "toolchain_lock_digest": toolchain_lock_digest,
+            "inventory_digest": inventory_digest,
+            "inventory_file_sha256": inventory_file_sha256,
+            "scan_flags": QUALIFICATION_SCAN_FLAGS,
+        },
+    )
+    core = verified["core"]
+    if (
+        verified["archive_sha256"] != cache.get("archive_sha256")
+        or verified["sidecar_sha256"] != cache.get("sidecar_sha256")
+        or verified["core_sha256"] != cache.get("core_sha256")
+        or verified["archive_sha256"] != entry.get("archive_sha256")
+        or verified["sidecar_sha256"] != entry.get("sidecar_sha256")
+        or verified["core_sha256"] != entry.get("core_sha256")
+        or core["commit"] != instance["base_commit"]
+        or core["tree"] != inventory_case.get("tree")
+        or core["case_inventory_digest"] != inventory_case.get("per_file_digest")
+        or core["configuration_digest"] != receipt.get("configuration_digest")
+        or core["completeness_report_digest"] != report.get("digest")
+        or core["graph_snapshot_digest"] != report.get("graph_snapshot_digest")
+    ):
+        raise ToolchainError("resume structural cache identities differ from receipt")
+    timings = receipt.get("timings_ms")
+    if not isinstance(timings, dict) or any(
+        type(timings.get(field)) is not int or timings[field] < 0
+        for field in (
+            "scan_update",
+            "full_readiness_validation",
+            "cache_archive",
+        )
+    ):
+        raise ToolchainError("resume timing evidence is malformed")
+    for field in ("cache_selection", "cache_verification", "cache_injection"):
+        value = timings.get(field)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ToolchainError("resume cache-preparation timing evidence is malformed")
+    if any(timings.get(field) is None for field in (
+        "cache_selection",
+        "cache_verification",
+        "cache_injection",
+    )) and not isinstance(receipt.get("timing_provenance"), dict):
+        raise ToolchainError("resume recovery timing provenance is missing")
+    return (
+        {
+            "instance_id": instance["instance_id"],
+            "repository": instance["repo"],
+            "base_commit": instance["base_commit"],
+            "report_path": str(report_path.resolve()),
+            "receipt_path": str(receipt_path.resolve()),
+            "receipt_sha256": sha256_file(receipt_path),
+            "archive_sha256": verified["archive_sha256"],
+            "sidecar_sha256": verified["sidecar_sha256"],
+            "core_sha256": verified["core_sha256"],
+        },
+        {
+            "instance_id": instance["instance_id"],
+            "population_index": case_index,
+            "scan_ms": timings["scan_update"],
+            "readiness_ms": timings["full_readiness_validation"],
+            "cache_selection_ms": timings["cache_selection"],
+            "cache_verification_ms": timings["cache_verification"],
+            "cache_injection_ms": timings["cache_injection"],
+            "cache_archive_ms": timings["cache_archive"],
+            "report_sha256": sha256_file(report_path),
+        },
+    )
+
+
+def _load_regular_json_with_sha(
+    path: Path, expected_sha256: str, label: str
+) -> dict[str, Any]:
+    expected_sha256 = _require_sha256(expected_sha256, f"{label} SHA-256")
+    if path.is_symlink() or not path.is_file():
+        raise ToolchainError(f"{label} must be an existing regular file")
+    if sha256_file(path) != expected_sha256:
+        raise ToolchainError(f"{label} SHA-256 mismatch")
+    return load_json_object(path, label)
+
+
+def _recovered_scan_timing(
+    failure_receipt: Mapping[str, Any], instance_id: str
+) -> tuple[int, dict[str, Any]]:
+    scan_log_path = Path(
+        _require_string(failure_receipt.get("scan_log_path"), "retained scan log path")
+    )
+    scan_log_sha256 = _require_sha256(
+        failure_receipt.get("scan_log_sha256"), "retained scan log SHA-256"
+    )
+    if scan_log_path.is_symlink() or not scan_log_path.is_file():
+        raise ToolchainError("retained scan log must be an existing regular file")
+    if sha256_file(scan_log_path) != scan_log_sha256:
+        raise ToolchainError("retained scan log SHA-256 mismatch")
+    totals = set()
+    for line in scan_log_path.read_text(errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- total: "):
+            continue
+        parts = stripped.removeprefix("- total: ").split()
+        if (
+            len(parts) == 2
+            and parts[0].endswith("m")
+            and parts[1].endswith("s")
+            and parts[0][:-1].isdigit()
+            and parts[1][:-1].isdigit()
+        ):
+            totals.add((int(parts[0][:-1]) * 60 + int(parts[1][:-1])) * 1000)
+    if len(totals) != 1:
+        raise ToolchainError(
+            f"{instance_id} retained scan log has no unique whole-second total"
+        )
+    recovered_ms = totals.pop()
+    return recovered_ms, {
+        "source": "retained_attempt_001_scan_log",
+        "path": str(scan_log_path.resolve()),
+        "sha256": scan_log_sha256,
+        "resolution_ms": 1000,
+        "value_ms": recovered_ms,
+    }
+
+
+def _validate_resume_replay_evidence(
+    *,
+    output_root: Path,
+    case_index: int,
+    instance: Mapping[str, Any],
+    inventory_case: Mapping[str, Any],
+    checkout: Path,
+    replay_receipt_path: Path,
+    replay_receipt_sha256: str,
+    approved_preflight_path: Path,
+    target_identity: Mapping[str, Any],
+    rna_binary: Path,
+    toolchain_lock_digest: str,
+    inventory_digest: str,
+    inventory_file_sha256: str,
+) -> dict[str, Any]:
+    instance_id = instance["instance_id"]
+    if checkout.is_symlink() or not checkout.is_dir():
+        raise ToolchainError("resume replay checkout must be an existing regular directory")
+    replay = _load_regular_json_with_sha(
+        replay_receipt_path,
+        replay_receipt_sha256,
+        "diagnostic replay receipt",
+    )
+    _require_exact_fields(replay, REPLAY_RECEIPT_FIELDS, "diagnostic replay receipt")
+    replay["source_producer"] = _validate_producer_identity(
+        replay["source_producer"]
+    )
+    replay["replay_producer"] = _validate_producer_identity(
+        replay["replay_producer"]
+    )
+    count_fields = REPLAY_RECEIPT_FIELDS - {
+        "schema_version",
+        "diagnostic_only",
+        "publishable",
+        "checkout_rebuilt",
+        "archive_created",
+        "catalog_updated",
+        "failure_receipt_sha256",
+        "failure_digest",
+        "authorization_sha256",
+        "source_producer_commit",
+        "replay_producer_commit",
+        "source_producer",
+        "replay_producer",
+        "target_commit",
+        "target_tree",
+        "target_tree_source",
+        "source_checkout_identity_verified",
+        "source_tree_diff_replayed",
+        "source_rescanned",
+        "full_target_readiness_recomputed",
+        "incremental_enrichment_job_id",
+        "pass1_job_ids",
+        "base_completeness_digest",
+        "checkpoint_validation_digest",
+        "diagnostic_checkpoint_validation_passed",
+        "target_completeness_digest",
+        "full_target_ready",
+    }
+    if any(type(replay[field]) is not int or replay[field] < 0 for field in count_fields):
+        raise ToolchainError("diagnostic replay receipt has invalid counters")
+    if (
+        replay["schema_version"] != SCHEMA_VERSION
+        or replay["diagnostic_only"] is not True
+        or replay["publishable"] is not False
+        or replay["checkout_rebuilt"] is not False
+        or replay["lsp_calls"] != 0
+        or replay["archive_created"] is not False
+        or replay["catalog_updated"] is not False
+        or replay["source_checkout_identity_verified"] is not True
+        or replay["source_tree_diff_replayed"] is not False
+        or replay["source_rescanned"] is not False
+        or replay["full_target_readiness_recomputed"] is not True
+        or replay["diagnostic_checkpoint_validation_passed"] is not True
+        or replay["coverage_violation_count"] != 0
+        or replay["compatibility_violation_count"] != 0
+        or replay["discarded_required_result_count"] != 0
+        or replay["full_target_ready"] is not True
+        or replay["target_tree_source"]
+        != "copied_retained_checkout_and_verified_authorization"
+    ):
+        raise ToolchainError("diagnostic replay receipt is not verifier-clean zero-LSP evidence")
+    for field in (
+        "failure_receipt_sha256",
+        "failure_digest",
+        "authorization_sha256",
+        "base_completeness_digest",
+        "checkpoint_validation_digest",
+        "target_completeness_digest",
+    ):
+        _require_sha256(replay[field], f"diagnostic replay {field}")
+    _require_git_oid(replay["source_producer_commit"], "source producer commit")
+    _require_git_oid(replay["replay_producer_commit"], "replay producer commit")
+    _require_git_oid(replay["target_commit"], "replay target commit")
+    _require_git_oid(replay["target_tree"], "replay target tree")
+    if (
+        not isinstance(replay["pass1_job_ids"], list)
+        or not replay["pass1_job_ids"]
+        or replay["pass1_job_ids"] != sorted(set(replay["pass1_job_ids"]))
+        or not all(isinstance(job_id, str) and job_id for job_id in replay["pass1_job_ids"])
+        or not isinstance(replay["incremental_enrichment_job_id"], str)
+        or not replay["incremental_enrichment_job_id"]
+    ):
+        raise ToolchainError("diagnostic replay job provenance is malformed")
+
+    failure_path = output_root / "cases" / f"{instance_id}-attempt-001-failure.json"
+    failure = _load_regular_json_with_sha(
+        failure_path,
+        replay["failure_receipt_sha256"],
+        "attempt-001 failure receipt",
+    )
+    _require_exact_fields(
+        failure,
+        {
+            "schema_version",
+            "status",
+            "instance_id",
+            "error",
+            "graph_snapshot_digest",
+            "scan_log_path",
+            "scan_log_sha256",
+            "evidence",
+            "publication_artifacts",
+            "full_cache_retained",
+            "full_cache_error",
+            "failure_digest",
+        },
+        "attempt-001 failure receipt",
+    )
+    failure_digest = _require_sha256(
+        failure.get("failure_digest"), "attempt-001 failure digest"
+    )
+    failure_payload = dict(failure)
+    failure_payload.pop("failure_digest")
+    if (
+        failure["schema_version"] != SCHEMA_VERSION
+        or failure["status"] != "failed"
+        or failure["instance_id"] != instance_id
+        or failure["full_cache_retained"] is not True
+        or failure["full_cache_error"] is not None
+        or failure_digest != replay["failure_digest"]
+        or sha256_bytes(canonical_json(failure_payload)) != failure_digest
+    ):
+        raise ToolchainError("attempt-001 failure provenance is invalid")
+
+    authorization_path = checkout / ".oh/.cache/structural-cache-inheritance.json"
+    authorization = _load_regular_json_with_sha(
+        authorization_path,
+        replay["authorization_sha256"],
+        "replay structural-cache authorization",
+    )
+    _require_exact_fields(
+        authorization,
+        {
+            "schema_version",
+            "offline_preprocessing",
+            "repository",
+            "base_commit",
+            "base_tree",
+            "target_commit",
+            "target_tree",
+            "root_slug",
+            "producer",
+            "toolchain_lock_digest",
+            "inventory_digest",
+            "inventory_file_sha256",
+            "configuration_digest",
+            "scan_flags",
+            "base_archive_sha256",
+            "base_sidecar_sha256",
+            "base_core_sha256",
+            "base_report_digest",
+            "base_report_sha256",
+            "inherited_files",
+            "changed_paths",
+            "added_paths",
+            "deleted_paths",
+            "renamed_paths",
+            "invalidated_partitions",
+            "invalidated_paths",
+            "path_partitions",
+            "digest",
+        },
+        "replay structural-cache authorization",
+    )
+    authorization["producer"] = _validate_producer_identity(authorization["producer"])
+    authorization_digest = _require_sha256(
+        authorization.get("digest"), "replay authorization digest"
+    )
+    authorization_payload = dict(authorization)
+    authorization_payload["digest"] = ""
+    if sha256_bytes(canonical_json(authorization_payload)) != authorization_digest:
+        raise ToolchainError("replay authorization self-digest mismatch")
+
+    approved_sha256 = sha256_file(approved_preflight_path)
+    approved = _load_regular_json_with_sha(
+        approved_preflight_path,
+        approved_sha256,
+        "approved structural-cache preflight",
+    )
+    validate_structural_cache_preflight(approved, target_identity)
+    selected_base = approved.get("selected_base_cache")
+    if not isinstance(selected_base, dict):
+        raise ToolchainError("resume replay requires an approved incremental base cache")
+    _require_exact_fields(
+        selected_base,
+        {
+            "instance_id",
+            "attempt_index",
+            "repository",
+            "commit",
+            "tree",
+            "archive_sha256",
+            "sidecar_sha256",
+            "core_sha256",
+        },
+        "approved replay base cache",
+    )
+    expected_base = {
+        "repository": authorization["repository"],
+        "commit": authorization["base_commit"],
+        "tree": authorization["base_tree"],
+        "archive_sha256": authorization["base_archive_sha256"],
+        "sidecar_sha256": authorization["base_sidecar_sha256"],
+        "core_sha256": authorization["base_core_sha256"],
+    }
+    if any(selected_base.get(field) != value for field, value in expected_base.items()):
+        raise ToolchainError("approved preflight/base authorization identities differ")
+
+    expected_identity = {
+        "repository": instance["repo"],
+        "commit": instance["base_commit"],
+        "tree": inventory_case.get("tree"),
+        "configuration_digest": target_identity["configuration_digest"],
+        "root_slug": target_identity["root_slug"],
+    }
+    if (
+        any(target_identity.get(field) != value for field, value in expected_identity.items())
+        or target_identity["producer"].get("binary_sha256") != sha256_file(rna_binary)
+        or replay["target_commit"] != instance["base_commit"]
+        or replay["target_tree"] != inventory_case.get("tree")
+        or replay["replay_producer"] != target_identity["producer"]
+        or replay["replay_producer_commit"]
+        != target_identity["producer"]["producer_commit"]
+        or replay["source_producer"] != authorization["producer"]
+        or replay["source_producer_commit"]
+        != authorization["producer"]["producer_commit"]
+        or replay["base_completeness_digest"]
+        != authorization["base_report_digest"]
+        or authorization["repository"] != instance["repo"]
+        or authorization["target_commit"] != instance["base_commit"]
+        or authorization["target_tree"] != inventory_case.get("tree")
+        or authorization["root_slug"] != target_identity["root_slug"]
+        or authorization["toolchain_lock_digest"] != toolchain_lock_digest
+        or authorization["inventory_digest"] != inventory_digest
+        or authorization["inventory_file_sha256"] != inventory_file_sha256
+        or authorization["configuration_digest"]
+        != target_identity["configuration_digest"]
+        or authorization["scan_flags"] != QUALIFICATION_SCAN_FLAGS
+        or approved["case_index"] != case_index
+        or approved["instance_id"] != instance_id
+        or approved["repository"] != instance["repo"]
+        or approved["target_commit"] != instance["base_commit"]
+        or approved["target_tree"] != inventory_case.get("tree")
+        or replay["target_inventory_path_count"]
+        != inventory_case.get("included_file_count")
+        or replay["validated_inventory_path_count"]
+        != inventory_case.get("included_file_count")
+    ):
+        raise ToolchainError("resume replay frozen identity binding mismatch")
+    scan_ms, scan_provenance = _recovered_scan_timing(failure, instance_id)
+    return {
+        "replay": replay,
+        "failure": failure,
+        "failure_path": failure_path,
+        "authorization": authorization,
+        "authorization_path": authorization_path,
+        "approved_preflight": approved,
+        "approved_preflight_sha256": approved_sha256,
+        "scan_ms": scan_ms,
+        "scan_provenance": scan_provenance,
+    }
+
+
+def _publish_resume_replay_case(
+    *,
+    output_root: Path,
+    case_index: int,
+    instance: Mapping[str, Any],
+    inventory_case: Mapping[str, Any],
+    checkout: Path,
+    replay_receipt_path: Path,
+    replay_receipt_sha256: str,
+    approved_preflight_path: Path,
+    rna_binary: Path,
+    environment: Mapping[str, str],
+    toolchain_lock_digest: str,
+    inventory_digest: str,
+    inventory_file_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    instance_id = instance["instance_id"]
+    target_identity = structural_cache_identity(rna_binary, checkout)
+    recovery = _validate_resume_replay_evidence(
+        output_root=output_root,
+        case_index=case_index,
+        instance=instance,
+        inventory_case=inventory_case,
+        checkout=checkout,
+        replay_receipt_path=replay_receipt_path,
+        replay_receipt_sha256=replay_receipt_sha256,
+        approved_preflight_path=approved_preflight_path,
+        target_identity=target_identity,
+        rna_binary=rna_binary,
+        toolchain_lock_digest=toolchain_lock_digest,
+        inventory_digest=inventory_digest,
+        inventory_file_sha256=inventory_file_sha256,
+    )
+    replay = recovery["replay"]
+    authorization = recovery["authorization"]
+    preflight = recovery["approved_preflight"]
+
+    selected_base = preflight["selected_base_cache"]
+    base_entries = [
+        entry
+        for entry in _load_cache_catalog(output_root)["entries"]
+        if entry.get("status") == "ready"
+        and entry.get("instance_id") == selected_base["instance_id"]
+        and entry.get("attempt_index") == selected_base["attempt_index"]
+        and entry.get("archive_sha256") == selected_base["archive_sha256"]
+        and entry.get("sidecar_sha256") == selected_base["sidecar_sha256"]
+        and entry.get("core_sha256") == selected_base["core_sha256"]
+    ]
+    if len(base_entries) != 1:
+        raise ToolchainError("resume replay base cache has no unique catalog entry")
+    base_entry = base_entries[0]
+    verify_structural_cache_archive(
+        Path(_require_string(base_entry.get("archive_path"), "base archive path")),
+        Path(_require_string(base_entry.get("sidecar_path"), "base sidecar path")),
+        expected={
+            "repository": instance["repo"],
+            "root_slug": target_identity["root_slug"],
+            "producer": replay["source_producer"],
+            "toolchain_lock_digest": toolchain_lock_digest,
+            "inventory_digest": inventory_digest,
+            "inventory_file_sha256": inventory_file_sha256,
+            "inventory_policy_digest": target_identity["inventory_policy_digest"],
+            "scan_flags": QUALIFICATION_SCAN_FLAGS,
+        },
+    )
+
+    attempt_index = _next_case_attempt_index(output_root, instance_id)
+    attempt_slug = f"{instance_id}-attempt-{attempt_index:03d}"
+    cases_root = output_root / "cases"
+    logs_root = output_root / "logs"
+    archives_root = output_root / "structural-caches"
+    report_path = cases_root / f"{attempt_slug}.json"
+    receipt_path = cases_root / f"{attempt_slug}-receipt.json"
+    readiness_log_path = logs_root / f"{attempt_slug}-readiness.log"
+    archive_path = archives_root / f"{attempt_slug}.tar.gz"
+    sidecar_path = archives_root / f"{attempt_slug}.manifest.json"
+    for path in (
+        report_path,
+        receipt_path,
+        readiness_log_path,
+        archive_path,
+        sidecar_path,
+    ):
+        if path.exists() or path.is_symlink():
+            raise ToolchainError(f"resume replay refuses to overwrite evidence: {path}")
+
+    case_environment = dict(environment)
+    case_environment[STRUCTURAL_CACHE_AUTHORIZATION_SHA256_ENV] = replay[
+        "authorization_sha256"
+    ]
+    readiness_seconds = _run_logged(
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "lsp-readiness",
+            "--repo",
+            str(checkout),
+            "--json",
+        ],
+        checkout,
+        case_environment,
+        readiness_log_path,
+    )
+    source_report_path = checkout / ".oh/.cache/lsp_completeness.json"
+    report = load_json_object(source_report_path, f"{instance_id} replay readiness")
+    _require_ready_case(readiness_log_path, report, instance_id)
+    if report.get("digest") != replay["target_completeness_digest"]:
+        raise ToolchainError("replay receipt and fresh readiness report differ")
+
+    execution = load_json_object(
+        checkout / ".oh/.cache/structural-cache-execution.json",
+        f"{instance_id} replay cache execution",
+    )
+    executed_paths = execution.get("executed_paths")
+    inherited_paths = execution.get("inherited_paths")
+    if (
+        not isinstance(executed_paths, list)
+        or not isinstance(inherited_paths, list)
+        or any(not isinstance(path, str) or not path for path in executed_paths)
+        or any(not isinstance(path, str) or not path for path in inherited_paths)
+        or execution.get("executed_graph_enrichment_operation_count")
+        != replay["executed_operation_count"]
+        or execution.get("executed_readiness_validation_request_count")
+        != replay["readiness_validation_request_count"]
+        or _readiness_validation_request_count(report)
+        != execution.get("inherited_readiness_validation_request_count", 0)
+        + execution.get("executed_readiness_validation_request_count", 0)
+    ):
+        raise ToolchainError("replay execution evidence differs from verified checkpoint")
+
+    base_cache = {
+        "archive_sha256": authorization["base_archive_sha256"],
+        "sidecar_sha256": authorization["base_sidecar_sha256"],
+        "core_sha256": authorization["base_core_sha256"],
+        "report_digest": authorization["base_report_digest"],
+    }
+    archive_started = time.monotonic()
+    archive_receipt = archive_structural_cache(
+        checkout,
+        archive_path,
+        sidecar_path,
+        identity=target_identity,
+        toolchain_lock_digest=toolchain_lock_digest,
+        inventory_digest=inventory_digest,
+        inventory_file_sha256=inventory_file_sha256,
+        case_inventory_digest=_require_sha256(
+            inventory_case.get("per_file_digest"), f"{instance_id} inventory digest"
+        ),
+        base_cache=base_cache,
+    )
+    archive_seconds = time.monotonic() - archive_started
+
+    _publish_canonical_json_exclusive(report_path, report)
+    recovered_timings = {
+        "cache_selection": None,
+        "cache_verification": None,
+        "cache_injection": None,
+        "scan_update": recovery["scan_ms"],
+        "full_readiness_validation": int(readiness_seconds * 1000),
+        "cache_archive": int(archive_seconds * 1000),
+    }
+    case_receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ready",
+        "offline_preprocessing": True,
+        "population_index": case_index,
+        "instance_id": instance_id,
+        "attempt_index": attempt_index,
+        "repository": instance["repo"],
+        "base_commit": instance["base_commit"],
+        "tree": target_identity["tree"],
+        "producer": target_identity["producer"],
+        "toolchain_lock_digest": toolchain_lock_digest,
+        "inventory_digest": inventory_digest,
+        "inventory_file_sha256": inventory_file_sha256,
+        "case_inventory_digest": inventory_case["per_file_digest"],
+        "configuration_digest": target_identity["configuration_digest"],
+        "scan_flags": QUALIFICATION_SCAN_FLAGS,
+        "preflight_path": str(approved_preflight_path.resolve()),
+        "preflight_sha256": recovery["approved_preflight_sha256"],
+        "preflight_digest": preflight["digest"],
+        "report_path": str(report_path.resolve()),
+        "report_sha256": sha256_file(report_path),
+        "report_digest": report["digest"],
+        "graph_snapshot_digest": report["graph_snapshot_digest"],
+        "cache": archive_receipt,
+        "base_cache": {
+            **base_cache,
+            "authorization_sha256": replay["authorization_sha256"],
+            "recovery": "retained_post_lsp_zero_lsp_replay",
+        },
+        "timings_ms": recovered_timings,
+        "timing_provenance": {
+            "cache_selection": "not_persisted_by_failed_attempt",
+            "cache_verification": "not_persisted_by_failed_attempt",
+            "cache_injection": "not_persisted_by_failed_attempt",
+            "scan_update": recovery["scan_provenance"],
+            "full_readiness_validation": "measured_during_zero_lsp_replay_publication",
+            "cache_archive": "measured_during_zero_lsp_replay_publication",
+        },
+        "recovery": {
+            "mode": "retained_post_lsp_zero_lsp_replay",
+            "failure_receipt_path": str(recovery["failure_path"].resolve()),
+            "failure_receipt_sha256": replay["failure_receipt_sha256"],
+            "failure_digest": replay["failure_digest"],
+            "replay_receipt_path": str(replay_receipt_path.resolve()),
+            "replay_receipt_sha256": replay_receipt_sha256,
+            "checkpoint_validation_digest": replay["checkpoint_validation_digest"],
+            "lsp_calls": 0,
+            "source_rescanned": False,
+        },
+        "changed_file_count": execution.get("changed_file_count", 0),
+        "invalidated_file_count": execution.get("invalidated_file_count", 0),
+        "graph_enrichment_operations_reused": execution.get(
+            "inherited_graph_enrichment_operation_count", 0
+        ),
+        "graph_enrichment_operations_executed": execution[
+            "executed_graph_enrichment_operation_count"
+        ],
+        "readiness_validation_requests_reused": execution.get(
+            "inherited_readiness_validation_request_count", 0
+        ),
+        "readiness_validation_requests_executed": execution[
+            "executed_readiness_validation_request_count"
+        ],
+    }
+    case_receipt["receipt_digest"] = sha256_bytes(canonical_json(case_receipt))
+    _publish_canonical_json_exclusive(receipt_path, case_receipt)
+    _publish_cache_catalog_entry(
+        output_root,
+        {
+            "schema_version": STRUCTURAL_CACHE_SCHEMA_VERSION,
+            "status": "ready",
+            "case_index": case_index,
+            "attempt_index": attempt_index,
+            "instance_id": instance_id,
+            "population_index": case_index,
+            "repository": instance["repo"],
+            "commit": instance["base_commit"],
+            "tree": target_identity["tree"],
+            "archive_path": archive_receipt["archive_path"],
+            "archive_sha256": archive_receipt["archive_sha256"],
+            "core_sha256": archive_receipt["core_sha256"],
+            "sidecar_path": archive_receipt["sidecar_path"],
+            "sidecar_sha256": archive_receipt["sidecar_sha256"],
+            "report_digest": report["digest"],
+            "receipt_path": str(receipt_path.resolve()),
+            "receipt_sha256": sha256_file(receipt_path),
+        },
+    )
+    cohort_case = {
+        "instance_id": instance_id,
+        "repository": instance["repo"],
+        "base_commit": instance["base_commit"],
+        "report_path": str(report_path.resolve()),
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+        "archive_sha256": archive_receipt["archive_sha256"],
+        "sidecar_sha256": archive_receipt["sidecar_sha256"],
+        "core_sha256": archive_receipt["core_sha256"],
+    }
+    timing_case = {
+        "instance_id": instance_id,
+        "population_index": case_index,
+        "scan_ms": recovery["scan_ms"],
+        "readiness_ms": recovered_timings["full_readiness_validation"],
+        "cache_selection_ms": None,
+        "cache_verification_ms": None,
+        "cache_injection_ms": None,
+        "cache_archive_ms": recovered_timings["cache_archive"],
+        "report_sha256": sha256_file(report_path),
+        "recovery": True,
+    }
+    return cohort_case, timing_case
+
+
+def _publish_or_verify_canonical_json(path: Path, value: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or load_json_object(
+            path, path.name
+        ) != value:
+            raise ToolchainError(f"existing immutable evidence differs: {path}")
+        return
+    _publish_canonical_json_exclusive(path, value)
+
+
+def _qualification_checkpoint(
+    *,
+    output_root: Path,
+    last_case_index: int,
+    cohort_cases: Sequence[Mapping[str, Any]],
+    timing_cases: Sequence[Mapping[str, Any]],
+    isolated: bool,
+) -> dict[str, Any]:
+    checkpoint = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "checkpoint",
+        "isolated_micro_qualification": isolated,
+        "last_case_index": last_case_index,
+        "completed_case_count": len(cohort_cases),
+        "cases": list(cohort_cases),
+        "timings": list(timing_cases),
+        "digest": "",
+    }
+    checkpoint["digest"] = sha256_bytes(canonical_json(checkpoint))
+    path = output_root / f"checkpoint-case-{last_case_index:03d}.json"
+    _publish_or_verify_canonical_json(path, checkpoint)
+    return {**checkpoint, "path": str(path.resolve()), "sha256": sha256_file(path)}
+
+
+def _build_frozen_cohort_manifest(
+    cohort_cases: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    cases = [dict(case) for case in cohort_cases]
+    schema_versions: set[int] = set()
+    for case in cases:
+        instance_id = _require_string(
+            case.get("instance_id"), "cohort case instance ID"
+        )
+        report_path = Path(
+            _require_string(case.get("report_path"), "cohort case report path")
+        )
+        if report_path.is_symlink() or not report_path.is_file():
+            raise ToolchainError(
+                f"cohort readiness report must be a regular file: {instance_id}"
+            )
+        report = load_json_object(report_path, f"{instance_id} readiness report")
+        identity = report.get("identity")
+        if not isinstance(identity, dict):
+            raise ToolchainError(
+                f"cohort readiness report has no identity: {instance_id}"
+            )
+        schema_version = identity.get("schema_version")
+        if type(schema_version) is not int or schema_version <= 0:
+            raise ToolchainError(
+                f"cohort readiness report has an invalid schema: {instance_id}"
+            )
+        schema_versions.add(schema_version)
+    if len(schema_versions) != 1:
+        raise ToolchainError(
+            "cohort readiness reports do not share one completeness schema"
+        )
+    return {"schema_version": schema_versions.pop(), "cases": cases}
+
+
+def _validate_ready_aggregate(
+    aggregate: Mapping[str, Any],
+    cohort_manifest: Mapping[str, Any],
+    *,
+    expected_population_digest: str,
+) -> None:
+    _require_exact_fields(
+        aggregate,
+        {"schema_version", "cohort_digest", "checkouts", "counts", "digest"},
+        "aggregate readiness report",
+    )
+    cases = cohort_manifest.get("cases")
+    manifest_schema = cohort_manifest.get("schema_version")
+    if (
+        not isinstance(cases, list)
+        or not cases
+        or type(manifest_schema) is not int
+        or manifest_schema <= 0
+        or aggregate.get("schema_version") != manifest_schema
+    ):
+        raise ToolchainError("aggregate readiness schema or cohort is invalid")
+    expected_population_digest = _require_sha256(
+        expected_population_digest, "expected frozen population digest"
+    )
+    if aggregate.get("cohort_digest") != expected_population_digest:
+        raise ToolchainError(
+            "aggregate cohort digest differs from frozen population digest"
+        )
+
+    expected_identities = set()
+    report_bindings: dict[tuple[str, str, str], tuple[str, int]] = {}
+    report_paths: set[Path] = set()
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ToolchainError("cohort manifest case is malformed")
+        identity_key = (
+            _require_string(case.get("instance_id"), "cohort instance ID"),
+            _require_string(case.get("repository"), "cohort repository"),
+            _require_git_oid(case.get("base_commit"), "cohort base commit"),
+        )
+        report_path = Path(
+            _require_string(case.get("report_path"), "cohort report path")
+        )
+        if report_path.is_symlink() or not report_path.is_file():
+            raise ToolchainError("cohort report binding is not a regular file")
+        resolved_report_path = report_path.resolve()
+        if resolved_report_path in report_paths:
+            raise ToolchainError("cohort report path is duplicated")
+        report_paths.add(resolved_report_path)
+        report = load_json_object(report_path, f"{identity_key[0]} cohort report")
+        report_identity = report.get("identity")
+        summary = report.get("summary")
+        report_digest = _require_sha256(
+            report.get("digest"), f"{identity_key[0]} report digest"
+        )
+        if (
+            not isinstance(report_identity, dict)
+            or report_identity.get("schema_version") != manifest_schema
+            or report_identity.get("context_mode") != "disabled"
+            or report_identity.get("repository") != identity_key[1]
+            or report_identity.get("checkout_sha") != identity_key[2]
+            or not isinstance(summary, dict)
+            or type(summary.get("total_files")) is not int
+            or summary["total_files"] < 0
+            or report.get("violations") != []
+        ):
+            raise ToolchainError(
+                "cohort report content identity is not verifier-clean READY"
+            )
+        expected_identities.add(identity_key)
+        report_bindings[identity_key] = (report_digest, summary["total_files"])
+    if len(expected_identities) != len(cases):
+        raise ToolchainError("cohort manifest identities are missing or duplicated")
+
+    counts = aggregate.get("counts")
+    if not isinstance(counts, dict):
+        raise ToolchainError("aggregate readiness counts are missing")
+    _require_exact_fields(
+        counts,
+        {
+            "checkouts",
+            "unique_instances",
+            "ready_checkouts",
+            "files",
+            "by_extension",
+            "by_role",
+            "by_status",
+        },
+        "aggregate readiness counts",
+    )
+    expected_count = len(cases)
+    if (
+        any(
+            type(counts.get(field)) is not int or counts[field] < 0
+            for field in ("checkouts", "unique_instances", "ready_checkouts", "files")
+        )
+        or counts["checkouts"] != expected_count
+        or counts["unique_instances"] != expected_count
+        or counts["ready_checkouts"] != expected_count
+        or counts["files"]
+        != sum(file_count for _, file_count in report_bindings.values())
+        or any(
+            not isinstance(counts[field], dict)
+            or any(
+                not isinstance(key, str)
+                or not key
+                or type(value) is not int
+                or value < 0
+                for key, value in counts[field].items()
+            )
+            for field in ("by_extension", "by_role", "by_status")
+        )
+    ):
+        raise ToolchainError("aggregate readiness counts are not fully READY")
+
+    checkouts = aggregate.get("checkouts")
+    if not isinstance(checkouts, list) or len(checkouts) != expected_count:
+        raise ToolchainError("aggregate readiness checkout count differs from cohort")
+    actual_identities = set()
+    for checkout in checkouts:
+        if not isinstance(checkout, dict):
+            raise ToolchainError("aggregate readiness checkout is malformed")
+        _require_exact_fields(
+            checkout,
+            {
+                "instance_id",
+                "repository",
+                "base_commit",
+                "checkout_sha",
+                "report_digest",
+                "ready",
+                "file_count",
+                "violation_count",
+            },
+            "aggregate readiness checkout",
+        )
+        instance_id = _require_string(
+            checkout.get("instance_id"), "aggregate instance ID"
+        )
+        repository = _require_string(
+            checkout.get("repository"), "aggregate repository"
+        )
+        base_commit = _require_git_oid(
+            checkout.get("base_commit"), "aggregate base commit"
+        )
+        checkout_sha = _require_git_oid(
+            checkout.get("checkout_sha"), "aggregate checkout SHA"
+        )
+        report_digest = _require_sha256(
+            checkout.get("report_digest"), "aggregate report digest"
+        )
+        identity_key = (instance_id, repository, base_commit)
+        report_binding = report_bindings.get(identity_key)
+        if (
+            report_binding is None
+            or report_digest != report_binding[0]
+            or checkout_sha != base_commit
+            or checkout.get("ready") is not True
+            or type(checkout.get("file_count")) is not int
+            or checkout["file_count"] != report_binding[1]
+            or type(checkout.get("violation_count")) is not int
+            or checkout["violation_count"] != 0
+        ):
+            raise ToolchainError(
+                "aggregate readiness checkout is not verifier-clean READY"
+            )
+        actual_identities.add(identity_key)
+    if actual_identities != expected_identities:
+        raise ToolchainError("aggregate readiness identities differ from cohort")
+    _require_sha256(aggregate.get("digest"), "aggregate report digest")
+
+
+def _select_qualification_instances(
+    instances: Sequence[Mapping[str, Any]],
+    instance_ids: Sequence[str] | None,
+    isolated_micro_qualification: bool,
+) -> list[tuple[int, Mapping[str, Any]]]:
+    indexed_instances = list(enumerate(instances, start=1))
+    requested_instance_ids = list(instance_ids or [])
+    if not requested_instance_ids:
+        if isolated_micro_qualification:
+            raise ToolchainError(
+                "--isolated-micro-qualification requires explicit instance IDs"
+            )
+        return indexed_instances
+    if not isolated_micro_qualification:
+        raise ToolchainError(
+            "an explicit instance subset requires --isolated-micro-qualification"
+        )
+    if len(requested_instance_ids) != 2 or len(set(requested_instance_ids)) != 2:
+        raise ToolchainError(
+            "isolated micro-qualification requires exactly two distinct instance IDs"
+        )
+    positions = {
+        instance["instance_id"]: index for index, instance in indexed_instances
+    }
+    if any(instance_id not in positions for instance_id in requested_instance_ids):
+        raise ToolchainError("isolated instance ID is absent from frozen population")
+    selected_indexes = [positions[instance_id] for instance_id in requested_instance_ids]
+    if selected_indexes != sorted(selected_indexes):
+        raise ToolchainError(
+            "isolated instance IDs must preserve frozen population order"
+        )
+    selected_id_set = set(requested_instance_ids)
+    selected = [
+        (positions[instance["instance_id"]], instance)
+        for _, instance in indexed_instances
+        if instance["instance_id"] in selected_id_set
+    ]
+    selected.sort(key=lambda pair: pair[0])
+    if len({instance["repo"] for _, instance in selected}) != 1:
+        raise ToolchainError(
+            "isolated micro-qualification instances must share one repository"
+        )
+    return selected
+
+
 def qualify_population(
     lock_path: Path,
     inventory_path: Path,
@@ -3552,9 +6130,21 @@ def qualify_population(
     rna_binary: Path,
     output_root: Path,
     case_timeout_seconds: float = 1800.0,
+    *,
+    preflight_case: int | None = None,
+    preflight_output: Path | None = None,
+    approved_preflight: Path | None = None,
+    stop_after_case: int | None = None,
+    instance_ids: Sequence[str] | None = None,
+    isolated_micro_qualification: bool = False,
+    repo_root: Path | None = None,
+    resume_replay_case: int | None = None,
+    resume_replay_checkout: Path | None = None,
+    resume_replay_receipt: Path | None = None,
+    resume_replay_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     rna_binary = rna_binary.resolve()
-    verification = verify_lock(lock_path, inventory_path, None, None)
+    verification = verify_lock(lock_path, inventory_path, None, None, repo_root)
     if not verification["compatible"]:
         raise ToolchainError("cannot qualify a lock with unsupported languages")
     if not rna_binary.is_file():
@@ -3562,7 +6152,8 @@ def qualify_population(
     if not math.isfinite(case_timeout_seconds) or case_timeout_seconds <= 0:
         raise ToolchainError("case timeout must be a positive finite number")
     git_cache_verification = verify_git_cache(population_path, git_cache_root)
-    instances = included_population(load_json_object(population_path, "population"))
+    population = load_json_object(population_path, "population")
+    instances = included_population(population)
     inventory = load_json_object(inventory_path, "frozen inventory")
     inventory_digest = _require_sha256(
         inventory.get("inventory_digest"), "frozen inventory digest"
@@ -3576,10 +6167,93 @@ def qualify_population(
     if set(inventory_cases) != {instance["instance_id"] for instance in instances}:
         raise ToolchainError("frozen inventory/population case identities differ")
     toolchain_lock_digest = sha256_file(lock_path)
+    indexed_instances = _select_qualification_instances(
+        instances,
+        instance_ids,
+        isolated_micro_qualification,
+    )
+    selected_indexes = [index for index, _ in indexed_instances]
+    for label, value in (
+        ("preflight case", preflight_case),
+        ("stop-after case", stop_after_case),
+        ("resume replay case", resume_replay_case),
+    ):
+        if value is not None and value not in selected_indexes:
+            raise ToolchainError(f"{label} is not selected for this qualification")
+    if preflight_output is not None and preflight_case is None:
+        raise ToolchainError("--preflight-output requires --preflight-case")
+    if preflight_case is not None and approved_preflight is not None:
+        raise ToolchainError("preflight-only and approved-preflight modes are exclusive")
+    replay_options = (
+        resume_replay_case,
+        resume_replay_checkout,
+        resume_replay_receipt,
+        resume_replay_receipt_sha256,
+    )
+    if any(value is not None for value in replay_options) and not all(
+        value is not None for value in replay_options
+    ):
+        raise ToolchainError("all resume-replay options are required together")
+    if resume_replay_case is not None:
+        if approved_preflight is None:
+            raise ToolchainError("resume replay requires --approved-preflight")
+        if preflight_case is not None or preflight_output is not None:
+            raise ToolchainError("resume replay and preflight-only modes are exclusive")
+        if stop_after_case != resume_replay_case:
+            raise ToolchainError("resume replay must stop after its selected case")
+        _require_sha256(
+            resume_replay_receipt_sha256, "resume replay receipt SHA-256"
+        )
+    approved_case_index = None
+    if approved_preflight is not None:
+        approved_plan = load_json_object(
+            approved_preflight, "approved structural-cache preflight"
+        )
+        approved_case_index = approved_plan.get("case_index")
+        if approved_case_index not in selected_indexes:
+            raise ToolchainError("approved preflight case is not selected")
+        if (
+            resume_replay_case is not None
+            and approved_case_index != resume_replay_case
+        ):
+            raise ToolchainError("resume replay and approved preflight cases differ")
     git_binary = shutil.which("git")
     if git_binary is None:
         raise ToolchainError("git is required to materialize frozen checkouts")
-    output_root.mkdir(parents=True, exist_ok=True)
+    isolation_marker_path = output_root / "isolated-micro-qualification.json"
+    if isolated_micro_qualification:
+        isolation_marker = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "isolated",
+            "population_sha256": sha256_file(population_path),
+            "inventory_sha256": inventory_file_sha256,
+            "toolchain_lock_digest": toolchain_lock_digest,
+            "selected_cases": [
+                {"population_index": index, "instance_id": instance["instance_id"]}
+                for index, instance in indexed_instances
+            ],
+            "digest": "",
+        }
+        isolation_marker["digest"] = sha256_bytes(canonical_json(isolation_marker))
+        if output_root.exists() and not isolation_marker_path.exists() and any(
+            output_root.iterdir()
+        ):
+            raise ToolchainError(
+                "isolated micro-qualification output must start empty"
+            )
+        for forbidden in ("cohort-manifest.json", "aggregate.json", "seal.json"):
+            if (output_root / forbidden).exists() or (output_root / forbidden).is_symlink():
+                raise ToolchainError(
+                    "isolated micro-qualification output contains N=70 evidence"
+                )
+        output_root.mkdir(parents=True, exist_ok=True)
+        _publish_or_verify_canonical_json(isolation_marker_path, isolation_marker)
+    else:
+        if isolation_marker_path.exists() or isolation_marker_path.is_symlink():
+            raise ToolchainError(
+                "N=70 qualification cannot use an isolated micro output root"
+            )
+        output_root.mkdir(parents=True, exist_ok=True)
     cases_root = output_root / "cases"
     logs_root = output_root / "logs"
     cases_root.mkdir(exist_ok=True)
@@ -3588,13 +6262,72 @@ def qualify_population(
     archives_root.mkdir(exist_ok=True)
     environment = toolchain_environment(toolchain_root)
     probe_path = output_root / "probe.json"
-    probe_started = time.monotonic()
-    probe_toolchain(lock_path, inventory_path, toolchain_root, probe_path, 30.0)
-    probe_seconds = time.monotonic() - probe_started
+    probe_seconds = 0.0
+    probe_performed = False
     cohort_cases = []
     timing_cases = []
-    for index, instance in enumerate(instances, start=1):
+    for index, instance in indexed_instances:
         instance_id = instance["instance_id"]
+        resumed = _resume_ready_case(
+            output_root=output_root,
+            case_index=index,
+            instance=instance,
+            inventory_case=inventory_cases[instance_id],
+            rna_binary=rna_binary,
+            toolchain_lock_digest=toolchain_lock_digest,
+            inventory_digest=inventory_digest,
+            inventory_file_sha256=inventory_file_sha256,
+        )
+        if resumed is not None:
+            if preflight_case == index:
+                raise ToolchainError(
+                    f"preflight case {index} already has verifier-clean READY evidence"
+                )
+            cohort_case, timing_case = resumed
+            cohort_cases.append(cohort_case)
+            timing_cases.append(timing_case)
+            if stop_after_case == index:
+                return _qualification_checkpoint(
+                    output_root=output_root,
+                    last_case_index=index,
+                    cohort_cases=cohort_cases,
+                    timing_cases=timing_cases,
+                    isolated=isolated_micro_qualification,
+                )
+            continue
+        if preflight_case is not None and index < preflight_case:
+            raise ToolchainError(
+                f"preflight case {preflight_case} requires READY prior case {index}"
+            )
+        if approved_case_index is not None and index < approved_case_index:
+            raise ToolchainError(
+                f"approved preflight case {approved_case_index} requires READY prior case {index}"
+            )
+        if resume_replay_case == index:
+            cohort_case, timing_case = _publish_resume_replay_case(
+                output_root=output_root,
+                case_index=index,
+                instance=instance,
+                inventory_case=inventory_cases[instance_id],
+                checkout=resume_replay_checkout,
+                replay_receipt_path=resume_replay_receipt,
+                replay_receipt_sha256=resume_replay_receipt_sha256,
+                approved_preflight_path=approved_preflight,
+                rna_binary=rna_binary,
+                environment=environment,
+                toolchain_lock_digest=toolchain_lock_digest,
+                inventory_digest=inventory_digest,
+                inventory_file_sha256=inventory_file_sha256,
+            )
+            cohort_cases.append(cohort_case)
+            timing_cases.append(timing_case)
+            return _qualification_checkpoint(
+                output_root=output_root,
+                last_case_index=index,
+                cohort_cases=cohort_cases,
+                timing_cases=timing_cases,
+                isolated=isolated_micro_qualification,
+            )
         attempt_index = _next_case_attempt_index(output_root, instance_id)
         attempt_slug = f"{instance_id}-attempt-{attempt_index:03d}"
         git_dir = git_cache_path(git_cache_root, instance["repo"])
@@ -3674,6 +6407,7 @@ def qualify_population(
                 ) from error
             selection_started = time.monotonic()
             try:
+                selection_diagnostics: dict[str, Any] = {}
                 selection = select_structural_cache(
                     output_root,
                     instance["repo"],
@@ -3684,7 +6418,9 @@ def qualify_population(
                     toolchain_lock_digest=toolchain_lock_digest,
                     inventory_digest=inventory_digest,
                     inventory_file_sha256=inventory_file_sha256,
+                    diagnostics=selection_diagnostics,
                 )
+                _validate_selected_partition_plan(selection, target_identity)
             except Exception as error:
                 cache_preparation_log_path.write_text(f"{type(error).__name__}: {error}\n")
                 failure_path = _preserve_failed_case_evidence(
@@ -3755,6 +6491,55 @@ def qualify_population(
                         f"failure evidence={failure_path}"
                     ) from error
 
+            try:
+                preflight = build_structural_cache_preflight(
+                    case_index=index,
+                    instance_id=instance_id,
+                    inventory_case=inventory_cases[instance_id],
+                    target_identity=target_identity,
+                    selection=selection,
+                    injection_receipt=injection_receipt,
+                    cold_rebuild_reasons=selection_diagnostics.get(
+                        "cold_rebuild_reasons"
+                    ),
+                )
+                if preflight_case == index:
+                    preflight_path = preflight_output or (
+                        logs_root / f"{attempt_slug}-preflight-only.json"
+                    )
+                    publish_structural_cache_preflight(preflight, preflight_path)
+                    return {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "preflight_ready",
+                        "case_index": index,
+                        "instance_id": instance_id,
+                        "preflight_path": str(preflight_path.resolve()),
+                        "preflight_sha256": sha256_file(preflight_path),
+                        "preflight_digest": preflight["digest"],
+                    }
+                preflight_path = logs_root / f"{attempt_slug}-preflight.json"
+                if approved_case_index == index:
+                    require_approved_structural_cache_preflight(
+                        preflight, approved_preflight
+                    )
+                publish_structural_cache_preflight(preflight, preflight_path)
+            except Exception as error:
+                cache_preparation_log_path.write_text(
+                    f"{type(error).__name__}: {error}\n"
+                )
+                failure_path = _preserve_failed_case_evidence(
+                    checkout,
+                    instance_id,
+                    cases_root,
+                    cache_preparation_log_path,
+                    error,
+                    attempt_slug,
+                )
+                raise ToolchainError(
+                    f"cache preflight failed for {instance_id}; "
+                    f"failure evidence={failure_path}"
+                ) from error
+
             case_environment = dict(environment)
             if injection_receipt is not None:
                 case_environment[STRUCTURAL_CACHE_AUTHORIZATION_SHA256_ENV] = (
@@ -3765,6 +6550,23 @@ def qualify_population(
             archive_path = archives_root / f"{attempt_slug}.tar.gz"
             sidecar_path = archives_root / f"{attempt_slug}.manifest.json"
             try:
+                if not probe_performed:
+                    if probe_path.is_symlink():
+                        _validate_toolchain_probe_evidence(probe_path, lock_path)
+                    elif probe_path.is_file():
+                        _validate_toolchain_probe_evidence(probe_path, lock_path)
+                    else:
+                        probe_started = time.monotonic()
+                        probe_toolchain(
+                            lock_path,
+                            inventory_path,
+                            toolchain_root,
+                            probe_path,
+                            30.0,
+                            repo_root,
+                        )
+                        probe_seconds = time.monotonic() - probe_started
+                    probe_performed = True
                 scan_seconds = _run_logged(
                     [
                         str(rna_binary),
@@ -3882,19 +6684,17 @@ def qualify_population(
                     ),
                 )
                 archive_seconds = time.monotonic() - archive_started
-            except ToolchainError as error:
-                failure_path = _preserve_failed_case_evidence(
-                    checkout,
-                    instance_id,
-                    cases_root,
-                    scan_log_path,
-                    error,
-                    attempt_slug,
-                    publication_artifacts=[archive_path, sidecar_path],
+            except Exception as error:
+                _raise_archive_failure(
+                    checkout=checkout,
+                    instance_id=instance_id,
+                    cases_root=cases_root,
+                    scan_log_path=scan_log_path,
+                    error=error,
+                    attempt_slug=attempt_slug,
+                    archive_path=archive_path,
+                    sidecar_path=sidecar_path,
                 )
-                raise ToolchainError(
-                    f"{error}; failure evidence={failure_path}"
-                ) from error
             publication_artifacts = [archive_path, sidecar_path]
             publication_log_path = logs_root / f"{attempt_slug}-publication.log"
             try:
@@ -3906,6 +6706,7 @@ def qualify_population(
                     "schema_version": SCHEMA_VERSION,
                     "status": "ready",
                     "offline_preprocessing": True,
+                    "population_index": index,
                     "instance_id": instance_id,
                     "attempt_index": attempt_index,
                     "repository": instance["repo"],
@@ -3920,6 +6721,9 @@ def qualify_population(
                     ],
                     "configuration_digest": target_identity["configuration_digest"],
                     "scan_flags": QUALIFICATION_SCAN_FLAGS,
+                    "preflight_path": str(preflight_path.resolve()),
+                    "preflight_sha256": sha256_file(preflight_path),
+                    "preflight_digest": preflight["digest"],
                     "report_path": str(report_path.resolve()),
                     "report_sha256": sha256_file(report_path),
                     "report_digest": report["digest"],
@@ -3970,6 +6774,7 @@ def qualify_population(
                         "case_index": index,
                         "attempt_index": attempt_index,
                         "instance_id": instance_id,
+                        "population_index": index,
                         "repository": instance["repo"],
                         "commit": instance["base_commit"],
                         "tree": target_identity["tree"],
@@ -3999,6 +6804,7 @@ def qualify_population(
                 timing_cases.append(
                     {
                         "instance_id": instance_id,
+                        "population_index": index,
                         "scan_ms": int(scan_seconds * 1000),
                         "readiness_ms": int(readiness_seconds * 1000),
                         "cache_selection_ms": int(selection_seconds * 1000),
@@ -4025,8 +6831,43 @@ def qualify_population(
                     f"case evidence publication failed for {instance_id}; "
                     f"failure evidence={failure_path}"
                 ) from error
+        if stop_after_case == index:
+            return _qualification_checkpoint(
+                output_root=output_root,
+                last_case_index=index,
+                cohort_cases=cohort_cases,
+                timing_cases=timing_cases,
+                isolated=isolated_micro_qualification,
+            )
 
-    cohort_manifest = {"schema_version": SCHEMA_VERSION, "cases": cohort_cases}
+    if isolated_micro_qualification:
+        isolated_manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "isolated_ready",
+            "population_sha256": sha256_file(population_path),
+            "inventory_sha256": inventory_file_sha256,
+            "toolchain_lock_digest": toolchain_lock_digest,
+            "isolation_marker_sha256": sha256_file(isolation_marker_path),
+            "selected_population_indexes": selected_indexes,
+            "cases": cohort_cases,
+            "timings": timing_cases,
+            "digest": "",
+        }
+        isolated_manifest["digest"] = sha256_bytes(
+            canonical_json(isolated_manifest)
+        )
+        isolated_manifest_path = output_root / "isolated-micro-manifest.json"
+        _publish_or_verify_canonical_json(
+            isolated_manifest_path, isolated_manifest
+        )
+        return {
+            **isolated_manifest,
+            "path": str(isolated_manifest_path.resolve()),
+            "sha256": sha256_file(isolated_manifest_path),
+        }
+
+    _validate_toolchain_probe_evidence(probe_path, lock_path)
+    cohort_manifest = _build_frozen_cohort_manifest(cohort_cases)
     manifest_path = output_root / "cohort-manifest.json"
     write_canonical_json(manifest_path, cohort_manifest)
     aggregate_path = output_root / "aggregate.json"
@@ -4046,8 +6887,11 @@ def qualify_population(
         aggregate_log,
     )
     aggregate = load_json_object(aggregate_path, "aggregate readiness report")
-    if aggregate.get("status") != "ready":
-        raise ToolchainError("aggregate readiness status is not ready")
+    _validate_ready_aggregate(
+        aggregate,
+        cohort_manifest,
+        expected_population_digest=sha256_file(population_path),
+    )
     timings = {
         "schema_version": SCHEMA_VERSION,
         "cases": timing_cases,
@@ -4104,12 +6948,14 @@ def build_parser() -> argparse.ArgumentParser:
     acquire = subparsers.add_parser("acquire-artifacts")
     acquire.add_argument("--lock", type=Path, required=True)
     acquire.add_argument("--cache", type=Path, required=True)
+    acquire.add_argument("--repo", type=Path, default=Path("."))
 
     verify = subparsers.add_parser("verify-lock")
     verify.add_argument("--lock", type=Path, required=True)
     verify.add_argument("--inventory", type=Path, required=True)
     verify.add_argument("--cache", type=Path)
     verify.add_argument("--descriptors", type=Path)
+    verify.add_argument("--repo", type=Path, default=Path("."))
 
     seal = subparsers.add_parser("seal-directory")
     seal.add_argument("--source", type=Path, required=True)
@@ -4127,6 +6973,7 @@ def build_parser() -> argparse.ArgumentParser:
     provision.add_argument("--root", type=Path, required=True)
     provision.add_argument("--receipt", type=Path, required=True)
     provision.add_argument("--offline", action="store_true")
+    provision.add_argument("--repo", type=Path, default=Path("."))
 
     probe = subparsers.add_parser("probe")
     probe.add_argument("--lock", type=Path, required=True)
@@ -4134,6 +6981,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--root", type=Path, required=True)
     probe.add_argument("--output", type=Path, required=True)
     probe.add_argument("--timeout", type=float, default=20.0)
+    probe.add_argument("--repo", type=Path, default=Path("."))
 
     qualify = subparsers.add_parser("qualify")
     qualify.add_argument("--lock", type=Path, required=True)
@@ -4144,6 +6992,17 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--rna", type=Path, required=True)
     qualify.add_argument("--output", type=Path, required=True)
     qualify.add_argument("--case-timeout-seconds", type=float, default=1800.0)
+    qualify.add_argument("--preflight-case", type=int)
+    qualify.add_argument("--preflight-output", type=Path)
+    qualify.add_argument("--approved-preflight", type=Path)
+    qualify.add_argument("--stop-after-case", type=int)
+    qualify.add_argument("--instance-id", action="append", dest="instance_ids")
+    qualify.add_argument("--isolated-micro-qualification", action="store_true")
+    qualify.add_argument("--resume-replay-case", type=int)
+    qualify.add_argument("--resume-replay-checkout", type=Path)
+    qualify.add_argument("--resume-replay-receipt", type=Path)
+    qualify.add_argument("--resume-replay-receipt-sha256")
+    qualify.add_argument("--repo", type=Path, default=Path("."))
     return parser
 
 
@@ -4161,10 +7020,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             write_canonical_json(args.output, result)
         elif args.command == "acquire-artifacts":
-            result = acquire_artifacts(args.lock, args.cache)
+            result = acquire_artifacts(args.lock, args.cache, args.repo)
         elif args.command == "verify-lock":
             result = verify_lock(
-                args.lock, args.inventory, args.cache, args.descriptors
+                args.lock, args.inventory, args.cache, args.descriptors, args.repo
             )
         elif args.command == "seal-directory":
             result = seal_directory(args.source, args.output, args.root_name)
@@ -4178,10 +7037,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.root,
                 args.receipt,
                 offline=args.offline,
+                repo_root=args.repo,
             )
         elif args.command == "probe":
             result = probe_toolchain(
-                args.lock, args.inventory, args.root, args.output, args.timeout
+                args.lock,
+                args.inventory,
+                args.root,
+                args.output,
+                args.timeout,
+                args.repo,
             )
         elif args.command == "qualify":
             result = qualify_population(
@@ -4193,6 +7058,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.rna,
                 args.output,
                 args.case_timeout_seconds,
+                preflight_case=args.preflight_case,
+                preflight_output=args.preflight_output,
+                approved_preflight=args.approved_preflight,
+                stop_after_case=args.stop_after_case,
+                instance_ids=args.instance_ids,
+                isolated_micro_qualification=args.isolated_micro_qualification,
+                repo_root=args.repo,
+                resume_replay_case=args.resume_replay_case,
+                resume_replay_checkout=args.resume_replay_checkout,
+                resume_replay_receipt=args.resume_replay_receipt,
+                resume_replay_receipt_sha256=args.resume_replay_receipt_sha256,
             )
         else:  # pragma: no cover - argparse owns this boundary.
             parser.error("unknown command")

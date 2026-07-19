@@ -268,7 +268,7 @@ pub trait Enricher: Send + Sync {
     ///
     /// Used by `enrich_all` to prefer lsp_roots that contain this file when selecting
     /// the LSP server startup directory. For example, typescript-language-server relies
-    /// on `tsconfig.json`, pyright on `pyproject.toml`.
+    /// on `tsconfig.json`, Pyrefly on `pyproject.toml`.
     ///
     /// Returns `None` if the enricher has no specific config file preference
     /// (it will fall back to the node-count heuristic).

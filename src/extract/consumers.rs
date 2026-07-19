@@ -317,13 +317,8 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
                 .or_default()
                 .push(node.clone());
         }
-        if self.file_readiness
-            && dirty_slugs
-                .as_ref()
-                .is_none_or(|dirty| !dirty.is_empty())
-        {
-            for (language, paths) in
-                crate::lsp_completeness::included_lsp_paths_by_language(path)?
+        if self.file_readiness && dirty_slugs.as_ref().is_none_or(|dirty| !dirty.is_empty()) {
+            for (language, paths) in crate::lsp_completeness::included_lsp_paths_by_language(path)?
             {
                 if self
                     .file_readiness_filter
@@ -1611,24 +1606,24 @@ impl ExtractionConsumer for LspConsumer {
                     })
                     .collect::<Vec<_>>();
                 events.push(ExtractionEvent::EnrichmentComplete {
-                        slug: slug.clone(),
-                        language: language.clone(),
-                        added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
-                        new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
-                        updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
-                        server_name: Some(self.enricher.name().to_string()),
-                        error_count: enrichment.error_count,
-                        server_missing,
-                        remediation: self.enricher.toolchain_remediation().map(str::to_string),
-                        aborted: enrichment.aborted,
-                        diagnostic: enrichment.diagnostic,
-                        validation: enrichment.lsp_validation.map(Box::new),
-                    });
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
+                    new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                    updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
+                    server_name: Some(self.enricher.name().to_string()),
+                    error_count: enrichment.error_count,
+                    server_missing,
+                    remediation: self.enricher.toolchain_remediation().map(str::to_string),
+                    aborted: enrichment.aborted,
+                    diagnostic: enrichment.diagnostic,
+                    validation: enrichment.lsp_validation.map(Box::new),
+                });
                 events.push(ExtractionEvent::LspQueryMetrics {
-                        slug: slug.clone(),
-                        language: language.clone(),
-                        metrics,
-                    });
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    metrics,
+                });
                 Ok(events)
             }
             Err(e) => {
@@ -1870,21 +1865,16 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         }
                     }
                     if self.file_readiness
-                        && dirty_slugs
-                            .as_ref()
-                            .is_none_or(|dirty| !dirty.is_empty())
+                        && dirty_slugs.as_ref().is_none_or(|dirty| !dirty.is_empty())
                     {
                         seen.extend(
                             crate::lsp_completeness::included_lsp_paths_by_language(path)?
                                 .into_iter()
                                 .filter(|(language, paths)| {
                                     supported.contains(language)
-                                        && self
-                                            .file_readiness_filter
-                                            .as_deref()
-                                            .is_none_or(|filter| {
-                                                paths.iter().any(|path| filter.contains(path))
-                                            })
+                                        && self.file_readiness_filter.as_deref().is_none_or(
+                                            |filter| paths.iter().any(|path| filter.contains(path)),
+                                        )
                                 })
                                 .map(|(language, _)| language),
                         );
@@ -2520,13 +2510,12 @@ pub fn build_builtin_bus(
         supported_languages.sort(); // deterministic registration order
 
         for lang in &supported_languages {
-            let single_lang_enricher =
-                build_single_language_enricher(
-                    lang,
-                    broad_reference_budget.clone(),
-                    file_readiness,
-                    file_readiness_filter.clone(),
-                );
+            let single_lang_enricher = build_single_language_enricher(
+                lang,
+                broad_reference_budget.clone(),
+                file_readiness,
+                file_readiness_filter.clone(),
+            );
             bus.register(Box::new(LspConsumer {
                 language: lang.clone(),
                 enricher: single_lang_enricher,
@@ -2586,14 +2575,12 @@ fn build_single_language_enricher(
     file_readiness: bool,
     file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
 ) -> Arc<dyn crate::extract::Enricher> {
-    if let Some(enricher) =
-        build_single_language_lsp_enricher(
-            language,
-            broad_reference_budget,
-            file_readiness,
-            file_readiness_filter,
-        )
-    {
+    if let Some(enricher) = build_single_language_lsp_enricher(
+        language,
+        broad_reference_budget,
+        file_readiness,
+        file_readiness_filter,
+    ) {
         return Arc::new(enricher);
     }
 
@@ -3306,7 +3293,7 @@ mod tests {
         );
         assert!(
             !event_bus_path.allows_declared_const_references(),
-            "Pyright declared-Const references remain disabled after the #768 probe"
+            "Python declared-Const references remain disabled without a qualifying probe"
         );
         assert_eq!(
             crate::extract::Enricher::name(&event_bus_path),

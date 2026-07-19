@@ -339,7 +339,7 @@ impl LspEnrichmentEntry {
 /// Rendered by `list_roots` to show per-root LSP effectiveness at a glance.
 #[derive(Debug, Clone)]
 pub struct LspLanguageStats {
-    /// LSP server binary name (e.g., "rust-analyzer", "pyright-langserver").
+    /// LSP server binary name (e.g., "rust-analyzer", "pyrefly").
     pub server_name: String,
     /// Number of edges produced by LSP enrichment.
     pub edge_count: usize,

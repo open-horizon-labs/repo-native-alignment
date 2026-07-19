@@ -102,7 +102,7 @@ pub struct LspWorkItemRecord {
     /// lineage lets verified structural-cache reuse retain a shared result only
     /// while at least one authenticated producer remains valid.
     #[serde(default)]
-    pub produced_result_ids: Vec<String>,
+    pub produced_result_ids: BTreeSet<String>,
     /// Number of raw, applicable LSP results observed before graph mapping.
     /// This remains non-zero when a server response cannot be mapped to a
     /// persistable graph node or edge, allowing readiness to fail closed.
@@ -520,8 +520,6 @@ impl LspWorkItemLedger {
                 .iter()
                 .map(Edge::stable_id)
                 .chain(nodes.iter().map(Node::stable_id))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .collect();
             record.observed_result_count = observed_result_count;
         })?;
@@ -669,7 +667,7 @@ fn new_record(
         recovery: LspWorkItemRecovery::New,
         output_edges: Vec::new(),
         output_nodes: Vec::new(),
-        produced_result_ids: Vec::new(),
+        produced_result_ids: BTreeSet::new(),
         observed_result_count: 0,
     }
 }
@@ -1150,7 +1148,7 @@ fn unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
@@ -1245,6 +1243,24 @@ mod tests {
         .unwrap();
         let snapshots = load_queue_snapshots(older.path(), 1).unwrap();
         assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn produced_result_ids_keep_the_existing_json_array_contract() {
+        let record: LspWorkItemRecord = serde_json::from_value(serde_json::json!({
+            "produced_result_ids": ["result-z", "result-a", "result-z"]
+        }))
+        .unwrap();
+        assert_eq!(
+            record.produced_result_ids,
+            BTreeSet::from(["result-a".to_string(), "result-z".to_string()])
+        );
+
+        let serialized = serde_json::to_value(record).unwrap();
+        assert_eq!(
+            serialized["produced_result_ids"],
+            serde_json::json!(["result-a", "result-z"])
+        );
     }
 
     #[tokio::test]

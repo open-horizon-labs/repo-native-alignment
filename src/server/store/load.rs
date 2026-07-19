@@ -41,6 +41,14 @@ fn required_string_column<'a>(
         .with_context(|| format!("persisted graph column {name:?} is not Utf8"))
 }
 
+fn ensure_persisted_node_identity(persisted_id: &str, node_id: &NodeId) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        node_id.to_stable_id() == persisted_id,
+        "persisted symbol identity mismatch: id={persisted_id:?}, fields={node_id:?}"
+    );
+    Ok(())
+}
+
 /// Load graph nodes and edges from LanceDB tables.
 ///
 /// Reads only rows matching the currently committed `scan_version`.
@@ -86,12 +94,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
 
         let mut nodes = Vec::new();
         for batch in &batches {
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let ids = required_string_column(batch, "id")?;
             let root_ids = batch
                 .column_by_name("root_id")
                 .unwrap()
@@ -158,7 +161,6 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
             // Language remains derived from the file extension. Legacy tables may not
             // have extraction_source, so node_extraction_source_at falls back safely.
-            let _ = ids; // ids column exists but we reconstruct from components
 
             // Read optional value and synthetic columns (present after schema migration)
             let value_col = batch
@@ -502,13 +504,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         metadata.insert(mk::RESPONSE_TYPE.to_owned(), val.to_string());
                     }
                 }
+                let id = NodeId {
+                    root: root_ids.value(i).to_string(),
+                    file: file_path,
+                    name: names.value(i).to_string(),
+                    kind: parse_node_kind(kinds.value(i)),
+                };
+                ensure_persisted_node_identity(ids.value(i), &id)?;
                 nodes.push(Node {
-                    id: NodeId {
-                        root: root_ids.value(i).to_string(),
-                        file: file_path,
-                        name: names.value(i).to_string(),
-                        kind: parse_node_kind(kinds.value(i)),
-                    },
+                    id,
                     language,
                     line_start: line_starts.value(i) as usize,
                     line_end: line_ends.value(i) as usize,
@@ -727,6 +731,24 @@ mod tests {
             node_extraction_source_at(None, 0),
             ExtractionSource::TreeSitter,
             "legacy symbols tables without extraction_source must still load"
+        );
+    }
+
+    #[test]
+    fn persisted_symbol_identity_mismatch_fails_closed() {
+        let id = NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/lib.rs"),
+            name: "target".to_string(),
+            kind: crate::graph::NodeKind::Function,
+        };
+
+        assert!(ensure_persisted_node_identity(&id.to_stable_id(), &id).is_ok());
+        let error = ensure_persisted_node_identity("tampered", &id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted symbol identity mismatch")
         );
     }
 }

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +52,9 @@ enum Commands {
     /// Print the exact producer/schema and target-tree identity used for
     /// verifier-clean structural-cache reuse.
     StructuralCacheIdentity(StructuralCacheIdentityArgs),
+    /// Replay a retained post-LSP failure cache without scanning or LSP calls.
+    #[command(hide = true)]
+    StructuralCacheReplay(StructuralCacheReplayArgs),
     Enrich(EnrichArgs),
     Search(SearchArgs),
     Graph(GraphArgs),
@@ -120,6 +124,37 @@ struct LspReadinessArgs {
 struct StructuralCacheIdentityArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct StructuralCacheReplayArgs {
+    #[arg(long)]
+    repo: PathBuf,
+    #[arg(long)]
+    failure_receipt: PathBuf,
+    #[arg(long)]
+    failure_receipt_sha256: String,
+    #[arg(long)]
+    authorization_sha256: String,
+    #[arg(long)]
+    toolchain_lock_digest: String,
+    #[arg(long)]
+    inventory_digest: String,
+    #[arg(long)]
+    inventory_file_sha256: String,
+    #[arg(long)]
+    configuration_digest: String,
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    root_slug: String,
+    #[arg(long)]
+    target_commit: String,
+    #[arg(long)]
+    target_tree: String,
+    /// New path for the non-publishable diagnostic receipt.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -753,6 +788,56 @@ async fn async_main() -> anyhow::Result<()> {
                 business_context_mode,
             )?;
             println!("{}", serde_json::to_string_pretty(&identity)?);
+            return Ok(());
+        }
+        Some(Commands::StructuralCacheReplay(args)) => {
+            init_tracing("warn", log_path.as_deref());
+            anyhow::ensure!(
+                business_context_mode.is_disabled(),
+                "structural-cache replay requires --business-context disabled"
+            );
+            let repo_root = args.repo.canonicalize()?;
+            let output_parent = args
+                .output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .canonicalize()?;
+            anyhow::ensure!(
+                !output_parent.starts_with(repo_root.join(".oh/.cache")),
+                "diagnostic replay receipt must be written outside the copied cache"
+            );
+            let receipt =
+                repo_native_alignment::structural_cache_replay::replay_retained_structural_cache(
+                    &repo_native_alignment::structural_cache_replay::StructuralCacheReplayRequest {
+                        repo_root: &repo_root,
+                        failure_receipt: &args.failure_receipt,
+                        failure_receipt_sha256: &args.failure_receipt_sha256,
+                        authorization_sha256: &args.authorization_sha256,
+                        toolchain_lock_digest: &args.toolchain_lock_digest,
+                        inventory_digest: &args.inventory_digest,
+                        inventory_file_sha256: &args.inventory_file_sha256,
+                        configuration_digest: &args.configuration_digest,
+                        repository: &args.repository,
+                        root_slug: &args.root_slug,
+                        target_commit: &args.target_commit,
+                        target_tree: &args.target_tree,
+                    },
+                )
+                .await?;
+            let mut bytes = serde_json::to_vec_pretty(&receipt)?;
+            bytes.push(b'\n');
+            let mut output = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&args.output)?;
+            output.write_all(&bytes)?;
+            output.sync_all()?;
+            print!("{}", String::from_utf8_lossy(&bytes));
+            anyhow::ensure!(
+                receipt.diagnostic_checkpoint_validation_passed && receipt.full_target_ready,
+                "diagnostic retained-cache replay is not READY"
+            );
             return Ok(());
         }
         Some(Commands::Scan(args)) => {

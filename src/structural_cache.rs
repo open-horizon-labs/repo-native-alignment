@@ -6,7 +6,7 @@
 //! the current Git tree and descriptor partitions, and computes the graph
 //! impact closure that must be executed before inherited evidence is admitted.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -231,21 +231,85 @@ pub struct VerifiedStructuralCacheAuthorization {
 }
 
 impl VerifiedStructuralCacheAuthorization {
+    pub fn inherited_readiness_validation_requests_by_language(
+        &self,
+        inherited_paths: &BTreeSet<PathBuf>,
+    ) -> Result<BTreeMap<String, u64>> {
+        let mut base_paths_by_language = BTreeMap::<String, BTreeSet<String>>::new();
+        for file in self
+            .base_report
+            .files
+            .iter()
+            .filter(|file| file.role.is_included())
+        {
+            let language = file.language.as_deref().with_context(|| {
+                format!("included base report file has no language: {}", file.path)
+            })?;
+            base_paths_by_language
+                .entry(language.to_string())
+                .or_default()
+                .insert(file.path.clone());
+        }
+
+        let mut inherited_counts = BTreeMap::<String, u64>::new();
+        for path in inherited_paths {
+            let path = path.to_string_lossy();
+            let file = self
+                .inherited_by_path
+                .get(path.as_ref())
+                .with_context(|| format!("missing inherited authorization for {path}"))?;
+            let base_paths = base_paths_by_language
+                .get(file.language.as_str())
+                .with_context(|| format!("base report has no {} partition", file.language))?;
+            ensure!(
+                base_paths.contains(file.path.as_str()),
+                "base report has no inherited readiness path {}",
+                file.path
+            );
+            *inherited_counts.entry(file.language.clone()).or_default() += 1;
+        }
+
+        let mut requests_by_language = BTreeMap::new();
+        for (language, inherited_count) in inherited_counts {
+            let base_file_count = base_paths_by_language[&language].len() as u64;
+            let base_request_count = *self
+                .base_report
+                .readiness_validation_requests_by_language
+                .get(&language)
+                .with_context(|| {
+                    format!("base report has no readiness request count for {language}")
+                })?;
+            ensure!(
+                base_request_count >= base_file_count,
+                "base readiness request count for {language} is smaller than its file count"
+            );
+            let partition_request_count = base_request_count - base_file_count;
+            ensure!(
+                partition_request_count <= 1,
+                "base readiness request count for {language} has ambiguous non-file evidence"
+            );
+
+            // A verifier-clean qualification emits one file-scoped validation
+            // per included file. Its one optional non-file initialization probe
+            // is reusable only when the entire language partition is inherited;
+            // a mixed partition executes a fresh probe for its changed paths.
+            let mut request_count = inherited_count;
+            if inherited_count == base_file_count {
+                request_count += partition_request_count;
+            }
+            requests_by_language.insert(language, request_count);
+        }
+        Ok(requests_by_language)
+    }
+
     pub fn inherited_readiness_validation_request_count(
         &self,
         inherited_paths: &BTreeSet<PathBuf>,
-    ) -> u64 {
-        let languages = inherited_paths
-            .iter()
-            .filter_map(|path| self.inherited_by_path.get(path.to_string_lossy().as_ref()))
-            .map(|file| file.language.as_str())
-            .collect::<BTreeSet<_>>();
-        self.base_report
-            .readiness_validation_requests_by_language
-            .iter()
-            .filter(|(language, _)| languages.contains(language.as_str()))
-            .map(|(_, count)| count)
-            .sum()
+    ) -> Result<u64> {
+        Ok(self
+            .inherited_readiness_validation_requests_by_language(inherited_paths)?
+            .values()
+            .sum())
     }
 }
 
@@ -421,6 +485,9 @@ pub fn load_verified_authorization(
         })
         .map(|record| (format!("{}:{}", record.job_id, record.item_id), record))
         .collect::<BTreeMap<_, _>>();
+    let validation_result_producers = crate::lsp_completeness::validation_result_producers(
+        &crate::server::EnrichmentJobLedger::default().all_jobs(repo_root),
+    );
     let execution = load_execution(repo_root)?;
     let mut executed_paths = BTreeSet::new();
     let mut executed_producer_ids = BTreeSet::new();
@@ -569,6 +636,12 @@ pub fn load_verified_authorization(
         if !file_was_executed {
             for lineage in &file.result_producers {
                 for producer_id in &lineage.producer_ids {
+                    if validation_result_producers
+                        .get(&(file.path.clone(), lineage.result_id.clone()))
+                        .is_some_and(|producers| producers.contains(producer_id))
+                    {
+                        continue;
+                    }
                     let record = completed_records.get(producer_id).with_context(|| {
                         format!(
                             "inherited result {} names missing producer {}",
@@ -650,7 +723,7 @@ pub fn plan_incremental_impact(
         .cloned()
         .collect::<BTreeSet<_>>();
     for node in old_nodes.iter().chain(new_nodes.iter()) {
-        if invalidated.contains(&node.language) {
+        if invalidated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
             executed.insert(node.id.file.clone());
         }
     }
@@ -658,7 +731,11 @@ pub fn plan_incremental_impact(
     let mut adjacency = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
     let mut closure_edge_count = 0usize;
     for edge in old_edges.iter().chain(new_edges.iter()) {
-        if !is_impact_edge(&edge.kind) || edge.from.file == edge.to.file {
+        if !is_impact_edge(&edge.kind)
+            || edge.from.file == edge.to.file
+            || edge.from.file.as_os_str().is_empty()
+            || edge.to.file.as_os_str().is_empty()
+        {
             continue;
         }
         adjacency
@@ -742,7 +819,7 @@ pub fn plan_incremental_impact(
             }
         }
         for node in new_nodes {
-            if escalated.contains(&node.language) {
+            if escalated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
                 executed.insert(node.id.file.clone());
             }
         }
@@ -780,7 +857,7 @@ pub fn plan_incremental_impact(
     {
         escalated.extend(planned_languages);
         for node in new_nodes {
-            if escalated.contains(&node.language) {
+            if escalated.contains(&node.language) && !node.id.file.as_os_str().is_empty() {
                 executed.insert(node.id.file.clone());
             }
         }
@@ -822,6 +899,117 @@ pub fn write_execution(repo_root: &Path, execution: &StructuralCacheExecution) -
     fs::write(&temporary, bytes)?;
     fs::rename(&temporary, &path)?;
     Ok(())
+}
+
+pub fn build_execution(
+    repo_root: &Path,
+    authorization: &VerifiedStructuralCacheAuthorization,
+    plan: &IncrementalImpactPlan,
+    validations: &[crate::extract::scan_stats::LspValidationEvidence],
+    execution_job_id: Option<String>,
+) -> Result<StructuralCacheExecution> {
+    let changed_paths = authorization
+        .authorization
+        .changed_paths
+        .iter()
+        .chain(authorization.authorization.added_paths.iter())
+        .chain(authorization.authorization.deleted_paths.iter())
+        .map(PathBuf::from)
+        .chain(
+            authorization
+                .authorization
+                .renamed_paths
+                .iter()
+                .flat_map(|rename| [PathBuf::from(&rename[0]), PathBuf::from(&rename[1])]),
+        )
+        .collect::<BTreeSet<_>>();
+    let base_producers = authorization
+        .inherited_by_path
+        .values()
+        .flat_map(|file| file.producer_work_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let executed_records = crate::extract::lsp::work_items::load_all_records(repo_root)?
+        .into_iter()
+        .filter(|record| {
+            plan.executed_paths.contains(Path::new(&record.file))
+                && !base_producers.contains(&format!("{}:{}", record.job_id, record.item_id))
+                && record.state == crate::extract::lsp::work_items::LspWorkItemState::Completed
+        })
+        .collect::<Vec<_>>();
+    let executed_graph_enrichment_operation_count = executed_records
+        .iter()
+        .map(|record| record.requested_operations.len() as u64)
+        .sum();
+    let executed_producer_work_ids = executed_records
+        .iter()
+        .map(|record| format!("{}:{}", record.job_id, record.item_id))
+        .collect();
+
+    Ok(StructuralCacheExecution {
+        schema_version: STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
+        offline_preprocessing: true,
+        base_archive_sha256: authorization.authorization.base_archive_sha256.clone(),
+        base_sidecar_sha256: authorization.authorization.base_sidecar_sha256.clone(),
+        base_report_digest: authorization.authorization.base_report_digest.clone(),
+        target_commit: authorization.authorization.target_commit.clone(),
+        target_tree: authorization.authorization.target_tree.clone(),
+        inherited_paths: plan
+            .inherited_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        executed_paths: plan
+            .executed_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        invalidated_partitions: authorization.authorization.invalidated_partitions.clone(),
+        escalated_partitions: plan.escalated_partitions.iter().cloned().collect(),
+        changed_file_count: changed_paths.len() as u64,
+        invalidated_file_count: plan.executed_paths.difference(&changed_paths).count() as u64,
+        inherited_graph_enrichment_operation_count: plan
+            .inherited_paths
+            .iter()
+            .filter_map(|path| {
+                authorization
+                    .inherited_by_path
+                    .get(path.to_string_lossy().as_ref())
+            })
+            .map(|file| file.producer_graph_enrichment_operation_count)
+            .sum(),
+        executed_graph_enrichment_operation_count,
+        inherited_readiness_validation_request_count: authorization
+            .inherited_readiness_validation_request_count(&plan.inherited_paths)?,
+        executed_readiness_validation_request_count: validations
+            .iter()
+            .filter(|validation| validation.method.is_some())
+            .count() as u64,
+        executed_producer_work_ids,
+        closure_edge_count: plan.closure_edge_count as u64,
+        execution_job_id,
+        digest: String::new(),
+    })
+}
+
+pub fn execution_related_job_ids(execution: &StructuralCacheExecution) -> Result<Vec<String>> {
+    let mut related = execution
+        .execution_job_id
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for producer_id in &execution.executed_producer_work_ids {
+        let (job_id, item_id) = producer_id
+            .rsplit_once(':')
+            .with_context(|| format!("invalid structural-cache producer ID {producer_id}"))?;
+        item_id
+            .parse::<usize>()
+            .with_context(|| format!("invalid structural-cache producer ID {producer_id}"))?;
+        if job_id.is_empty() {
+            bail!("invalid structural-cache producer ID {producer_id}");
+        }
+        related.insert(job_id.to_string());
+    }
+    Ok(related.into_iter().collect())
 }
 
 pub fn load_execution(repo_root: &Path) -> Result<Option<StructuralCacheExecution>> {
@@ -1473,6 +1661,111 @@ mod tests {
     }
 
     #[test]
+    fn execution_related_jobs_include_enrichment_and_pass1_producers() {
+        let execution = StructuralCacheExecution {
+            schema_version: 1,
+            offline_preprocessing: true,
+            base_archive_sha256: "a".repeat(64),
+            base_sidecar_sha256: "b".repeat(64),
+            base_report_digest: "report".to_string(),
+            target_commit: "c".repeat(40),
+            target_tree: "d".repeat(40),
+            inherited_paths: Vec::new(),
+            executed_paths: vec!["src/a.py".to_string()],
+            invalidated_partitions: vec!["python".to_string()],
+            escalated_partitions: Vec::new(),
+            changed_file_count: 1,
+            invalidated_file_count: 0,
+            inherited_graph_enrichment_operation_count: 0,
+            executed_graph_enrichment_operation_count: 2,
+            inherited_readiness_validation_request_count: 0,
+            executed_readiness_validation_request_count: 1,
+            executed_producer_work_ids: vec![
+                "lsp-pass1-b:1".to_string(),
+                "lsp-pass1-a:0".to_string(),
+                "lsp-pass1-a:2".to_string(),
+            ],
+            closure_edge_count: 0,
+            execution_job_id: Some("call_references-target".to_string()),
+            digest: String::new(),
+        };
+
+        assert_eq!(
+            execution_related_job_ids(&execution).unwrap(),
+            vec![
+                "call_references-target".to_string(),
+                "lsp-pass1-a".to_string(),
+                "lsp-pass1-b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn inherited_readiness_counts_are_exact_for_mixed_language_partitions() {
+        use crate::lsp_completeness::{
+            FileCoverageRecord, FileRole, FileTerminalStatus, PersistedResults,
+        };
+
+        let mut authorization = verified_authorization(
+            &[
+                ("src/a.py", "python"),
+                ("src/b.py", "python"),
+                ("src/lib.rs", "rust"),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let file = |path: &str, language: &str| FileCoverageRecord {
+            path: path.to_string(),
+            role: FileRole::Source,
+            language: Some(language.to_string()),
+            expected_server: None,
+            advertised_capabilities: Vec::new(),
+            requests_attempted: Vec::new(),
+            expected_results: BTreeSet::new(),
+            expected_result_ids: BTreeSet::new(),
+            persisted_results: PersistedResults::default(),
+            terminal_status: FileTerminalStatus::Processed { result_count: 0 },
+            exclusion: None,
+        };
+        authorization.base_report.files = vec![
+            file("src/a.py", "python"),
+            file("src/b.py", "python"),
+            file("src/lib.rs", "rust"),
+        ];
+        authorization
+            .base_report
+            .readiness_validation_requests_by_language =
+            BTreeMap::from([("python".to_string(), 3), ("rust".to_string(), 1)]);
+
+        assert_eq!(
+            authorization
+                .inherited_readiness_validation_request_count(&BTreeSet::from([
+                    PathBuf::from("src/a.py"),
+                    PathBuf::from("src/lib.rs"),
+                ]))
+                .unwrap(),
+            2,
+            "a partial Python partition inherits one file probe but not its workspace probe"
+        );
+        assert_eq!(
+            authorization
+                .inherited_readiness_validation_request_count(&BTreeSet::from([
+                    PathBuf::from("src/a.py"),
+                    PathBuf::from("src/b.py"),
+                    PathBuf::from("src/lib.rs"),
+                ]))
+                .unwrap(),
+            4,
+            "a wholly inherited partition also inherits its one non-file probe"
+        );
+    }
+
+    #[test]
     fn identical_target_reuses_every_authorized_structural_file() {
         let nodes = [
             node("src/a.py", "python"),
@@ -1547,6 +1840,48 @@ mod tests {
         );
         assert!(plan.inherited_paths.contains(Path::new("src/d.py")));
         assert!(!plan.escalated_partitions.contains("python"));
+    }
+
+    #[test]
+    fn pathless_external_lsp_endpoints_never_become_execution_paths() {
+        let local = node("src/parser.pyx", "cython");
+        let helper = node("src/helper.pyx", "cython");
+        let mut external_cython = node("", "cython");
+        external_cython.id.root = "external".to_string();
+        external_cython.source = ExtractionSource::Lsp;
+        let mut external_unknown = node("", "");
+        external_unknown.id.root = "external".to_string();
+        external_unknown.source = ExtractionSource::Lsp;
+        let nodes = [local, helper, external_cython, external_unknown];
+        let edges = [edge(&nodes[0], &nodes[2]), edge(&nodes[1], &nodes[3])];
+        let authorization = verified_authorization(
+            &[("src/helper.pyx", "cython")],
+            &[],
+            &["src/parser.pyx"],
+            &[],
+            &[],
+            &["cython"],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &edges, &nodes, &edges);
+
+        assert_eq!(
+            plan.executed_paths,
+            ["src/helper.pyx", "src/parser.pyx"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert!(plan.escalated_partitions.contains("cython"));
+        assert!(!plan.escalated_partitions.contains(""));
+        for path in &plan.executed_paths {
+            let path = path.to_str().expect("execution path must be UTF-8");
+            assert_eq!(
+                crate::lsp_completeness::normalize_repo_relative_path(path).as_deref(),
+                Ok(path)
+            );
+        }
     }
 
     #[test]

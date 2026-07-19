@@ -4,7 +4,7 @@
 //! appends results to the `EnrichmentResult`. The top-level `enrich()` orchestrates
 //! them in sequence: Pass 0 -> Pass 1 -> Pass 2 -> Pass 4 -> Pass 5 -> Pass 3.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -19,10 +19,7 @@ use super::policy::{
     LspDeclarationClass, LspQueryBudget, LspQueryOperation, LspQueryTelemetry,
     LspServerCapabilities,
 };
-use super::transport::{
-    PipelinedTransport, find_enclosing_symbol, find_enclosing_symbol_in_file, path_to_uri,
-    uri_to_relative_path,
-};
+use super::transport::{PipelinedTransport, path_to_uri, uri_to_relative_path};
 use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
@@ -35,13 +32,130 @@ const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Default)]
+struct EndpointLookupIndex {
+    functions_by_file_and_name: HashMap<PathBuf, HashMap<String, Vec<NodeId>>>,
+    enclosing_by_file: HashMap<PathBuf, EnclosingLineIndex>,
+}
+
+#[derive(Debug, Default)]
+struct EnclosingLineIndex {
+    changes: Vec<(usize, Option<NodeId>)>,
+}
+
+impl EnclosingLineIndex {
+    fn build(nodes: &[Node]) -> Self {
+        let indexed = nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.id.kind,
+                    NodeKind::Function
+                        | NodeKind::Impl
+                        | NodeKind::Struct
+                        | NodeKind::Trait
+                        | NodeKind::Enum
+                        | NodeKind::TypeAlias
+                        | NodeKind::Const
+                )
+            })
+            .map(|node| {
+                let line_end = node.line_end.max(node.line_start);
+                (
+                    line_end.saturating_sub(node.line_start),
+                    node.stable_id(),
+                    node.id.clone(),
+                    node.line_start,
+                    line_end,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut events = BTreeMap::<usize, (Vec<usize>, Vec<usize>)>::new();
+        for (index, (_, _, _, line_start, line_end)) in indexed.iter().enumerate() {
+            events.entry(*line_start).or_default().1.push(index);
+            if let Some(after_end) = line_end.checked_add(1) {
+                events.entry(after_end).or_default().0.push(index);
+            }
+        }
+
+        let mut active = BTreeSet::<(usize, String, usize)>::new();
+        let mut changes = Vec::new();
+        for (line, (removals, additions)) in events {
+            for index in removals {
+                active.remove(&(indexed[index].0, indexed[index].1.clone(), index));
+            }
+            for index in additions {
+                active.insert((indexed[index].0, indexed[index].1.clone(), index));
+            }
+            let selected = active
+                .iter()
+                .next()
+                .map(|(_, _, index)| indexed[*index].2.clone());
+            if changes
+                .last()
+                .is_none_or(|(_, previous)| previous != &selected)
+            {
+                changes.push((line, selected));
+            }
+        }
+        Self { changes }
+    }
+
+    fn resolve(&self, line: usize) -> Option<NodeId> {
+        let insertion = self
+            .changes
+            .partition_point(|(change_line, _)| *change_line <= line);
+        insertion
+            .checked_sub(1)
+            .and_then(|index| self.changes[index].1.clone())
+    }
+}
+
+impl EndpointLookupIndex {
+    fn build(nodes_by_file: &HashMap<PathBuf, Vec<Node>>) -> Self {
+        let mut functions_by_file_and_name = HashMap::new();
+        let mut enclosing_by_file = HashMap::new();
+        for (file, nodes) in nodes_by_file {
+            let mut functions = HashMap::<String, Vec<NodeId>>::new();
+            for node in nodes
+                .iter()
+                .filter(|node| node.id.kind == NodeKind::Function)
+            {
+                functions
+                    .entry(node.id.name.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+            for ids in functions.values_mut() {
+                ids.sort_by_key(NodeId::to_stable_id);
+                ids.dedup();
+            }
+            functions_by_file_and_name.insert(file.clone(), functions);
+            enclosing_by_file.insert(file.clone(), EnclosingLineIndex::build(nodes));
+        }
+        Self {
+            functions_by_file_and_name,
+            enclosing_by_file,
+        }
+    }
+
+    fn unique_function(&self, file: &Path, name: &str) -> Option<NodeId> {
+        let ids = self.functions_by_file_and_name.get(file)?.get(name)?;
+        (ids.len() == 1).then(|| ids[0].clone())
+    }
+
+    fn enclosing_symbol(&self, file: &Path, line: usize) -> Option<NodeId> {
+        self.enclosing_by_file.get(file)?.resolve(line)
+    }
+}
+
 fn resolve_or_materialize_call_hierarchy_endpoint(
     item: &serde_json::Value,
     endpoint: &str,
     root: &Path,
     local_root: &str,
     language: &str,
-    refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+    endpoint_index: &EndpointLookupIndex,
 ) -> Option<(NodeId, Option<Node>, Confidence)> {
     let endpoint = item.get(endpoint)?;
     let uri: lsp_types::Uri = endpoint.get("uri")?.as_str()?.parse().ok()?;
@@ -54,21 +168,21 @@ fn resolve_or_materialize_call_hierarchy_endpoint(
         .get("detail")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let line_start = endpoint["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
-    let line_end = endpoint["range"]["end"]["line"].as_u64().unwrap_or(0) as usize + 1;
+    let start_line = endpoint["range"]["start"]["line"].as_u64().unwrap_or(0);
+    let start_character = endpoint["range"]["start"]["character"]
+        .as_u64()
+        .unwrap_or(0);
+    let end_line = endpoint["range"]["end"]["line"].as_u64().unwrap_or(0);
+    let end_character = endpoint["range"]["end"]["character"].as_u64().unwrap_or(0);
+    let line_start = start_line as usize + 1;
+    let line_end = end_line as usize + 1;
+    let range_disambiguator = format!("{start_line}:{start_character}-{end_line}:{end_character}");
 
     if !path.is_absolute() {
-        let candidates = refs_by_file.get(&path).map(Vec::as_slice).unwrap_or(&[]);
-        let exact = candidates
-            .iter()
-            .filter(|node| node.id.name == name && node.id.kind == NodeKind::Function)
-            .map(|node| node.id.clone())
-            .collect::<Vec<_>>();
-        if exact.len() == 1 {
-            return Some((exact[0].clone(), None, Confidence::Confirmed));
+        if let Some(exact) = endpoint_index.unique_function(&path, name) {
+            return Some((exact, None, Confidence::Confirmed));
         }
-        let candidate_refs = candidates.iter().collect::<Vec<_>>();
-        if let Some(existing) = find_enclosing_symbol(&candidate_refs, &path, line_start) {
+        if let Some(existing) = endpoint_index.enclosing_symbol(&path, line_start) {
             return Some((existing, None, Confidence::Confirmed));
         }
 
@@ -76,11 +190,7 @@ fn resolve_or_materialize_call_hierarchy_endpoint(
         if base_name.is_empty() {
             return None;
         }
-        let node_name = if exact.is_empty() {
-            base_name.to_string()
-        } else {
-            format!("{base_name}@lsp:{line_start}")
-        };
+        let node_name = format!("{base_name}@lsp:{range_disambiguator}");
         let id = NodeId {
             root: local_root.to_string(),
             file: path,
@@ -116,7 +226,7 @@ fn resolve_or_materialize_call_hierarchy_endpoint(
     let id = NodeId {
         root: "external".to_string(),
         file: PathBuf::new(),
-        name: fqn.to_string(),
+        name: format!("{fqn}@lsp:{range_disambiguator}"),
         kind: NodeKind::Function,
     };
     let mut metadata = BTreeMap::new();
@@ -307,6 +417,16 @@ struct LspPass1WorkItem {
     node: Node,
     requested_operations: Vec<LspQueryOperation>,
     attempt_count: u32,
+}
+
+fn pass1_work_item_files(work_items: &[LspPass1WorkItem]) -> Vec<PathBuf> {
+    let mut files = work_items
+        .iter()
+        .map(|item| item.node.id.file.clone())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files.dedup();
+    files
 }
 
 #[derive(Debug)]
@@ -983,11 +1103,43 @@ impl LspEnricher {
             self.server_command.clone(),
             self.language.clone(),
         ));
+        // Send every document mutation before issuing any concurrent request.
+        // Some standards-compliant servers cancel outstanding requests when a
+        // later didOpen changes workspace state. Lazy per-worker opens therefore
+        // make unrelated file requests race each other. Pre-opening the bounded,
+        // deterministic file set preserves pipelined query concurrency without
+        // interleaving mutations and requests.
+        for rel_path in pass1_work_item_files(&work_items) {
+            if tokio::time::Instant::now() >= job_deadline {
+                break;
+            }
+            let file_uri = match path_to_uri(&root.join(&rel_path)) {
+                Ok(uri) => uri,
+                Err(error) => {
+                    tracing::warn!(
+                        "LSP Pass 1 pre-open skipped {} after URI failure: {}",
+                        rel_path.display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = did_open
+                .ensure_open(transport, root, &rel_path, &file_uri)
+                .await
+            {
+                // The owning work item retries through the same coordinator so
+                // the durable ledger, error accounting, and fail-closed behavior
+                // remain unchanged.
+                tracing::warn!("LSP Pass 1 pre-open failed: {error}");
+            }
+        }
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
         let matching_owned = Arc::clone(matching_nodes_owned);
         let refs_by_file = Arc::clone(refs_by_file_shared);
+        let endpoint_index = Arc::new(EndpointLookupIndex::build(refs_by_file_shared));
         let worker_telemetry = Arc::clone(telemetry);
         let (total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
@@ -998,6 +1150,7 @@ impl LspEnricher {
                 let root = root.clone();
                 let matching_owned = Arc::clone(&matching_owned);
                 let refs_by_file = Arc::clone(&refs_by_file);
+                let endpoint_index = Arc::clone(&endpoint_index);
                 let language = language.clone();
                 let error_count = Arc::clone(&error_count);
                 let did_open = Arc::clone(&did_open);
@@ -1031,6 +1184,7 @@ impl LspEnricher {
                         &root,
                         &matching_owned,
                         &refs_by_file,
+                        &endpoint_index,
                         &language,
                         &did_open,
                         &diagnostics,
@@ -1253,6 +1407,7 @@ impl LspEnricher {
         root: &Path,
         matching_owned: &Arc<Vec<Node>>,
         refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        endpoint_index: &EndpointLookupIndex,
         language: &str,
         did_open: &DidOpenCoordinator,
         diagnostics: &LspPass1Diagnostics,
@@ -1349,7 +1504,7 @@ impl LspEnricher {
                         line,
                         col,
                         node,
-                        refs_by_file,
+                        endpoint_index,
                         root,
                         language,
                         operation == Some(LspQueryOperation::References),
@@ -1386,7 +1541,7 @@ impl LspEnricher {
                             line,
                             col,
                             node,
-                            matching_owned,
+                            endpoint_index,
                             root,
                             item.id,
                             telemetry,
@@ -1416,7 +1571,7 @@ impl LspEnricher {
                             line,
                             col,
                             node,
-                            refs_by_file,
+                            endpoint_index,
                             root,
                             operation,
                             item.id,
@@ -1478,7 +1633,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         language: &str,
         has_references: bool,
@@ -1515,10 +1670,7 @@ impl LspEnricher {
                         observation.result_count += 1;
 
                         let referrer_id =
-                            refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
-                                let refs: Vec<&Node> = candidates.iter().collect();
-                                find_enclosing_symbol(&refs, &ref_path, ref_line)
-                            });
+                            endpoint_index.enclosing_symbol(ref_path.as_path(), ref_line);
 
                         if let Some(referrer) = referrer_id {
                             if referrer == node.id {
@@ -1567,7 +1719,7 @@ impl LspEnricher {
                                         root,
                                         &node.id.root,
                                         language,
-                                        refs_by_file,
+                                        endpoint_index,
                                     )
                                 else {
                                     continue;
@@ -1609,7 +1761,7 @@ impl LspEnricher {
                                         root,
                                         &node.id.root,
                                         language,
-                                        refs_by_file,
+                                        endpoint_index,
                                     )
                                 else {
                                     continue;
@@ -1717,7 +1869,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_owned: &Arc<Vec<Node>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
@@ -1733,14 +1885,6 @@ impl LspEnricher {
         match Self::find_references_p(transport, file_uri, line, col).await {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
-                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
-                for n in &matching_refs {
-                    refs_by_file
-                        .entry(n.id.file.as_path())
-                        .or_default()
-                        .push(*n);
-                }
                 for loc in &locations {
                     let ref_path = uri_to_relative_path(&loc.uri, root);
                     let ref_line = loc.range.start.line as usize + 1;
@@ -1757,9 +1901,7 @@ impl LspEnricher {
                     }
                     observation.result_count += 1;
 
-                    let referrer_id = refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
-                        find_enclosing_symbol(candidates, &ref_path, ref_line)
-                    });
+                    let referrer_id = endpoint_index.enclosing_symbol(ref_path.as_path(), ref_line);
 
                     if let Some(referrer) = referrer_id {
                         if referrer == node.id {
@@ -1906,7 +2048,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+        endpoint_index: &EndpointLookupIndex,
         root: &Path,
         operation: LspQueryOperation,
         work_item_id: usize,
@@ -1936,9 +2078,8 @@ impl LspEnricher {
                     observation.result_count += 1;
                     let target_path = uri_to_relative_path(&location.uri, root);
                     let target_line = location.range.start.line as usize + 1;
-                    let target = refs_by_file
-                        .get(&target_path)
-                        .and_then(|nodes| find_enclosing_symbol_in_file(nodes, target_line))
+                    let target = endpoint_index
+                        .enclosing_symbol(&target_path, target_line)
                         .unwrap_or_else(|| NodeId {
                             root: node.id.root.clone(),
                             file: target_path.clone(),
@@ -2406,14 +2547,28 @@ mod tests {
         name: &str,
         detail: &str,
     ) -> serde_json::Value {
+        call_hierarchy_item_at(endpoint, uri, name, detail, 7, 0, 9, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_hierarchy_item_at(
+        endpoint: &str,
+        uri: &str,
+        name: &str,
+        detail: &str,
+        start_line: u64,
+        start_character: u64,
+        end_line: u64,
+        end_character: u64,
+    ) -> serde_json::Value {
         serde_json::json!({
             endpoint: {
                 "uri": uri,
                 "name": name,
                 "detail": detail,
                 "range": {
-                    "start": { "line": 7, "character": 0 },
-                    "end": { "line": 9, "character": 1 }
+                    "start": { "line": start_line, "character": start_character },
+                    "end": { "line": end_line, "character": end_character }
                 }
             }
         })
@@ -2437,6 +2592,7 @@ mod tests {
             source: ExtractionSource::TreeSitter,
         };
         let refs = HashMap::from([(existing.id.file.clone(), vec![existing.clone()])]);
+        let endpoint_index = EndpointLookupIndex::build(&refs);
         let item = call_hierarchy_item(
             "from",
             "file:///tmp/rna-call-hierarchy/src/caller.py",
@@ -2450,7 +2606,7 @@ mod tests {
             Path::new("/tmp/rna-call-hierarchy"),
             "repo",
             "python",
-            &refs,
+            &endpoint_index,
         )
         .expect("existing endpoint must resolve");
 
@@ -2467,6 +2623,7 @@ mod tests {
             "generated_target",
             "module.generated_target",
         );
+        let endpoint_index = EndpointLookupIndex::default();
         let resolve = || {
             resolve_or_materialize_call_hierarchy_endpoint(
                 &item,
@@ -2474,7 +2631,7 @@ mod tests {
                 Path::new("/tmp/rna-call-hierarchy"),
                 "repo",
                 "python",
-                &HashMap::new(),
+                &endpoint_index,
             )
             .expect("valid local endpoint must materialize")
         };
@@ -2485,7 +2642,7 @@ mod tests {
 
         assert_eq!(first_id, second_id);
         assert_eq!(first_id.file, PathBuf::from("src/generated.py"));
-        assert_eq!(first_id.name, "generated_target");
+        assert_eq!(first_id.name, "generated_target@lsp:7:0-9:1");
         assert_eq!(confidence, Confidence::Detected);
         assert_eq!(first_node.source, ExtractionSource::Lsp);
         assert_eq!(
@@ -2505,20 +2662,21 @@ mod tests {
             "target",
             "pkg.api.target",
         );
+        let endpoint_index = EndpointLookupIndex::default();
         let (id, node, confidence) = resolve_or_materialize_call_hierarchy_endpoint(
             &item,
             "to",
             Path::new("/tmp/rna-call-hierarchy"),
             "repo",
             "python",
-            &HashMap::new(),
+            &endpoint_index,
         )
         .expect("valid external endpoint must materialize");
         let node = node.expect("external endpoint must produce a node");
 
         assert_eq!(id.root, "external");
         assert!(id.file.as_os_str().is_empty());
-        assert_eq!(id.name, "pkg.api.target");
+        assert_eq!(id.name, "pkg.api.target@lsp:7:0-9:1");
         assert_eq!(confidence, Confidence::Detected);
         assert!(!id.to_stable_id().contains("/opt/venv"));
         assert_eq!(
@@ -2528,6 +2686,118 @@ mod tests {
         assert_eq!(
             node.metadata.get("external").map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn same_name_unresolved_endpoints_use_range_disambiguators() {
+        let index = EndpointLookupIndex::default();
+        let local_first = call_hierarchy_item_at(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+            7,
+            0,
+            9,
+            1,
+        );
+        let local_second = call_hierarchy_item_at(
+            "to",
+            "file:///tmp/rna-call-hierarchy/src/generated.py",
+            "generated_target",
+            "module.generated_target",
+            17,
+            2,
+            19,
+            3,
+        );
+        let external_first = call_hierarchy_item_at(
+            "to",
+            "file:///opt/venv/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+            3,
+            0,
+            4,
+            1,
+        );
+        let external_second = call_hierarchy_item_at(
+            "to",
+            "file:///opt/venv/site-packages/pkg/api.py",
+            "target",
+            "pkg.api.target",
+            13,
+            4,
+            14,
+            5,
+        );
+        let resolve = |item: &serde_json::Value| {
+            resolve_or_materialize_call_hierarchy_endpoint(
+                item,
+                "to",
+                Path::new("/tmp/rna-call-hierarchy"),
+                "repo",
+                "python",
+                &index,
+            )
+            .expect("valid unresolved endpoint must materialize")
+            .0
+        };
+
+        let local_first = resolve(&local_first);
+        let local_second = resolve(&local_second);
+        let external_first = resolve(&external_first);
+        let external_second = resolve(&external_second);
+        assert_ne!(local_first, local_second);
+        assert_ne!(external_first, external_second);
+        assert_eq!(local_first.name, "generated_target@lsp:7:0-9:1");
+        assert_eq!(local_second.name, "generated_target@lsp:17:2-19:3");
+        assert_eq!(external_first.name, "pkg.api.target@lsp:3:0-4:1");
+        assert_eq!(external_second.name, "pkg.api.target@lsp:13:4-14:5");
+    }
+
+    #[test]
+    fn endpoint_lookup_index_resolves_narrowest_enclosing_symbol() {
+        let make_node = |name: &str, kind: NodeKind, start: usize, end: usize| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/nested.py"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "python".to_string(),
+            line_start: start,
+            line_end: end,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let outer = make_node("Outer", NodeKind::Struct, 1, 20);
+        let inner = make_node("inner", NodeKind::Function, 5, 10);
+        let nodes = HashMap::from([(
+            PathBuf::from("src/nested.py"),
+            vec![outer.clone(), inner.clone()],
+        )]);
+        let index = EndpointLookupIndex::build(&nodes);
+
+        assert_eq!(
+            index.enclosing_symbol(Path::new("src/nested.py"), 7),
+            Some(inner.id)
+        );
+        assert_eq!(
+            index.enclosing_symbol(Path::new("src/nested.py"), 15),
+            Some(outer.id)
+        );
+        assert_eq!(
+            index.unique_function(Path::new("src/nested.py"), "inner"),
+            Some(NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/nested.py"),
+                name: "inner".to_string(),
+                kind: NodeKind::Function,
+            })
         );
     }
 
@@ -2625,6 +2895,43 @@ mod tests {
             LspQueryOperation::DocumentLinks,
             &mut seen,
         ));
+    }
+
+    #[test]
+    fn pass1_preopen_files_are_deterministic_and_deduplicated() {
+        let item = |id: usize, file: &str, operation| LspPass1WorkItem {
+            id,
+            node: Node {
+                id: NodeId {
+                    root: "repo".to_string(),
+                    file: PathBuf::from(file),
+                    name: format!("symbol-{id}"),
+                    kind: NodeKind::Function,
+                },
+                language: "python".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: String::new(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            },
+            requested_operations: vec![operation],
+            attempt_count: 1,
+        };
+        let work_items = vec![
+            item(0, "tests/test_app.py", LspQueryOperation::DocumentSymbols),
+            item(1, "src/app.py", LspQueryOperation::CallHierarchy),
+            item(2, "src/app.py", LspQueryOperation::DocumentSymbols),
+        ];
+
+        assert_eq!(
+            pass1_work_item_files(&work_items),
+            [
+                PathBuf::from("src/app.py"),
+                PathBuf::from("tests/test_app.py")
+            ]
+        );
     }
 
     #[tokio::test]

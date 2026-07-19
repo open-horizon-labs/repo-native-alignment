@@ -19,8 +19,8 @@ use tokio::sync::Mutex;
 
 use lsp_types::Uri;
 
-use crate::graph::Node;
-use crate::graph::{NodeId, NodeKind};
+#[cfg(test)]
+use crate::graph::{Node, NodeId, NodeKind};
 
 // ---------------------------------------------------------------------------
 // URI helpers
@@ -48,12 +48,12 @@ pub(super) fn path_to_uri(path: &Path) -> Result<Uri> {
         encoded_path,
         &file_url[url::Position::AfterPath..]
     );
-    Uri::from_str(&uri_string)
-        .map_err(|e| anyhow::anyhow!("Invalid URI {}: {}", uri_string, e))
+    Uri::from_str(&uri_string).map_err(|e| anyhow::anyhow!("Invalid URI {}: {}", uri_string, e))
 }
 
 /// Find the narrowest enclosing function/impl/struct at a given file + line.
 /// Returns None if no symbol contains this location.
+#[cfg(test)]
 pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<NodeId> {
     let file_matches: Vec<_> = nodes.iter().filter(|n| n.id.file == file).collect();
 
@@ -92,30 +92,6 @@ pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -
         .filter(|n| n.line_start <= line && n.line_end >= line)
         .min_by_key(|n| n.line_end - n.line_start)
         .map(|n| n.id.clone())
-}
-
-/// Find the narrowest enclosing symbol in a pre-indexed, single-file node set.
-///
-/// The Pass 1 file index keeps these nodes ordered by increasing source span, so
-/// the first containing symbol is the same narrowest match as
-/// [`find_enclosing_symbol`] without rescanning every node in the graph.
-pub(super) fn find_enclosing_symbol_in_file(nodes: &[Node], line: usize) -> Option<NodeId> {
-    nodes
-        .iter()
-        .filter(|node| {
-            matches!(
-                node.id.kind,
-                NodeKind::Function
-                    | NodeKind::Impl
-                    | NodeKind::Struct
-                    | NodeKind::Trait
-                    | NodeKind::Enum
-                    | NodeKind::TypeAlias
-                    | NodeKind::Const
-            )
-        })
-        .find(|node| node.line_start <= line && node.line_end >= line)
-        .map(|node| node.id.clone())
 }
 
 /// Extract a relative file path from an LSP URI, relative to a given root.
@@ -206,6 +182,8 @@ pub(super) struct LspTransport {
     pub(super) child: Child,
     pub(super) reader: BufReader<tokio::process::ChildStdout>,
     pub(super) next_id: i64,
+    workspace_folder: serde_json::Value,
+    workspace_configuration: serde_json::Value,
     stderr_tail: Arc<std::sync::Mutex<VecDeque<u8>>>,
     stderr_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -213,6 +191,13 @@ pub(super) struct LspTransport {
 impl LspTransport {
     /// Spawn a language server process and set up the transport.
     pub(super) async fn spawn(command: &str, args: &[String], root_path: &Path) -> Result<Self> {
+        let workspace_folder = serde_json::json!({
+            "uri": path_to_uri(root_path)?.to_string(),
+            "name": root_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace"),
+        });
         let mut child = Command::new(command)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -246,6 +231,8 @@ impl LspTransport {
             child,
             reader,
             next_id: 1,
+            workspace_folder,
+            workspace_configuration: serde_json::json!({}),
             stderr_tail,
             stderr_handle: Some(stderr_handle),
         })
@@ -310,6 +297,29 @@ impl LspTransport {
         Ok(())
     }
 
+    pub(super) fn set_workspace_configuration(&mut self, configuration: serde_json::Value) {
+        self.workspace_configuration = configuration;
+    }
+
+    /// Respond to standard server-to-client requests that RNA declares support for.
+    ///
+    /// Dropping these messages can deadlock a server while the client waits for an
+    /// unrelated response. In particular, Cyright requests workspace configuration
+    /// after `initialized` and will not answer document-symbol requests until the
+    /// client responds.
+    pub(super) async fn respond_to_server_request(
+        &mut self,
+        msg: &serde_json::Value,
+    ) -> Result<bool> {
+        let Some(response) =
+            server_request_response(msg, &self.workspace_folder, &self.workspace_configuration)
+        else {
+            return Ok(false);
+        };
+        self.send_message(&response).await?;
+        Ok(true)
+    }
+
     /// Read LSP messages until we find the response with the given ID.
     /// Discards notifications and other messages along the way.
     async fn read_response(&mut self, expected_id: i64) -> Result<serde_json::Value> {
@@ -319,6 +329,7 @@ impl LspTransport {
             // Check if this is our response
             if let Some(id) = msg.get("id")
                 && id.as_i64() == Some(expected_id)
+                && msg.get("method").is_none()
             {
                 if let Some(error) = msg.get("error") {
                     return Err(LspRpcError {
@@ -341,7 +352,11 @@ impl LspTransport {
                     .unwrap_or(serde_json::Value::Null));
             }
 
-            // Otherwise it's a notification or a response to a different request -- skip it
+            if self.respond_to_server_request(&msg).await? {
+                continue;
+            }
+
+            // Otherwise it's a notification or a response to a different request -- skip it.
         }
     }
 
@@ -388,6 +403,76 @@ impl LspTransport {
     }
 }
 
+fn server_request_result(
+    method: &str,
+    msg: &serde_json::Value,
+    workspace_folder: &serde_json::Value,
+    workspace_configuration: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match method {
+        "workspace/configuration" => {
+            let items = msg
+                .pointer("/params/items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            Some(serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| {
+                        let Some(section) = item
+                            .get("section")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|section| !section.is_empty())
+                        else {
+                            return workspace_configuration.clone();
+                        };
+                        section
+                            .split('.')
+                            .try_fold(workspace_configuration, |value, key| value.get(key))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect(),
+            ))
+        }
+        "workspace/workspaceFolders" => Some(serde_json::json!([workspace_folder.clone()])),
+        "client/registerCapability"
+        | "client/unregisterCapability"
+        | "window/workDoneProgress/create" => Some(serde_json::Value::Null),
+        _ => None,
+    }
+}
+
+fn server_request_response(
+    msg: &serde_json::Value,
+    workspace_folder: &serde_json::Value,
+    workspace_configuration: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let id = msg.get("id")?.clone();
+    let method = msg.get("method")?.as_str()?;
+    Some(
+        if let Some(result) =
+            server_request_result(method, msg, workspace_folder, workspace_configuration)
+        {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            })
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("Method not found: {method}"),
+                },
+            })
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Pipelined LSP transport (concurrent JSON-RPC requests)
 // ---------------------------------------------------------------------------
@@ -400,7 +485,7 @@ impl LspTransport {
 /// and returns a future that resolves when the matching response arrives.
 pub(super) struct PipelinedTransport {
     /// Writer half (stdin), protected by a mutex for serialized writes.
-    writer: Mutex<tokio::process::ChildStdin>,
+    writer: Arc<Mutex<tokio::process::ChildStdin>>,
     /// Monotonically increasing request ID counter.
     next_id: AtomicI64,
     /// Map of pending request IDs to their response channels.
@@ -446,8 +531,11 @@ impl PipelinedTransport {
         let stdin = transport.child.stdin.take().expect("stdin already taken");
         let reader = transport.reader;
         let next_id = transport.next_id;
+        let workspace_folder = transport.workspace_folder.clone();
+        let workspace_configuration = transport.workspace_configuration.clone();
         let stderr_tail = Arc::clone(&transport.stderr_tail);
         let stderr_handle = transport.stderr_handle.take();
+        let writer = Arc::new(Mutex::new(stdin));
 
         let pending: Arc<
             std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
@@ -458,12 +546,22 @@ impl PipelinedTransport {
         let pending_clone = Arc::clone(&pending);
         let diag_clone = Arc::clone(&diagnostics_sink);
         let quiescent_clone = Arc::clone(&quiescent_flag);
+        let writer_clone = Arc::clone(&writer);
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(reader, pending_clone, diag_clone, quiescent_clone).await;
+            Self::reader_loop(
+                reader,
+                writer_clone,
+                pending_clone,
+                diag_clone,
+                quiescent_clone,
+                workspace_folder,
+                workspace_configuration,
+            )
+            .await;
         });
 
         Self {
-            writer: Mutex::new(stdin),
+            writer,
             next_id: AtomicI64::new(next_id),
             pending,
             diagnostics_sink,
@@ -483,11 +581,14 @@ impl PipelinedTransport {
     /// is received — allowing later `enrich()` calls to proceed after RA finishes indexing.
     async fn reader_loop(
         mut reader: BufReader<tokio::process::ChildStdout>,
+        writer: Arc<Mutex<tokio::process::ChildStdin>>,
         pending: Arc<
             std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
         >,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
         quiescent_flag: Arc<AtomicBool>,
+        workspace_folder: serde_json::Value,
+        workspace_configuration: serde_json::Value,
     ) {
         loop {
             // Read a single Content-Length framed message
@@ -507,6 +608,18 @@ impl PipelinedTransport {
                 }
             };
 
+            if let Some(response) =
+                server_request_response(&msg, &workspace_folder, &workspace_configuration)
+            {
+                if let Err(error) = Self::write_message(&writer, &response).await {
+                    tracing::debug!(
+                        "PipelinedTransport failed to answer server request: {}",
+                        error
+                    );
+                }
+                continue;
+            }
+
             // Check if this is a response (has "id" field and no "method" field)
             if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
                 if msg.get("method").is_none() {
@@ -524,19 +637,6 @@ impl PipelinedTransport {
                         let _ = sender.send(result);
                     }
                     continue;
-                }
-                // It has both "id" and "method" — it's a server-to-client *request*
-                // (e.g. window/workDoneProgress/create). We need to respond.
-                if let Some(method) = msg.get("method").and_then(|m| m.as_str())
-                    && method == "window/workDoneProgress/create"
-                {
-                    // We can't write back from the reader loop without the writer.
-                    // These are non-critical during enrichment; log and skip.
-                    tracing::debug!(
-                        "PipelinedTransport: ignoring server request {} (id={})",
-                        method,
-                        id
-                    );
                 }
             }
 
@@ -639,6 +739,19 @@ impl PipelinedTransport {
         Ok(msg)
     }
 
+    async fn write_message(
+        writer: &Mutex<tokio::process::ChildStdin>,
+        message: &serde_json::Value,
+    ) -> Result<()> {
+        let body = serde_json::to_string(message)?;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut writer = writer.lock().await;
+        writer.write_all(header.as_bytes()).await?;
+        writer.write_all(body.as_bytes()).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
     /// Send a JSON-RPC request and return a future that resolves with the response.
     /// This is `&self` — multiple concurrent requests are supported.
     pub(super) async fn request<P: serde::Serialize>(
@@ -663,14 +776,7 @@ impl PipelinedTransport {
         }
 
         // Send the request
-        {
-            let body = serde_json::to_string(&request)?;
-            let header = format!("Content-Length: {}\r\n\r\n", body.len());
-            let mut writer = self.writer.lock().await;
-            writer.write_all(header.as_bytes()).await?;
-            writer.write_all(body.as_bytes()).await?;
-            writer.flush().await?;
-        }
+        Self::write_message(&self.writer, &request).await?;
 
         // Wait for the response with timeout.
         // 30s timeout for pipelined enrichment requests. The old 5s timeout
@@ -705,13 +811,7 @@ impl PipelinedTransport {
             "method": method,
             "params": params,
         });
-        let body = serde_json::to_string(&notification)?;
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
-        let mut writer = self.writer.lock().await;
-        writer.write_all(header.as_bytes()).await?;
-        writer.write_all(body.as_bytes()).await?;
-        writer.flush().await?;
-        Ok(())
+        Self::write_message(&self.writer, &notification).await
     }
 }
 
@@ -726,6 +826,206 @@ impl Drop for PipelinedTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_server_requests_receive_protocol_responses() {
+        let folder = serde_json::json!({
+            "uri": "file:///tmp/workspace",
+            "name": "workspace",
+        });
+        let request = serde_json::json!({
+            "id": 1,
+            "method": "workspace/configuration",
+            "params": {"items": [
+                {"section": "python.analysis"},
+                {"section": "cython.analysis.enabled"},
+                {"section": "missing.section"},
+                {}
+            ]},
+        });
+        let configuration = serde_json::json!({
+            "python": {"analysis": {"diagnosticMode": "openFilesOnly"}},
+            "cython": {"analysis": {"enabled": true}},
+        });
+        assert_eq!(
+            server_request_result("workspace/configuration", &request, &folder, &configuration,),
+            Some(serde_json::json!([
+                {"diagnosticMode": "openFilesOnly"},
+                true,
+                null,
+                configuration,
+            ]))
+        );
+        assert_eq!(
+            server_request_result(
+                "workspace/workspaceFolders",
+                &serde_json::json!({}),
+                &folder,
+                &serde_json::json!({}),
+            ),
+            Some(serde_json::json!([folder]))
+        );
+        assert_eq!(
+            server_request_result(
+                "window/workDoneProgress/create",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+            ),
+            Some(serde_json::Value::Null)
+        );
+        assert_eq!(
+            server_request_result(
+                "workspace/unknown",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+            ),
+            None
+        );
+        assert_eq!(
+            server_request_response(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "unsupported",
+                    "method": "workspace/unknown",
+                }),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+            ),
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "unsupported",
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found: workspace/unknown",
+                },
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_transport_answers_server_requests_after_initialization() {
+        let root = tempfile::tempdir().unwrap();
+        let server = root.path().join("fixture_lsp.py");
+        std::fs::write(
+            &server,
+            r#"
+import json
+import sys
+
+def receive():
+    content_length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            raise EOFError("client closed")
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode("ascii").split(":", 1)
+        if key.lower() == "content-length":
+            content_length = int(value.strip())
+    return json.loads(sys.stdin.buffer.read(content_length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+initialize = receive()
+send({"jsonrpc": "2.0", "id": initialize["id"], "result": {"capabilities": {}}})
+assert receive()["method"] == "initialized"
+trigger = receive()
+
+send({
+    "jsonrpc": "2.0",
+    "id": "configuration",
+    "method": "workspace/configuration",
+    "params": {"items": [
+        {"section": "python.analysis"},
+        {"section": "cython.analysis.enabled"},
+        {"section": "missing"},
+    ]},
+})
+configuration = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": "folders",
+    "method": "workspace/workspaceFolders",
+    "params": None,
+})
+folders = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": "unsupported",
+    "method": "fixture/unsupported",
+    "params": None,
+})
+unsupported = receive()
+
+send({
+    "jsonrpc": "2.0",
+    "id": trigger["id"],
+    "result": {
+        "configuration": configuration,
+        "folders": folders,
+        "unsupported": unsupported,
+    },
+})
+"#,
+        )
+        .unwrap();
+
+        let mut sequential = LspTransport::spawn(
+            "python3",
+            &[server.to_string_lossy().into_owned()],
+            root.path(),
+        )
+        .await
+        .unwrap();
+        sequential.set_workspace_configuration(serde_json::json!({
+            "python": {"analysis": {"diagnosticMode": "openFilesOnly"}},
+            "cython": {"analysis": {"enabled": true}},
+        }));
+        sequential
+            .request("initialize", serde_json::json!({}))
+            .await
+            .unwrap();
+        sequential
+            .notify("initialized", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let pipelined = PipelinedTransport::from_sequential_with_diag_sink(
+            sequential,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            true,
+        );
+        let result = pipelined
+            .request("fixture/trigger", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.pointer("/configuration/result"),
+            Some(&serde_json::json!([
+                {"diagnosticMode": "openFilesOnly"},
+                true,
+                null,
+            ]))
+        );
+        assert_eq!(
+            result.pointer("/folders/result/0/uri"),
+            Some(&serde_json::json!(
+                path_to_uri(root.path()).unwrap().to_string()
+            ))
+        );
+        assert_eq!(
+            result.pointer("/unsupported/error/code"),
+            Some(&serde_json::json!(-32601))
+        );
+    }
 
     #[test]
     fn path_to_uri_percent_encodes_cohort_special_paths() {

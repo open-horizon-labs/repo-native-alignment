@@ -10,8 +10,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
-from unittest import mock
+import unittest.mock as mock
 from pathlib import Path
 
 
@@ -110,6 +111,54 @@ class SwebenchLspToolchainTests(unittest.TestCase):
 
             self.assertEqual(completed.stdout, "lemminx 0.3.0\n")
             self.assertEqual(completed.stderr, "")
+
+    def test_operation_capabilities_preserve_actual_negotiated_providers(self) -> None:
+        text_document_client = TOOLCHAIN._probe_client_capabilities()[
+            "textDocument"
+        ]
+        self.assertEqual(
+            text_document_client["definition"], {"dynamicRegistration": False}
+        )
+        self.assertEqual(
+            text_document_client["references"], {"dynamicRegistration": False}
+        )
+        self.assertEqual(
+            text_document_client["callHierarchy"],
+            {"dynamicRegistration": False},
+        )
+        capabilities = {
+            "documentSymbolProvider": {"label": "symbols"},
+            "definitionProvider": True,
+            "referencesProvider": {"workDoneProgress": True},
+            "callHierarchyProvider": {},
+            "codeActionProvider": False,
+        }
+        evidence = TOOLCHAIN._operation_capability_evidence(capabilities)
+        self.assertEqual(
+            TOOLCHAIN._operation_capabilities(capabilities),
+            [
+                "textDocument/documentSymbol",
+                "textDocument/definition",
+                "textDocument/references",
+                "textDocument/prepareCallHierarchy",
+                "callHierarchy/incomingCalls",
+                "callHierarchy/outgoingCalls",
+            ],
+        )
+        by_provider = {record["provider"]: record for record in evidence}
+        self.assertEqual(
+            by_provider["documentSymbolProvider"]["advertised_value"],
+            {"label": "symbols"},
+        )
+        self.assertEqual(
+            by_provider["callHierarchyProvider"]["methods"],
+            [
+                "textDocument/prepareCallHierarchy",
+                "callHierarchy/incomingCalls",
+                "callHierarchy/outgoingCalls",
+            ],
+        )
+        self.assertFalse(by_provider["codeActionProvider"]["supported"])
 
     def test_failed_case_evidence_survives_ephemeral_checkout_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -214,9 +263,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-c",
-                        "import subprocess,time; "
-                        "subprocess.Popen([\"sleep\",\"30\"]); "
-                        "print(\"started\", flush=True); time.sleep(30)",
+                        "import subprocess,time; subprocess.Popen([\"sleep\",\"30\"]); print(\"started\", flush=True); time.sleep(30)",
                     ],
                     root,
                     dict(os.environ),
@@ -339,10 +386,28 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             artifact.write_bytes(b"locked artifact")
             parser_artifact = cache / "parser.tgz"
             parser_artifact.write_bytes(b"locked parser")
+            parser_source = root / "fixture.py"
+            parser_source.write_text("#!/usr/bin/env python3\n")
             entry = self.lock_entry(
-                artifact_sha256=TOOLCHAIN.sha256_file(artifact), languages=["python"]
+                artifact_sha256=TOOLCHAIN.sha256_file(parser_artifact),
+                languages=["python"],
+            )
+            entry["artifact"] = "parser.tgz"
+            acquisition = self.write_repo_acquisition_contract(
+                root,
+                artifact="parser.tgz",
+                artifact_sha256=TOOLCHAIN.sha256_file(parser_artifact),
+                root_name="fixture-parser",
+                sources=[
+                    {
+                        "path": "fixture.py",
+                        "sha256": TOOLCHAIN.sha256_file(parser_source),
+                        "destination": "fixture-server",
+                    }
+                ],
             )
             lock = {
+                "acquisition": acquisition,
                 "schema_version": 1,
                 "platform": {"os": "macos", "architecture": "arm64"},
                 "inventory_sha256": TOOLCHAIN.sha256_file(inventory_path),
@@ -350,7 +415,12 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 "repo_parser_bundle": {
                     "artifact": "parser.tgz",
                     "artifact_sha256": TOOLCHAIN.sha256_file(parser_artifact),
-                    "sources": [{"path": "fixture.py", "sha256": "c" * 64}],
+                    "sources": [
+                        {
+                            "path": "fixture.py",
+                            "sha256": TOOLCHAIN.sha256_file(parser_source),
+                        }
+                    ],
                 },
                 "runtimes": [],
                 "servers": [entry],
@@ -365,20 +435,24 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             lock_path = root / "lock.json"
             lock_path.write_bytes(TOOLCHAIN.canonical_json(lock))
 
-            result = TOOLCHAIN.verify_lock(lock_path, inventory_path, cache, None)
+            result = TOOLCHAIN.verify_lock(
+                lock_path, inventory_path, cache, None, root
+            )
             self.assertFalse(result["compatible"])
             self.assertEqual(result["unsupported_languages"], ["restructuredtext"])
 
-            artifact.write_bytes(b"drifted")
+            parser_artifact.write_bytes(b"drifted")
             with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "digest mismatch"):
-                TOOLCHAIN.verify_lock(lock_path, inventory_path, cache, None)
+                TOOLCHAIN.verify_lock(
+                    lock_path, inventory_path, cache, None, root
+                )
 
-            artifact.write_bytes(b"locked artifact")
+            parser_artifact.write_bytes(b"locked parser")
             descriptors_path = root / "descriptors.json"
             descriptors_path.write_text('{"schema_version":1,"servers":[]}')
             with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "language mismatch"):
                 TOOLCHAIN.verify_lock(
-                    lock_path, inventory_path, cache, descriptors_path
+                    lock_path, inventory_path, cache, descriptors_path, root
                 )
 
             descriptor_inventory = {
@@ -394,7 +468,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             }
             descriptors_path.write_text(json.dumps(descriptor_inventory))
             result = TOOLCHAIN.verify_lock(
-                lock_path, inventory_path, cache, descriptors_path
+                lock_path, inventory_path, cache, descriptors_path, root
             )
             self.assertTrue(result["descriptors_verified"])
 
@@ -402,7 +476,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             descriptors_path.write_text(json.dumps(descriptor_inventory))
             with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "profile mismatch"):
                 TOOLCHAIN.verify_lock(
-                    lock_path, inventory_path, cache, descriptors_path
+                    lock_path, inventory_path, cache, descriptors_path, root
                 )
 
     def test_verify_lock_rejects_unknown_fields(self) -> None:
@@ -429,6 +503,349 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             lock_path.write_bytes(TOOLCHAIN.canonical_json(lock))
             with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "top-level fields"):
                 TOOLCHAIN.verify_lock(lock_path, inventory_path, None, None)
+
+    def test_real_acquisition_contract_and_repo_sources_are_verifier_clean(self) -> None:
+        lock = TOOLCHAIN.load_json_object(
+            ROOT / "benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json",
+            "toolchain lock",
+        )
+        python_server = next(
+            server for server in lock["servers"] if server["languages"] == ["python"]
+        )
+        self.assertEqual(python_server["name"], "pyrefly")
+        self.assertEqual(python_server["version"], "1.1.1")
+        self.assertEqual(
+            python_server["artifact_sha256"],
+            "d6b238e1362622d47a6eb5af704fd8b613c94e8c303386efd6350e3da59fecc8",
+        )
+        self.assertEqual(
+            python_server["executable_sha256"],
+            "d471718bb618c4e6e7c30549da6efdd8eca8abea138dc1dec1524564bc4da396",
+        )
+        result = TOOLCHAIN.verify_lock(
+            ROOT / "benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json",
+            ROOT / "benchmark/swebench-act-context/lsp-toolchain/inventory.json",
+            None,
+            ROOT
+            / "benchmark/swebench-act-context/lsp-toolchain/descriptor-inventory.json",
+            ROOT,
+        )
+        self.assertTrue(result["compatible"])
+        self.assertTrue(result["repository_sources_verified"])
+        self.assertEqual(result["acquisition_recipe_count"], 4)
+        self.assertEqual(result["acquisition_artifact_count"], 14)
+
+    def test_empty_cache_repo_recipe_verifies_and_provisions_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "fixture_server.py"
+            source.write_text("#!/usr/bin/env python3\nprint('fixture')\n")
+            source_digest = TOOLCHAIN.sha256_file(source)
+
+            expected_root = root / "expected-tree"
+            expected_root.mkdir()
+            expected_server = expected_root / "server"
+            expected_server.write_bytes(source.read_bytes())
+            expected_server.chmod(0o755)
+            expected_archive = root / "expected.tar.gz"
+            TOOLCHAIN.seal_directory(
+                expected_root, expected_archive, "fixture-bundle"
+            )
+            artifact_digest = TOOLCHAIN.sha256_file(expected_archive)
+            acquisition = self.write_repo_acquisition_contract(
+                root,
+                artifact="fixture-bundle.tar.gz",
+                artifact_sha256=artifact_digest,
+                root_name="fixture-bundle",
+                sources=[
+                    {
+                        "path": source.name,
+                        "sha256": source_digest,
+                        "destination": "server",
+                    }
+                ],
+            )
+            inventory = {
+                "schema_version": 1,
+                "inventory_digest": "a" * 64,
+                "languages": [{"language": "python", "extensions": {"py": 1}}],
+            }
+            inventory_path = root / "inventory.json"
+            inventory_path.write_bytes(TOOLCHAIN.canonical_json(inventory))
+            entry = self.lock_entry(
+                artifact_sha256=artifact_digest, languages=["python"]
+            )
+            entry["artifact"] = "fixture-bundle.tar.gz"
+            entry["executable_sha256"] = source_digest
+            entry["launcher"] = {
+                "kind": "direct",
+                "target": "servers/fixture-bundle/server",
+            }
+            entry["install"] = {
+                "kind": "tar",
+                "destination": "servers",
+                "member": "",
+            }
+            lock = {
+                "acquisition": acquisition,
+                "schema_version": 1,
+                "platform": {"os": "macos", "architecture": "arm64"},
+                "inventory_sha256": TOOLCHAIN.sha256_file(inventory_path),
+                "inventory_digest": inventory["inventory_digest"],
+                "repo_parser_bundle": {
+                    "artifact": "fixture-bundle.tar.gz",
+                    "artifact_sha256": artifact_digest,
+                    "sources": [{"path": source.name, "sha256": source_digest}],
+                },
+                "runtimes": [],
+                "servers": [entry],
+                "unsupported_languages": [],
+            }
+            lock_path = root / "lock.json"
+            lock_path.write_bytes(TOOLCHAIN.canonical_json(lock))
+            cache = root / "empty-cache"
+            with mock.patch.object(
+                TOOLCHAIN.urllib.request,
+                "urlopen",
+                side_effect=AssertionError("network must not be used"),
+            ):
+                acquisition_result = TOOLCHAIN.acquire_artifacts(
+                    lock_path, cache, root
+                )
+            self.assertEqual(acquisition_result["downloaded"], 0)
+            self.assertEqual(acquisition_result["built"], 1)
+            self.assertEqual(
+                TOOLCHAIN.sha256_file(cache / "fixture-bundle.tar.gz"),
+                artifact_digest,
+            )
+            verification = TOOLCHAIN.verify_lock(
+                lock_path, inventory_path, cache, None, root
+            )
+            self.assertTrue(verification["cache_verified"])
+
+            toolchain_root = root / "toolchain"
+            receipt_path = root / "provision.json"
+            receipt = TOOLCHAIN.provision_toolchain(
+                lock_path,
+                inventory_path,
+                cache,
+                toolchain_root,
+                receipt_path,
+                offline=True,
+                repo_root=root,
+            )
+            self.assertTrue(receipt["offline"])
+            self.assertEqual(
+                TOOLCHAIN.sha256_file(toolchain_root / "bin/server"), source_digest
+            )
+
+            source.write_text("drifted\n")
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "source digest mismatch"
+            ):
+                TOOLCHAIN.verify_lock(
+                    lock_path, inventory_path, cache, None, root
+                )
+
+    def test_probe_server_requests_use_initialized_workspace_and_sections(self) -> None:
+        rpc = object.__new__(TOOLCHAIN.JsonRpcProcess)
+        rpc.next_id = 1
+        rpc.configuration = {
+            "python": {"analysis": {"typeCheckingMode": "strict"}},
+            "feature": True,
+        }
+        rpc.workspace_folders = []
+        rpc.send = mock.Mock()
+        rpc.receive = mock.Mock(return_value={"id": 1, "result": {}})
+        folder = {"uri": "file:///fixture", "name": "fixture"}
+        rpc.request(
+            "initialize",
+            {"workspaceFolders": [folder], "capabilities": {}},
+            0.1,
+        )
+        self.assertEqual(
+            rpc._server_request_result(
+                {"method": "workspace/workspaceFolders", "params": {}}
+            ),
+            [folder],
+        )
+        self.assertEqual(
+            rpc._server_request_result(
+                {
+                    "method": "workspace/configuration",
+                    "params": {
+                        "items": [
+                            {"section": "python.analysis"},
+                            {"section": "feature"},
+                            {"section": "missing.section"},
+                            {"scopeUri": "file:///fixture"},
+                        ]
+                    },
+                }
+            ),
+            [
+                {"typeCheckingMode": "strict"},
+                True,
+                None,
+                rpc.configuration,
+            ],
+        )
+
+    def test_probe_evidence_binds_current_lock_and_rejects_stale_pyright(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock_path = root / "lock.json"
+            expected_capabilities = [
+                method
+                for _, methods in TOOLCHAIN.OPERATION_CAPABILITY_PROVIDERS
+                for method in methods
+            ]
+            lock_server = {
+                "name": "pyrefly",
+                "version": "1.1.1",
+                "languages": ["python"],
+                "command": "pyrefly",
+                "args": ["lsp", "--threads", "1"],
+                "expected_capabilities": expected_capabilities,
+                "probe": {"operation": "textDocument/documentSymbol"},
+            }
+            TOOLCHAIN.write_canonical_json(lock_path, {"servers": [lock_server]})
+            operation_evidence = [
+                {
+                    "provider": provider,
+                    "present": True,
+                    "advertised_value": True,
+                    "supported": True,
+                    "methods": list(methods),
+                }
+                for provider, methods in TOOLCHAIN.OPERATION_CAPABILITY_PROVIDERS
+            ]
+            server_receipt = {
+                "name": lock_server["name"],
+                "version": lock_server["version"],
+                "languages": lock_server["languages"],
+                "command": lock_server["command"],
+                "args": lock_server["args"],
+                "negotiated_capabilities": expected_capabilities,
+                "negotiated_operation_capabilities": operation_evidence,
+                "operation": "textDocument/documentSymbol",
+                "result_count": 1,
+                "initialize_ms": 1,
+                "workspace_ready_ms": 2,
+                "operation_ms": 1,
+                "shutdown_ms": 1,
+                "quiescence_messages": 0,
+                "stderr_tail": "",
+                "status": "ready",
+            }
+
+            def publish_probe(receipt: dict[str, object]) -> Path:
+                path = root / "probe.json"
+                probe = {
+                    "schema_version": TOOLCHAIN.SCHEMA_VERSION,
+                    "lock_sha256": TOOLCHAIN.sha256_file(lock_path),
+                    "server_count": 1,
+                    "servers": [receipt],
+                }
+                probe["probe_digest"] = TOOLCHAIN.sha256_bytes(
+                    TOOLCHAIN.canonical_json(probe)
+                )
+                TOOLCHAIN.write_canonical_json(path, probe)
+                return path
+
+            probe_path = publish_probe(server_receipt)
+            TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+
+            stale_pyright = copy.deepcopy(server_receipt)
+            stale_pyright.update(
+                {
+                    "name": "pyright",
+                    "version": "1.1.405",
+                    "command": "pyright-langserver",
+                    "args": ["--stdio"],
+                }
+            )
+            publish_probe(stale_pyright)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "server identity mismatch"
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+
+            probe_path = publish_probe(server_receipt)
+            tampered = TOOLCHAIN.load_json_object(probe_path, "test probe")
+            tampered["servers"][0]["status"] = "blocked"
+            TOOLCHAIN.write_canonical_json(probe_path, tampered)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "self-digest mismatch"
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(probe_path, lock_path)
+
+    def test_json_rpc_partial_body_obeys_receive_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            server_code = "\n".join(
+                [
+                    "import sys, time",
+                    "sys.stdout.buffer.write(b'Content-Length: 10\\r\\n\\r\\n{}')",
+                    "sys.stdout.buffer.flush()",
+                    "time.sleep(30)",
+                ]
+            )
+            rpc = TOOLCHAIN.JsonRpcProcess(
+                [sys.executable, "-c", server_code],
+                Path(temporary),
+                dict(os.environ),
+            )
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    TOOLCHAIN.ToolchainError, "response timed out"
+                ):
+                    rpc.receive(0.1)
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                rpc.process.kill()
+                rpc.process.wait()
+                if rpc.process.stdin:
+                    rpc.process.stdin.close()
+                if rpc.process.stdout:
+                    rpc.process.stdout.close()
+                if rpc.process.stderr:
+                    rpc.process.stderr.close()
+
+    def test_non_toolchain_archive_failure_preserves_failure_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache"
+            cache.mkdir(parents=True)
+            (cache / "lsp_completeness.json").write_text(
+                '{"graph_snapshot_digest":"graph"}'
+            )
+            cases = root / "cases"
+            cases.mkdir()
+            log = root / "scan.log"
+            log.write_text("scan complete")
+            archive = root / "archive.tar.gz"
+            sidecar = root / "archive.manifest.json"
+            archive.write_bytes(b"partial archive")
+            sidecar.write_bytes(b"partial sidecar")
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "failure evidence="
+            ):
+                TOOLCHAIN._raise_archive_failure(
+                    checkout=checkout,
+                    instance_id="owner__repo-1",
+                    cases_root=cases,
+                    scan_log_path=log,
+                    error=OSError("disk full"),
+                    attempt_slug="owner__repo-1-attempt-001",
+                    archive_path=archive,
+                    sidecar_path=sidecar,
+                )
+            receipt_path = cases / "owner__repo-1-attempt-001-failure.json"
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["error"], "disk full")
+            self.assertEqual(len(receipt["publication_artifacts"]), 2)
 
     def test_structural_archive_is_deterministic_verifier_clean_and_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -655,15 +1072,28 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             mismatch_cases.append(("inventory", target_identity, {"inventory": "6" * 64}))
             for label, mismatched_identity, overrides in mismatch_cases:
                 with self.subTest(label=label):
+                    diagnostics = {}
                     self.assertIsNone(
                         self.select_fixture_cache(
                             output,
                             target_commit,
                             mismatched_identity,
                             git_dir,
+                            diagnostics=diagnostics,
                             **overrides,
                         )
                     )
+                    self.assertTrue(diagnostics["cold_rebuild_reasons"])
+                    if label == "toolchain":
+                        self.assertIn(
+                            "toolchain_lock_digest_mismatch",
+                            {
+                                reason["code"]
+                                for reason in diagnostics[
+                                    "cold_rebuild_reasons"
+                                ]
+                            },
+                        )
 
             shared_config_changed = copy.deepcopy(target_identity)
             shared_config_changed["shared_influence_digest"] = "8" * 64
@@ -686,7 +1116,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 )
             )
 
-    def test_identical_target_injection_authorizes_all_work_with_bound_digest(self) -> None:
+    def test_identical_target_injection_authorizes_work_and_validation_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source"
@@ -706,6 +1136,41 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 check=True,
             )
             checkout, identity = self.structural_cache_fixture(root)
+            cache = checkout / ".oh/.cache"
+            report = TOOLCHAIN.load_json_object(
+                cache / "lsp_completeness.json", "fixture completeness report"
+            )
+            report["files"][0]["expected_result_ids"].append("result-2")
+            report["files"][0]["persisted_results"]["provenance"].append(
+                "result-2"
+            )
+            TOOLCHAIN.write_canonical_json(cache / "lsp_completeness.json", report)
+            TOOLCHAIN.write_canonical_json(
+                cache / "enrichment_jobs.json",
+                {
+                    "events": [],
+                    "jobs": [
+                        {
+                            "job_id": "validation-job",
+                            "capability": "call_references",
+                            "state": "completed",
+                            "lsp_evidence": {
+                                "validations": [
+                                    {
+                                        "status": "processed",
+                                        "document_symbols": [
+                                            {
+                                                "file": "src/a.py",
+                                                "graph_result_id": "result-2",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                },
+            )
             identity["commit"] = commit
             identity["tree"] = tree
             archive = root / "base.tar.gz"
@@ -717,12 +1182,16 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             )
             selection = {
                 "entry": {
+                    "instance_id": "owner__repo-1",
+                    "attempt_index": 1,
                     "archive_path": str(archive),
                     "sidecar_path": str(sidecar),
                 },
                 "verified": verified,
                 "diff": TOOLCHAIN._git_diff_paths(git_dir, commit, commit),
                 "invalidated_partitions": [],
+                "compatible_partitions": ["python"],
+                "invalidated_partition_reasons": {},
             }
             target = root / "target"
             target.mkdir()
@@ -743,9 +1212,592 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             authorization["digest"] = ""
             self.assertEqual(digest, TOOLCHAIN.sha256_bytes(TOOLCHAIN.canonical_json(authorization)))
             self.assertEqual(receipt["inherited_file_count"], 1)
+            self.assertEqual(receipt["predicted_executed_file_count"], 0)
+            self.assertEqual(
+                receipt["predicted_total_graph_enrichment_operation_count"], 1
+            )
             self.assertEqual(receipt["changed_file_count"], 0)
             self.assertEqual(receipt["authorization_sha256"], TOOLCHAIN.sha256_file(authorization_path))
+            inherited = authorization["inherited_files"][0]
+            self.assertEqual(inherited["producer_work_ids"], ["job:1"])
+            self.assertEqual(
+                {
+                    lineage["result_id"]: lineage["producer_ids"]
+                    for lineage in inherited["result_producers"]
+                },
+                {
+                    "result-1": ["job:1"],
+                    "result-2": ["enrichment-job:validation-job"],
+                },
+            )
             self.assertEqual(archived["archive_sha256"], TOOLCHAIN.sha256_file(archive))
+            preflight = TOOLCHAIN.build_structural_cache_preflight(
+                case_index=2,
+                instance_id="owner__repo-2",
+                inventory_case={"included_file_count": 1},
+                target_identity=identity,
+                selection=selection,
+                injection_receipt=receipt,
+            )
+            self.assertEqual(
+                preflight["predicted_file_counts"],
+                {"target": 1, "inherited": 1, "executed": 0},
+            )
+            self.assertEqual(
+                preflight["expected_operation_count"],
+                {
+                    "inherited_exact": 1,
+                    "executed_estimate": 0,
+                    "total_estimate": 1,
+                    "basis": (
+                        "verified_base_per_path_work_ledger_with_language_median_for_unseen_paths"
+                    ),
+                    "estimated_file_count": 0,
+                },
+            )
+
+    def test_cache_preflight_rejects_unexpected_all_partition_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, identity = self.structural_cache_fixture(Path(temporary))
+            identity["partitions"] = {
+                f"language-{index:02d}": {
+                    "language": f"language-{index:02d}",
+                    "descriptor_signature": "7" * 64,
+                    "influence_patterns": [],
+                    "influence_digest": "8" * 64,
+                    "signature": TOOLCHAIN.sha256_bytes(
+                        f"base-{index}".encode()
+                    ),
+                    "matched_file_count": 0,
+                }
+                for index in range(58)
+            }
+            core = {
+                "configuration_digest": identity["configuration_digest"],
+                "shared_influence_digest": identity["shared_influence_digest"],
+                "partition_signatures": {
+                    language: partition["signature"]
+                    for language, partition in identity["partitions"].items()
+                },
+            }
+            target = copy.deepcopy(identity)
+            for index, partition in enumerate(target["partitions"].values()):
+                partition["signature"] = TOOLCHAIN.sha256_bytes(
+                    f"target-{index}".encode()
+                )
+            invalidated, compatible, reasons = TOOLCHAIN._partition_invalidation_plan(
+                core, target
+            )
+            selection = {
+                "invalidated_partitions": invalidated,
+                "compatible_partitions": compatible,
+                "invalidated_partition_reasons": reasons,
+            }
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError,
+                "unexpected all-partition invalidation.*partition_count=58",
+            ), mock.patch.object(
+                TOOLCHAIN, "verify_structural_cache_archive"
+            ) as archive_verifier:
+                TOOLCHAIN._validate_selected_partition_plan(selection, target)
+            archive_verifier.assert_not_called()
+
+    def test_ci_yaml_and_test_json_changes_do_not_invalidate_all_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, identity = self.structural_cache_fixture(Path(temporary))
+            identity["partitions"] = {
+                f"language-{index:02d}": {
+                    "language": f"language-{index:02d}",
+                    "descriptor_signature": "7" * 64,
+                    "influence_patterns": [],
+                    "influence_digest": "8" * 64,
+                    "signature": TOOLCHAIN.sha256_bytes(
+                        f"stable-{index}".encode()
+                    ),
+                    "matched_file_count": 0,
+                }
+                for index in range(58)
+            }
+            core = {
+                "configuration_digest": identity["configuration_digest"],
+                "shared_influence_digest": identity["shared_influence_digest"],
+                "partition_signatures": {
+                    language: partition["signature"]
+                    for language, partition in identity["partitions"].items()
+                },
+            }
+            invalidated, compatible, reasons = TOOLCHAIN._partition_invalidation_plan(
+                core, identity
+            )
+            selection = {
+                "diff": {
+                    "changed_paths": [
+                        ".github/workflows/ci.yml",
+                        "tests/fixtures/snapshot.json",
+                    ]
+                },
+                "invalidated_partitions": invalidated,
+                "compatible_partitions": compatible,
+                "invalidated_partition_reasons": reasons,
+            }
+            TOOLCHAIN._validate_selected_partition_plan(selection, identity)
+            self.assertEqual(invalidated, [])
+            self.assertEqual(compatible, sorted(identity["partitions"]))
+            self.assertEqual(reasons, {})
+
+            configuration_changed = copy.deepcopy(identity)
+            configuration_changed["configuration_digest"] = "changed-configuration"
+            invalidated, compatible, reasons = TOOLCHAIN._partition_invalidation_plan(
+                core, configuration_changed
+            )
+            TOOLCHAIN._validate_selected_partition_plan(
+                {
+                    "invalidated_partitions": invalidated,
+                    "compatible_partitions": compatible,
+                    "invalidated_partition_reasons": reasons,
+                },
+                configuration_changed,
+            )
+            self.assertEqual(invalidated, sorted(identity["partitions"]))
+            self.assertEqual(compatible, [])
+            self.assertEqual(
+                {
+                    reason["code"]
+                    for language_reasons in reasons.values()
+                    for reason in language_reasons
+                },
+                {"configuration_digest_mismatch"},
+            )
+
+    def test_cold_preflight_marks_operation_count_unknown_and_closes_toctou(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, identity = self.structural_cache_fixture(root)
+            second = copy.deepcopy(identity["partitions"]["python"])
+            second["language"] = "yaml"
+            second["signature"] = "a" * 64
+            identity["partitions"]["yaml"] = second
+            preflight = TOOLCHAIN.build_structural_cache_preflight(
+                case_index=1,
+                instance_id="owner__repo-1",
+                inventory_case={"included_file_count": 2},
+                target_identity=identity,
+                selection=None,
+                injection_receipt=None,
+            )
+            self.assertIsNone(
+                preflight["expected_operation_count"]["executed_estimate"]
+            )
+            self.assertIsNone(
+                preflight["expected_operation_count"]["total_estimate"]
+            )
+            approved = root / "approved.json"
+            with mock.patch("builtins.print"):
+                TOOLCHAIN.publish_structural_cache_preflight(preflight, approved)
+            TOOLCHAIN.require_approved_structural_cache_preflight(
+                preflight, approved
+            )
+            drifted = copy.deepcopy(preflight)
+            drifted["target_tree"] = "f" * 40
+            drifted["digest"] = ""
+            drifted["digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(drifted)
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "differs from recomputed plan"
+            ):
+                TOOLCHAIN.require_approved_structural_cache_preflight(
+                    drifted, approved
+                )
+
+    def test_isolated_sphinx_pair_preserves_qualification_indexes(self) -> None:
+        population_document = TOOLCHAIN.load_json_object(
+            ROOT / "benchmark/swebench-act-context/population.json",
+            "test population",
+        )
+        population = TOOLCHAIN.included_population(population_document)
+        selected = TOOLCHAIN._select_qualification_instances(
+            population,
+            ["sphinx-doc__sphinx-8548", "sphinx-doc__sphinx-8551"],
+            True,
+        )
+        self.assertEqual(
+            [(index, case["instance_id"]) for index, case in selected],
+            [
+                (59, "sphinx-doc__sphinx-8548"),
+                (60, "sphinx-doc__sphinx-8551"),
+            ],
+        )
+        raw_indexes = {
+            case["instance_id"]: index
+            for index, case in enumerate(population_document["instances"], start=1)
+        }
+        self.assertEqual(
+            [
+                raw_indexes["sphinx-doc__sphinx-8548"],
+                raw_indexes["sphinx-doc__sphinx-8551"],
+            ],
+            [60, 61],
+        )
+        with self.assertRaises(TOOLCHAIN.ToolchainError):
+            TOOLCHAIN._select_qualification_instances(
+                population,
+                ["sphinx-doc__sphinx-8548", "sphinx-doc__sphinx-8551"],
+                False,
+            )
+        with self.assertRaises(TOOLCHAIN.ToolchainError):
+            TOOLCHAIN._select_qualification_instances(
+                population,
+                ["sphinx-doc__sphinx-8551", "sphinx-doc__sphinx-8548"],
+                True,
+            )
+        with self.assertRaisesRegex(
+            TOOLCHAIN.ToolchainError, "must share one repository"
+        ):
+            TOOLCHAIN._select_qualification_instances(
+                [
+                    {"instance_id": "owner__one-1", "repo": "owner/one"},
+                    {"instance_id": "owner__two-1", "repo": "owner/two"},
+                ],
+                ["owner__one-1", "owner__two-1"],
+                True,
+            )
+
+    def test_checkpoint_is_partial_and_never_writes_ready_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            checkpoint = TOOLCHAIN._qualification_checkpoint(
+                output_root=output,
+                last_case_index=2,
+                cohort_cases=[{"instance_id": "owner__repo-2"}],
+                timing_cases=[{"instance_id": "owner__repo-2", "scan_ms": 1}],
+                isolated=False,
+            )
+            self.assertEqual(checkpoint["status"], "checkpoint")
+            self.assertTrue(Path(checkpoint["path"]).is_file())
+            self.assertFalse((output / "cohort-manifest.json").exists())
+            self.assertFalse((output / "aggregate.json").exists())
+            self.assertFalse((output / "seal.json").exists())
+            repeated = TOOLCHAIN._qualification_checkpoint(
+                output_root=output,
+                last_case_index=2,
+                cohort_cases=[{"instance_id": "owner__repo-2"}],
+                timing_cases=[{"instance_id": "owner__repo-2", "scan_ms": 1}],
+                isolated=False,
+            )
+            self.assertEqual(repeated["digest"], checkpoint["digest"])
+
+    def test_frozen_cohort_manifest_uses_report_schema_and_rejects_mixed_versions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = []
+            for index, commit in enumerate(("a" * 40, "b" * 40), start=1):
+                report_path = root / f"report-{index}.json"
+                TOOLCHAIN.write_canonical_json(
+                    report_path,
+                    {"identity": {"schema_version": 6}},
+                )
+                cases.append(
+                    {
+                        "instance_id": f"owner__repo-{index}",
+                        "repository": "owner/repo",
+                        "base_commit": commit,
+                        "report_path": str(report_path),
+                    }
+                )
+
+            manifest = TOOLCHAIN._build_frozen_cohort_manifest(cases)
+            self.assertEqual(manifest, {"schema_version": 6, "cases": cases})
+            self.assertNotEqual(manifest["schema_version"], TOOLCHAIN.SCHEMA_VERSION)
+
+            TOOLCHAIN.write_canonical_json(
+                Path(cases[1]["report_path"]),
+                {"identity": {"schema_version": 7}},
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "do not share one completeness schema"
+            ):
+                TOOLCHAIN._build_frozen_cohort_manifest(cases)
+
+    def test_ready_aggregate_uses_counts_and_checkouts_without_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = []
+            report_digests = ("d" * 64, "e" * 64)
+            for index, (commit, report_digest) in enumerate(
+                zip(("a" * 40, "b" * 40), report_digests), start=1
+            ):
+                report_path = root / f"report-{index}.json"
+                TOOLCHAIN.write_canonical_json(
+                    report_path,
+                    {
+                        "identity": {
+                            "schema_version": 6,
+                            "context_mode": "disabled",
+                            "repository": "owner/repo",
+                            "checkout_sha": commit,
+                        },
+                        "summary": {"total_files": 1},
+                        "violations": [],
+                        "digest": report_digest,
+                    },
+                )
+                cases.append(
+                    {
+                        "instance_id": f"owner__repo-{index}",
+                        "repository": "owner/repo",
+                        "base_commit": commit,
+                        "report_path": str(report_path),
+                    }
+                )
+            manifest = TOOLCHAIN._build_frozen_cohort_manifest(cases)
+            population_digest = "c" * 64
+            aggregate = {
+                "schema_version": 6,
+                "cohort_digest": population_digest,
+                "checkouts": [
+                {
+                    "instance_id": case["instance_id"],
+                    "repository": case["repository"],
+                    "base_commit": case["base_commit"],
+                    "checkout_sha": case["base_commit"],
+                    "report_digest": report_digest,
+                    "ready": True,
+                    "file_count": 1,
+                    "violation_count": 0,
+                }
+                    for case, report_digest in zip(cases, report_digests)
+                ],
+                "counts": {
+                    "checkouts": 2,
+                    "unique_instances": 2,
+                    "ready_checkouts": 2,
+                    "files": 2,
+                    "by_extension": {"py": 2},
+                    "by_role": {"source": 2},
+                    "by_status": {"complete": 2},
+                },
+                "digest": "f" * 64,
+            }
+            self.assertNotIn("status", aggregate)
+            TOOLCHAIN._validate_ready_aggregate(
+                aggregate,
+                manifest,
+                expected_population_digest=population_digest,
+            )
+
+            blocked_counts = copy.deepcopy(aggregate)
+            blocked_counts["counts"]["ready_checkouts"] = 1
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "counts are not fully READY"
+            ):
+                TOOLCHAIN._validate_ready_aggregate(
+                    blocked_counts,
+                    manifest,
+                    expected_population_digest=population_digest,
+                )
+
+            blocked_checkout = copy.deepcopy(aggregate)
+            blocked_checkout["checkouts"][0]["ready"] = False
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "checkout is not verifier-clean READY"
+            ):
+                TOOLCHAIN._validate_ready_aggregate(
+                    blocked_checkout,
+                    manifest,
+                    expected_population_digest=population_digest,
+                )
+
+            fabricated_checkout = copy.deepcopy(aggregate)
+            fabricated_checkout["checkouts"][0]["report_digest"] = "0" * 64
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "checkout is not verifier-clean READY"
+            ):
+                TOOLCHAIN._validate_ready_aggregate(
+                    fabricated_checkout,
+                    manifest,
+                    expected_population_digest=population_digest,
+                )
+
+            fabricated_cohort = copy.deepcopy(aggregate)
+            fabricated_cohort["cohort_digest"] = "0" * 64
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "differs from frozen population digest"
+            ):
+                TOOLCHAIN._validate_ready_aggregate(
+                    fabricated_cohort,
+                    manifest,
+                    expected_population_digest=population_digest,
+                )
+
+    def test_resume_receipt_rejects_population_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            _, identity = self.structural_cache_fixture(root)
+            rna_binary = root / "rna"
+            rna_binary.write_bytes(b"exact CI artifact")
+            identity["producer"]["binary_sha256"] = TOOLCHAIN.sha256_file(
+                rna_binary
+            )
+            instance = {
+                "instance_id": "owner__repo-1",
+                "repo": "owner/repo",
+                "base_commit": identity["commit"],
+            }
+            inventory_case = {
+                "tree": identity["tree"],
+                "per_file_digest": "d" * 64,
+                "included_file_count": 1,
+            }
+            preflight = TOOLCHAIN.build_structural_cache_preflight(
+                case_index=1,
+                instance_id=instance["instance_id"],
+                inventory_case=inventory_case,
+                target_identity=identity,
+                selection=None,
+                injection_receipt=None,
+            )
+            preflight_path = output / "preflight.json"
+            TOOLCHAIN.write_canonical_json(preflight_path, preflight)
+            report = {
+                "violations": [],
+                "digest": "report-digest",
+                "graph_snapshot_digest": "graph-digest",
+            }
+            report_path = output / "report.json"
+            TOOLCHAIN.write_canonical_json(report_path, report)
+            archive_path = output / "cache.tar.gz"
+            sidecar_path = output / "cache.manifest.json"
+            archive_path.write_bytes(b"fixture archive")
+            sidecar_path.write_bytes(b"fixture sidecar")
+            cache_identity = {
+                "archive_path": str(archive_path),
+                "archive_sha256": "a" * 64,
+                "sidecar_path": str(sidecar_path),
+                "sidecar_sha256": "b" * 64,
+                "core_sha256": "c" * 64,
+            }
+            receipt = {
+                "schema_version": TOOLCHAIN.SCHEMA_VERSION,
+                "status": "ready",
+                "offline_preprocessing": True,
+                "population_index": 1,
+                "instance_id": instance["instance_id"],
+                "repository": instance["repo"],
+                "base_commit": instance["base_commit"],
+                "tree": inventory_case["tree"],
+                "producer": identity["producer"],
+                "toolchain_lock_digest": "a" * 64,
+                "inventory_digest": "b" * 64,
+                "inventory_file_sha256": "c" * 64,
+                "case_inventory_digest": inventory_case["per_file_digest"],
+                "configuration_digest": identity["configuration_digest"],
+                "scan_flags": TOOLCHAIN.QUALIFICATION_SCAN_FLAGS,
+                "preflight_path": str(preflight_path),
+                "preflight_sha256": TOOLCHAIN.sha256_file(preflight_path),
+                "preflight_digest": preflight["digest"],
+                "report_path": str(report_path),
+                "report_sha256": TOOLCHAIN.sha256_file(report_path),
+                "report_digest": report["digest"],
+                "graph_snapshot_digest": report["graph_snapshot_digest"],
+                "cache": cache_identity,
+                "timings_ms": {
+                    "cache_selection": 1,
+                    "cache_verification": 2,
+                    "cache_injection": 3,
+                    "scan_update": 4,
+                    "full_readiness_validation": 5,
+                    "cache_archive": 6,
+                },
+            }
+            receipt["receipt_digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(receipt)
+            )
+            receipt_path = output / "receipt.json"
+            TOOLCHAIN.write_canonical_json(receipt_path, receipt)
+            TOOLCHAIN._publish_cache_catalog_entry(
+                output,
+                {
+                    "schema_version": TOOLCHAIN.STRUCTURAL_CACHE_SCHEMA_VERSION,
+                    "status": "ready",
+                    "case_index": 1,
+                    "population_index": 1,
+                    "attempt_index": 1,
+                    "instance_id": instance["instance_id"],
+                    "repository": instance["repo"],
+                    "commit": instance["base_commit"],
+                    "tree": inventory_case["tree"],
+                    "archive_path": str(archive_path),
+                    "archive_sha256": cache_identity["archive_sha256"],
+                    "sidecar_path": str(sidecar_path),
+                    "sidecar_sha256": cache_identity["sidecar_sha256"],
+                    "core_sha256": cache_identity["core_sha256"],
+                    "report_digest": report["digest"],
+                    "receipt_path": str(receipt_path),
+                    "receipt_sha256": TOOLCHAIN.sha256_file(receipt_path),
+                },
+            )
+            verified = {
+                "archive_sha256": cache_identity["archive_sha256"],
+                "sidecar_sha256": cache_identity["sidecar_sha256"],
+                "core_sha256": cache_identity["core_sha256"],
+                "core": {
+                    "commit": instance["base_commit"],
+                    "tree": inventory_case["tree"],
+                    "case_inventory_digest": inventory_case["per_file_digest"],
+                    "configuration_digest": identity["configuration_digest"],
+                    "completeness_report_digest": report["digest"],
+                    "graph_snapshot_digest": report["graph_snapshot_digest"],
+                },
+            }
+            with mock.patch.object(
+                TOOLCHAIN,
+                "verify_structural_cache_archive",
+                return_value=verified,
+            ):
+                self.assertIsNotNone(
+                    TOOLCHAIN._resume_ready_case(
+                        output_root=output,
+                        case_index=1,
+                        instance=instance,
+                        inventory_case=inventory_case,
+                        rna_binary=rna_binary,
+                        toolchain_lock_digest="a" * 64,
+                        inventory_digest="b" * 64,
+                        inventory_file_sha256="c" * 64,
+                    )
+                )
+
+            receipt["population_index"] = 2
+            receipt["receipt_digest"] = ""
+            receipt.pop("receipt_digest")
+            receipt["receipt_digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(receipt)
+            )
+            TOOLCHAIN.write_canonical_json(receipt_path, receipt)
+            catalog_path = output / TOOLCHAIN.STRUCTURAL_CACHE_CATALOG
+            catalog = TOOLCHAIN.load_json_object(catalog_path, "test catalog")
+            catalog["entries"][0]["receipt_sha256"] = TOOLCHAIN.sha256_file(
+                receipt_path
+            )
+            TOOLCHAIN.write_canonical_json(catalog_path, catalog)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "frozen identity mismatch"
+            ):
+                TOOLCHAIN._resume_ready_case(
+                    output_root=output,
+                    case_index=1,
+                    instance=instance,
+                    inventory_case=inventory_case,
+                    rna_binary=rna_binary,
+                    toolchain_lock_digest="a" * 64,
+                    inventory_digest="b" * 64,
+                    inventory_file_sha256="c" * 64,
+                )
 
     @staticmethod
     def structural_cache_fixture(root: Path) -> tuple[Path, dict[str, object]]:
@@ -756,7 +1808,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             "path": "src/a.py",
             "role": "source",
             "language": "python",
-            "expected_server": {"command": "pyright", "version": "1", "digest": "x"},
+            "expected_server": {"command": "pyrefly", "version": "1", "digest": "x"},
             "advertised_capabilities": [
                 {"name": "textDocument/documentSymbol", "supported": True}
             ],
@@ -917,6 +1969,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         *,
         toolchain: str = "a" * 64,
         inventory: str = "b" * 64,
+        diagnostics: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
         return TOOLCHAIN.select_structural_cache(
             output,
@@ -928,7 +1981,36 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             toolchain_lock_digest=toolchain,
             inventory_digest=inventory,
             inventory_file_sha256="c" * 64,
+            diagnostics=diagnostics,
         )
+
+    @staticmethod
+    def write_repo_acquisition_contract(
+        root: Path,
+        *,
+        artifact: str,
+        artifact_sha256: str,
+        root_name: str,
+        sources: list[dict[str, str]],
+    ) -> dict[str, str]:
+        contract = {
+            "schema_version": 1,
+            "artifacts": [
+                {
+                    "artifact": artifact,
+                    "artifact_sha256": artifact_sha256,
+                    "kind": "repo-sources",
+                    "root_name": root_name,
+                    "sources": sources,
+                }
+            ],
+        }
+        path = root / "acquisition-recipes.json"
+        TOOLCHAIN.write_canonical_json(path, contract)
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": TOOLCHAIN.sha256_file(path),
+        }
 
     @staticmethod
     def lock_entry(

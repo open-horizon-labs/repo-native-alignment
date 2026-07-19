@@ -6074,7 +6074,7 @@ mod tests {
                 role: FileRole::Source,
                 language: Some("python".to_string()),
                 expected_server: Some(ServerIdentity {
-                    name: "pyright-langserver".to_string(),
+                    name: "pyrefly".to_string(),
                     version: Some("1.1.0".to_string()),
                     executable_digest: Some("blake3:fixture".to_string()),
                 }),

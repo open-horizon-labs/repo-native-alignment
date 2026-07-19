@@ -266,6 +266,55 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     has_all_export: true,
     test_name_prefix: true,
     lsp_enrichable_kinds: Some(&[NodeKind::Function, NodeKind::Trait]),
+    // Pyrefly discovers the target environment through its build-system
+    // integration; legacy Python-analysis initializationOptions are not sent.
+    venv_candidates: None,
+    attribute_access_node: Some(("attribute", "attribute")),
+    has_parent_module_request: false,
+};
+
+/// Cython uses Python's tree-sitter grammar for structural anchoring while
+/// retaining a distinct language identity for Cyright enrichment.
+pub static CYTHON_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_python::LANGUAGE.into(),
+    language_name: "cython",
+    extensions: &["pyx", "pxd", "pxi", "tp"],
+    node_kinds: &[
+        ("function_definition", NodeKind::Function),
+        ("class_definition", NodeKind::Struct),
+        ("import_statement", NodeKind::Import),
+        ("import_from_statement", NodeKind::Import),
+    ],
+    scope_parent_kinds: &["class_definition", "function_definition"],
+    const_value_field: None,
+    full_text_name_kinds: &["import_statement", "import_from_statement"],
+    string_literal_kinds: &[("string", None)],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("return_type"),
+    type_requires_uppercase: false,
+    branch_node_types: &[
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "for_statement",
+        "while_statement",
+        "boolean_operator",
+        "try_statement",
+        "except_clause",
+        "conditional_expression",
+    ],
+    decorator_node_kinds: &["decorator"],
+    type_param_node_kind: None,
+    docstring_in_body: true,
+    doc_comment_prefix: None,
+    route_queries: &[PYTHON_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call", "function")),
+    pub_visibility_modifier: None,
+    has_all_export: true,
+    test_name_prefix: true,
+    lsp_enrichable_kinds: Some(&[NodeKind::Function, NodeKind::Trait]),
     venv_candidates: Some(&[".venv", "venv", "env"]),
     attribute_access_node: Some(("attribute", "attribute")),
     has_parent_module_request: false,
@@ -1247,6 +1296,7 @@ pub fn config_for_language(language: &str) -> Option<&'static LangConfig> {
     match language {
         "rust" => Some(&super::rust::RUST_CONFIG),
         "python" => Some(&PYTHON_CONFIG),
+        "cython" => Some(&CYTHON_CONFIG),
         "typescript" => Some(&TYPESCRIPT_CONFIG),
         "javascript" => Some(&JAVASCRIPT_CONFIG),
         "go" => Some(&GO_CONFIG),
@@ -1265,5 +1315,22 @@ pub fn config_for_language(language: &str) -> Option<&'static LangConfig> {
         "dart" => Some(&DART_CONFIG),
         "gdscript" => Some(&GDSCRIPT_CONFIG),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cython_language_lookup_preserves_python_lsp_policy() {
+        let config = config_for_language("cython").expect("Cython config must be addressable");
+
+        assert_eq!(config.language_name, "cython");
+        assert_eq!(
+            config.lsp_enrichable_kinds,
+            Some(&[NodeKind::Function, NodeKind::Trait][..])
+        );
+        assert_eq!(config.venv_candidates, Some(&[".venv", "venv", "env"][..]));
     }
 }

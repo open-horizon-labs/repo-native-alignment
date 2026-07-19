@@ -46,6 +46,7 @@ pub mod server;
 pub mod service;
 pub mod smoke_test;
 pub mod structural_cache;
+pub mod structural_cache_replay;
 pub mod types;
 pub mod walk;
 

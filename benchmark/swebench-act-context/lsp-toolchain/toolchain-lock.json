@@ -6,9 +6,13 @@
   },
   "inventory_sha256": "500ff11ba916a697fcdac0747d25d3094b81ab4c816f38df43540fd5018bb5d7",
   "inventory_digest": "2b52991f0dd3e6b2ebf34053dc59e77ab9e85bb022d154911dfc521cc35009a9",
+  "acquisition": {
+    "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/recipes.json",
+    "sha256": "a6073c405e637346c4d8d0de1ada73ead13d2c019c6f73ce884bf655da8b4a1a"
+  },
   "repo_parser_bundle": {
     "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-    "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+    "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
     "sources": [
       {
         "path": "scripts/lsp/config_language_server.py",
@@ -16,7 +20,7 @@
       },
       {
         "path": "scripts/lsp/cohort_language_server.py",
-        "sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a"
+        "sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce"
       }
     ]
   },
@@ -92,9 +96,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -137,9 +141,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -182,9 +186,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -270,7 +274,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/bash-language-server/-/bash-language-server-5.6.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/bash-language-server",
       "executable_sha256": "90419f24f837d3883264478f66b1eafebe6283f8641dda3893bd81f040a404d8",
       "command": "bash-language-server",
@@ -318,9 +322,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -410,9 +414,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -503,7 +507,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/dot-language-server/-/dot-language-server-3.1.2.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/dot-language-server",
       "executable_sha256": "01cb5f4da4952d8d3b028e8eff19d78ad6fdfae5d5e5aab77cdc8e4f9c949284",
       "command": "dot-language-server",
@@ -547,9 +551,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -649,9 +653,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -756,9 +760,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -883,9 +887,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -928,9 +932,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -968,17 +972,27 @@
       }
     },
     {
-      "name": "pyright",
-      "version": "1.1.411",
+      "name": "pyrefly",
+      "version": "1.1.1",
       "license": "MIT",
-      "source_url": "https://registry.npmjs.org/pyright/-/pyright-1.1.411.tgz",
-      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
-      "executable": "bin/pyright-langserver",
-      "executable_sha256": "c2baca27bbdfaab86805c598b66c3519effdf8a654dfdbf941443e63000ea1e8",
-      "command": "pyright-langserver",
+      "source_url": "https://files.pythonhosted.org/packages/71/47/7a3457dbbddb513a83cf4fe527d5d5ebda5201a1010ad2a6034030e3e358/pyrefly-1.1.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact": "pyrefly-1.1.1-py3-none-macosx_11_0_arm64.whl",
+      "artifact_sha256": "d6b238e1362622d47a6eb5af704fd8b613c94e8c303386efd6350e3da59fecc8",
+      "executable": "bin/pyrefly",
+      "executable_sha256": "d471718bb618c4e6e7c30549da6efdd8eca8abea138dc1dec1524564bc4da396",
+      "command": "pyrefly",
       "args": [
-        "--stdio"
+        "lsp",
+        "--verbose",
+        "--indexing-mode",
+        "lazy-blocking",
+        "--threads",
+        "1",
+        "--workspace-indexing-limit",
+        "5000",
+        "--build-system-blocking",
+        "--color",
+        "never"
       ],
       "languages": [
         "python"
@@ -993,30 +1007,31 @@
         "sample"
       ],
       "expected_capabilities": [
-        "textDocument/documentSymbol"
+        "textDocument/documentSymbol",
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/prepareCallHierarchy",
+        "callHierarchy/incomingCalls",
+        "callHierarchy/outgoingCalls"
       ],
       "platform": {
         "os": "macos",
         "architecture": "arm64"
       },
-      "runtime_dependencies": [
-        "node-22.12.0",
-        "python-3.12.13"
-      ],
+      "runtime_dependencies": [],
       "install": {
-        "kind": "tar",
-        "destination": "servers",
-        "member": ""
+        "kind": "zip-member",
+        "destination": "bin/pyrefly",
+        "member": "pyrefly-1.1.1.data/scripts/pyrefly"
       },
       "launcher": {
-        "kind": "node",
-        "target": "servers/issue785-node-bundle/node_modules/pyright/langserver.index.js"
+        "kind": "direct",
+        "target": "bin/pyrefly"
       },
       "probe": {
         "file_name": "probe.py",
         "language_id": "python",
-        "operation": "textDocument/documentSymbol",
-        "configuration": {}
+        "operation": "textDocument/documentSymbol"
       }
     },
     {
@@ -1025,7 +1040,7 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-config-language-server",
       "executable_sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651",
       "command": "rna-config-language-server",
@@ -1078,9 +1093,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -1123,9 +1138,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -1168,9 +1183,9 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-cohort-language-server",
-      "executable_sha256": "79c08db0ee2140298df57f94a8aa20c974bd71dee2f521fc5148a769f3ff617a",
+      "executable_sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce",
       "command": "rna-cohort-language-server",
       "args": [
         "--language",
@@ -1213,7 +1228,7 @@
       "license": "MIT",
       "source_url": "https://github.com/open-horizon-labs/repo-native-alignment",
       "artifact": "rna-cohort-servers-1.0.0.tar.gz",
-      "artifact_sha256": "7eb1057c2bef279cca5917bdb2bf583a7cbbf526938fbab0837380ed52af696c",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
       "executable": "bin/rna-config-language-server",
       "executable_sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651",
       "command": "rna-config-language-server",
@@ -1302,7 +1317,7 @@
       "license": "Apache-2.0",
       "source_url": "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-5.3.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/typescript-language-server",
       "executable_sha256": "191f7bad6b4f6ca943bebf76caa9fa486bb790333cba087b345edd176e114d66",
       "command": "typescript-language-server",
@@ -1347,7 +1362,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-css-language-server",
       "executable_sha256": "f9bacb87b974f1e72efbdf255829c08f0ab6f2e9372c5a102f2cb726ec8de51c",
       "command": "vscode-css-language-server",
@@ -1392,7 +1407,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-html-language-server",
       "executable_sha256": "8ff58f1bf4033168558b3d46e47a2eb59804203aa33ff8fc52ccedbd717d7b86",
       "command": "vscode-html-language-server",
@@ -1440,7 +1455,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/vscode-langservers-extracted/-/vscode-langservers-extracted-4.10.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-json-language-server",
       "executable_sha256": "c5417bff21eb9f0313e66ac114030ff2e389927cb69bf8d9ce7b1cb02425873e",
       "command": "vscode-json-language-server",
@@ -1485,7 +1500,7 @@
       "license": "MIT",
       "source_url": "https://registry.npmjs.org/yaml-language-server/-/yaml-language-server-1.24.0.tgz",
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
-      "artifact_sha256": "58d0139063401c8f46ffbf5774f839a474fe6fc1d91101fc99b18e677eb49d13",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/yaml-language-server",
       "executable_sha256": "4531cb2ac8e089373282b099e9df1729a7814d2eaeeddcc96bd3aadaa8da290d",
       "command": "yaml-language-server",

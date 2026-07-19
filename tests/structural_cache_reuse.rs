@@ -55,9 +55,9 @@ fn make_server_wrappers(root: &Path) -> (PathBuf, String) {
     let fixture = fixture_path("tests/fixtures/lsp_capability_server.py");
     let fixture = fixture.to_str().expect("fixture path is UTF-8");
     write_executable(
-        &bin.join("pyright-langserver"),
+        &bin.join("pyrefly"),
         &format!(
-            "#!/bin/sh\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'fixture-pyright 1.0'; exit 0; fi\nexec python3 \"{fixture}\" python_features\n"
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'fixture-pyrefly 1.1.1'; exit 0; fi\nexec python3 \"{fixture}\" python_features\n"
         ),
     );
     write_executable(
@@ -383,11 +383,13 @@ async fn verified_cache_chain_reuses_then_incrementally_refreshes_real_persisted
 
     let cold = clone_at(root, "cold", &history.bare, &history.base);
     let cold_report = scan_ready(&rna, &cold, &fixture_path_env, "tests/test_app.py", None);
-    assert!(
-        cold_report["readiness_validation_requests_by_language"]["python"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        cold_report["readiness_validation_requests_by_language"]["python"], 7,
+        "six Python file probes plus one workspace probe"
+    );
+    assert_eq!(
+        cold_report["readiness_validation_requests_by_language"]["toml"], 1,
+        "the TOML warm-up document probe covers pyproject.toml"
     );
     assert!(
         cold_report["evidence"]
@@ -427,11 +429,9 @@ async fn verified_cache_chain_reuses_then_incrementally_refreshes_real_persisted
             .unwrap()
             > 0
     );
-    assert!(
-        identical_execution["inherited_readiness_validation_request_count"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        identical_execution["inherited_readiness_validation_request_count"], 8,
+        "an identical target inherits every file and partition-level readiness probe"
     );
     assert_eq!(
         identical_execution["executed_readiness_validation_request_count"],
@@ -475,17 +475,13 @@ async fn verified_cache_chain_reuses_then_incrementally_refreshes_real_persisted
             .unwrap()
             > 0
     );
-    assert!(
-        changed_execution["inherited_readiness_validation_request_count"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        changed_execution["inherited_readiness_validation_request_count"], 5,
+        "four unchanged Python files and pyproject.toml remain inherited; execution-path validations and the mixed Python partition's workspace probe are not counted as inherited"
     );
-    assert!(
-        changed_execution["executed_readiness_validation_request_count"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        changed_execution["executed_readiness_validation_request_count"], 2,
+        "the changed Python file and fresh workspace probe execute; the unchanged impact-closure file keeps its verifier-bound document response"
     );
     assert_fresh_graph_has_no_path(&changed, "does/not/exist.py").await;
     let (changed_archive, changed_sidecar) =
@@ -519,8 +515,15 @@ async fn verified_cache_chain_reuses_then_incrementally_refreshes_real_persisted
         "tests/test_renamed.py",
     );
     let invalidated = string_set(&configured_execution["invalidated_partitions"]);
-    assert!(invalidated.contains("python"));
-    assert!(invalidated.contains("toml"));
+    assert_eq!(
+        invalidated,
+        BTreeSet::from(["cython".to_string(), "python".to_string()]),
+        "pyproject.toml owns Python/Cython project state; the changed TOML file is executed without invalidating unrelated TOML documents"
+    );
+    assert!(
+        string_set(&configured_execution["executed_paths"]).contains("pyproject.toml"),
+        "the changed owner configuration must itself be executed"
+    );
     assert!(
         configured_execution["executed_graph_enrichment_operation_count"]
             .as_u64()

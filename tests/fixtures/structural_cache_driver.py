@@ -79,15 +79,13 @@ def inject(args: argparse.Namespace) -> dict[str, object]:
         diff = TOOLCHAIN._git_diff_paths(
             args.git_dir, core["commit"], identity["commit"]
         )
-        invalidate_all = core["shared_influence_digest"] != identity[
-            "shared_influence_digest"
-        ]
-        invalidated = sorted(
-            language
-            for language, signature in core["partition_signatures"].items()
-            if invalidate_all
-            or language not in identity["partitions"]
-            or identity["partitions"][language]["signature"] != signature
+        (
+            invalidated,
+            compatible,
+            invalidation_reasons,
+        ) = TOOLCHAIN._partition_invalidation_plan(
+            core,
+            identity,
         )
         selection = {
             "entry": {
@@ -97,6 +95,8 @@ def inject(args: argparse.Namespace) -> dict[str, object]:
             "verified": verified,
             "diff": diff,
             "invalidated_partitions": invalidated,
+            "compatible_partitions": compatible,
+            "invalidated_partition_reasons": invalidation_reasons,
         }
         return TOOLCHAIN.inject_structural_cache(
             selection,

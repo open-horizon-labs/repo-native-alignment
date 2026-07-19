@@ -18,6 +18,7 @@ pub(crate) use graph::SUBSYSTEM_KEY;
 
 // Re-export public API so external `use crate::server::X` still works.
 pub use enrichment::EnrichmentContinuation;
+pub(crate) use enrichment::purge_existing_scoped_lsp_output;
 pub use enrichment_jobs::{
     BroadReferenceBudget, EmbeddingEnrichmentMode, EnrichmentCapability, EnrichmentJobLedger,
     EnrichmentJobRecord, EnrichmentJobState, EnrichmentScope, EnrichmentTrigger, JobStart,

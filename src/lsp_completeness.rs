@@ -1287,7 +1287,32 @@ pub fn build_and_persist_report(
 ) -> Result<LspCompletenessReport> {
     let inheritance = crate::structural_cache::load_verified_authorization(repo_root)?;
     let execution = crate::structural_cache::load_execution(repo_root)?;
-    match (&inheritance, &execution) {
+    build_and_persist_report_from_evidence(
+        repo_root,
+        context_mode,
+        nodes,
+        edges,
+        lsp_entries,
+        related_job_ids,
+        scan_started_at_ms,
+        inheritance.as_ref(),
+        execution.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_and_persist_report_from_evidence(
+    repo_root: &Path,
+    context_mode: BusinessContextMode,
+    nodes: &[Node],
+    edges: &[Edge],
+    lsp_entries: &[LspEnrichmentEntry],
+    related_job_ids: &[String],
+    scan_started_at_ms: u64,
+    inheritance: Option<&crate::structural_cache::VerifiedStructuralCacheAuthorization>,
+    execution: Option<&crate::structural_cache::StructuralCacheExecution>,
+) -> Result<LspCompletenessReport> {
+    match (inheritance, execution) {
         (Some(authorization), Some(execution)) => {
             if execution.base_archive_sha256 != authorization.authorization.base_archive_sha256
                 || execution.base_sidecar_sha256 != authorization.authorization.base_sidecar_sha256
@@ -1334,8 +1359,8 @@ pub fn build_and_persist_report(
         lsp_entries,
         &work_items,
         &jobs,
-        inheritance.as_ref(),
-        execution.as_ref(),
+        inheritance,
+        execution,
     )?;
     persist_report(repo_root, &report)?;
     Ok(report)
@@ -1516,6 +1541,25 @@ fn build_report(
             work_by_path.entry(path).or_default().push(item);
         }
     }
+    let mut result_producers = validation_result_producers(jobs);
+    for item in work_items
+        .iter()
+        .filter(|item| item.state == LspWorkItemState::Completed)
+    {
+        let Ok(path) = normalize_repo_relative_path(&item.file) else {
+            continue;
+        };
+        let producer_id = format!("{}:{}", item.job_id, item.item_id);
+        let mut result_ids = item.produced_result_ids.clone();
+        result_ids.extend(item.output_edges.iter().map(Edge::stable_id));
+        result_ids.extend(item.output_nodes.iter().map(Node::stable_id));
+        for result_id in result_ids {
+            result_producers
+                .entry((path.clone(), result_id))
+                .or_default()
+                .insert(producer_id.clone());
+        }
+    }
     let mut entries_by_language: BTreeMap<&str, Vec<&LspEnrichmentEntry>> = BTreeMap::new();
     for entry in lsp_entries {
         entries_by_language
@@ -1559,23 +1603,18 @@ fn build_report(
             .or_default() += 1;
     }
     if let (Some(inheritance), Some(execution)) = (inheritance, execution) {
-        let inherited_languages = execution
+        let inherited_paths = execution
             .inherited_paths
             .iter()
-            .filter_map(|path| inheritance.inherited_by_path.get(path))
-            .map(|file| file.language.as_str())
+            .map(PathBuf::from)
             .collect::<BTreeSet<_>>();
-        let mut inherited_request_count = 0_u64;
-        for (language, count) in &inheritance
-            .base_report
-            .readiness_validation_requests_by_language
-        {
-            if inherited_languages.contains(language.as_str()) {
-                inherited_request_count += count;
-                *readiness_validation_requests_by_language
-                    .entry(language.clone())
-                    .or_default() += count;
-            }
+        let inherited_requests =
+            inheritance.inherited_readiness_validation_requests_by_language(&inherited_paths)?;
+        let inherited_request_count = inherited_requests.values().sum::<u64>();
+        for (language, count) in inherited_requests {
+            *readiness_validation_requests_by_language
+                .entry(language)
+                .or_default() += count;
         }
         let executed_request_count = jobs
             .iter()
@@ -1586,7 +1625,13 @@ fn build_report(
         if inherited_request_count != execution.inherited_readiness_validation_request_count
             || executed_request_count != execution.executed_readiness_validation_request_count
         {
-            anyhow::bail!("structural cache readiness-validation request accounting mismatch");
+            anyhow::bail!(
+                "structural cache readiness-validation request accounting mismatch: \
+                 inherited report={inherited_request_count} execution={}, \
+                 executed report={executed_request_count} execution={}",
+                execution.inherited_readiness_validation_request_count,
+                execution.executed_readiness_validation_request_count,
+            );
         }
     }
     let mut files = Vec::with_capacity(paths.len());
@@ -1741,16 +1786,6 @@ fn build_report(
             jobs,
             &validations,
         );
-        let producer_ids = records
-            .iter()
-            .map(|record| format!("{}:{}", record.job_id, record.item_id))
-            .chain(
-                jobs.iter()
-                    .map(|job| format!("enrichment-job:{}", job.job_id)),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
         evidence.push(LspFileEvidence {
             path: normalized.clone(),
             disposition: LspEvidenceDisposition::Executed,
@@ -1783,7 +1818,12 @@ fn build_report(
                 .map(
                     |result_id| crate::structural_cache::InheritedResultProducer {
                         result_id: result_id.clone(),
-                        producer_ids: producer_ids.clone(),
+                        producer_ids: result_producers
+                            .get(&(normalized.clone(), result_id.clone()))
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
                     },
                 )
                 .collect(),
@@ -2074,6 +2114,43 @@ fn job_validations_for_language<'a>(
         .flat_map(|evidence| evidence.validations.iter())
         .filter(|validation| validation.language == language)
         .collect()
+}
+
+pub(crate) fn validation_result_producers(
+    jobs: &[EnrichmentJobRecord],
+) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut producers = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for job in jobs.iter().filter(|job| {
+        job.state == EnrichmentJobState::Completed
+            && job.capability == EnrichmentCapability::CallReferences
+    }) {
+        let producer_id = format!("enrichment-job:{}", job.job_id);
+        for symbol in job
+            .lsp_evidence
+            .as_ref()
+            .into_iter()
+            .flat_map(|evidence| evidence.validations.iter())
+            .filter(|validation| validation.status == LspValidationStatus::Processed)
+            .flat_map(|validation| validation.document_symbols.iter())
+        {
+            let (Some(path), Some(result_id)) =
+                (symbol.file.as_deref(), symbol.graph_result_id.as_deref())
+            else {
+                continue;
+            };
+            let Ok(path) = normalize_repo_relative_path(path) else {
+                continue;
+            };
+            if result_id.is_empty() {
+                continue;
+            }
+            producers
+                .entry((path, result_id.to_string()))
+                .or_default()
+                .insert(producer_id.clone());
+        }
+    }
+    producers
 }
 
 fn validation_applies_to_path(
@@ -3085,6 +3162,34 @@ mod tests {
             "schema_version": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn incremental_report_must_include_pass1_job_ids_to_retain_target_work() {
+        let records = vec![
+            LspWorkItemRecord {
+                job_id: "lsp-pass1-a".to_string(),
+                item_id: 0,
+                state: LspWorkItemState::Completed,
+                ..Default::default()
+            },
+            LspWorkItemRecord {
+                job_id: "lsp-pass1-b".to_string(),
+                item_id: 0,
+                state: LspWorkItemState::Completed,
+                ..Default::default()
+            },
+        ];
+        let enrichment_only = BTreeSet::from(["call_references-target"]);
+        assert!(
+            filter_work_items_for_related_jobs(records.clone(), &enrichment_only).is_empty(),
+            "the retained case-2 enrichment job ID cannot name pass1 work records"
+        );
+        let complete = BTreeSet::from(["call_references-target", "lsp-pass1-a", "lsp-pass1-b"]);
+        assert_eq!(
+            filter_work_items_for_related_jobs(records, &complete).len(),
+            2
+        );
     }
 
     fn included(path: &str, status: FileTerminalStatus) -> FileCoverageRecord {
@@ -4599,7 +4704,7 @@ mod tests {
     #[test]
     fn durable_validation_is_request_and_capability_evidence() {
         let validation =
-            LspValidationEvidence::processed("python", "pyright", "workspace/symbol", 2)
+            LspValidationEvidence::processed("python", "pyrefly", "workspace/symbol", 2)
                 .with_negotiated_capabilities(
                     crate::extract::scan_stats::LspNegotiatedCapabilities {
                         references_provider: true,

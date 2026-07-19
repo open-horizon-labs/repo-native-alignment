@@ -4,7 +4,7 @@
 //! JSON-RPC messages over stdin/stdout, and uses `textDocument/references`
 //! and `textDocument/implementation` to discover cross-file edges.
 //!
-//! Supports multiple language servers (rust-analyzer, pyright, typescript-language-server,
+//! Supports multiple language servers (rust-analyzer, pyrefly, typescript-language-server,
 //! gopls, marksman) via the same generic `LspEnricher` struct.
 //!
 //! Design decisions:
@@ -156,10 +156,99 @@ impl BuiltinLspDescriptor {
     }
 }
 
-fn python_init_settings() -> serde_json::Value {
+fn cyright_init_settings() -> serde_json::Value {
     serde_json::json!({
         "python": { "analysis": { "autoSearchPaths": true } }
     })
+}
+
+/// Describe the standard LSP operations RNA's generic client can actually consume.
+///
+/// Servers are free to shape responses based on these declarations. Keeping the
+/// fields absent while issuing the corresponding requests can therefore suppress
+/// otherwise valid results (notably hierarchical document symbols and cross-file
+/// reference/call-hierarchy results). This stays language-agnostic: server
+/// capabilities still decide which operations RNA schedules for a particular
+/// repository.
+fn lsp_client_capabilities() -> ClientCapabilities {
+    let static_registration = lsp_types::DynamicRegistrationClientCapabilities {
+        dynamic_registration: Some(false),
+    };
+    let goto = lsp_types::GotoCapability {
+        dynamic_registration: Some(false),
+        link_support: Some(true),
+    };
+
+    ClientCapabilities {
+        workspace: Some(lsp_types::WorkspaceClientCapabilities {
+            symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            configuration: Some(true),
+            workspace_folders: Some(true),
+            ..Default::default()
+        }),
+        text_document: Some(lsp_types::TextDocumentClientCapabilities {
+            synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            references: Some(static_registration),
+            document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
+            }),
+            definition: Some(goto),
+            implementation: Some(goto),
+            code_action: Some(lsp_types::CodeActionClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            document_link: Some(lsp_types::DocumentLinkClientCapabilities {
+                dynamic_registration: Some(false),
+                tooltip_support: Some(false),
+            }),
+            publish_diagnostics: Some(Default::default()),
+            call_hierarchy: Some(static_registration),
+            type_hierarchy: Some(static_registration),
+            inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            diagnostic: Some(lsp_types::DiagnosticClientCapabilities {
+                dynamic_registration: Some(false),
+                related_document_support: Some(false),
+            }),
+            ..Default::default()
+        }),
+        window: Some(lsp_types::WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..Default::default()
+        }),
+        // Declare support for experimental/serverStatus notifications.
+        // Without this, rust-analyzer won't send serverStatus and the
+        // readiness wait falls through to a timeout, sending queries
+        // while the server is still indexing (producing 0 edges).
+        experimental: Some(serde_json::json!({
+            "serverStatusNotification": true
+        })),
+        ..Default::default()
+    }
+}
+
+#[allow(deprecated)] // root_uri is retained for servers predating workspace folders.
+fn lsp_initialize_params(root_uri: Uri, workspace_name: String) -> InitializeParams {
+    InitializeParams {
+        root_uri: Some(root_uri.clone()),
+        workspace_folders: Some(vec![lsp_types::WorkspaceFolder {
+            uri: root_uri,
+            name: workspace_name,
+        }]),
+        capabilities: lsp_client_capabilities(),
+        ..Default::default()
+    }
 }
 
 macro_rules! builtin_lsp {
@@ -194,7 +283,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ..builtin_lsp!("rust", "rust-analyzer", &[], &["rs"])
     },
     BuiltinLspDescriptor {
-        init_settings: Some(python_init_settings),
+        init_settings: None,
         config_file: Some("pyproject.toml"),
         partition_influence_patterns: &[
             "setup.py",
@@ -207,13 +296,25 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ],
         ..builtin_lsp!(
             "python",
-            "pyright-langserver",
-            &["--stdio"],
+            "pyrefly",
+            &[
+                "lsp",
+                "--verbose",
+                "--indexing-mode",
+                "lazy-blocking",
+                "--threads",
+                "1",
+                "--workspace-indexing-limit",
+                "5000",
+                "--build-system-blocking",
+                "--color",
+                "never"
+            ],
             &["py", "pyi", "py-tpl", "py_t", "bench"]
         )
     },
     BuiltinLspDescriptor {
-        init_settings: Some(python_init_settings),
+        init_settings: Some(cyright_init_settings),
         config_file: Some("pyproject.toml"),
         partition_influence_patterns: &[
             "setup.py",
@@ -838,7 +939,7 @@ pub(crate) fn builtin_lsp_enricher(language: &str) -> Option<LspEnricher> {
 /// and trait/interface implementations.
 ///
 /// Generic over the language server binary — the same struct handles
-/// rust-analyzer, pyright, typescript-language-server, gopls, and marksman.
+/// rust-analyzer, pyrefly, typescript-language-server, gopls, and marksman.
 pub struct LspEnricher {
     /// Language identifier (e.g., "rust", "python").
     language: String,
@@ -846,7 +947,7 @@ pub struct LspEnricher {
     language_static: &'static [&'static str],
     /// Display name for logging (e.g., "rust-analyzer-lsp").
     display_name: String,
-    /// Command to spawn (e.g., "rust-analyzer", "pyright-langserver").
+    /// Command to spawn (e.g., "rust-analyzer", "pyrefly").
     server_command: String,
     /// Arguments to pass to the server (e.g., ["--stdio"]).
     server_args: Vec<String>,
@@ -898,7 +999,7 @@ struct LspState {
     /// Whether the language server supports callHierarchy requests
     /// (`textDocument/prepareCallHierarchy`, LSP 3.16+).
     /// When false, fall back to `textDocument/references` for function edges.
-    /// Pyright supports references but not callHierarchy.
+    /// Some servers support references but not callHierarchy.
     has_call_hierarchy: bool,
     /// Whether the language server supports textDocument/implementation.
     has_implementation: bool,
@@ -937,8 +1038,8 @@ const MAX_TYPE_HIERARCHY_STRIKES: u32 = 3;
 
 /// After processing this many nodes with zero edges, abort enrichment.
 /// A functioning language server should produce at least some edges within
-/// the first 1,000 nodes; zero edges indicates misconfiguration (e.g., pyright
-/// without a venv, or a server that can't resolve any references).
+/// the first 1,000 nodes; zero edges indicates a server that cannot resolve any
+/// references in the selected workspace.
 const ZERO_EDGE_ABORT_THRESHOLD: u32 = 1_000;
 
 /// Minimum warmup time before the node-count abort can fire.
@@ -950,8 +1051,8 @@ const ZERO_EDGE_ABORT_THRESHOLD: u32 = 1_000;
 const ZERO_EDGE_MIN_WARMUP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Time-based abort: if no edges after this duration, abort enrichment.
-/// On slow LSP servers (e.g., pyright without warm cache), reaching the
-/// node-count threshold can take 100+ minutes. This caps the wait at 2 minutes.
+/// On slow LSP servers, reaching the node-count threshold can take 100+ minutes.
+/// This caps the wait at 2 minutes.
 const ZERO_EDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 const READINESS_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
@@ -1515,7 +1616,7 @@ impl LspEnricher {
     /// Create a new LSP enricher for the given language server.
     ///
     /// - `language`: language identifier (e.g., "rust", "python")
-    /// - `command`: binary to spawn (e.g., "rust-analyzer", "pyright-langserver")
+    /// - `command`: binary to spawn (e.g., "rust-analyzer", "pyrefly")
     /// - `args`: command-line arguments (e.g., &["--stdio"])
     /// - `extensions`: file extensions this enricher handles (e.g., &["rs"])
     pub fn new(language: &str, command: &str, args: &[&str], _extensions: &[&str]) -> Self {
@@ -2178,36 +2279,16 @@ impl LspEnricher {
         // Send initialize request using the startup root as rootUri.
         let root_uri = path_to_uri(startup_root)?;
 
-        #[allow(deprecated)] // root_uri is deprecated in favor of workspace_folders
-        let mut init_params = InitializeParams {
-            root_uri: Some(root_uri),
-            capabilities: ClientCapabilities {
-                window: Some(lsp_types::WindowClientCapabilities {
-                    work_done_progress: Some(true),
-                    ..Default::default()
-                }),
-                // Declare support for experimental/serverStatus notifications.
-                // Without this, rust-analyzer won't send serverStatus and the
-                // readiness wait falls through to a timeout, sending queries
-                // while the server is still indexing (producing 0 edges).
-                experimental: Some(serde_json::json!({
-                    "serverStatusNotification": true
-                })),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let workspace_name = startup_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| startup_root.to_string_lossy().into_owned());
+        let mut init_params = lsp_initialize_params(root_uri, workspace_name);
 
-        // Apply per-language initialization settings if provided.
-        // For pyright, augment with venvPath + venv when a virtual environment exists at
-        // startup_root, so pyright can resolve installed packages and produce call edges.
-        // Without this, pyright produces 0 edges on projects that use poetry/venv.
-        //
-        // Checks common venv directory names in priority order: .venv, venv, env.
-        // Build effective initialization settings.
-        // If the LangConfig declares venv_candidates, detect a virtual environment
-        // at startup_root and inject venvPath + venv so the LSP server can resolve
-        // installed packages.
+        // Apply per-language initialization settings if provided. Descriptors
+        // whose LangConfig declares venv_candidates receive the Python-analysis
+        // venvPath/venv settings expected by that server family.
         let lang_config = crate::extract::configs::config_for_language(&self.language);
         let effective_settings =
             if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
@@ -2266,9 +2347,11 @@ impl LspEnricher {
         if let Some(ref settings) = effective_settings {
             init_params.initialization_options = Some(settings.clone());
         }
+        let workspace_configuration = effective_settings.unwrap_or_else(|| serde_json::json!({}));
 
         let init_result = {
             let transport = state.transport.as_mut().unwrap();
+            transport.set_workspace_configuration(workspace_configuration.clone());
             transport.request("initialize", &init_params).await?
         };
 
@@ -2281,9 +2364,8 @@ impl LspEnricher {
             .unwrap_or(false);
 
         // Check call hierarchy provider (LSP 3.16+, "callHierarchyProvider").
-        // Pyright supports textDocument/references but NOT callHierarchy.
-        // Without this check, we'd send prepareCallHierarchy to pyright and get
-        // errors on every request, producing 0 edges.
+        // Without this check, RNA could send prepareCallHierarchy to a server
+        // that only supports references and turn every request into an error.
         let has_call_hierarchy = init_result
             .pointer("/capabilities/callHierarchyProvider")
             .map(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
@@ -2351,10 +2433,16 @@ impl LspEnricher {
         transport
             .notify("initialized", serde_json::json!({}))
             .await?;
+        transport
+            .notify(
+                "workspace/didChangeConfiguration",
+                serde_json::json!({"settings": workspace_configuration}),
+            )
+            .await?;
 
         // Send didOpen for a representative source file to create a project
         // context. tsserver requires at least one open file before it creates
-        // a project; pyright uses it to trigger import-graph indexing.
+        // a project; several servers use it to trigger workspace indexing.
         // Save the URI for use as a documentSymbol validation fallback.
         let warmup_uri: Option<String> = if let Some(warmup_path) = warmup_path {
             let uri_str = path_to_uri(warmup_path).ok().map(|u| u.to_string());
@@ -2403,12 +2491,12 @@ impl LspEnricher {
         // Strategy (adaptive, no fixed timeout):
         //
         // 1. If the server sends `experimental/serverStatus`, wait indefinitely
-        //    for `quiescent=true`. This is the correct signal — pyright on a 22k-node
-        //    repo may need minutes. The old 30s hard timeout fired before pyright
+        //    for `quiescent=true`. This is the correct signal — large workspaces
+        //    may need minutes. The old 30s hard timeout fired before indexing
         //    finished, producing 193 errors and 0 call edges.
         //
         // 2. If `serverStatus` never arrives (e.g. typescript-language-server,
-        //    pyright), use a two-phase probe strategy:
+        //    that do not expose quiescence), use a two-phase probe strategy:
         //
         //    Phase A (responsiveness): probe every 5s with workspace/symbol("")
         //    until 2 consecutive successes confirm the server is alive.
@@ -2421,7 +2509,7 @@ impl LspEnricher {
         //    responses on different queries, the server is declared "responsive
         //    but not indexed" and Passes 1/3 are skipped.
         //
-        //    This fixes the #576 regression where pyright and tsserver responded
+        //    This fixes the #576 regression where some servers responded
         //    to probes within 5s but hadn't indexed the workspace, producing
         //    0 edges from thousands of nodes.
         //
@@ -2491,6 +2579,9 @@ impl LspEnricher {
 
             match tokio::time::timeout(msg_timeout, transport.read_message()).await {
                 Ok(Ok(msg)) => {
+                    if transport.respond_to_server_request(&msg).await? {
+                        continue;
+                    }
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                         match method {
                             // rust-analyzer's readiness signal
@@ -2547,17 +2638,6 @@ impl LspEnricher {
                                     "{} not yet ready, continuing to wait for indexing...",
                                     self.server_command
                                 );
-                            }
-                            // Respond to progress create requests (required by protocol)
-                            "window/workDoneProgress/create" => {
-                                if let Some(id) = msg.get("id") {
-                                    let response = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": id,
-                                        "result": null
-                                    });
-                                    let _ = transport.send_message(&response).await;
-                                }
                             }
                             "$/progress" => {
                                 // Log progress for debugging but don't use it for readiness
@@ -2691,7 +2771,7 @@ impl LspEnricher {
         // Indexing validation for probe-based servers (no serverStatus).
         //
         // "Server responds to requests" != "server has finished indexing."
-        // pyright and typescript-language-server respond to workspace/symbol
+        // Several servers respond to workspace/symbol
         // within 5s but may not have indexed a single file yet. On large
         // repos this produces 0 edges from thousands of nodes.
         //
@@ -2719,7 +2799,7 @@ impl LspEnricher {
                 let query = VALIDATION_QUERIES[((attempt - 1) as usize) % VALIDATION_QUERIES.len()];
 
                 // Drain any pending notifications before sending the validation request.
-                // Some servers (pyright) may send progress or diagnostic notifications
+                // Some servers may send progress or diagnostic notifications
                 // that need to be consumed to avoid transport deadlock.
                 while let Ok(Ok(msg)) = tokio::time::timeout(
                     tokio::time::Duration::from_millis(100),
@@ -2727,18 +2807,11 @@ impl LspEnricher {
                 )
                 .await
                 {
-                    // Handle workDoneProgress/create requests during drain
+                    if transport.respond_to_server_request(&msg).await? {
+                        continue;
+                    }
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                        if method == "window/workDoneProgress/create" {
-                            if let Some(id) = msg.get("id") {
-                                let response = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": null
-                                });
-                                let _ = transport.send_message(&response).await;
-                            }
-                        } else if method == "$/progress" {
+                        if method == "$/progress" {
                             let kind = msg
                                 .pointer("/params/value/kind")
                                 .and_then(|k| k.as_str())
@@ -2834,7 +2907,7 @@ impl LspEnricher {
                 // After consecutive empty responses on different queries,
                 // the server may not have finished indexing yet. Only bail
                 // early if we've waited at least 60s — large Python/TS projects
-                // (27k+ nodes) genuinely need this long for pyright to index.
+                // (27k+ nodes) genuinely need this long for a server to index.
                 if consecutive_empty >= 3 && attempt >= 3 && elapsed >= 60 {
                     tracing::warn!(
                         "{} indexing validation failed: {} consecutive empty responses across different queries — \
@@ -2888,7 +2961,7 @@ impl LspEnricher {
         // that do NOT support serverStatus use the probe path: they are quiescent
         // only when `server_ready=true` (probe + indexing validation both passed).
         // This ensures a server that responded to probes but returned 0 symbols
-        // on validation (e.g., pyright before indexing completes) is NOT treated
+        // on validation before indexing completes is NOT treated
         // as quiescent — Pass 1 and Pass 3 would produce 0 edges.
         state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
         state.validation_evidence = Some(
@@ -3914,7 +3987,7 @@ impl LspEnricher {
     /// Request `textDocument/inlayHint` for a file range and return a compact
     /// string of inferred type names suitable for embedding.
     ///
-    /// Supported by: rust-analyzer, TypeScript LS, Pyright, gopls.
+    /// Supported by: rust-analyzer, TypeScript LS, Pyrefly, gopls.
     async fn inlay_hints_for_file(
         transport: &PipelinedTransport,
         file_uri: &Uri,
@@ -5207,7 +5280,9 @@ mod tests {
             .iter()
             .find(|node| {
                 node.id.file.as_path() == Path::new("src/app.py")
-                    && node.id.name == "generated_target"
+                    && node.id.name == "generated_target@lsp:49:0-50:1"
+                    && node.metadata.get("lsp_name").map(String::as_str)
+                        == Some("generated_target")
                     && node.source == ExtractionSource::Lsp
             })
             .expect("raw endpoint without an extracted node is materialized")
@@ -5523,8 +5598,23 @@ mod tests {
     fn test_builtin_python_factory_applies_lang_config_policy() {
         let python = builtin_lsp_enricher("python").expect("python is a built-in LSP profile");
 
-        assert_eq!(python.server_command, "pyright-langserver");
-        assert_eq!(python.server_args, vec!["--stdio"]);
+        assert_eq!(python.server_command, "pyrefly");
+        assert_eq!(
+            python.server_args,
+            vec![
+                "lsp",
+                "--verbose",
+                "--indexing-mode",
+                "lazy-blocking",
+                "--threads",
+                "1",
+                "--workspace-indexing-limit",
+                "5000",
+                "--build-system-blocking",
+                "--color",
+                "never"
+            ]
+        );
         assert_eq!(python.config_file_hint(), Some("pyproject.toml"));
         let python_kinds = python
             .enrichable_kinds()
@@ -5534,19 +5624,33 @@ mod tests {
         assert!(python_kinds.contains(&NodeKind::Trait));
         assert!(
             !python.allows_declared_const_references(),
-            "Pyright must keep declared-Const references disabled after the #768 probe"
+            "Python declared-Const references remain default-deny without a qualifying probe"
         );
         let rust = builtin_lsp_enricher("rust").expect("rust is a built-in LSP profile");
         assert!(
             rust.allows_declared_const_references(),
             "rust-analyzer cleared the #768 declared-Const yield threshold"
         );
+        assert_eq!(python.init_settings, None);
+        let python_config = crate::extract::configs::config_for_language("python")
+            .expect("Python must retain its LangConfig policy");
+        assert_eq!(python_config.venv_candidates, None);
+
+        let cython = builtin_lsp_enricher("cython").expect("cython is a built-in LSP profile");
+        assert_eq!(cython.server_command, "cyright-langserver");
+        assert_eq!(cython.server_args, vec!["--stdio"]);
+        let cython_config = crate::extract::configs::config_for_language("cython")
+            .expect("Cython must retain its LangConfig policy");
         assert_eq!(
-            python.init_settings,
-            Some(serde_json::json!({
-                "python": { "analysis": { "autoSearchPaths": true } }
-            }))
+            cython_config.venv_candidates,
+            Some(&[".venv", "venv", "env"][..])
         );
+        let cython_kinds = cython
+            .enrichable_kinds()
+            .expect("the shared factory must retain Cython's admission policy");
+        assert_eq!(cython_kinds.len(), 2);
+        assert!(cython_kinds.contains(&NodeKind::Function));
+        assert!(cython_kinds.contains(&NodeKind::Trait));
     }
 
     #[tokio::test]
@@ -5604,10 +5708,27 @@ mod tests {
         assert_eq!(rust.languages(), &["rust"]);
         assert_eq!(rust.name(), "rust-analyzer-lsp");
 
-        let python = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"]);
+        let python = LspEnricher::new(
+            "python",
+            "pyrefly",
+            &[
+                "lsp",
+                "--verbose",
+                "--indexing-mode",
+                "lazy-blocking",
+                "--threads",
+                "1",
+                "--workspace-indexing-limit",
+                "5000",
+                "--build-system-blocking",
+                "--color",
+                "never",
+            ],
+            &["py"],
+        );
         assert_eq!(python.languages(), &["python"]);
-        assert_eq!(python.name(), "pyright-langserver-lsp");
-        assert_eq!(python.server_args, vec!["--stdio"]);
+        assert_eq!(python.name(), "pyrefly-lsp");
+        assert_eq!(python.server_args.len(), 11);
 
         let typescript = LspEnricher::new(
             "typescript",
@@ -5690,8 +5811,8 @@ mod tests {
         )));
         registry.register(Box::new(LspEnricher::new(
             "python",
-            "pyright-langserver",
-            &["--stdio"],
+            "pyrefly",
+            &["lsp"],
             &["py"],
         )));
         registry.register(Box::new(LspEnricher::new(
@@ -5720,126 +5841,10 @@ mod tests {
     /// Verify the with_settings builder works.
     #[test]
     fn test_lsp_enricher_with_settings() {
-        let settings = serde_json::json!({
-            "python": {
-                "analysis": {
-                    "autoSearchPaths": true
-                }
-            }
-        });
-        let enricher = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"])
+        let settings = serde_json::json!({ "fixture": { "enabled": true } });
+        let enricher = LspEnricher::new("fixture", "fixture-lsp", &[], &["fixture"])
             .with_settings(settings.clone());
         assert_eq!(enricher.init_settings, Some(settings));
-    }
-
-    /// Helper: apply the same venv-merge logic as ensure_initialized.
-    fn apply_pyright_venv_settings(
-        base_settings: &serde_json::Value,
-        language: &str,
-        startup_root: &std::path::Path,
-        venv_name: &str, // the venv subdir that "exists" (simulated)
-    ) -> serde_json::Value {
-        if language == "python" {
-            let venv_candidates = [".venv", "venv", "env"];
-            // Simulate: check which candidate would match (first that matches venv_name).
-            if venv_candidates.contains(&venv_name) {
-                let venv_path_str = startup_root.to_string_lossy().to_string();
-                let mut merged = base_settings.clone();
-                if let Some(python_obj) = merged.get_mut("python") {
-                    if let Some(analysis_obj) = python_obj.get_mut("analysis") {
-                        if let Some(obj) = analysis_obj.as_object_mut() {
-                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                            obj.insert(
-                                "venv".into(),
-                                serde_json::Value::String(venv_name.to_string()),
-                            );
-                        }
-                    }
-                }
-                return merged;
-            }
-        }
-        base_settings.clone()
-    }
-
-    /// Verify pyright venv detection logic: when .venv exists at startup_root,
-    /// venvPath and venv should be merged into initializationOptions.
-    #[test]
-    fn test_pyright_venv_detection_merges_dot_venv() {
-        let base_settings = serde_json::json!({
-            "python": { "analysis": { "autoSearchPaths": true } }
-        });
-        let startup_root = std::path::Path::new("/tmp/ai_service");
-
-        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, ".venv");
-
-        assert_eq!(
-            merged["python"]["analysis"]["autoSearchPaths"],
-            serde_json::Value::Bool(true),
-            "autoSearchPaths should be preserved"
-        );
-        assert_eq!(
-            merged["python"]["analysis"]["venvPath"],
-            serde_json::Value::String("/tmp/ai_service".into()),
-            "venvPath should be the startup root"
-        );
-        assert_eq!(
-            merged["python"]["analysis"]["venv"],
-            serde_json::Value::String(".venv".into()),
-            "venv should be .venv"
-        );
-    }
-
-    /// Verify pyright venv detection works for bare `venv/` directory (common with pip).
-    #[test]
-    fn test_pyright_venv_detection_merges_bare_venv() {
-        let base_settings = serde_json::json!({
-            "python": { "analysis": { "autoSearchPaths": true } }
-        });
-        let startup_root = std::path::Path::new("/tmp/myproject");
-
-        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "venv");
-
-        assert_eq!(
-            merged["python"]["analysis"]["venv"],
-            serde_json::Value::String("venv".into()),
-            "venv should be 'venv' for bare venv"
-        );
-        assert_eq!(
-            merged["python"]["analysis"]["venvPath"],
-            serde_json::Value::String("/tmp/myproject".into()),
-        );
-    }
-
-    /// Verify pyright venv detection works for `env/` directory.
-    #[test]
-    fn test_pyright_venv_detection_merges_env() {
-        let base_settings = serde_json::json!({
-            "python": { "analysis": { "autoSearchPaths": true } }
-        });
-        let startup_root = std::path::Path::new("/tmp/myproject");
-
-        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "env");
-
-        assert_eq!(
-            merged["python"]["analysis"]["venv"],
-            serde_json::Value::String("env".into()),
-        );
-    }
-
-    /// Verify pyright venv detection: non-python enrichers are not augmented.
-    #[test]
-    fn test_pyright_venv_detection_skips_non_python() {
-        let base_settings = serde_json::json!({
-            "typescript": { "preferences": {} }
-        });
-        let startup_root = std::path::Path::new("/tmp/client");
-
-        let effective_settings =
-            apply_pyright_venv_settings(&base_settings, "typescript", startup_root, ".venv");
-
-        // TypeScript settings should be unchanged — venv detection only fires for python
-        assert_eq!(effective_settings, base_settings);
     }
 
     /// Verify URI helper functions work correctly.
@@ -6449,7 +6454,7 @@ mod tests {
     /// RNA's real LSP scheduling, telemetry, and edge rendering against maintained
     /// fixtures. Production opt-ins remain separately encoded in built-in profiles.
     #[tokio::test]
-    #[ignore = "requires installed rust-analyzer and pyright-langserver"]
+    #[ignore = "requires installed rust-analyzer and pyrefly"]
     async fn measure_declared_const_reference_yield() {
         use crate::extract::{Extractor, python::PythonExtractor, rust::RustExtractor};
 
@@ -6569,9 +6574,21 @@ mod tests {
             },
             FixtureCase {
                 language: "python",
-                server: "pyright-langserver",
-                args: &["--stdio"],
-                version_command: "pyright",
+                server: "pyrefly",
+                args: &[
+                    "lsp",
+                    "--verbose",
+                    "--indexing-mode",
+                    "lazy-blocking",
+                    "--threads",
+                    "1",
+                    "--workspace-indexing-limit",
+                    "5000",
+                    "--build-system-blocking",
+                    "--color",
+                    "never",
+                ],
+                version_command: "pyrefly",
                 version_args: &["--version"],
                 extension: "py",
                 config_name: "pyproject.toml",
@@ -6645,9 +6662,7 @@ mod tests {
                     .with_declared_const_references(true);
             enricher = match case.language {
                 "rust" => enricher.with_config_file("Cargo.toml"),
-                "python" => enricher
-                    .with_settings(python_init_settings())
-                    .with_config_file("pyproject.toml"),
+                "python" => enricher.with_config_file("pyproject.toml"),
                 _ => enricher,
             };
             let result = enricher
@@ -7013,30 +7028,71 @@ mod tests {
         assert_eq!(edge.confidence, Confidence::Confirmed);
     }
 
-    /// Verify that the initialize request includes experimental.serverStatusNotification.
+    /// Verify that the initialize request truthfully declares the generic LSP
+    /// operations RNA sends and preserves server-status readiness support.
     ///
     /// Without this capability, rust-analyzer won't send serverStatus notifications
     /// and the readiness wait falls through to a 5s timeout, querying before indexing
     /// is complete and producing 0 edges. This was the root cause of issue #293.
     #[test]
-    fn test_init_params_declare_server_status_notification() {
-        // Build the same init params that ensure_initialized() would build
+    fn test_init_params_declare_supported_client_operations() {
         let root_uri = Uri::from_str("file:///tmp/test").unwrap();
-        #[allow(deprecated)]
-        let init_params = InitializeParams {
-            root_uri: Some(root_uri),
-            capabilities: ClientCapabilities {
-                window: Some(lsp_types::WindowClientCapabilities {
-                    work_done_progress: Some(true),
-                    ..Default::default()
-                }),
-                experimental: Some(serde_json::json!({
-                    "serverStatusNotification": true
-                })),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let init_params = lsp_initialize_params(root_uri, "test".to_string());
+        let serialized = serde_json::to_value(&init_params).unwrap();
+
+        assert_eq!(
+            serialized.pointer("/workspaceFolders/0/name"),
+            Some(&serde_json::json!("test"))
+        );
+        assert_eq!(
+            serialized.pointer("/rootUri"),
+            serialized.pointer("/workspaceFolders/0/uri"),
+            "the compatibility rootUri and workspace folder must identify the same root"
+        );
+        assert_eq!(
+            serialized.pointer("/capabilities/workspace/workspaceFolders"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            serialized.pointer("/capabilities/workspace/configuration"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            serialized
+                .pointer("/capabilities/workspace/symbol")
+                .is_some(),
+            "workspace/symbol support must be declared"
+        );
+        assert_eq!(
+            serialized.pointer(
+                "/capabilities/textDocument/documentSymbol/hierarchicalDocumentSymbolSupport"
+            ),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            serialized.pointer("/capabilities/textDocument/documentSymbol/dynamicRegistration"),
+            Some(&serde_json::json!(false))
+        );
+        for operation in [
+            "synchronization",
+            "references",
+            "definition",
+            "implementation",
+            "codeAction",
+            "documentLink",
+            "publishDiagnostics",
+            "callHierarchy",
+            "typeHierarchy",
+            "inlayHint",
+            "diagnostic",
+        ] {
+            assert!(
+                serialized
+                    .pointer(&format!("/capabilities/textDocument/{operation}"))
+                    .is_some(),
+                "textDocument/{operation} support must be declared"
+            );
+        }
 
         // Verify the experimental capability is set
         let experimental = init_params
@@ -7059,7 +7115,7 @@ mod tests {
     /// - Probe succeeds + validation returns 0 symbols → was_quiescent = false
     /// - Probe never succeeds → was_quiescent = false
     ///
-    /// This ensures Pass 1 and Pass 3 are skipped when a server (e.g., pyright,
+    /// This ensures Pass 1 and Pass 3 are skipped when a server
     /// tsserver) responds to probes but hasn't indexed the workspace.
     #[test]
     fn test_was_quiescent_probe_validation_path() {
@@ -7381,7 +7437,7 @@ mod tests {
     ///
     /// The guard is `saw_quiescent || !seen_server_status`:
     /// - saw_quiescent=true (any health): done indexing → Run Pass 3
-    /// - seen_server_status=false: no serverStatus (pyright etc.) → assumed ready → Run Pass 3
+    /// - seen_server_status=false: no serverStatus → assumed ready → Run Pass 3
     /// - saw_quiescent=false, seen_server_status=true: RA timed out → SKIP Pass 3
     ///
     /// Note: `saw_quiescent` tracks the raw `quiescent=true` bit, not `server_ready`
@@ -7647,7 +7703,7 @@ mod tests {
             &diags,
             &root,
             "/project",
-            "pyright-langserver",
+            "pyrefly",
             "python",
             "1700000000",
             2,

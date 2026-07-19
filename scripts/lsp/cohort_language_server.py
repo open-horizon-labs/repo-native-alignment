@@ -11,7 +11,7 @@ import argparse
 import json
 import re
 import sys
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO
 
 
 VERSION = "1.0.0"

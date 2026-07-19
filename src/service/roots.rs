@@ -388,7 +388,7 @@ fn lsp_server_relevant_for_languages(
 ) -> bool {
     let relevant_langs: &[&str] = match server {
         "rust-analyzer" => &["rust"],
-        "pyright-langserver" => &["python"],
+        "pyrefly" => &["python"],
         "typescript-language-server" => &["typescript", "javascript"],
         "gopls" => &["go"],
         "clangd" => &["c", "cpp", "c++"],
@@ -829,8 +829,8 @@ mod tests {
         let result =
             list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None, None);
         let roots_section = result
-            .split("\n## Recent Operations")
-            .next()
+            .split_once("\n## ")
+            .map(|(section, _)| section)
             .unwrap_or(&result);
         assert!(
             !result.contains("Last scan:"),
@@ -935,35 +935,29 @@ mod tests {
         let mut active_slugs = std::collections::HashSet::new();
         active_slugs.insert(primary_slug.clone());
 
-        // Only rust nodes — pyright should NOT appear
+        // Only rust nodes — Pyrefly should NOT appear
         let nodes = vec![make_node_for_root(&primary_slug, "rust")];
         let gs = make_test_graph_state(nodes, vec![]);
 
         let lsp = crate::server::state::LspEnrichmentStatus::default();
-        // Simulate: rust-analyzer found, pyright-langserver missing
+        // Simulate: rust-analyzer found, Pyrefly missing
         lsp.set_server_name("rust-analyzer");
         lsp.set_server_found();
         // Manually set missing servers via the public API (only missing servers relevant for current langs)
-        // We test by confirming pyright doesn't show up for a rust-only root.
+        // We test by confirming Pyrefly doesn't show up for a rust-only root.
         // But we need to actually have the missing_servers populated.
-        // Use a fresh status with only pyright as missing (simulate via probe_for_servers won't work in test).
+        // Use a fresh status with only Pyrefly as missing (simulate via probe_for_servers won't work in test).
         // Instead, just verify the filtering function directly:
         let rust_langs: std::collections::HashSet<String> = ["rust".to_string()].into();
         assert!(lsp_server_relevant_for_languages(
             "rust-analyzer",
             &rust_langs
         ));
-        assert!(!lsp_server_relevant_for_languages(
-            "pyright-langserver",
-            &rust_langs
-        ));
+        assert!(!lsp_server_relevant_for_languages("pyrefly", &rust_langs));
         assert!(!lsp_server_relevant_for_languages("gopls", &rust_langs));
 
         let py_langs: std::collections::HashSet<String> = ["python".to_string()].into();
-        assert!(lsp_server_relevant_for_languages(
-            "pyright-langserver",
-            &py_langs
-        ));
+        assert!(lsp_server_relevant_for_languages("pyrefly", &py_langs));
         assert!(!lsp_server_relevant_for_languages(
             "rust-analyzer",
             &py_langs
@@ -1436,19 +1430,19 @@ mod tests {
         root_lsp.insert(
             "python".to_string(),
             LspLanguageStats {
-                server_name: "pyright-langserver".to_string(),
+                server_name: "pyrefly".to_string(),
                 edge_count: 0,
                 node_count: 0,
                 duration: std::time::Duration::from_secs(120),
                 error_count: 13,
                 aborted: true,
                 server_missing: false,
-                remediation: Some("install pyright".to_string()),
+                remediation: Some("provision exact-pinned pyrefly".to_string()),
                 query_metrics: Vec::new(),
                 validation: Some(
                     crate::extract::scan_stats::LspValidationEvidence::not_validated(
                         "python",
-                        "pyright-langserver",
+                        "pyrefly",
                         "server exited before validation",
                     ),
                 ),
@@ -1458,7 +1452,7 @@ mod tests {
 
         let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
         assert!(
-            result.contains("LSP: pyright-langserver -> python"),
+            result.contains("LSP: pyrefly -> python"),
             "should show server name, got: {}",
             result
         );
@@ -1478,7 +1472,7 @@ mod tests {
             result
         );
         assert!(
-            result.contains("next: install pyright"),
+            result.contains("next: provision exact-pinned pyrefly"),
             "should show remediation guidance, got: {}",
             result
         );

@@ -7,7 +7,6 @@
     "bash-language-server": "5.6.0",
     "dockerfile-language-server-nodejs": "0.15.0",
     "dot-language-server": "3.1.2",
-    "pyright": "1.1.411",
     "typescript": "5.9.3",
     "typescript-language-server": "5.3.0",
     "vscode-langservers-extracted": "4.10.0",

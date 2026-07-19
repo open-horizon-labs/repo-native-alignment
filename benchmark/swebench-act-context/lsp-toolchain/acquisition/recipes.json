@@ -1,0 +1,87 @@
+{
+  "artifacts": [
+    {
+      "artifact": "cyright-1e055084.tar.gz",
+      "artifact_sha256": "f78160a80b4f57c8e5f875c11da371e8f7fbced4b66eaa5b4f027d4f13f4fc02",
+      "commands": [
+        [
+          "npm",
+          "ci"
+        ],
+        [
+          "npm",
+          "run",
+          "build:cli:dev"
+        ]
+      ],
+      "kind": "cyright-source",
+      "node_runtime_artifact": "node-v22.12.0-darwin-arm64.tar.gz",
+      "node_runtime_root": "node-v22.12.0-darwin-arm64",
+      "output_path": "packages/pyright/dist",
+      "patches": [
+        {
+          "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/cyright-package-version.patch",
+          "sha256": "81e351538a25d969ad79c2c59576228443e26cb7cc831016e97525f60fd30a55"
+        }
+      ],
+      "root_name": "issue785-cyright-bundle",
+      "source_root": "cyright-1e055084408cbef84bdbab6a34d3771775eb5a2d",
+      "source_sha256": "cfced750b794d1558bb23f96c1687eccda61497a8aa72934f69a347195768a2a",
+      "source_url": "https://github.com/whoami730/cyright/archive/1e055084408cbef84bdbab6a34d3771775eb5a2d.tar.gz"
+    },
+    {
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "commands": [
+        [
+          "npm",
+          "ci",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund"
+        ]
+      ],
+      "kind": "node-npm-ci",
+      "node_runtime_artifact": "node-v22.12.0-darwin-arm64.tar.gz",
+      "node_runtime_root": "node-v22.12.0-darwin-arm64",
+      "package_json": {
+        "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/node/package.json",
+        "sha256": "3b355fff07f0568093eb95d5a63d79f1955619f7a335566c4c5a11383c6371d7"
+      },
+      "package_lock": {
+        "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/node/package-lock.json",
+        "sha256": "a04a1f15b48978e8ace951e3f0ac9e84a54f525dc1fed3b6b2ad66adc44f3f8e"
+      },
+      "root_name": "issue785-node-bundle"
+    },
+    {
+      "artifact": "python-wheelhouse-1.0.0.tar.gz",
+      "artifact_sha256": "fb12835461b96db29599f5b70ca37655e4be22109be5289b6b0469514222283e",
+      "kind": "python-wheelhouse",
+      "manifest": {
+        "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/python-wheelhouse.json",
+        "sha256": "05456b2aea70ea56d646133959dc763197e864bfc6f69cba49b9873bea69b9c7"
+      },
+      "root_name": "issue785-python-wheelhouse"
+    },
+    {
+      "artifact": "rna-cohort-servers-1.0.0.tar.gz",
+      "artifact_sha256": "c79d5699f755dd42a3f1743b79421996e18d49163ab60aa5acc9cb098efedcb3",
+      "kind": "repo-sources",
+      "root_name": "issue785-repo-servers",
+      "sources": [
+        {
+          "destination": "rna-config-language-server",
+          "path": "scripts/lsp/config_language_server.py",
+          "sha256": "f54212c475633948bc776208c7fad73f4ba1456fdb047c92ac6317da3a183651"
+        },
+        {
+          "destination": "rna-cohort-language-server",
+          "path": "scripts/lsp/cohort_language_server.py",
+          "sha256": "fc31612da05303627347832904496ce014633ad355f6fa0ec74d30a9f066c1ce"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1
+}

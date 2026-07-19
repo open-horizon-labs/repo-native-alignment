@@ -7,7 +7,7 @@
 //! - `update_graph()` -- apply changes, run enrichment pipeline
 //! - `persist_deltas()` -- write to LanceDB, commit scanner state
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -244,7 +244,7 @@ fn remove_existing_scoped_lsp_edges(
     removed
 }
 
-fn purge_existing_scoped_lsp_output(
+pub(crate) fn purge_existing_scoped_lsp_output(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
     node_filter: &HashSet<String>,
@@ -1757,7 +1757,13 @@ impl RnaHandler {
                             .sum(),
                         executed_graph_enrichment_operation_count: 0,
                         inherited_readiness_validation_request_count: authorization
-                            .inherited_readiness_validation_request_count(&plan.inherited_paths),
+                            .inherited_readiness_validation_request_count(
+                                &authorization
+                                    .inherited_by_path
+                                    .keys()
+                                    .map(PathBuf::from)
+                                    .collect(),
+                            )?,
                         executed_readiness_validation_request_count: 0,
                         executed_producer_work_ids: Vec::new(),
                         closure_edge_count: plan.closure_edge_count as u64,
@@ -2263,110 +2269,14 @@ impl RnaHandler {
                         &stale_paths,
                     )
                     .await?;
-                    let changed_paths = authorization
-                        .authorization
-                        .changed_paths
-                        .iter()
-                        .chain(authorization.authorization.added_paths.iter())
-                        .chain(authorization.authorization.deleted_paths.iter())
-                        .map(PathBuf::from)
-                        .chain(authorization.authorization.renamed_paths.iter().flat_map(
-                            |rename| [PathBuf::from(&rename[0]), PathBuf::from(&rename[1])],
-                        ))
-                        .collect::<BTreeSet<_>>();
-                    let base_producers = authorization
-                        .inherited_by_path
-                        .values()
-                        .flat_map(|file| file.producer_work_ids.iter().cloned())
-                        .collect::<BTreeSet<_>>();
-                    let executed_records =
-                        crate::extract::lsp::work_items::load_all_records(&self.repo_root)?
-                            .into_iter()
-                            .filter(|record| {
-                                plan.executed_paths.contains(Path::new(&record.file))
-                            && !base_producers
-                                .contains(&format!("{}:{}", record.job_id, record.item_id))
-                            && record.state
-                                == crate::extract::lsp::work_items::LspWorkItemState::Completed
-                            })
-                            .collect::<Vec<_>>();
-                    let executed_graph_enrichment_operation_count = executed_records
-                        .iter()
-                        .map(|record| record.requested_operations.len() as u64)
-                        .sum();
-                    let executed_producer_work_ids = executed_records
-                        .iter()
-                        .map(|record| format!("{}:{}", record.job_id, record.item_id))
-                        .collect();
-                    crate::structural_cache::write_execution(
+                    let execution = crate::structural_cache::build_execution(
                         &self.repo_root,
-                        &crate::structural_cache::StructuralCacheExecution {
-                            schema_version: crate::structural_cache::
-                                STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
-                            offline_preprocessing: true,
-                            base_archive_sha256: authorization
-                                .authorization
-                                .base_archive_sha256
-                                .clone(),
-                            base_sidecar_sha256: authorization
-                                .authorization
-                                .base_sidecar_sha256
-                                .clone(),
-                            base_report_digest: authorization
-                                .authorization
-                                .base_report_digest
-                                .clone(),
-                            target_commit: authorization.authorization.target_commit.clone(),
-                            target_tree: authorization.authorization.target_tree.clone(),
-                            inherited_paths: plan
-                                .inherited_paths
-                                .iter()
-                                .map(|path| path.to_string_lossy().to_string())
-                                .collect(),
-                            executed_paths: plan
-                                .executed_paths
-                                .iter()
-                                .map(|path| path.to_string_lossy().to_string())
-                                .collect(),
-                            invalidated_partitions: authorization
-                                .authorization
-                                .invalidated_partitions
-                                .clone(),
-                            escalated_partitions: plan
-                                .escalated_partitions
-                                .iter()
-                                .cloned()
-                                .collect(),
-                            changed_file_count: changed_paths.len() as u64,
-                            invalidated_file_count: plan
-                                .executed_paths
-                                .difference(&changed_paths)
-                                .count() as u64,
-                            inherited_graph_enrichment_operation_count: plan
-                                .inherited_paths
-                                .iter()
-                                .filter_map(|path| {
-                                    authorization
-                                        .inherited_by_path
-                                        .get(path.to_string_lossy().as_ref())
-                                })
-                                .map(|file| file.producer_graph_enrichment_operation_count)
-                                .sum(),
-                            executed_graph_enrichment_operation_count,
-                            inherited_readiness_validation_request_count: authorization
-                                .inherited_readiness_validation_request_count(
-                                    &plan.inherited_paths,
-                                ),
-                            executed_readiness_validation_request_count: lsp_validations
-                                .iter()
-                                .filter(|validation| validation.method.is_some())
-                                .count() as u64,
-                            executed_producer_work_ids,
-                            closure_edge_count: plan.closure_edge_count as u64,
-                            execution_job_id: incremental_lsp_job_id.clone(),
-                            digest: String::new(),
-                        },
+                        authorization,
+                        plan,
+                        &lsp_validations,
+                        incremental_lsp_job_id.clone(),
                     )?;
+                    crate::structural_cache::write_execution(&self.repo_root, &execution)?;
                 }
             }
         }
@@ -2416,7 +2326,15 @@ impl RnaHandler {
                 "skipped by scan options",
             ));
         }
-        let related_job_ids = incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>();
+        let related_job_ids = if cache_authorization.is_some() {
+            let execution =
+                crate::structural_cache::load_execution(&self.repo_root)?.ok_or_else(|| {
+                    anyhow::anyhow!("incremental structural-cache execution evidence is missing")
+                })?;
+            crate::structural_cache::execution_related_job_ids(&execution)?
+        } else {
+            incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>()
+        };
         let (lsp_state, lsp_detail) = lsp_capability_from_status(
             enrichment,
             self.lsp_status.current_state(),
