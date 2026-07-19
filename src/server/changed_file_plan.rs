@@ -227,6 +227,7 @@ pub(crate) fn plan_changed_files(input: ChangedFilePlanInput<'_>) -> Result<Chan
             || node.language.is_empty()
             || !supported_languages.contains(&node.language)
             || node.source == crate::graph::ExtractionSource::Lsp
+            || crate::ranking::is_test_function(node)
         {
             continue;
         }
@@ -325,6 +326,7 @@ pub(crate) fn plan_lsp_node_ids_for_verified_structural_cache(
     cached_nodes: &[Node],
 ) -> Result<Arc<HashSet<String>>> {
     crate::structural_cache::validate_runtime_plan_handoff(authorization, plan)?;
+    let signed_budget = authorization.signed_operation_budget()?;
     let touched_files = plan
         .executed_paths
         .iter()
@@ -335,14 +337,47 @@ pub(crate) fn plan_lsp_node_ids_for_verified_structural_cache(
         &touched_files,
         cached_nodes,
         &plan.escalated_partitions,
-        ChangedFileNodeBound::AuthorizedStructuralCache,
+        ChangedFileNodeBound::AuthorizedStructuralCache {
+            signed_operation_count: usize::try_from(signed_budget.executed_estimate)
+                .context("signed structural-cache operation estimate does not fit usize")?,
+            authorized_operations_by_language: signed_budget
+                .authorized_operations_by_language
+                .clone(),
+        },
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ChangedFileNodeBound {
     Enforce,
-    AuthorizedStructuralCache,
+    AuthorizedStructuralCache {
+        signed_operation_count: usize,
+        authorized_operations_by_language: BTreeMap<String, Vec<String>>,
+    },
+}
+
+fn authorized_operations_for_node(node: &Node, authorized: &[String]) -> Vec<String> {
+    let mut requested = planned_operations_for_node(node);
+    if node.id.kind == crate::graph::NodeKind::Function
+        && requested
+            .iter()
+            .any(|operation| operation == "call_hierarchy")
+        && authorized
+            .binary_search_by(|operation| operation.as_str().cmp("call_hierarchy"))
+            .is_err()
+        && authorized
+            .binary_search_by(|operation| operation.as_str().cmp("references"))
+            .is_ok()
+    {
+        // Runtime uses references when the negotiated server capabilities do
+        // not include call hierarchy. The signed operation set records those
+        // negotiated operations, so preserve the same fallback at the
+        // verifier-to-runtime planning handoff.
+        requested.retain(|operation| operation != "call_hierarchy");
+        requested.push("references".to_string());
+    }
+    requested.retain(|operation| authorized.binary_search(operation).is_ok());
+    requested
 }
 
 fn plan_lsp_node_ids_for_touched_files_with_bounds(
@@ -359,6 +394,7 @@ fn plan_lsp_node_ids_for_touched_files_with_bounds(
         .collect();
     let mut planned_node_ids = HashSet::new();
     let mut planned_languages = BTreeSet::new();
+    let mut document_symbol_files = BTreeSet::<(String, String, PathBuf)>::new();
     let mut eligible_rebuild_node_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut operation_count = 0usize;
 
@@ -376,26 +412,57 @@ fn plan_lsp_node_ids_for_touched_files_with_bounds(
             continue;
         }
         let file = normalize_relative(&node.id.file)?;
-        let requested_operations = planned_operations_for_node(node);
-        if requested_operations.is_empty() {
+        let touched = touched_files.contains(&(node.id.root.clone(), file.clone()));
+        let stable_id = node.stable_id();
+        let mut requested_operations = planned_operations_for_node(node);
+        if let ChangedFileNodeBound::AuthorizedStructuralCache {
+            authorized_operations_by_language,
+            ..
+        } = &node_bound
+        {
+            let authorized = authorized_operations_by_language
+                .get(&node.language)
+                .context("signed structural-cache operation budget lacks a target language")?;
+            if touched
+                && authorized
+                    .binary_search_by(|operation| operation.as_str().cmp("document_symbols"))
+                    .is_ok()
+            {
+                let key = (node.id.root.clone(), node.language.clone(), file.clone());
+                document_symbol_files.insert(key);
+            }
+            requested_operations = authorized_operations_for_node(node, authorized);
+        }
+        if crate::ranking::is_test_function(node) || requested_operations.is_empty() {
             continue;
         }
-        let stable_id = node.stable_id();
         if rebuilt_partitions.contains(&node.language) {
             eligible_rebuild_node_ids
                 .entry(node.language.clone())
                 .or_default()
                 .insert(stable_id.clone());
         }
-        if !touched_files.contains(&(node.id.root.clone(), file))
-            || !planned_node_ids.insert(stable_id)
-        {
+        if !touched || !planned_node_ids.insert(stable_id) {
             continue;
         }
         planned_languages.insert(node.language.clone());
         operation_count = operation_count
             .checked_add(requested_operations.len())
             .context("changed-file LSP operation count overflowed")?;
+    }
+
+    // Runtime Pass 1 emits one document-symbol work item for each admitted file.
+    // Count the signed per-file document-symbol work independently of query
+    // node IDs. Endpoint-only source/test context is attached by the language
+    // accumulator without making those nodes schedulable.
+    if !document_symbol_files.is_empty() {
+        let document_symbol_count = document_symbol_files.len();
+        for (_root, language, _file) in document_symbol_files {
+            planned_languages.insert(language);
+        }
+        operation_count = operation_count
+            .checked_add(document_symbol_count)
+            .context("changed-file LSP document-symbol operation count overflowed")?;
     }
 
     for (partition, expected_node_ids) in eligible_rebuild_node_ids {
@@ -414,9 +481,17 @@ fn plan_lsp_node_ids_for_touched_files_with_bounds(
     // than the ordinary changed-file ceiling while remaining below that same
     // operation ceiling, so only the verifier-bound path may skip the
     // redundant node-count check.
-    let exceeds_node_bound = node_bound == ChangedFileNodeBound::Enforce
-        && planned_node_ids.len() > MAX_CHANGED_LSP_NODES;
-    if exceeds_node_bound || operation_count > MAX_CHANGED_LSP_OPERATIONS {
+    let (exceeds_node_bound, bounded_operation_count) = match &node_bound {
+        ChangedFileNodeBound::Enforce => (
+            planned_node_ids.len() > MAX_CHANGED_LSP_NODES,
+            operation_count,
+        ),
+        ChangedFileNodeBound::AuthorizedStructuralCache {
+            signed_operation_count,
+            ..
+        } => (false, operation_count.max(*signed_operation_count)),
+    };
+    if exceeds_node_bound || bounded_operation_count > MAX_CHANGED_LSP_OPERATIONS {
         let unrebuilt_languages = planned_languages
             .difference(rebuilt_partitions)
             .cloned()
@@ -668,6 +743,43 @@ mod tests {
     }
 
     #[test]
+    fn test_file_function_fanout_above_operation_ceiling_is_not_planned() {
+        let nodes = (0..=MAX_CHANGED_LSP_OPERATIONS)
+            .map(|index| {
+                let mut test = node(
+                    "tests/test_dense.py",
+                    &format!("test_symbol_{index}"),
+                    NodeKind::Function,
+                );
+                test.language = "python".to_string();
+                test
+            })
+            .collect::<Vec<_>>();
+
+        let plan = plan_changed_files(ChangedFilePlanInput {
+            provenance: provenance(),
+            root_slug: "fixture",
+            changes: vec![ChangedFile {
+                kind: ChangedFileKind::Modified,
+                old_path: Some(PathBuf::from("tests/test_dense.py")),
+                new_path: Some(PathBuf::from("tests/test_dense.py")),
+            }],
+            cached_nodes: &nodes,
+            max_nodes: MAX_CHANGED_LSP_NODES,
+            max_operations: MAX_CHANGED_LSP_OPERATIONS,
+            allow_broad_references: false,
+        })
+        .unwrap();
+
+        assert!(plan.planned_nodes.is_empty());
+        assert_eq!(plan.operation_count, 0);
+        assert_eq!(
+            plan.unmapped_files,
+            vec![PathBuf::from("tests/test_dense.py")]
+        );
+    }
+
+    #[test]
     fn scanner_touched_files_plan_only_stable_ids_from_touched_paths() {
         let nodes = vec![
             node("src/changed.rs", "changed", NodeKind::Function),
@@ -682,6 +794,86 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.contains("src/changed.rs")));
         assert!(!ids.iter().any(|id| id.contains("unrelated")));
+    }
+
+    #[test]
+    fn verified_plan_counts_one_signed_document_symbol_operation_per_file() {
+        let file_count = (MAX_CHANGED_LSP_OPERATIONS / 2) + 1;
+        let nodes = (0..file_count)
+            .map(|index| {
+                node(
+                    &format!("src/file_{index}.rs"),
+                    &format!("symbol_{index}"),
+                    NodeKind::Function,
+                )
+            })
+            .collect::<Vec<_>>();
+        let touched_files = nodes
+            .iter()
+            .map(|node| ("fixture".to_string(), node.id.file.clone()))
+            .collect::<HashSet<_>>();
+        let authorized_operations_by_language = BTreeMap::from([(
+            "rust".to_string(),
+            vec!["call_hierarchy".to_string(), "document_symbols".to_string()],
+        )]);
+
+        let error = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::new(),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 0,
+                authorized_operations_by_language,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds its bound"));
+    }
+
+    #[test]
+    fn verified_plan_preserves_negotiated_reference_fallback_and_test_document_symbols() {
+        let mut source = node("src/app.py", "greet", NodeKind::Function);
+        source.language = "python".to_string();
+        let source_id = source.stable_id();
+        let mut test = node("tests/test_app.py", "test_greet", NodeKind::Function);
+        test.language = "python".to_string();
+        let test_id = test.stable_id();
+        let mut import = node(
+            "tests/test_app.py",
+            "from src.app import greet",
+            NodeKind::Import,
+        );
+        import.language = "python".to_string();
+        let import_id = import.stable_id();
+        let nodes = vec![source.clone(), test, import];
+        let touched_files = nodes
+            .iter()
+            .map(|node| ("fixture".to_string(), node.id.file.clone()))
+            .collect::<HashSet<_>>();
+        let authorized = vec!["document_symbols".to_string(), "references".to_string()];
+
+        assert_eq!(
+            authorized_operations_for_node(&source, &authorized),
+            vec!["references"]
+        );
+        let ids = plan_lsp_node_ids_for_touched_files_with_bounds(
+            &touched_files,
+            &nodes,
+            &BTreeSet::new(),
+            ChangedFileNodeBound::AuthorizedStructuralCache {
+                signed_operation_count: 3,
+                authorized_operations_by_language: BTreeMap::from([(
+                    "python".to_string(),
+                    authorized,
+                )]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids.as_ref(), &HashSet::from([source_id]));
+        assert!(!ids.contains(&test_id));
+        assert!(!ids.contains(&import_id));
     }
 
     #[test]

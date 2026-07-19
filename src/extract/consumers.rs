@@ -317,6 +317,70 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
                 .or_default()
                 .push(node.clone());
         }
+        if self.planned_node_ids.is_some()
+            && let Some(file_filter) = self.file_readiness_filter.as_deref()
+            && !by_lang.is_empty()
+        {
+            let active_languages = by_lang.keys().cloned().collect::<HashSet<_>>();
+            for node in nodes.iter() {
+                if node.language.is_empty()
+                    || !active_languages.contains(&node.language)
+                    || node.source == crate::graph::ExtractionSource::Lsp
+                    || !file_filter.contains(&node.id.file)
+                    || dirty_set.is_some_and(|dirty| !dirty.contains(&node.id.root))
+                    || !emitted_planned_ids.insert(node.stable_id())
+                {
+                    continue;
+                }
+                // Reference/call results must resolve against precise nodes in
+                // every executed impact-closure file, including tests. Carry
+                // them as event-local, empty-language endpoint context so the
+                // LSP resolver can see their NodeIds while query admission can
+                // never schedule them as additional work.
+                let mut endpoint = node.clone();
+                endpoint.language.clear();
+                by_lang
+                    .get_mut(&node.language)
+                    .expect("active language bucket disappeared")
+                    .push(endpoint);
+            }
+        }
+        let scoped_readiness_anchors = self.planned_node_ids.as_ref().map(|_| {
+            let mut anchors_by_language_and_file =
+                std::collections::BTreeMap::<(String, PathBuf), Node>::new();
+            for node in nodes.iter().filter(|node| {
+                !node.language.is_empty()
+                    && node.source != crate::graph::ExtractionSource::Lsp
+                    && dirty_set.is_none_or(|dirty| dirty.contains(&node.id.root))
+                    && self
+                        .file_readiness_filter
+                        .as_deref()
+                        .is_none_or(|filter| filter.contains(&node.id.file))
+            }) {
+                let key = (node.language.clone(), node.id.file.clone());
+                let stable_id = node.stable_id();
+                let should_replace = anchors_by_language_and_file
+                    .get(&key)
+                    .is_none_or(|existing| stable_id < existing.stable_id());
+                if should_replace {
+                    anchors_by_language_and_file.insert(key, node.clone());
+                }
+            }
+
+            let mut anchors_by_language = std::collections::BTreeMap::<String, Vec<Node>>::new();
+            for ((language, _file), mut anchor) in anchors_by_language_and_file {
+                // A planned scope must never broaden back to the full graph merely
+                // to carry each executed file into inventory-only readiness. These
+                // event-local clones cannot become LSP query seeds because their
+                // language is empty; RootExtracted retains the real nodes.
+                anchor.language.clear();
+                anchors_by_language
+                    .entry(language)
+                    .or_default()
+                    .push(anchor);
+            }
+            anchors_by_language
+        });
         if self.file_readiness && dirty_slugs.as_ref().is_none_or(|dirty| !dirty.is_empty()) {
             for (language, paths) in crate::lsp_completeness::included_lsp_paths_by_language(path)?
             {
@@ -327,10 +391,16 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
                 {
                     continue;
                 }
-                // Inventory-only languages need the real root nodes as anchors
-                // for any returned document symbols; no placeholder nodes are
-                // invented. The enricher still admits only its own language.
-                by_lang.entry(language).or_insert_with(|| nodes.to_vec());
+                // Inventory-only languages need root and file identity for returned
+                // document symbols. An explicit planned scope receives one inert
+                // real anchor per filtered file; passing the complete graph here
+                // would bypass the signed node plan and schedule uncounted LSP work.
+                by_lang.entry(language.clone()).or_insert_with(|| {
+                    scoped_readiness_anchors
+                        .as_ref()
+                        .and_then(|anchors| anchors.get(&language).cloned())
+                        .unwrap_or_else(|| nodes.to_vec())
+                });
             }
         }
 
@@ -3148,6 +3218,163 @@ mod tests {
         assert!(
             follow_ons.is_empty(),
             "Empty language nodes must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_file_readiness_keeps_every_test_only_file_inert_and_scoped() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_one.py"),
+            "def test_one():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_two.py"),
+            "def test_two():\n    assert True\n",
+        )
+        .unwrap();
+        let make_test_node = |file: &str, name: &str| Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from(file),
+                name: name.into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 2,
+            signature: format!("def {name}()"),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: repo.path().to_path_buf(),
+            dirty_slugs: None,
+            nodes: Arc::from(
+                vec![
+                    make_test_node("tests/test_one.py", "test_one"),
+                    make_test_node("tests/test_two.py", "test_two"),
+                ]
+                .into_boxed_slice(),
+            ),
+            edges: Arc::from([]),
+        };
+        let consumer = LanguageAccumulatorConsumer::with_planned_nodes_and_file_readiness(
+            Some(Arc::new(HashSet::new())),
+            true,
+            Some(Arc::new(HashSet::from([
+                PathBuf::from("tests/test_one.py"),
+                PathBuf::from("tests/test_two.py"),
+            ]))),
+        );
+
+        let events = consumer.on_event(&event).await.unwrap();
+        let python_nodes = events
+            .iter()
+            .find_map(|event| match event {
+                ExtractionEvent::LanguageDetected {
+                    language, nodes, ..
+                } if language == "python" => Some(nodes),
+                _ => None,
+            })
+            .expect("Python inventory readiness event");
+
+        assert_eq!(python_nodes.len(), 2);
+        assert!(
+            python_nodes.iter().all(|node| node.language.is_empty()),
+            "event-local file anchors must not become LSP query seeds"
+        );
+        assert_eq!(
+            python_nodes
+                .iter()
+                .map(|node| node.id.file.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                PathBuf::from("tests/test_one.py"),
+                PathBuf::from("tests/test_two.py"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_file_readiness_carries_unscheduled_cross_file_endpoint_context() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        std::fs::write(
+            repo.path().join("src/app.py"),
+            "def greet():\n    return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("tests/test_app.py"),
+            "def test_greet():\n    assert True\n",
+        )
+        .unwrap();
+        let make_node = |file: &str, name: &str| Node {
+            id: NodeId {
+                root: "fixture".into(),
+                file: PathBuf::from(file),
+                name: name.into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 2,
+            signature: format!("def {name}()"),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let source = make_node("src/app.py", "greet");
+        let test = make_node("tests/test_app.py", "test_greet");
+        let event = ExtractionEvent::RootExtracted {
+            slug: "fixture".into(),
+            path: repo.path().to_path_buf(),
+            dirty_slugs: None,
+            nodes: Arc::from(vec![source.clone(), test.clone()].into_boxed_slice()),
+            edges: Arc::from([]),
+        };
+        let consumer = LanguageAccumulatorConsumer::with_planned_nodes_and_file_readiness(
+            Some(Arc::new(HashSet::from([source.stable_id()]))),
+            true,
+            Some(Arc::new(HashSet::from([
+                PathBuf::from("src/app.py"),
+                PathBuf::from("tests/test_app.py"),
+            ]))),
+        );
+
+        let events = consumer.on_event(&event).await.unwrap();
+        let python_nodes = events
+            .iter()
+            .find_map(|event| match event {
+                ExtractionEvent::LanguageDetected {
+                    language, nodes, ..
+                } if language == "python" => Some(nodes),
+                _ => None,
+            })
+            .expect("Python planned event");
+
+        assert_eq!(python_nodes.len(), 2);
+        assert!(
+            python_nodes
+                .iter()
+                .any(|node| { node.id == source.id && node.language == "python" })
+        );
+        assert!(
+            python_nodes
+                .iter()
+                .any(|node| { node.id == test.id && node.language.is_empty() })
         );
     }
 

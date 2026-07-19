@@ -12,14 +12,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::business_context::BusinessContextMode;
-use crate::extract::lsp::{MAX_INCREMENTAL_LSP_OPERATIONS, planned_operations_for_node};
+use crate::extract::lsp::MAX_INCREMENTAL_LSP_OPERATIONS;
 use crate::graph::{Edge, EdgeKind, Node};
 use crate::roots::RootConfig;
 
 pub const STRUCTURAL_CACHE_IDENTITY_SCHEMA_VERSION: u32 = 1;
-pub const STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+pub const STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION: u32 = 2;
 pub const STRUCTURAL_CACHE_AUTHORIZATION_PATH: &str =
     ".oh/.cache/structural-cache-inheritance.json";
 pub const STRUCTURAL_CACHE_EXECUTION_PATH: &str = ".oh/.cache/structural-cache-execution.json";
@@ -35,6 +36,8 @@ pub const QUALIFICATION_SCAN_FLAGS: &[&str] = &[
 const MAX_IMPACT_FILES: usize = 4_096;
 const MAX_IMPACT_FRACTION_NUMERATOR: usize = 1;
 const MAX_IMPACT_FRACTION_DENOMINATOR: usize = 2;
+pub const VERIFIED_OPERATION_BUDGET_BASIS: &str =
+    "verified_base_capability_aware_per_path_work_ledger_with_language_median_for_unseen_paths";
 const SHARED_INFLUENCE_PATTERNS: &[&str] = &[
     ".oh/config.toml",
     ".editorconfig",
@@ -111,6 +114,16 @@ pub struct InheritedFileAuthorization {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct StructuralCacheOperationBudget {
+    pub max_operations: u64,
+    pub executed_estimate: u64,
+    pub authorized_operations_by_language: BTreeMap<String, Vec<String>>,
+    pub basis: String,
+    pub estimated_file_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StructuralCacheAuthorization {
     pub schema_version: u32,
     pub offline_preprocessing: bool,
@@ -139,6 +152,7 @@ pub struct StructuralCacheAuthorization {
     pub invalidated_partitions: Vec<String>,
     pub invalidated_paths: Vec<String>,
     pub path_partitions: BTreeMap<String, String>,
+    pub executed_operation_budget: StructuralCacheOperationBudget,
     pub digest: String,
 }
 
@@ -228,7 +242,71 @@ pub struct VerifiedStructuralCacheAuthorization {
     pub base_report: crate::lsp_completeness::LspCompletenessReport,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeStructuralCacheOperationAdmission {
+    language: String,
+    allowed_operations: BTreeSet<String>,
+    max_operations: usize,
+    signed_estimate: usize,
+}
+
+impl RuntimeStructuralCacheOperationAdmission {
+    pub(crate) fn allows(&self, operation: &str) -> bool {
+        self.allowed_operations.contains(operation)
+    }
+
+    pub(crate) fn validate_exact_plan<'a>(
+        &self,
+        operations: impl IntoIterator<Item = &'a str>,
+    ) -> Result<usize> {
+        let operations = operations.into_iter().collect::<Vec<_>>();
+        if let Some(operation) = operations.iter().find(|operation| !self.allows(operation)) {
+            bail!(
+                "runtime LSP operation {operation} is outside the signed structural-cache admission for {}",
+                self.language
+            );
+        }
+        ensure!(
+            operations.len() <= self.max_operations,
+            "runtime LSP plan for {} exceeds the signed structural-cache ceiling (actual={} max={})",
+            self.language,
+            operations.len(),
+            self.max_operations,
+        );
+        Ok(operations.len())
+    }
+
+    pub(crate) fn signed_estimate(&self) -> usize {
+        self.signed_estimate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(allowed_operations: &[&str], max_operations: usize) -> Self {
+        Self {
+            language: "test-language".to_string(),
+            allowed_operations: allowed_operations
+                .iter()
+                .map(|operation| (*operation).to_string())
+                .collect(),
+            max_operations,
+            signed_estimate: 0,
+        }
+    }
+}
+
 impl VerifiedStructuralCacheAuthorization {
+    pub fn signed_operation_budget(&self) -> Result<&StructuralCacheOperationBudget> {
+        validate_executed_operation_budget(&self.authorization, &self.inherited_by_path)?;
+        Ok(&self.authorization.executed_operation_budget)
+    }
+
+    pub fn signed_executed_operation_count(&self) -> Result<usize> {
+        self.signed_operation_budget().and_then(|budget| {
+            usize::try_from(budget.executed_estimate)
+                .context("signed structural-cache operation estimate does not fit usize")
+        })
+    }
+
     pub fn inherited_readiness_validation_requests_by_language(
         &self,
         inherited_paths: &BTreeSet<PathBuf>,
@@ -309,6 +387,112 @@ impl VerifiedStructuralCacheAuthorization {
             .values()
             .sum())
     }
+}
+
+fn validate_runtime_authorization_presence(
+    authorization_present: bool,
+    signed_marker_present: bool,
+) -> Result<bool> {
+    ensure!(
+        authorization_present || !signed_marker_present,
+        "signed structural-cache runtime marker is present but its authorization file is missing"
+    );
+    Ok(authorization_present)
+}
+
+static VERIFIED_RUNTIME_AUTHORIZATIONS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> =
+    OnceLock::new();
+
+fn runtime_authorization_key(repo_root: &Path) -> Result<PathBuf> {
+    repo_root.canonicalize().with_context(|| {
+        format!(
+            "resolve structural-cache runtime root {}",
+            repo_root.display()
+        )
+    })
+}
+
+fn attest_runtime_authorization(repo_root: &Path, authorization_sha256: &str) -> Result<()> {
+    let key = runtime_authorization_key(repo_root)?;
+    VERIFIED_RUNTIME_AUTHORIZATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("structural-cache runtime attestation lock is poisoned"))?
+        .insert(key, authorization_sha256.to_string());
+    Ok(())
+}
+
+fn require_runtime_authorization_attestation(
+    repo_root: &Path,
+    authorization_sha256: &str,
+) -> Result<()> {
+    let key = runtime_authorization_key(repo_root)?;
+    let verified = VERIFIED_RUNTIME_AUTHORIZATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("structural-cache runtime attestation lock is poisoned"))?;
+    ensure!(
+        verified.get(&key).map(String::as_str) == Some(authorization_sha256),
+        "structural-cache runtime admission lacks an exact pre-request verifier attestation"
+    );
+    Ok(())
+}
+
+pub(crate) fn load_runtime_operation_admission(
+    repo_root: &Path,
+    language: &str,
+) -> Result<Option<RuntimeStructuralCacheOperationAdmission>> {
+    if !validate_runtime_authorization_presence(
+        authorization_path(repo_root).is_file(),
+        std::env::var_os(STRUCTURAL_CACHE_AUTHORIZATION_SHA256_ENV).is_some(),
+    )? {
+        return Ok(None);
+    }
+    let path = authorization_path(repo_root);
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "read runtime structural cache authorization {}",
+            path.display()
+        )
+    })?;
+    let expected_authorization_sha256 = std::env::var(STRUCTURAL_CACHE_AUTHORIZATION_SHA256_ENV)
+        .context("signed structural-cache runtime marker disappeared")?;
+    require_sha256(
+        &expected_authorization_sha256,
+        "runtime structural cache authorization handoff",
+    )?;
+    let actual_authorization_sha256 = hex_sha256(&bytes);
+    ensure!(
+        actual_authorization_sha256 == expected_authorization_sha256,
+        "structural-cache authorization changed after verifier preflight"
+    );
+    require_runtime_authorization_attestation(repo_root, &actual_authorization_sha256)?;
+    let authorization: StructuralCacheAuthorization =
+        serde_json::from_slice(&bytes).context("invalid runtime structural cache authorization")?;
+    ensure!(
+        authorization.schema_version == STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION
+            && authorization.offline_preprocessing
+            && authorization.verify_digest(),
+        "runtime structural-cache authorization contract is invalid"
+    );
+    let budget = &authorization.executed_operation_budget;
+    let allowed_operations = budget
+        .authorized_operations_by_language
+        .get(language)
+        .with_context(|| {
+            format!("signed structural-cache operation admission lacks runtime language {language}")
+        })?
+        .iter()
+        .cloned()
+        .collect();
+    Ok(Some(RuntimeStructuralCacheOperationAdmission {
+        language: language.to_string(),
+        allowed_operations,
+        max_operations: usize::try_from(budget.max_operations)
+            .context("signed structural-cache operation ceiling does not fit usize")?,
+        signed_estimate: usize::try_from(budget.executed_estimate)
+            .context("signed structural-cache operation estimate does not fit usize")?,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +596,68 @@ fn verifier_authorized_executed_paths(
         executed.insert(PathBuf::from(&rename[1]));
     }
     executed
+}
+
+fn validate_executed_operation_budget(
+    authorization: &StructuralCacheAuthorization,
+    inherited_by_path: &BTreeMap<String, InheritedFileAuthorization>,
+) -> Result<()> {
+    let budget = &authorization.executed_operation_budget;
+    const KNOWN_OPERATIONS: &[&str] = &[
+        "call_hierarchy",
+        "references",
+        "definitions",
+        "implementations",
+        "type_hierarchy",
+        "document_symbols",
+        "document_links",
+    ];
+    ensure!(
+        budget.max_operations == MAX_INCREMENTAL_LSP_OPERATIONS as u64,
+        "signed structural-cache operation ceiling does not match this producer"
+    );
+    ensure!(
+        budget.basis == VERIFIED_OPERATION_BUDGET_BASIS,
+        "signed structural-cache operation-budget basis is unsupported"
+    );
+    let authorized_languages = authorization
+        .path_partitions
+        .values()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        budget
+            .authorized_operations_by_language
+            .keys()
+            .collect::<BTreeSet<_>>()
+            == authorized_languages,
+        "signed structural-cache authorized operations do not cover every target language"
+    );
+    for (language, operations) in &budget.authorized_operations_by_language {
+        let mut normalized_operations = operations.clone();
+        normalized_operations.sort();
+        normalized_operations.dedup();
+        ensure!(
+            authorized_languages.contains(language)
+                && normalized_operations == *operations
+                && normalized_operations
+                    .iter()
+                    .all(|operation| KNOWN_OPERATIONS.contains(&operation.as_str())),
+            "signed structural-cache authorized operations are invalid"
+        );
+    }
+    let executed_paths = verifier_authorized_executed_paths(authorization, inherited_by_path);
+    ensure!(
+        budget.estimated_file_count <= executed_paths.len() as u64,
+        "signed structural-cache operation estimate names more unseen files than the authorized execution set"
+    );
+    ensure!(
+        budget.executed_estimate <= budget.max_operations,
+        "signed structural-cache operation estimate exceeds its bound (max {} operations)",
+        budget.max_operations
+    );
+    usize::try_from(budget.executed_estimate)
+        .context("signed structural-cache operation estimate does not fit usize")?;
+    Ok(())
 }
 
 fn retained_output_touching_executed_path(
@@ -762,6 +1008,8 @@ pub fn load_verified_authorization(
             );
         }
     }
+    validate_executed_operation_budget(&authorization, &inherited_by_path)?;
+    attest_runtime_authorization(repo_root, &expected_authorization_sha256)?;
     Ok(Some(VerifiedStructuralCacheAuthorization {
         authorization,
         inherited_by_path,
@@ -795,6 +1043,20 @@ pub fn plan_incremental_impact(
         direct_seeds.insert(PathBuf::from(&rename[1]));
     }
     let mut executed = direct_seeds.clone();
+    // The verifier authorizes every target path that is not backed by an
+    // inherited file record. Some of those paths are neither a direct tree
+    // delta nor a partition invalidation (for example a base cache that never
+    // produced reusable evidence for that file), so seed the runtime plan from
+    // the complete signed execution set rather than relying on a later broad
+    // operation-bound escalation to discover them.
+    executed.extend(
+        verifier_authorized_executed_paths(
+            &authorization.authorization,
+            &authorization.inherited_by_path,
+        )
+        .into_iter()
+        .map(PathBuf::from),
+    );
     executed.extend(
         authorization
             .authorization
@@ -865,35 +1127,24 @@ pub fn plan_incremental_impact(
             }
         }
 
-        // The graph closure is bounded by files, while actual LSP cost is
-        // bounded by descriptor-owned node operations. Every planned node
-        // contributes at least one operation, so this also bounds executable
-        // nodes without reintroducing the ordinary changed-file node ceiling.
-        let mut planned_node_ids = BTreeSet::new();
-        let mut planned_operation_count = 0usize;
-        let mut planned_languages = BTreeSet::new();
-        for node in new_nodes {
-            if node.id.root != root_slug
-                || node.id.file.as_os_str().is_empty()
-                || !target_paths.contains(&node.id.file)
-                || !executed.contains(&node.id.file)
-                // Persisted LSP output nodes are carried evidence and graph
-                // closure endpoints, never fresh query seeds. Counting them
-                // here recursively schedules prior results and can falsely
-                // escalate an otherwise verifier-bounded file plan.
-                || node.source == crate::graph::ExtractionSource::Lsp
-            {
-                continue;
-            }
-            let operations = planned_operations_for_node(node);
-            if operations.is_empty() || !planned_node_ids.insert(node.stable_id()) {
-                continue;
-            }
-            planned_operation_count = planned_operation_count.saturating_add(operations.len());
-            planned_languages.insert(node.language.clone());
-        }
-        if planned_operation_count > MAX_INCREMENTAL_LSP_OPERATIONS {
-            escalated.extend(planned_languages);
+        // The verifier signs the capability-aware shared-server estimate from
+        // completed per-path work. Recomputing a static operation profile for
+        // every node invents unsupported work (for example typeHierarchy) and
+        // resets the shared budget once per symbol. Invalid or over-limit
+        // authorization escalates fail-closed; the exact handoff rejects that
+        // unsigned expansion before an LSP request is made.
+        if !matches!(
+            authorization.signed_executed_operation_count(),
+            Ok(count) if count <= MAX_INCREMENTAL_LSP_OPERATIONS
+        ) {
+            escalated.extend(
+                authorization
+                    .authorization
+                    .path_partitions
+                    .iter()
+                    .filter(|(path, _)| executed.contains(Path::new(path.as_str())))
+                    .map(|(_, language)| language.clone()),
+            );
         }
 
         for (path, language) in &authorization.authorization.path_partitions {
@@ -1081,6 +1332,10 @@ pub fn build_execution(
         .iter()
         .map(|record| record.requested_operations.len() as u64)
         .sum();
+    ensure!(
+        executed_graph_enrichment_operation_count <= MAX_INCREMENTAL_LSP_OPERATIONS as u64,
+        "executed structural-cache operation count exceeds its signed producer bound"
+    );
     let executed_producer_work_ids = executed_records
         .iter()
         .map(|record| format!("{}:{}", record.job_id, record.item_id))
@@ -1531,6 +1786,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_runtime_marker_requires_its_authorization_file() {
+        assert!(!validate_runtime_authorization_presence(false, false).unwrap());
+        assert!(validate_runtime_authorization_presence(true, true).unwrap());
+        let error = validate_runtime_authorization_presence(false, true).unwrap_err();
+        assert!(error.to_string().contains("authorization file is missing"));
+    }
     use crate::graph::{Confidence, ExtractionSource, NodeId, NodeKind};
 
     fn node(path: &str, language: &str) -> Node {
@@ -1601,7 +1864,7 @@ mod tests {
             .map(|file| (file.path.clone(), file.clone()))
             .collect();
         let authorization = StructuralCacheAuthorization {
-            schema_version: 1,
+            schema_version: STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
             offline_preprocessing: true,
             repository: "owner/repo".to_string(),
             base_commit: "d".repeat(40),
@@ -1657,6 +1920,23 @@ mod tests {
                         .map(|path| ((*path).to_string(), "python".to_string())),
                 )
                 .collect(),
+            executed_operation_budget: StructuralCacheOperationBudget {
+                max_operations: MAX_INCREMENTAL_LSP_OPERATIONS as u64,
+                executed_estimate: changed.len() as u64,
+                authorized_operations_by_language: inherited
+                    .iter()
+                    .map(|(_, language)| (*language).to_string())
+                    .chain((!changed.is_empty()).then_some("python".to_string()))
+                    .map(|language| {
+                        (
+                            language,
+                            vec!["call_hierarchy".to_string(), "document_symbols".to_string()],
+                        )
+                    })
+                    .collect(),
+                basis: VERIFIED_OPERATION_BUDGET_BASIS.to_string(),
+                estimated_file_count: 0,
+            },
             digest: String::new(),
         };
         VerifiedStructuralCacheAuthorization {
@@ -1765,7 +2045,7 @@ mod tests {
     #[test]
     fn execution_digest_detects_copied_or_modified_plan() {
         let mut execution = StructuralCacheExecution {
-            schema_version: 1,
+            schema_version: STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
             offline_preprocessing: true,
             base_archive_sha256: "a".repeat(64),
             base_sidecar_sha256: "b".repeat(64),
@@ -1796,7 +2076,7 @@ mod tests {
     #[test]
     fn execution_related_jobs_include_enrichment_and_pass1_producers() {
         let execution = StructuralCacheExecution {
-            schema_version: 1,
+            schema_version: STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
             offline_preprocessing: true,
             base_archive_sha256: "a".repeat(64),
             base_sidecar_sha256: "b".repeat(64),
@@ -1932,6 +2212,44 @@ mod tests {
     }
 
     #[test]
+    fn signed_non_inherited_path_is_executed_without_broad_escalation() {
+        let nodes = [
+            node("src/inherited.py", "python"),
+            node("src/no-base-evidence.py", "python"),
+        ];
+        let mut authorization = verified_authorization(
+            &[("src/inherited.py", "python")],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        authorization
+            .authorization
+            .path_partitions
+            .insert("src/no-base-evidence.py".to_string(), "python".to_string());
+        authorization
+            .authorization
+            .executed_operation_budget
+            .executed_estimate = 1;
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &[], &nodes, &[]);
+
+        assert_eq!(
+            plan.executed_paths,
+            BTreeSet::from([PathBuf::from("src/no-base-evidence.py")])
+        );
+        assert_eq!(
+            plan.inherited_paths,
+            BTreeSet::from([PathBuf::from("src/inherited.py")])
+        );
+        assert!(plan.escalated_partitions.is_empty());
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+    }
+
+    #[test]
     fn changed_python_file_reprocesses_transitive_cross_file_closure() {
         let nodes = [
             node("src/a.py", "python"),
@@ -2064,14 +2382,19 @@ mod tests {
 
     #[test]
     fn verified_changed_file_scheduler_accepts_node_dense_authorized_plan() {
-        let authorization = verified_authorization(&[], &["src/dense.py"], &[], &[], &[], &[], &[]);
+        let mut authorization =
+            verified_authorization(&[], &["src/dense.py"], &[], &[], &[], &[], &[]);
+        authorization
+            .authorization
+            .executed_operation_budget
+            .executed_estimate = 7_523;
         let plan = IncrementalImpactPlan {
             executed_paths: BTreeSet::from([PathBuf::from("src/dense.py")]),
             inherited_paths: BTreeSet::new(),
             escalated_partitions: BTreeSet::new(),
             closure_edge_count: 0,
         };
-        let nodes = (0..=crate::extract::lsp::MAX_INCREMENTAL_LSP_NODES)
+        let nodes = (0..6_067)
             .map(|index| {
                 let mut node = node("src/dense.py", "python");
                 node.id.name = format!("symbol_{index}");
@@ -2085,16 +2408,17 @@ mod tests {
             &nodes,
         )
         .unwrap();
-        assert_eq!(
-            ids.len(),
-            crate::extract::lsp::MAX_INCREMENTAL_LSP_NODES + 1
-        );
+        assert_eq!(ids.len(), 6_067);
     }
 
     #[test]
     fn verified_changed_file_scheduler_still_enforces_operation_ceiling() {
-        let authorization =
+        let mut authorization =
             verified_authorization(&[], &["src/operation-heavy.py"], &[], &[], &[], &[], &[]);
+        authorization
+            .authorization
+            .executed_operation_budget
+            .executed_estimate = 1;
         let plan = IncrementalImpactPlan {
             executed_paths: BTreeSet::from([PathBuf::from("src/operation-heavy.py")]),
             inherited_paths: BTreeSet::new(),
@@ -2115,8 +2439,11 @@ mod tests {
             &nodes,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("exceeds its bound"));
-        assert!(error.to_string().contains("python"));
+        assert!(
+            error
+                .to_string()
+                .contains("changed-file LSP plan exceeds its bound")
+        );
     }
 
     #[test]
@@ -2500,7 +2827,6 @@ mod tests {
             &[],
             &[],
         );
-
         let plan = plan_incremental_impact(&authorization, &nodes, &[], &nodes, &[]);
 
         assert_eq!(
@@ -2516,6 +2842,47 @@ mod tests {
     }
 
     #[test]
+    fn test_file_functions_above_operation_ceiling_do_not_escalate_or_schedule() {
+        let nodes = (0..=MAX_INCREMENTAL_LSP_OPERATIONS)
+            .map(|index| {
+                let mut test = node("tests/test_dense.py", "python");
+                test.id.name = format!("test_symbol_{index}");
+                test.signature = format!("def test_symbol_{index}():");
+                test
+            })
+            .collect::<Vec<_>>();
+        let authorization = verified_authorization(
+            &[("src/unchanged.py", "python")],
+            &["tests/test_dense.py"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let plan = plan_incremental_impact(&authorization, &nodes, &[], &nodes, &[]);
+
+        assert_eq!(
+            plan.executed_paths,
+            BTreeSet::from([PathBuf::from("tests/test_dense.py")])
+        );
+        assert_eq!(
+            plan.inherited_paths,
+            BTreeSet::from([PathBuf::from("src/unchanged.py")])
+        );
+        assert!(plan.escalated_partitions.is_empty());
+        validate_runtime_plan_handoff(&authorization, &plan).unwrap();
+        let scheduled = crate::server::plan_lsp_node_ids_for_verified_structural_cache(
+            &authorization,
+            &plan,
+            &nodes,
+        )
+        .unwrap();
+        assert!(scheduled.is_empty());
+    }
+
+    #[test]
     fn operation_over_bound_update_escalates_descriptor_partition() {
         let mut nodes = (0..=MAX_INCREMENTAL_LSP_OPERATIONS)
             .map(|index| {
@@ -2526,7 +2893,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         nodes.push(node("src/unchanged.py", "python"));
-        let authorization = verified_authorization(
+        let mut authorization = verified_authorization(
             &[("src/unchanged.py", "python")],
             &["src/dense.py"],
             &[],
@@ -2535,6 +2902,10 @@ mod tests {
             &[],
             &[],
         );
+        authorization
+            .authorization
+            .executed_operation_budget
+            .executed_estimate = MAX_INCREMENTAL_LSP_OPERATIONS as u64 + 1;
 
         let plan = plan_incremental_impact(&authorization, &nodes, &[], &nodes, &[]);
 

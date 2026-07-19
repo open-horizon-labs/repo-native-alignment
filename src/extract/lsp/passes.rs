@@ -419,6 +419,22 @@ struct LspPass1WorkItem {
     attempt_count: u32,
 }
 
+fn validate_structural_cache_runtime_operation_plan(
+    admission: Option<&crate::structural_cache::RuntimeStructuralCacheOperationAdmission>,
+    operations: &[LspQueryOperation],
+) -> Result<Option<usize>> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    let operation_names = operations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    admission
+        .validate_exact_plan(operation_names.iter().map(String::as_str))
+        .map(Some)
+}
+
 fn pass1_work_item_files(work_items: &[LspPass1WorkItem]) -> Vec<PathBuf> {
     let mut files = work_items
         .iter()
@@ -1202,6 +1218,18 @@ impl LspEnricher {
     ) -> (u32, u32, bool, Option<String>) {
         let pass1_start = std::time::Instant::now();
         let language = self.language.clone();
+        let runtime_admission = match crate::structural_cache::load_runtime_operation_admission(
+            root, &language,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let diagnostic = format!(
+                    "structural-cache runtime LSP admission failed before Pass 1 requests: {error:#}"
+                );
+                tracing::warn!("{diagnostic}");
+                return (0, 1, true, Some(diagnostic));
+            }
+        };
 
         // Filter to only nodes that need LSP requests:
         // Functions (call hierarchy), Traits (implementations), and Other (document links).
@@ -1226,21 +1254,7 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            .filter(|n| {
-                // Skip test functions (have #[test] or #[tokio::test] decorator)
-                if n.id.kind == NodeKind::Function {
-                    if let Some(decorators) = n.metadata.get("decorators")
-                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]"))
-                    {
-                        return false;
-                    }
-                    // Also skip functions in test files
-                    if crate::ranking::is_test_file(n) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|n| !crate::ranking::is_test_function(n))
             .copied()
             .collect();
 
@@ -1302,6 +1316,28 @@ impl LspEnricher {
                     admitted_nodes.push((node, operation));
                 }
             }
+        }
+
+        if let Some(admission) = runtime_admission.as_ref() {
+            let operations = admitted_nodes
+                .iter()
+                .map(|(_, operation)| *operation)
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                validate_structural_cache_runtime_operation_plan(Some(admission), &operations)
+            {
+                let diagnostic = format!(
+                    "structural-cache runtime LSP plan failed closed before Pass 1 requests: {error:#}"
+                );
+                tracing::warn!("{diagnostic}");
+                return (0, 1, true, Some(diagnostic));
+            }
+            tracing::info!(
+                language = %language,
+                actual_operations = operations.len(),
+                signed_estimate = admission.signed_estimate(),
+                "Verified exact structural-cache Pass 1 runtime operation plan"
+            );
         }
 
         let ref_eligible = admitted_nodes
@@ -2480,6 +2516,21 @@ impl LspEnricher {
             return (has_type_hierarchy, type_hierarchy_strikes);
         }
 
+        let runtime_admission = match crate::structural_cache::load_runtime_operation_admission(
+            root,
+            &self.language,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "structural-cache runtime LSP admission failed before Pass 2 requests: {error:#}"
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                return (false, type_hierarchy_strikes.saturating_add(1));
+            }
+        };
         let type_nodes: Vec<&Node> = matching_nodes
             .iter()
             .filter(|n| {
@@ -2498,6 +2549,21 @@ impl LspEnricher {
             })
             .copied()
             .collect();
+
+        if let Some(admission) = runtime_admission.as_ref() {
+            let operations = vec![LspQueryOperation::TypeHierarchy; type_nodes.len()];
+            if let Err(error) =
+                validate_structural_cache_runtime_operation_plan(Some(admission), &operations)
+            {
+                result.aborted = true;
+                result.error_count = result.error_count.saturating_add(1);
+                result.diagnostic = Some(format!(
+                    "structural-cache runtime LSP plan failed closed before Pass 2 requests: {error:#}"
+                ));
+                tracing::warn!("{}", result.diagnostic.as_deref().unwrap_or_default());
+                return (false, type_hierarchy_strikes.saturating_add(1));
+            }
+        }
 
         if !type_nodes.is_empty() {
             tracing::debug!("Type hierarchy pass: {} eligible nodes", type_nodes.len());
@@ -2880,6 +2946,55 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn signed_runtime_plan_rejects_unsigned_document_symbols_and_reference_fallback() {
+        let admission = crate::structural_cache::RuntimeStructuralCacheOperationAdmission::for_test(
+            &["call_hierarchy"],
+            8,
+        );
+
+        let document_symbol_error = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::DocumentSymbols],
+        )
+        .unwrap_err();
+        assert!(
+            document_symbol_error
+                .to_string()
+                .contains("document_symbols")
+        );
+
+        let fallback_error = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::References],
+        )
+        .unwrap_err();
+        assert!(fallback_error.to_string().contains("references"));
+    }
+
+    #[test]
+    fn signed_runtime_plan_accepts_signed_fallback_and_rejects_exact_overflow() {
+        let admission = crate::structural_cache::RuntimeStructuralCacheOperationAdmission::for_test(
+            &["references"],
+            1,
+        );
+
+        assert_eq!(
+            validate_structural_cache_runtime_operation_plan(
+                Some(&admission),
+                &[LspQueryOperation::References],
+            )
+            .unwrap(),
+            Some(1)
+        );
+        let overflow = validate_structural_cache_runtime_operation_plan(
+            Some(&admission),
+            &[LspQueryOperation::References, LspQueryOperation::References],
+        )
+        .unwrap_err();
+        assert!(overflow.to_string().contains("actual=2 max=1"));
+    }
 
     fn call_hierarchy_item(
         endpoint: &str,

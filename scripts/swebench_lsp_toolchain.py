@@ -40,6 +40,7 @@ from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 
 SCHEMA_VERSION = 1
 STRUCTURAL_CACHE_SCHEMA_VERSION = 1
+STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION = 2
 STRUCTURAL_CACHE_ROOT = "cache"
 STRUCTURAL_CACHE_CORE = ".rna-structural-cache-core.json"
 STRUCTURAL_CACHE_CATALOG = "structural-cache-catalog.json"
@@ -49,9 +50,25 @@ STRUCTURAL_CACHE_AUTHORIZATION_SHA256_ENV = (
 STRUCTURAL_CACHE_MAX_MEMBERS = 250_000
 STRUCTURAL_CACHE_MAX_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 STRUCTURAL_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+STRUCTURAL_CACHE_MAX_EXECUTED_LSP_OPERATIONS = 12_288
+STRUCTURAL_CACHE_OPERATION_BUDGET_BASIS = (
+    "verified_base_capability_aware_per_path_work_ledger_with_language_median_for_unseen_paths"
+)
+STRUCTURAL_CACHE_LSP_OPERATIONS = frozenset(
+    {
+        "call_hierarchy",
+        "references",
+        "definitions",
+        "implementations",
+        "type_hierarchy",
+        "document_symbols",
+        "document_links",
+    }
+)
 STRUCTURAL_CACHE_FORBIDDEN_COMPONENTS = frozenset(
     {"embedding", "embeddings", "rerank", "reranker", "vectors", "vector-index"}
 )
+STRUCTURAL_CACHE_FORBIDDEN_PATHS = frozenset({"lance/artifacts.lance"})
 STRUCTURAL_CACHE_LSP_IMPACT_MARKERS = (
     "->calls->",
     "->referenced_by->",
@@ -564,7 +581,15 @@ def _normalized_cache_path(value: str, label: str = "cache member") -> str:
     if normalized != value:
         raise ToolchainError(f"{label} path is not canonical: {value}")
     lowered = {part.casefold() for part in parts}
-    if lowered & STRUCTURAL_CACHE_FORBIDDEN_COMPONENTS:
+    normalized_folded = normalized.casefold()
+    if (
+        lowered & STRUCTURAL_CACHE_FORBIDDEN_COMPONENTS
+        or any(
+            normalized_folded == forbidden
+            or normalized_folded.startswith(f"{forbidden}/")
+            for forbidden in STRUCTURAL_CACHE_FORBIDDEN_PATHS
+        )
+    ):
         raise ToolchainError(f"{label} contains embeddings/rerank payload: {value}")
     return normalized
 
@@ -1900,7 +1925,6 @@ def inject_structural_cache(
         )
         for path, records in completed_by_path.items()
     }
-
     diff = selection["diff"]
     touched = set(diff["changed_paths"]) | set(diff["added_paths"]) | set(
         diff["deleted_paths"]
@@ -2134,8 +2158,27 @@ def inject_structural_cache(
             else 0
         )
         estimated_operation_file_count += 1
+    authorized_operations_by_language: dict[str, list[str]] = {}
+    for language in sorted(set(path_partitions.values())):
+        authorized_operations_by_language[language] = sorted(
+            {
+                operation
+                for path, records in completed_by_path.items()
+                if base_languages.get(path) == language
+                for _, record in records
+                for operation in record.get("requested_operations", [])
+                if isinstance(operation, str) and operation
+            }
+        )
+    executed_operation_budget = {
+        "max_operations": STRUCTURAL_CACHE_MAX_EXECUTED_LSP_OPERATIONS,
+        "executed_estimate": predicted_executed_work_count,
+        "authorized_operations_by_language": authorized_operations_by_language,
+        "basis": STRUCTURAL_CACHE_OPERATION_BUDGET_BASIS,
+        "estimated_file_count": estimated_operation_file_count,
+    }
     authorization = {
-        "schema_version": STRUCTURAL_CACHE_SCHEMA_VERSION,
+        "schema_version": STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION,
         "offline_preprocessing": True,
         "repository": target_identity["repository"],
         "base_commit": core["commit"],
@@ -2162,6 +2205,7 @@ def inject_structural_cache(
         "invalidated_partitions": sorted(invalidated),
         "invalidated_paths": invalidated_paths,
         "path_partitions": path_partitions,
+        "executed_operation_budget": executed_operation_budget,
         "digest": "",
     }
     authorization["digest"] = sha256_bytes(canonical_json(authorization))
@@ -2183,6 +2227,7 @@ def inject_structural_cache(
             inherited_work_count + predicted_executed_work_count
         ),
         "predicted_operation_estimated_file_count": estimated_operation_file_count,
+        "executed_operation_budget": executed_operation_budget,
         "impact_closure_basis": "verified_base_persisted_old_lsp_edge_fixed_point",
         "impact_closure_paths": impact_closure_paths,
         "changed_file_count": diff["distance"],
@@ -2240,6 +2285,8 @@ def build_structural_cache_preflight(
             "inherited_exact": 0,
             "executed_estimate": None,
             "total_estimate": None,
+            "max_executed": STRUCTURAL_CACHE_MAX_EXECUTED_LSP_OPERATIONS,
+            "authorized_operations_by_language": None,
             "basis": "cold_no_base_work_ledger",
             "estimated_file_count": target_file_count,
         }
@@ -2271,6 +2318,22 @@ def build_structural_cache_preflight(
             Path(injection_receipt["authorization_path"]),
             f"{instance_id} structural-cache authorization",
         )
+        if (
+            authorization.get("schema_version")
+            != STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION
+            or authorization.get("offline_preprocessing") is not True
+        ):
+            raise ToolchainError(
+                f"{instance_id} structural-cache authorization schema/status mismatch"
+            )
+        signed_budget = authorization.get("executed_operation_budget")
+        if (
+            not isinstance(signed_budget, dict)
+            or signed_budget != injection_receipt.get("executed_operation_budget")
+        ):
+            raise ToolchainError(
+                f"{instance_id} authorization/preflight operation budget mismatch"
+            )
         inherited_partitions = sorted(
             {
                 inherited["language"]
@@ -2291,18 +2354,17 @@ def build_structural_cache_preflight(
             "inherited_exact": injection_receipt[
                 "inherited_graph_enrichment_operation_count"
             ],
-            "executed_estimate": injection_receipt[
-                "predicted_executed_graph_enrichment_operation_count"
-            ],
-            "total_estimate": injection_receipt[
-                "predicted_total_graph_enrichment_operation_count"
-            ],
-            "basis": (
-                "verified_base_per_path_work_ledger_with_language_median_for_unseen_paths"
+            "executed_estimate": signed_budget["executed_estimate"],
+            "total_estimate": (
+                injection_receipt["inherited_graph_enrichment_operation_count"]
+                + signed_budget["executed_estimate"]
             ),
-            "estimated_file_count": injection_receipt[
-                "predicted_operation_estimated_file_count"
+            "max_executed": signed_budget["max_operations"],
+            "authorized_operations_by_language": signed_budget[
+                "authorized_operations_by_language"
             ],
+            "basis": signed_budget["basis"],
+            "estimated_file_count": signed_budget["estimated_file_count"],
         }
         impact_closure_paths = list(injection_receipt["impact_closure_paths"])
         impact_closure_basis = injection_receipt["impact_closure_basis"]
@@ -2507,6 +2569,8 @@ def validate_structural_cache_preflight(
         "inherited_exact",
         "executed_estimate",
         "total_estimate",
+        "max_executed",
+        "authorized_operations_by_language",
         "basis",
         "estimated_file_count",
     }:
@@ -2514,6 +2578,8 @@ def validate_structural_cache_preflight(
     if (
         type(operations["inherited_exact"]) is not int
         or operations["inherited_exact"] < 0
+        or type(operations["max_executed"]) is not int
+        or operations["max_executed"] != STRUCTURAL_CACHE_MAX_EXECUTED_LSP_OPERATIONS
         or type(operations["estimated_file_count"]) is not int
         or operations["estimated_file_count"] < 0
         or not isinstance(operations["basis"], str)
@@ -2521,11 +2587,33 @@ def validate_structural_cache_preflight(
     ):
         raise ToolchainError("structural-cache preflight operation count is invalid")
     if selected is None:
-        if operations["executed_estimate"] is not None or operations["total_estimate"] is not None:
+        if (
+            operations["executed_estimate"] is not None
+            or operations["total_estimate"] is not None
+            or operations["authorized_operations_by_language"] is not None
+        ):
             raise ToolchainError("cold operation estimate must be explicitly unknown")
     elif (
         type(operations["executed_estimate"]) is not int
         or operations["executed_estimate"] < 0
+        or operations["executed_estimate"] > operations["max_executed"]
+        or not isinstance(operations["authorized_operations_by_language"], dict)
+        or not set(operations["authorized_operations_by_language"]).issubset(
+            target_identity["partitions"]
+        )
+        or any(
+            not isinstance(language, str)
+            or not isinstance(language_operations, list)
+            or language_operations != sorted(set(language_operations))
+            or not all(
+                isinstance(operation, str) and operation
+                for operation in language_operations
+            )
+            or not set(language_operations).issubset(STRUCTURAL_CACHE_LSP_OPERATIONS)
+            for language, language_operations in operations[
+                "authorized_operations_by_language"
+            ].items()
+        )
         or type(operations["total_estimate"]) is not int
         or operations["total_estimate"]
         != operations["inherited_exact"] + operations["executed_estimate"]
@@ -5673,11 +5761,17 @@ def _validate_resume_replay_evidence(
             "invalidated_partitions",
             "invalidated_paths",
             "path_partitions",
+            "executed_operation_budget",
             "digest",
         },
         "replay structural-cache authorization",
     )
     authorization["producer"] = _validate_producer_identity(authorization["producer"])
+    if (
+        authorization["schema_version"] != STRUCTURAL_CACHE_AUTHORIZATION_SCHEMA_VERSION
+        or authorization["offline_preprocessing"] is not True
+    ):
+        raise ToolchainError("replay structural-cache authorization schema/status mismatch")
     authorization_digest = _require_sha256(
         authorization.get("digest"), "replay authorization digest"
     )
@@ -5685,6 +5779,18 @@ def _validate_resume_replay_evidence(
     authorization_payload["digest"] = ""
     if sha256_bytes(canonical_json(authorization_payload)) != authorization_digest:
         raise ToolchainError("replay authorization self-digest mismatch")
+    operation_budget = authorization["executed_operation_budget"]
+    _require_exact_fields(
+        operation_budget,
+        {
+            "max_operations",
+            "executed_estimate",
+            "authorized_operations_by_language",
+            "basis",
+            "estimated_file_count",
+        },
+        "replay structural-cache operation budget",
+    )
 
     approved_sha256 = sha256_file(approved_preflight_path)
     approved = _load_regular_json_with_sha(
@@ -5720,6 +5826,20 @@ def _validate_resume_replay_evidence(
     }
     if any(selected_base.get(field) != value for field, value in expected_base.items()):
         raise ToolchainError("approved preflight/base authorization identities differ")
+    approved_operations = approved.get("expected_operation_count")
+    if (
+        not isinstance(approved_operations, dict)
+        or approved_operations.get("max_executed")
+        != operation_budget["max_operations"]
+        or approved_operations.get("executed_estimate")
+        != operation_budget["executed_estimate"]
+        or approved_operations.get("authorized_operations_by_language")
+        != operation_budget["authorized_operations_by_language"]
+        or approved_operations.get("basis") != operation_budget["basis"]
+        or approved_operations.get("estimated_file_count")
+        != operation_budget["estimated_file_count"]
+    ):
+        raise ToolchainError("approved preflight/authorization operation budgets differ")
 
     expected_identity = {
         "repository": instance["repo"],

@@ -984,6 +984,27 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                             hostile_archive, hostile_sidecar
                         )
 
+            nested_semantic_archive = root / "nested-semantic.tar.gz"
+            nested_semantic_sidecar = root / "nested-semantic.manifest.json"
+            self.write_hostile_archive(
+                nested_semantic_archive,
+                nested_semantic_sidecar,
+                original_sidecar["core"],
+                [
+                    (
+                        "file",
+                        "cache/lance/artifacts.lance/data/0000000000000001.lance",
+                        b"forbidden",
+                    )
+                ],
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "embeddings/rerank"
+            ):
+                TOOLCHAIN.verify_structural_cache_archive(
+                    nested_semantic_archive, nested_semantic_sidecar
+                )
+
             embeddings = checkout / ".oh/.cache/embeddings/index.bin"
             embeddings.parent.mkdir(parents=True)
             embeddings.write_bytes(b"forbidden")
@@ -994,6 +1015,26 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                     checkout,
                     root / "forbidden.tar.gz",
                     root / "forbidden.manifest.json",
+                    identity=identity,
+                    toolchain_lock_digest="a" * 64,
+                    inventory_digest="b" * 64,
+                    inventory_file_sha256="c" * 64,
+                    case_inventory_digest="d" * 64,
+                    base_cache=None,
+                )
+            embeddings.unlink()
+
+            semantic_artifacts = checkout / ".oh/.cache/lance/artifacts.lance"
+            semantic_data = semantic_artifacts / "data"
+            semantic_data.mkdir(parents=True)
+            (semantic_data / "0000000000000001.lance").write_bytes(b"forbidden")
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "embeddings/rerank"
+            ):
+                TOOLCHAIN.archive_structural_cache(
+                    checkout,
+                    root / "forbidden-artifacts.tar.gz",
+                    root / "forbidden-artifacts.manifest.json",
                     identity=identity,
                     toolchain_lock_digest="a" * 64,
                     inventory_digest="b" * 64,
@@ -1218,6 +1259,18 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             )
             self.assertEqual(receipt["changed_file_count"], 0)
             self.assertEqual(receipt["authorization_sha256"], TOOLCHAIN.sha256_file(authorization_path))
+            self.assertEqual(
+                authorization["executed_operation_budget"],
+                {
+                    "max_operations": 12_288,
+                    "executed_estimate": 0,
+                    "authorized_operations_by_language": {
+                        "python": ["document_symbols"]
+                    },
+                    "basis": TOOLCHAIN.STRUCTURAL_CACHE_OPERATION_BUDGET_BASIS,
+                    "estimated_file_count": 0,
+                },
+            )
             inherited = authorization["inherited_files"][0]
             self.assertEqual(inherited["producer_work_ids"], ["job:1"])
             self.assertEqual(
@@ -1249,12 +1302,48 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                     "inherited_exact": 1,
                     "executed_estimate": 0,
                     "total_estimate": 1,
-                    "basis": (
-                        "verified_base_per_path_work_ledger_with_language_median_for_unseen_paths"
-                    ),
+                    "max_executed": 12_288,
+                    "authorized_operations_by_language": {
+                        "python": ["document_symbols"]
+                    },
+                    "basis": TOOLCHAIN.STRUCTURAL_CACHE_OPERATION_BUDGET_BASIS,
                     "estimated_file_count": 0,
                 },
             )
+            over_limit = copy.deepcopy(preflight)
+            over_limit["expected_operation_count"]["executed_estimate"] = 12_289
+            over_limit["expected_operation_count"]["total_estimate"] = 12_290
+            over_limit["digest"] = ""
+            over_limit["digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(over_limit)
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "operation estimate is inconsistent"
+            ):
+                TOOLCHAIN.validate_structural_cache_preflight(
+                    over_limit, identity
+                )
+
+            original_authorization = authorization_path.read_bytes()
+            legacy_authorization = json.loads(original_authorization)
+            legacy_authorization["schema_version"] = 1
+            legacy_authorization["digest"] = ""
+            legacy_authorization["digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(legacy_authorization)
+            )
+            TOOLCHAIN.write_canonical_json(authorization_path, legacy_authorization)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "authorization schema/status mismatch"
+            ):
+                TOOLCHAIN.build_structural_cache_preflight(
+                    case_index=2,
+                    instance_id="owner__repo-2",
+                    inventory_case={"included_file_count": 1},
+                    target_identity=identity,
+                    selection=selection,
+                    injection_receipt=receipt,
+                )
+            authorization_path.write_bytes(original_authorization)
 
     def test_lineage_invalidated_partition_is_a_fixed_point_seed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1309,7 +1398,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 "state": "completed",
                 "file": "src/b.rs",
                 "input_hash": "input-2",
-                "requested_operations": ["callHierarchy/outgoingCalls"],
+                "requested_operations": ["call_hierarchy"],
                 "produced_result_ids": [crossing],
             }
             TOOLCHAIN.write_canonical_json(work_path, work)
@@ -2110,7 +2199,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                         "state": "completed",
                         "file": "src/a.py",
                         "input_hash": "input-1",
-                        "requested_operations": ["textDocument/documentSymbol"],
+                        "requested_operations": ["document_symbols"],
                         "produced_result_ids": ["result-1"],
                     }
                 }
