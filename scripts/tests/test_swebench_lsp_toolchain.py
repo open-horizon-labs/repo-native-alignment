@@ -1133,7 +1133,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             ],
         )
 
-    def test_probe_evidence_binds_current_lock_and_rejects_stale_pyright(self) -> None:
+    def test_probe_evidence_binds_stable_identity_across_extraction_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             lock_path = root / "lock.json"
@@ -1227,6 +1227,42 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             TOOLCHAIN._validate_toolchain_probe_evidence(
                 probe_path, lock_path, provisioned_identity
             )
+
+            relocated_verifier_clean_identity = copy.deepcopy(provisioned_identity)
+            relocated_verifier_clean_identity["toolchain_root"] = str(
+                (root / "different-bundle-extraction" / "toolchain").resolve()
+            )
+            TOOLCHAIN._validate_toolchain_probe_evidence(
+                probe_path, lock_path, relocated_verifier_clean_identity
+            )
+
+            relative_recorded_root = TOOLCHAIN.load_json_object(
+                probe_path, "test probe"
+            )
+            relative_recorded_root["toolchain_root"] = "relative/toolchain"
+            relative_recorded_root.pop("probe_digest")
+            relative_recorded_root["probe_digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(relative_recorded_root)
+            )
+            TOOLCHAIN.write_canonical_json(probe_path, relative_recorded_root)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError,
+                "toolchain probe roots must be absolute paths",
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, provisioned_identity
+                )
+
+            probe_path = publish_probe(server_receipt)
+            relative_current_root = copy.deepcopy(provisioned_identity)
+            relative_current_root["toolchain_root"] = "relative/toolchain"
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError,
+                "toolchain probe roots must be absolute paths",
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, relative_current_root
+                )
 
             stale_pyright = copy.deepcopy(server_receipt)
             stale_pyright.update(

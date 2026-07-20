@@ -5531,6 +5531,18 @@ def _validate_toolchain_probe_evidence(
     if sha256_bytes(canonical_json(digest_payload)) != stored_digest:
         raise ToolchainError("toolchain probe self-digest mismatch")
 
+    probe_toolchain_root = _require_string(
+        probe.get("toolchain_root"), "toolchain probe root"
+    )
+    current_toolchain_root = _require_string(
+        provisioned_identity.get("toolchain_root"),
+        "current provisioned toolchain root",
+    )
+    if not Path(probe_toolchain_root).is_absolute() or not Path(
+        current_toolchain_root
+    ).is_absolute():
+        raise ToolchainError("toolchain probe roots must be absolute paths")
+
     lock = load_json_object(lock_path, "toolchain lock for probe validation")
     lock_servers = lock.get("servers")
     probe_servers = probe.get("servers")
@@ -5542,7 +5554,6 @@ def _validate_toolchain_probe_evidence(
         or type(probe.get("server_count")) is not int
         or probe["schema_version"] != SCHEMA_VERSION
         or probe["lock_sha256"] != sha256_file(lock_path)
-        or probe.get("toolchain_root") != provisioned_identity.get("toolchain_root")
         or probe.get("inventory_sha256")
         != provisioned_identity.get("inventory_sha256")
         or probe.get("provision_receipt_digest")
