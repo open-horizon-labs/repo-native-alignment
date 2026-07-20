@@ -38,7 +38,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -590,7 +590,7 @@ def structural_cache_identity(rna_binary: Path, checkout: Path) -> dict[str, Any
     return identity
 
 
-def _normalized_cache_path(value: str, label: str = "cache member") -> str:
+def _normalized_cache_member_path(value: str, label: str = "cache member") -> str:
     if not value or "\0" in value or "\\" in value:
         raise ToolchainError(f"{label} path is empty, contains NUL, or uses backslashes")
     pure = PurePosixPath(value)
@@ -604,6 +604,12 @@ def _normalized_cache_path(value: str, label: str = "cache member") -> str:
     normalized = pure.as_posix()
     if normalized != value:
         raise ToolchainError(f"{label} path is not canonical: {value}")
+    return normalized
+
+
+def _normalized_cache_path(value: str, label: str = "cache member") -> str:
+    normalized = _normalized_cache_member_path(value, label)
+    parts = PurePosixPath(normalized).parts
     lowered = {part.casefold() for part in parts}
     normalized_folded = normalized.casefold()
     if (
@@ -618,28 +624,36 @@ def _normalized_cache_path(value: str, label: str = "cache member") -> str:
     return normalized
 
 
-def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+def _cache_files(
+    cache_root: Path,
+    *,
+    label: str,
+    normalize_path: Callable[[str, str], str],
+    reserved_paths: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     if not cache_root.is_dir() or cache_root.is_symlink():
-        raise ToolchainError("structural cache root must be a real directory")
+        raise ToolchainError(f"{label} root must be a real directory")
     members: list[dict[str, Any]] = []
     total_size = 0
     for path in sorted(cache_root.rglob("*"), key=lambda candidate: candidate.as_posix()):
-        relative = _normalized_cache_path(path.relative_to(cache_root).as_posix())
+        relative = normalize_path(
+            path.relative_to(cache_root).as_posix(), f"{label} member"
+        )
         stat_result = path.lstat()
         if path.is_symlink():
-            raise ToolchainError(f"structural cache contains a symlink: {relative}")
+            raise ToolchainError(f"{label} contains a symlink: {relative}")
         if path.is_dir():
             continue
         if not path.is_file():
-            raise ToolchainError(f"structural cache contains a special file: {relative}")
-        if relative == STRUCTURAL_CACHE_CORE:
-            raise ToolchainError("live cache contains a reserved embedded core manifest")
+            raise ToolchainError(f"{label} contains a special file: {relative}")
+        if relative in reserved_paths:
+            raise ToolchainError(f"{label} contains a reserved path: {relative}")
         size = stat_result.st_size
         if size > STRUCTURAL_CACHE_MAX_MEMBER_BYTES:
-            raise ToolchainError(f"structural cache member is oversized: {relative}")
+            raise ToolchainError(f"{label} member is oversized: {relative}")
         total_size += size
         if total_size > STRUCTURAL_CACHE_MAX_TOTAL_BYTES:
-            raise ToolchainError("structural cache exceeds total size limit")
+            raise ToolchainError(f"{label} exceeds total size limit")
         members.append(
             {
                 "path": relative,
@@ -649,11 +663,62 @@ def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
             }
         )
         if len(members) > STRUCTURAL_CACHE_MAX_MEMBERS:
-            raise ToolchainError("structural cache contains too many members")
+            raise ToolchainError(f"{label} contains too many members")
     paths = [member["path"] for member in members]
     if len(paths) != len(set(paths)) or len(paths) != len({path.casefold() for path in paths}):
-        raise ToolchainError("structural cache paths collide")
+        raise ToolchainError(f"{label} paths collide")
     return members
+
+
+def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+    return _cache_files(
+        cache_root,
+        label="structural cache",
+        normalize_path=_normalized_cache_path,
+        reserved_paths=frozenset({STRUCTURAL_CACHE_CORE}),
+    )
+
+
+def _diagnostic_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+    """Enumerate all regular failure-state bytes without structural projection."""
+    return _cache_files(
+        cache_root,
+        label="diagnostic cache",
+        normalize_path=_normalized_cache_member_path,
+    )
+
+
+def _validate_diagnostic_cache_root(checkout: Path, cache_root: Path) -> None:
+    for label, path in (
+        ("checkout", checkout),
+        ("checkout .oh directory", checkout / ".oh"),
+        ("diagnostic cache", cache_root),
+    ):
+        if path.is_symlink() or not path.is_dir():
+            raise ToolchainError(f"{label} must be a real non-symlink directory")
+
+
+def _diagnostic_cache_source_is_regular(cache_root: Path, source: Path) -> bool:
+    try:
+        relative = source.relative_to(cache_root)
+    except ValueError as error:
+        raise ToolchainError(
+            f"diagnostic cache member escapes cache root: {source}"
+        ) from error
+    _normalized_cache_member_path(relative.as_posix(), "diagnostic cache member")
+    current = cache_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if current.is_symlink():
+            raise ToolchainError(
+                f"diagnostic cache member has a symlink component: {relative}"
+            )
+        if index < len(relative.parts) - 1:
+            if not current.is_dir():
+                return False
+        else:
+            return current.is_file()
+    return False
 
 
 def _structural_tree_digest(members: Sequence[Mapping[str, Any]]) -> str:
@@ -4476,15 +4541,15 @@ def _wrapper(
 ) -> bytes:
     target_literal = target.replace('"', '\\"')
     version_guard = ""
+    if kind in {"java-jar", "node"} and command_name and version:
+        version_line = shlex.quote(f"{command_name} {version}")
+        version_guard = (
+            'if [ "${1-}" = "--version" ]; then\n'
+            f"  printf '%s\\n' {version_line}\n"
+            "  exit 0\n"
+            "fi\n"
+        )
     if kind == "java-jar":
-        if command_name and version:
-            version_line = shlex.quote(f"{command_name} {version}")
-            version_guard = (
-                'if [ "${1-}" = "--version" ]; then\n'
-                f"  printf '%s\\n' {version_line}\n"
-                "  exit 0\n"
-                "fi\n"
-            )
         command = (
             'exec "$ROOT/runtimes/jdk-21.0.11+10-jre/Contents/Home/bin/java" '
             f'-jar "$ROOT/{target_literal}" "$@"'
@@ -5919,7 +5984,10 @@ def _run_combined_query_probes(
             "--compact",
         ],
     ).decode("utf-8", errors="strict")
-    if "0 result(s)" in graph_output or selected_node_id not in graph_output:
+    if (
+        re.search(r"(?m)^0 result\(s\)\s*$", graph_output) is not None
+        or selected_node_id not in graph_output
+    ):
         raise ToolchainError("fresh-reopen graph traversal returned no persisted neighbors")
 
     full_output = run(
@@ -6097,9 +6165,15 @@ def _preserve_failed_case_evidence(
     ]
     full_cache_retained = False
     full_cache_error = None
-    if cache_root.is_dir() and not cache_root.is_symlink():
+    cache_root_is_valid = False
+    try:
+        _validate_diagnostic_cache_root(checkout, cache_root)
+        cache_root_is_valid = True
+    except ToolchainError as cache_error:
+        full_cache_error = str(cache_error)
+    if cache_root_is_valid:
         try:
-            members = _structural_cache_files(cache_root)
+            members = _diagnostic_cache_files(cache_root)
             evidence_sources.extend(cache_root / member["path"] for member in members)
             full_cache_retained = True
         except ToolchainError as cache_error:
@@ -6108,14 +6182,17 @@ def _preserve_failed_case_evidence(
     copied = []
     seen: set[Path] = set()
     for source in evidence_sources:
-        if source in seen or not source.is_file():
+        if source in seen or not cache_root_is_valid:
             continue
-        if source.is_symlink():
-            full_cache_retained = False
-            full_cache_error = (
-                full_cache_error
-                or f"refusing symlink in failed cache evidence: {source}"
+        try:
+            source_is_regular = _diagnostic_cache_source_is_regular(
+                cache_root, source
             )
+        except ToolchainError as cache_error:
+            full_cache_retained = False
+            full_cache_error = full_cache_error or str(cache_error)
+            continue
+        if not source_is_regular:
             continue
         seen.add(source)
         relative = source.relative_to(cache_root)

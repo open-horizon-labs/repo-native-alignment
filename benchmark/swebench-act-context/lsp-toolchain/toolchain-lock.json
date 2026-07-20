@@ -276,7 +276,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/bash-language-server",
-      "executable_sha256": "90419f24f837d3883264478f66b1eafebe6283f8641dda3893bd81f040a404d8",
+      "executable_sha256": "dcac261d73ac5cf0b79a97b487ee398dfaccb64b7a662579a4511347171b3317",
       "command": "bash-language-server",
       "args": [
         "start"
@@ -461,7 +461,7 @@
       "artifact": "cyright-1e055084.tar.gz",
       "artifact_sha256": "f78160a80b4f57c8e5f875c11da371e8f7fbced4b66eaa5b4f027d4f13f4fc02",
       "executable": "bin/cyright-langserver",
-      "executable_sha256": "21f72a15e7606f5b8f8a6e60bd094dd44a5b10827cc9c07e2a717d9496665d45",
+      "executable_sha256": "167ad1cc8af943a7353dbbba29962c94eff91976b114877a1ade56f1cb861cb6",
       "command": "cyright-langserver",
       "args": [
         "--stdio"
@@ -509,7 +509,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/dot-language-server",
-      "executable_sha256": "01cb5f4da4952d8d3b028e8eff19d78ad6fdfae5d5e5aab77cdc8e4f9c949284",
+      "executable_sha256": "318faff63c6928a3cb23be777b708300dd583d58c95757d08f5a58df5cf50953",
       "command": "dot-language-server",
       "args": [
         "--stdio"
@@ -1319,7 +1319,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/typescript-language-server",
-      "executable_sha256": "191f7bad6b4f6ca943bebf76caa9fa486bb790333cba087b345edd176e114d66",
+      "executable_sha256": "0da5ca1e0aa833a0d566a4b9edfafbfb923d8cc0e68123fb733f46b7547a23a4",
       "command": "typescript-language-server",
       "args": [
         "--stdio"
@@ -1364,7 +1364,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-css-language-server",
-      "executable_sha256": "f9bacb87b974f1e72efbdf255829c08f0ab6f2e9372c5a102f2cb726ec8de51c",
+      "executable_sha256": "5b614aa09b9e916a1164848c5c649c367e8788d3eb2613b2e5e0a83abf333a18",
       "command": "vscode-css-language-server",
       "args": [
         "--stdio"
@@ -1409,7 +1409,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-html-language-server",
-      "executable_sha256": "8ff58f1bf4033168558b3d46e47a2eb59804203aa33ff8fc52ccedbd717d7b86",
+      "executable_sha256": "17d3e6ce8da85ab5bdd4a24ee2126b5330ba82446872ae65167ebf546ea83577",
       "command": "vscode-html-language-server",
       "args": [
         "--stdio"
@@ -1457,7 +1457,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/vscode-json-language-server",
-      "executable_sha256": "c5417bff21eb9f0313e66ac114030ff2e389927cb69bf8d9ce7b1cb02425873e",
+      "executable_sha256": "95af57496aac09954c6afbbca3858e29144a0f6c61c6e67b379bf1e441c48178",
       "command": "vscode-json-language-server",
       "args": [
         "--stdio"
@@ -1502,7 +1502,7 @@
       "artifact": "node-lsp-bundle-1.0.0.tar.gz",
       "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
       "executable": "bin/yaml-language-server",
-      "executable_sha256": "4531cb2ac8e089373282b099e9df1729a7814d2eaeeddcc96bd3aadaa8da290d",
+      "executable_sha256": "91cb774ba56dfbf4014ea598dbef498f0c8944af22bc11eec3e38062f1e87c6b",
       "command": "yaml-language-server",
       "args": [
         "--stdio"

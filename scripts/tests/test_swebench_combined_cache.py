@@ -20,6 +20,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             selected = "src/lib.rs:fixture:function"
+            graph_result_count = 10
 
             def fake_profiled_query(
                 args: list[str],
@@ -32,7 +33,10 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
             ) -> dict[str, object]:
                 self.assertEqual(timeout_seconds, 300.0)
                 if "--mode" in args:
-                    stdout = f"Graph neighbors of `{selected}`\n1 result(s)\n"
+                    stdout = (
+                        f"Graph neighbors of `{selected}`\n"
+                        f"{graph_result_count} result(s)\n"
+                    )
                 elif "--include-body" in args:
                     stdout = f"`{selected}`\n```rust\nfn fixture() {{}}\n```\n"
                 else:
@@ -72,6 +76,29 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
             verified = COMBINED._validate_query_evidence_root(result["root"])
             self.assertEqual(verified["evidence_digest"], result["evidence_digest"])
             self.assertEqual(set(result["probes"]), set(COMBINED.QUERY_PROBE_NAMES))
+
+            graph_result_count = 0
+            with mock.patch.object(
+                STRUCTURAL,
+                "_run_profiled_query",
+                side_effect=fake_profiled_query,
+            ):
+                with self.assertRaisesRegex(
+                    STRUCTURAL.ToolchainError,
+                    "graph traversal returned no persisted neighbors",
+                ):
+                    STRUCTURAL._run_combined_query_probes(
+                        combined=COMBINED,
+                        rna_binary=root / "rna",
+                        checkout=root,
+                        environment={},
+                        evidence_root=root / "zero-query-evidence",
+                        case_identity={
+                            "case_index": 1,
+                            "attempt_index": 2,
+                            "instance_id": "owner__repo-1",
+                        },
+                    )
 
     def test_qualifier_combined_mode_is_explicit_and_projects_structural_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -132,6 +132,36 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             self.assertEqual(completed.stdout, "lemminx 0.3.0\n")
             self.assertEqual(completed.stderr, "")
 
+    def test_node_launcher_reports_locked_version_without_path_bearing_diagnostics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launcher = root / "bin" / "vscode-json-language-server"
+            launcher.parent.mkdir()
+            launcher.write_bytes(
+                TOOLCHAIN._wrapper(
+                    "node",
+                    "missing/server.js",
+                    command_name="vscode-json-language-server",
+                    version="4.10.0",
+                )
+            )
+            launcher.chmod(0o755)
+
+            completed = subprocess.run(
+                [str(launcher), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(
+                completed.stdout,
+                "vscode-json-language-server 4.10.0\n",
+            )
+            self.assertEqual(completed.stderr, "")
+
     def test_operation_capabilities_preserve_actual_negotiated_providers(self) -> None:
         text_document_client = TOOLCHAIN._probe_client_capabilities()[
             "textDocument"
@@ -272,6 +302,108 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             self.assertEqual(set(retained), {str(archive.resolve()), str(sidecar.resolve())})
             self.assertEqual(retained[str(archive.resolve())]["sha256"], TOOLCHAIN.sha256_file(archive))
             self.assertEqual(retained[str(sidecar.resolve())]["sha256"], TOOLCHAIN.sha256_file(sidecar))
+
+    def test_failed_case_evidence_retains_combined_cache_without_mutating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache"
+            graph = cache / "lance/graph.bin"
+            vectors = cache / "embeddings/generations/generation/lance/vectors.bin"
+            graph.parent.mkdir(parents=True)
+            vectors.parent.mkdir(parents=True)
+            graph.write_bytes(b"persisted graph")
+            vectors.write_bytes(b"persisted vectors")
+            before = {
+                graph: TOOLCHAIN.sha256_file(graph),
+                vectors: TOOLCHAIN.sha256_file(vectors),
+            }
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertTrue(receipt["full_cache_retained"])
+            self.assertIsNone(receipt["full_cache_error"])
+            evidence = {entry["cache_path"]: entry for entry in receipt["evidence"]}
+            self.assertEqual(
+                set(evidence),
+                {
+                    "lance/graph.bin",
+                    "embeddings/generations/generation/lance/vectors.bin",
+                },
+            )
+            evidence_root = root / "cases/owner__repo-1-failure-evidence"
+            for source, digest in before.items():
+                relative = source.relative_to(cache)
+                retained = evidence_root / relative
+                self.assertEqual(TOOLCHAIN.sha256_file(source), digest)
+                self.assertEqual(TOOLCHAIN.sha256_file(retained), digest)
+                self.assertEqual(
+                    evidence[relative.as_posix()]["size_bytes"], source.stat().st_size
+                )
+
+    def test_failed_case_evidence_rejects_symlinked_combined_cache_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache/embeddings"
+            cache.mkdir(parents=True)
+            target = root / "outside.bin"
+            target.write_bytes(b"outside")
+            (cache / "vectors.bin").symlink_to(target)
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertFalse(receipt["full_cache_retained"])
+            self.assertIn("contains a symlink", receipt["full_cache_error"])
+            self.assertFalse(
+                (root / "cases/owner__repo-1-failure-evidence/embeddings/vectors.bin").exists()
+            )
+
+    def test_failed_case_evidence_rejects_symlinked_cache_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache"
+            cache.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "scan_version").write_bytes(b"outside")
+            (cache / "lance").symlink_to(outside, target_is_directory=True)
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertFalse(receipt["full_cache_retained"])
+            self.assertIn("symlink", receipt["full_cache_error"])
+            self.assertFalse(
+                (root / "cases/owner__repo-1-failure-evidence/lance/scan_version").exists()
+            )
 
     def test_run_logged_timeout_preserves_evidence_and_kills_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -554,6 +686,30 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertTrue(result["repository_sources_verified"])
         self.assertEqual(result["acquisition_recipe_count"], 4)
         self.assertEqual(result["acquisition_artifact_count"], 14)
+
+    def test_real_generated_launcher_digests_match_lock(self) -> None:
+        lock = TOOLCHAIN.load_json_object(
+            ROOT / "benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json",
+            "toolchain lock",
+        )
+        checked = []
+        for entry in lock["servers"]:
+            launcher = entry["launcher"]
+            if launcher["kind"] == "direct":
+                continue
+            generated = TOOLCHAIN._wrapper(
+                launcher["kind"],
+                launcher["target"],
+                command_name=entry["command"],
+                version=entry["version"],
+            )
+            self.assertEqual(
+                TOOLCHAIN.sha256_bytes(generated),
+                entry["executable_sha256"],
+                entry["command"],
+            )
+            checked.append(entry["command"])
+        self.assertGreaterEqual(len(checked), 10)
 
     def test_empty_cache_repo_recipe_verifies_and_provisions_offline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
