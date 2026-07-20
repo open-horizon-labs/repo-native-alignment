@@ -4544,6 +4544,29 @@ def _install_launcher(entry: Mapping[str, Any], toolchain_root: Path) -> None:
         command_path.chmod(0o755)
 
 
+def _write_relocatable_esbonio_entrypoint(entrypoint: Path) -> None:
+    """Replace pip's absolute-venv shebang with deterministic entrypoint bytes.
+
+    The provisioned launcher invokes this file with the private environment's
+    Python interpreter, so the shebang is not used at runtime. Keeping a
+    portable shebang makes the target content (and therefore the sealed
+    provision receipt) independent of the toolchain installation directory.
+    """
+    if entrypoint.is_symlink() or not entrypoint.is_file():
+        raise ToolchainError("offline Esbonio entrypoint is missing")
+    entrypoint.write_bytes(
+        b"#!/usr/bin/env python3\n"
+        b"# -*- coding: utf-8 -*-\n"
+        b"import re\n"
+        b"import sys\n"
+        b"from esbonio.cli import main\n"
+        b"if __name__ == '__main__':\n"
+        b"    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        b"    sys.exit(main())\n"
+    )
+    entrypoint.chmod(0o755)
+
+
 def toolchain_environment(
     toolchain_root: Path, isolation_root: Path
 ) -> dict[str, str]:
@@ -4720,6 +4743,7 @@ def provision_toolchain(
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise ToolchainError(f"offline wheel installation failed: {detail}")
+        _write_relocatable_esbonio_entrypoint(python_env / "bin/esbonio")
 
     for entry in lock["servers"]:
         _install_launcher(entry, toolchain_root)

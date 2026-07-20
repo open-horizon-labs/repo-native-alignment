@@ -26,6 +26,26 @@ SPEC.loader.exec_module(TOOLCHAIN)
 
 
 class SwebenchLspToolchainTests(unittest.TestCase):
+    def test_esbonio_entrypoint_is_relocatable_and_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first/bin/esbonio"
+            second = root / "different-length-root/bin/esbonio"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_text(f"#!{first.parent}/python\npath dependent\n")
+            second.write_text(f"#!{second.parent}/python\npath dependent\n")
+
+            TOOLCHAIN._write_relocatable_esbonio_entrypoint(first)
+            TOOLCHAIN._write_relocatable_esbonio_entrypoint(second)
+
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(
+                TOOLCHAIN.sha256_file(first), TOOLCHAIN.sha256_file(second)
+            )
+            self.assertTrue(first.stat().st_mode & 0o111)
+            self.assertIn(b"from esbonio.cli import main", first.read_bytes())
+
     def test_case_readiness_uses_live_gate_and_matches_persisted_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "readiness.log"
