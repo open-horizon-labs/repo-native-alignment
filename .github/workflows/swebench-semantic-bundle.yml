@@ -91,6 +91,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: aarch64-apple-darwin
+          components: rust-analyzer
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -173,6 +174,13 @@ jobs:
           RNA_SEMANTIC_ASSET_SEEDING: "1"
         run: |
           set -euo pipefail
+          SEMANTIC_SEED_HOME="$MODEL_DOWNLOAD_ROOT/metal-candle-home"
+          mkdir -p "$HF_HOME/hub" "$SEMANTIC_SEED_HOME"
+          python3 scripts/swebench_lsp_toolchain.py bind-hf-default-cache \
+            --hf-home "$HF_HOME" \
+            --home "$SEMANTIC_SEED_HOME" \
+            > "$BUNDLE_ROOT/evidence/online-hf-cache-binding.json"
+          export HOME="$SEMANTIC_SEED_HOME"
           ditto .github/fixtures/smoke "$FIXTURE_ROOT"
           git -C "$FIXTURE_ROOT" init --quiet
           git -C "$FIXTURE_ROOT" config user.name "RNA CI"
@@ -191,15 +199,20 @@ jobs:
             --timings \
             > "$BUNDLE_ROOT/evidence/online-structural-seed.stdout" \
             2> "$BUNDLE_ROOT/evidence/online-structural-seed.stderr"
-          "$BUNDLE_ROOT/repo-native-alignment" search \
-            --repo "$FIXTURE_ROOT" \
-            --search-mode hybrid \
-            --rerank \
-            --limit 10 \
-            --compact \
-            "function returns value" \
-            > "$BUNDLE_ROOT/evidence/online-reranker-seed.stdout" \
-            2> "$BUNDLE_ROOT/evidence/online-reranker-seed.stderr"
+          (
+            # FastEmbed gives HF_HOME precedence over FASTEMBED_CACHE_DIR.
+            # Keep the reranker in its separately sealed cache root.
+            unset HF_HOME
+            "$BUNDLE_ROOT/repo-native-alignment" search \
+              --repo "$FIXTURE_ROOT" \
+              --search-mode hybrid \
+              --rerank \
+              --limit 10 \
+              --compact \
+              "function returns value" \
+              > "$BUNDLE_ROOT/evidence/online-reranker-seed.stdout" \
+              2> "$BUNDLE_ROOT/evidence/online-reranker-seed.stderr"
+          )
 
           set +e
           "$BUNDLE_ROOT/repo-native-alignment" scan \
@@ -339,7 +352,18 @@ jobs:
             "$ISOLATION_ROOT/xdg-state" \
             "$ISOLATION_ROOT/pip-cache" \
             "$ISOLATION_ROOT/npm-cache"
-          export PATH="$LSP_ROOT/bin:$LSP_ROOT/runtimes/node-v22.12.0-darwin-arm64/bin:$LSP_ROOT/runtimes/python/bin:$LSP_ROOT/runtimes/jdk-21.0.11+10-jre/Contents/Home/bin"
+          python3 scripts/swebench_lsp_toolchain.py bind-hf-default-cache \
+            --hf-home "$HF_HOME" \
+            --home "$ISOLATION_ROOT/home" \
+            > "$BUNDLE_ROOT/evidence/offline-hf-cache-binding.json"
+          RUST_ANALYZER_BIN="$(rustup which --toolchain 1.97.0 rust-analyzer)"
+          test -x "$RUST_ANALYZER_BIN"
+          RUST_TOOLCHAIN_BIN="${RUST_ANALYZER_BIN%/*}"
+          "$RUST_ANALYZER_BIN" --version \
+            > "$BUNDLE_ROOT/evidence/offline-rust-analyzer-version.txt"
+          /usr/bin/shasum -a 256 "$RUST_ANALYZER_BIN" | /usr/bin/awk '{print $1}' \
+            > "$BUNDLE_ROOT/evidence/offline-rust-analyzer-sha256.txt"
+          export PATH="$RUST_TOOLCHAIN_BIN:$LSP_ROOT/bin:$LSP_ROOT/runtimes/node-v22.12.0-darwin-arm64/bin:$LSP_ROOT/runtimes/python/bin:$LSP_ROOT/runtimes/jdk-21.0.11+10-jre/Contents/Home/bin"
           export HOME="$ISOLATION_ROOT/home"
           export TMPDIR="$ISOLATION_ROOT/tmp"
           export XDG_CONFIG_HOME="$ISOLATION_ROOT/xdg-config"
@@ -374,7 +398,9 @@ jobs:
               > "$BUNDLE_ROOT/evidence/offline-lsp-readiness.json" \
               2> "$BUNDLE_ROOT/evidence/offline-lsp-readiness.stderr"
           /usr/bin/sandbox-exec -p "$PROFILE" \
-            "$BUNDLE_ROOT/repo-native-alignment" search \
+            "$BUNDLE_ROOT/repo-native-alignment" \
+              --business-context disabled \
+              search \
               --repo "$FIXTURE_ROOT" \
               --limit 10 \
               --compact \

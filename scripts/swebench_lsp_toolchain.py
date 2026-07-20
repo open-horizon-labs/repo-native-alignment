@@ -4607,6 +4607,55 @@ def toolchain_environment(
     }
 
 
+def bind_hf_default_cache(hf_home: Path, isolated_home: Path) -> dict[str, Any]:
+    """Expose an HF_HOME cache at hf-hub's actual default cache path."""
+    if hf_home.is_symlink() or not hf_home.is_dir():
+        raise ToolchainError("HF_HOME must be a real directory")
+    source_hub = hf_home / "hub"
+    if source_hub.is_symlink() or not source_hub.is_dir():
+        raise ToolchainError("HF_HOME hub must be a real directory")
+    if isolated_home.is_symlink() or not isolated_home.is_dir():
+        raise ToolchainError("isolated HOME must be a real directory")
+
+    source_hub = source_hub.resolve(strict=True)
+    isolated_home = isolated_home.resolve(strict=True)
+    if (
+        source_hub == isolated_home
+        or source_hub in isolated_home.parents
+        or isolated_home in source_hub.parents
+    ):
+        raise ToolchainError("HF_HOME hub and isolated HOME must be disjoint")
+
+    cache_parent = isolated_home / ".cache"
+    huggingface_parent = cache_parent / "huggingface"
+    for label, directory in (
+        ("isolated HOME cache", cache_parent),
+        ("isolated HOME HuggingFace cache", huggingface_parent),
+    ):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ToolchainError(f"{label} must be a real directory")
+        directory.mkdir(exist_ok=True)
+
+    default_hub = huggingface_parent / "hub"
+    if default_hub.exists() or default_hub.is_symlink():
+        raise ToolchainError("default HuggingFace cache destination must be absent")
+    try:
+        default_hub.symlink_to(source_hub, target_is_directory=True)
+        if default_hub.resolve(strict=True) != source_hub:
+            raise ToolchainError("default HuggingFace cache binding target drifted")
+    except Exception:
+        if default_hub.is_symlink():
+            default_hub.unlink()
+        raise
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "bound",
+        "binding": "symlink",
+        "default_cache_relative_path": ".cache/huggingface/hub",
+        "hf_home_relative_path": "hub",
+    }
+
+
 def provision_toolchain(
     lock_path: Path,
     inventory_path: Path,
@@ -7820,6 +7869,7 @@ def qualify_population(
                 ),
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
+                "CANDLE_METAL_ENABLE_FAST_MATH": "1",
                 "RNA_EMBEDDING_MODEL_FILES_DIGEST": embedding["files_digest"],
                 "RNA_EMBEDDING_MODEL_SHA256": embedding["assets"][
                     "model.safetensors"
@@ -7829,6 +7879,9 @@ def qualify_population(
                 ]["sha256"],
                 "RNA_RERANKER_MODEL_FILES_DIGEST": reranker["files_digest"],
             }
+        )
+        bind_hf_default_cache(
+            Path(environment["HF_HOME"]), Path(environment["HOME"])
         )
         environment.pop("RNA_SEMANTIC_ASSET_SEEDING", None)
     probe_path = output_root / "probe.json"
@@ -9107,6 +9160,10 @@ def build_parser() -> argparse.ArgumentParser:
     seal.add_argument("--output", type=Path, required=True)
     seal.add_argument("--root-name", required=True)
 
+    bind_hf = subparsers.add_parser("bind-hf-default-cache")
+    bind_hf.add_argument("--hf-home", type=Path, required=True)
+    bind_hf.add_argument("--home", type=Path, required=True)
+
     repo_bundle = subparsers.add_parser("build-repo-parser-bundle")
     repo_bundle.add_argument("--repo", type=Path, default=Path("."))
     repo_bundle.add_argument("--output", type=Path, required=True)
@@ -9179,6 +9236,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "seal-directory":
             result = seal_directory(args.source, args.output, args.root_name)
+        elif args.command == "bind-hf-default-cache":
+            result = bind_hf_default_cache(args.hf_home, args.home)
         elif args.command == "build-repo-parser-bundle":
             result = build_repo_parser_bundle(args.repo.resolve(), args.output)
         elif args.command == "provision":

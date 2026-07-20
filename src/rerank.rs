@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use fastembed::{RerankResult, RerankerModel, TextRerank};
+use fastembed::{
+    RerankInitOptionsUserDefined, RerankResult, RerankerModel, TextRerank, TokenizerFiles,
+    UserDefinedRerankingModel,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -23,6 +26,16 @@ use sha2::{Digest, Sha256};
 /// The `TextRerank::rerank()` method requires `&mut self` (ONNX session state),
 /// so we use `Mutex` for safe concurrent access.
 static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
+
+/// Strict qualification bypasses fastembed's hub/cache resolution entirely.
+/// Keep it separate from the ordinary reranker so a previously initialized
+/// best-effort model can never satisfy a sealed-cache request.
+static STRICT_RERANKER: Mutex<Option<StrictReranker>> = Mutex::new(None);
+
+struct StrictReranker {
+    cache_digest: String,
+    model: TextRerank,
+}
 
 /// Return the model cache directory.
 /// Precedence: `FASTEMBED_CACHE_DIR` env var > `~/.cache/rna/models/` > fastembed default.
@@ -116,6 +129,14 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
     }
 
     let reranker = guard.as_mut().expect("reranker guaranteed Some after init");
+    rerank_with_model(reranker, query, candidates)
+}
+
+fn rerank_with_model(
+    reranker: &mut TextRerank,
+    query: &str,
+    candidates: &[RerankCandidate],
+) -> Result<Vec<RerankedResult>> {
     let start = std::time::Instant::now();
 
     // Collect document texts for the reranker.
@@ -167,14 +188,253 @@ pub fn rerank_results_strict(
     query: &str,
     candidates: &[RerankCandidate],
 ) -> Result<Vec<RerankedResult>> {
-    let expected_cache_digest = verify_strict_reranker_cache()?;
-    let results = rerank_results(query, candidates)?;
+    let verified_cache = verify_strict_reranker_cache()?;
+    let mut guard = STRICT_RERANKER
+        .lock()
+        .map_err(|error| anyhow::anyhow!("Strict reranker lock poisoned: {error}"))?;
+
+    let cache_is_loaded = guard
+        .as_ref()
+        .map(|reranker| reranker.cache_digest.as_str())
+        == Some(verified_cache.digest.as_str());
+    if !cache_is_loaded {
+        let start = std::time::Instant::now();
+        let files = locate_strict_reranker_snapshot(&verified_cache.root)?;
+        let model = load_strict_reranker(&files)?;
+        tracing::info!(
+            "Strict reranker: loaded sealed snapshot {} in {:?}",
+            files.snapshot.display(),
+            start.elapsed()
+        );
+        *guard = Some(StrictReranker {
+            cache_digest: verified_cache.digest.clone(),
+            model,
+        });
+    }
+
+    let reranker = guard
+        .as_mut()
+        .expect("strict reranker guaranteed Some after initialization");
+    let results = rerank_with_model(&mut reranker.model, query, candidates)?;
     validate_strict_rerank(candidates, &results)?;
-    let observed_after_inference = strict_reranker_cache_digest()?;
-    if observed_after_inference != expected_cache_digest {
+    let observed_after_inference = strict_reranker_cache_digest_at(&verified_cache.root)?;
+    if observed_after_inference != verified_cache.digest {
         anyhow::bail!("Strict reranker cache changed during inference");
     }
     Ok(results)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrictRerankerModelFiles {
+    snapshot: PathBuf,
+    onnx_model: PathBuf,
+    tokenizer: PathBuf,
+    config: PathBuf,
+    special_tokens_map: PathBuf,
+    tokenizer_config: PathBuf,
+}
+
+const STRICT_RERANKER_ASSETS: [&str; 5] = [
+    "onnx/model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+
+fn validate_no_traversal(path: &Path, label: &str) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        anyhow::bail!("{label} contains a traversal component: {}", path.display());
+    }
+    Ok(())
+}
+
+fn collect_strict_reranker_paths(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut entries = std::fs::read_dir(directory)
+        .with_context(|| format!("Failed to read reranker cache {}", directory.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for entry in &entries {
+        entry.file_name().to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Strict reranker cache entry is not UTF-8: {}",
+                entry.path().display()
+            )
+        })?;
+    }
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .as_encoded_bytes()
+            .cmp(right.file_name().as_encoded_bytes())
+    });
+
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("Reranker cache entry escaped its root"))?;
+        validate_no_traversal(relative, "Strict reranker cache entry")?;
+
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to inspect reranker asset {}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "Strict reranker cache contains a symlink: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            collect_strict_reranker_paths(root, &path, paths)?;
+        } else if file_type.is_file() {
+            paths.push(relative.to_path_buf());
+        } else {
+            anyhow::bail!(
+                "Strict reranker cache contains a non-regular entry: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn strict_asset_location(relative: &Path) -> Option<(PathBuf, &'static str)> {
+    let file_name = relative.file_name()?.to_str()?;
+    match file_name {
+        "tokenizer.json" | "config.json" | "special_tokens_map.json" | "tokenizer_config.json" => {
+            Some((
+                relative
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf(),
+                match file_name {
+                    "tokenizer.json" => "tokenizer.json",
+                    "config.json" => "config.json",
+                    "special_tokens_map.json" => "special_tokens_map.json",
+                    "tokenizer_config.json" => "tokenizer_config.json",
+                    _ => unreachable!(),
+                },
+            ))
+        }
+        "model.onnx" if relative.parent()?.file_name()?.to_str()? == "onnx" => Some((
+            relative
+                .parent()?
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf(),
+            "onnx/model.onnx",
+        )),
+        _ => None,
+    }
+}
+
+fn locate_strict_reranker_snapshot(root: &Path) -> Result<StrictRerankerModelFiles> {
+    validate_no_traversal(root, "Strict reranker cache root")?;
+    let root_metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("Failed to inspect reranker cache {}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        anyhow::bail!("Strict reranker cache root must be a regular directory");
+    }
+
+    let mut paths = Vec::new();
+    collect_strict_reranker_paths(root, root, &mut paths)?;
+    paths.sort();
+
+    let mut candidates: std::collections::BTreeMap<
+        PathBuf,
+        std::collections::BTreeSet<&'static str>,
+    > = std::collections::BTreeMap::new();
+    for path in paths {
+        if let Some((snapshot, asset)) = strict_asset_location(&path) {
+            candidates.entry(snapshot).or_default().insert(asset);
+        }
+    }
+
+    let required: std::collections::BTreeSet<&str> =
+        STRICT_RERANKER_ASSETS.iter().copied().collect();
+    if candidates.is_empty() {
+        anyhow::bail!("Strict reranker cache contains no model snapshot assets");
+    }
+    for (snapshot, present) in &candidates {
+        if present != &required {
+            let missing = required
+                .difference(present)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Strict reranker snapshot {} is missing required assets: {missing}",
+                root.join(snapshot).display()
+            );
+        }
+    }
+    if candidates.len() != 1 {
+        let snapshots = candidates
+            .keys()
+            .map(|path| root.join(path).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("Strict reranker cache contains duplicate snapshots: {snapshots}");
+    }
+
+    let relative_snapshot = candidates
+        .into_keys()
+        .next()
+        .expect("one strict reranker snapshot was required");
+    let snapshot = root.join(relative_snapshot);
+    Ok(StrictRerankerModelFiles {
+        onnx_model: snapshot.join("onnx/model.onnx"),
+        tokenizer: snapshot.join("tokenizer.json"),
+        config: snapshot.join("config.json"),
+        special_tokens_map: snapshot.join("special_tokens_map.json"),
+        tokenizer_config: snapshot.join("tokenizer_config.json"),
+        snapshot,
+    })
+}
+
+fn read_strict_reranker_asset(path: &Path) -> Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect reranker asset {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "Strict reranker asset must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    std::fs::read(path).with_context(|| format!("Failed to read reranker asset {}", path.display()))
+}
+
+fn load_strict_reranker(files: &StrictRerankerModelFiles) -> Result<TextRerank> {
+    let onnx_metadata = std::fs::symlink_metadata(&files.onnx_model).with_context(|| {
+        format!(
+            "Failed to inspect reranker asset {}",
+            files.onnx_model.display()
+        )
+    })?;
+    if onnx_metadata.file_type().is_symlink() || !onnx_metadata.is_file() {
+        anyhow::bail!(
+            "Strict reranker asset must be a regular non-symlink file: {}",
+            files.onnx_model.display()
+        );
+    }
+
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read_strict_reranker_asset(&files.tokenizer)?,
+        config_file: read_strict_reranker_asset(&files.config)?,
+        special_tokens_map_file: read_strict_reranker_asset(&files.special_tokens_map)?,
+        tokenizer_config_file: read_strict_reranker_asset(&files.tokenizer_config)?,
+    };
+    let model = UserDefinedRerankingModel::new(files.onnx_model.clone(), tokenizer_files);
+    TextRerank::try_new_from_user_defined(model, RerankInitOptionsUserDefined::default())
+        .context("Failed to load strict reranker from sealed cache")
 }
 
 #[derive(Serialize)]
@@ -264,19 +524,24 @@ fn collect_reranker_files(
     Ok(())
 }
 
-fn strict_reranker_cache_digest() -> Result<String> {
+fn strict_reranker_cache_root() -> Result<PathBuf> {
     let root = std::env::var("FASTEMBED_CACHE_DIR")
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("Strict reranking requires FASTEMBED_CACHE_DIR"))?;
-    let root_metadata = std::fs::symlink_metadata(&root)
+    validate_no_traversal(&root, "Strict reranker cache root")?;
+    Ok(root)
+}
+
+fn strict_reranker_cache_digest_at(root: &Path) -> Result<String> {
+    let root_metadata = std::fs::symlink_metadata(root)
         .with_context(|| format!("Failed to inspect reranker cache {}", root.display()))?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         anyhow::bail!("Strict reranker cache root must be a regular directory");
     }
     let mut records = Vec::new();
-    collect_reranker_files(&root, &root, &mut records)?;
+    collect_reranker_files(root, root, &mut records)?;
     if records.is_empty() {
         anyhow::bail!("Strict reranker cache contains no regular files");
     }
@@ -287,15 +552,24 @@ fn strict_reranker_cache_digest() -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
-fn verify_strict_reranker_cache() -> Result<String> {
+struct VerifiedStrictRerankerCache {
+    root: PathBuf,
+    digest: String,
+}
+
+fn verify_strict_reranker_cache() -> Result<VerifiedStrictRerankerCache> {
     let expected = std::env::var(RERANKER_FILES_DIGEST_ENV)
         .with_context(|| format!("Strict reranking requires {RERANKER_FILES_DIGEST_ENV}"))?;
     require_lower_sha256(&expected, RERANKER_FILES_DIGEST_ENV)?;
-    let observed = strict_reranker_cache_digest()?;
+    let root = strict_reranker_cache_root()?;
+    let observed = strict_reranker_cache_digest_at(&root)?;
     if observed != expected {
         anyhow::bail!("Strict reranker cache digest does not match the sealed manifest");
     }
-    Ok(observed)
+    Ok(VerifiedStrictRerankerCache {
+        root,
+        digest: observed,
+    })
 }
 
 fn validate_strict_rerank(
@@ -395,6 +669,90 @@ mod tests {
                 original_index: 9,
             },
         ]
+    }
+
+    fn write_strict_snapshot(root: &Path, relative: &str) -> PathBuf {
+        let snapshot = root.join(relative);
+        std::fs::create_dir_all(snapshot.join("onnx")).unwrap();
+        std::fs::write(snapshot.join("onnx/model.onnx"), b"onnx").unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
+        std::fs::write(snapshot.join("special_tokens_map.json"), b"{}").unwrap();
+        std::fs::write(snapshot.join("tokenizer_config.json"), b"{}").unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn strict_snapshot_planner_selects_one_complete_regular_snapshot() {
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("blobs")).unwrap();
+        std::fs::write(cache.path().join("blobs/content-addressed"), b"blob").unwrap();
+        let expected = write_strict_snapshot(
+            cache.path(),
+            "models--jinaai--jina-reranker/snapshots/revision",
+        );
+
+        let planned = locate_strict_reranker_snapshot(cache.path()).unwrap();
+        assert_eq!(planned.snapshot, expected);
+        assert_eq!(planned.onnx_model, expected.join("onnx/model.onnx"));
+        assert_eq!(planned.tokenizer, expected.join("tokenizer.json"));
+        assert_eq!(planned.config, expected.join("config.json"));
+        assert_eq!(
+            planned.special_tokens_map,
+            expected.join("special_tokens_map.json")
+        );
+        assert_eq!(
+            planned.tokenizer_config,
+            expected.join("tokenizer_config.json")
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_planner_rejects_missing_and_duplicate_snapshots() {
+        let missing_cache = tempfile::tempdir().unwrap();
+        let incomplete = write_strict_snapshot(missing_cache.path(), "snapshots/incomplete");
+        std::fs::remove_file(incomplete.join("tokenizer_config.json")).unwrap();
+        let missing_error = locate_strict_reranker_snapshot(missing_cache.path())
+            .unwrap_err()
+            .to_string();
+        assert!(missing_error.contains("missing required assets: tokenizer_config.json"));
+
+        let duplicate_cache = tempfile::tempdir().unwrap();
+        write_strict_snapshot(duplicate_cache.path(), "snapshots/first");
+        write_strict_snapshot(duplicate_cache.path(), "snapshots/second");
+        let duplicate_error = locate_strict_reranker_snapshot(duplicate_cache.path())
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate_error.contains("duplicate snapshots"));
+        assert!(duplicate_error.contains("snapshots/first"));
+        assert!(duplicate_error.contains("snapshots/second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_snapshot_planner_rejects_symlinks_and_traversal_roots() {
+        use std::os::unix::fs::symlink;
+
+        let symlink_cache = tempfile::tempdir().unwrap();
+        let snapshot = write_strict_snapshot(symlink_cache.path(), "snapshots/revision");
+        symlink(
+            snapshot.join("config.json"),
+            symlink_cache.path().join("untrusted-link"),
+        )
+        .unwrap();
+        let symlink_error = locate_strict_reranker_snapshot(symlink_cache.path())
+            .unwrap_err()
+            .to_string();
+        assert!(symlink_error.contains("contains a symlink"));
+
+        let traversal_cache = tempfile::tempdir().unwrap();
+        let cache_root = traversal_cache.path().join("cache");
+        write_strict_snapshot(&cache_root, "snapshots/revision");
+        let traversal_root = cache_root.join("..").join("cache");
+        let traversal_error = locate_strict_reranker_snapshot(&traversal_root)
+            .unwrap_err()
+            .to_string();
+        assert!(traversal_error.contains("traversal component"));
     }
 
     #[test]

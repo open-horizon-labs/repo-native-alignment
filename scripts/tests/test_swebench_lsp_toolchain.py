@@ -745,6 +745,162 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 self.assertTrue(path.is_dir(), key)
                 self.assertTrue(path.is_relative_to(isolation_root.resolve()), key)
 
+    def test_hf_default_cache_binding_projects_read_only_cache_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hf_home = root / "verified-bundle/components/models/huggingface"
+            source_hub = hf_home / "hub"
+            source_hub.mkdir(parents=True)
+            source_file = source_hub / "sentinel"
+            source_file.write_bytes(b"verified model bytes")
+            isolated_home = root / "isolated/home"
+            isolated_home.mkdir(parents=True)
+
+            source_file.chmod(0o444)
+            source_hub.chmod(0o555)
+            hf_home.chmod(0o555)
+            before = (
+                source_file.read_bytes(),
+                source_file.stat().st_mtime_ns,
+                source_file.stat().st_mode,
+                source_hub.stat().st_mode,
+                hf_home.stat().st_mode,
+            )
+            try:
+                receipt = TOOLCHAIN.bind_hf_default_cache(hf_home, isolated_home)
+                default_hub = isolated_home / ".cache/huggingface/hub"
+                self.assertTrue(default_hub.is_symlink())
+                self.assertEqual(default_hub.resolve(strict=True), source_hub.resolve())
+                self.assertEqual(
+                    (default_hub / "sentinel").read_bytes(), b"verified model bytes"
+                )
+                self.assertEqual(
+                    receipt,
+                    {
+                        "schema_version": TOOLCHAIN.SCHEMA_VERSION,
+                        "status": "bound",
+                        "binding": "symlink",
+                        "default_cache_relative_path": ".cache/huggingface/hub",
+                        "hf_home_relative_path": "hub",
+                    },
+                )
+                after = (
+                    source_file.read_bytes(),
+                    source_file.stat().st_mtime_ns,
+                    source_file.stat().st_mode,
+                    source_hub.stat().st_mode,
+                    hf_home.stat().st_mode,
+                )
+                self.assertEqual(after, before)
+            finally:
+                hf_home.chmod(0o755)
+                source_hub.chmod(0o755)
+                source_file.chmod(0o644)
+
+    def test_hf_default_cache_binding_fails_closed_on_unsafe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            missing_hf_home = root / "missing-hub"
+            missing_hf_home.mkdir()
+            missing_home = root / "missing-home"
+            missing_home.mkdir()
+            with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "hub must be"):
+                TOOLCHAIN.bind_hf_default_cache(missing_hf_home, missing_home)
+
+            symlink_hf_home = root / "symlink-hf-home"
+            symlink_hf_home.mkdir()
+            real_hub = root / "real-hub"
+            real_hub.mkdir()
+            (symlink_hf_home / "hub").symlink_to(
+                real_hub, target_is_directory=True
+            )
+            symlink_home = root / "symlink-home"
+            symlink_home.mkdir()
+            with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "hub must be"):
+                TOOLCHAIN.bind_hf_default_cache(symlink_hf_home, symlink_home)
+
+            occupied_hf_home = root / "occupied-hf-home"
+            (occupied_hf_home / "hub").mkdir(parents=True)
+            occupied_home = root / "occupied-home"
+            (occupied_home / ".cache/huggingface/hub").mkdir(parents=True)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "destination must be absent"
+            ):
+                TOOLCHAIN.bind_hf_default_cache(occupied_hf_home, occupied_home)
+
+            parent_hf_home = root / "parent-hf-home"
+            (parent_hf_home / "hub").mkdir(parents=True)
+            parent_home = root / "parent-home"
+            parent_home.mkdir()
+            redirected_cache = root / "redirected-cache"
+            redirected_cache.mkdir()
+            (parent_home / ".cache").symlink_to(
+                redirected_cache, target_is_directory=True
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "cache must be a real directory"
+            ):
+                TOOLCHAIN.bind_hf_default_cache(parent_hf_home, parent_home)
+
+    def test_hf_default_cache_binding_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hf_home = root / "hf-home"
+            (hf_home / "hub").mkdir(parents=True)
+            isolated_home = root / "home"
+            isolated_home.mkdir()
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                status = TOOLCHAIN.main(
+                    [
+                        "bind-hf-default-cache",
+                        "--hf-home",
+                        str(hf_home),
+                        "--home",
+                        str(isolated_home),
+                    ]
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "bound")
+            self.assertTrue((isolated_home / ".cache/huggingface/hub").is_symlink())
+
+    def test_semantic_bundle_offline_environment_contract(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/swebench-semantic-bundle.yml"
+        ).read_text()
+        source = MODULE_PATH.read_text()
+        self.assertEqual(workflow.count("bind-hf-default-cache"), 2)
+        self.assertIn(
+            "            unset HF_HOME\n"
+            '            "$BUNDLE_ROOT/repo-native-alignment" search \\\n',
+            workflow,
+        )
+        self.assertIn("components: rust-analyzer", workflow)
+        self.assertIn(
+            'RUST_ANALYZER_BIN="$(rustup which --toolchain 1.97.0 rust-analyzer)"',
+            workflow,
+        )
+        self.assertIn(
+            'export PATH="$RUST_TOOLCHAIN_BIN:$LSP_ROOT/bin:', workflow
+        )
+        self.assertIn("offline-rust-analyzer-version.txt", workflow)
+        self.assertIn("offline-rust-analyzer-sha256.txt", workflow)
+        self.assertIn(
+            '            "$BUNDLE_ROOT/repo-native-alignment" \\\n'
+            "              --business-context disabled \\\n"
+            "              search \\\n",
+            workflow,
+        )
+        self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)
+        self.assertIn(
+            'bind_hf_default_cache(\n            Path(environment["HF_HOME"]), '
+            'Path(environment["HOME"])\n        )',
+            source,
+        )
+
     def test_probe_server_requests_use_initialized_workspace_and_sections(self) -> None:
         rpc = object.__new__(TOOLCHAIN.JsonRpcProcess)
         rpc.next_id = 1
