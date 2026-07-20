@@ -1287,7 +1287,7 @@ impl RnaHandler {
             );
 
             let embed_fut = async move {
-                match EmbeddingIndex::new(&embed_repo_root).await {
+                match EmbeddingIndex::new_for_reconciliation(&embed_repo_root).await {
                     Ok(idx) => {
                         let result = idx
                             .index_all_with_persisted_graph_and_business_context(
@@ -3852,7 +3852,7 @@ impl RnaHandler {
                 Some(expected_embeddable),
             );
 
-            let index = EmbeddingIndex::new(&self.repo_root).await?;
+            let index = EmbeddingIndex::new_for_reconciliation(&self.repo_root).await?;
             #[cfg(feature = "embeddings")]
             let prior_generation_digest = index
                 .active_generation_manifest()
@@ -4085,7 +4085,7 @@ impl RnaHandler {
         );
 
         let result = async {
-            let idx = EmbeddingIndex::new(&self.repo_root).await?;
+            let idx = EmbeddingIndex::new_for_reconciliation(&self.repo_root).await?;
             let active_manifest = idx.active_generation_manifest();
             let mode = embedding_reconciliation_mode(
                 &scope,

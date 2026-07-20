@@ -1200,6 +1200,81 @@ mod tests {
         }
     }
 
+    fn publish_test_generation(
+        repo: &Path,
+        identity: &SemanticIdentity,
+        row: &CoverageRow,
+        target_graph_digest: String,
+        structural_graph_snapshot_digest: String,
+        reused_vector_count: usize,
+        encoded_vector_count: usize,
+        prior_generation_digest: Option<String>,
+    ) -> GenerationManifest {
+        let semantic_identity_digest = identity.digest().unwrap();
+        let canonical_input_digest =
+            canonical_input_digest([(row.id.clone(), row.canonical_input_digest.clone())]).unwrap();
+        let generation_digest = generation_digest(
+            identity,
+            &canonical_input_digest,
+            &target_graph_digest,
+            &structural_graph_snapshot_digest,
+        )
+        .unwrap();
+        let staging = new_staging_root(repo, &generation_digest).unwrap();
+        fs::create_dir(staging.join("lance")).unwrap();
+        fs::write(
+            staging.join("lance/data"),
+            format!("immutable-vector:{}", row.vector_sha256),
+        )
+        .unwrap();
+        let coverage = CoverageManifest {
+            schema_version: COVERAGE_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            semantic_identity_digest: semantic_identity_digest.clone(),
+            canonical_input_digest: canonical_input_digest.clone(),
+            target_graph_digest: target_graph_digest.clone(),
+            structural_graph_snapshot_digest: structural_graph_snapshot_digest.clone(),
+            row_count: 1,
+            rows: vec![row.clone()],
+        };
+        let coverage_digest = coverage.digest().unwrap();
+        let lance_tree_digest = tree_digest(&staging.join("lance")).unwrap();
+        let manifest = GenerationManifest {
+            schema_version: GENERATION_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            semantic_identity: identity.clone(),
+            semantic_identity_digest,
+            canonical_input_digest,
+            target_graph_digest: target_graph_digest.clone(),
+            structural_graph_snapshot_digest: structural_graph_snapshot_digest.clone(),
+            row_count: 1,
+            coverage_digest: coverage_digest.clone(),
+            lance_tree_digest: lance_tree_digest.clone(),
+            reused_vector_count,
+            encoded_vector_count,
+            prior_generation_digest,
+            created_by_artifact_sha256: identity.artifact_sha256.clone(),
+            device_attestation: attestation(),
+        };
+        let manifest_sha = write_generation_evidence(&staging, &coverage, &manifest).unwrap();
+        let verification = SemanticVerificationReceipt {
+            schema_version: VERIFICATION_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            manifest_sha256: manifest_sha.clone(),
+            coverage_digest,
+            lance_tree_digest,
+            structural_graph_snapshot_digest,
+            target_graph_digest,
+            row_count: 1,
+            one_to_one_coverage: true,
+            fresh_reopen_ready: true,
+        };
+        write_verification_evidence(&staging, &verification, &manifest).unwrap();
+        promote_staging_generation(repo, &staging, &generation_digest).unwrap();
+        publish_current_generation(repo, &generation_digest, &manifest_sha, &verification).unwrap();
+        manifest
+    }
+
     #[test]
     fn canonical_json_is_stable_and_newline_terminated() {
         let value = BTreeMap::from([
@@ -1350,6 +1425,61 @@ mod tests {
         let plan = plan_vector_reuse(Some(&original), &changed, &prior, &target).unwrap();
         assert!(plan.reused_ids.is_empty());
         assert_eq!(plan.encode_ids, ["a"]);
+    }
+
+    #[test]
+    fn stale_graph_generation_vectors_publish_into_a_new_graph_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = identity();
+        let row = CoverageRow {
+            id: "unchanged".to_string(),
+            canonical_input_digest: digest(80),
+            vector_sha256: digest(81),
+        };
+        let prior = publish_test_generation(
+            temp.path(),
+            &identity,
+            &row,
+            digest(82),
+            digest(83),
+            0,
+            1,
+            None,
+        );
+
+        let reuse = plan_vector_reuse(
+            Some(&identity),
+            &identity,
+            std::slice::from_ref(&row),
+            &[(row.id.clone(), row.canonical_input_digest.clone())],
+        )
+        .unwrap();
+        assert_eq!(reuse.reused_ids, ["unchanged"]);
+        assert!(reuse.encode_ids.is_empty());
+
+        let target = publish_test_generation(
+            temp.path(),
+            &identity,
+            &row,
+            digest(84),
+            digest(85),
+            reuse.reused_ids.len(),
+            reuse.encode_ids.len(),
+            Some(prior.generation_digest.clone()),
+        );
+        let (_, published, coverage, _) = load_current_generation(temp.path())
+            .unwrap()
+            .expect("target generation must be published");
+
+        assert_ne!(published.target_graph_digest, prior.target_graph_digest);
+        assert_eq!(published, target);
+        assert_eq!(
+            published.prior_generation_digest,
+            Some(prior.generation_digest)
+        );
+        assert_eq!(published.reused_vector_count, 1);
+        assert_eq!(published.encoded_vector_count, 0);
+        assert_eq!(coverage.rows, [row]);
     }
 
     #[test]

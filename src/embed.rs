@@ -147,6 +147,10 @@ impl EmbeddingIndex {
         ))
     }
 
+    pub(crate) async fn new_for_reconciliation(_repo_root: &Path) -> Result<Self> {
+        Ok(Self)
+    }
+
     pub async fn has_table(&self) -> Result<bool> {
         Ok(false)
     }

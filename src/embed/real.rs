@@ -850,6 +850,28 @@ pub struct EmbeddingIndex {
     require_metal: bool,
 }
 
+/// A published generation is queryable only after it matches the current graph.
+/// Reconciliation is the sole exception: it must be able to open a verified prior
+/// generation after a structural update so exact vectors can be copied into the
+/// next graph-bound generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationOpenPurpose {
+    Serving,
+    Reconciliation,
+}
+
+fn requires_active_generation_graph_validation(
+    purpose: GenerationOpenPurpose,
+    require_metal: bool,
+    asset_seeding: bool,
+    has_active_generation: bool,
+) -> bool {
+    purpose == GenerationOpenPurpose::Serving
+        && require_metal
+        && !asset_seeding
+        && has_active_generation
+}
+
 /// The query handle and the generation identity it serves must move together.
 /// Keeping them under one lock prevents a publisher from exposing a new Lance
 /// connection with the old generation evidence (or the reverse).
@@ -1247,17 +1269,40 @@ impl EmbeddingIndex {
         if require_metal {
             require_metal_device()?;
         }
-        Self::new_with_policy(repo_root, require_metal).await
+        Self::new_with_policy(repo_root, require_metal, GenerationOpenPurpose::Serving).await
     }
 
     /// Open the semantic index with the #786 fail-closed execution policy.
     /// Building or querying through this handle never falls back from Metal to CPU.
     pub async fn new_strict(repo_root: &Path) -> Result<Self> {
         require_metal_device()?;
-        Self::new_with_policy(repo_root, true).await
+        Self::new_with_policy(repo_root, true, GenerationOpenPurpose::Serving).await
     }
 
-    async fn new_with_policy(repo_root: &Path, require_metal: bool) -> Result<Self> {
+    /// Open a verified prior generation only for immutable generation rebuilding.
+    ///
+    /// This preserves the strict artifact, model, tokenizer, reranker, and Metal
+    /// identity checks below. It deliberately defers only the active generation's
+    /// graph-readiness check because reconciliation binds and validates the newly
+    /// published generation against the freshly reopened target graph.
+    pub(crate) async fn new_for_reconciliation(repo_root: &Path) -> Result<Self> {
+        let require_metal = sealed_semantic_bundle_build();
+        if require_metal {
+            require_metal_device()?;
+        }
+        Self::new_with_policy(
+            repo_root,
+            require_metal,
+            GenerationOpenPurpose::Reconciliation,
+        )
+        .await
+    }
+
+    async fn new_with_policy(
+        repo_root: &Path,
+        require_metal: bool,
+        purpose: GenerationOpenPurpose,
+    ) -> Result<Self> {
         let expected_asset_digests = if require_metal && !generation::semantic_asset_seeding() {
             let digests = generation::runtime_asset_digests()?;
             generation::verify_runtime_encoder_assets()?;
@@ -1335,10 +1380,12 @@ impl EmbeddingIndex {
             repo_root: Arc::new(repo_root.to_path_buf()),
             require_metal,
         };
-        if require_metal
-            && !generation::semantic_asset_seeding()
-            && index.active_generation_manifest().is_some()
-        {
+        if requires_active_generation_graph_validation(
+            purpose,
+            require_metal,
+            generation::semantic_asset_seeding(),
+            index.active_generation_manifest().is_some(),
+        ) {
             index.validate_active_generation_graph().await?;
         }
         Ok(index)
@@ -3244,12 +3291,13 @@ impl EmbeddingIndex {
 mod tests {
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
-        EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, MaterializedEmbeddingRow,
-        SearchFilters, SearchMode, SearchResult, build_artifact_embedding_text,
-        build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
-        node_scalar_filters, publish_generation_after_final_validation, required_string_column,
-        requires_sealed_query_validation, single_query_embedding, truncate_chars,
-        verify_materialized_rows,
+        EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
+        MaterializedEmbeddingRow, SearchFilters, SearchMode, SearchResult,
+        build_artifact_embedding_text, build_code_embedding_text, node_embedding_kind,
+        node_embedding_text, node_embedding_title, node_scalar_filters,
+        publish_generation_after_final_validation, required_string_column,
+        requires_active_generation_graph_validation, requires_sealed_query_validation,
+        single_query_embedding, truncate_chars, verify_materialized_rows,
     };
 
     #[test]
@@ -3258,6 +3306,42 @@ mod tests {
         assert!(!requires_sealed_query_validation(
             false,
             SearchMode::Semantic
+        ));
+    }
+
+    #[test]
+    fn stale_generation_is_rejected_for_serving_but_available_to_reconciliation() {
+        assert!(requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            false,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Reconciliation,
+            true,
+            false,
+            true,
+        ));
+
+        // The exemption is not a general strict-open bypass.
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            true,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            false,
+            false,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            false,
+            false,
         ));
     }
 
