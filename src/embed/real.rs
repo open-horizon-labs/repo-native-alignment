@@ -144,12 +144,11 @@ impl RetrievalScoreKind {
     }
 }
 
-fn retrieval_score(
+fn validated_retrieval_score_column(
     batch: &RecordBatch,
-    row: usize,
     kind: RetrievalScoreKind,
     strict: bool,
-) -> Result<f32> {
+) -> Result<Option<&Float32Array>> {
     let column_name = kind.column();
     let column = match batch.column_by_name(column_name) {
         Some(column) => column,
@@ -158,7 +157,7 @@ fn retrieval_score(
             kind.label(),
             column_name
         ),
-        None => return Ok(kind.normalize(kind.default_raw_score())),
+        None => return Ok(None),
     };
     let scores = match column.as_any().downcast_ref::<Float32Array>() {
         Some(scores) => scores,
@@ -168,8 +167,21 @@ fn retrieval_score(
             column_name,
             column.data_type()
         ),
-        None => return Ok(kind.normalize(kind.default_raw_score())),
+        None => return Ok(None),
     };
+    Ok(Some(scores))
+}
+
+fn retrieval_score(
+    scores: Option<&Float32Array>,
+    row: usize,
+    kind: RetrievalScoreKind,
+    strict: bool,
+) -> Result<f32> {
+    let Some(scores) = scores else {
+        return Ok(kind.normalize(kind.default_raw_score()));
+    };
+    let column_name = kind.column();
     if scores.is_null(row) {
         if strict {
             anyhow::bail!(
@@ -3462,6 +3474,12 @@ impl EmbeddingIndex {
         let mut search_results = Vec::new();
 
         for batch in &batches {
+            // Validate the mode-specific score schema once per batch before
+            // row filtering. Strict retrieval must reject malformed empty or
+            // fully filtered batches instead of silently accepting them.
+            let score_column =
+                validated_retrieval_score_column(batch, score_kind, strict)?;
+
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
             // RecordBatches that are missing table columns — only FTS-indexed
             // columns may be present. Guard against this rather than panicking.
@@ -3508,7 +3526,7 @@ impl EmbeddingIndex {
                 // family: BM25 `_score`, vector `_distance`, and hybrid RRF
                 // `_relevance_score`. The non-strict hybrid fallback is a real
                 // vector query and therefore intentionally uses `_distance`.
-                let raw_score = retrieval_score(batch, i, score_kind, strict)?;
+                let raw_score = retrieval_score(score_column, i, score_kind, strict)?;
 
                 // Demote test files: reduce score so production code ranks above
                 // test code at similar distances.
@@ -3548,7 +3566,8 @@ mod tests {
         publish_generation_after_final_validation, rank_search_results, required_string_column,
         requires_active_generation_graph_validation, requires_sealed_query_validation,
         retain_reusable_vector, retrieval_score, single_query_embedding, truncate_chars,
-        validate_canonical_vector_mapping, verify_materialized_rows,
+        validate_canonical_vector_mapping, validated_retrieval_score_column,
+        verify_materialized_rows,
     };
 
     #[test]
@@ -3632,6 +3651,16 @@ mod tests {
         RecordBatch::try_from_iter([(name, values)]).unwrap()
     }
 
+    fn score_at(
+        batch: &RecordBatch,
+        row: usize,
+        kind: RetrievalScoreKind,
+        strict: bool,
+    ) -> anyhow::Result<f32> {
+        let scores = validated_retrieval_score_column(batch, kind, strict)?;
+        retrieval_score(scores, row, kind, strict)
+    }
+
     #[test]
     fn retrieval_scores_use_the_lancedb_031_mode_specific_columns() {
         use std::sync::Arc;
@@ -3651,15 +3680,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            retrieval_score(&keyword, 0, RetrievalScoreKind::Keyword, true).unwrap(),
+            score_at(&keyword, 0, RetrievalScoreKind::Keyword, true).unwrap(),
             0.75
         );
         assert_eq!(
-            retrieval_score(&semantic, 0, RetrievalScoreKind::Semantic, true).unwrap(),
+            score_at(&semantic, 0, RetrievalScoreKind::Semantic, true).unwrap(),
             0.75
         );
         let hybrid_score =
-            retrieval_score(&hybrid, 0, RetrievalScoreKind::HybridRrf, true).unwrap();
+            score_at(&hybrid, 0, RetrievalScoreKind::HybridRrf, true).unwrap();
         assert!((hybrid_score - (0.03 / 1.03)).abs() < f32::EPSILON);
     }
 
@@ -3668,20 +3697,20 @@ mod tests {
         use std::sync::Arc;
 
         let legacy_name = score_batch("_score", Arc::new(Float32Array::from(vec![0.03])));
-        let missing = retrieval_score(&legacy_name, 0, RetrievalScoreKind::HybridRrf, true)
+        let missing = score_at(&legacy_name, 0, RetrievalScoreKind::HybridRrf, true)
             .unwrap_err()
             .to_string();
         assert!(missing.contains("`_relevance_score`"));
         assert!(missing.contains("missing"));
 
         let wrong_type = score_batch("_relevance_score", Arc::new(Int32Array::from(vec![1])));
-        let wrong_type = retrieval_score(&wrong_type, 0, RetrievalScoreKind::HybridRrf, true)
+        let wrong_type = score_at(&wrong_type, 0, RetrievalScoreKind::HybridRrf, true)
             .unwrap_err()
             .to_string();
         assert!(wrong_type.contains("must be Float32"));
 
         let null_score = score_batch("_relevance_score", Arc::new(Float32Array::from(vec![None])));
-        let null_score = retrieval_score(&null_score, 0, RetrievalScoreKind::HybridRrf, true)
+        let null_score = score_at(&null_score, 0, RetrievalScoreKind::HybridRrf, true)
             .unwrap_err()
             .to_string();
         assert!(null_score.contains("is null"));
@@ -3690,10 +3719,44 @@ mod tests {
             "_relevance_score",
             Arc::new(Float32Array::from(vec![f32::NAN])),
         );
-        let non_finite = retrieval_score(&non_finite, 0, RetrievalScoreKind::HybridRrf, true)
+        let non_finite = score_at(&non_finite, 0, RetrievalScoreKind::HybridRrf, true)
             .unwrap_err()
             .to_string();
         assert!(non_finite.contains("non-finite"));
+    }
+
+    #[test]
+    fn strict_score_schema_rejects_malformed_zero_row_batches() {
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let missing = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+        )])
+        .unwrap();
+        let missing = validated_retrieval_score_column(
+            &missing,
+            RetrievalScoreKind::HybridRrf,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("`_relevance_score`"));
+        assert!(missing.contains("missing"));
+
+        let wrong_type = score_batch(
+            "_relevance_score",
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+        );
+        let wrong_type = validated_retrieval_score_column(
+            &wrong_type,
+            RetrievalScoreKind::HybridRrf,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_type.contains("must be Float32"));
     }
 
     #[test]
@@ -3702,7 +3765,7 @@ mod tests {
 
         let fallback = score_batch("_distance", Arc::new(Float32Array::from(vec![0.125])));
         assert_eq!(
-            retrieval_score(&fallback, 0, RetrievalScoreKind::Semantic, false).unwrap(),
+            score_at(&fallback, 0, RetrievalScoreKind::Semantic, false).unwrap(),
             0.875
         );
     }

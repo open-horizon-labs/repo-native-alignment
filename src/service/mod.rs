@@ -137,7 +137,11 @@ impl SearchParams {
     /// Convert from MCP `Search` tool struct.
     pub fn from_mcp_search(args: &crate::server::tools::Search) -> Self {
         Self {
-            query: non_blank_optional(&args.query),
+            query: args
+                .query
+                .as_ref()
+                .filter(|query| !query.trim().is_empty())
+                .cloned(),
             node: non_blank_optional(&args.node),
             mode: non_blank_optional(&args.mode),
             hops: args.hops,
@@ -309,6 +313,19 @@ mod tests {
         assert!(params.search_mode.is_none());
         assert!(params.subsystem.is_none());
         assert!(params.target_subsystem.is_none());
+    }
+
+    #[test]
+    fn from_mcp_search_preserves_non_blank_query_bytes() {
+        let query = "  MiXeD/Δοκιμή/東京  ";
+        let search: Search = serde_json::from_value(json!({
+            "query": query
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.query.as_deref(), Some(query));
     }
 
     #[test]
