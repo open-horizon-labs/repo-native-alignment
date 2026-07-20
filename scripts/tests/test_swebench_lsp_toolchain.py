@@ -26,6 +26,37 @@ SPEC.loader.exec_module(TOOLCHAIN)
 
 
 class SwebenchLspToolchainTests(unittest.TestCase):
+    def test_minified_body_provenance_accepts_direct_and_wrapped_structural_ast(
+        self,
+    ) -> None:
+        for wrapped in ("false", "true"):
+            with self.subTest(wrapped=wrapped):
+                TOOLCHAIN._require_structural_minification_provenance(
+                    "`owner/repo:file.py:symbol:function`\n"
+                    f"  body_minification.v1 provenance=structural_ast wrapper={wrapped}\n"
+                    "```python\ndef symbol(): ...\n```\n"
+                )
+
+    def test_minified_body_provenance_rejects_non_strict_markers(self) -> None:
+        structural = (
+            "body_minification.v1 provenance=structural_ast wrapper=false"
+        )
+        cases = {
+            "missing": "```python\ndef symbol(): ...\n```\n",
+            "duplicate": f"{structural}\n{structural}\n",
+            "fallback": (
+                "body_minification.v1 provenance=unsupported_language_text\n"
+            ),
+            "failure": (
+                "body_minification.v1 failure language=python "
+                "stage=parse reason=syntax_error\n"
+            ),
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(TOOLCHAIN.ToolchainError):
+                    TOOLCHAIN._require_structural_minification_provenance(stdout)
+
     def test_esbonio_entrypoint_is_relocatable_and_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

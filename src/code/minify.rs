@@ -1,4 +1,100 @@
 use std::collections::HashMap;
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinifyProvenance {
+    StructuralAst { wrapped: bool },
+    UnsupportedLanguageText,
+}
+
+impl fmt::Display for MinifyProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StructuralAst { wrapped } => {
+                write!(f, "provenance=structural_ast wrapper={wrapped}")
+            }
+            Self::UnsupportedLanguageText => write!(f, "provenance=unsupported_language_text"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinifiedBody {
+    pub body: String,
+    pub provenance: MinifyProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinifyFailureStage {
+    InputValidation,
+    ParserSetup,
+    WrapperParse,
+    WrapperExtraction,
+    FinalOutputParse,
+}
+
+impl fmt::Display for MinifyFailureStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InputValidation => "input_validation",
+            Self::ParserSetup => "parser_setup",
+            Self::WrapperParse => "wrapper_parse",
+            Self::WrapperExtraction => "wrapper_extraction",
+            Self::FinalOutputParse => "final_output_parse",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinifyFailureReason {
+    EmptyBody,
+    LanguageRejected,
+    NoParseTree,
+    SyntaxError,
+    WrapperMarkersMissing,
+}
+
+impl fmt::Display for MinifyFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EmptyBody => "empty_body",
+            Self::LanguageRejected => "language_rejected",
+            Self::NoParseTree => "no_parse_tree",
+            Self::SyntaxError => "syntax_error",
+            Self::WrapperMarkersMissing => "wrapper_markers_missing",
+        })
+    }
+}
+
+/// A deterministic, content-free failure. The source body is deliberately never retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinifyError {
+    pub language: String,
+    pub stage: MinifyFailureStage,
+    pub reason: MinifyFailureReason,
+}
+
+impl MinifyError {
+    fn new(language: &str, stage: MinifyFailureStage, reason: MinifyFailureReason) -> Self {
+        Self {
+            language: language.to_string(),
+            stage,
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for MinifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "language={} stage={} reason={}",
+            self.language, self.stage, self.reason
+        )
+    }
+}
+
+impl std::error::Error for MinifyError {}
 
 /// Minify a function body for LLM consumption.
 ///
@@ -9,15 +105,13 @@ use std::collections::HashMap;
 /// - Collapses blank lines
 /// - Emits a legend mapping short names to originals
 ///
-/// Falls back to text-based minification for unsupported languages.
-pub fn minify_body(body: &str, language: &str) -> String {
-    if body.is_empty() {
-        return String::new();
-    }
-
+/// Text minification is used only when the normalized language is not AST-supported.
+/// AST-supported languages fail closed if any structural parse cannot be verified.
+pub fn minify_body(body: &str, language: &str) -> Result<MinifiedBody, MinifyError> {
     // Normalize language aliases/casing so callers don't silently fall through
     // to the text-only path for common variants like "ts", "py", "rs", "golang".
-    let lang = match language.trim().to_ascii_lowercase().as_str() {
+    let normalized = language.trim().to_ascii_lowercase();
+    let lang = match normalized.as_str() {
         "typescript" | "ts" => "typescript",
         "tsx" => "tsx",
         "javascript" | "js" => "javascript",
@@ -27,8 +121,16 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "go" | "golang" => "go",
         "csharp" | "c#" | "cs" => "csharp",
         "gdscript" | "gd" => "gdscript",
-        _ => language,
+        _ => normalized.as_str(),
     };
+
+    if body.is_empty() {
+        return Err(MinifyError::new(
+            lang,
+            MinifyFailureStage::InputValidation,
+            MinifyFailureReason::EmptyBody,
+        ));
+    }
 
     match lang {
         "typescript" | "tsx" => minify_ts(body),
@@ -38,7 +140,10 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "go" => minify_go(body),
         "csharp" => minify_csharp(body),
         "gdscript" => minify_gdscript(body),
-        _ => minify_text(body, lang),
+        _ => Ok(MinifiedBody {
+            body: minify_text(body, lang),
+            provenance: MinifyProvenance::UnsupportedLanguageText,
+        }),
     }
 }
 
@@ -46,27 +151,33 @@ pub fn minify_body(body: &str, language: &str) -> String {
 // Tree-sitter minification for TypeScript/JavaScript
 // ---------------------------------------------------------------------------
 
-fn minify_ts(body: &str) -> String {
+fn minify_ts(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-        .is_err()
-    {
-        return minify_text(body, "typescript");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "typescript",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "typescript", collect_ts_locals)
 }
 
-fn minify_javascript(body: &str) -> String {
+fn minify_javascript(body: &str) -> Result<MinifiedBody, MinifyError> {
     // Use the dedicated JavaScript parser for JS/JSX to avoid
     // subtle TSX-versus-JS ambiguity in edge cases.
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_javascript::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "javascript");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "javascript",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "javascript", collect_ts_locals)
 }
 
@@ -226,16 +337,84 @@ fn make_short_name(original: &str, used: &mut std::collections::HashSet<String>)
     fb
 }
 
-/// Extract the inner body from our `function __wrapper__() { ... }` wrapper.
-fn extract_wrapper_body(wrapped: &str) -> &str {
-    // Find first `{` after `function __wrapper__()`
-    if let Some(open) = wrapped.find("{\n") {
-        let inner_start = open + 2; // skip `{\n`
-        if let Some(close) = wrapped.rfind("\n}") {
-            return &wrapped[inner_start..close];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperKind {
+    FunctionBody,
+    ClassMember,
+    RustFunctionBody,
+    RustImplMember,
+    PythonFunctionBody,
+    GdscriptFunctionBody,
+    GoFunctionBody,
+    CsharpMethodBody,
+    CsharpClassMember,
+}
+
+impl WrapperKind {
+    fn wrap(self, body: &str) -> String {
+        match self {
+            Self::FunctionBody => format!("function __wrapper__() {{\n{body}\n}}"),
+            Self::ClassMember => format!("class __W__ {{\n{body}\n}}"),
+            Self::RustFunctionBody => format!("fn __wrapper__() {{\n{body}\n}}"),
+            Self::RustImplMember => format!("struct __W__;\nimpl __W__ {{\n{body}\n}}"),
+            Self::PythonFunctionBody => {
+                format!("def __wrapper__():\n{}", indent_body(body, "    "))
+            }
+            Self::GdscriptFunctionBody => {
+                format!("func __wrapper__():\n{}", indent_body(body, "    "))
+            }
+            Self::GoFunctionBody => format!("func __wrapper__() {{\n{body}\n}}"),
+            Self::CsharpMethodBody => {
+                format!("class __W__ {{\nvoid __wrapper__() {{\n{body}\n}}\n}}")
+            }
+            Self::CsharpClassMember => format!("class __W__ {{\n{body}\n}}"),
         }
     }
-    wrapped
+
+    fn extract(self, wrapped: &str) -> Option<String> {
+        match self {
+            Self::PythonFunctionBody | Self::GdscriptFunctionBody => {
+                let body = wrapped.split_once('\n')?.1;
+                unindent_body(body, "    ")
+            }
+            _ => {
+                let (prefix, suffix) = self.prefix_suffix()?;
+                Some(
+                    wrapped
+                        .strip_prefix(prefix)?
+                        .strip_suffix(suffix)?
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    fn prefix_suffix(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::FunctionBody => Some(("function __wrapper__() {\n", "\n}")),
+            Self::ClassMember => Some(("class __W__ {\n", "\n}")),
+            Self::RustFunctionBody => Some(("fn __wrapper__() {\n", "\n}")),
+            Self::RustImplMember => Some(("struct __W__;\nimpl __W__ {\n", "\n}")),
+            Self::GoFunctionBody => Some(("func __wrapper__() {\n", "\n}")),
+            Self::CsharpMethodBody => Some(("class __W__ {\nvoid __wrapper__() {\n", "\n}\n}")),
+            Self::CsharpClassMember => Some(("class __W__ {\n", "\n}")),
+            Self::PythonFunctionBody | Self::GdscriptFunctionBody => None,
+        }
+    }
+}
+
+fn wrapper_candidates(language: &str) -> &'static [WrapperKind] {
+    match language {
+        "rust" => &[WrapperKind::RustImplMember, WrapperKind::RustFunctionBody],
+        "python" => &[WrapperKind::PythonFunctionBody],
+        "gdscript" => &[WrapperKind::GdscriptFunctionBody],
+        "go" => &[WrapperKind::GoFunctionBody],
+        "csharp" => &[
+            WrapperKind::CsharpClassMember,
+            WrapperKind::CsharpMethodBody,
+        ],
+        _ => &[WrapperKind::ClassMember, WrapperKind::FunctionBody],
+    }
 }
 
 fn build_legend(locals: &HashMap<String, String>) -> String {
@@ -352,30 +531,37 @@ fn minify_with_ast(
     body: &str,
     language: &str,
     collect_locals: LocalCollector,
-) -> String {
+) -> Result<MinifiedBody, MinifyError> {
     let config = lang_config(language);
 
-    // Parse the body directly or wrap if needed
-    let (source_text, tree, is_wrapped) = {
-        if let Some(t) = parser.parse(body, None) {
-            if !t.root_node().has_error() {
-                (body.to_string(), t, false)
-            } else {
-                let wrapper = match language {
-                    "rust" => format!("fn __wrapper__() {{\n{}\n}}", body),
-                    "python" => format!("def __wrapper__():\n{}", indent_body(body, "    ")),
-                    "gdscript" => format!("func __wrapper__():\n{}", indent_body(body, "    ")),
-                    "go" => format!("func __wrapper__() {{\n{}\n}}", body),
-                    "csharp" => format!("class __W__ {{\n{}\n}}", body),
-                    _ => format!("function __wrapper__() {{\n{}\n}}", body),
-                };
-                match parser.parse(&wrapper, None) {
-                    Some(t2) => (wrapper, t2, true),
-                    None => return minify_text(body, language),
+    // Parse the body directly or select the first valid deterministic wrapper.
+    let direct_tree = parser.parse(body, None);
+    let (source_text, tree, wrapper_kind) = match direct_tree {
+        Some(tree) if !tree.root_node().has_error() => (body.to_string(), tree, None),
+        _ => {
+            let mut selected = None;
+            let mut produced_tree = false;
+            for candidate in wrapper_candidates(language) {
+                let wrapped = candidate.wrap(body);
+                if let Some(candidate_tree) = parser.parse(&wrapped, None) {
+                    produced_tree = true;
+                    if !candidate_tree.root_node().has_error() {
+                        selected = Some((wrapped, candidate_tree, Some(*candidate)));
+                        break;
+                    }
                 }
             }
-        } else {
-            return minify_text(body, language);
+            selected.ok_or_else(|| {
+                MinifyError::new(
+                    language,
+                    MinifyFailureStage::WrapperParse,
+                    if produced_tree {
+                        MinifyFailureReason::SyntaxError
+                    } else {
+                        MinifyFailureReason::NoParseTree
+                    },
+                )
+            })?
         }
     };
 
@@ -389,6 +575,7 @@ fn minify_with_ast(
     let mut rename_ranges: Vec<(usize, usize, String)> = Vec::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    collect_existing_identifiers(root, source, &mut used_names);
     collect_locals(
         body_node,
         source,
@@ -397,6 +584,7 @@ fn minify_with_ast(
         &mut used_names,
     );
     collect_references(body_node, source, &locals, &mut rename_ranges, config);
+    collect_comment_ranges(root, &mut rename_ranges);
 
     // Sort descending by start, deduplicate
     rename_ranges.sort_by_key(|range| std::cmp::Reverse(range.0));
@@ -407,19 +595,21 @@ fn minify_with_ast(
         result = format!("{}{}{}", &result[..*start], short, &result[*end..]);
     }
 
-    let inner: String = if is_wrapped {
-        match language {
-            "python" | "gdscript" => extract_python_wrapper_body(&result),
-            _ => extract_wrapper_body(&result).to_string(),
-        }
+    let inner = if let Some(wrapper_kind) = wrapper_kind {
+        wrapper_kind.extract(&result).ok_or_else(|| {
+            MinifyError::new(
+                language,
+                MinifyFailureStage::WrapperExtraction,
+                MinifyFailureReason::WrapperMarkersMissing,
+            )
+        })?
     } else {
         result
     };
 
-    let cleaned = minify_text(&inner, language);
     let legend = build_legend(&locals);
-    if legend.is_empty() {
-        cleaned
+    let output = if legend.is_empty() {
+        inner
     } else {
         let prefix = if config.comment_prefix == "#" {
             "# "
@@ -427,7 +617,65 @@ fn minify_with_ast(
             "// "
         };
         let legend_line = format!("{}{}", prefix, legend.trim_start_matches("// "));
-        format!("{}\n{}", cleaned, legend_line)
+        let separator = if inner.ends_with('\n') { "" } else { "\n" };
+        format!("{inner}{separator}{legend_line}")
+    };
+
+    let final_source = if let Some(wrapper_kind) = wrapper_kind {
+        wrapper_kind.wrap(&output)
+    } else {
+        output.clone()
+    };
+    let final_tree = parser.parse(&final_source, None).ok_or_else(|| {
+        MinifyError::new(
+            language,
+            MinifyFailureStage::FinalOutputParse,
+            MinifyFailureReason::NoParseTree,
+        )
+    })?;
+    if final_tree.root_node().has_error() {
+        return Err(MinifyError::new(
+            language,
+            MinifyFailureStage::FinalOutputParse,
+            MinifyFailureReason::SyntaxError,
+        ));
+    }
+
+    Ok(MinifiedBody {
+        body: output,
+        provenance: MinifyProvenance::StructuralAst {
+            wrapped: wrapper_kind.is_some(),
+        },
+    })
+}
+
+fn collect_existing_identifiers(
+    node: tree_sitter::Node,
+    source: &[u8],
+    identifiers: &mut std::collections::HashSet<String>,
+) {
+    if node.kind().contains("identifier")
+        && let Ok(identifier) = node.utf8_text(source)
+        && !identifier.is_empty()
+    {
+        identifiers.insert(identifier.to_string());
+    }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            collect_existing_identifiers(child, source, identifiers);
+        }
+    }
+}
+
+fn collect_comment_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usize, String)>) {
+    if node.kind().contains("comment") {
+        ranges.push((node.start_byte(), node.end_byte(), String::new()));
+        return;
+    }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            collect_comment_ranges(child, ranges);
+        }
     }
 }
 
@@ -627,24 +875,20 @@ fn register_local(
 
 /// Indent a body for Python wrapping.
 fn indent_body(body: &str, indent: &str) -> String {
-    body.lines()
-        .map(|l| format!("{}{}", indent, l))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut indented = String::with_capacity(body.len() + indent.len());
+    for line in body.split_inclusive('\n') {
+        indented.push_str(indent);
+        indented.push_str(line);
+    }
+    indented
 }
 
-/// Extract body from Python `def __wrapper__():` wrapper, removing the
-/// 4-space indentation that `indent_body` added during wrapping.
-fn extract_python_wrapper_body(wrapped: &str) -> String {
-    if let Some(pos) = wrapped.find('\n') {
-        let body = &wrapped[pos + 1..];
-        body.lines()
-            .map(|l| l.strip_prefix("    ").unwrap_or(l))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        wrapped.to_string()
+fn unindent_body(body: &str, indent: &str) -> Option<String> {
+    let mut unindented = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        unindented.push_str(line.strip_prefix(indent)?);
     }
+    Some(unindented)
 }
 
 // ---------------------------------------------------------------------------
@@ -888,14 +1132,17 @@ fn collect_go_id_list(
 // Rust minification (simpler — no type stripping since types are meaningful)
 // ---------------------------------------------------------------------------
 
-fn minify_rust(body: &str) -> String {
+fn minify_rust(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "rust");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "rust",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "rust", collect_rust_locals)
 }
 
@@ -903,14 +1150,17 @@ fn minify_rust(body: &str) -> String {
 // Python minification
 // ---------------------------------------------------------------------------
 
-fn minify_python(body: &str) -> String {
+fn minify_python(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "python");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "python",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "python", collect_python_locals)
 }
 
@@ -918,14 +1168,17 @@ fn minify_python(body: &str) -> String {
 // Go minification
 // ---------------------------------------------------------------------------
 
-fn minify_go(body: &str) -> String {
+fn minify_go(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "go");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "go",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "go", collect_go_locals)
 }
 
@@ -933,14 +1186,17 @@ fn minify_go(body: &str) -> String {
 // C# minification
 // ---------------------------------------------------------------------------
 
-fn minify_csharp(body: &str) -> String {
+fn minify_csharp(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "csharp");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "csharp",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "csharp", collect_csharp_locals)
 }
 
@@ -1036,14 +1292,17 @@ fn collect_csharp_locals(
 // GDScript minification
 // ---------------------------------------------------------------------------
 
-fn minify_gdscript(body: &str) -> String {
+fn minify_gdscript(body: &str) -> Result<MinifiedBody, MinifyError> {
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_gdscript::LANGUAGE.into())
-        .is_err()
-    {
-        return minify_text(body, "gdscript");
-    }
+        .map_err(|_| {
+            MinifyError::new(
+                "gdscript",
+                MinifyFailureStage::ParserSetup,
+                MinifyFailureReason::LanguageRejected,
+            )
+        })?;
     minify_with_ast(&mut parser, body, "gdscript", collect_gdscript_locals)
 }
 
@@ -1244,12 +1503,18 @@ fn find_line_comment(line: &str, prefix: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn minified(input: &str, language: &str) -> String {
+        minify_body(input, language)
+            .expect("fixture should minify structurally")
+            .body
+    }
+
     // -- Text-based fallback tests (retained from phase 1) --
 
     #[test]
     fn test_strips_line_comments() {
         let input = "let x = 1; // set x\nlet y = 2;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         assert!(!result.contains("set x"));
         assert!(result.contains("= 1;"));
         assert!(result.contains("= 2;"));
@@ -1258,38 +1523,40 @@ mod tests {
     #[test]
     fn test_preserves_urls() {
         let input = "let url = \"https://example.com\";";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         assert!(result.contains("https://example.com"));
     }
 
     #[test]
     fn test_strips_block_comments() {
         let input = "let x = 1;\n/* this is\na comment */\nlet y = 2;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         assert!(result.contains("= 1;"));
         assert!(result.contains("= 2;"));
         assert!(!result.contains("comment"));
     }
 
     #[test]
-    fn test_collapses_blank_lines() {
+    fn test_unsupported_text_fallback_collapses_blank_lines() {
         let input = "let x = 1;\n\n\n\nlet y = 2;";
-        let result = minify_body(input, "typescript");
+        let result = minify_body(input, "hcl").unwrap();
+        assert_eq!(result.provenance, MinifyProvenance::UnsupportedLanguageText);
         // Should have at most one blank line between
-        assert!(!result.contains("\n\n\n"));
+        assert!(!result.body.contains("\n\n\n"));
     }
 
     #[test]
     fn test_strips_python_comments() {
         let input = "x = 1  # set x\ny = 2";
-        let result = minify_body(input, "python");
-        assert_eq!(result, "x = 1\ny = 2");
+        let result = minified(input, "python");
+        assert_eq!(result, "x = 1  \ny = 2");
+        assert!(!result.contains("set x"));
     }
 
     #[test]
     fn test_preserves_string_with_comment_chars() {
         let input = "let s = \"hello // world\";";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         assert!(result.contains("hello // world"));
     }
 
@@ -1298,7 +1565,7 @@ mod tests {
     #[test]
     fn test_renames_long_locals() {
         let input = "const userCount = 5;\nconst result = userCount + 1;\nreturn result;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         // Code lines should use short names, not originals
         let code_lines: Vec<&str> = result.lines().filter(|l| !l.starts_with("// ")).collect();
         let code = code_lines.join("\n");
@@ -1322,7 +1589,7 @@ mod tests {
     #[test]
     fn test_preserves_short_names() {
         let input = "const x = 5;\nreturn x;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         // Short names (<=2 chars) should NOT be renamed
         assert!(result.contains("x"));
         assert!(!result.contains("// ")); // no legend needed
@@ -1331,7 +1598,7 @@ mod tests {
     #[test]
     fn test_preserves_property_access() {
         let input = "const result = obj.propertyName;\nreturn result;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         // Property names should NOT be renamed
         assert!(result.contains(".propertyName"));
     }
@@ -1339,20 +1606,22 @@ mod tests {
     #[test]
     fn test_preserves_function_calls() {
         let input = "const data = fetchUserById(id);\nreturn data;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         // Function names should be preserved
         assert!(result.contains("fetchUserById"));
     }
 
     #[test]
     fn test_empty_body() {
-        assert_eq!(minify_body("", "typescript"), "");
+        let error = minify_body("", "typescript").unwrap_err();
+        assert_eq!(error.stage, MinifyFailureStage::InputValidation);
+        assert_eq!(error.reason, MinifyFailureReason::EmptyBody);
     }
 
     #[test]
     fn test_legend_format() {
         let input = "const longName = 1;\nreturn longName;";
-        let result = minify_body(input, "typescript");
+        let result = minified(input, "typescript");
         // Legend should be on the last line
         let last_line = result.lines().last().unwrap();
         assert!(last_line.starts_with("// "));
@@ -1364,7 +1633,7 @@ mod tests {
     #[test]
     fn test_csharp_renames_long_locals() {
         let input = "var userCount = 5;\nvar result = userCount + 1;\nreturn result;";
-        let result = minify_body(input, "csharp");
+        let result = minified(input, "csharp");
         let code_lines: Vec<&str> = result.lines().filter(|l| !l.starts_with("// ")).collect();
         let code = code_lines.join("\n");
         assert!(
@@ -1386,14 +1655,14 @@ mod tests {
     #[test]
     fn test_csharp_preserves_short_names() {
         let input = "var x = 5;\nreturn x;";
-        let result = minify_body(input, "csharp");
+        let result = minified(input, "csharp");
         assert!(result.contains("x"));
     }
 
     #[test]
     fn test_csharp_preserves_member_access() {
         let input = "var result = obj.PropertyName;\nreturn result;";
-        let result = minify_body(input, "csharp");
+        let result = minified(input, "csharp");
         assert!(
             result.contains("PropertyName"),
             "property should be preserved: {}",
@@ -1404,7 +1673,7 @@ mod tests {
     #[test]
     fn test_csharp_preserves_method_calls() {
         let input = "var data = FetchUserById(id);\nreturn data;";
-        let result = minify_body(input, "csharp");
+        let result = minified(input, "csharp");
         assert!(
             result.contains("FetchUserById"),
             "method name should be preserved: {}",
@@ -1415,7 +1684,7 @@ mod tests {
     #[test]
     fn test_csharp_alias_cs() {
         let input = "var longVariable = 42;\nConsole.WriteLine(longVariable);";
-        let result = minify_body(input, "cs");
+        let result = minified(input, "cs");
         let legend = result.lines().find(|l| l.starts_with("// "));
         assert!(
             legend.is_some(),
@@ -1428,7 +1697,7 @@ mod tests {
     fn test_gdscript_strips_hash_comments() {
         // Regression: minify_text must recognize '#' as gdscript comment prefix
         let input = "var x = 1  # set x\nvar y = 2";
-        let result = minify_body(input, "gdscript");
+        let result = minified(input, "gdscript");
         assert!(
             !result.contains("set x"),
             "gdscript # comments should be stripped: {}",
@@ -1445,7 +1714,7 @@ mod tests {
     fn test_gdscript_minify_no_tab_artifacts() {
         // Regression: GDScript wrapper must not leave tab indentation in output
         let input = "var counter = 0\nfor item in list:\n\tcounter += 1";
-        let result = minify_body(input, "gdscript");
+        let result = minified(input, "gdscript");
         // The output should not contain artificial wrapper-introduced tabs
         // (original code may have tabs, but wrapper shouldn't add new ones)
         assert!(
@@ -1458,8 +1727,122 @@ mod tests {
     #[test]
     fn test_gdscript_alias_gd() {
         let input = "var longVariable = 42";
-        let result = minify_body(input, "gd");
+        let result = minified(input, "gd");
         // Should route through GDScript minification, not fallback
         assert!(result.contains("42"), "gd alias should work: {}", result);
+    }
+
+    #[test]
+    fn strict_direct_ast_reports_structural_provenance() {
+        let result = minify_body("const longName = 1;", "typescript").unwrap();
+        assert_eq!(
+            result.provenance,
+            MinifyProvenance::StructuralAst { wrapped: false }
+        );
+        assert!(!result.body.is_empty());
+    }
+
+    #[test]
+    fn strict_wrapper_ast_reports_structural_provenance() {
+        let body = "methodName() { return this.value; }";
+        let result = minify_body(body, "typescript").unwrap();
+        assert_eq!(
+            result.provenance,
+            MinifyProvenance::StructuralAst { wrapped: true }
+        );
+        assert!(!result.body.contains("__wrapper__"));
+        assert_eq!(result.body, body);
+    }
+
+    #[test]
+    fn structural_minification_preserves_multiline_literals_exactly() {
+        let fixtures = [
+            (
+                "x = \"\"\"line one\n# not a comment\nline three\"\"\"",
+                "python",
+            ),
+            (
+                "const x = `line one\n// not a comment\nline three`;",
+                "javascript",
+            ),
+            (
+                "var x = @\"line one\n// not a comment\nline three\";",
+                "csharp",
+            ),
+        ];
+        for (body, language) in fixtures {
+            let result = minify_body(body, language).unwrap();
+            assert_eq!(result.body, body, "language={language}");
+        }
+    }
+
+    #[test]
+    fn structural_minification_changes_only_comments_and_registered_locals() {
+        let body = "const x = source.member;\nif (x) {\n  callee(x);\n} // remove me";
+        let result = minify_body(body, "typescript").unwrap();
+        assert_eq!(
+            result.body,
+            "const x = source.member;\nif (x) {\n  callee(x);\n} "
+        );
+    }
+
+    #[test]
+    fn generated_local_names_never_collide_with_existing_identifiers() {
+        let body =
+            "function f(mvb) { const accumulated_value = 1; return accumulated_value + mvb; }";
+        let result = minify_body(body, "typescript").unwrap();
+        assert!(result.body.contains("f(mvb)"), "got: {}", result.body);
+        assert!(!result.body.contains("const mvb ="), "got: {}", result.body);
+        assert!(
+            !result.body.contains("mvb=accumulated_value"),
+            "got: {}",
+            result.body
+        );
+    }
+
+    #[test]
+    fn deterministic_wrapper_variants_preserve_member_and_statement_forms() {
+        let fixtures = [
+            ("methodName() { return this.value; }", "typescript"),
+            ("methodName() { return this.value; }", "javascript"),
+            ("fn value(&self) -> i32 { self.value }", "rust"),
+            ("int Value { get; set; }", "csharp"),
+            ("var x = 1;\nreturn;", "csharp"),
+        ];
+        for (body, language) in fixtures {
+            let result = minify_body(body, language).unwrap();
+            assert_eq!(result.body, body, "language={language}");
+            assert!(matches!(
+                result.provenance,
+                MinifyProvenance::StructuralAst { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn explicitly_unsupported_language_uses_text_provenance() {
+        let result = minify_body("value = 1; // comment", "hcl").unwrap();
+        assert_eq!(result.provenance, MinifyProvenance::UnsupportedLanguageText);
+        assert_eq!(result.body, "value = 1;");
+    }
+
+    #[test]
+    fn invalid_eligible_input_fails_without_retaining_content() {
+        let secret = "const broken = \"unterminated-sensitive-value";
+        let error = minify_body(secret, "typescript").unwrap_err();
+        assert_eq!(error.stage, MinifyFailureStage::WrapperParse);
+        assert_eq!(error.reason, MinifyFailureReason::SyntaxError);
+        assert!(!error.to_string().contains("sensitive"));
+    }
+
+    #[test]
+    fn provenance_rendering_is_deterministic() {
+        let first = minify_body("const value = 1;", "typescript").unwrap();
+        let second = minify_body("const value = 1;", "ts").unwrap();
+        assert_eq!(first.provenance.to_string(), second.provenance.to_string());
+        assert_eq!(
+            first.provenance.to_string(),
+            "provenance=structural_ast wrapper=false"
+        );
     }
 }

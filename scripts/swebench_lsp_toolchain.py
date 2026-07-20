@@ -5921,6 +5921,25 @@ def _selected_query_node(stdout: bytes) -> str:
     raise ToolchainError("strict hybrid query returned no stable node identity")
 
 
+def _require_structural_minification_provenance(stdout: str) -> None:
+    markers = re.findall(
+        r"(?m)^[ \t]*body_minification\.v1[^\r\n]*$",
+        stdout,
+    )
+    if len(markers) != 1:
+        raise ToolchainError(
+            "fresh-reopen minified-body retrieval must contain exactly one "
+            "body_minification.v1 marker"
+        )
+    if re.fullmatch(
+        r"body_minification\.v1 provenance=structural_ast wrapper=(?:true|false)",
+        markers[0].strip(),
+    ) is None:
+        raise ToolchainError(
+            "fresh-reopen minified-body retrieval did not use structural AST minification"
+        )
+
+
 def _run_combined_query_probes(
     *,
     combined: Any,
@@ -6037,6 +6056,7 @@ def _run_combined_query_probes(
     ).decode("utf-8", errors="strict")
     if selected_node_id not in minified_output or "```" not in minified_output:
         raise ToolchainError("fresh-reopen minified-body retrieval returned no body")
+    _require_structural_minification_provenance(minified_output)
 
     repeat_1 = run("repeat_hybrid_1", hybrid_command)
     repeat_2 = run("repeat_hybrid_2", hybrid_command)
