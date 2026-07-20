@@ -97,6 +97,110 @@ pub enum SearchMode {
     Semantic,
 }
 
+/// Score representation returned by LanceDB for the query that actually ran.
+///
+/// Hybrid search and its non-strict vector fallback have different schemas, so
+/// this is deliberately tracked alongside the batches instead of inferred from
+/// whichever score-like column happens to be present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalScoreKind {
+    Keyword,
+    Semantic,
+    HybridRrf,
+}
+
+impl RetrievalScoreKind {
+    fn column(self) -> &'static str {
+        match self {
+            Self::Keyword => "_score",
+            Self::Semantic => "_distance",
+            Self::HybridRrf => "_relevance_score",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Semantic => "semantic",
+            Self::HybridRrf => "hybrid RRF",
+        }
+    }
+
+    fn default_raw_score(self) -> f32 {
+        match self {
+            Self::Keyword | Self::HybridRrf => 0.5,
+            Self::Semantic => 2.0,
+        }
+    }
+
+    fn normalize(self, raw: f32) -> f32 {
+        match self {
+            Self::Keyword | Self::HybridRrf => {
+                let score = raw.max(0.0);
+                score / (1.0 + score)
+            }
+            Self::Semantic => (1.0 - raw).max(0.0),
+        }
+    }
+}
+
+fn retrieval_score(
+    batch: &RecordBatch,
+    row: usize,
+    kind: RetrievalScoreKind,
+    strict: bool,
+) -> Result<f32> {
+    let column_name = kind.column();
+    let column = match batch.column_by_name(column_name) {
+        Some(column) => column,
+        None if strict => anyhow::bail!(
+            "strict {} search result is missing required score column `{}`",
+            kind.label(),
+            column_name
+        ),
+        None => return Ok(kind.normalize(kind.default_raw_score())),
+    };
+    let scores = match column.as_any().downcast_ref::<Float32Array>() {
+        Some(scores) => scores,
+        None if strict => anyhow::bail!(
+            "strict {} search score column `{}` must be Float32, found {:?}",
+            kind.label(),
+            column_name,
+            column.data_type()
+        ),
+        None => return Ok(kind.normalize(kind.default_raw_score())),
+    };
+    if scores.is_null(row) {
+        if strict {
+            anyhow::bail!(
+                "strict {} search score column `{}` is null at row {}",
+                kind.label(),
+                column_name,
+                row
+            );
+        }
+        return Ok(kind.normalize(kind.default_raw_score()));
+    }
+
+    let raw = scores.value(row);
+    if !raw.is_finite() {
+        if strict {
+            anyhow::bail!(
+                "strict {} search score column `{}` contains a non-finite value at row {}",
+                kind.label(),
+                column_name,
+                row
+            );
+        }
+        return Ok(kind.normalize(kind.default_raw_score()));
+    }
+    Ok(kind.normalize(raw))
+}
+
+fn rank_search_results(results: &mut [SearchResult]) {
+    results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+}
+
 /// Sealed handles must validate graph/current-pointer and runtime asset identity
 /// for every query, regardless of the explicitly requested retrieval mode.
 fn requires_sealed_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
@@ -3269,7 +3373,7 @@ impl EmbeddingIndex {
 
         use futures::TryStreamExt;
 
-        let batches: Vec<RecordBatch> = match mode {
+        let (batches, score_kind): (Vec<RecordBatch>, RetrievalScoreKind) = match mode {
             SearchMode::Keyword => {
                 // Pure BM25 full-text search — no embedding needed.
                 let fts_query = FullTextSearchQuery::new(query.to_string());
@@ -3278,7 +3382,7 @@ impl EmbeddingIndex {
                     q = q.only_if(sql.clone());
                 }
                 let results = q.execute().await.context("FTS keyword search failed")?;
-                results.try_collect().await?
+                (results.try_collect().await?, RetrievalScoreKind::Keyword)
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
@@ -3299,7 +3403,7 @@ impl EmbeddingIndex {
                     search = search.only_if(sql.clone());
                 }
                 let results = search.execute().await.context("Vector search failed")?;
-                results.try_collect().await?
+                (results.try_collect().await?, RetrievalScoreKind::Semantic)
             }
             SearchMode::Hybrid => {
                 // Hybrid: BM25 + vector with RRF fusion.
@@ -3327,7 +3431,7 @@ impl EmbeddingIndex {
                     .await;
 
                 match hybrid_result {
-                    Ok(stream) => stream.try_collect().await?,
+                    Ok(stream) => (stream.try_collect().await?, RetrievalScoreKind::HybridRrf),
                     Err(error) if strict => {
                         return Err(error).context(
                             "strict hybrid semantic search failed; vector-only fallback is forbidden",
@@ -3349,20 +3453,13 @@ impl EmbeddingIndex {
                             .execute()
                             .await
                             .context("Fallback vector search failed")?;
-                        results.try_collect().await?
+                        (results.try_collect().await?, RetrievalScoreKind::Semantic)
                     }
                 }
             }
         };
 
         let mut search_results = Vec::new();
-
-        // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
-        // Detect which column is present by checking ANY batch — not just the first.
-        // The first batch may be skipped (missing required columns) when hybrid search
-        // with a pre-filter returns a partial schema, so checking only the first batch
-        // could misdetect the score column. (#400)
-        let has_score_col = batches.iter().any(|b| b.column_by_name("_score").is_some());
 
         for batch in &batches {
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
@@ -3407,38 +3504,11 @@ impl EmbeddingIndex {
                     continue;
                 }
 
-                let raw_score = if has_score_col {
-                    // RRF / BM25 `_score` — higher is better.
-                    // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
-                    // BM25 scores can exceed 1.0 for highly relevant short docs.
-                    // Use monotonic s/(1+s) transform to map [0, inf) -> [0, 1)
-                    // while preserving ranking order. A hard clamp at 1.0 would
-                    // destroy differentiation among high-scoring results.
-                    //
-                    // _score column presence was checked on first batch; if a
-                    // subsequent batch is missing it, fall back to 0.5 (neutral).
-                    let score = batch
-                        .column_by_name("_score")
-                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-                    if strict && score.is_none() {
-                        anyhow::bail!("strict semantic search result is missing `_score`");
-                    }
-                    let s = score.map(|arr| arr.value(i)).unwrap_or(0.5);
-                    let s = s.max(0.0);
-                    s / (1.0 + s)
-                } else {
-                    // Cosine distance [0, 2]: convert to similarity.
-                    // If _distance is absent (shouldn't happen in vector mode,
-                    // but guard defensively), treat as maximum distance → 0 score.
-                    let distance = batch
-                        .column_by_name("_distance")
-                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-                    if strict && distance.is_none() {
-                        anyhow::bail!("strict semantic search result is missing `_distance`");
-                    }
-                    let d = distance.map(|arr| arr.value(i)).unwrap_or(2.0);
-                    (1.0 - d).max(0.0)
-                };
+                // LanceDB 0.31 uses a different score column for each query
+                // family: BM25 `_score`, vector `_distance`, and hybrid RRF
+                // `_relevance_score`. The non-strict hybrid fallback is a real
+                // vector query and therefore intentionally uses `_distance`.
+                let raw_score = retrieval_score(batch, i, score_kind, strict)?;
 
                 // Demote test files: reduce score so production code ranks above
                 // test code at similar distances.
@@ -3457,11 +3527,7 @@ impl EmbeddingIndex {
         }
 
         // Re-sort by adjusted score (descending) and truncate.
-        search_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rank_search_results(&mut search_results);
         search_results.truncate(limit);
 
         Ok(SearchOutcome::Results(search_results))
@@ -3470,16 +3536,19 @@ impl EmbeddingIndex {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{Float32Array, Int32Array, RecordBatch};
+
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
         EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
-        MaterializedEmbeddingRow, SearchFilters, SearchMode, SearchResult, UnpublishedScratchRoot,
-        build_artifact_embedding_text, build_code_embedding_text, fan_out_encoded_vector,
-        group_canonical_encoder_inputs, node_embedding_kind, node_embedding_text,
-        node_embedding_title, node_scalar_filters, publish_generation_after_final_validation,
-        required_string_column, requires_active_generation_graph_validation,
-        requires_sealed_query_validation, retain_reusable_vector, single_query_embedding,
-        truncate_chars, validate_canonical_vector_mapping, verify_materialized_rows,
+        MaterializedEmbeddingRow, RetrievalScoreKind, SearchFilters, SearchMode, SearchResult,
+        UnpublishedScratchRoot, build_artifact_embedding_text, build_code_embedding_text,
+        fan_out_encoded_vector, group_canonical_encoder_inputs, node_embedding_kind,
+        node_embedding_text, node_embedding_title, node_scalar_filters,
+        publish_generation_after_final_validation, rank_search_results, required_string_column,
+        requires_active_generation_graph_validation, requires_sealed_query_validation,
+        retain_reusable_vector, retrieval_score, single_query_embedding, truncate_chars,
+        validate_canonical_vector_mapping, verify_materialized_rows,
     };
 
     #[test]
@@ -3557,6 +3626,121 @@ mod tests {
             .to_string();
         assert!(error.contains("`id` must be Utf8"));
         assert!(error.contains("Int32"));
+    }
+
+    fn score_batch(name: &str, values: arrow_array::ArrayRef) -> RecordBatch {
+        RecordBatch::try_from_iter([(name, values)]).unwrap()
+    }
+
+    #[test]
+    fn retrieval_scores_use_the_lancedb_031_mode_specific_columns() {
+        use std::sync::Arc;
+
+        let keyword = score_batch("_score", Arc::new(Float32Array::from(vec![3.0])));
+        let semantic = score_batch("_distance", Arc::new(Float32Array::from(vec![0.25])));
+        let hybrid = RecordBatch::try_from_iter([
+            (
+                "_relevance_score",
+                Arc::new(Float32Array::from(vec![0.03])) as arrow_array::ArrayRef,
+            ),
+            (
+                "_distance",
+                Arc::new(Float32Array::from(vec![1.75])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            retrieval_score(&keyword, 0, RetrievalScoreKind::Keyword, true).unwrap(),
+            0.75
+        );
+        assert_eq!(
+            retrieval_score(&semantic, 0, RetrievalScoreKind::Semantic, true).unwrap(),
+            0.75
+        );
+        let hybrid_score =
+            retrieval_score(&hybrid, 0, RetrievalScoreKind::HybridRrf, true).unwrap();
+        assert!((hybrid_score - (0.03 / 1.03)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn strict_hybrid_rrf_score_contract_fails_closed() {
+        use std::sync::Arc;
+
+        let legacy_name = score_batch("_score", Arc::new(Float32Array::from(vec![0.03])));
+        let missing = retrieval_score(&legacy_name, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("`_relevance_score`"));
+        assert!(missing.contains("missing"));
+
+        let wrong_type = score_batch("_relevance_score", Arc::new(Int32Array::from(vec![1])));
+        let wrong_type = retrieval_score(&wrong_type, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("must be Float32"));
+
+        let null_score = score_batch("_relevance_score", Arc::new(Float32Array::from(vec![None])));
+        let null_score = retrieval_score(&null_score, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(null_score.contains("is null"));
+
+        let non_finite = score_batch(
+            "_relevance_score",
+            Arc::new(Float32Array::from(vec![f32::NAN])),
+        );
+        let non_finite = retrieval_score(&non_finite, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(non_finite.contains("non-finite"));
+    }
+
+    #[test]
+    fn non_strict_hybrid_vector_fallback_uses_distance() {
+        use std::sync::Arc;
+
+        let fallback = score_batch("_distance", Arc::new(Float32Array::from(vec![0.125])));
+        assert_eq!(
+            retrieval_score(&fallback, 0, RetrievalScoreKind::Semantic, false).unwrap(),
+            0.875
+        );
+    }
+
+    #[test]
+    fn retrieval_ranking_breaks_score_ties_by_stable_id() {
+        let mut results = vec![
+            SearchResult {
+                id: "stable:z".to_string(),
+                kind: "code:function".to_string(),
+                title: "z".to_string(),
+                body: String::new(),
+                score: 0.75,
+            },
+            SearchResult {
+                id: "stable:a".to_string(),
+                kind: "code:function".to_string(),
+                title: "a".to_string(),
+                body: String::new(),
+                score: 0.75,
+            },
+            SearchResult {
+                id: "stable:m".to_string(),
+                kind: "code:function".to_string(),
+                title: "m".to_string(),
+                body: String::new(),
+                score: 0.9,
+            },
+        ];
+
+        rank_search_results(&mut results);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable:m", "stable:a", "stable:z"]
+        );
     }
 
     #[test]
@@ -5317,59 +5501,6 @@ mod tests {
     /// When the first batch is missing required columns (and gets skipped), later
     /// batches may have _score. has_score_col must still be true so they use the
     /// correct scoring branch.
-    #[test]
-    fn has_score_col_detected_from_any_batch() {
-        use arrow_array::{Float32Array, RecordBatch, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
-        // No _score column either.
-        let schema_incomplete = Schema::new(vec![Field::new("title", DataType::Utf8, false)]);
-        let batch_incomplete = RecordBatch::try_new(
-            Arc::new(schema_incomplete),
-            vec![Arc::new(StringArray::from(vec!["stub"]))],
-        )
-        .expect("should build incomplete batch");
-
-        // Batch 1: complete batch with _score (simulates valid hybrid search result).
-        let schema_complete = Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("title", DataType::Utf8, false),
-            Field::new("body", DataType::Utf8, false),
-            Field::new("_score", DataType::Float32, false),
-        ]);
-        let batch_complete = RecordBatch::try_new(
-            Arc::new(schema_complete),
-            vec![
-                Arc::new(StringArray::from(vec!["id1"])),
-                Arc::new(StringArray::from(vec!["function"])),
-                Arc::new(StringArray::from(vec!["title1"])),
-                Arc::new(StringArray::from(vec!["body1"])),
-                Arc::new(Float32Array::from(vec![0.8f32])),
-            ],
-        )
-        .expect("should build complete batch");
-
-        let batches = vec![batch_incomplete, batch_complete];
-
-        // Simulate the has_score_col detection from the fix (any batch, not just first).
-        let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
-        let has_score_col_first = batches
-            .first()
-            .is_some_and(|b| b.column_by_name("_score").is_some());
-
-        assert!(
-            has_score_col_any,
-            "should detect _score from any batch, but iter().any() returned false"
-        );
-        assert!(
-            !has_score_col_first,
-            "first batch does not have _score — verifying that first-only detection is wrong"
-        );
-    }
-
     // ── #599: unified node embedding helpers ──────────────────────────────
 
     fn make_test_node(

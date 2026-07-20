@@ -800,11 +800,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             .unwrap_or_else(|error| format!("Source span lookup task failed: {error}."));
     }
 
-    let query = params
-        .query
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let query = nonempty_query_preserving_bytes(params.query.as_deref());
     let node = params
         .node
         .as_deref()
@@ -1295,7 +1291,10 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
 
     // Detect path/name split query (e.g. "auth/handlers/validate" → path="auth/handlers", name="validate").
     // When present, embed search uses only the name part; name-matching filters by both.
-    let path_name = parse_path_name_query(query_str);
+    // Strict semantic qualification binds the model input to the caller's exact
+    // query bytes. The interactive path/name shorthand is useful for ordinary
+    // search, but must never rewrite a sealed benchmark query.
+    let path_name = parse_path_name_query_for_search(query_str, strict_semantic);
     let (path_filter_lower, name_filter_lower): (Option<String>, Option<String>) =
         if let Some((p, n)) = path_name {
             (Some(p.to_lowercase()), Some(n.to_lowercase()))
@@ -2597,6 +2596,18 @@ fn parse_path_name_query(query: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((path_part, name_part))
+}
+
+fn parse_path_name_query_for_search(query: &str, strict_semantic: bool) -> Option<(&str, &str)> {
+    if strict_semantic {
+        None
+    } else {
+        parse_path_name_query(query)
+    }
+}
+
+fn nonempty_query_preserving_bytes(query: Option<&str>) -> Option<&str> {
+    query.filter(|value| !value.trim().is_empty())
 }
 
 /// Resolve traversal entry points by exact name/signature matching against graph nodes.
@@ -5131,6 +5142,27 @@ mod tests {
     fn test_parse_path_name_query_basic() {
         let result = parse_path_name_query("auth/handlers/validate");
         assert_eq!(result, Some(("auth/handlers", "validate")));
+    }
+
+    #[test]
+    fn nonempty_query_preserves_exact_bytes() {
+        let query = "\n  Diagnose Src/naïve_path.py EXACTLY.  \t";
+        assert_eq!(nonempty_query_preserving_bytes(Some(query)), Some(query));
+        assert_eq!(nonempty_query_preserving_bytes(Some(" \n\t ")), None);
+    }
+
+    #[test]
+    fn strict_semantic_query_bypasses_path_name_rewrite() {
+        let query = "\n  Diagnose Src/naïve_path.py WITHOUT rewriting.  \t";
+        let path_name = parse_path_name_query_for_search(query, true);
+        let embed_query = path_name.map(|(_, name)| name).unwrap_or(query);
+
+        assert!(parse_path_name_query(query).is_some());
+        assert_eq!(
+            parse_path_name_query_for_search(query, false),
+            parse_path_name_query(query)
+        );
+        assert_eq!(embed_query.as_bytes(), query.as_bytes());
     }
 
     #[test]

@@ -243,7 +243,14 @@ struct SearchArgs {
     nodes: Option<String>,
     #[arg(long)]
     search_mode: Option<String>,
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     include_artifacts: bool,
     #[arg(long, default_value_t = true)]
     include_markdown: bool,
@@ -1738,6 +1745,37 @@ async fn async_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
+
+    #[test]
+    fn search_cli_preserves_default_and_accepts_explicit_artifact_exclusion() {
+        for (arguments, expected) in [
+            (vec!["repo-native-alignment", "search", "query"], true),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-artifacts",
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-artifacts=false",
+                ],
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("search CLI should parse");
+            let Some(Commands::Search(args)) = cli.command else {
+                panic!("expected search command");
+            };
+            assert_eq!(args.include_artifacts, expected);
+        }
+    }
 
     #[test]
     fn lsp_readiness_cli_exposes_checkout_and_aggregate_modes() {

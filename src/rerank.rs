@@ -171,13 +171,20 @@ fn rerank_with_model(
     }
 
     // Sort by score descending (fastembed may already do this, but be explicit).
+    // Preserve the exact model score and make exact ties independent of the
+    // inference runtime's output order.
+    sort_reranked_results(&mut results);
+
+    Ok(results)
+}
+
+fn sort_reranked_results(results: &mut [RerankedResult]) {
     results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.original_index.cmp(&b.original_index))
     });
-
-    Ok(results)
 }
 
 /// Rerank for the qualification lane, requiring a complete one-to-one result
@@ -912,11 +919,7 @@ mod tests {
                 score: 0.5,
             },
         ];
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sort_reranked_results(&mut results);
         assert_eq!(results[0].original_index, 1); // 0.9
         assert_eq!(results[1].original_index, 2); // 0.5
         assert_eq!(results[2].original_index, 0); // 0.3
@@ -937,12 +940,35 @@ mod tests {
             },
         ];
         // Should not panic -- NaN comparison falls through to Equal
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sort_reranked_results(&mut results);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_reranked_result_score_ties_use_original_index() {
+        let mut results = vec![
+            RerankedResult {
+                original_index: 42,
+                score: 0.5,
+            },
+            RerankedResult {
+                original_index: 5,
+                score: 0.5,
+            },
+            RerankedResult {
+                original_index: 9,
+                score: 0.9,
+            },
+        ];
+
+        sort_reranked_results(&mut results);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.original_index)
+                .collect::<Vec<_>>(),
+            vec![9, 5, 42]
+        );
     }
 
     // Integration test: actually loads the model and reranks.
