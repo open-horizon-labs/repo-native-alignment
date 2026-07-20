@@ -12,7 +12,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use serde::Serialize;
 
 use crate::embed::generation::{
     self, CoverageManifest, CoverageRow, DeviceAttestation, GenerationManifest,
@@ -262,19 +261,6 @@ struct EmbeddingCandidate {
     cyclomatic: Option<i32>,
 }
 
-#[derive(Serialize)]
-struct CanonicalCandidateInput<'a> {
-    id: &'a str,
-    kind: &'a str,
-    title: &'a str,
-    body: &'a str,
-    text: &'a str,
-    file_path: Option<&'a str>,
-    language: Option<&'a str>,
-    subsystem: Option<&'a str>,
-    cyclomatic: Option<i32>,
-}
-
 impl EmbeddingCandidate {
     fn new(
         id: String,
@@ -287,19 +273,10 @@ impl EmbeddingCandidate {
         subsystem: Option<String>,
         cyclomatic: Option<i32>,
     ) -> Result<Self> {
-        let canonical = CanonicalCandidateInput {
-            id: &id,
-            kind: &kind,
-            title: &title,
-            body: &body,
-            text: &text,
-            file_path: file_path.as_deref(),
-            language: language.as_deref(),
-            subsystem: subsystem.as_deref(),
-            cyclomatic,
-        };
-        let canonical_input_digest =
-            generation::sha256_bytes(&generation::canonical_json_bytes(&canonical)?);
+        // A vector is a pure function of the exact encoder text and semantic
+        // identity. Target row identity and scalar metadata are verified and
+        // rebuilt separately, so they must not invalidate reusable payloads.
+        let canonical_input_digest = generation::sha256_bytes(text.as_bytes());
         Ok(Self {
             id,
             kind,
@@ -585,6 +562,18 @@ fn build_artifact_embedding_text(
 // embed.rs still owns the text-building logic (budget, truncation) but
 // the indexing loops no longer test `oh_kind` directly.
 
+fn stable_code_embedding_metadata(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    // Body text already carries source-level syntax. Only these two semantic
+    // enrichments belong in the encoder input; ranking, subsystem, response,
+    // provenance, path, and job metadata are rebuilt as target row scalars.
+    ["doc_comment", "inferred_types"]
+        .into_iter()
+        .filter_map(|key| metadata.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect()
+}
+
 /// Build embedding text for any graph node, dispatching by node properties.
 fn node_embedding_text(node: &crate::graph::Node) -> String {
     if node.metadata.contains_key("oh_kind") {
@@ -592,7 +581,11 @@ fn node_embedding_text(node: &crate::graph::Node) -> String {
     } else {
         match &node.id.kind {
             crate::graph::NodeKind::MarkdownSection => truncate_chars(&node.body, 500).to_string(),
-            _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
+            _ => build_code_embedding_text(
+                &node.id.name,
+                &node.body,
+                &stable_code_embedding_metadata(&node.metadata),
+            ),
         }
     }
 }
@@ -1042,6 +1035,29 @@ struct MaterializedEmbeddingRow {
     subsystem: Option<String>,
     cyclomatic: Option<i32>,
     vector: Vec<f32>,
+}
+
+fn retain_reusable_vector(
+    vectors_by_input: &mut BTreeMap<String, (String, Vec<f32>)>,
+    canonical_input_digest: &str,
+    vector_sha256: String,
+    vector: &[f32],
+) -> Result<()> {
+    if let Some((existing_sha256, existing_vector)) =
+        vectors_by_input.get(canonical_input_digest)
+    {
+        if existing_sha256 != &vector_sha256 || existing_vector.as_slice() != vector {
+            anyhow::bail!(
+                "prior semantic generation maps one canonical encoder input to conflicting vector payloads"
+            );
+        }
+    } else {
+        vectors_by_input.insert(
+            canonical_input_digest.to_string(),
+            (vector_sha256, vector.to_vec()),
+        );
+    }
+    Ok(())
 }
 
 fn generation_record_batch(
@@ -2181,8 +2197,10 @@ impl EmbeddingIndex {
         let prior = generation::load_current_generation(repo_root)?;
         let mut prior_generation_digest = None;
         let mut reusable_vectors = BTreeMap::new();
+        let mut prior_row_ids = BTreeSet::new();
         if let Some((pointer, prior_manifest, prior_coverage, prior_verification)) = &prior {
             prior_generation_digest = Some(pointer.generation_digest.clone());
+            prior_row_ids.extend(prior_coverage.rows.iter().map(|row| row.id.clone()));
             if prior_manifest.semantic_identity == identity {
                 let prior_path =
                     generation::generation_root(repo_root, &pointer.generation_digest)?
@@ -2204,17 +2222,24 @@ impl EmbeddingIndex {
                 {
                     anyhow::bail!("prior semantic generation coverage is not one-to-one");
                 }
+                let mut prior_vectors_by_input = BTreeMap::new();
                 for (id, row) in &prior_rows {
                     let coverage = prior_coverage_rows.get(id.as_str()).ok_or_else(|| {
                         anyhow::anyhow!("prior semantic generation contains orphan row {id}")
                     })?;
-                    if generation::vector_sha256(&row.vector, EMBEDDING_DIMENSION)?
-                        != coverage.vector_sha256
-                    {
+                    let vector_sha256 =
+                        generation::vector_sha256(&row.vector, EMBEDDING_DIMENSION)?;
+                    if vector_sha256 != coverage.vector_sha256 {
                         anyhow::bail!(
                             "prior semantic generation vector checksum mismatch for {id}"
                         );
                     }
+                    retain_reusable_vector(
+                        &mut prior_vectors_by_input,
+                        &coverage.canonical_input_digest,
+                        vector_sha256,
+                        &row.vector,
+                    )?;
                 }
 
                 if pointer.generation_digest == generation_digest {
@@ -2251,13 +2276,15 @@ impl EmbeddingIndex {
                 )?;
                 let reusable_ids = reuse_plan.reused_ids.into_iter().collect::<BTreeSet<_>>();
                 for candidate in &candidates {
-                    if let (Some(row), Some(coverage)) = (
-                        prior_rows.get(&candidate.id),
-                        prior_coverage_rows.get(candidate.id.as_str()),
-                    ) && reusable_ids.contains(&candidate.id)
-                        && coverage.canonical_input_digest == candidate.canonical_input_digest
-                    {
-                        reusable_vectors.insert(candidate.id.clone(), row.vector.clone());
+                    if reusable_ids.contains(&candidate.id) {
+                        let (_, vector) = prior_vectors_by_input
+                            .get(&candidate.canonical_input_digest)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "vector reuse plan selected an unavailable canonical encoder input"
+                                )
+                            })?;
+                        reusable_vectors.insert(candidate.id.clone(), vector.clone());
                     }
                 }
             }
@@ -2269,6 +2296,22 @@ impl EmbeddingIndex {
             .filter(|candidate| !vectors.contains_key(&candidate.id))
             .collect::<Vec<_>>();
         let encoded_vector_count = to_encode.len();
+        let target_ids = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let purged_row_count = prior_row_ids
+            .iter()
+            .filter(|id| !target_ids.contains(id.as_str()))
+            .count();
+        tracing::info!(
+            prior_rows = prior_row_ids.len(),
+            target_rows = candidates.len(),
+            reused_vectors = vectors.len(),
+            encoded_vectors = encoded_vector_count,
+            purged_rows = purged_row_count,
+            "EmbeddingIndex: value-addressed vector plan"
+        );
         let mut device_attestation = attest_available_device(require_metal)?;
         if !to_encode.is_empty() {
             let (model, observed_attestation) = new_model_with_policy(require_metal)?;
@@ -3362,6 +3405,7 @@ mod tests {
         build_artifact_embedding_text, build_code_embedding_text, node_embedding_kind,
         node_embedding_text, node_embedding_title, node_scalar_filters,
         publish_generation_after_final_validation, required_string_column,
+        retain_reusable_vector,
         requires_active_generation_graph_validation, requires_sealed_query_validation,
         single_query_embedding, truncate_chars, verify_materialized_rows,
     };
@@ -3441,6 +3485,116 @@ mod tests {
             .to_string();
         assert!(error.contains("`id` must be Utf8"));
         assert!(error.contains("Int32"));
+    }
+
+    #[test]
+    fn value_addressed_digest_depends_only_on_exact_encoder_text() {
+        let first = EmbeddingCandidate::new(
+            "old-id".into(),
+            "code:function".into(),
+            "old title".into(),
+            "fn value()\n\nold.py:10".into(),
+            "value fn value()".into(),
+            Some("old.py".into()),
+            Some("python".into()),
+            Some("old-subsystem".into()),
+            Some(1),
+        )
+        .unwrap();
+        let renamed = EmbeddingCandidate::new(
+            "new-id".into(),
+            "code:function".into(),
+            "new title".into(),
+            "fn value()\n\nnew.py:90".into(),
+            "value fn value()".into(),
+            Some("new.py".into()),
+            Some("python".into()),
+            Some("new-subsystem".into()),
+            Some(99),
+        )
+        .unwrap();
+        let changed = EmbeddingCandidate::new(
+            "new-id".into(),
+            "code:function".into(),
+            "new title".into(),
+            "fn value()\n\nnew.py:90".into(),
+            "value fn value() changed".into(),
+            Some("new.py".into()),
+            Some("python".into()),
+            Some("new-subsystem".into()),
+            Some(99),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.canonical_input_digest,
+            renamed.canonical_input_digest
+        );
+        assert_ne!(
+            first.canonical_input_digest,
+            changed.canonical_input_digest
+        );
+    }
+
+    #[test]
+    fn value_addressed_input_ignores_derived_graph_metadata() {
+        let mut first_metadata = BTreeMap::from([
+            ("doc_comment".to_string(), "Stable intent".to_string()),
+            ("inferred_types".to_string(), "Result[str]".to_string()),
+            ("importance".to_string(), "0.01".to_string()),
+            ("subsystem".to_string(), "first".to_string()),
+            ("lsp_document_symbol_payload_digest".to_string(), "one".to_string()),
+        ]);
+        let first = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata.clone(),
+        );
+        first_metadata.insert("importance".to_string(), "0.99".to_string());
+        first_metadata.insert("subsystem".to_string(), "second".to_string());
+        first_metadata.insert(
+            "lsp_document_symbol_payload_digest".to_string(),
+            "two".to_string(),
+        );
+        let derived_changed = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata.clone(),
+        );
+        assert_eq!(
+            node_embedding_text(&first),
+            node_embedding_text(&derived_changed)
+        );
+
+        first_metadata.insert("doc_comment".to_string(), "Changed intent".to_string());
+        let semantic_changed = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata,
+        );
+        assert_ne!(
+            node_embedding_text(&first),
+            node_embedding_text(&semantic_changed)
+        );
+    }
+
+    #[test]
+    fn value_addressed_conflicting_payloads_fail_closed() {
+        let mut reusable = BTreeMap::new();
+        retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
+        retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
+        let error = retain_reusable_vector(
+            &mut reusable,
+            "input",
+            "b".repeat(64),
+            &[0.5],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("conflicting vector payloads"));
     }
 
     #[test]

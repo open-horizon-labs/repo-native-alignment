@@ -32,18 +32,20 @@ COMBINED_CACHE_ROOT = "combined"
 COMBINED_CACHE_CORE = ".rna-combined-cache-core.json"
 COMBINED_CACHE_CATALOG = "combined-cache-catalog.json"
 SEMANTIC_ROOT = "embeddings"
-SEMANTIC_SCHEMA_VERSION = 1
+SEMANTIC_SCHEMA_VERSION = 2
 SEMANTIC_SCHEMA_SIGNATURE = (
-    "rna.embedding-generation.v1:"
+    "rna.embedding-generation.v2:"
     "id-kind-title-body-text_hash-file_path-language-subsystem-"
-    "cyclomatic-vector-f32"
+    "cyclomatic-vector-f32:value-addressed-vector-input"
 )
 SEMANTIC_BUNDLE_SCHEMA = "rna-swebench-semantic-bundle-manifest-v1"
 EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_TOKENIZER_IDENTITY = (
     "sentence-transformers/all-MiniLM-L6-v2:metal-candle-tokenizer-v1"
 )
-EMBEDDING_PREPROCESSING_VERSION = "rna-minilm-preprocessing-v1-char-budget-650"
+EMBEDDING_PREPROCESSING_VERSION = (
+    "rna-minilm-preprocessing-v2-stable-semantic-metadata-char-budget-650"
+)
 EMBEDDING_DIMENSION = 384
 RERANKER_MODEL_ID = "jinaai/jina-reranker-v1-turbo-en"
 FIXED_MTIME = 1_577_836_800

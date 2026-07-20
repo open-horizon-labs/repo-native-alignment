@@ -8,12 +8,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const GENERATION_SCHEMA_VERSION: u32 = 1;
-pub const COVERAGE_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_POINTER_SCHEMA_VERSION: u32 = 1;
-pub const VERIFICATION_SCHEMA_VERSION: u32 = 1;
-pub const SEMANTIC_SCHEMA_SIGNATURE: &str = "rna.embedding-generation.v1:id-kind-title-body-text_hash-file_path-language-subsystem-cyclomatic-vector-f32";
-pub const PREPROCESSING_VERSION: &str = "rna-minilm-preprocessing-v1-char-budget-650";
+pub const GENERATION_SCHEMA_VERSION: u32 = 2;
+pub const COVERAGE_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_POINTER_SCHEMA_VERSION: u32 = 2;
+pub const VERIFICATION_SCHEMA_VERSION: u32 = 2;
+pub const SEMANTIC_SCHEMA_SIGNATURE: &str = "rna.embedding-generation.v2:id-kind-title-body-text_hash-file_path-language-subsystem-cyclomatic-vector-f32:value-addressed-vector-input";
+pub const PREPROCESSING_VERSION: &str =
+    "rna-minilm-preprocessing-v2-stable-semantic-metadata-char-budget-650";
 pub const TOKENIZER_IDENTITY: &str =
     "sentence-transformers/all-MiniLM-L6-v2:metal-candle-tokenizer-v1";
 
@@ -327,20 +328,19 @@ pub fn plan_vector_reuse(
             encode_ids: target.into_iter().map(|(id, _)| id).collect(),
         });
     }
-    let mut prior = BTreeMap::new();
+    let mut prior_ids = BTreeSet::new();
+    let mut prior_inputs = BTreeSet::new();
     for row in prior_rows {
         row.validate()?;
-        if prior
-            .insert(row.id.as_str(), row.canonical_input_digest.as_str())
-            .is_some()
-        {
+        if !prior_ids.insert(row.id.as_str()) {
             bail!("prior semantic coverage contains duplicate id {}", row.id);
         }
+        prior_inputs.insert(row.canonical_input_digest.as_str());
     }
     let mut reused_ids = Vec::new();
     let mut encode_ids = Vec::new();
     for (id, digest) in target {
-        if prior.get(id.as_str()).is_some_and(|prior| *prior == digest) {
+        if prior_inputs.contains(digest.as_str()) {
             reused_ids.push(id);
         } else {
             encode_ids.push(id);
@@ -1372,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn add_change_delete_and_rename_reuse_only_exact_target_inputs() {
+    fn value_addressed_add_change_delete_and_rename_reuse() {
         let identity = identity();
         let prior = vec![
             CoverageRow {
@@ -1403,8 +1403,8 @@ mod tests {
             ("new-name".to_string(), digest(36)),
         ];
         let plan = plan_vector_reuse(Some(&identity), &identity, &prior, &target).unwrap();
-        assert_eq!(plan.reused_ids, ["unchanged"]);
-        assert_eq!(plan.encode_ids, ["added", "changed", "new-name"]);
+        assert_eq!(plan.reused_ids, ["new-name", "unchanged"]);
+        assert_eq!(plan.encode_ids, ["added", "changed"]);
         assert!(!plan.reused_ids.iter().any(|id| id == "deleted"));
         assert!(!plan.reused_ids.iter().any(|id| id == "old-name"));
     }

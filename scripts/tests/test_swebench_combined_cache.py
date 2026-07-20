@@ -671,7 +671,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         target_graph_digest = "3" * 64
         generation_digest = COMBINED._sha256_semantic(
             {
-                "schema_version": 1,
+                "schema_version": COMBINED.SEMANTIC_SCHEMA_VERSION,
                 "semantic_identity": semantic_identity,
                 "canonical_input_digest": canonical_input_digest,
                 "target_graph_digest": target_graph_digest,
@@ -683,7 +683,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         lance.mkdir(parents=True)
         (lance / "rows.bin").write_bytes(b"lance rows")
         coverage = {
-            "schema_version": 1,
+            "schema_version": COMBINED.SEMANTIC_SCHEMA_VERSION,
             "generation_digest": generation_digest,
             "semantic_identity_digest": COMBINED._sha256_semantic(semantic_identity),
             "canonical_input_digest": canonical_input_digest,
@@ -696,7 +696,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         coverage_path.write_bytes(COMBINED.semantic_canonical_json(coverage))
         lance_members = COMBINED._regular_tree(lance, "fixture Lance")
         manifest = {
-            "schema_version": 1,
+            "schema_version": COMBINED.SEMANTIC_SCHEMA_VERSION,
             "generation_digest": generation_digest,
             "semantic_identity": semantic_identity,
             "semantic_identity_digest": COMBINED._sha256_semantic(semantic_identity),
@@ -722,7 +722,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         manifest_path = generation / "manifest.json"
         manifest_path.write_bytes(COMBINED.semantic_canonical_json(manifest))
         verification = {
-            "schema_version": 1,
+            "schema_version": COMBINED.SEMANTIC_SCHEMA_VERSION,
             "generation_digest": generation_digest,
             "manifest_sha256": STRUCTURAL.sha256_file(manifest_path),
             "coverage_digest": STRUCTURAL.sha256_file(coverage_path),
@@ -736,7 +736,7 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
         verification_path = generation / "verification.json"
         verification_path.write_bytes(COMBINED.semantic_canonical_json(verification))
         current = {
-            "schema_version": 1,
+            "schema_version": COMBINED.SEMANTIC_SCHEMA_VERSION,
             "generation_digest": generation_digest,
             "manifest_sha256": STRUCTURAL.sha256_file(manifest_path),
             "verification_sha256": STRUCTURAL.sha256_file(verification_path),

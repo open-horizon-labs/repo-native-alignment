@@ -126,8 +126,12 @@ impl NodeKind {
             | NodeKind::ProtoMessage
             | NodeKind::SqlTable
             | NodeKind::ApiEndpoint
-            | NodeKind::MarkdownSection
-            | NodeKind::Other(_) => true,
+            | NodeKind::MarkdownSection => true,
+
+            // These nodes persist document-symbol response proof for readiness;
+            // they duplicate source symbols and carry no additional retrieval
+            // content. Other extensible node kinds remain semantic candidates.
+            NodeKind::Other(kind) => kind != "lsp_document_symbol",
 
             NodeKind::Import
             | NodeKind::Const
@@ -1405,6 +1409,12 @@ mod tests {
             NodeKind::TypeAlias.is_embeddable(),
             "TypeAlias should be embeddable"
         );
+    }
+
+    #[test]
+    fn lsp_document_symbol_proof_nodes_are_not_embeddable() {
+        assert!(!NodeKind::Other("lsp_document_symbol".to_string()).is_embeddable());
+        assert!(NodeKind::Other("html_id".to_string()).is_embeddable());
     }
 
     #[test]
