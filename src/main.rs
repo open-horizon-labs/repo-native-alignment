@@ -904,14 +904,36 @@ async fn async_main() -> anyhow::Result<()> {
                         )?;
                     let completeness = &readiness.report;
                     eprintln!(
-                        "LSP completeness: {} included file(s), {} violation(s), digest={}",
+                        "LSP completeness: {} included file(s), {} per-file violation(s), {} compatibility violation(s), digest={}",
                         completeness.summary.included_files,
                         completeness.violations.len(),
+                        readiness.compatibility_violations.len(),
                         completeness.digest,
                     );
+                    const MAX_COMPATIBILITY_DIAGNOSTICS: usize = 5;
+                    for (index, violation) in readiness
+                        .compatibility_violations
+                        .iter()
+                        .take(MAX_COMPATIBILITY_DIAGNOSTICS)
+                        .enumerate()
+                    {
+                        eprintln!(
+                            "  compatibility violation {}: {:?}: {}",
+                            index + 1,
+                            violation.code,
+                            violation.detail,
+                        );
+                    }
+                    if readiness.compatibility_violations.len() > MAX_COMPATIBILITY_DIAGNOSTICS {
+                        eprintln!(
+                            "  ... {} additional compatibility violation(s) omitted",
+                            readiness.compatibility_violations.len()
+                                - MAX_COMPATIBILITY_DIAGNOSTICS,
+                        );
+                    }
                     if !readiness.ready {
                         anyhow::bail!(
-                            "benchmark LSP completeness blocked by {} per-file and {} compatibility violation(s); inspect {}",
+                            "benchmark LSP completeness blocked by {} per-file and {} compatibility violation(s); inspect the captured benchmark scan-log artifact above for compatibility details and {} for persisted per-file details",
                             completeness.violations.len(),
                             readiness.compatibility_violations.len(),
                             repo_native_alignment::lsp_completeness::report_path(&repo_root)

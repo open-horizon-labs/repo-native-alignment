@@ -200,12 +200,7 @@ pub struct Search {
     /// Batch-retrieve multiple node IDs in one call
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
-    /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict".
-    /// "strict" is the SWE-bench qualification lane: it requires the exact
-    /// CI semantic bundle, a ready embedding index, observed Metal execution,
-    /// hybrid retrieval without fallback, and successful reranking. It forces
-    /// reranking even when `rerank` was omitted. Flat queries from that sealed
-    /// bundle enter the same strict lane by default.
+    /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict requires sealed artifacts, forbids fallback, and forces reranking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
     /// Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false
@@ -716,10 +711,21 @@ mod tests {
     // ── Schema description length guardrail ───────────────────────────────
     // Doc comments on struct fields become JSON schema descriptions via JsonSchema derive.
     // This test ensures no parameter description regresses to multi-sentence verbosity.
-    // We test the source strings directly since schemars isn't a direct dependency.
-
     #[test]
     fn test_param_descriptions_are_slim() {
+        let schema = Search::json_schema();
+        let search_mode_description = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|properties| properties.get("search_mode"))
+            .and_then(|property| property.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .expect("emitted search_mode schema description");
+        assert_eq!(
+            search_mode_description,
+            r#"Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict requires sealed artifacts, forbids fallback, and forces reranking."#,
+        );
+
         // All parameter doc comments from tools.rs, extracted as string literals.
         // If you add a parameter, add its description here.
         let descriptions = vec![
@@ -742,7 +748,7 @@ mod tests {
             "Filter synthetic (inferred) constants: true=only, false=exclude",
             "Compact output: signature + location only (~25x fewer tokens)",
             "Batch-retrieve multiple node IDs in one call",
-            r#"Ranking: "hybrid" (default), "keyword", "semantic""#,
+            search_mode_description,
             "Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false",
             "Search .oh/ artifacts and commits (default: true)",
             "Search markdown sections (default: true)",

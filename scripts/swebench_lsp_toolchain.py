@@ -4589,6 +4589,7 @@ def toolchain_environment(
         "PYTHONSAFEPATH": "1",
         "PYTHONUTF8": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "NODE_DISABLE_COMPILE_CACHE": "1",
         "PIP_NO_INDEX": "1",
         "PIP_CONFIG_FILE": os.devnull,
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",

@@ -729,6 +729,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             self.assertEqual(environment["LANG"], "C")
             self.assertEqual(environment["LC_ALL"], "C")
             self.assertEqual(environment["TZ"], "UTC")
+            self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
             self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
             self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
             for key in (
