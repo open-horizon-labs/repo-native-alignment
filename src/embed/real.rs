@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use anyhow::{Context, Result};
@@ -134,6 +137,66 @@ const RECENT_COMMIT_LIMIT: usize = 100;
 /// Number of PR merge commits to embed for structural context.
 const PR_MERGE_LIMIT: usize = 50;
 const EMBEDDING_DIMENSION: usize = 384;
+static UNPUBLISHED_SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Ephemeral Lance handle used before the first immutable generation exists.
+///
+/// This database is only a placeholder for APIs such as `has_table`; generation
+/// building writes to its own digest-bound staging tree. Keeping the placeholder
+/// outside `.oh/.cache/embeddings` prevents a successful publication from
+/// leaving undeclared bytes in an otherwise verifier-clean semantic cache.
+#[derive(Debug)]
+struct UnpublishedScratchRoot {
+    root: PathBuf,
+}
+
+impl UnpublishedScratchRoot {
+    fn new() -> Result<Self> {
+        let parent = std::env::temp_dir()
+            .join("repo-native-alignment")
+            .join("embedding-scratch");
+        fs::create_dir_all(&parent).with_context(|| {
+            format!(
+                "failed to create unpublished semantic scratch parent {}",
+                parent.display()
+            )
+        })?;
+
+        loop {
+            let sequence = UNPUBLISHED_SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = parent.join(format!("unpublished.{}.{}", std::process::id(), sequence));
+            match fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create unpublished semantic scratch root {}",
+                            root.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    fn lance_root(&self) -> PathBuf {
+        self.root.join("lance")
+    }
+}
+
+impl Drop for UnpublishedScratchRoot {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root)
+            && error.kind() != ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove unpublished semantic scratch root {}: {error}",
+                self.root.display()
+            );
+        }
+    }
+}
 
 fn sealed_semantic_bundle_build() -> bool {
     option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
@@ -844,10 +907,13 @@ async fn embed_texts_with_model(
 /// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
 #[derive(Clone)]
 pub struct EmbeddingIndex {
+    // Keep this field before `_unpublished_scratch`: Rust drops fields in
+    // declaration order, so the Lance connection closes before scratch cleanup.
     active_generation: Arc<RwLock<ActiveGeneration>>,
     table_name: String,
     repo_root: Arc<PathBuf>,
     require_metal: bool,
+    _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
 /// A published generation is queryable only after it matches the current graph.
@@ -1315,7 +1381,7 @@ impl EmbeddingIndex {
         } else {
             generation::load_current_generation(repo_root)?
         };
-        let (db_path, active_manifest) = match current {
+        let (db_path, active_manifest, unpublished_scratch) = match current {
             Some((_, manifest, _, _)) => {
                 if require_metal {
                     let executable = std::env::current_exe()
@@ -1347,14 +1413,13 @@ impl EmbeddingIndex {
                     generation::generation_root(repo_root, &manifest.generation_digest)?
                         .join("lance"),
                     Some(manifest),
+                    None,
                 )
             }
             None => {
-                let path = generation::semantic_root(repo_root)
-                    .join("staging")
-                    .join(format!("unpublished.{}", std::process::id()))
-                    .join("lance");
-                (path, None)
+                let scratch = Arc::new(UnpublishedScratchRoot::new()?);
+                let path = scratch.lance_root();
+                (path, None, Some(scratch))
             }
         };
         std::fs::create_dir_all(&db_path)?;
@@ -1379,6 +1444,7 @@ impl EmbeddingIndex {
             table_name: "artifacts".to_string(),
             repo_root: Arc::new(repo_root.to_path_buf()),
             require_metal,
+            _unpublished_scratch: unpublished_scratch,
         };
         if requires_active_generation_graph_validation(
             purpose,
@@ -3292,7 +3358,7 @@ mod tests {
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
         EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
-        MaterializedEmbeddingRow, SearchFilters, SearchMode, SearchResult,
+        MaterializedEmbeddingRow, SearchFilters, SearchMode, SearchResult, UnpublishedScratchRoot,
         build_artifact_embedding_text, build_code_embedding_text, node_embedding_kind,
         node_embedding_text, node_embedding_title, node_scalar_filters,
         publish_generation_after_final_validation, required_string_column,
@@ -3439,6 +3505,21 @@ mod tests {
         assert!(!publication_attempted.get());
         assert_eq!(std::fs::read(&current).unwrap(), b"previous-generation");
     }
+
+    #[test]
+    fn unpublished_scratch_lives_until_last_clone_and_is_ephemeral() {
+        let scratch = std::sync::Arc::new(UnpublishedScratchRoot::new().unwrap());
+        let path = scratch.root.clone();
+        let clone = std::sync::Arc::clone(&scratch);
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path.is_dir());
+
+        drop(scratch);
+        assert!(path.is_dir());
+        drop(clone);
+
+        assert!(!path.exists());
+    }
     use std::collections::BTreeMap;
 
     #[test]
@@ -3470,6 +3551,12 @@ mod tests {
             !idx.has_table().await.unwrap(),
             "has_table should be false on fresh DB"
         );
+        assert!(
+            !crate::embed::generation::semantic_root(&repo_root)
+                .join("staging")
+                .exists(),
+            "an unpublished handle must not write into the archivable semantic cache"
+        );
     }
 
     #[tokio::test]
@@ -3477,16 +3564,41 @@ mod tests {
         use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
 
         let tmp = tempfile::tempdir().unwrap();
-        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
         let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let nodes = Vec::<crate::graph::Node>::new();
+        let edges = Vec::<crate::graph::Edge>::new();
+        crate::server::persist_graph_to_lance(tmp.path(), &nodes, &edges)
+            .await
+            .unwrap();
+        let identity =
+            crate::lsp_completeness::current_report_identity(tmp.path(), business_context.mode())
+                .unwrap();
+        let report = crate::lsp_completeness::LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            &nodes,
+            &edges,
+        );
+        crate::lsp_completeness::persist_report(tmp.path(), &report).unwrap();
+        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
 
         let indexed = idx
-            .index_all_with_symbols_and_business_context(tmp.path(), &[], &business_context)
+            .index_all_with_persisted_graph_and_business_context(
+                tmp.path(),
+                &nodes,
+                &edges,
+                &business_context,
+            )
             .await
             .unwrap();
 
         assert_eq!(indexed, 0);
-        assert_eq!(business_context.counts().git_history_producers, 2);
+        assert_eq!(business_context.counts().git_history_producers, 1);
+        let staging = crate::embed::generation::semantic_root(tmp.path()).join("staging");
+        assert!(
+            !staging.exists() || std::fs::read_dir(staging).unwrap().next().is_none(),
+            "successful publication must leave no semantic staging members"
+        );
     }
 
     #[tokio::test]
