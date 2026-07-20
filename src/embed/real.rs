@@ -1037,6 +1037,84 @@ struct MaterializedEmbeddingRow {
     vector: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalEncoderInput<'a> {
+    canonical_input_digest: &'a str,
+    text: &'a str,
+    candidate_ids: Vec<&'a str>,
+}
+
+fn group_canonical_encoder_inputs<'a>(
+    candidates: impl IntoIterator<Item = &'a EmbeddingCandidate>,
+) -> Result<Vec<CanonicalEncoderInput<'a>>> {
+    let mut groups = BTreeMap::<&str, CanonicalEncoderInput<'a>>::new();
+    for candidate in candidates {
+        if let Some(group) = groups.get_mut(candidate.canonical_input_digest.as_str()) {
+            if group.text.as_bytes() != candidate.text.as_bytes() {
+                anyhow::bail!(
+                    "canonical encoder input digest collision maps to different text payloads"
+                );
+            }
+            group.candidate_ids.push(candidate.id.as_str());
+        } else {
+            groups.insert(
+                candidate.canonical_input_digest.as_str(),
+                CanonicalEncoderInput {
+                    canonical_input_digest: candidate.canonical_input_digest.as_str(),
+                    text: candidate.text.as_str(),
+                    candidate_ids: vec![candidate.id.as_str()],
+                },
+            );
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
+fn fan_out_encoded_vector(
+    vectors: &mut BTreeMap<String, Vec<f32>>,
+    input: &CanonicalEncoderInput<'_>,
+    vector: Vec<f32>,
+) -> Result<()> {
+    if generation::sha256_bytes(input.text.as_bytes()) != input.canonical_input_digest {
+        anyhow::bail!("canonical encoder input digest does not match exact text payload");
+    }
+    generation::vector_sha256(&vector, EMBEDDING_DIMENSION)?;
+    for candidate_id in &input.candidate_ids {
+        if vectors
+            .insert((*candidate_id).to_string(), vector.clone())
+            .is_some()
+        {
+            anyhow::bail!("embedding output attempted duplicate candidate {candidate_id}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_vector_mapping(
+    candidates: &[EmbeddingCandidate],
+    vectors: &BTreeMap<String, Vec<f32>>,
+) -> Result<()> {
+    let mut vector_hashes_by_input = BTreeMap::<&str, String>::new();
+    for candidate in candidates {
+        let vector = vectors.get(&candidate.id).ok_or_else(|| {
+            anyhow::anyhow!("semantic vector output missing candidate {}", candidate.id)
+        })?;
+        let vector_sha256 = generation::vector_sha256(vector, EMBEDDING_DIMENSION)?;
+        if let Some(existing_sha256) =
+            vector_hashes_by_input.get(candidate.canonical_input_digest.as_str())
+        {
+            if existing_sha256 != &vector_sha256 {
+                anyhow::bail!(
+                    "target semantic generation maps one canonical encoder input to conflicting vector payloads"
+                );
+            }
+        } else {
+            vector_hashes_by_input.insert(candidate.canonical_input_digest.as_str(), vector_sha256);
+        }
+    }
+    Ok(())
+}
+
 fn retain_reusable_vector(
     vectors_by_input: &mut BTreeMap<String, (String, Vec<f32>)>,
     canonical_input_digest: &str,
@@ -2295,6 +2373,7 @@ impl EmbeddingIndex {
             .iter()
             .filter(|candidate| !vectors.contains_key(&candidate.id))
             .collect::<Vec<_>>();
+        let encoder_inputs = group_canonical_encoder_inputs(to_encode.iter().copied())?;
         let encoded_vector_count = to_encode.len();
         let target_ids = candidates
             .iter()
@@ -2309,21 +2388,19 @@ impl EmbeddingIndex {
             target_rows = candidates.len(),
             reused_vectors = vectors.len(),
             encoded_vectors = encoded_vector_count,
+            encoded_inputs = encoder_inputs.len(),
             purged_rows = purged_row_count,
             "EmbeddingIndex: value-addressed vector plan"
         );
         let mut device_attestation = attest_available_device(require_metal)?;
-        if !to_encode.is_empty() {
+        if !encoder_inputs.is_empty() {
             let (model, observed_attestation) = new_model_with_policy(require_metal)?;
             device_attestation = observed_attestation;
             const ENCODE_BATCH_SIZE: usize = 2048;
-            for batch in to_encode.chunks(ENCODE_BATCH_SIZE) {
+            for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
                     &model,
-                    batch
-                        .iter()
-                        .map(|candidate| candidate.text.clone())
-                        .collect(),
+                    batch.iter().map(|input| input.text.to_string()).collect(),
                 )
                 .await?;
                 if output.len() != batch.len() {
@@ -2333,14 +2410,8 @@ impl EmbeddingIndex {
                         output.len()
                     );
                 }
-                for (candidate, vector) in batch.iter().zip(output) {
-                    generation::vector_sha256(&vector, EMBEDDING_DIMENSION)?;
-                    if vectors.insert(candidate.id.clone(), vector).is_some() {
-                        anyhow::bail!(
-                            "embedding output attempted duplicate candidate {}",
-                            candidate.id
-                        );
-                    }
+                for (input, vector) in batch.iter().zip(output) {
+                    fan_out_encoded_vector(&mut vectors, input, vector)?;
                 }
             }
         }
@@ -2351,6 +2422,7 @@ impl EmbeddingIndex {
                 vectors.len()
             );
         }
+        validate_canonical_vector_mapping(&candidates, &vectors)?;
         let expected_vector_hashes = vectors
             .iter()
             .map(|(id, vector)| {
@@ -3402,12 +3474,12 @@ mod tests {
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
         EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
         MaterializedEmbeddingRow, SearchFilters, SearchMode, SearchResult, UnpublishedScratchRoot,
-        build_artifact_embedding_text, build_code_embedding_text, node_embedding_kind,
-        node_embedding_text, node_embedding_title, node_scalar_filters,
-        publish_generation_after_final_validation, required_string_column,
-        retain_reusable_vector,
-        requires_active_generation_graph_validation, requires_sealed_query_validation,
-        single_query_embedding, truncate_chars, verify_materialized_rows,
+        build_artifact_embedding_text, build_code_embedding_text, fan_out_encoded_vector,
+        group_canonical_encoder_inputs, node_embedding_kind, node_embedding_text,
+        node_embedding_title, node_scalar_filters, publish_generation_after_final_validation,
+        required_string_column, requires_active_generation_graph_validation,
+        requires_sealed_query_validation, retain_reusable_vector, single_query_embedding,
+        truncate_chars, validate_canonical_vector_mapping, verify_materialized_rows,
     };
 
     #[test]
@@ -3594,6 +3666,110 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+        assert!(error.contains("conflicting vector payloads"));
+    }
+
+    #[test]
+    fn value_addressed_duplicate_inputs_encode_once_and_fan_out_exactly() {
+        let first = EmbeddingCandidate::new(
+            "first-id".into(),
+            "code:function".into(),
+            "first".into(),
+            "fn first()".into(),
+            "shared encoder input".into(),
+            Some("first.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let second = EmbeddingCandidate::new(
+            "second-id".into(),
+            "code:function".into(),
+            "second".into(),
+            "fn second()".into(),
+            "shared encoder input".into(),
+            Some("second.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let changed = EmbeddingCandidate::new(
+            "changed-id".into(),
+            "code:function".into(),
+            "changed".into(),
+            "fn changed()".into(),
+            "different encoder input".into(),
+            Some("changed.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let candidates = vec![first, second, changed];
+        let inputs = group_canonical_encoder_inputs(&candidates).unwrap();
+        assert_eq!(inputs.len(), 2);
+        let shared = inputs
+            .iter()
+            .find(|input| input.candidate_ids.len() == 2)
+            .unwrap();
+        assert_eq!(
+            shared.candidate_ids,
+            vec!["first-id", "second-id"],
+            "target row identity must not duplicate encoder work"
+        );
+
+        let shared_vector = vec![0.25; EMBEDDING_DIMENSION];
+        let mut vectors = BTreeMap::new();
+        fan_out_encoded_vector(&mut vectors, shared, shared_vector.clone()).unwrap();
+        let unique = inputs
+            .iter()
+            .find(|input| input.candidate_ids.len() == 1)
+            .unwrap();
+        fan_out_encoded_vector(&mut vectors, unique, vec![0.5; EMBEDDING_DIMENSION]).unwrap();
+
+        assert_eq!(vectors["first-id"], shared_vector);
+        assert_eq!(vectors["second-id"], vectors["first-id"]);
+        validate_canonical_vector_mapping(&candidates, &vectors).unwrap();
+    }
+
+    #[test]
+    fn value_addressed_target_conflicting_payloads_fail_closed() {
+        let first = EmbeddingCandidate::new(
+            "first-id".into(),
+            "code:function".into(),
+            "first".into(),
+            "fn first()".into(),
+            "shared encoder input".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let second = EmbeddingCandidate::new(
+            "second-id".into(),
+            "code:function".into(),
+            "second".into(),
+            "fn second()".into(),
+            "shared encoder input".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let candidates = vec![first, second];
+        let vectors = BTreeMap::from([
+            ("first-id".to_string(), vec![0.25; EMBEDDING_DIMENSION]),
+            ("second-id".to_string(), vec![0.5; EMBEDDING_DIMENSION]),
+        ]);
+
+        let error = validate_canonical_vector_mapping(&candidates, &vectors)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("conflicting vector payloads"));
     }
 
