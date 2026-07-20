@@ -889,6 +889,17 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertIn("offline-rust-analyzer-version.txt", workflow)
         self.assertIn("offline-rust-analyzer-sha256.txt", workflow)
         self.assertIn(
+            'if re.fullmatch(r"[0-9a-f]{64}", artifact_digest):', workflow
+        )
+        self.assertIn(
+            'artifact_digest = f"sha256:{artifact_digest}"', workflow
+        )
+        self.assertIn(
+            'if re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None:',
+            workflow,
+        )
+        self.assertIn('"artifact_digest": artifact_digest', workflow)
+        self.assertIn(
             '            "$BUNDLE_ROOT/repo-native-alignment" \\\n'
             "              --business-context disabled \\\n"
             "              search \\\n",

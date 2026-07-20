@@ -657,16 +657,22 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           from pathlib import Path
 
           root = Path(os.environ["SEMANTIC_OUTPUT_ROOT"])
           manifest = root / "semantic-bundle-manifest.json"
+          artifact_digest = os.environ["ARTIFACT_DIGEST"]
+          if re.fullmatch(r"[0-9a-f]{64}", artifact_digest):
+              artifact_digest = f"sha256:{artifact_digest}"
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None:
+              raise SystemExit("upload-artifact returned an invalid artifact digest")
           value = {
               "schema": "rna-swebench-semantic-bundle-upload-v1",
               "artifact_name": os.environ["BUNDLE_NAME"],
               "artifact_id": int(os.environ["ARTIFACT_ID"]),
               "artifact_url": os.environ["ARTIFACT_URL"],
-              "artifact_digest": os.environ["ARTIFACT_DIGEST"],
+              "artifact_digest": artifact_digest,
               "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
               "head_sha": os.environ["SOURCE_SHA"],
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
