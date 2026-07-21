@@ -112,6 +112,7 @@ class ParsedNode:
     path: str
     start_line: int
     end_line: int
+    inline_body: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,6 +574,67 @@ def parse_nodes(output: bytes) -> list[ParsedNode]:
     return nodes
 
 
+def parse_markdown_nodes(output: bytes, checkout: Path) -> list[ParsedNode]:
+    text = output.decode("utf-8", errors="strict")
+    marker = re.search(r"(?m)^### Markdown \((?P<count>[0-9]+) result\(s\)\)\s*$", text)
+    if marker is None:
+        return []
+    expected = int(marker.group("count"))
+    section = text[marker.end() :].lstrip("\n")
+    section = section.split("\n*Index:", 1)[0]
+    blocks = section.split("\n\n---\n\n") if section else []
+    nodes: list[ParsedNode] = []
+    checkout_root = checkout.resolve(strict=True)
+    for ordinal, block in enumerate(blocks, 1):
+        match = re.match(
+            r"^- \(score: -?[0-9]+(?:\.[0-9]+)?\) `(?P<path>[^`\n]+)` > (?P<hierarchy>[^\n]*)\n\n(?P<body>[\s\S]*)$",
+            block,
+        )
+        if match is None:
+            raise PacketError(f"Markdown result {ordinal} format drift")
+        raw_path = Path(match.group("path"))
+        candidate_path = raw_path if raw_path.is_absolute() else checkout_root / raw_path
+        try:
+            resolved = candidate_path.resolve(strict=True)
+            relative = resolved.relative_to(checkout_root).as_posix()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise PacketError(f"Markdown result {ordinal} path is unsafe") from error
+        if not resolved.is_file() or resolved.is_symlink():
+            raise PacketError(f"Markdown result {ordinal} path is not a regular file")
+        body = match.group("body")
+        source = resolved.read_bytes().decode("utf-8", errors="strict")
+        offsets = [found.start() for found in re.finditer(re.escape(body), source)]
+        if len(offsets) != 1:
+            raise PacketError(f"Markdown result {ordinal} body is not uniquely source-backed")
+        start_line = source[: offsets[0]].count("\n") + 1
+        end_line = start_line + body.count("\n")
+        body_sha = sha256(body.encode("utf-8"))
+        stable_id = "markdown:" + sha256(
+            canonical_json([relative, start_line, end_line, body_sha])
+        )
+        nodes.append(
+            ParsedNode(
+                stable_id,
+                "markdown_section",
+                relative,
+                start_line,
+                end_line,
+                body,
+            )
+        )
+    if len(nodes) != expected:
+        raise PacketError(f"parsed {len(nodes)} of {expected} Markdown result entries")
+    return nodes
+
+
+def parse_search_nodes(output: bytes, checkout: Path) -> list[ParsedNode]:
+    nodes = [*parse_nodes(output), *parse_markdown_nodes(output, checkout)]
+    stable_ids = [node.stable_id for node in nodes]
+    if len(stable_ids) != len(set(stable_ids)):
+        raise PacketError("RNA search output contains duplicate candidate IDs")
+    return nodes
+
+
 def raw_label_from_heading(heading: str) -> str:
     if not heading or heading != heading.strip():
         raise PacketError("invalid neighbor edge heading")
@@ -936,9 +998,7 @@ def semantic_search(
     text = result.stdout.decode("utf-8", errors="strict")
     if STRICT_SENTINEL not in text:
         raise PacketError("strict hybrid/RRF/rerank READY sentinel is missing")
-    nodes = parse_nodes(result.stdout)
-    if len(nodes) > 20:
-        raise PacketError("semantic search exceeded frozen limit")
+    nodes = parse_search_nodes(result.stdout, checkout)[:20]
     return nodes, result
 
 
@@ -1042,6 +1102,39 @@ def retrieve_candidate(
     return candidate, full, full, evidence
 
 
+def inline_markdown_candidate(node: ParsedNode) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
+    if node.inline_body is None:
+        raise PacketError("inline Markdown candidate body is missing")
+    body = node.inline_body.encode("utf-8")
+    candidate = {
+        "acquisition_ordinal": 0,
+        "stable_id": node.stable_id,
+        "path": node.path,
+        "start_line": node.start_line,
+        "end_line": node.end_line,
+        "language": language_from_tag("", node.path),
+        "full_body_byte_length": len(body),
+        "full_body_sha256": sha256(body),
+        "semantic_rank": None,
+        "graph_hops": None,
+        "semantic_component": 0,
+        "graph_component": 0,
+        "total": 0,
+        "eligibility_evidence": {
+            "source_backed": True,
+            "complete_utf8_body": True,
+            "locus_overlap": False,
+            "excluded_record_class": node.path.startswith(".oh/"),
+        },
+        "eligibility": "eligible",
+        "selected": False,
+    }
+    return candidate, node.inline_body, node.inline_body, {
+        "stable_id": node.stable_id,
+        "inline_markdown": True,
+    }
+
+
 def retrieve_minified_candidate(
     node: ParsedNode,
     full: str,
@@ -1132,7 +1225,9 @@ def candidate_pool(
     evidence: list[dict[str, Any]] = []
     for retrieval_ordinal, stable_id in enumerate(ordered_ids, 1):
         node = node_by_id[stable_id]
-        if node.start_line >= 1 and node.end_line >= node.start_line and node.path:
+        if node.inline_body is not None:
+            candidate, full, minified, body_evidence = inline_markdown_candidate(node)
+        elif node.start_line >= 1 and node.end_line >= node.start_line and node.path:
             candidate, full, minified, body_evidence = retrieve_candidate(
                 node, checkout, binary, recorder, retrieval_ordinal
             )
@@ -1157,7 +1252,7 @@ def candidate_pool(
             graph_hops=hops,
         )
     selected, omissions = PROTOCOL._replay_candidate_admission(candidates)
-    for candidate, is_selected in zip(candidates, selected):
+    for candidate, is_selected in zip(candidates, selected, strict=True):
         candidate["selected"] = is_selected
     for selected_ordinal, candidate in enumerate(
         (item for item in candidates if item["selected"] is True), 1
@@ -1218,11 +1313,17 @@ def candidate_records(
 
 def packet_tokens(records: Sequence[Mapping[str, Any]], arm: str) -> int:
     try:
-        if importlib.metadata.version("tiktoken") != "0.13.0":
-            raise PacketError("packet token accounting requires exact tiktoken 0.13.0")
+        if importlib.metadata.version("tiktoken") != PROTOCOL.TIKTOKEN_VERSION:
+            raise PacketError(
+                "packet token accounting requires exact tiktoken "
+                + PROTOCOL.TIKTOKEN_VERSION
+            )
         import tiktoken  # type: ignore
     except importlib.metadata.PackageNotFoundError as exc:
-        raise PacketError("packet token accounting requires exact tiktoken 0.13.0") from exc
+        raise PacketError(
+            "packet token accounting requires exact tiktoken "
+            + PROTOCOL.TIKTOKEN_VERSION
+        ) from exc
     encoder = tiktoken.get_encoding("cl100k_base")
     total = 0
     for record in records:
@@ -1731,7 +1832,10 @@ def validate_command_protocol(
             ordered_ids.append(candidate_id)
     for retrieval_ordinal, stable_id in enumerate(ordered_ids, 1):
         candidate = candidate_by_id[stable_id]
-        if candidate["eligibility_evidence"]["source_backed"]:
+        if (
+            candidate["eligibility_evidence"]["source_backed"]
+            and not stable_id.startswith("markdown:")
+        ):
             expected_commands.append(
                 (
                     f"candidate-{retrieval_ordinal:03d}-full",
@@ -1795,9 +1899,10 @@ def validate_command_protocol(
         if [node.stable_id for node in parsed] != item.get("nodes"):
             raise PacketError("locus node evidence drift")
     semantic_ordinal = ordinal_by_name["semantic-search"]
-    semantic_nodes = parse_nodes(
-        _command_stdout(evidence_root, semantic_ordinal, "semantic-search")
-    )
+    semantic_nodes = parse_search_nodes(
+        _command_stdout(evidence_root, semantic_ordinal, "semantic-search"),
+        Path(checkout),
+    )[:20]
     semantic_ids = [
         candidate["stable_id"]
         for candidate in sorted(
@@ -1837,8 +1942,27 @@ def validate_command_protocol(
         for record in vector["records"]
         if record["kind"] == "candidate"
     }
+    semantic_node_by_id = {node.stable_id: node for node in semantic_nodes}
     for retrieval_ordinal, stable_id in enumerate(ordered_ids, 1):
         candidate = candidate_by_id[stable_id]
+        if stable_id.startswith("markdown:"):
+            node = semantic_node_by_id.get(stable_id)
+            if node is None or node.inline_body is None:
+                raise PacketError("inline Markdown semantic evidence is missing")
+            payload = node.inline_body
+            if (
+                len(payload.encode("utf-8")) != candidate["full_body_byte_length"]
+                or sha256(payload.encode("utf-8")) != candidate["full_body_sha256"]
+                or (
+                    candidate["selected"]
+                    and (
+                        records_by_id[stable_id]["full_payload"] != payload
+                        or records_by_id[stable_id]["minified_payload"] != payload
+                    )
+                )
+            ):
+                raise PacketError("inline Markdown candidate payload drift")
+            continue
         if not candidate["eligibility_evidence"]["source_backed"]:
             continue
         name = f"candidate-{retrieval_ordinal:03d}-full"

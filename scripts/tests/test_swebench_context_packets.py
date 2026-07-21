@@ -6,8 +6,8 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 from scripts import swebench_context_packets as PACKETS
 from scripts import validate_swebench_act_context_protocol as PROTOCOL
@@ -359,6 +359,86 @@ class SwebenchContextPacketTests(unittest.TestCase):
             self.assertIn(locus["full_payload"].encode(), packet_b)
             self.assertIn(locus["full_payload"].encode(), packet_c)
 
+    def test_realistic_markdown_cli_results_flow_into_selection_and_packets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            readme = checkout / "README.md"
+            nested = checkout / "docs/configuration.rst"
+            readme_body = "# Project\n\nUse the deterministic packet builder."
+            nested_body = "Configuration\n=============\n\nSet offline mode."
+            readme.write_text(readme_body, encoding="utf-8")
+            nested.parent.mkdir()
+            nested.write_text(nested_body, encoding="utf-8")
+            stdout = (
+                "## Search: \"deterministic offline configuration\"\n\n"
+                "### Strict semantic qualification\n\n"
+                f"`{PACKETS.STRICT_SENTINEL}`\n\n"
+                "### Markdown (2 result(s))\n\n"
+                f"- (score: 0.91) `{readme}` > # Project\n\n{readme_body}\n\n"
+                "---\n\n"
+                f"- (score: 0.74) `{nested}` > Configuration\n\n{nested_body}"
+                "\n*Index: sealed*\n"
+            ).encode()
+            recorder = FakeRecorder(stdout)
+            semantic_nodes, _ = PACKETS.semantic_search(
+                "deterministic offline configuration",
+                checkout,
+                Path("/bundle/rna"),
+                recorder,
+            )
+            self.assertEqual(
+                [(node.path, node.kind) for node in semantic_nodes],
+                [
+                    ("README.md", "markdown_section"),
+                    ("docs/configuration.rst", "markdown_section"),
+                ],
+            )
+            locus, locus_record = PACKETS.make_locus(
+                1, "module_preamble", "src/edit.py", 1, 1, "Python", "EDIT = 1", []
+            )
+            candidates, payloads, evidence = PACKETS.candidate_pool(
+                semantic_nodes,
+                [],
+                [],
+                [locus],
+                checkout,
+                Path("/bundle/rna"),
+                FakeRecorder(b""),
+            )
+            self.assertEqual([candidate["selected"] for candidate in candidates], [True, True])
+            self.assertTrue(
+                all(item.get("inline_markdown") for item in evidence[: len(semantic_nodes)])
+            )
+            acquisition = {
+                "schema_version": 1,
+                "dataset_row_sha256": "a" * 64,
+                "query_sha256": "b" * 64,
+                "rna_artifact_receipt_sha256": "c" * 64,
+                "loci": [locus],
+                "candidates": candidates,
+                "relationships": [],
+                "omissions": evidence[-1]["omissions"],
+            }
+            records = [
+                locus_record,
+                *PACKETS.candidate_records(candidates, [], payloads, 1),
+            ]
+            vector = {
+                "metadata": {
+                    "instance_id": "owner__repo-1",
+                    "protocol_id": "rna-act-context-swebench-v1",
+                    "record_count": len(records),
+                    "acquisition": acquisition,
+                },
+                "records": records,
+            }
+            PACKETS.verify_vector(vector)
+            packet_b = PROTOCOL.assemble_packet_vector(vector, "B")
+            packet_c = PROTOCOL.assemble_packet_vector(vector, "C")
+            for body in (readme_body, nested_body):
+                self.assertIn(body.encode(), packet_b)
+                self.assertIn(body.encode(), packet_c)
+
     def test_vector_rejects_payload_and_closed_schema_tamper(self) -> None:
         source = json.loads(
             (ROOT / "benchmark/swebench-act-context/packet-vector.json").read_text()
@@ -415,15 +495,15 @@ class SwebenchContextPacketTests(unittest.TestCase):
         protocol = {"protocol_id": "rna-act-context-swebench-v1"}
         population = {"instances": []}
         with (
-            mock.patch.object(PACKETS, "validate_frozen_lock") as validate,
-            mock.patch.object(
+            unittest.mock.patch.object(PACKETS, "validate_frozen_lock") as validate,
+            unittest.mock.patch.object(
                 PACKETS.PROTOCOL,
                 "load_json_object",
                 side_effect=(protocol, population),
             ),
-            mock.patch.object(PACKETS.PROTOCOL, "validate_protocol"),
-            mock.patch.object(PACKETS.PROTOCOL, "validate_population"),
-            mock.patch.object(PACKETS, "sha256_file", side_effect=(
+            unittest.mock.patch.object(PACKETS.PROTOCOL, "validate_protocol"),
+            unittest.mock.patch.object(PACKETS.PROTOCOL, "validate_population"),
+            unittest.mock.patch.object(PACKETS, "sha256_file", side_effect=(
                 PACKETS.PROTOCOL.EXPECTED_PROTOCOL_SHA256,
                 PACKETS.PROTOCOL.EXPECTED_POPULATION_SHA256,
             )),
@@ -452,13 +532,13 @@ class SwebenchContextPacketTests(unittest.TestCase):
                 {"patch": "", "problem_statement": "exact issue"},
             )
 
-    @mock.patch.object(PACKETS, "packet_tokens", return_value=1)
+    @unittest.mock.patch.object(PACKETS, "packet_tokens", return_value=1)
     def test_offline_verifier_rejects_packet_manifest_and_trace_tamper(
-        self, _packet_tokens: mock.Mock
+        self, _packet_tokens: unittest.mock.Mock
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            manifest = _packet_manifest(root)
+            _packet_manifest(root)
             self.assertEqual(PACKETS.verify_output(root)["status"], "ready")
 
             packet_b = root / "packet-B.bin"
@@ -487,7 +567,7 @@ class SwebenchContextPacketTests(unittest.TestCase):
             with self.assertRaisesRegex(PACKETS.PacketError, "forbidden enrichment"):
                 recorder.run("bad", ["rna", "scan", "--full"], Path(temporary))
             self.assertEqual(recorder.results, [])
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "redacted"}, clear=False):
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "redacted"}, clear=False):
             with self.assertRaisesRegex(PACKETS.PacketError, "rejects ANTHROPIC_API_KEY"):
                 PACKETS.materialize_command_environment(
                     Path("/does/not/matter/rna"),

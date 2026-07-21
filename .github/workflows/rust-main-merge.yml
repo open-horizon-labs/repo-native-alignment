@@ -35,6 +35,8 @@ jobs:
               - '.github/fixtures/**'
               - 'scripts/swebench_rna_one.py'
               - 'scripts/swebench_rna_mcp_proxy.py'
+              - 'scripts/swebench_context_packets.py'
+              - 'scripts/swebench_combined_cache.py'
               - 'scripts/tests/**'
               - 'security/rustsec-policy.json'
 
