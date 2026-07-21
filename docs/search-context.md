@@ -74,6 +74,25 @@ a backend-native observation. Test-path demotion is likewise recorded as an
 explicit post-normalization adjustment rather than being mislabeled as a native
 similarity or relevance score.
 
+### Representative four-query channel diagnostic (#812)
+
+This is a deterministic contract diagnostic, not a latency, quality, or model
+benchmark. The “before” column records the scale/pathology found by the packet
+and seam audit; the “after” column is asserted by the named pure/service
+fixtures. No unexecuted query is presented as measured performance.
+
+| Representative query shape | Before the calibrated contract | After, as asserted by fixtures |
+| --- | --- | --- |
+| Exact name: `projected_search` | Exact and later semantic/graph observations could be assembled at different seams without one comparable contribution record. | Exact/lexical is an explicit ranked lane, additional lanes remain visible, and stable identity closes ties. `giant_semantic_decoy_is_bounded_and_cannot_erase_exact_graph_evidence` proves a large semantic decoy cannot erase the exact/graph candidate solely through score scale. |
+| Natural language: “paginate source hydration without losing bytes” | Native semantic or reranker magnitudes could dominate merely because their numeric scale was larger. | Semantic acquisition and rerank are independent within-channel ranks. `multiplying_each_channel_alone_cannot_change_fusion` proves positive raw-score rescaling cannot change identities or order when channel order is unchanged. |
+| Graph entry: impact from `projected_graph_delta` | The audited formula admitted million-point adjacent semantic gaps while graph bonuses remained below one hundred thousand, so direct graph evidence could not promote by one semantic position. | Graph directness/hops contributes through the same rank fusion. `graph_only_evidence_promotes_while_weak_graph_does_not_overwhelm_semantic` proves both legitimate promotion and weak-graph restraint. |
+| Mixed task: change `projected_graph_delta` and verify its test | A flat top-k could spend the body budget on a giant generic semantic record and omit a named test or state/API obligation. | Fusion establishes comparable candidates first; task selection then admits distinct exact, editable, test, state/API, analogue, dependency, and impact roles by coverage per rendered cost. Exact misses, ambiguities, and role omissions remain explicit. |
+
+The table describes non-strict product search only. The sealed #779 strict
+semantic path still consumes its frozen hybrid candidate order and reranker
+permutation without lexical, graph, vector-only, CPU, or original-order
+fallback.
+
 ## Rendered cost
 
 Cost is computed after canonical rendering. RNA reports UTF-8 bytes, Unicode
@@ -145,6 +164,16 @@ edit sketch in `proposal`. RNA parses it into an ephemeral overlay, compares
 deterministic before/after routes, and reports changed edges, lost reachability,
 equal-cost alternatives, bypassed behavior, affected contracts/tests, and an
 affected-locus checklist.
+
+The pure parser emits proposal-grounded relationship facts for calls, imports,
+registrations, and qualified attribute/state references. These are candidates,
+not graph claims: the live adapter must resolve each target to exactly one
+current source-grounded node before adding or removing an overlay edge.
+Ambiguous or absent endpoints degrade capability evidence rather than being
+guessed. Changed lines also surface grounded behavioral classes for branches,
+reconciliation, representation handling, error paths, and state propagation.
+For route changes, bounded traversal returns only the nearest source-grounded
+test layer; farther tests are not mislabeled as equally direct.
 
 The beta analyzer never applies the proposal, changes the worktree, mutates the
 published graph, or writes overlay evidence to LanceDB. Every claim links to an

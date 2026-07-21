@@ -5,7 +5,7 @@
 //! a proposal never mutates that snapshot or the persisted RNA graph.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -241,6 +241,7 @@ pub(crate) struct ImpactEvidence {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphNode {
     pub(crate) id: String,
+    pub(crate) kind: ImpactKind,
     pub(crate) grounding: EvidenceGrounding,
 }
 
@@ -312,6 +313,40 @@ pub(crate) struct ChangedFileFact {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum InferredRelationshipKind {
+    Call,
+    Reference,
+    Registration,
+    AttributeOrStateReference,
+}
+
+impl InferredRelationshipKind {
+    pub(crate) fn edge_kind(self) -> &'static str {
+        match self {
+            Self::Call => "calls",
+            Self::Reference => "references",
+            Self::Registration => "registers",
+            Self::AttributeOrStateReference => "references_state",
+        }
+    }
+}
+
+/// A conservative proposal relationship awaiting live-graph endpoint
+/// resolution. The pure parser identifies syntax and a qualified target; the
+/// service adapter must corroborate exactly one current graph node before it
+/// materializes an overlay edge.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChangedRelationshipFact {
+    pub(crate) change: ChangedLineKind,
+    pub(crate) kind: InferredRelationshipKind,
+    pub(crate) qualifier: Option<String>,
+    pub(crate) target: String,
+    pub(crate) grounding: ProposalLine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum GraphDeltaCapability {
     ProposalParsing,
     LiveGraphInference,
@@ -341,6 +376,7 @@ pub(crate) struct CapabilityReport {
 pub(crate) enum BehavioralDeltaKind {
     BypassedCall,
     BranchBehavior,
+    Reconciliation,
     ErrorPath,
     Representation,
     StatePropagation,
@@ -395,6 +431,8 @@ pub(crate) struct StructuredProposal {
     #[serde(default)]
     pub(crate) edge_removals: Vec<EdgeKey>,
     #[serde(default)]
+    pub(crate) relationships: Vec<ChangedRelationshipFact>,
+    #[serde(default)]
     pub(crate) impacted: Vec<ImpactEvidence>,
     #[serde(default)]
     pub(crate) capabilities: Vec<CapabilityReport>,
@@ -413,6 +451,7 @@ impl Default for StructuredProposal {
             changed_files: Vec::new(),
             edge_additions: Vec::new(),
             edge_removals: Vec::new(),
+            relationships: Vec::new(),
             impacted: Vec::new(),
             capabilities: Vec::new(),
             behavioral_deltas: Vec::new(),
@@ -444,6 +483,7 @@ pub(crate) struct EphemeralOverlay {
     pub(crate) changed_files: Vec<ChangedFileFact>,
     pub(crate) edge_additions: Vec<WeightedEdge>,
     pub(crate) edge_removals: Vec<EdgeKey>,
+    pub(crate) relationships: Vec<ChangedRelationshipFact>,
     pub(crate) impacted: Vec<ImpactEvidence>,
     pub(crate) capabilities: Vec<CapabilityReport>,
     pub(crate) behavioral_deltas: Vec<BehavioralDelta>,
@@ -493,6 +533,7 @@ fn structured_overlay(proposal: StructuredProposal) -> Result<EphemeralOverlay, 
         changed_files: proposal.changed_files,
         edge_additions: proposal.edge_additions,
         edge_removals: proposal.edge_removals,
+        relationships: proposal.relationships,
         impacted: proposal.impacted,
         capabilities: proposal.capabilities,
         behavioral_deltas: proposal.behavioral_deltas,
@@ -773,11 +814,19 @@ fn parse_unified_diff(
         .iter()
         .next()
         .map(|evidence| evidence.grounding.clone());
+    let relationships = changed_files
+        .iter()
+        .flat_map(|file| &file.hunks)
+        .flat_map(|hunk| &hunk.changed_lines)
+        .flat_map(infer_changed_line_relationships)
+        .collect::<Vec<_>>();
+    let behavioral_deltas = infer_changed_behavioral_deltas(&changed_files);
 
     Ok(EphemeralOverlay {
         changed_files,
         edge_additions: Vec::new(),
         edge_removals: Vec::new(),
+        relationships,
         impacted: impacted.into_iter().collect(),
         capabilities: vec![
             CapabilityReport {
@@ -791,7 +840,7 @@ fn parse_unified_diff(
                 detail: "raw changed lines require the service adapter and live GraphState to infer relationships".to_owned(),
             },
         ],
-        behavioral_deltas: Vec::new(),
+        behavioral_deltas,
         analogues: Vec::new(),
         omissions: vec![GraphDeltaOmission {
             code: GraphDeltaOmissionCode::LiveGraphInferenceDeferred,
@@ -802,6 +851,275 @@ fn parse_unified_diff(
             grounding: first_grounding,
         }],
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentifierToken {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+/// Extract conservative syntax facts without claiming that a textual name is
+/// a graph endpoint. Live graph resolution remains mandatory and fail-closed.
+pub(crate) fn infer_changed_line_relationships(
+    line: &ChangedLineFact,
+) -> Vec<ChangedRelationshipFact> {
+    let tokens = identifier_tokens(&line.text);
+    let mut facts = BTreeSet::new();
+    let trimmed = line.text.trim_start();
+    let import_like = trimmed.starts_with("use ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("from ");
+
+    if import_like {
+        for token in &tokens {
+            if !is_syntax_word(&token.value) {
+                facts.insert(relationship_fact(
+                    line,
+                    InferredRelationshipKind::Reference,
+                    None,
+                    token.value.clone(),
+                ));
+            }
+        }
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        let called = line.text[token.end..].trim_start().starts_with('(');
+        let qualifier = token_qualifier(&line.text, &tokens, index);
+        if called && is_registration_operation(&token.value) {
+            for (target_index, target) in tokens.iter().enumerate().skip(index + 1).take(8) {
+                if !is_syntax_word(&target.value)
+                    && !line.text[target.end..].trim_start().starts_with('=')
+                {
+                    facts.insert(relationship_fact(
+                        line,
+                        InferredRelationshipKind::Registration,
+                        token_qualifier(&line.text, &tokens, target_index),
+                        target.value.clone(),
+                    ));
+                }
+            }
+        } else if called && !is_syntax_word(&token.value) {
+            facts.insert(relationship_fact(
+                line,
+                InferredRelationshipKind::Call,
+                qualifier,
+                token.value.clone(),
+            ));
+        } else if let Some(qualifier) = qualifier
+            && !called
+        {
+            facts.insert(relationship_fact(
+                line,
+                InferredRelationshipKind::AttributeOrStateReference,
+                Some(qualifier),
+                token.value.clone(),
+            ));
+        }
+    }
+    facts.into_iter().collect()
+}
+
+fn relationship_fact(
+    line: &ChangedLineFact,
+    kind: InferredRelationshipKind,
+    qualifier: Option<String>,
+    target: String,
+) -> ChangedRelationshipFact {
+    ChangedRelationshipFact {
+        change: line.kind,
+        kind,
+        qualifier,
+        target,
+        grounding: line.grounding.clone(),
+    }
+}
+
+fn identifier_tokens(text: &str) -> Vec<IdentifierToken> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            break;
+        }
+        if byte == b'_' || byte.is_ascii_alphabetic() {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+            {
+                index += 1;
+            }
+            tokens.push(IdentifierToken {
+                value: text[start..index].to_owned(),
+                start,
+                end: index,
+            });
+            continue;
+        }
+        index += 1;
+    }
+    tokens
+}
+
+fn token_qualifier(text: &str, tokens: &[IdentifierToken], index: usize) -> Option<String> {
+    let token = tokens.get(index)?;
+    let previous = index.checked_sub(1).and_then(|index| tokens.get(index))?;
+    (text[previous.end..token.start].trim() == ".").then(|| previous.value.clone())
+}
+
+fn is_registration_operation(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "register"
+            | "register_route"
+            | "add_route"
+            | "add_url_rule"
+            | "mount"
+            | "include_router"
+            | "register_blueprint"
+    )
+}
+
+fn is_syntax_word(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "as" | "async"
+            | "await"
+            | "case"
+            | "catch"
+            | "else"
+            | "except"
+            | "false"
+            | "for"
+            | "from"
+            | "if"
+            | "import"
+            | "in"
+            | "let"
+            | "match"
+            | "mod"
+            | "none"
+            | "null"
+            | "raise"
+            | "return"
+            | "self"
+            | "super"
+            | "switch"
+            | "throw"
+            | "true"
+            | "use"
+            | "while"
+    )
+}
+
+fn infer_changed_behavioral_deltas(files: &[ChangedFileFact]) -> Vec<BehavioralDelta> {
+    let mut deltas = BTreeSet::new();
+    for line in files
+        .iter()
+        .flat_map(|file| &file.hunks)
+        .flat_map(|hunk| &hunk.changed_lines)
+    {
+        let tokens = identifier_tokens(&line.text)
+            .into_iter()
+            .map(|token| token.value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let mut classify = |kind, marker: &str| {
+            deltas.insert(BehavioralDelta {
+                kind,
+                label: format!(
+                    "{} proposal line contains `{marker}` behavior",
+                    match line.kind {
+                        ChangedLineKind::Added => "added",
+                        ChangedLineKind::Removed => "removed",
+                    }
+                ),
+                changed_locus: EvidenceGrounding::Proposal(line.grounding.clone()),
+                analogue_locus: None,
+            });
+        };
+        if let Some(marker) = first_marker(
+            &tokens,
+            &["case", "else", "elif", "guard", "if", "match", "switch"],
+        ) {
+            classify(BehavioralDeltaKind::BranchBehavior, marker);
+        }
+        if let Some(marker) = first_marker(
+            &tokens,
+            &[
+                "dedupe",
+                "deduplicate",
+                "merge",
+                "reconcile",
+                "reconciliation",
+                "sync",
+                "synchronize",
+            ],
+        ) {
+            classify(BehavioralDeltaKind::Reconciliation, marker);
+        }
+        if let Some(marker) = first_marker(
+            &tokens,
+            &[
+                "decode",
+                "deserialize",
+                "encode",
+                "format",
+                "render",
+                "representation",
+                "serialize",
+            ],
+        ) {
+            classify(BehavioralDeltaKind::Representation, marker);
+        }
+        if let Some(marker) = first_marker(
+            &tokens,
+            &[
+                "bail", "catch", "err", "error", "except", "panic", "raise", "throw",
+            ],
+        ) {
+            classify(BehavioralDeltaKind::ErrorPath, marker);
+        }
+        let has_state_reference = infer_changed_line_relationships(line)
+            .iter()
+            .any(|fact| fact.kind == InferredRelationshipKind::AttributeOrStateReference);
+        if let Some(marker) = first_marker(
+            &tokens,
+            &["cache", "context", "metadata", "state", "status"],
+        ) && (has_state_reference || line.text.contains('='))
+        {
+            classify(BehavioralDeltaKind::StatePropagation, marker);
+        }
+    }
+    deltas.into_iter().collect()
+}
+
+fn first_marker<'a>(tokens: &BTreeSet<String>, markers: &[&'a str]) -> Option<&'a str> {
+    markers
+        .iter()
+        .copied()
+        .find(|marker| tokens.contains(*marker))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1135,6 +1453,27 @@ fn validate_overlay(
     for key in &overlay.edge_removals {
         validate_edge_key(key)?;
     }
+    enforce_limit(
+        "relationship facts",
+        overlay.relationships.len(),
+        limits.changed_lines.saturating_mul(16),
+    )?;
+    for relationship in &overlay.relationships {
+        EvidenceGrounding::Proposal(relationship.grounding.clone()).validate()?;
+        if relationship.target.trim().is_empty()
+            || relationship.target.len() > 1_024
+            || relationship.target.chars().any(char::is_control)
+            || relationship.qualifier.as_ref().is_some_and(|qualifier| {
+                qualifier.trim().is_empty()
+                    || qualifier.len() > 1_024
+                    || qualifier.chars().any(char::is_control)
+            })
+        {
+            return Err(GraphDeltaError::InvalidGraph(
+                "relationship facts require bounded printable targets".to_owned(),
+            ));
+        }
+    }
     for evidence in &overlay.impacted {
         if evidence.label.trim().is_empty() {
             return Err(GraphDeltaError::InvalidGraph(
@@ -1229,6 +1568,8 @@ fn canonicalize_overlay(mut overlay: EphemeralOverlay) -> EphemeralOverlay {
     overlay.edge_additions.dedup_by(|left, right| left == right);
     overlay.edge_removals.sort();
     overlay.edge_removals.dedup();
+    overlay.relationships.sort();
+    overlay.relationships.dedup();
     overlay.impacted.sort();
     overlay.impacted.dedup();
     overlay.capabilities.sort();
@@ -1286,6 +1627,10 @@ fn validate_overlay_root(
         .changed_files
         .iter()
         .any(|file| file.root != expected_root)
+        || overlay
+            .relationships
+            .iter()
+            .any(|relationship| relationship.grounding.root != expected_root)
         || proposal_groundings.iter().any(|grounding| {
             matches!(grounding, EvidenceGrounding::Proposal(line) if line.root != expected_root)
         })
@@ -1515,6 +1860,23 @@ pub(crate) fn analyze_graph_delta(
     }
 
     let mut impacted = overlay.impacted.clone();
+    impacted.extend(changed_edges.iter().filter_map(|changed| {
+        nodes
+            .get(&changed.edge.key.to)
+            .map(|target| ImpactEvidence {
+                label: target.id.clone(),
+                kind: target.kind,
+                grounding: target.grounding.clone(),
+            })
+    }));
+    impacted.extend(nearest_route_tests(
+        &nodes,
+        &before_edges,
+        &after_edges,
+        &changed_edges,
+        &routes,
+        limits,
+    )?);
     impacted.sort();
     impacted.dedup();
     let impacted_tests = impacted
@@ -1931,6 +2293,77 @@ fn classify_route_change(before: &PathSet, after: &PathSet) -> RouteChange {
     }
 }
 
+fn nearest_route_tests(
+    nodes: &BTreeMap<String, GraphNode>,
+    before_edges: &BTreeMap<EdgeKey, WeightedEdge>,
+    after_edges: &BTreeMap<EdgeKey, WeightedEdge>,
+    changed_edges: &[ChangedEdge],
+    routes: &[RouteDelta],
+    limits: &GraphDeltaLimits,
+) -> Result<Vec<ImpactEvidence>, GraphDeltaError> {
+    let mut seeds = BTreeSet::new();
+    for changed in changed_edges {
+        seeds.insert(changed.edge.key.from.clone());
+        seeds.insert(changed.edge.key.to.clone());
+    }
+    for route in routes
+        .iter()
+        .filter(|route| route.change != RouteChange::Unchanged)
+    {
+        seeds.insert(route.endpoints.from.clone());
+        seeds.insert(route.endpoints.to.clone());
+    }
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
+    for edge in before_edges.values().chain(after_edges.values()) {
+        adjacency
+            .entry(edge.key.from.clone())
+            .or_default()
+            .insert(edge.key.to.clone());
+        adjacency
+            .entry(edge.key.to.clone())
+            .or_default()
+            .insert(edge.key.from.clone());
+    }
+    let mut queue = seeds
+        .iter()
+        .cloned()
+        .map(|seed| (seed, 0usize))
+        .collect::<VecDeque<_>>();
+    let mut visited = seeds;
+    let mut nearest_distance = None;
+    let mut tests = BTreeSet::new();
+    while let Some((node_id, distance)) = queue.pop_front() {
+        enforce_limit("visited nodes", visited.len(), limits.visited_nodes)?;
+        if nearest_distance.is_some_and(|nearest| distance > nearest) {
+            break;
+        }
+        if let Some(node) = nodes.get(&node_id)
+            && node.kind == ImpactKind::Test
+        {
+            nearest_distance.get_or_insert(distance);
+            tests.insert(ImpactEvidence {
+                label: node.id.clone(),
+                kind: ImpactKind::Test,
+                grounding: node.grounding.clone(),
+            });
+            continue;
+        }
+        if nearest_distance.is_some() {
+            continue;
+        }
+        for neighbor in adjacency.get(&node_id).into_iter().flatten() {
+            if visited.insert(neighbor.clone()) {
+                queue.push_back((neighbor.clone(), distance.saturating_add(1)));
+            }
+        }
+    }
+    Ok(tests.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,6 +2387,20 @@ mod tests {
         })
     }
 
+    fn changed(text: &str, line: u32) -> ChangedLineFact {
+        ChangedLineFact {
+            kind: ChangedLineKind::Added,
+            grounding: ProposalLine {
+                root: "workspace".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                proposal_line: line,
+                old_line: None,
+                new_line: Some(line),
+            },
+            text: text.to_owned(),
+        }
+    }
+
     fn edge(from: &str, to: &str, cost: u32, priority: u32) -> WeightedEdge {
         WeightedEdge {
             key: EdgeKey {
@@ -1974,6 +2421,7 @@ mod tests {
                 .into_iter()
                 .map(|id| GraphNode {
                     id: id.to_owned(),
+                    kind: ImpactKind::EditableLocus,
                     grounding: current(&format!("src/{id}.rs"), 1),
                 })
                 .collect(),
@@ -2036,6 +2484,74 @@ mod tests {
         assert!(overlay.omissions.iter().any(|omission| {
             omission.code == GraphDeltaOmissionCode::LiveGraphInferenceDeferred
         }));
+    }
+
+    #[test]
+    fn changed_lines_infer_typed_registration_and_attribute_state_facts() {
+        let registration =
+            infer_changed_line_relationships(&changed("router.register(handler)", 8));
+        assert!(registration.iter().any(|fact| {
+            fact.kind == InferredRelationshipKind::Registration
+                && fact.target == "handler"
+                && fact.grounding.proposal_line == 8
+        }));
+        assert!(
+            registration
+                .iter()
+                .all(|fact| fact.kind != InferredRelationshipKind::Call)
+        );
+
+        let state =
+            infer_changed_line_relationships(&changed("endpoint.state = response.status", 9));
+        assert!(state.iter().any(|fact| {
+            fact.kind == InferredRelationshipKind::AttributeOrStateReference
+                && fact.qualifier.as_deref() == Some("endpoint")
+                && fact.target == "state"
+        }));
+        assert!(state.iter().any(|fact| {
+            fact.kind == InferredRelationshipKind::AttributeOrStateReference
+                && fact.qualifier.as_deref() == Some("response")
+                && fact.target == "status"
+        }));
+    }
+
+    #[test]
+    fn behavioral_classes_are_proposal_grounded_and_deterministic() {
+        let lines = vec![
+            changed("if endpoint.state == None {", 10),
+            changed("reconcile(value);", 11),
+            changed("decode(payload);", 12),
+            changed("raise(error);", 13),
+            changed("cache.status = value;", 14),
+        ];
+        let files = vec![ChangedFileFact {
+            root: "workspace".to_owned(),
+            path: "src/lib.rs".to_owned(),
+            hunks: vec![ChangedHunkFact {
+                proposal_header_line: 9,
+                old_start: 10,
+                old_count: 0,
+                new_start: 10,
+                new_count: 5,
+                changed_lines: lines.clone(),
+            }],
+        }];
+        let forward = infer_changed_behavioral_deltas(&files);
+        let mut reversed = files;
+        reversed[0].hunks[0].changed_lines.reverse();
+        let reverse = infer_changed_behavioral_deltas(&reversed);
+        assert_eq!(forward, reverse);
+        for kind in [
+            BehavioralDeltaKind::BranchBehavior,
+            BehavioralDeltaKind::Reconciliation,
+            BehavioralDeltaKind::Representation,
+            BehavioralDeltaKind::ErrorPath,
+            BehavioralDeltaKind::StatePropagation,
+        ] {
+            assert!(forward.iter().any(|delta| {
+                delta.kind == kind && matches!(delta.changed_locus, EvidenceGrounding::Proposal(_))
+            }));
+        }
     }
 
     #[test]
@@ -2103,6 +2619,61 @@ mod tests {
                 && matches!(delta.changed_locus, EvidenceGrounding::CurrentSource(_))
         }));
         assert_eq!(card.routes[0].after.alternatives[0].grounded_steps.len(), 1);
+    }
+
+    #[test]
+    fn nearest_route_test_is_discovered_without_returning_farther_tests() {
+        let mut base = graph();
+        base.nodes.extend([
+            GraphNode {
+                id: "near_test".to_owned(),
+                kind: ImpactKind::Test,
+                grounding: current("tests/near.rs", 4),
+            },
+            GraphNode {
+                id: "far_test".to_owned(),
+                kind: ImpactKind::Test,
+                grounding: current("tests/far.rs", 8),
+            },
+        ]);
+        base.edges
+            .extend([edge("near_test", "a", 1, 0), edge("far_test", "b", 1, 0)]);
+        let card = analyze_graph_delta(
+            &base,
+            &EphemeralOverlay {
+                edge_additions: vec![WeightedEdge {
+                    key: EdgeKey {
+                        from: "a".to_owned(),
+                        to: "d".to_owned(),
+                        kind: "registers".to_owned(),
+                    },
+                    cost: 1,
+                    priority: 0,
+                    registration_order: 0,
+                    grounding: proposed("src/lib.rs", 8),
+                }],
+                ..EphemeralOverlay::default()
+            },
+            &[EndpointPair {
+                from: "a".to_owned(),
+                to: "d".to_owned(),
+            }],
+            &GraphDeltaLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            card.impacted_tests
+                .iter()
+                .map(|test| test.label.as_str())
+                .collect::<Vec<_>>(),
+            ["near_test"]
+        );
+        assert!(
+            card.affected_locus_checklist.iter().any(|item| {
+                item.label == "near_test" && item.kinds.contains(&ImpactKind::Test)
+            })
+        );
     }
 
     #[test]
@@ -2223,6 +2794,7 @@ mod tests {
                 .into_iter()
                 .map(|id| GraphNode {
                     id: id.to_owned(),
+                    kind: ImpactKind::EditableLocus,
                     grounding: current(&format!("src/{id}.rs"), 1),
                 })
                 .collect(),
@@ -2288,6 +2860,58 @@ mod tests {
             omission.code == GraphDeltaOmissionCode::CapabilityDegraded
                 && omission.detail.contains("ImpactTraversal")
         }));
+    }
+
+    #[test]
+    fn referenced_state_edge_surfaces_the_source_grounded_target_contract() {
+        let base = GraphSnapshot {
+            nodes: vec![
+                GraphNode {
+                    id: "handler".to_owned(),
+                    kind: ImpactKind::EditableLocus,
+                    grounding: current("src/handler.rs", 3),
+                },
+                GraphNode {
+                    id: "endpoint_state".to_owned(),
+                    kind: ImpactKind::StateOrApi,
+                    grounding: current("src/state.rs", 7),
+                },
+            ],
+            edges: Vec::new(),
+        };
+        let card = analyze_graph_delta(
+            &base,
+            &EphemeralOverlay {
+                edge_additions: vec![WeightedEdge {
+                    key: EdgeKey {
+                        from: "handler".to_owned(),
+                        to: "endpoint_state".to_owned(),
+                        kind: InferredRelationshipKind::AttributeOrStateReference
+                            .edge_kind()
+                            .to_owned(),
+                    },
+                    cost: 1,
+                    priority: 0,
+                    registration_order: 12,
+                    grounding: proposed("src/handler.rs", 12),
+                }],
+                ..EphemeralOverlay::default()
+            },
+            &[EndpointPair {
+                from: "handler".to_owned(),
+                to: "endpoint_state".to_owned(),
+            }],
+            &GraphDeltaLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(card.routes[0].change, RouteChange::AddedReachability);
+        assert_eq!(card.impacted_state_or_api.len(), 1);
+        assert_eq!(card.impacted_state_or_api[0].label, "endpoint_state");
+        assert!(matches!(
+            card.impacted_state_or_api[0].grounding,
+            EvidenceGrounding::CurrentSource(_)
+        ));
     }
 
     #[test]

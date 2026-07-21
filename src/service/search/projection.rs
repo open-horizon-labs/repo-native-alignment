@@ -210,6 +210,7 @@ pub(crate) fn plan_projection(
 
     spans.sort_by(span_order);
     enforce_total_body_cap(&request, &mut records, &mut omissions, &mut spans);
+    annotate_projected_span_costs(&mut records, &spans);
     omissions.sort_by(omission_order);
 
     ProjectionPlan {
@@ -220,6 +221,41 @@ pub(crate) fn plan_projection(
         relationships: input.relationships,
         omissions,
         capabilities: input.capabilities,
+    }
+}
+
+/// Bind each selected record to the deterministic body-span cost it receives.
+/// The values live in evidence diagnostics, so the agent projection stays
+/// concise while evidence projection can audit admission against the exact
+/// coalesced span rather than an unprojected record body.
+fn annotate_projected_span_costs(records: &mut [ProjectedRecord], spans: &[ProjectedSpan]) {
+    for span in spans {
+        let unicode_chars = span.text.chars().count();
+        let estimated_tokens = unicode_chars.saturating_add(3) / 4;
+        let span_id = span.source.stable_id();
+        for mapping in &span.mappings {
+            for record in records.iter_mut().filter(|record| {
+                record.selection_rank == mapping.selection_rank
+                    && record.identity.node_id == mapping.record_id
+            }) {
+                record
+                    .evidence
+                    .diagnostics
+                    .insert("projected_span_id".into(), span_id.clone());
+                record.evidence.diagnostics.insert(
+                    "projected_span_utf8_bytes".into(),
+                    span.text.len().to_string(),
+                );
+                record.evidence.diagnostics.insert(
+                    "projected_span_unicode_chars".into(),
+                    unicode_chars.to_string(),
+                );
+                record.evidence.diagnostics.insert(
+                    "projected_span_estimated_tokens".into(),
+                    estimated_tokens.to_string(),
+                );
+            }
+        }
     }
 }
 
@@ -706,6 +742,24 @@ mod tests {
         assert_eq!(first.spans.len(), 1);
         assert_eq!(first.spans[0].text, "a\nb\nc\n");
         assert_eq!(first.spans[0].mappings.len(), 2);
+        for record in &first.records {
+            assert_eq!(
+                record
+                    .evidence
+                    .diagnostics
+                    .get("projected_span_utf8_bytes")
+                    .map(String::as_str),
+                Some("6")
+            );
+            assert_eq!(
+                record
+                    .evidence
+                    .diagnostics
+                    .get("projected_span_estimated_tokens")
+                    .map(String::as_str),
+                Some("2")
+            );
+        }
     }
 
     #[test]

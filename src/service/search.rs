@@ -1045,6 +1045,13 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     if let Some(node) = params.node.as_deref()
         && node.starts_with("rna-hydrate-v1:")
     {
+        if params.normalized_mode().is_some()
+            || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
+            || params.target_subsystem.is_some()
+        {
+            return "Invalid search context: hydration cannot be combined with legacy nodes/traversal/target_subsystem dispatch."
+                .to_string();
+        }
         return hydrate_from_handle(node, params, ctx).await;
     }
 
@@ -1059,22 +1066,59 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             .unwrap_or_else(|error| format!("Source span lookup task failed: {error}."));
     }
 
-    // Traversal and batch rendering retain their established contracts until
-    // typed projection adapters exist. In particular, never reinterpret a
-    // node/mode request as a flat product search.
-    if params.context_mode.is_none()
+    let legacy_dispatch = params.context_mode.is_none()
         && (params.normalized_mode().is_some()
             || params
                 .node
                 .as_deref()
                 .is_some_and(|node| !node.trim().is_empty())
             || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
-            || params.target_subsystem.is_some())
-    {
+            || params.target_subsystem.is_some());
+    if legacy_dispatch && let Some(controls) = legacy_product_controls(params) {
+        return format!(
+            "Invalid search context: product controls ({controls}) cannot be combined with legacy node/nodes/traversal/target_subsystem dispatch. Remove those controls or use flat/task context search."
+        );
+    }
+
+    // Traversal and batch rendering retain their established contracts until
+    // typed projection adapters exist. In particular, never reinterpret a
+    // node/mode request as a flat product search.
+    if legacy_dispatch {
         return legacy_search_dispatch(params, ctx).await;
     }
 
     projected_search(params, ctx).await
+}
+
+/// Return the stable names of product-only controls that legacy dispatch
+/// cannot honor. Legacy requests with none of these controls retain their
+/// established renderer and ordering; silently ignoring an explicit control
+/// would otherwise make the response claim a contract it did not execute.
+fn legacy_product_controls(params: &SearchParams) -> Option<String> {
+    let controls = [
+        params.projection.is_some().then_some("projection"),
+        params.body_policy.is_some().then_some("body_policy"),
+        params
+            .max_output_bytes
+            .is_some()
+            .then_some("max_output_bytes"),
+        params
+            .max_output_tokens
+            .is_some()
+            .then_some("max_output_tokens"),
+        params.max_body_bytes.is_some().then_some("max_body_bytes"),
+        params
+            .max_total_body_bytes
+            .is_some()
+            .then_some("max_total_body_bytes"),
+        params.context_roles.is_some().then_some("context_roles"),
+        params.context_facets.is_some().then_some("context_facets"),
+        params.proposal.is_some().then_some("proposal"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (!controls.is_empty()).then(|| controls.join(", "))
 }
 
 fn normalize_product_context_controls(params: &SearchParams) -> SearchParams {
@@ -2745,10 +2789,11 @@ async fn task_records(
     }
 
     let mut policy = TaskSelectionPolicy::default();
-    policy.rendered_budget = params
-        .max_output_bytes
-        .unwrap_or(policy.rendered_budget)
-        .min(task_context::MAX_RENDERED_BUDGET);
+    // Admission uses one deterministic byte currency. A token-only request is
+    // conservatively projected at four bytes per estimated token; when callers
+    // supply both bounds, the tighter one wins. The final renderer still
+    // validates the exact independently measured byte and token totals.
+    policy.rendered_budget = task_admission_budget(params, policy.rendered_budget);
     policy.per_record_limit = policy.rendered_budget;
     policy.candidate_limit = typed.len().clamp(1, task_context::MAX_SELECTION_CANDIDATES);
     policy.per_file_limit = policy.per_file_limit.min(policy.candidate_limit).max(1);
@@ -2844,6 +2889,19 @@ async fn task_records(
         ),
     });
     Ok(output)
+}
+
+fn task_admission_budget(params: &SearchParams, default_budget: usize) -> usize {
+    let token_budget_bytes = params
+        .max_output_tokens
+        .map(|tokens| tokens.saturating_mul(4));
+    match (params.max_output_bytes, token_budget_bytes) {
+        (Some(bytes), Some(token_bytes)) => bytes.min(token_bytes),
+        (Some(bytes), None) => bytes,
+        (None, Some(token_bytes)) => token_bytes,
+        (None, None) => default_budget,
+    }
+    .min(task_context::MAX_RENDERED_BUDGET)
 }
 
 fn task_lane_candidate_evidence(
@@ -3447,42 +3505,37 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
         }
     }
 
-    let mut relationship_lines = 0usize;
-    let mut inferred_lines = 0usize;
-    for file in &overlay.changed_files {
-        for hunk in &file.hunks {
-            for line in &hunk.changed_lines {
-                if !relationship_shaped_line(&line.text) {
-                    continue;
-                }
-                relationship_lines += 1;
-                let Some(source_id) =
-                    grounded.get(&(file.path.clone(), line.grounding.proposal_line))
-                else {
-                    continue;
-                };
-                match infer_changed_line_edge(line, source_id, ctx) {
-                    Ok(Some(edge)) => {
-                        inferred_lines += 1;
-                        match line.kind {
-                            graph_delta::ChangedLineKind::Added => {
-                                if !ctx.graph_state.edges.iter().any(|current| {
-                                    current.from.to_stable_id() == edge.key.from
-                                        && current.to.to_stable_id() == edge.key.to
-                                        && current.kind.to_string() == edge.key.kind
-                                }) {
-                                    overlay.edge_additions.push(edge);
-                                }
-                            }
-                            graph_delta::ChangedLineKind::Removed => {
-                                overlay.edge_removals.push(edge.key);
-                            }
+    let relationship_facts = overlay.relationships.len();
+    let mut inferred_relationships = 0usize;
+    for fact in &overlay.relationships {
+        let Some(source_id) =
+            grounded.get(&(fact.grounding.path.clone(), fact.grounding.proposal_line))
+        else {
+            misses.push((
+                fact.grounding.clone(),
+                "relationship fact has no uniquely grounded changed source line",
+            ));
+            continue;
+        };
+        match corroborate_changed_relationship(fact, source_id, ctx) {
+            Ok(edge) => {
+                inferred_relationships += 1;
+                match fact.change {
+                    graph_delta::ChangedLineKind::Added => {
+                        if !ctx.graph_state.edges.iter().any(|current| {
+                            current.from.to_stable_id() == edge.key.from
+                                && current.to.to_stable_id() == edge.key.to
+                                && current.kind.to_string() == edge.key.kind
+                        }) {
+                            overlay.edge_additions.push(edge);
                         }
                     }
-                    Ok(None) => {}
-                    Err(reason) => misses.push((line.grounding.clone(), reason)),
+                    graph_delta::ChangedLineKind::Removed => {
+                        overlay.edge_removals.push(edge.key);
+                    }
                 }
             }
+            Err(reason) => misses.push((fact.grounding.clone(), reason)),
         }
     }
 
@@ -3605,13 +3658,13 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
     set_graph_delta_capability(
         &mut overlay.capabilities,
         graph_delta::GraphDeltaCapability::LiveGraphInference,
-        if grounded.is_empty() || inferred_lines < relationship_lines {
+        if grounded.is_empty() || inferred_relationships < relationship_facts {
             graph_delta::CapabilityState::Degraded
         } else {
             graph_delta::CapabilityState::Ready
         },
         format!(
-            "uniquely grounded {}/{} changed lines and inferred {inferred_lines}/{relationship_lines} corroborated relationship lines",
+            "uniquely grounded {}/{} changed lines and inferred {inferred_relationships}/{relationship_facts} canonical corroborated relationship facts",
             grounded.len(),
             overlay
                 .changed_files
@@ -3695,58 +3748,44 @@ fn unique_node_at_line<'a>(
     Ok(best)
 }
 
-fn relationship_shaped_line(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("use ")
-        || trimmed.starts_with("import ")
-        || trimmed.starts_with("from ")
-        || (text.contains('(') && text.contains(')'))
-}
-
-fn infer_changed_line_edge(
-    line: &graph_delta::ChangedLineFact,
+fn corroborate_changed_relationship(
+    fact: &graph_delta::ChangedRelationshipFact,
     source_id: &str,
     ctx: &SearchContext<'_>,
-) -> Result<Option<graph_delta::WeightedEdge>, &'static str> {
-    let identifiers = line
-        .text
-        .split(|character: char| !(character == '_' || character.is_ascii_alphanumeric()))
-        .filter(|token| !token.is_empty())
-        .collect::<BTreeSet<_>>();
-    let compact = line
-        .text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let import_like = {
-        let trimmed = line.text.trim_start();
-        trimmed.starts_with("use ")
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ")
-    };
+) -> Result<graph_delta::WeightedEdge, &'static str> {
     let mut matches = ctx
         .graph_state
         .nodes
         .iter()
-        .filter(|node| node.stable_id() != source_id && identifiers.contains(node.id.name.as_str()))
-        .filter(|node| import_like || compact.contains(&format!("{}(", node.id.name)))
+        .filter(|node| node.stable_id() != source_id && node.id.name == fact.target)
         .collect::<Vec<_>>();
     matches.sort_by_key(|node| node.stable_id());
     matches.dedup_by_key(|node| node.stable_id());
+    if matches.len() > 1
+        && let Some(qualifier) = fact.qualifier.as_deref()
+    {
+        let qualified = matches
+            .iter()
+            .copied()
+            .filter(|node| changed_relationship_qualifier_matches(node, qualifier))
+            .collect::<Vec<_>>();
+        if !qualified.is_empty() {
+            matches = qualified;
+        }
+    }
     let [target] = matches.as_slice() else {
         return if matches.is_empty() {
-            Err("relationship-shaped line has no uniquely corroborated current endpoint")
+            Err("canonical relationship fact has no corroborated current endpoint")
         } else {
-            Err("relationship-shaped line has multiple corroborated current endpoints")
+            Err("canonical relationship fact has multiple corroborated current endpoints")
         };
     };
-    let kind = if import_like { "references" } else { "calls" };
     let key = graph_delta::EdgeKey {
         from: source_id.to_string(),
         to: target.stable_id(),
-        kind: kind.to_string(),
+        kind: fact.kind.edge_kind().to_string(),
     };
-    if line.kind == graph_delta::ChangedLineKind::Removed
+    if fact.change == graph_delta::ChangedLineKind::Removed
         && !ctx.graph_state.edges.iter().any(|edge| {
             edge.from.to_stable_id() == key.from
                 && edge.to.to_stable_id() == key.to
@@ -3755,13 +3794,19 @@ fn infer_changed_line_edge(
     {
         return Err("removed relationship is not corroborated by a persisted current edge");
     }
-    Ok(Some(graph_delta::WeightedEdge {
+    Ok(graph_delta::WeightedEdge {
         key,
         cost: 1,
         priority: 0,
-        registration_order: line.grounding.proposal_line,
-        grounding: graph_delta::EvidenceGrounding::Proposal(line.grounding.clone()),
-    }))
+        registration_order: fact.grounding.proposal_line,
+        grounding: graph_delta::EvidenceGrounding::Proposal(fact.grounding.clone()),
+    })
+}
+
+fn changed_relationship_qualifier_matches(node: &Node, qualifier: &str) -> bool {
+    node.stable_id().contains(qualifier)
+        || node.id.file.to_string_lossy().contains(qualifier)
+        || node.signature.contains(qualifier)
 }
 
 fn graph_delta_node_grounding(node: &Node) -> Option<graph_delta::EvidenceGrounding> {
@@ -4351,6 +4396,7 @@ fn graph_delta_snapshot(graph: &GraphState) -> graph_delta::GraphSnapshot {
             let span = node_source_span(node)?;
             safe_graph_delta_path(&span.path).then_some(graph_delta::GraphNode {
                 id: node.stable_id(),
+                kind: graph_delta_impact_kind(node, false),
                 grounding: graph_delta::EvidenceGrounding::CurrentSource(graph_delta::SourceSpan {
                     root: span.root,
                     path: span.path,
@@ -8340,6 +8386,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_compact_evidence_projection_matrix_is_byte_stable() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        std::fs::write(
+            repository.path().join("src/matrix.rs"),
+            "fn matrix_target() {}\n",
+        )
+        .unwrap();
+        let mut node = make_node("matrix_target", NodeKind::Function, "src/matrix.rs");
+        node.line_start = 1;
+        node.line_end = 1;
+        let graph = make_graph_state(vec![node]);
+        let ctx = make_search_context(&graph, repository.path());
+        let base = SearchParams {
+            query: Some("matrix_target".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+        let action = search(&base, &ctx).await;
+        let compact = search(
+            &SearchParams {
+                compact: true,
+                ..base.clone()
+            },
+            &ctx,
+        )
+        .await;
+        let evidence = search(
+            &SearchParams {
+                projection: Some("evidence".into()),
+                ..base.clone()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(action, compact, "compact is the concise agent projection");
+        assert_eq!(action, search(&base, &ctx).await);
+        assert!(action.contains("- projection: agent"));
+        assert!(!action.contains("## Candidate audit"));
+        assert!(!action.contains("evidence.content_hash"));
+        assert!(evidence.contains("- projection: evidence"));
+        assert!(evidence.contains("## Candidate audit"));
+        assert!(evidence.contains("evidence.content_hash"));
+        for rendered in [&action, &compact, &evidence] {
+            assert!(rendered.contains("## Render accounting"));
+            assert!(rendered.contains("deterministic estimate; not provider usage"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_search_trims_traversal_mode_at_service_boundary() {
         let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
         let callee = make_node("callee", NodeKind::Function, "src/callee.rs");
@@ -11653,6 +11751,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_dispatch_rejects_product_controls_but_preserves_default_bytes() {
+        let caller = make_node("legacy_caller", NodeKind::Function, "src/caller.rs");
+        let callee = make_node("legacy_callee", NodeKind::Function, "src/callee.rs");
+        let graph = make_graph_state_with_edges(
+            vec![caller.clone(), callee.clone()],
+            vec![make_edge(&caller, &callee, EdgeKind::Calls)],
+        );
+        let repository = PathBuf::from("/tmp/legacy-product-control-fixture");
+        let ctx = make_search_context(&graph, &repository);
+        let legacy = SearchParams {
+            node: Some(caller.stable_id()),
+            mode: Some("neighbors".into()),
+            compact: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&legacy, &ctx).await,
+            legacy_search_dispatch(&legacy, &ctx).await,
+            "default legacy dispatch must remain byte/order compatible"
+        );
+
+        let controlled = [
+            SearchParams {
+                projection: Some("evidence".into()),
+                ..legacy.clone()
+            },
+            SearchParams {
+                body_policy: Some("focused_span".into()),
+                ..legacy.clone()
+            },
+            SearchParams {
+                max_output_bytes: Some(4096),
+                ..legacy.clone()
+            },
+            SearchParams {
+                max_output_tokens: Some(1024),
+                ..legacy.clone()
+            },
+            SearchParams {
+                max_body_bytes: Some(512),
+                ..legacy.clone()
+            },
+            SearchParams {
+                max_total_body_bytes: Some(2048),
+                ..legacy.clone()
+            },
+        ];
+        for params in controlled {
+            let response = search(&params, &ctx).await;
+            assert!(
+                response.contains("product controls")
+                    && response.contains("legacy node/nodes/traversal/target_subsystem dispatch"),
+                "explicit product control must fail closed: {response}"
+            );
+        }
+
+        for params in [
+            SearchParams {
+                nodes: Some(vec![caller.stable_id()]),
+                projection: Some("agent".into()),
+                ..Default::default()
+            },
+            SearchParams {
+                query: Some("legacy".into()),
+                target_subsystem: Some("service".into()),
+                projection: Some("agent".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(search(&params, &ctx).await.contains("product controls"));
+        }
+    }
+
+    #[test]
+    fn task_admission_uses_token_only_and_tighter_combined_budget() {
+        assert_eq!(
+            task_admission_budget(
+                &SearchParams {
+                    max_output_tokens: Some(250),
+                    ..Default::default()
+                },
+                9_999,
+            ),
+            1_000
+        );
+        assert_eq!(
+            task_admission_budget(
+                &SearchParams {
+                    max_output_bytes: Some(700),
+                    max_output_tokens: Some(250),
+                    ..Default::default()
+                },
+                9_999,
+            ),
+            700
+        );
+        assert_eq!(
+            task_admission_budget(
+                &SearchParams {
+                    max_output_bytes: Some(2_000),
+                    max_output_tokens: Some(250),
+                    ..Default::default()
+                },
+                9_999,
+            ),
+            1_000
+        );
+    }
+
     #[test]
     fn graph_delta_beta_requires_bounded_non_binary_proposal() {
         let missing = SearchParams {
@@ -11997,50 +12205,167 @@ mod tests {
             "fn live_graph_delta_infers_corroborated_edges_without_mutating_graph(",
         );
         delta_test.metadata.insert("is_test".into(), "true".into());
+        let mut nodes = vec![
+            projected.clone(),
+            delta.clone(),
+            task_test.clone(),
+            delta_test.clone(),
+        ];
+        for (name, needle) in [
+            ("projection_request", "fn projection_request("),
+            ("projection_source_reader", "fn projection_source_reader("),
+            (
+                "projected_non_code_records",
+                "async fn projected_non_code_records(",
+            ),
+            (
+                "projected_live_markdown_records",
+                "fn projected_live_markdown_records(",
+            ),
+            (
+                "evidence_capsule_capability",
+                "fn evidence_capsule_capability(",
+            ),
+            ("graph_delta_projection", "fn graph_delta_projection("),
+            (
+                "graph_delta_projection_span",
+                "fn graph_delta_projection_span(",
+            ),
+            ("render_projected_input", "fn render_projected_input("),
+            (
+                "projected_fused_candidates",
+                "async fn projected_fused_candidates(",
+            ),
+            (
+                "resolve_projected_entry_nodes",
+                "fn resolve_projected_entry_nodes<'a>(",
+            ),
+            ("projected_traversal_ids", "fn projected_traversal_ids("),
+            ("projected_node_passes", "fn projected_node_passes("),
+            ("node_projection_digest", "fn node_projection_digest("),
+        ] {
+            nodes.push(node_at(name, needle));
+        }
+        // Put each real test two typed hops behind its editable source. Task
+        // mode is allowed to satisfy its explicit test obligation through the
+        // bounded graph expansion; ordinary flat fusion sees only the direct
+        // helper and must spend top-k slots without receiving that obligation
+        // for free.
+        let projection_bridge = nodes
+            .iter()
+            .find(|node| node.id.name == "projection_request")
+            .unwrap()
+            .clone();
+        let delta_bridge = nodes
+            .iter()
+            .find(|node| node.id.name == "graph_delta_projection")
+            .unwrap()
+            .clone();
         let graph = make_graph_state_with_edges(
+            nodes,
             vec![
-                projected.clone(),
-                delta.clone(),
-                task_test.clone(),
-                delta_test.clone(),
-            ],
-            vec![
-                make_edge(&task_test, &projected, EdgeKind::TestedBy),
-                make_edge(&delta_test, &delta, EdgeKind::TestedBy),
+                make_edge(&task_test, &projection_bridge, EdgeKind::TestedBy),
+                make_edge(&projection_bridge, &projected, EdgeKind::Calls),
+                make_edge(&delta_test, &delta_bridge, EdgeKind::TestedBy),
+                make_edge(&delta_bridge, &delta, EdgeKind::Calls),
             ],
         );
         let ctx = make_search_context(&graph, repository.path());
-        for (query, expected) in [
+        for (query, expected, expected_test) in [
             (
-                "Change `projected_search` behavior and verify the regression test",
+                "Change `projected_search` search projection source evidence behavior and verify `task_agent_projection_carries_stable_action_fields`",
                 projected.stable_id(),
+                task_test.stable_id(),
             ),
             (
-                "Review `projected_graph_delta` API state and its existing analogue test",
+                "Review `projected_graph_delta` search projection source evidence behavior and verify `live_graph_delta_infers_corroborated_edges_without_mutating_graph`",
                 delta.stable_id(),
+                delta_test.stable_id(),
             ),
         ] {
-            let output = task_records(
-                &SearchParams {
-                    query: Some(query.into()),
-                    context_mode: Some("task".into()),
-                    include_artifacts: false,
-                    include_markdown: false,
-                    ..Default::default()
-                },
-                &ctx,
-            )
-            .await
-            .unwrap();
+            let task_params = SearchParams {
+                query: Some(query.into()),
+                context_mode: Some("task".into()),
+                context_roles: Some(vec![
+                    "editable_source".into(),
+                    "test".into(),
+                    "direct_dependency".into(),
+                    "caller_or_impact".into(),
+                ]),
+                context_facets: Some(vec!["behavior".into(), "test".into()]),
+                hops: Some(2),
+                limit: Some(16),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            };
+            let output = task_records(&task_params, &ctx).await.unwrap();
             assert!(output.records.iter().any(|record| {
                 record.identity.node_id == expected
                     && record.selection.role == Some(ProjectionRole::EditableSource)
             }));
+            assert!(output.records.iter().any(|record| {
+                record.identity.node_id == expected_test
+                    && record.selection.role == Some(ProjectionRole::Test)
+            }));
+
+            let flat_params = SearchParams {
+                query: task_params.query.clone(),
+                // Give flat retrieval twice as many records as the role-aware
+                // bundle. It still cannot express the required dependency and
+                // impact obligations, while its extra records make the cost
+                // comparison conservative rather than k-starved.
+                limit: Some(32),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            };
+            let (flat, _, _) = projected_fused_candidates(&flat_params, &ctx)
+                .await
+                .unwrap();
+            let flat_roles = flat
+                .iter()
+                .take(flat_params.limit.unwrap())
+                .filter_map(|candidate| find_node(&graph, &candidate.stable_id))
+                .map(default_role)
+                .collect::<BTreeSet<_>>();
+            let flat_ids = flat
+                .iter()
+                .take(flat_params.limit.unwrap())
+                .map(|candidate| candidate.stable_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let task_roles = output
+                .records
+                .iter()
+                .filter_map(|record| record.selection.role)
+                .collect::<BTreeSet<_>>();
+            let required = [
+                ProjectionRole::EditableSource,
+                ProjectionRole::Test,
+                ProjectionRole::DirectDependency,
+                ProjectionRole::CallerOrImpact,
+            ];
+            let task_coverage = required
+                .iter()
+                .filter(|role| task_roles.contains(role))
+                .count();
+            let flat_coverage = required
+                .iter()
+                .filter(|role| flat_roles.contains(role))
+                .count();
+            assert_eq!(task_coverage, required.len());
             assert!(
-                output
-                    .records
-                    .iter()
-                    .any(|record| record.selection.role == Some(ProjectionRole::Test))
+                task_coverage > flat_coverage,
+                "task lanes must improve required-role coverage: task={task_roles:?} flat={flat_roles:?} flat_ids={flat_ids:?}"
+            );
+
+            let task_rendered = projected_search(&task_params, &ctx).await;
+            let flat_rendered = projected_search(&flat_params, &ctx).await;
+            assert!(
+                task_rendered.len() < flat_rendered.len(),
+                "task context must render below flat top-k bytes: task={} flat={}",
+                task_rendered.len(),
+                flat_rendered.len()
             );
         }
     }
@@ -12159,5 +12484,199 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn rna_graph_delta_card_is_smaller_and_more_role_specific_than_raw_traversal() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src/service")).unwrap();
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service/search.rs"),
+        )
+        .unwrap();
+        std::fs::write(repository.path().join("src/service/search.rs"), &source).unwrap();
+        let line_of = |needle: &str| {
+            u32::try_from(
+                source
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .unwrap_or_else(|| panic!("real RNA source fixture is missing {needle:?}"))
+                    + 1,
+            )
+            .unwrap()
+        };
+        let node_at = |name: &str, needle: &str| {
+            let mut node = make_node(name, NodeKind::Function, "src/service/search.rs");
+            let line = line_of(needle);
+            node.line_start = line as usize;
+            node.line_end = (line as usize + 39).min(source.lines().count());
+            node.body = source
+                .lines()
+                .skip(line as usize - 1)
+                .take(node.line_end - node.line_start + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+            node
+        };
+
+        let mut search_node = make_node("search", NodeKind::Function, "src/service/search.rs");
+        search_node.line_start = line_of("pub async fn search(") as usize;
+        search_node.line_end = line_of("fn legacy_product_controls(") as usize - 1;
+        search_node.body = "pub async fn search(/* current product dispatch */)".into();
+        let legacy = node_at("legacy_search_dispatch", "async fn legacy_search_dispatch(");
+        let projected = node_at("projected_search", "async fn projected_search(");
+        let mut nodes = vec![search_node.clone(), legacy.clone(), projected.clone()];
+        for (name, needle) in [
+            ("validate_named_values", "fn validate_named_values("),
+            (
+                "validate_search_experience",
+                "fn validate_search_experience(",
+            ),
+            ("strict_semantic_requested", "fn strict_semantic_requested("),
+            ("projection_request", "fn projection_request("),
+            ("projection_source_reader", "fn projection_source_reader("),
+            ("hydrate_from_handle", "async fn hydrate_from_handle("),
+            (
+                "projected_non_code_records",
+                "async fn projected_non_code_records(",
+            ),
+            (
+                "projected_live_markdown_records",
+                "fn projected_live_markdown_records(",
+            ),
+            (
+                "evidence_capsule_capability",
+                "fn evidence_capsule_capability(",
+            ),
+            ("task_records", "async fn task_records("),
+            (
+                "task_lane_candidate_evidence",
+                "fn task_lane_candidate_evidence(",
+            ),
+            ("requested_task_facets", "fn requested_task_facets("),
+            ("expand_task_graph", "fn expand_task_graph("),
+            ("rendered_task_bundle_cost", "fn rendered_task_bundle_cost("),
+            ("live_graph_delta_card", "fn live_graph_delta_card("),
+            ("enrich_live_graph_delta", "fn enrich_live_graph_delta("),
+            ("graph_delta_projection", "fn graph_delta_projection("),
+            ("render_projected_input", "fn render_projected_input("),
+            (
+                "projected_fused_candidates",
+                "async fn projected_fused_candidates(",
+            ),
+            ("projected_node_passes", "fn projected_node_passes("),
+            ("node_projection_digest", "fn node_projection_digest("),
+            ("default_role", "fn default_role("),
+            ("projected_relationships", "fn projected_relationships("),
+            ("compiler_location", "fn compiler_location("),
+            ("source_roots", "fn source_roots("),
+            ("collect_suffix_matches", "fn collect_suffix_matches("),
+            ("source_span", "fn source_span("),
+            ("format_lsp_completeness", "fn format_lsp_completeness("),
+            ("legacy_search_dispatch", "async fn legacy_search_dispatch("),
+            ("selected_for_hydration", "fn selected_for_hydration("),
+            ("task_role_from_str", "fn task_role_from_str("),
+            ("lexical_score", "fn lexical_score("),
+            ("node_source_span", "fn node_source_span("),
+            ("symbol_summary", "fn symbol_summary("),
+            ("selected_from_exact_node", "fn selected_from_exact_node("),
+            ("default_capabilities", "fn default_capabilities("),
+            ("channel_for_evidence", "fn channel_for_evidence("),
+            (
+                "resolve_projected_entry_nodes",
+                "fn resolve_projected_entry_nodes<'a>(",
+            ),
+        ] {
+            nodes.push(node_at(name, needle));
+        }
+        let mut nearest_route_test = node_at(
+            "live_graph_delta_infers_corroborated_edges_without_mutating_graph",
+            "fn live_graph_delta_infers_corroborated_edges_without_mutating_graph(",
+        );
+        nearest_route_test
+            .metadata
+            .insert("is_test".into(), "true".into());
+        nodes.push(nearest_route_test.clone());
+
+        let mut edges = vec![make_edge(&search_node, &legacy, EdgeKind::Calls)];
+        for node in nodes.iter().skip(3) {
+            edges.push(make_edge(node, &search_node, EdgeKind::Calls));
+        }
+        edges.push(make_edge(
+            &nearest_route_test,
+            &search_node,
+            EdgeKind::TestedBy,
+        ));
+        let graph = make_graph_state_with_edges(nodes, edges);
+        let ctx = make_search_context(&graph, repository.path());
+        let changed_line = line_of("return legacy_search_dispatch(params, ctx).await;");
+        let proposal = format!(
+            "diff --git a/src/service/search.rs b/src/service/search.rs\n--- a/src/service/search.rs\n+++ b/src/service/search.rs\n@@ -{changed_line},1 +{changed_line},1 @@\n-        return legacy_search_dispatch(params, ctx).await;\n+        return projected_search(params, ctx).await;\n"
+        );
+        let card = projected_graph_delta(
+            &SearchParams {
+                context_mode: Some("graph-delta-beta".into()),
+                root: Some("local".into()),
+                proposal: Some(proposal),
+                limit: Some(4),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+        // The card covers all affected loci in one bounded response. The
+        // context-equivalent legacy baseline therefore needs the neighbors and
+        // impact view for every locus, not only the edited seed.
+        let mut raw_bytes = 0usize;
+        let mut seed_neighbors = String::new();
+        let mut seed_impact = String::new();
+        for node_id in graph.nodes.iter().map(Node::stable_id) {
+            let neighbors = search(
+                &SearchParams {
+                    node: Some(node_id.clone()),
+                    mode: Some("neighbors".into()),
+                    limit: Some(50),
+                    include_body: true,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .await;
+            let impact = search(
+                &SearchParams {
+                    node: Some(node_id.clone()),
+                    mode: Some("impact".into()),
+                    hops: Some(1),
+                    limit: Some(50),
+                    include_body: true,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .await;
+            if node_id == search_node.stable_id() {
+                seed_neighbors = neighbors.clone();
+                seed_impact = impact.clone();
+            }
+            raw_bytes = raw_bytes
+                .saturating_add(neighbors.len())
+                .saturating_add(impact.len());
+        }
+
+        assert!(
+            card.len() < raw_bytes,
+            "graph-delta card must be smaller than raw neighbors+impact: card={} raw={raw_bytes}",
+            card.len()
+        );
+        assert!(card.contains("role: caller_or_impact"));
+        assert!(
+            card.contains("role: test"),
+            "nearest route test missing: {card}"
+        );
+        assert!(card.contains("graph_delta_route"));
+        assert!(!seed_neighbors.contains("role:"));
+        assert!(!seed_impact.contains("role:"));
     }
 }
