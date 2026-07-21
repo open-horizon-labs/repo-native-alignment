@@ -334,6 +334,27 @@ class SwebenchContextPacketTests(unittest.TestCase):
         with self.assertRaises(PACKETS.PacketError):
             PACKETS.validate_dataset_row(drifted, {"instances": [frozen]})
 
+    def test_checkout_rejects_untracked_markdown_before_packet_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            PACKETS.git(checkout, "init", "--quiet")
+            PACKETS.git(checkout, "config", "user.email", "packet-test@example.invalid")
+            PACKETS.git(checkout, "config", "user.name", "Packet Test")
+            (checkout / "source.py").write_text("VALUE = 1\n", encoding="utf-8")
+            PACKETS.git(checkout, "add", "source.py")
+            PACKETS.git(checkout, "commit", "--quiet", "-m", "fixture")
+            head = PACKETS.git(checkout, "rev-parse", "HEAD")
+
+            (checkout / "README.md").write_text(
+                "# Untracked query-visible context\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(PACKETS.PacketError, "untracked files"):
+                PACKETS.validate_checkout(
+                    checkout,
+                    {"base_commit": head, "patch": ""},
+                )
+
     def test_vector_uses_one_selection_and_verbatim_loci_for_b_and_c(self) -> None:
         source = json.loads(
             (ROOT / "benchmark/swebench-act-context/packet-vector.json").read_text()

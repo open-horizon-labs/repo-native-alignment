@@ -243,7 +243,6 @@ def validate_checkout(checkout: Path, frozen: Mapping[str, Any]) -> dict[str, st
         raise PacketError("checkout commit mismatch")
     if git(checkout, "status", "--porcelain", "--untracked-files=no"):
         raise PacketError("checkout has tracked modifications")
-    patch_paths = set(patch_file_order(str(frozen.get("patch", ""))))
     untracked = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=checkout,
@@ -257,8 +256,8 @@ def validate_checkout(checkout: Path, frozen: Mapping[str, Any]) -> dict[str, st
         for value in untracked.stdout.split(b"\0")
         if value
     }
-    if patch_paths & untracked_paths:
-        raise PacketError("checkout has an untracked oracle-path file")
+    if untracked_paths:
+        raise PacketError("checkout has untracked files")
     return {"commit": head, "tree": tree}
 
 
