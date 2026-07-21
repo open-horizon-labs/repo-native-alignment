@@ -271,8 +271,7 @@ pub struct Search {
     /// Opt-in context mode: `task` or experimental `graph-delta-beta`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_mode: Option<String>,
-    /// Requested task roles: editable_source, definition_or_api_state, test,
-    /// behavioral_analogue, direct_dependency, caller_or_impact, proposal_delta.
+    /// Task roles: editable_source, definition_or_api_state, test, behavioral_analogue, direct_dependency, caller_or_impact, proposal_delta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_roles: Option<Vec<String>>,
     /// Requested task facets: behavior, api_or_state, test, analogue, proposal.
@@ -822,6 +821,16 @@ mod tests {
             "Search markdown sections (default: true)",
             "Artifact filter: outcome, signal, guardrail, metis, commit",
             "Filter to a specific subsystem (from repo_map)",
+            "Output projection: `agent` (default) or `evidence`.",
+            "Body policy: `complete`, `focused_span`, `signature_only`, `minified`, or `none`.",
+            "Maximum final rendered UTF-8 bytes (bounded by the service hard limit).",
+            "Maximum estimated rendered tokens (an estimate, never provider usage).",
+            "Maximum source-body UTF-8 bytes per selected record.",
+            "Maximum source-body UTF-8 bytes across all selected records after coalescing.",
+            "Opt-in context mode: `task` or experimental `graph-delta-beta`.",
+            "Task roles: editable_source, definition_or_api_state, test, behavioral_analogue, direct_dependency, caller_or_impact, proposal_delta.",
+            "Requested task facets: behavior, api_or_state, test, analogue, proposal.",
+            "Bounded unified diff or structured edit sketch for graph-delta beta.",
             // RepoMap
             "Number of top symbols (default: 15)",
             // Shared

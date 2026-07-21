@@ -176,18 +176,30 @@ function assertTaskRoleOrDegradation(text, role) {
     pass(`task context delivers role ${role}`);
     return;
   }
-  const hasOmissionSurface = text.includes("## Omissions and degradation");
+  const omissionHeading = "\n## Omissions and degradation\n";
+  const omissionStart = text.indexOf(omissionHeading);
+  const omissionRemainder =
+    omissionStart === -1
+      ? ""
+      : text.slice(omissionStart + omissionHeading.length);
+  const nextHeading = omissionRemainder.indexOf("\n## ");
+  const omissionSection = omissionRemainder.slice(
+    0,
+    nextHeading === -1 ? omissionRemainder.length : nextHeading,
+  );
   const debugRole = role
     .split("_")
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join("");
-  const roleNamed = [role, debugRole].some((name) =>
-    text.toLowerCase().includes(name.toLowerCase()),
-  );
-  const truthfullyDegraded = /\b(?:degraded|unavailable|missing|omitted|not covered)\b/i.test(
-    text,
-  );
-  if (hasOmissionSurface && roleNamed && truthfullyDegraded) {
+  const roleNames = [role, debugRole].map((name) => name.toLowerCase());
+  const roleSpecificDegradation = omissionSection
+    .split(/\n(?=- )/)
+    .some(
+      (entry) =>
+        roleNames.some((name) => entry.toLowerCase().includes(name)) &&
+        /\b(?:degraded|unavailable|missing|omitted|not covered)\b/i.test(entry),
+    );
+  if (roleSpecificDegradation) {
     pass(`task context truthfully degrades role ${role}`);
   } else {
     fail(

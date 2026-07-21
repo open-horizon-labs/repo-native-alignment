@@ -17,7 +17,7 @@ use crate::embed::{
     SearchOutcome, SearchResult, SearchScoreProvenance, TestResultPolicy,
 };
 use crate::graph::index::GraphIndex;
-use crate::graph::{EdgeKind, ExtractionSource, Node, NodeKind};
+use crate::graph::{Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
@@ -306,7 +306,25 @@ fn strict_semantic_requested(params: &SearchParams) -> bool {
         .search_mode
         .as_deref()
         .is_some_and(|mode| mode.trim().eq_ignore_ascii_case(STRICT_SEMANTIC_MODE));
-    let sealed_bundle_default = sealed_semantic_bundle()
+    // The frozen #779 packet generator predates `search_mode=strict`, so the
+    // sealed artifact must still recognize its exact CLI request shape. Do not
+    // broaden that compatibility hook to ordinary product searches merely
+    // because they happen to run from the same artifact.
+    let sealed_bundle_default = sealed_semantic_bundle() && frozen_implicit_strict_request(params);
+    explicit || sealed_bundle_default
+}
+
+fn frozen_implicit_strict_request(params: &SearchParams) -> bool {
+    params
+        .search_mode
+        .as_deref()
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("hybrid"))
+        && params.rerank
+        && params.limit == Some(20)
+        && !params.include_artifacts
+        && params.include_markdown
+        && params.compact
+        && legacy_product_controls(params).is_none()
         && params.context_mode.is_none()
         && params.normalized_mode().is_none()
         && params
@@ -317,8 +335,7 @@ fn strict_semantic_requested(params: &SearchParams) -> bool {
             .node
             .as_deref()
             .is_none_or(|node| node.trim().is_empty())
-        && params.nodes.as_ref().is_none_or(|nodes| nodes.is_empty());
-    explicit || sealed_bundle_default
+        && params.nodes.as_ref().is_none_or(|nodes| nodes.is_empty())
 }
 
 fn strict_semantic_failure(reason: &str) -> String {
@@ -1565,8 +1582,9 @@ fn selected_for_hydration(
 }
 
 async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    let edge_index = ProjectedEdgeIndex::new(ctx.graph_state);
     if params.context_mode.as_deref() == Some("graph-delta-beta") {
-        return projected_graph_delta(params, ctx).await;
+        return projected_graph_delta(params, ctx, &edge_index).await;
     }
     let intent = if params.context_mode.as_deref() == Some("task") {
         SearchIntent::Implement
@@ -1576,7 +1594,7 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
     let request = projection_request(params, intent);
     let (mut records, mut relationships, mut capabilities, mut omissions, mut candidate_audit) =
         if params.context_mode.as_deref() == Some("task") {
-            match task_records(params, ctx).await {
+            match task_records(params, ctx, &edge_index).await {
                 Ok(output) => (
                     output.records,
                     output.relationships,
@@ -1588,7 +1606,7 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
             }
         } else {
             let (fused, capabilities, product_score_audit) =
-                match projected_fused_candidates(params, ctx).await {
+                match projected_fused_candidates(params, ctx, &edge_index).await {
                     Ok(result) => result,
                     Err(error) => return format!("Search projection failed: {error}."),
                 };
@@ -1685,7 +1703,7 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
     });
     capabilities.extend(default_capabilities(ctx, request.projection).await);
     capabilities = merge_capabilities(capabilities);
-    relationships.extend(projected_relationships(ctx.graph_state, &records));
+    relationships.extend(projected_relationships(&edge_index, &records));
     relationships.sort();
     relationships.dedup();
     candidate_audit.sort_by(|left, right| {
@@ -2392,6 +2410,7 @@ struct TaskAssembly {
 async fn task_records(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<TaskAdapterOutput, String> {
     let task = task_context::parse_task(params.query.as_deref().unwrap_or_default())
         .map_err(|error| error.to_string())?;
@@ -2525,7 +2544,7 @@ async fn task_records(
         lane_params.nodes = None;
         lane_params.mode = None;
         let (fused, capabilities, lane_score_audit) =
-            projected_fused_candidates(&lane_params, ctx).await?;
+            projected_fused_candidates(&lane_params, ctx, edge_index).await?;
         merge_product_score_audit(&mut product_score_audit, lane_score_audit);
         let observed = fused.len().min(TASK_LANE_CANDIDATE_LIMIT);
         let mut eligible = 0usize;
@@ -2539,7 +2558,8 @@ async fn task_records(
                 rejected += 1;
                 continue;
             };
-            match task_lane_candidate_evidence(node, role, &assemblies, ctx.graph_state) {
+            match task_lane_candidate_evidence(node, role, &assemblies, ctx.graph_state, edge_index)
+            {
                 Ok(role_evidence) => {
                     eligible += 1;
                     merge_task_assembly(
@@ -2612,7 +2632,7 @@ async fn task_records(
         proposal_params.nodes = None;
         proposal_params.mode = None;
         let (fused, capabilities, proposal_score_audit) =
-            projected_fused_candidates(&proposal_params, ctx).await?;
+            projected_fused_candidates(&proposal_params, ctx, edge_index).await?;
         merge_product_score_audit(&mut product_score_audit, proposal_score_audit);
         let observed = fused.len().min(TASK_LANE_CANDIDATE_LIMIT);
         for (rank, candidate) in fused
@@ -2643,7 +2663,7 @@ async fn task_records(
                 "independently queried proposal evidence and retained {observed} bounded candidates"
             ),
         });
-        match live_graph_delta_card(params, ctx) {
+        match live_graph_delta_card(params, ctx, edge_index) {
             Ok(card) => {
                 for (rank, impact) in card.impacted_loci.iter().enumerate() {
                     let Ok(node) = graph_delta_grounding_node(&impact.grounding, ctx) else {
@@ -2727,7 +2747,13 @@ async fn task_records(
         }
     }
 
-    expand_task_graph(params, ctx, &mut assemblies, &mut output.relationships);
+    expand_task_graph(
+        params,
+        ctx,
+        edge_index,
+        &mut assemblies,
+        &mut output.relationships,
+    );
 
     if assemblies.len() > task_context::MAX_SELECTION_CANDIDATES {
         return Err(format!(
@@ -2741,6 +2767,16 @@ async fn task_records(
     let mut typed = BTreeMap::<String, TaskEvidenceCandidate>::new();
     for (id, assembly) in &assemblies {
         let Some(node) = candidate_nodes.get(id).copied() else {
+            continue;
+        };
+        let Some(source) = node_source_span(node) else {
+            output.omissions.push(ProjectionOmission {
+                record_id: Some(id.clone()),
+                source: None,
+                code: OmissionCode::MissingSource,
+                detail: "task candidate has no valid current source anchor and was omitted before selection"
+                    .into(),
+            });
             continue;
         };
         let mut records = Vec::new();
@@ -2767,7 +2803,6 @@ async fn task_records(
             records.push(selected);
         }
         let rendered_cost = rendered_task_bundle_cost(params, &reader, &records)?;
-        let source = node_source_span(node);
         typed.insert(
             id.clone(),
             TaskEvidenceCandidate {
@@ -2778,9 +2813,9 @@ async fn task_records(
                 rendered_cost,
                 exact_reference: assembly.exact_reference.clone(),
                 source: SourceAnchor {
-                    path: node.id.file.to_string_lossy().replace('\\', "/"),
-                    start_line: source.as_ref().map_or(1, |span| span.start_line),
-                    end_line: source.as_ref().map_or(1, |span| span.end_line),
+                    path: source.path,
+                    start_line: source.start_line,
+                    end_line: source.end_line,
                 },
                 channel_rank: assembly.channel_rank,
             },
@@ -2909,6 +2944,7 @@ fn task_lane_candidate_evidence(
     role: TaskRole,
     assemblies: &BTreeMap<String, TaskAssembly>,
     graph: &GraphState,
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<String, String> {
     let span = node_source_span(node)
         .ok_or_else(|| "candidate has no valid current source span".to_string())?;
@@ -2988,10 +3024,9 @@ fn task_lane_candidate_evidence(
             {
                 anchors.retain(|(_, assembly)| assembly.exact_reference.is_some());
             }
-            let candidate_edges = graph
-                .edges
+            let candidate_edges = edge_index
+                .outgoing(&candidate_id)
                 .iter()
-                .filter(|edge| edge.from.to_stable_id() == candidate_id)
                 .map(|edge| (edge.kind.to_string(), edge.to.to_stable_id()))
                 .collect::<BTreeSet<_>>();
             let mut corroborated = anchors
@@ -3001,10 +3036,9 @@ fn task_lane_candidate_evidence(
                     if anchor.id.kind != node.id.kind {
                         return None;
                     }
-                    let anchor_edges = graph
-                        .edges
+                    let anchor_edges = edge_index
+                        .outgoing(anchor_id)
                         .iter()
-                        .filter(|edge| edge.from.to_stable_id() == anchor_id.as_str())
                         .map(|edge| (edge.kind.to_string(), edge.to.to_stable_id()))
                         .collect::<BTreeSet<_>>();
                     let shared = candidate_edges
@@ -3139,6 +3173,7 @@ fn merge_task_assembly(
 fn expand_task_graph(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
     assemblies: &mut BTreeMap<String, TaskAssembly>,
     relationships: &mut Vec<ProjectedRelationship>,
 ) {
@@ -3167,20 +3202,27 @@ fn expand_task_graph(
             continue;
         }
         let mut adjacent = Vec::new();
-        for edge in &ctx.graph_state.edges {
+        for edge in edge_index.outgoing(&current) {
             if allowed
                 .as_ref()
                 .is_some_and(|allowed| !allowed.contains(&edge.kind))
             {
                 continue;
             }
-            let from = edge.from.to_stable_id();
             let to = edge.to.to_stable_id();
-            if outgoing && from == current {
+            if outgoing {
                 adjacent.push((to.clone(), true, edge));
             }
-            if incoming && to == current {
-                adjacent.push((from, false, edge));
+        }
+        for edge in edge_index.incoming(&current) {
+            if allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&edge.kind))
+            {
+                continue;
+            }
+            if incoming {
+                adjacent.push((edge.from.to_stable_id(), false, edge));
             }
         }
         adjacent.sort_by(|left, right| {
@@ -3388,8 +3430,12 @@ fn task_selection_reason(reason: &TaskSelectionReason) -> String {
     }
 }
 
-async fn projected_graph_delta(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
-    let card = match live_graph_delta_card(params, ctx) {
+async fn projected_graph_delta(
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
+) -> String {
+    let card = match live_graph_delta_card(params, ctx, edge_index) {
         Ok(card) => card,
         Err(error) => return format!("Graph-delta analysis failed: {error}."),
     };
@@ -3412,6 +3458,7 @@ async fn projected_graph_delta(params: &SearchParams, ctx: &SearchContext<'_>) -
 fn live_graph_delta_card(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<graph_delta::GraphDeltaCard, String> {
     let proposal = params.proposal.clone().unwrap_or_default();
     let root = graph_delta_request_root(params, ctx)?;
@@ -3430,7 +3477,7 @@ fn live_graph_delta_card(
         &limits,
     )
     .map_err(|error| format!("proposal rejected: {error}"))?;
-    enrich_live_graph_delta(&mut overlay, ctx);
+    enrich_live_graph_delta(&mut overlay, ctx, edge_index);
     let mut endpoint_pairs = overlay
         .edge_additions
         .iter()
@@ -3460,7 +3507,11 @@ fn live_graph_delta_card(
     .map_err(|error| error.to_string())
 }
 
-fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &SearchContext<'_>) {
+fn enrich_live_graph_delta(
+    overlay: &mut graph_delta::EphemeralOverlay,
+    ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
+) {
     let mut grounded = BTreeMap::<(String, u32), String>::new();
     let mut changed_nodes = BTreeSet::new();
     let mut misses = Vec::new();
@@ -3517,16 +3568,12 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
             ));
             continue;
         };
-        match corroborate_changed_relationship(fact, source_id, ctx) {
+        match corroborate_changed_relationship(fact, source_id, ctx, edge_index) {
             Ok(edge) => {
                 inferred_relationships += 1;
                 match fact.change {
                     graph_delta::ChangedLineKind::Added => {
-                        if !ctx.graph_state.edges.iter().any(|current| {
-                            current.from.to_stable_id() == edge.key.from
-                                && current.to.to_stable_id() == edge.key.to
-                                && current.kind.to_string() == edge.key.kind
-                        }) {
+                        if !edge_index.contains(&edge.key.from, &edge.key.to, &edge.key.kind) {
                             overlay.edge_additions.push(edge);
                         }
                     }
@@ -3549,16 +3596,18 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
         if depth >= 2 || visited.len() >= TASK_GRAPH_CANDIDATE_LIMIT {
             continue;
         }
-        for edge in &ctx.graph_state.edges {
-            let from = edge.from.to_stable_id();
-            let to = edge.to.to_stable_id();
-            let (neighbor, caller) = if from == current {
-                (to, false)
-            } else if to == current {
-                (from, true)
-            } else {
-                continue;
-            };
+        let adjacent = edge_index
+            .outgoing(&current)
+            .iter()
+            .map(|edge| (edge.to.to_stable_id(), false))
+            .chain(
+                edge_index
+                    .incoming(&current)
+                    .iter()
+                    .map(|edge| (edge.from.to_stable_id(), true)),
+            )
+            .collect::<Vec<_>>();
+        for (neighbor, caller) in adjacent {
             if !visited.insert(neighbor.clone()) {
                 continue;
             }
@@ -3582,7 +3631,7 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
         let Some(changed) = find_node(ctx.graph_state, changed_id) else {
             continue;
         };
-        let changed_edges = outgoing_edge_kinds(ctx.graph_state, changed_id);
+        let changed_edges = outgoing_edge_kinds(edge_index, changed_id);
         let Some(changed_grounding) = graph_delta_node_grounding(changed) else {
             continue;
         };
@@ -3594,7 +3643,7 @@ fn enrich_live_graph_delta(overlay: &mut graph_delta::EphemeralOverlay, ctx: &Se
                 candidate.stable_id() != *changed_id && candidate.id.kind == changed.id.kind
             })
             .filter_map(|candidate| {
-                let candidate_edges = outgoing_edge_kinds(ctx.graph_state, &candidate.stable_id());
+                let candidate_edges = outgoing_edge_kinds(edge_index, &candidate.stable_id());
                 let overlap = candidate_edges.intersection(&changed_edges).count();
                 (overlap > 0).then_some((
                     std::cmp::Reverse(overlap),
@@ -3752,6 +3801,7 @@ fn corroborate_changed_relationship(
     fact: &graph_delta::ChangedRelationshipFact,
     source_id: &str,
     ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<graph_delta::WeightedEdge, &'static str> {
     let mut matches = ctx
         .graph_state
@@ -3786,11 +3836,7 @@ fn corroborate_changed_relationship(
         kind: fact.kind.edge_kind().to_string(),
     };
     if fact.change == graph_delta::ChangedLineKind::Removed
-        && !ctx.graph_state.edges.iter().any(|edge| {
-            edge.from.to_stable_id() == key.from
-                && edge.to.to_stable_id() == key.to
-                && edge.kind.to_string() == key.kind
-        })
+        && !edge_index.contains(&key.from, &key.to, &key.kind)
     {
         return Err("removed relationship is not corroborated by a persisted current edge");
     }
@@ -3841,11 +3887,10 @@ fn graph_delta_impact_kind(node: &Node, caller: bool) -> graph_delta::ImpactKind
     }
 }
 
-fn outgoing_edge_kinds(graph: &GraphState, id: &str) -> BTreeSet<String> {
-    graph
-        .edges
+fn outgoing_edge_kinds(edge_index: &ProjectedEdgeIndex<'_>, id: &str) -> BTreeSet<String> {
+    edge_index
+        .outgoing(id)
         .iter()
-        .filter(|edge| edge.from.to_stable_id() == id)
         .map(|edge| edge.kind.to_string())
         .collect()
 }
@@ -4466,6 +4511,7 @@ fn render_projected_input(
 async fn projected_fused_candidates(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<
     (
         Vec<FusedCandidate>,
@@ -4621,7 +4667,7 @@ async fn projected_fused_candidates(
                 .map(|node| {
                     RawCandidateScore::new(
                         node.stable_id(),
-                        edge_degree(ctx.graph_state, node) as f64,
+                        edge_index.degree(&node.stable_id()) as f64,
                     )
                 })
                 .collect(),
@@ -4634,8 +4680,8 @@ async fn projected_fused_candidates(
             graph_ids
                 .into_iter()
                 .filter_map(|id| {
-                    find_node(ctx.graph_state, &id).map(|node| {
-                        RawCandidateScore::new(id, edge_degree(ctx.graph_state, node) as f64)
+                    find_node(ctx.graph_state, &id).map(|_node| {
+                        RawCandidateScore::new(id.clone(), edge_index.degree(&id) as f64)
                     })
                 })
                 .collect(),
@@ -4802,16 +4848,55 @@ fn lexical_score(node: &Node, query: &str) -> f64 {
     }
 }
 
-fn edge_degree(graph: &GraphState, node: &Node) -> usize {
-    graph
-        .edges
-        .iter()
-        .filter(|edge| edge.from == node.id || edge.to == node.id)
-        .count()
+struct ProjectedEdgeIndex<'a> {
+    outgoing: HashMap<String, Vec<&'a Edge>>,
+    incoming: HashMap<String, Vec<&'a Edge>>,
+    degrees: HashMap<String, usize>,
+}
+
+impl<'a> ProjectedEdgeIndex<'a> {
+    fn new(graph: &'a GraphState) -> Self {
+        let mut outgoing = HashMap::<String, Vec<&Edge>>::new();
+        let mut incoming = HashMap::<String, Vec<&Edge>>::new();
+        let mut degrees = HashMap::<String, usize>::new();
+        for edge in &graph.edges {
+            let from = edge.from.to_stable_id();
+            let to = edge.to.to_stable_id();
+            outgoing.entry(from.clone()).or_default().push(edge);
+            incoming.entry(to.clone()).or_default().push(edge);
+            *degrees.entry(from.clone()).or_default() += 1;
+            if to != from {
+                *degrees.entry(to).or_default() += 1;
+            }
+        }
+        Self {
+            outgoing,
+            incoming,
+            degrees,
+        }
+    }
+
+    fn outgoing(&self, id: &str) -> &[&'a Edge] {
+        self.outgoing.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn incoming(&self, id: &str) -> &[&'a Edge] {
+        self.incoming.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn degree(&self, id: &str) -> usize {
+        self.degrees.get(id).copied().unwrap_or_default()
+    }
+
+    fn contains(&self, from: &str, to: &str, kind: &str) -> bool {
+        self.outgoing(from)
+            .iter()
+            .any(|edge| edge.to.to_stable_id() == to && edge.kind.to_string() == kind)
+    }
 }
 
 fn find_node<'a>(graph: &'a GraphState, id: &str) -> Option<&'a Node> {
-    graph.nodes.iter().find(|node| node.stable_id() == id)
+    graph.node_by_stable_id(id, graph.node_index_map())
 }
 
 fn symbol_summary(node: &Node) -> SymbolSummary {
@@ -5606,29 +5691,25 @@ fn merge_capabilities(capabilities: Vec<CapabilityStatus>) -> Vec<CapabilityStat
 }
 
 fn projected_relationships(
-    graph: &GraphState,
+    edge_index: &ProjectedEdgeIndex<'_>,
     records: &[SelectedRecord],
 ) -> Vec<ProjectedRelationship> {
     let ids: BTreeSet<_> = records
         .iter()
         .map(|record| record.identity.node_id.as_str())
         .collect();
-    let mut relationships: Vec<_> = graph
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            let from = edge.from.to_stable_id();
+    let mut relationships = Vec::new();
+    for id in &ids {
+        relationships.extend(edge_index.outgoing(id).iter().filter_map(|edge| {
             let to = edge.to.to_stable_id();
-            (ids.contains(from.as_str()) && ids.contains(to.as_str())).then(|| {
-                ProjectedRelationship {
-                    from,
-                    kind: edge.kind.to_string(),
-                    to,
-                    reason: format!("{} {:?}", edge.source, edge.confidence),
-                }
+            ids.contains(to.as_str()).then(|| ProjectedRelationship {
+                from: edge.from.to_stable_id(),
+                kind: edge.kind.to_string(),
+                to,
+                reason: format!("{} {:?}", edge.source, edge.confidence),
             })
-        })
-        .collect();
+        }));
+    }
     relationships.sort();
     relationships.dedup();
     relationships
@@ -9808,6 +9889,47 @@ mod tests {
         assert!(strict_semantic_requested(&strict));
     }
 
+    #[test]
+    fn sealed_implicit_strict_is_limited_to_frozen_packet_shape() {
+        let frozen = SearchParams {
+            query: Some("registered frozen query".into()),
+            search_mode: Some("hybrid".into()),
+            rerank: true,
+            limit: Some(20),
+            include_artifacts: false,
+            include_markdown: true,
+            compact: true,
+            ..Default::default()
+        };
+        assert!(frozen_implicit_strict_request(&frozen));
+
+        let ordinary = SearchParams {
+            query: frozen.query.clone(),
+            ..Default::default()
+        };
+        assert!(!frozen_implicit_strict_request(&ordinary));
+
+        for product in [
+            SearchParams {
+                projection: Some("agent".into()),
+                ..frozen.clone()
+            },
+            SearchParams {
+                context_mode: Some("task".into()),
+                ..frozen.clone()
+            },
+            SearchParams {
+                body_policy: Some("signature_only".into()),
+                ..frozen.clone()
+            },
+        ] {
+            assert!(
+                !frozen_implicit_strict_request(&product),
+                "product controls must never enter the frozen implicit strict path"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn strict_semantic_search_rejects_an_unsealed_binary_without_fallback() {
         let gs = make_graph_state(vec![make_node(
@@ -12019,6 +12141,7 @@ mod tests {
         nodes.push(target);
         let graph = make_graph_state(nodes);
         let ctx = make_search_context(&graph, repository.path());
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let output = task_records(
             &SearchParams {
                 query: Some("Fix `target_symbol` behavior and add a regression test".into()),
@@ -12028,6 +12151,7 @@ mod tests {
                 ..Default::default()
             },
             &ctx,
+            &edge_index,
         )
         .await
         .unwrap();
@@ -12040,6 +12164,68 @@ mod tests {
         assert!(output.capabilities.iter().any(|capability| {
             capability.capability == "task_exact_reference_resolution"
                 && capability.state == CapabilityState::Ready
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_evidence_omits_source_less_graph_candidate_without_failing_valid_records() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repository.path().join("lib.rs"),
+            "fn hello() {}\nfn test_hello() {}\n",
+        )
+        .unwrap();
+        let mut hello = make_node("hello", NodeKind::Function, "lib.rs");
+        hello.line_start = 1;
+        hello.line_end = 1;
+        let mut test = make_node("test_hello", NodeKind::Function, "lib.rs");
+        test.line_start = 2;
+        test.line_end = 2;
+        test.metadata.insert("is_test".into(), "true".into());
+        let source_less_module = make_node("lib", NodeKind::Module, "lib.rs");
+        let source_less_id = source_less_module.stable_id();
+        let graph = make_graph_state_with_edges(
+            vec![hello.clone(), test.clone(), source_less_module],
+            vec![make_edge(
+                &hello,
+                &make_node("lib", NodeKind::Module, "lib.rs"),
+                EdgeKind::DependsOn,
+            )],
+        );
+        let ctx = make_search_context(&graph, repository.path());
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let output = task_records(
+            &SearchParams {
+                query: Some("Fix `hello` and update `test_hello`".into()),
+                context_mode: Some("task".into()),
+                context_roles: Some(vec!["editable_source".into()]),
+                context_facets: Some(Vec::new()),
+                hops: Some(1),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+            &edge_index,
+        )
+        .await
+        .expect("a source-less graph neighbor must not fail the valid task response");
+
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == hello.stable_id())
+        );
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == test.stable_id())
+        );
+        assert!(output.omissions.iter().any(|omission| {
+            omission.record_id.as_deref() == Some(source_less_id.as_str())
+                && omission.detail.contains("no valid current source anchor")
         }));
     }
 
@@ -12056,16 +12242,28 @@ mod tests {
         regression.line_start = 1;
         regression.line_end = 1;
         let graph = make_graph_state(vec![production.clone(), regression.clone()]);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let assemblies = BTreeMap::new();
 
-        let rejection =
-            task_lane_candidate_evidence(&production, TaskRole::Test, &assemblies, &graph)
-                .unwrap_err();
+        let rejection = task_lane_candidate_evidence(
+            &production,
+            TaskRole::Test,
+            &assemblies,
+            &graph,
+            &edge_index,
+        )
+        .unwrap_err();
         assert!(rejection.contains("production source cannot satisfy the test lane"));
         assert!(
-            task_lane_candidate_evidence(&regression, TaskRole::Test, &assemblies, &graph,)
-                .unwrap()
-                .contains("test path/metadata")
+            task_lane_candidate_evidence(
+                &regression,
+                TaskRole::Test,
+                &assemblies,
+                &graph,
+                &edge_index,
+            )
+            .unwrap()
+            .contains("test path/metadata")
         );
     }
 
@@ -12138,11 +12336,13 @@ mod tests {
         );
         let unrelated_graph =
             make_graph_state(vec![anchor.clone(), candidate.clone(), helper.clone()]);
+        let unrelated_edge_index = ProjectedEdgeIndex::new(&unrelated_graph);
         let rejection = task_lane_candidate_evidence(
             &candidate,
             TaskRole::BehavioralAnalogue,
             &assemblies,
             &unrelated_graph,
+            &unrelated_edge_index,
         )
         .unwrap_err();
         assert!(rejection.contains("lacks a shared typed graph target"));
@@ -12154,12 +12354,14 @@ mod tests {
                 make_edge(&candidate, &helper, EdgeKind::Calls),
             ],
         );
+        let corroborated_edge_index = ProjectedEdgeIndex::new(&corroborated_graph);
         assert!(
             task_lane_candidate_evidence(
                 &candidate,
                 TaskRole::BehavioralAnalogue,
                 &assemblies,
                 &corroborated_graph,
+                &corroborated_edge_index,
             )
             .unwrap()
             .contains("shared_typed_targets=calls:")
@@ -12270,6 +12472,7 @@ mod tests {
                 make_edge(&delta_bridge, &delta, EdgeKind::Calls),
             ],
         );
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let ctx = make_search_context(&graph, repository.path());
         for (query, expected, expected_test) in [
             (
@@ -12299,7 +12502,7 @@ mod tests {
                 include_markdown: false,
                 ..Default::default()
             };
-            let output = task_records(&task_params, &ctx).await.unwrap();
+            let output = task_records(&task_params, &ctx, &edge_index).await.unwrap();
             assert!(output.records.iter().any(|record| {
                 record.identity.node_id == expected
                     && record.selection.role == Some(ProjectionRole::EditableSource)
@@ -12320,7 +12523,7 @@ mod tests {
                 include_markdown: false,
                 ..Default::default()
             };
-            let (flat, _, _) = projected_fused_candidates(&flat_params, &ctx)
+            let (flat, _, _) = projected_fused_candidates(&flat_params, &ctx, &edge_index)
                 .await
                 .unwrap();
             let flat_roles = flat
@@ -12388,6 +12591,7 @@ mod tests {
         );
         let repository = PathBuf::from("/tmp/task-graph-fixture");
         let ctx = make_search_context(&graph, &repository);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let mut assemblies = BTreeMap::new();
         merge_task_assembly(
             &mut assemblies,
@@ -12411,6 +12615,7 @@ mod tests {
                 ..Default::default()
             },
             &ctx,
+            &edge_index,
             &mut assemblies,
             &mut relationships,
         );
@@ -12448,6 +12653,7 @@ mod tests {
             .collect::<Vec<_>>();
         let repository = PathBuf::from("/tmp/graph-delta-fixture");
         let ctx = make_search_context(&graph, &repository);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let card = live_graph_delta_card(
             &SearchParams {
                 context_mode: Some("graph-delta-beta".into()),
@@ -12459,6 +12665,7 @@ mod tests {
                 ..Default::default()
             },
             &ctx,
+            &edge_index,
         )
         .unwrap();
         assert_eq!(card.changed_edges.len(), 2);
@@ -12608,6 +12815,7 @@ mod tests {
             EdgeKind::TestedBy,
         ));
         let graph = make_graph_state_with_edges(nodes, edges);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
         let ctx = make_search_context(&graph, repository.path());
         let changed_line = line_of("return legacy_search_dispatch(params, ctx).await;");
         let proposal = format!(
@@ -12624,6 +12832,7 @@ mod tests {
                 ..Default::default()
             },
             &ctx,
+            &edge_index,
         )
         .await;
         // The card covers all affected loci in one bounded response. The
