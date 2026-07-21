@@ -298,6 +298,10 @@ fn sealed_semantic_bundle() -> bool {
         && option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
 }
 
+const fn use_verified_reranker_loader(strict_semantic: bool, sealed_bundle: bool) -> bool {
+    strict_semantic || sealed_bundle
+}
+
 fn semantic_asset_seeding() -> bool {
     std::env::var("RNA_SEMANTIC_ASSET_SEEDING").as_deref() == Ok("1")
 }
@@ -4355,6 +4359,15 @@ fn unique_node_at_line<'a>(
         .nodes
         .iter()
         .filter(|node| node.id.file.to_string_lossy().replace('\\', "/") == path)
+        // Persisted document-symbol nodes prove the LSP response survived
+        // reopen; they intentionally duplicate the source symbol and must not
+        // compete with that symbol as proposal grounding.
+        .filter(|node| {
+            !matches!(
+                &node.id.kind,
+                NodeKind::Other(kind) if kind == "lsp_document_symbol"
+            )
+        })
         .filter(|node| {
             u32::try_from(node.line_start).is_ok_and(|start| start <= line)
                 && u32::try_from(node.line_end).is_ok_and(|end| end >= line)
@@ -7423,8 +7436,10 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // executor during ONNX model inference (and possible first-time
         // model download/initialization).
         let query_owned = query_str.to_string();
+        let verified_reranker =
+            use_verified_reranker_loader(strict_semantic, sealed_semantic_bundle());
         let rerank_result = tokio::task::spawn_blocking(move || {
-            if strict_semantic {
+            if verified_reranker {
                 rerank_results_strict(&query_owned, &candidates)
             } else {
                 rerank_results(&query_owned, &candidates)
@@ -13595,6 +13610,36 @@ mod tests {
         );
         let proposal_grounding = graph_delta::EvidenceGrounding::Proposal(added.grounding);
         assert!(graph_delta_grounding_node(&proposal_grounding, &enclosing_ctx).is_err());
+    }
+
+    #[test]
+    fn acceptance_delivery_changed_line_prefers_source_over_lsp_document_symbol_proof() {
+        let mut source = make_node("hello", NodeKind::Function, "lib.rs");
+        source.line_start = 2;
+        source.line_end = 2;
+        let mut proof = make_node(
+            "hello@proof",
+            NodeKind::Other("lsp_document_symbol".into()),
+            "lib.rs",
+        );
+        proof.line_start = 2;
+        proof.line_end = 2;
+        let graph = make_graph_state(vec![source.clone(), proof]);
+        let repository = tempfile::tempdir().unwrap();
+        let ctx = make_search_context(&graph, repository.path());
+
+        assert_eq!(
+            unique_node_at_line(&ctx, "lib.rs", 2).unwrap().stable_id(),
+            source.stable_id()
+        );
+    }
+
+    #[test]
+    fn acceptance_delivery_sealed_product_queries_use_verified_reranker_loader() {
+        assert!(!use_verified_reranker_loader(false, false));
+        assert!(use_verified_reranker_loader(true, false));
+        assert!(use_verified_reranker_loader(false, true));
+        assert!(use_verified_reranker_loader(true, true));
     }
 
     #[test]

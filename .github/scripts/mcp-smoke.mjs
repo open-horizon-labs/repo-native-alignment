@@ -221,7 +221,10 @@ async function callSearchWithRetry(args) {
     });
     text = extractText(result);
 
-    if (!text.includes("Index building")) {
+    const prewarmStillAttachingSemanticIndex = text.includes(
+      "Strict semantic qualification FAILED: `embedding index is not attached`",
+    );
+    if (!text.includes("Index building") && !prewarmStillAttachingSemanticIndex) {
       return text;
     }
 
@@ -230,9 +233,14 @@ async function callSearchWithRetry(args) {
     }
   }
 
-  if (text.includes("Index building")) {
+  if (
+    text.includes("Index building") ||
+    text.includes(
+      "Strict semantic qualification FAILED: `embedding index is not attached`",
+    )
+  ) {
     throw new Error(
-      `search remained in "Index building" state after ${maxAttempts} attempts`
+      `search remained in a transient prewarm state after ${maxAttempts} attempts`
     );
   }
   return text;
