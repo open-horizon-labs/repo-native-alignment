@@ -306,25 +306,16 @@ fn strict_semantic_requested(params: &SearchParams) -> bool {
         .search_mode
         .as_deref()
         .is_some_and(|mode| mode.trim().eq_ignore_ascii_case(STRICT_SEMANTIC_MODE));
-    // The frozen #779 packet generator predates `search_mode=strict`, so the
-    // sealed artifact must still recognize its exact CLI request shape. Do not
-    // broaden that compatibility hook to ordinary product searches merely
-    // because they happen to run from the same artifact.
-    let sealed_bundle_default = sealed_semantic_bundle() && frozen_implicit_strict_request(params);
+    // The frozen #779 packet generator and the artifact's offline qualification
+    // probe predate `search_mode=strict`, so eligible bare queries from a sealed
+    // bundle must retain implicit strict behavior. Explicit product-context
+    // controls opt into the separate non-strict projection pipeline.
+    let sealed_bundle_default = sealed_semantic_bundle() && implicit_strict_request(params);
     explicit || sealed_bundle_default
 }
 
-fn frozen_implicit_strict_request(params: &SearchParams) -> bool {
-    params
-        .search_mode
-        .as_deref()
-        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("hybrid"))
-        && params.rerank
-        && params.limit == Some(20)
-        && !params.include_artifacts
-        && params.include_markdown
-        && params.compact
-        && legacy_product_controls(params).is_none()
+fn implicit_strict_request(params: &SearchParams) -> bool {
+    legacy_product_controls(params).is_none()
         && params.context_mode.is_none()
         && params.normalized_mode().is_none()
         && params
@@ -9890,7 +9881,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_implicit_strict_is_limited_to_frozen_packet_shape() {
+    fn sealed_implicit_strict_preserves_qualification_and_excludes_product_controls() {
         let frozen = SearchParams {
             query: Some("registered frozen query".into()),
             search_mode: Some("hybrid".into()),
@@ -9901,13 +9892,15 @@ mod tests {
             compact: true,
             ..Default::default()
         };
-        assert!(frozen_implicit_strict_request(&frozen));
+        assert!(implicit_strict_request(&frozen));
 
-        let ordinary = SearchParams {
-            query: frozen.query.clone(),
+        let offline_probe = SearchParams {
+            query: Some("function returns value".into()),
+            limit: Some(10),
+            compact: true,
             ..Default::default()
         };
-        assert!(!frozen_implicit_strict_request(&ordinary));
+        assert!(implicit_strict_request(&offline_probe));
 
         for product in [
             SearchParams {
@@ -9924,7 +9917,7 @@ mod tests {
             },
         ] {
             assert!(
-                !frozen_implicit_strict_request(&product),
+                !implicit_strict_request(&product),
                 "product controls must never enter the frozen implicit strict path"
             );
         }
