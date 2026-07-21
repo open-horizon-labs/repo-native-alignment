@@ -998,7 +998,7 @@ def semantic_search(
     text = result.stdout.decode("utf-8", errors="strict")
     if STRICT_SENTINEL not in text:
         raise PacketError("strict hybrid/RRF/rerank READY sentinel is missing")
-    nodes = parse_search_nodes(result.stdout, checkout)[:20]
+    nodes = parse_search_nodes(result.stdout, checkout)
     return nodes, result
 
 
@@ -1902,7 +1902,7 @@ def validate_command_protocol(
     semantic_nodes = parse_search_nodes(
         _command_stdout(evidence_root, semantic_ordinal, "semantic-search"),
         Path(checkout),
-    )[:20]
+    )
     semantic_ids = [
         candidate["stable_id"]
         for candidate in sorted(

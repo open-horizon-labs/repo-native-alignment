@@ -439,6 +439,57 @@ class SwebenchContextPacketTests(unittest.TestCase):
                 self.assertIn(body.encode(), packet_b)
                 self.assertIn(body.encode(), packet_c)
 
+    def test_semantic_search_keeps_docs_after_twenty_code_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            readme = checkout / "README.md"
+            guide = checkout / "docs/guide.rst"
+            readme_body = "# Project\n\nRepository overview."
+            guide_body = "Guide\n=====\n\nRepository guide."
+            readme.write_text(readme_body, encoding="utf-8")
+            guide.parent.mkdir()
+            guide.write_text(guide_body, encoding="utf-8")
+            code = "\n".join(
+                _node_entry(
+                    f"src/module_{ordinal}.py:value:function",
+                    path=f"src/module_{ordinal}.py",
+                    line=ordinal,
+                )
+                for ordinal in range(1, 21)
+            )
+            stdout = (
+                "## Search: \"repository behavior\"\n\n"
+                "### Code symbols (20 result(s))\n\n"
+                f"{code}\n"
+                "### Strict semantic qualification\n\n"
+                f"`{PACKETS.STRICT_SENTINEL}`\n\n"
+                "### Markdown (2 result(s))\n\n"
+                f"- (score: 0.91) `{readme}` > # Project\n\n{readme_body}\n\n"
+                "---\n\n"
+                f"- (score: 0.74) `{guide}` > Guide\n\n{guide_body}"
+                "\n*Index: sealed*\n"
+            ).encode()
+
+            semantic_nodes, _ = PACKETS.semantic_search(
+                "repository behavior",
+                checkout,
+                Path("/bundle/rna"),
+                FakeRecorder(stdout),
+            )
+
+            self.assertEqual(len(semantic_nodes), 22)
+            self.assertEqual(
+                [node.stable_id for node in semantic_nodes[:20]],
+                [f"src/module_{ordinal}.py:value:function" for ordinal in range(1, 21)],
+            )
+            self.assertEqual(
+                [(node.path, node.kind) for node in semantic_nodes[20:]],
+                [
+                    ("README.md", "markdown_section"),
+                    ("docs/guide.rst", "markdown_section"),
+                ],
+            )
+
     def test_vector_rejects_payload_and_closed_schema_tamper(self) -> None:
         source = json.loads(
             (ROOT / "benchmark/swebench-act-context/packet-vector.json").read_text()
