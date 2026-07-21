@@ -21,7 +21,10 @@ import json
 import math
 import os
 import platform
+import re
+import resource
 import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -35,7 +38,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -86,6 +89,26 @@ QUALIFICATION_SCAN_FLAGS = [
     "--no-embed",
     "--timings",
 ]
+COMBINED_QUALIFICATION_SCAN_FLAGS = [
+    "--business-context=disabled",
+    "scan",
+    "--full",
+    "--timings",
+]
+COMBINED_QUERY = "function returns value"
+COMBINED_STRICT_SEARCH_SENTINEL = (
+    "status=READY embeddings=true retrieval=hybrid rerank=true "
+    "metal=true fallback=false"
+)
+COMBINED_QUERY_PROBE_NAMES = (
+    "first_hybrid_rerank",
+    "graph_traversal",
+    "full_body",
+    "minified_body",
+    "repeat_hybrid_1",
+    "repeat_hybrid_2",
+    "warm_hybrid_rerank",
+)
 REPLAY_RECEIPT_FIELDS = {
     "schema_version",
     "diagnostic_only",
@@ -567,7 +590,7 @@ def structural_cache_identity(rna_binary: Path, checkout: Path) -> dict[str, Any
     return identity
 
 
-def _normalized_cache_path(value: str, label: str = "cache member") -> str:
+def _normalized_cache_member_path(value: str, label: str = "cache member") -> str:
     if not value or "\0" in value or "\\" in value:
         raise ToolchainError(f"{label} path is empty, contains NUL, or uses backslashes")
     pure = PurePosixPath(value)
@@ -581,6 +604,12 @@ def _normalized_cache_path(value: str, label: str = "cache member") -> str:
     normalized = pure.as_posix()
     if normalized != value:
         raise ToolchainError(f"{label} path is not canonical: {value}")
+    return normalized
+
+
+def _normalized_cache_path(value: str, label: str = "cache member") -> str:
+    normalized = _normalized_cache_member_path(value, label)
+    parts = PurePosixPath(normalized).parts
     lowered = {part.casefold() for part in parts}
     normalized_folded = normalized.casefold()
     if (
@@ -595,28 +624,36 @@ def _normalized_cache_path(value: str, label: str = "cache member") -> str:
     return normalized
 
 
-def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+def _cache_files(
+    cache_root: Path,
+    *,
+    label: str,
+    normalize_path: Callable[[str, str], str],
+    reserved_paths: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     if not cache_root.is_dir() or cache_root.is_symlink():
-        raise ToolchainError("structural cache root must be a real directory")
+        raise ToolchainError(f"{label} root must be a real directory")
     members: list[dict[str, Any]] = []
     total_size = 0
     for path in sorted(cache_root.rglob("*"), key=lambda candidate: candidate.as_posix()):
-        relative = _normalized_cache_path(path.relative_to(cache_root).as_posix())
+        relative = normalize_path(
+            path.relative_to(cache_root).as_posix(), f"{label} member"
+        )
         stat_result = path.lstat()
         if path.is_symlink():
-            raise ToolchainError(f"structural cache contains a symlink: {relative}")
+            raise ToolchainError(f"{label} contains a symlink: {relative}")
         if path.is_dir():
             continue
         if not path.is_file():
-            raise ToolchainError(f"structural cache contains a special file: {relative}")
-        if relative == STRUCTURAL_CACHE_CORE:
-            raise ToolchainError("live cache contains a reserved embedded core manifest")
+            raise ToolchainError(f"{label} contains a special file: {relative}")
+        if relative in reserved_paths:
+            raise ToolchainError(f"{label} contains a reserved path: {relative}")
         size = stat_result.st_size
         if size > STRUCTURAL_CACHE_MAX_MEMBER_BYTES:
-            raise ToolchainError(f"structural cache member is oversized: {relative}")
+            raise ToolchainError(f"{label} member is oversized: {relative}")
         total_size += size
         if total_size > STRUCTURAL_CACHE_MAX_TOTAL_BYTES:
-            raise ToolchainError("structural cache exceeds total size limit")
+            raise ToolchainError(f"{label} exceeds total size limit")
         members.append(
             {
                 "path": relative,
@@ -626,11 +663,62 @@ def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
             }
         )
         if len(members) > STRUCTURAL_CACHE_MAX_MEMBERS:
-            raise ToolchainError("structural cache contains too many members")
+            raise ToolchainError(f"{label} contains too many members")
     paths = [member["path"] for member in members]
     if len(paths) != len(set(paths)) or len(paths) != len({path.casefold() for path in paths}):
-        raise ToolchainError("structural cache paths collide")
+        raise ToolchainError(f"{label} paths collide")
     return members
+
+
+def _structural_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+    return _cache_files(
+        cache_root,
+        label="structural cache",
+        normalize_path=_normalized_cache_path,
+        reserved_paths=frozenset({STRUCTURAL_CACHE_CORE}),
+    )
+
+
+def _diagnostic_cache_files(cache_root: Path) -> list[dict[str, Any]]:
+    """Enumerate all regular failure-state bytes without structural projection."""
+    return _cache_files(
+        cache_root,
+        label="diagnostic cache",
+        normalize_path=_normalized_cache_member_path,
+    )
+
+
+def _validate_diagnostic_cache_root(checkout: Path, cache_root: Path) -> None:
+    for label, path in (
+        ("checkout", checkout),
+        ("checkout .oh directory", checkout / ".oh"),
+        ("diagnostic cache", cache_root),
+    ):
+        if path.is_symlink() or not path.is_dir():
+            raise ToolchainError(f"{label} must be a real non-symlink directory")
+
+
+def _diagnostic_cache_source_is_regular(cache_root: Path, source: Path) -> bool:
+    try:
+        relative = source.relative_to(cache_root)
+    except ValueError as error:
+        raise ToolchainError(
+            f"diagnostic cache member escapes cache root: {source}"
+        ) from error
+    _normalized_cache_member_path(relative.as_posix(), "diagnostic cache member")
+    current = cache_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if current.is_symlink():
+            raise ToolchainError(
+                f"diagnostic cache member has a symlink component: {relative}"
+            )
+        if index < len(relative.parts) - 1:
+            if not current.is_dir():
+                return False
+        else:
+            return current.is_file()
+    return False
 
 
 def _structural_tree_digest(members: Sequence[Mapping[str, Any]]) -> str:
@@ -4264,6 +4352,141 @@ def _extract_tar(artifact: Path, destination: Path) -> None:
         archive.extractall(destination, filter="data")
 
 
+def _extract_verified_lsp_artifact_cache(
+    archive_path: Path, destination: Path
+) -> Path:
+    """Extract the CI-bundled artifact cache without trusting tar metadata."""
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise ToolchainError("verified LSP artifact cache must be a regular file")
+    if destination.exists() or destination.is_symlink():
+        raise ToolchainError("verified LSP artifact-cache destination must be absent")
+    archive_sha256 = sha256_file(archive_path)
+    destination.mkdir(parents=True)
+    seen: set[str] = set()
+    seen_casefold: set[str] = set()
+    total_size = 0
+    directory_modes: list[tuple[Path, int]] = []
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if not members or len(members) > STRUCTURAL_CACHE_MAX_MEMBERS:
+                raise ToolchainError("verified LSP artifact cache entry count is invalid")
+            for member in members:
+                name = member.name
+                pure = PurePosixPath(name)
+                if (
+                    "\\" in name
+                    or "\0" in name
+                    or pure.is_absolute()
+                    or not pure.parts
+                    or pure.parts[0] != "lsp-artifact-cache"
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                ):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is unsafe: {name}"
+                    )
+                normalized = pure.as_posix()
+                folded = normalized.casefold()
+                if normalized in seen or folded in seen_casefold:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is duplicated: {name}"
+                    )
+                seen.add(normalized)
+                seen_casefold.add(folded)
+                if not (member.isdir() or member.isfile()):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache contains a link or special file: {name}"
+                    )
+                if getattr(member, "sparse", None):
+                    raise ToolchainError(
+                        f"verified LSP artifact cache contains a sparse member: {name}"
+                    )
+                if member.size < 0 or member.size > STRUCTURAL_CACHE_MAX_MEMBER_BYTES:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member size is invalid: {name}"
+                    )
+                total_size += member.size
+                if total_size > STRUCTURAL_CACHE_MAX_TOTAL_BYTES:
+                    raise ToolchainError("verified LSP artifact cache is oversized")
+
+            for member in members:
+                target = destination.joinpath(*PurePosixPath(member.name).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.isdir():
+                    target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    directory_modes.append((target, 0o755))
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is partial: {member.name}"
+                    )
+                written = 0
+                with target.open("xb") as output:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        output.write(chunk)
+                        written += len(chunk)
+                if written != member.size:
+                    raise ToolchainError(
+                        f"verified LSP artifact cache member is truncated: {member.name}"
+                    )
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+        for directory, mode in sorted(
+            directory_modes, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            directory.chmod(mode)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    if sha256_file(archive_path) != archive_sha256:
+        raise ToolchainError("verified LSP artifact cache changed during extraction")
+    cache_root = destination / "lsp-artifact-cache"
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise ToolchainError("verified LSP artifact cache root is missing")
+    return cache_root
+
+
+def _materialize_verified_bundle_toolchain(
+    bundle_root: Path,
+    lock_path: Path,
+    inventory_path: Path,
+    private_root: Path,
+    repo_root: Path | None,
+) -> dict[str, Any]:
+    """Offline-provision a private LSP root from the verifier-clean CI bundle."""
+    if private_root.exists() or private_root.is_symlink():
+        raise ToolchainError("private verified LSP materialization root must be absent")
+    private_root.mkdir(parents=True)
+    component_root = bundle_root / "components/lsp"
+    artifact_cache_archive = component_root / "artifact-cache.tar.gz"
+    cache_root = _extract_verified_lsp_artifact_cache(
+        artifact_cache_archive, private_root / "artifact-cache"
+    )
+    toolchain_root = private_root / "provisioned"
+    receipt = provision_toolchain(
+        lock_path,
+        inventory_path,
+        cache_root,
+        toolchain_root,
+        toolchain_root / PROVISION_RECEIPT_FILE,
+        offline=True,
+        repo_root=repo_root,
+    )
+    ci_receipt_path = component_root / "provision-receipt.json"
+    if ci_receipt_path.is_symlink() or not ci_receipt_path.is_file():
+        raise ToolchainError("verified bundle CI provision receipt is missing")
+    if load_json_object(ci_receipt_path, "verified bundle CI provision receipt") != receipt:
+        raise ToolchainError(
+            "private offline provision receipt differs from the CI-qualified toolchain"
+        )
+    identity = _validate_provisioned_toolchain(
+        lock_path, inventory_path, toolchain_root
+    )
+    if identity["provision_receipt_digest"] != receipt["receipt_digest"]:
+        raise ToolchainError("private verified LSP provision identity drifted")
+    return identity
+
+
 def _install_artifact(
     artifact: Path, install: Mapping[str, str], toolchain_root: Path
 ) -> None:
@@ -4318,15 +4541,15 @@ def _wrapper(
 ) -> bytes:
     target_literal = target.replace('"', '\\"')
     version_guard = ""
+    if kind in {"java-jar", "node"} and command_name and version:
+        version_line = shlex.quote(f"{command_name} {version}")
+        version_guard = (
+            'if [ "${1-}" = "--version" ]; then\n'
+            f"  printf '%s\\n' {version_line}\n"
+            "  exit 0\n"
+            "fi\n"
+        )
     if kind == "java-jar":
-        if command_name and version:
-            version_line = shlex.quote(f"{command_name} {version}")
-            version_guard = (
-                'if [ "${1-}" = "--version" ]; then\n'
-                f"  printf '%s\\n' {version_line}\n"
-                "  exit 0\n"
-                "fi\n"
-            )
         command = (
             'exec "$ROOT/runtimes/jdk-21.0.11+10-jre/Contents/Home/bin/java" '
             f'-jar "$ROOT/{target_literal}" "$@"'
@@ -4386,6 +4609,29 @@ def _install_launcher(entry: Mapping[str, Any], toolchain_root: Path) -> None:
         command_path.chmod(0o755)
 
 
+def _write_relocatable_esbonio_entrypoint(entrypoint: Path) -> None:
+    """Replace pip's absolute-venv shebang with deterministic entrypoint bytes.
+
+    The provisioned launcher invokes this file with the private environment's
+    Python interpreter, so the shebang is not used at runtime. Keeping a
+    portable shebang makes the target content (and therefore the sealed
+    provision receipt) independent of the toolchain installation directory.
+    """
+    if entrypoint.is_symlink() or not entrypoint.is_file():
+        raise ToolchainError("offline Esbonio entrypoint is missing")
+    entrypoint.write_bytes(
+        b"#!/usr/bin/env python3\n"
+        b"# -*- coding: utf-8 -*-\n"
+        b"import re\n"
+        b"import sys\n"
+        b"from esbonio.cli import main\n"
+        b"if __name__ == '__main__':\n"
+        b"    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        b"    sys.exit(main())\n"
+    )
+    entrypoint.chmod(0o755)
+
+
 def toolchain_environment(
     toolchain_root: Path, isolation_root: Path
 ) -> dict[str, str]:
@@ -4431,6 +4677,7 @@ def toolchain_environment(
         "PYTHONSAFEPATH": "1",
         "PYTHONUTF8": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "NODE_DISABLE_COMPILE_CACHE": "1",
         "PIP_NO_INDEX": "1",
         "PIP_CONFIG_FILE": os.devnull,
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
@@ -4446,6 +4693,55 @@ def toolchain_environment(
         "GIT_TERMINAL_PROMPT": "0",
         "NO_PROXY": "*",
         "no_proxy": "*",
+    }
+
+
+def bind_hf_default_cache(hf_home: Path, isolated_home: Path) -> dict[str, Any]:
+    """Expose an HF_HOME cache at hf-hub's actual default cache path."""
+    if hf_home.is_symlink() or not hf_home.is_dir():
+        raise ToolchainError("HF_HOME must be a real directory")
+    source_hub = hf_home / "hub"
+    if source_hub.is_symlink() or not source_hub.is_dir():
+        raise ToolchainError("HF_HOME hub must be a real directory")
+    if isolated_home.is_symlink() or not isolated_home.is_dir():
+        raise ToolchainError("isolated HOME must be a real directory")
+
+    source_hub = source_hub.resolve(strict=True)
+    isolated_home = isolated_home.resolve(strict=True)
+    if (
+        source_hub == isolated_home
+        or source_hub in isolated_home.parents
+        or isolated_home in source_hub.parents
+    ):
+        raise ToolchainError("HF_HOME hub and isolated HOME must be disjoint")
+
+    cache_parent = isolated_home / ".cache"
+    huggingface_parent = cache_parent / "huggingface"
+    for label, directory in (
+        ("isolated HOME cache", cache_parent),
+        ("isolated HOME HuggingFace cache", huggingface_parent),
+    ):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ToolchainError(f"{label} must be a real directory")
+        directory.mkdir(exist_ok=True)
+
+    default_hub = huggingface_parent / "hub"
+    if default_hub.exists() or default_hub.is_symlink():
+        raise ToolchainError("default HuggingFace cache destination must be absent")
+    try:
+        default_hub.symlink_to(source_hub, target_is_directory=True)
+        if default_hub.resolve(strict=True) != source_hub:
+            raise ToolchainError("default HuggingFace cache binding target drifted")
+    except Exception:
+        if default_hub.is_symlink():
+            default_hub.unlink()
+        raise
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "bound",
+        "binding": "symlink",
+        "default_cache_relative_path": ".cache/huggingface/hub",
+        "hf_home_relative_path": "hub",
     }
 
 
@@ -4512,6 +4808,7 @@ def provision_toolchain(
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise ToolchainError(f"offline wheel installation failed: {detail}")
+        _write_relocatable_esbonio_entrypoint(python_env / "bin/esbonio")
 
     for entry in lock["servers"]:
         _install_launcher(entry, toolchain_root)
@@ -5234,6 +5531,18 @@ def _validate_toolchain_probe_evidence(
     if sha256_bytes(canonical_json(digest_payload)) != stored_digest:
         raise ToolchainError("toolchain probe self-digest mismatch")
 
+    probe_toolchain_root = _require_string(
+        probe.get("toolchain_root"), "toolchain probe root"
+    )
+    current_toolchain_root = _require_string(
+        provisioned_identity.get("toolchain_root"),
+        "current provisioned toolchain root",
+    )
+    if not Path(probe_toolchain_root).is_absolute() or not Path(
+        current_toolchain_root
+    ).is_absolute():
+        raise ToolchainError("toolchain probe roots must be absolute paths")
+
     lock = load_json_object(lock_path, "toolchain lock for probe validation")
     lock_servers = lock.get("servers")
     probe_servers = probe.get("servers")
@@ -5245,7 +5554,6 @@ def _validate_toolchain_probe_evidence(
         or type(probe.get("server_count")) is not int
         or probe["schema_version"] != SCHEMA_VERSION
         or probe["lock_sha256"] != sha256_file(lock_path)
-        or probe.get("toolchain_root") != provisioned_identity.get("toolchain_root")
         or probe.get("inventory_sha256")
         != provisioned_identity.get("inventory_sha256")
         or probe.get("provision_receipt_digest")
@@ -5501,6 +5809,298 @@ def _run_logged(
     return duration
 
 
+def _peak_memory_bytes() -> int:
+    """Return the largest observed RSS for this qualifier or a completed child."""
+    observed = max(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+    )
+    # Darwin reports bytes; Linux and the other supported Unix CI hosts report KiB.
+    return int(observed if sys.platform == "darwin" else observed * 1024)
+
+
+def _run_profiled_query(
+    args: Sequence[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Run one fresh-process query while measuring first stdout and total time."""
+    if stdout_path.exists() or stderr_path.exists():
+        raise ToolchainError("query probe output paths must be absent")
+    started = time.monotonic()
+    process = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        env=dict(environment),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:  # pragma: no cover
+        raise ToolchainError("query probe pipes were not created")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    streams: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    first_stdout_seconds: float | None = None
+    timed_out = False
+    try:
+        while selector.get_map():
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                # A final read after exit drains any bytes buffered in the pipes.
+                events = [
+                    (key, selectors.EVENT_READ)
+                    for key in list(selector.get_map().values())
+                ]
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                observed = time.monotonic()
+                label = str(key.data)
+                streams[label].extend(chunk)
+                if label == "stdout" and first_stdout_seconds is None:
+                    first_stdout_seconds = observed - started
+        if timed_out:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        else:
+            process.wait()
+    finally:
+        selector.close()
+    duration_seconds = time.monotonic() - started
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.write_bytes(bytes(streams["stdout"]))
+    stderr_path.write_bytes(bytes(streams["stderr"]))
+    if timed_out:
+        raise ToolchainError(
+            f"query probe timed out after {timeout_seconds:.0f}s: {stdout_path.name}"
+        )
+    if process.returncode != 0:
+        detail = bytes(streams["stderr"]).decode(errors="replace").strip()
+        raise ToolchainError(
+            f"query probe failed: {stdout_path.name}: {detail[-2000:]}"
+        )
+    if first_stdout_seconds is None or not streams["stdout"]:
+        raise ToolchainError(f"query probe produced no stdout: {stdout_path.name}")
+    return {
+        "duration_ms": int(duration_seconds * 1000),
+        "ttfe_ms": int(first_stdout_seconds * 1000),
+        "peak_memory_bytes": _peak_memory_bytes(),
+        "stdout_file": stdout_path.name,
+        "stdout_sha256": sha256_file(stdout_path),
+        "stderr_file": stderr_path.name,
+        "stderr_sha256": sha256_file(stderr_path),
+    }
+
+
+def _selected_query_node(stdout: bytes) -> str:
+    text = stdout.decode("utf-8", errors="strict")
+    for match in re.finditer(r"(?m)^\s*`([^`\r\n]+)`\s*$", text):
+        candidate = match.group(1)
+        if (
+            candidate.count(":") >= 2
+            and candidate.rsplit(":", 1)[-1] in {"function", "method"}
+            and not candidate.startswith(("http:", "https:"))
+        ):
+            return candidate
+    raise ToolchainError("strict hybrid query returned no stable node identity")
+
+
+def _require_structural_minification_provenance(stdout: str) -> None:
+    markers = re.findall(
+        r"(?m)^[ \t]*body_minification\.v1[^\r\n]*$",
+        stdout,
+    )
+    if len(markers) != 1:
+        raise ToolchainError(
+            "fresh-reopen minified-body retrieval must contain exactly one "
+            "body_minification.v1 marker"
+        )
+    if re.fullmatch(
+        r"body_minification\.v1 provenance=structural_ast wrapper=(?:true|false)",
+        markers[0].strip(),
+    ) is None:
+        raise ToolchainError(
+            "fresh-reopen minified-body retrieval did not use structural AST minification"
+        )
+
+
+def _run_combined_query_probes(
+    *,
+    combined: Any,
+    rna_binary: Path,
+    checkout: Path,
+    environment: Mapping[str, str],
+    evidence_root: Path,
+    case_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Exercise every benchmark query path against a fresh-reopened READY cache."""
+    if evidence_root.exists() or evidence_root.is_symlink():
+        raise ToolchainError("combined query-evidence root must be absent")
+    evidence_root.mkdir(parents=True)
+    hybrid_command = [
+        str(rna_binary),
+        "--business-context",
+        "disabled",
+        "search",
+        "--repo",
+        str(checkout),
+        "--search-mode",
+        "hybrid",
+        "--rerank",
+        "--limit",
+        "10",
+        "--compact",
+        COMBINED_QUERY,
+    ]
+    probes: dict[str, dict[str, Any]] = {}
+
+    def run(name: str, command: Sequence[str]) -> bytes:
+        stdout_path = evidence_root / f"{name}.stdout"
+        stderr_path = evidence_root / f"{name}.stderr"
+        probes[name] = _run_profiled_query(
+            command,
+            checkout,
+            environment,
+            stdout_path,
+            stderr_path,
+        )
+        return stdout_path.read_bytes()
+
+    first_output = run("first_hybrid_rerank", hybrid_command)
+    first_text = first_output.decode("utf-8", errors="strict")
+    first_stderr = (evidence_root / "first_hybrid_rerank.stderr").read_text(
+        errors="replace"
+    ).lower()
+    if COMBINED_STRICT_SEARCH_SENTINEL not in first_text:
+        raise ToolchainError("strict hybrid/RRF/rerank readiness sentinel is missing")
+    if any(
+        marker in first_stderr
+        for marker in ("falling back", "using cpu", "original order")
+    ):
+        raise ToolchainError("strict hybrid/RRF/rerank query used a forbidden fallback")
+    selected_node_id = _selected_query_node(first_output)
+
+    graph_output = run(
+        "graph_traversal",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--mode",
+            "neighbors",
+            "--direction",
+            "both",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if (
+        re.search(r"(?m)^0 result\(s\)\s*$", graph_output) is not None
+        or selected_node_id not in graph_output
+    ):
+        raise ToolchainError("fresh-reopen graph traversal returned no persisted neighbors")
+
+    full_output = run(
+        "full_body",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--include-body",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if selected_node_id not in full_output or "```" not in full_output:
+        raise ToolchainError("fresh-reopen full-body retrieval returned no persisted body")
+
+    minified_output = run(
+        "minified_body",
+        [
+            str(rna_binary),
+            "--business-context",
+            "disabled",
+            "search",
+            "--repo",
+            str(checkout),
+            "--node",
+            selected_node_id,
+            "--include-body",
+            "--minify-body",
+            "--compact",
+        ],
+    ).decode("utf-8", errors="strict")
+    if selected_node_id not in minified_output or "```" not in minified_output:
+        raise ToolchainError("fresh-reopen minified-body retrieval returned no body")
+    _require_structural_minification_provenance(minified_output)
+
+    repeat_1 = run("repeat_hybrid_1", hybrid_command)
+    repeat_2 = run("repeat_hybrid_2", hybrid_command)
+    warm = run("warm_hybrid_rerank", hybrid_command)
+    if repeat_1 != repeat_2 or repeat_2 != warm:
+        raise ToolchainError("fresh-reopen hybrid/RRF/rerank output is not repeat-stable")
+    for name in ("repeat_hybrid_1", "repeat_hybrid_2", "warm_hybrid_rerank"):
+        stdout = (evidence_root / f"{name}.stdout").read_text(errors="strict")
+        stderr = (evidence_root / f"{name}.stderr").read_text(
+            errors="replace"
+        ).lower()
+        if COMBINED_STRICT_SEARCH_SENTINEL not in stdout or any(
+            marker in stderr
+            for marker in ("falling back", "using cpu", "original order")
+        ):
+            raise ToolchainError(f"{name} did not remain strict and fallback-free")
+
+    peak_memory = max(profile["peak_memory_bytes"] for profile in probes.values())
+    receipt = {
+        "schema_version": combined.QUERY_EVIDENCE_SCHEMA_VERSION,
+        "status": "ready",
+        "case": dict(case_identity),
+        "query": COMBINED_QUERY,
+        "retrieval": {"mode": "hybrid", "fusion": "rrf", "rerank": True},
+        "selected_node_id": selected_node_id,
+        "strict_sentinel": COMBINED_STRICT_SEARCH_SENTINEL,
+        "repeat_stable": True,
+        "probes": probes,
+        "peak_memory_bytes": peak_memory,
+        "evidence_digest": "",
+    }
+    receipt["evidence_digest"] = sha256_bytes(canonical_json(receipt))
+    receipt_path = evidence_root / combined.QUERY_EVIDENCE_RECEIPT
+    _publish_canonical_json_exclusive(receipt_path, receipt)
+    return {
+        "root": evidence_root,
+        "receipt_path": receipt_path,
+        "receipt_sha256": sha256_file(receipt_path),
+        "evidence_digest": receipt["evidence_digest"],
+        "probes": probes,
+        "peak_memory_bytes": peak_memory,
+    }
+
+
 def _load_logged_json_object(log_path: Path, label: str) -> dict[str, Any]:
     """Read the stdout JSON captured by ``_run_logged``."""
     try:
@@ -5596,9 +6196,15 @@ def _preserve_failed_case_evidence(
     ]
     full_cache_retained = False
     full_cache_error = None
-    if cache_root.is_dir() and not cache_root.is_symlink():
+    cache_root_is_valid = False
+    try:
+        _validate_diagnostic_cache_root(checkout, cache_root)
+        cache_root_is_valid = True
+    except ToolchainError as cache_error:
+        full_cache_error = str(cache_error)
+    if cache_root_is_valid:
         try:
-            members = _structural_cache_files(cache_root)
+            members = _diagnostic_cache_files(cache_root)
             evidence_sources.extend(cache_root / member["path"] for member in members)
             full_cache_retained = True
         except ToolchainError as cache_error:
@@ -5607,14 +6213,17 @@ def _preserve_failed_case_evidence(
     copied = []
     seen: set[Path] = set()
     for source in evidence_sources:
-        if source in seen or not source.is_file():
+        if source in seen or not cache_root_is_valid:
             continue
-        if source.is_symlink():
-            full_cache_retained = False
-            full_cache_error = (
-                full_cache_error
-                or f"refusing symlink in failed cache evidence: {source}"
+        try:
+            source_is_regular = _diagnostic_cache_source_is_regular(
+                cache_root, source
             )
+        except ToolchainError as cache_error:
+            full_cache_retained = False
+            full_cache_error = full_cache_error or str(cache_error)
+            continue
+        if not source_is_regular:
             continue
         seen.add(source)
         relative = source.relative_to(cache_root)
@@ -5693,6 +6302,7 @@ def _raise_archive_failure(
     attempt_slug: str,
     archive_path: Path,
     sidecar_path: Path,
+    additional_artifacts: Sequence[Path] = (),
 ) -> None:
     failure_path = _preserve_failed_case_evidence(
         checkout,
@@ -5701,7 +6311,7 @@ def _raise_archive_failure(
         scan_log_path,
         error,
         attempt_slug,
-        publication_artifacts=[archive_path, sidecar_path],
+        publication_artifacts=[archive_path, sidecar_path, *additional_artifacts],
     )
     raise ToolchainError(f"{error}; failure evidence={failure_path}") from error
 
@@ -5716,6 +6326,7 @@ def _resume_ready_case(
     toolchain_lock_digest: str,
     inventory_digest: str,
     inventory_file_sha256: str,
+    receipt_scan_flags: Sequence[str] = QUALIFICATION_SCAN_FLAGS,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     catalog = _load_cache_catalog(output_root)
     candidates = [
@@ -5769,7 +6380,7 @@ def _resume_ready_case(
         or receipt.get("inventory_file_sha256") != inventory_file_sha256
         or receipt.get("case_inventory_digest")
         != inventory_case.get("per_file_digest")
-        or receipt.get("scan_flags") != QUALIFICATION_SCAN_FLAGS
+        or receipt.get("scan_flags") != list(receipt_scan_flags)
     ):
         raise ToolchainError(
             f"resume receipt frozen identity mismatch for {instance['instance_id']}"
@@ -6829,6 +7440,293 @@ def _select_qualification_instances(
     return selected
 
 
+def _qualification_scan_command(
+    rna_binary: Path, checkout: Path, *, combined_cache: bool
+) -> list[str]:
+    command = [
+        str(rna_binary),
+        "--business-context",
+        "disabled",
+        "scan",
+        "--repo",
+        str(checkout),
+        "--full",
+    ]
+    if not combined_cache:
+        command.append("--no-embed")
+    command.append("--timings")
+    return command
+
+
+def _scan_phase_timings(checkout: Path) -> dict[str, int | str]:
+    store = load_json_object(
+        checkout / ".oh/.cache/operation_reports.json",
+        "combined scan operation report store",
+    )
+    reports = store.get("reports")
+    if not isinstance(reports, list):
+        raise ToolchainError("combined scan operation report store has no reports")
+    candidates = [
+        report
+        for report in reports
+        if isinstance(report, dict)
+        and report.get("operation") in {"scan", "full_rebuild", "incremental_refresh"}
+        and report.get("state") == "completed"
+    ]
+    if not candidates:
+        raise ToolchainError("combined scan has no completed persisted operation report")
+    report = candidates[-1]
+    total_ms = report.get("duration_ms")
+    phases = report.get("phases")
+    if type(total_ms) is not int or total_ms < 0 or not isinstance(phases, list):
+        raise ToolchainError("combined scan persisted timing evidence is malformed")
+    embedding_phases = [
+        phase
+        for phase in phases
+        if isinstance(phase, dict) and phase.get("phase") == "embeddings"
+    ]
+    if len(embedding_phases) != 1:
+        raise ToolchainError("combined scan must persist one embeddings timing phase")
+    embedding_phase = embedding_phases[0]
+    semantic_ms = embedding_phase.get("duration_ms")
+    if embedding_phase.get("state") != "ran" or type(semantic_ms) is not int:
+        raise ToolchainError("combined scan embeddings phase did not run with timing evidence")
+    if semantic_ms < 0 or semantic_ms > total_ms:
+        raise ToolchainError("combined scan embeddings timing exceeds total scan time")
+    persistence_phases = [
+        phase
+        for phase in phases
+        if isinstance(phase, dict) and phase.get("phase") == "persist_graph"
+    ]
+    if len(persistence_phases) != 1:
+        raise ToolchainError("combined scan must persist one graph-persistence timing phase")
+    persistence_phase = persistence_phases[0]
+    persistence_ms = persistence_phase.get("duration_ms")
+    if persistence_phase.get("state") != "ran" or type(persistence_ms) is not int:
+        raise ToolchainError("combined scan graph-persistence phase did not run")
+    if persistence_ms < 0 or persistence_ms > total_ms:
+        raise ToolchainError("combined scan persistence timing exceeds total scan time")
+    return {
+        "operation_id": _require_string(
+            report.get("operation_id"), "combined scan operation ID"
+        ),
+        "total_ms": total_ms,
+        "structural_ms": total_ms - semantic_ms,
+        "semantic_ms": semantic_ms,
+        "persistence_ms": persistence_ms,
+    }
+
+
+def _structural_projection_checkout(checkout: Path, destination: Path) -> Path:
+    """Hardlink-copy only structural cache bytes for #785's unchanged archiver."""
+    if destination.exists() or destination.is_symlink():
+        raise ToolchainError("structural projection checkout destination already exists")
+    source_cache = checkout / ".oh/.cache"
+    if not source_cache.is_dir() or source_cache.is_symlink():
+        raise ToolchainError("combined checkout cache is missing or is a symlink")
+    destination_cache = destination / ".oh/.cache"
+    destination_cache.parent.mkdir(parents=True)
+
+    def ignore_semantic_root(directory: str, names: list[str]) -> set[str]:
+        if Path(directory) == source_cache and "embeddings" in names:
+            return {"embeddings"}
+        return set()
+
+    shutil.copytree(
+        source_cache,
+        destination_cache,
+        symlinks=True,
+        copy_function=os.link,
+        ignore=ignore_semantic_root,
+    )
+    if (destination_cache / "embeddings").exists() or (
+        destination_cache / "embeddings"
+    ).is_symlink():
+        raise ToolchainError("structural projection retained semantic cache bytes")
+    return destination
+
+
+def _require_resumed_combined_cache(
+    combined: Any,
+    *,
+    output_root: Path,
+    cohort_case: Mapping[str, Any],
+    case_index: int,
+    instance: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    receipt_path = Path(
+        _require_string(cohort_case.get("receipt_path"), "combined resume receipt path")
+    )
+    receipt = load_json_object(receipt_path, "combined resume case receipt")
+    combined_receipt = receipt.get("combined_cache")
+    if not isinstance(combined_receipt, dict):
+        raise ToolchainError("combined resume receipt has no combined cache identity")
+    validated = combined._validate_receipt(combined_receipt, verify_bytes=True)
+    catalog = combined.load_combined_cache_catalog(output_root)
+    if validated not in catalog["entries"]:
+        raise ToolchainError("combined resume receipt is absent from the immutable catalog")
+    verified = combined.verify_combined_cache_archive(
+        Path(validated["archive_path"]),
+        Path(validated["sidecar_path"]),
+        expected={
+            "repository": instance["repo"],
+            "commit": instance["base_commit"],
+            "scan_flags": COMBINED_QUALIFICATION_SCAN_FLAGS,
+            "runtime": runtime,
+        },
+    )
+    if (
+        validated["case"]["case_index"] != case_index
+        or validated["case"]["instance_id"] != instance["instance_id"]
+        or verified["core"]["case"] != validated["case"]
+    ):
+        raise ToolchainError("combined resume cache is not bound to the frozen case")
+    return validated
+
+
+def _latest_verified_combined_case(
+    combined: Any,
+    *,
+    output_root: Path,
+    case_index: int,
+    instance: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    catalog = combined.load_combined_cache_catalog(output_root)
+    matches = [
+        entry
+        for entry in catalog["entries"]
+        if entry["case"]["case_index"] == case_index
+        and entry["case"]["instance_id"] == instance["instance_id"]
+        and entry["repository"] == instance["repo"]
+        and entry["commit"] == instance["base_commit"]
+    ]
+    if not matches:
+        raise ToolchainError(
+            f"combined qualification case {case_index} has no verifier-clean READY cache"
+        )
+    matches.sort(key=lambda entry: entry["case"]["attempt_index"])
+    receipt = combined._validate_receipt(matches[-1], verify_bytes=True)
+    verified = combined.verify_combined_cache_archive(
+        Path(receipt["archive_path"]),
+        Path(receipt["sidecar_path"]),
+        expected={
+            "repository": instance["repo"],
+            "commit": instance["base_commit"],
+            "scan_flags": COMBINED_QUALIFICATION_SCAN_FLAGS,
+            "runtime": runtime,
+        },
+    )
+    if verified["core"]["case"] != receipt["case"]:
+        raise ToolchainError(
+            f"combined qualification case {case_index} receipt/archive identity mismatch"
+        )
+    return receipt, verified
+
+
+def _require_actual_combined_incremental_lineage(
+    combined: Any,
+    first_receipt: Mapping[str, Any],
+    first_verified: Mapping[str, Any],
+    second_receipt: Mapping[str, Any],
+    second_verified: Mapping[str, Any],
+) -> None:
+    first_core = first_verified["core"]
+    second_core = second_verified["core"]
+    if (
+        first_receipt.get("base_combined_cache") is not None
+        or first_core.get("base_combined_cache") is not None
+    ):
+        raise ToolchainError("combined qualification case 1 must be a cold cache")
+    expected_base = combined.combined_base_identity(first_verified)
+    second_bases = (
+        second_receipt.get("base_combined_cache"),
+        second_core.get("base_combined_cache"),
+    )
+    if any(base is None for base in second_bases):
+        raise ToolchainError(
+            "combined qualification case 2 has null case-1 cache lineage"
+        )
+    if any(base != expected_base for base in second_bases):
+        raise ToolchainError(
+            "combined qualification case 2 names the wrong immutable case-1 cache"
+        )
+    work = second_core["work"]
+    if (
+        work["structural_inherited_file_count"] <= 0
+        or work["structural_inherited_operation_count"] <= 0
+        or work["vector_inherited_count"] <= 0
+    ):
+        raise ToolchainError(
+            "combined qualification case 2 is cold instead of incrementally inherited"
+        )
+
+
+def _require_combined_case2_selection(
+    combined: Any,
+    *,
+    output_root: Path,
+    first_case_index: int,
+    first_instance: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
+) -> None:
+    first_receipt, first_verified = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=first_case_index,
+        instance=first_instance,
+        runtime=runtime,
+    )
+    if (
+        first_receipt["base_combined_cache"] is not None
+        or first_verified["core"]["base_combined_cache"] is not None
+    ):
+        raise ToolchainError("combined qualification case 1 must be a cold cache")
+    if selection is None:
+        raise ToolchainError(
+            "combined qualification case 2 cannot cold-rebuild without case-1 lineage"
+        )
+    expected_base = combined.combined_base_identity(first_verified)
+    if (
+        selection.get("base_combined_cache") != expected_base
+        or combined.combined_base_identity(selection["verified"]) != expected_base
+        or selection["receipt"] != first_receipt
+    ):
+        raise ToolchainError(
+            "combined qualification case 2 selected the wrong immutable case-1 cache"
+        )
+
+
+def _require_combined_pair_ready(
+    combined: Any,
+    *,
+    output_root: Path,
+    indexed_instances: Sequence[tuple[int, Mapping[str, Any]]],
+    runtime: Mapping[str, Any],
+) -> None:
+    if len(indexed_instances) < 2:
+        raise ToolchainError("combined qualification has no frozen case-1/case-2 pair")
+    first_case = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=indexed_instances[0][0],
+        instance=indexed_instances[0][1],
+        runtime=runtime,
+    )
+    second_case = _latest_verified_combined_case(
+        combined,
+        output_root=output_root,
+        case_index=indexed_instances[1][0],
+        instance=indexed_instances[1][1],
+        runtime=runtime,
+    )
+    _require_actual_combined_incremental_lineage(
+        combined, *first_case, *second_case
+    )
+
+
 def qualify_population(
     lock_path: Path,
     inventory_path: Path,
@@ -6850,12 +7748,19 @@ def qualify_population(
     resume_replay_checkout: Path | None = None,
     resume_replay_receipt: Path | None = None,
     resume_replay_receipt_sha256: str | None = None,
+    combined_runtime_manifest: Path | None = None,
+    combined_bundle_archive: Path | None = None,
+    combined_upload_attestation: Path | None = None,
+    combined_expected_manifest_sha256: str | None = None,
+    combined_expected_upload_attestation_sha256: str | None = None,
+    combined_expected_github_artifact_digest: str | None = None,
+    combined_expected_head_sha: str | None = None,
 ) -> dict[str, Any]:
     rna_binary = rna_binary.resolve()
     verification = verify_lock(lock_path, inventory_path, None, None, repo_root)
     if not verification["compatible"]:
         raise ToolchainError("cannot qualify a lock with unsupported languages")
-    if not rna_binary.is_file():
+    if combined_runtime_manifest is None and not rna_binary.is_file():
         raise ToolchainError(f"RNA binary is missing: {rna_binary}")
     if not math.isfinite(case_timeout_seconds) or case_timeout_seconds <= 0:
         raise ToolchainError("case timeout must be a positive finite number")
@@ -6875,6 +7780,90 @@ def qualify_population(
     if set(inventory_cases) != {instance["instance_id"] for instance in instances}:
         raise ToolchainError("frozen inventory/population case identities differ")
     toolchain_lock_digest = sha256_file(lock_path)
+    combined = None
+    combined_runtime = None
+    combined_bundle_root = None
+    combined_bundle_verification_receipt = None
+    combined_bundle_verification_directory = None
+    combined_initialization_seconds = 0.0
+    combined_options = (
+        combined_runtime_manifest,
+        combined_bundle_archive,
+        combined_upload_attestation,
+        combined_expected_manifest_sha256,
+        combined_expected_upload_attestation_sha256,
+        combined_expected_github_artifact_digest,
+        combined_expected_head_sha,
+    )
+    if any(value is not None for value in combined_options) and not all(
+        value is not None for value in combined_options
+    ):
+        raise ToolchainError("all combined CI bundle verification options are required")
+    if combined_runtime_manifest is not None:
+        combined_initialization_started = time.monotonic()
+        if isolated_micro_qualification or instance_ids:
+            raise ToolchainError(
+                "combined qualification must preserve the full frozen population order"
+            )
+        if resume_replay_case is not None:
+            raise ToolchainError(
+                "combined qualification cannot publish semantic evidence from structural replay"
+            )
+        from scripts import swebench_combined_cache as combined_module
+        from scripts import verify_swebench_semantic_bundle as bundle_verifier
+
+        combined = combined_module
+        combined_runtime_manifest = combined_runtime_manifest.resolve()
+        combined_bundle_verification_directory = tempfile.TemporaryDirectory(
+            prefix="rna-verified-semantic-bundle-"
+        )
+        verified_output = (
+            Path(combined_bundle_verification_directory.name) / "verified"
+        )
+        try:
+            combined_bundle_verification_receipt = bundle_verifier.verify_bundle(
+                archive=combined_bundle_archive.resolve(),
+                manifest_path=combined_runtime_manifest,
+                upload_attestation_path=combined_upload_attestation.resolve(),
+                output=verified_output,
+                expected_manifest_sha256=combined_expected_manifest_sha256,
+                expected_upload_attestation_sha256=(
+                    combined_expected_upload_attestation_sha256
+                ),
+                expected_github_artifact_digest=(
+                    combined_expected_github_artifact_digest
+                ),
+                expected_head_sha=combined_expected_head_sha,
+            )
+        except bundle_verifier.BundleVerificationError as error:
+            raise ToolchainError(f"combined CI bundle verification failed: {error}") from error
+        combined_bundle_root = verified_output / bundle_verifier.ARCHIVE_ROOT
+        rna_binary = combined_bundle_root / "repo-native-alignment"
+        combined_runtime = combined._project_runtime_manifest(
+            combined_runtime_manifest
+        )
+        runtime_lsp = combined_runtime["projection"]["components"]["lsp"]
+        if (
+            runtime_lsp["toolchain_lock_sha256"] != toolchain_lock_digest
+            or runtime_lsp["inventory_sha256"] != inventory_file_sha256
+        ):
+            raise ToolchainError(
+                "combined CI bundle LSP lock/inventory differs from frozen qualification inputs"
+            )
+        provisioned_identity = _materialize_verified_bundle_toolchain(
+            combined_bundle_root,
+            lock_path,
+            inventory_path,
+            Path(combined_bundle_verification_directory.name)
+            / "private-verified-lsp",
+            repo_root,
+        )
+        toolchain_root = Path(provisioned_identity["toolchain_root"])
+        combined_initialization_seconds = (
+            time.monotonic() - combined_initialization_started
+        )
+    if not rna_binary.is_file():
+        raise ToolchainError(f"RNA binary is missing: {rna_binary}")
     provisioned_identity = _validate_provisioned_toolchain(
         lock_path, inventory_path, toolchain_root
     )
@@ -6884,6 +7873,8 @@ def qualify_population(
         instance_ids,
         isolated_micro_qualification,
     )
+    if combined is not None and len(indexed_instances) < 2:
+        raise ToolchainError("combined qualification requires frozen cases 1 and 2")
     selected_indexes = [index for index, _ in indexed_instances]
     for label, value in (
         ("preflight case", preflight_case),
@@ -6966,24 +7957,79 @@ def qualify_population(
                 "N=70 qualification cannot use an isolated micro output root"
             )
         output_root.mkdir(parents=True, exist_ok=True)
+    combined_bundle_verification_path = None
+    if combined is not None:
+        combined_bundle_evidence = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "verified",
+            "verification": combined_bundle_verification_receipt,
+            "digest": "",
+        }
+        combined_bundle_evidence["digest"] = sha256_bytes(
+            canonical_json(combined_bundle_evidence)
+        )
+        combined_bundle_verification_path = (
+            output_root / "semantic-bundle-verification.json"
+        )
+        _publish_or_verify_canonical_json(
+            combined_bundle_verification_path, combined_bundle_evidence
+        )
     cases_root = output_root / "cases"
     logs_root = output_root / "logs"
     cases_root.mkdir(exist_ok=True)
     logs_root.mkdir(exist_ok=True)
     archives_root = output_root / "structural-caches"
     archives_root.mkdir(exist_ok=True)
+    combined_archives_root = None
+    if combined is not None:
+        combined_archives_root = output_root / "combined-caches"
+        combined_archives_root.mkdir(exist_ok=True)
     qualification_environment_directory = tempfile.TemporaryDirectory(
         prefix="rna-lsp-qualification-environment-"
     )
     environment = toolchain_environment(
         toolchain_root, Path(qualification_environment_directory.name)
     )
+    if combined is not None:
+        projection = combined_runtime["projection"]
+        embedding = projection["components"]["embedding"]
+        reranker = projection["components"]["reranker"]
+        environment.update(
+            {
+                "HF_HOME": str(combined_bundle_root / "components/models/huggingface"),
+                "FASTEMBED_CACHE_DIR": str(
+                    combined_bundle_root / "components/models/reranker"
+                ),
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "CANDLE_METAL_ENABLE_FAST_MATH": "1",
+                "RNA_EMBEDDING_MODEL_FILES_DIGEST": embedding["files_digest"],
+                "RNA_EMBEDDING_MODEL_SHA256": embedding["assets"][
+                    "model.safetensors"
+                ]["sha256"],
+                "RNA_EMBEDDING_TOKENIZER_SHA256": embedding["assets"][
+                    "tokenizer.json"
+                ]["sha256"],
+                "RNA_RERANKER_MODEL_FILES_DIGEST": reranker["files_digest"],
+            }
+        )
+        bind_hf_default_cache(
+            Path(environment["HF_HOME"]), Path(environment["HOME"])
+        )
+        environment.pop("RNA_SEMANTIC_ASSET_SEEDING", None)
     probe_path = output_root / "probe.json"
     probe_seconds = 0.0
     probe_performed = False
     cohort_cases = []
     timing_cases = []
     for index, instance in indexed_instances:
+        if combined is not None and index > indexed_instances[1][0]:
+            _require_combined_pair_ready(
+                combined,
+                output_root=output_root,
+                indexed_instances=indexed_instances,
+                runtime=combined_runtime,
+            )
         instance_id = instance["instance_id"]
         resumed = _resume_ready_case(
             output_root=output_root,
@@ -6994,6 +8040,11 @@ def qualify_population(
             toolchain_lock_digest=toolchain_lock_digest,
             inventory_digest=inventory_digest,
             inventory_file_sha256=inventory_file_sha256,
+            receipt_scan_flags=(
+                COMBINED_QUALIFICATION_SCAN_FLAGS
+                if combined is not None
+                else QUALIFICATION_SCAN_FLAGS
+            ),
         )
         if resumed is not None:
             if preflight_case == index:
@@ -7001,6 +8052,31 @@ def qualify_population(
                     f"preflight case {index} already has verifier-clean READY evidence"
                 )
             cohort_case, timing_case = resumed
+            if combined is not None:
+                combined_receipt = _require_resumed_combined_cache(
+                    combined,
+                    output_root=output_root,
+                    cohort_case=cohort_case,
+                    case_index=index,
+                    instance=instance,
+                    runtime=combined_runtime,
+                )
+                cohort_case["combined_archive_sha256"] = combined_receipt[
+                    "archive_sha256"
+                ]
+                timing_case["semantic_update_ms"] = combined_receipt["timings_ms"][
+                    "semantic_update_ms"
+                ]
+                timing_case["combined_cache_archive_ms"] = combined_receipt[
+                    "publication_metrics"
+                ]["combined_archive_ms"]
+                if index == indexed_instances[1][0]:
+                    _require_combined_pair_ready(
+                        combined,
+                        output_root=output_root,
+                        indexed_instances=indexed_instances,
+                        runtime=combined_runtime,
+                    )
             cohort_cases.append(cohort_case)
             timing_cases.append(timing_case)
             if stop_after_case == index:
@@ -7047,6 +8123,7 @@ def qualify_population(
             )
         attempt_index = _next_case_attempt_index(output_root, instance_id)
         attempt_slug = f"{instance_id}-attempt-{attempt_index:03d}"
+        case_started = time.monotonic()
         git_dir = git_cache_path(git_cache_root, instance["repo"])
         if not git_dir.is_dir():
             raise ToolchainError(f"missing git cache for {instance['repo']}")
@@ -7128,20 +8205,56 @@ def qualify_population(
                     f"failure evidence={failure_path}"
                 ) from error
             selection_started = time.monotonic()
+            combined_selection = None
+            combined_injection = None
             try:
                 selection_diagnostics: dict[str, Any] = {}
-                selection = select_structural_cache(
-                    output_root,
-                    instance["repo"],
-                    instance["base_commit"],
-                    target_identity,
-                    git_dir,
-                    index,
-                    toolchain_lock_digest=toolchain_lock_digest,
-                    inventory_digest=inventory_digest,
-                    inventory_file_sha256=inventory_file_sha256,
-                    diagnostics=selection_diagnostics,
-                )
+                if combined is None:
+                    selection = select_structural_cache(
+                        output_root,
+                        instance["repo"],
+                        instance["base_commit"],
+                        target_identity,
+                        git_dir,
+                        index,
+                        toolchain_lock_digest=toolchain_lock_digest,
+                        inventory_digest=inventory_digest,
+                        inventory_file_sha256=inventory_file_sha256,
+                        diagnostics=selection_diagnostics,
+                    )
+                else:
+                    combined_catalog = combined.load_combined_cache_catalog(
+                        output_root
+                    )
+                    combined_selection = combined.select_combined_cache(
+                        combined_catalog["entries"],
+                        instance["repo"],
+                        instance["base_commit"],
+                        target_identity,
+                        git_dir,
+                        index,
+                        runtime_manifest_path=combined_runtime_manifest,
+                        semantic_identity=None,
+                        scan_flags=COMBINED_QUALIFICATION_SCAN_FLAGS,
+                        toolchain_lock_digest=toolchain_lock_digest,
+                        inventory_digest=inventory_digest,
+                        inventory_file_sha256=inventory_file_sha256,
+                        diagnostics=selection_diagnostics,
+                    )
+                    if index == indexed_instances[1][0]:
+                        _require_combined_case2_selection(
+                            combined,
+                            output_root=output_root,
+                            first_case_index=indexed_instances[0][0],
+                            first_instance=indexed_instances[0][1],
+                            runtime=combined_runtime,
+                            selection=combined_selection,
+                        )
+                    selection = (
+                        combined_selection["structural_selection"]
+                        if combined_selection is not None
+                        else None
+                    )
                 _validate_selected_partition_plan(selection, target_identity)
             except Exception as error:
                 cache_preparation_log_path.write_text(f"{type(error).__name__}: {error}\n")
@@ -7157,44 +8270,65 @@ def qualify_population(
                     f"cache selection failed for {instance_id}; "
                     f"failure evidence={failure_path}"
                 ) from error
-            selection_seconds = time.monotonic() - selection_started
-            verification_seconds = 0.0
+            selection_wall_seconds = time.monotonic() - selection_started
+            verification_seconds = float(
+                selection_diagnostics.get("verification_seconds", 0.0)
+            )
+            selection_seconds = max(
+                0.0, selection_wall_seconds - verification_seconds
+            )
             injection_seconds = 0.0
             injection_receipt = None
             if selection is not None:
                 try:
-                    materialized_cache = Path(temporary) / "verified-structural-cache"
-                    verification_started = time.monotonic()
-                    verified = verify_structural_cache_archive(
-                        Path(selection["entry"]["archive_path"]),
-                        Path(selection["entry"]["sidecar_path"]),
-                        expected={
-                            "repository": instance["repo"],
-                            "root_slug": target_identity["root_slug"],
-                            "producer": target_identity["producer"],
-                            "toolchain_lock_digest": toolchain_lock_digest,
-                            "inventory_digest": inventory_digest,
-                            "inventory_file_sha256": inventory_file_sha256,
-                            "inventory_policy_digest": target_identity[
-                                "inventory_policy_digest"
-                            ],
-                            "scan_flags": QUALIFICATION_SCAN_FLAGS,
-                        },
-                        materialize_cache=materialized_cache,
-                    )
-                    verification_seconds = time.monotonic() - verification_started
                     injection_started = time.monotonic()
-                    injection_receipt = inject_structural_cache(
-                        selection,
-                        checkout,
-                        target_identity,
-                        git_dir,
-                        toolchain_lock_digest=toolchain_lock_digest,
-                        inventory_digest=inventory_digest,
-                        inventory_file_sha256=inventory_file_sha256,
-                        verified=verified,
-                        materialized_cache=materialized_cache,
-                    )
+                    if combined is None:
+                        materialized_cache = (
+                            Path(temporary) / "verified-structural-cache"
+                        )
+                        verification_started = time.monotonic()
+                        verified = verify_structural_cache_archive(
+                            Path(selection["entry"]["archive_path"]),
+                            Path(selection["entry"]["sidecar_path"]),
+                            expected={
+                                "repository": instance["repo"],
+                                "root_slug": target_identity["root_slug"],
+                                "producer": target_identity["producer"],
+                                "toolchain_lock_digest": toolchain_lock_digest,
+                                "inventory_digest": inventory_digest,
+                                "inventory_file_sha256": inventory_file_sha256,
+                                "inventory_policy_digest": target_identity[
+                                    "inventory_policy_digest"
+                                ],
+                                "scan_flags": QUALIFICATION_SCAN_FLAGS,
+                            },
+                            materialize_cache=materialized_cache,
+                        )
+                        verification_seconds += time.monotonic() - verification_started
+                        injection_receipt = inject_structural_cache(
+                            selection,
+                            checkout,
+                            target_identity,
+                            git_dir,
+                            toolchain_lock_digest=toolchain_lock_digest,
+                            inventory_digest=inventory_digest,
+                            inventory_file_sha256=inventory_file_sha256,
+                            verified=verified,
+                            materialized_cache=materialized_cache,
+                        )
+                    else:
+                        combined_injection = combined.inject_combined_cache(
+                            combined_selection,
+                            checkout,
+                            target_identity,
+                            git_dir,
+                            toolchain_lock_digest=toolchain_lock_digest,
+                            inventory_digest=inventory_digest,
+                            inventory_file_sha256=inventory_file_sha256,
+                        )
+                        injection_receipt = combined_injection[
+                            "structural_injection"
+                        ]
                     injection_seconds = time.monotonic() - injection_started
                 except Exception as error:
                     cache_preparation_log_path.write_text(
@@ -7271,8 +8405,32 @@ def qualify_population(
             scan_log_path = logs_root / f"{attempt_slug}-scan.log"
             archive_path = archives_root / f"{attempt_slug}.tar.gz"
             sidecar_path = archives_root / f"{attempt_slug}.manifest.json"
+            combined_archive_path = (
+                combined_archives_root / f"{attempt_slug}.tar.gz"
+                if combined_archives_root is not None
+                else None
+            )
+            combined_sidecar_path = (
+                combined_archives_root / f"{attempt_slug}.manifest.json"
+                if combined_archives_root is not None
+                else None
+            )
+            combined_archive_receipt = None
+            semantic_summary = None
+            combined_work = None
+            combined_timings = None
+            combined_peak_memory = None
+            query_evidence = None
+            query_evidence_root = logs_root / f"{attempt_slug}-query-evidence"
+            case_initialization_seconds = (
+                combined_initialization_seconds
+                if combined is not None and index == indexed_instances[0][0]
+                else 0.0
+            )
+            initialization_peak_memory = _peak_memory_bytes()
             try:
-                if not probe_performed:
+                probe_pending = not probe_performed
+                if probe_pending:
                     current_provisioned_identity = _validate_provisioned_toolchain(
                         lock_path, inventory_path, toolchain_root
                     )
@@ -7300,6 +8458,8 @@ def qualify_population(
                         )
                         probe_seconds = time.monotonic() - probe_started
                     probe_performed = True
+                    case_initialization_seconds += probe_seconds
+                initialization_peak_memory = _peak_memory_bytes()
                 if (
                     _validate_provisioned_toolchain(
                         lock_path, inventory_path, toolchain_root
@@ -7310,17 +8470,11 @@ def qualify_population(
                         "provisioned toolchain identity changed before qualification scan"
                     )
                 scan_seconds = _run_logged(
-                    [
-                        str(rna_binary),
-                        "--business-context",
-                        "disabled",
-                        "scan",
-                        "--repo",
-                        str(checkout),
-                        "--full",
-                        "--no-embed",
-                        "--timings",
-                    ],
+                    _qualification_scan_command(
+                        rna_binary,
+                        checkout,
+                        combined_cache=combined is not None,
+                    ),
                     checkout,
                     case_environment,
                     scan_log_path,
@@ -7328,6 +8482,10 @@ def qualify_population(
                     timeout_evidence_path=logs_root
                     / f"{attempt_slug}-scan-timeout.json",
                 )
+                scan_phase_timings = (
+                    _scan_phase_timings(checkout) if combined is not None else None
+                )
+                scan_peak_memory = _peak_memory_bytes()
                 readiness_log_path = logs_root / f"{attempt_slug}-readiness.log"
                 readiness_seconds = _run_logged(
                     [
@@ -7405,9 +8563,108 @@ def qualify_population(
                         "provisioned toolchain identity changed during "
                         "qualification scan/readiness"
                     )
+                execution_counts = execution or {}
+                if combined is not None:
+                    runtime_projection = combined_runtime["projection"]
+                    if (
+                        target_identity["producer"]["binary_sha256"]
+                        != runtime_projection["components"]["executable_sha256"]
+                        or target_identity["producer"]["producer_commit"]
+                        != runtime_projection["provenance"]["head_sha"]
+                    ):
+                        raise ToolchainError(
+                            "combined target identity differs from the exact CI producer"
+                        )
+                    semantic_summary = combined.verify_semantic_cache_root(
+                        checkout / ".oh/.cache/embeddings"
+                    )
+                    if injection_receipt is None:
+                        inherited_paths: list[str] = []
+                        executed_file_count = preflight["predicted_file_counts"][
+                            "executed"
+                        ]
+                    else:
+                        inherited_paths = execution_counts.get("inherited_paths")
+                        executed_paths = execution_counts.get("executed_paths")
+                        if not isinstance(inherited_paths, list) or not isinstance(
+                            executed_paths, list
+                        ):
+                            raise ToolchainError(
+                                "combined structural execution file evidence is malformed"
+                            )
+                        executed_file_count = len(executed_paths)
+                    if combined_injection is None:
+                        vector_inherited_count = 0
+                        vector_encoded_count = semantic_summary["row_count"]
+                        vector_purged_count = 0
+                        base_combined_cache = None
+                    else:
+                        base_combined_cache = combined_injection[
+                            "base_combined_cache"
+                        ]
+                        base_row_count = combined_injection[
+                            "base_semantic_row_count"
+                        ]
+                        if (
+                            semantic_summary["generation_digest"]
+                            == combined_injection[
+                                "base_semantic_generation_digest"
+                            ]
+                        ):
+                            vector_inherited_count = semantic_summary["row_count"]
+                            vector_encoded_count = 0
+                            vector_purged_count = 0
+                        else:
+                            vector_inherited_count = semantic_summary[
+                                "reused_vector_count"
+                            ]
+                            vector_encoded_count = semantic_summary[
+                                "encoded_vector_count"
+                            ]
+                            if vector_inherited_count > base_row_count:
+                                raise ToolchainError(
+                                    "combined semantic reuse exceeds the immutable base"
+                                )
+                            vector_purged_count = (
+                                base_row_count - vector_inherited_count
+                            )
+                    combined_work = {
+                        "structural_inherited_file_count": len(inherited_paths),
+                        "structural_executed_file_count": executed_file_count,
+                        "structural_invalidated_file_count": execution_counts.get(
+                            "invalidated_file_count", 0
+                        ),
+                        "structural_inherited_operation_count": execution_counts.get(
+                            "inherited_graph_enrichment_operation_count", 0
+                        ),
+                        "structural_executed_operation_count": execution_counts.get(
+                            "executed_graph_enrichment_operation_count",
+                            cold_executed_graph_enrichment_operation_count,
+                        ),
+                        "vector_inherited_count": vector_inherited_count,
+                        "vector_encoded_count": vector_encoded_count,
+                        "vector_purged_count": vector_purged_count,
+                    }
+                    query_evidence = _run_combined_query_probes(
+                        combined=combined,
+                        rna_binary=rna_binary,
+                        checkout=checkout,
+                        environment=case_environment,
+                        evidence_root=query_evidence_root,
+                        case_identity={
+                            "case_index": index,
+                            "attempt_index": attempt_index,
+                            "instance_id": instance_id,
+                        },
+                    )
                 archive_started = time.monotonic()
+                archive_checkout = checkout
+                if combined is not None:
+                    archive_checkout = _structural_projection_checkout(
+                        checkout, Path(temporary) / "structural-archive-checkout"
+                    )
                 archive_receipt = archive_structural_cache(
-                    checkout,
+                    archive_checkout,
                     archive_path,
                     sidecar_path,
                     identity=target_identity,
@@ -7436,6 +8693,95 @@ def qualify_population(
                     ),
                 )
                 archive_seconds = time.monotonic() - archive_started
+                if combined is not None:
+                    if query_evidence is None:
+                        raise ToolchainError("combined query evidence was not produced")
+                    query_probes = query_evidence["probes"]
+                    prepublication_total_ms = int(
+                        (
+                            time.monotonic()
+                            - case_started
+                            + (
+                                combined_initialization_seconds
+                                if index == indexed_instances[0][0]
+                                else 0.0
+                            )
+                        )
+                        * 1000
+                    )
+                    combined_timings = {
+                        "cache_selection_ms": int(selection_seconds * 1000),
+                        "cache_verification_ms": int(verification_seconds * 1000),
+                        "cache_injection_ms": int(injection_seconds * 1000),
+                        "initialization_ms": int(
+                            case_initialization_seconds * 1000
+                        ),
+                        "structural_update_ms": scan_phase_timings["structural_ms"],
+                        "semantic_update_ms": scan_phase_timings["semantic_ms"],
+                        "persistence_ms": scan_phase_timings["persistence_ms"],
+                        "full_readiness_validation_ms": int(
+                            readiness_seconds * 1000
+                        ),
+                        "query_hybrid_rrf_ms": query_probes[
+                            "first_hybrid_rerank"
+                        ]["duration_ms"],
+                        "query_graph_traversal_ms": query_probes[
+                            "graph_traversal"
+                        ]["duration_ms"],
+                        "query_full_body_ms": query_probes["full_body"][
+                            "duration_ms"
+                        ],
+                        "query_minified_body_ms": query_probes["minified_body"][
+                            "duration_ms"
+                        ],
+                        "query_repeat_stability_ms": (
+                            query_probes["repeat_hybrid_1"]["duration_ms"]
+                            + query_probes["repeat_hybrid_2"]["duration_ms"]
+                        ),
+                        "first_query_ttfe_ms": query_probes[
+                            "first_hybrid_rerank"
+                        ]["ttfe_ms"],
+                        "first_rerank_ms": query_probes["first_hybrid_rerank"][
+                            "duration_ms"
+                        ],
+                        "warm_query_ms": query_probes["warm_hybrid_rerank"][
+                            "duration_ms"
+                        ],
+                        "structural_cache_archive_ms": int(
+                            archive_seconds * 1000
+                        ),
+                        "prepublication_total_ms": prepublication_total_ms,
+                    }
+                    combined_peak_memory = {
+                        "initialization_bytes": initialization_peak_memory,
+                        "scan_update_bytes": scan_peak_memory,
+                        "persistence_bytes": scan_peak_memory,
+                        "query_rerank_bytes": query_evidence[
+                            "peak_memory_bytes"
+                        ],
+                    }
+                    combined_archive_receipt = combined.archive_combined_cache(
+                        archive_path,
+                        sidecar_path,
+                        checkout / ".oh/.cache/embeddings",
+                        combined_runtime_manifest,
+                        query_evidence_root,
+                        combined_archive_path,
+                        combined_sidecar_path,
+                        case_identity={
+                            "case_index": index,
+                            "attempt_index": attempt_index,
+                            "instance_id": instance_id,
+                        },
+                        repository=instance["repo"],
+                        commit=instance["base_commit"],
+                        tree=target_identity["tree"],
+                        scan_flags=COMBINED_QUALIFICATION_SCAN_FLAGS,
+                        work=combined_work,
+                        timings_ms=combined_timings,
+                        peak_memory_bytes=combined_peak_memory,
+                        base_combined_cache=base_combined_cache,
+                    )
             except Exception as error:
                 _raise_archive_failure(
                     checkout=checkout,
@@ -7446,8 +8792,27 @@ def qualify_population(
                     attempt_slug=attempt_slug,
                     archive_path=archive_path,
                     sidecar_path=sidecar_path,
+                    additional_artifacts=(
+                        (
+                            [combined_archive_path, combined_sidecar_path]
+                            if combined_archive_path is not None
+                            and combined_sidecar_path is not None
+                            else []
+                        )
+                        + (
+                            sorted(query_evidence_root.iterdir())
+                            if query_evidence_root.is_dir()
+                            else []
+                        )
+                    ),
                 )
             publication_artifacts = [archive_path, sidecar_path]
+            if combined_archive_path is not None and combined_sidecar_path is not None:
+                publication_artifacts.extend(
+                    [combined_archive_path, combined_sidecar_path]
+                )
+            if query_evidence_root.is_dir():
+                publication_artifacts.extend(sorted(query_evidence_root.iterdir()))
             publication_log_path = logs_root / f"{attempt_slug}-publication.log"
             try:
                 report_path = cases_root / f"{attempt_slug}.json"
@@ -7472,7 +8837,11 @@ def qualify_population(
                         "per_file_digest"
                     ],
                     "configuration_digest": target_identity["configuration_digest"],
-                    "scan_flags": QUALIFICATION_SCAN_FLAGS,
+                    "scan_flags": (
+                        COMBINED_QUALIFICATION_SCAN_FLAGS
+                        if combined is not None
+                        else QUALIFICATION_SCAN_FLAGS
+                    ),
                     "preflight_path": str(preflight_path.resolve()),
                     "preflight_sha256": sha256_file(preflight_path),
                     "preflight_digest": preflight["digest"],
@@ -7512,6 +8881,103 @@ def qualify_population(
                         cold_executed_readiness_validation_request_count,
                     ),
                 }
+                if combined is not None:
+                    case_receipt["combined_cache"] = combined_archive_receipt
+                    case_receipt["semantic"] = {
+                        "generation_digest": semantic_summary["generation_digest"],
+                        "semantic_identity": semantic_summary["semantic_identity"],
+                        "semantic_identity_digest": semantic_summary[
+                            "semantic_identity_digest"
+                        ],
+                        "manifest_sha256": semantic_summary["manifest_sha256"],
+                        "verification_sha256": semantic_summary[
+                            "verification_sha256"
+                        ],
+                        "row_count": semantic_summary["row_count"],
+                        "reused_vector_count": semantic_summary[
+                            "reused_vector_count"
+                        ],
+                        "encoded_vector_count": semantic_summary[
+                            "encoded_vector_count"
+                        ],
+                        "prior_generation_digest": semantic_summary[
+                            "prior_generation_digest"
+                        ],
+                        "work": combined_work,
+                        "scan_operation": scan_phase_timings,
+                        "runtime_manifest_sha256": combined_runtime[
+                            "manifest_sha256"
+                        ],
+                        "bundle_verification_path": str(
+                            combined_bundle_verification_path.resolve()
+                        ),
+                        "bundle_verification_sha256": sha256_file(
+                            combined_bundle_verification_path
+                        ),
+                        "query_evidence_path": str(
+                            query_evidence["receipt_path"].resolve()
+                        ),
+                        "query_evidence_sha256": query_evidence[
+                            "receipt_sha256"
+                        ],
+                        "query_evidence_digest": query_evidence[
+                            "evidence_digest"
+                        ],
+                        "query_evidence_tree_digest": combined_archive_receipt[
+                            "query_evidence_tree_digest"
+                        ],
+                    }
+                    case_receipt["timings_ms"].update(
+                        {
+                            "initialization": combined_timings[
+                                "initialization_ms"
+                            ],
+                            "structural_update": combined_timings[
+                                "structural_update_ms"
+                            ],
+                            "semantic_update": combined_timings[
+                                "semantic_update_ms"
+                            ],
+                            "persistence": combined_timings["persistence_ms"],
+                            "query_hybrid_rrf": combined_timings[
+                                "query_hybrid_rrf_ms"
+                            ],
+                            "query_graph_traversal": combined_timings[
+                                "query_graph_traversal_ms"
+                            ],
+                            "query_full_body": combined_timings[
+                                "query_full_body_ms"
+                            ],
+                            "query_minified_body": combined_timings[
+                                "query_minified_body_ms"
+                            ],
+                            "query_repeat_stability": combined_timings[
+                                "query_repeat_stability_ms"
+                            ],
+                            "first_query_ttfe": combined_timings[
+                                "first_query_ttfe_ms"
+                            ],
+                            "first_rerank": combined_timings[
+                                "first_rerank_ms"
+                            ],
+                            "warm_query": combined_timings["warm_query_ms"],
+                            "combined_cache_archive": combined_archive_receipt[
+                                "publication_metrics"
+                            ]["combined_archive_ms"],
+                            "total": combined_archive_receipt[
+                                "publication_metrics"
+                            ]["total_ms"],
+                        }
+                    )
+                    case_receipt["peak_memory_bytes"] = {
+                        **combined_peak_memory,
+                        "archive_bytes": combined_archive_receipt[
+                            "publication_metrics"
+                        ]["archive_peak_memory_bytes"],
+                        "total_bytes": combined_archive_receipt[
+                            "publication_metrics"
+                        ]["total_peak_memory_bytes"],
+                    }
                 case_receipt["receipt_digest"] = sha256_bytes(
                     canonical_json(case_receipt)
                 )
@@ -7540,6 +9006,19 @@ def qualify_population(
                         "receipt_sha256": sha256_file(case_receipt_path),
                     },
                 )
+                combined_catalog_path = None
+                if combined is not None:
+                    combined_catalog_path = combined.publish_combined_cache_receipt(
+                        output_root, combined_archive_receipt
+                    )
+                    publication_artifacts.append(combined_catalog_path)
+                    if index == indexed_instances[1][0]:
+                        _require_combined_pair_ready(
+                            combined,
+                            output_root=output_root,
+                            indexed_instances=indexed_instances,
+                            runtime=combined_runtime,
+                        )
                 cohort_cases.append(
                     {
                         "instance_id": instance_id,
@@ -7551,6 +9030,21 @@ def qualify_population(
                         "archive_sha256": archive_receipt["archive_sha256"],
                         "sidecar_sha256": archive_receipt["sidecar_sha256"],
                         "core_sha256": archive_receipt["core_sha256"],
+                        **(
+                            {
+                                "combined_archive_sha256": combined_archive_receipt[
+                                    "archive_sha256"
+                                ],
+                                "combined_sidecar_sha256": combined_archive_receipt[
+                                    "sidecar_sha256"
+                                ],
+                                "semantic_generation_digest": semantic_summary[
+                                    "generation_digest"
+                                ],
+                            }
+                            if combined is not None
+                            else {}
+                        ),
                     }
                 )
                 timing_cases.append(
@@ -7564,6 +9058,42 @@ def qualify_population(
                         "cache_injection_ms": int(injection_seconds * 1000),
                         "cache_archive_ms": int(archive_seconds * 1000),
                         "report_sha256": sha256_file(report_path),
+                        **(
+                            {
+                                "structural_update_ms": scan_phase_timings[
+                                    "structural_ms"
+                                ],
+                                "semantic_update_ms": scan_phase_timings[
+                                    "semantic_ms"
+                                ],
+                                "persistence_ms": scan_phase_timings[
+                                    "persistence_ms"
+                                ],
+                                "first_query_ttfe_ms": combined_timings[
+                                    "first_query_ttfe_ms"
+                                ],
+                                "first_rerank_ms": combined_timings[
+                                    "first_rerank_ms"
+                                ],
+                                "warm_query_ms": combined_timings[
+                                    "warm_query_ms"
+                                ],
+                                "combined_cache_archive_ms": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["combined_archive_ms"],
+                                "total_ms": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["total_ms"],
+                                "peak_memory_bytes": combined_archive_receipt[
+                                    "publication_metrics"
+                                ]["total_peak_memory_bytes"],
+                                "semantic_generation_digest": semantic_summary[
+                                    "generation_digest"
+                                ],
+                            }
+                            if combined is not None
+                            else {}
+                        ),
                     }
                 )
             except Exception as error:
@@ -7685,6 +9215,13 @@ def qualify_population(
             "duration_ms": int(probe_seconds * 1000),
         },
     }
+    if combined is not None:
+        timings["combined_runtime_manifest_sha256"] = combined_runtime[
+            "manifest_sha256"
+        ]
+        timings["combined_bundle_verification_sha256"] = sha256_file(
+            combined_bundle_verification_path
+        )
     timings["timings_digest"] = sha256_bytes(canonical_json(timings))
     timings_path = output_root / "timings.json"
     write_canonical_json(timings_path, timings)
@@ -7706,6 +9243,16 @@ def qualify_population(
         ],
         "status": "ready",
     }
+    if combined is not None:
+        seal["combined_cache_catalog_sha256"] = sha256_file(
+            output_root / combined.COMBINED_CACHE_CATALOG
+        )
+        seal["combined_runtime_manifest_sha256"] = combined_runtime[
+            "manifest_sha256"
+        ]
+        seal["combined_bundle_verification_sha256"] = sha256_file(
+            combined_bundle_verification_path
+        )
     seal["seal_digest"] = sha256_bytes(canonical_json(seal))
     write_canonical_json(output_root / "seal.json", seal)
     return seal
@@ -7745,6 +9292,10 @@ def build_parser() -> argparse.ArgumentParser:
     seal.add_argument("--source", type=Path, required=True)
     seal.add_argument("--output", type=Path, required=True)
     seal.add_argument("--root-name", required=True)
+
+    bind_hf = subparsers.add_parser("bind-hf-default-cache")
+    bind_hf.add_argument("--hf-home", type=Path, required=True)
+    bind_hf.add_argument("--home", type=Path, required=True)
 
     repo_bundle = subparsers.add_parser("build-repo-parser-bundle")
     repo_bundle.add_argument("--repo", type=Path, default=Path("."))
@@ -7786,6 +9337,13 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--resume-replay-checkout", type=Path)
     qualify.add_argument("--resume-replay-receipt", type=Path)
     qualify.add_argument("--resume-replay-receipt-sha256")
+    qualify.add_argument("--combined-runtime-manifest", type=Path)
+    qualify.add_argument("--combined-bundle-archive", type=Path)
+    qualify.add_argument("--combined-upload-attestation", type=Path)
+    qualify.add_argument("--combined-expected-manifest-sha256")
+    qualify.add_argument("--combined-expected-upload-attestation-sha256")
+    qualify.add_argument("--combined-expected-github-artifact-digest")
+    qualify.add_argument("--combined-expected-head-sha")
     qualify.add_argument("--repo", type=Path, default=Path("."))
     return parser
 
@@ -7811,6 +9369,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "seal-directory":
             result = seal_directory(args.source, args.output, args.root_name)
+        elif args.command == "bind-hf-default-cache":
+            result = bind_hf_default_cache(args.hf_home, args.home)
         elif args.command == "build-repo-parser-bundle":
             result = build_repo_parser_bundle(args.repo.resolve(), args.output)
         elif args.command == "provision":
@@ -7853,6 +9413,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 resume_replay_checkout=args.resume_replay_checkout,
                 resume_replay_receipt=args.resume_replay_receipt,
                 resume_replay_receipt_sha256=args.resume_replay_receipt_sha256,
+                combined_runtime_manifest=args.combined_runtime_manifest,
+                combined_bundle_archive=args.combined_bundle_archive,
+                combined_upload_attestation=args.combined_upload_attestation,
+                combined_expected_manifest_sha256=(
+                    args.combined_expected_manifest_sha256
+                ),
+                combined_expected_upload_attestation_sha256=(
+                    args.combined_expected_upload_attestation_sha256
+                ),
+                combined_expected_github_artifact_digest=(
+                    args.combined_expected_github_artifact_digest
+                ),
+                combined_expected_head_sha=args.combined_expected_head_sha,
             )
         else:  # pragma: no cover - argparse owns this boundary.
             parser.error("unknown command")

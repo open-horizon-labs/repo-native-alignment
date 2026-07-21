@@ -26,6 +26,57 @@ SPEC.loader.exec_module(TOOLCHAIN)
 
 
 class SwebenchLspToolchainTests(unittest.TestCase):
+    def test_minified_body_provenance_accepts_direct_and_wrapped_structural_ast(
+        self,
+    ) -> None:
+        for wrapped in ("false", "true"):
+            with self.subTest(wrapped=wrapped):
+                TOOLCHAIN._require_structural_minification_provenance(
+                    "`owner/repo:file.py:symbol:function`\n"
+                    f"  body_minification.v1 provenance=structural_ast wrapper={wrapped}\n"
+                    "```python\ndef symbol(): ...\n```\n"
+                )
+
+    def test_minified_body_provenance_rejects_non_strict_markers(self) -> None:
+        structural = (
+            "body_minification.v1 provenance=structural_ast wrapper=false"
+        )
+        cases = {
+            "missing": "```python\ndef symbol(): ...\n```\n",
+            "duplicate": f"{structural}\n{structural}\n",
+            "fallback": (
+                "body_minification.v1 provenance=unsupported_language_text\n"
+            ),
+            "failure": (
+                "body_minification.v1 failure language=python "
+                "stage=parse reason=syntax_error\n"
+            ),
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(TOOLCHAIN.ToolchainError):
+                    TOOLCHAIN._require_structural_minification_provenance(stdout)
+
+    def test_esbonio_entrypoint_is_relocatable_and_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first/bin/esbonio"
+            second = root / "different-length-root/bin/esbonio"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_text(f"#!{first.parent}/python\npath dependent\n")
+            second.write_text(f"#!{second.parent}/python\npath dependent\n")
+
+            TOOLCHAIN._write_relocatable_esbonio_entrypoint(first)
+            TOOLCHAIN._write_relocatable_esbonio_entrypoint(second)
+
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(
+                TOOLCHAIN.sha256_file(first), TOOLCHAIN.sha256_file(second)
+            )
+            self.assertTrue(first.stat().st_mode & 0o111)
+            self.assertIn(b"from esbonio.cli import main", first.read_bytes())
+
     def test_case_readiness_uses_live_gate_and_matches_persisted_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "readiness.log"
@@ -110,6 +161,36 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.stdout, "lemminx 0.3.0\n")
+            self.assertEqual(completed.stderr, "")
+
+    def test_node_launcher_reports_locked_version_without_path_bearing_diagnostics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launcher = root / "bin" / "vscode-json-language-server"
+            launcher.parent.mkdir()
+            launcher.write_bytes(
+                TOOLCHAIN._wrapper(
+                    "node",
+                    "missing/server.js",
+                    command_name="vscode-json-language-server",
+                    version="4.10.0",
+                )
+            )
+            launcher.chmod(0o755)
+
+            completed = subprocess.run(
+                [str(launcher), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(
+                completed.stdout,
+                "vscode-json-language-server 4.10.0\n",
+            )
             self.assertEqual(completed.stderr, "")
 
     def test_operation_capabilities_preserve_actual_negotiated_providers(self) -> None:
@@ -252,6 +333,108 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             self.assertEqual(set(retained), {str(archive.resolve()), str(sidecar.resolve())})
             self.assertEqual(retained[str(archive.resolve())]["sha256"], TOOLCHAIN.sha256_file(archive))
             self.assertEqual(retained[str(sidecar.resolve())]["sha256"], TOOLCHAIN.sha256_file(sidecar))
+
+    def test_failed_case_evidence_retains_combined_cache_without_mutating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache"
+            graph = cache / "lance/graph.bin"
+            vectors = cache / "embeddings/generations/generation/lance/vectors.bin"
+            graph.parent.mkdir(parents=True)
+            vectors.parent.mkdir(parents=True)
+            graph.write_bytes(b"persisted graph")
+            vectors.write_bytes(b"persisted vectors")
+            before = {
+                graph: TOOLCHAIN.sha256_file(graph),
+                vectors: TOOLCHAIN.sha256_file(vectors),
+            }
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertTrue(receipt["full_cache_retained"])
+            self.assertIsNone(receipt["full_cache_error"])
+            evidence = {entry["cache_path"]: entry for entry in receipt["evidence"]}
+            self.assertEqual(
+                set(evidence),
+                {
+                    "lance/graph.bin",
+                    "embeddings/generations/generation/lance/vectors.bin",
+                },
+            )
+            evidence_root = root / "cases/owner__repo-1-failure-evidence"
+            for source, digest in before.items():
+                relative = source.relative_to(cache)
+                retained = evidence_root / relative
+                self.assertEqual(TOOLCHAIN.sha256_file(source), digest)
+                self.assertEqual(TOOLCHAIN.sha256_file(retained), digest)
+                self.assertEqual(
+                    evidence[relative.as_posix()]["size_bytes"], source.stat().st_size
+                )
+
+    def test_failed_case_evidence_rejects_symlinked_combined_cache_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache/embeddings"
+            cache.mkdir(parents=True)
+            target = root / "outside.bin"
+            target.write_bytes(b"outside")
+            (cache / "vectors.bin").symlink_to(target)
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertFalse(receipt["full_cache_retained"])
+            self.assertIn("contains a symlink", receipt["full_cache_error"])
+            self.assertFalse(
+                (root / "cases/owner__repo-1-failure-evidence/embeddings/vectors.bin").exists()
+            )
+
+    def test_failed_case_evidence_rejects_symlinked_cache_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            cache = checkout / ".oh/.cache"
+            cache.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "scan_version").write_bytes(b"outside")
+            (cache / "lance").symlink_to(outside, target_is_directory=True)
+            log = root / "scan.log"
+            log.write_text("post-scan failure")
+
+            receipt_path = TOOLCHAIN._preserve_failed_case_evidence(
+                checkout,
+                "owner__repo-1",
+                root / "cases",
+                log,
+                TOOLCHAIN.ToolchainError("query probe failed"),
+            )
+
+            receipt = json.loads(receipt_path.read_text())
+            self.assertFalse(receipt["full_cache_retained"])
+            self.assertIn("symlink", receipt["full_cache_error"])
+            self.assertFalse(
+                (root / "cases/owner__repo-1-failure-evidence/lance/scan_version").exists()
+            )
 
     def test_run_logged_timeout_preserves_evidence_and_kills_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -535,6 +718,30 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertEqual(result["acquisition_recipe_count"], 4)
         self.assertEqual(result["acquisition_artifact_count"], 14)
 
+    def test_real_generated_launcher_digests_match_lock(self) -> None:
+        lock = TOOLCHAIN.load_json_object(
+            ROOT / "benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json",
+            "toolchain lock",
+        )
+        checked = []
+        for entry in lock["servers"]:
+            launcher = entry["launcher"]
+            if launcher["kind"] == "direct":
+                continue
+            generated = TOOLCHAIN._wrapper(
+                launcher["kind"],
+                launcher["target"],
+                command_name=entry["command"],
+                version=entry["version"],
+            )
+            self.assertEqual(
+                TOOLCHAIN.sha256_bytes(generated),
+                entry["executable_sha256"],
+                entry["command"],
+            )
+            checked.append(entry["command"])
+        self.assertGreaterEqual(len(checked), 10)
+
     def test_empty_cache_repo_recipe_verifies_and_provisions_offline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -729,6 +936,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             self.assertEqual(environment["LANG"], "C")
             self.assertEqual(environment["LC_ALL"], "C")
             self.assertEqual(environment["TZ"], "UTC")
+            self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
             self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
             self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
             for key in (
@@ -744,6 +952,173 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                 path = Path(environment[key])
                 self.assertTrue(path.is_dir(), key)
                 self.assertTrue(path.is_relative_to(isolation_root.resolve()), key)
+
+    def test_hf_default_cache_binding_projects_read_only_cache_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hf_home = root / "verified-bundle/components/models/huggingface"
+            source_hub = hf_home / "hub"
+            source_hub.mkdir(parents=True)
+            source_file = source_hub / "sentinel"
+            source_file.write_bytes(b"verified model bytes")
+            isolated_home = root / "isolated/home"
+            isolated_home.mkdir(parents=True)
+
+            source_file.chmod(0o444)
+            source_hub.chmod(0o555)
+            hf_home.chmod(0o555)
+            before = (
+                source_file.read_bytes(),
+                source_file.stat().st_mtime_ns,
+                source_file.stat().st_mode,
+                source_hub.stat().st_mode,
+                hf_home.stat().st_mode,
+            )
+            try:
+                receipt = TOOLCHAIN.bind_hf_default_cache(hf_home, isolated_home)
+                default_hub = isolated_home / ".cache/huggingface/hub"
+                self.assertTrue(default_hub.is_symlink())
+                self.assertEqual(default_hub.resolve(strict=True), source_hub.resolve())
+                self.assertEqual(
+                    (default_hub / "sentinel").read_bytes(), b"verified model bytes"
+                )
+                self.assertEqual(
+                    receipt,
+                    {
+                        "schema_version": TOOLCHAIN.SCHEMA_VERSION,
+                        "status": "bound",
+                        "binding": "symlink",
+                        "default_cache_relative_path": ".cache/huggingface/hub",
+                        "hf_home_relative_path": "hub",
+                    },
+                )
+                after = (
+                    source_file.read_bytes(),
+                    source_file.stat().st_mtime_ns,
+                    source_file.stat().st_mode,
+                    source_hub.stat().st_mode,
+                    hf_home.stat().st_mode,
+                )
+                self.assertEqual(after, before)
+            finally:
+                hf_home.chmod(0o755)
+                source_hub.chmod(0o755)
+                source_file.chmod(0o644)
+
+    def test_hf_default_cache_binding_fails_closed_on_unsafe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            missing_hf_home = root / "missing-hub"
+            missing_hf_home.mkdir()
+            missing_home = root / "missing-home"
+            missing_home.mkdir()
+            with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "hub must be"):
+                TOOLCHAIN.bind_hf_default_cache(missing_hf_home, missing_home)
+
+            symlink_hf_home = root / "symlink-hf-home"
+            symlink_hf_home.mkdir()
+            real_hub = root / "real-hub"
+            real_hub.mkdir()
+            (symlink_hf_home / "hub").symlink_to(
+                real_hub, target_is_directory=True
+            )
+            symlink_home = root / "symlink-home"
+            symlink_home.mkdir()
+            with self.assertRaisesRegex(TOOLCHAIN.ToolchainError, "hub must be"):
+                TOOLCHAIN.bind_hf_default_cache(symlink_hf_home, symlink_home)
+
+            occupied_hf_home = root / "occupied-hf-home"
+            (occupied_hf_home / "hub").mkdir(parents=True)
+            occupied_home = root / "occupied-home"
+            (occupied_home / ".cache/huggingface/hub").mkdir(parents=True)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "destination must be absent"
+            ):
+                TOOLCHAIN.bind_hf_default_cache(occupied_hf_home, occupied_home)
+
+            parent_hf_home = root / "parent-hf-home"
+            (parent_hf_home / "hub").mkdir(parents=True)
+            parent_home = root / "parent-home"
+            parent_home.mkdir()
+            redirected_cache = root / "redirected-cache"
+            redirected_cache.mkdir()
+            (parent_home / ".cache").symlink_to(
+                redirected_cache, target_is_directory=True
+            )
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError, "cache must be a real directory"
+            ):
+                TOOLCHAIN.bind_hf_default_cache(parent_hf_home, parent_home)
+
+    def test_hf_default_cache_binding_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hf_home = root / "hf-home"
+            (hf_home / "hub").mkdir(parents=True)
+            isolated_home = root / "home"
+            isolated_home.mkdir()
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                status = TOOLCHAIN.main(
+                    [
+                        "bind-hf-default-cache",
+                        "--hf-home",
+                        str(hf_home),
+                        "--home",
+                        str(isolated_home),
+                    ]
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "bound")
+            self.assertTrue((isolated_home / ".cache/huggingface/hub").is_symlink())
+
+    def test_semantic_bundle_offline_environment_contract(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/swebench-semantic-bundle.yml"
+        ).read_text()
+        source = MODULE_PATH.read_text()
+        self.assertEqual(workflow.count("bind-hf-default-cache"), 2)
+        self.assertIn(
+            "            unset HF_HOME\n"
+            '            "$BUNDLE_ROOT/repo-native-alignment" search \\\n',
+            workflow,
+        )
+        self.assertIn("components: rust-analyzer", workflow)
+        self.assertIn(
+            'RUST_ANALYZER_BIN="$(rustup which --toolchain 1.97.0 rust-analyzer)"',
+            workflow,
+        )
+        self.assertIn(
+            'export PATH="$RUST_TOOLCHAIN_BIN:$LSP_ROOT/bin:', workflow
+        )
+        self.assertIn("offline-rust-analyzer-version.txt", workflow)
+        self.assertIn("offline-rust-analyzer-sha256.txt", workflow)
+        self.assertIn(
+            'if re.fullmatch(r"[0-9a-f]{64}", artifact_digest):', workflow
+        )
+        self.assertIn(
+            'artifact_digest = f"sha256:{artifact_digest}"', workflow
+        )
+        self.assertIn(
+            'if re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None:',
+            workflow,
+        )
+        self.assertIn('"artifact_digest": artifact_digest', workflow)
+        self.assertIn(
+            '            "$BUNDLE_ROOT/repo-native-alignment" \\\n'
+            "              --business-context disabled \\\n"
+            "              search \\\n",
+            workflow,
+        )
+        self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)
+        self.assertIn(
+            'bind_hf_default_cache(\n            Path(environment["HF_HOME"]), '
+            'Path(environment["HOME"])\n        )',
+            source,
+        )
 
     def test_probe_server_requests_use_initialized_workspace_and_sections(self) -> None:
         rpc = object.__new__(TOOLCHAIN.JsonRpcProcess)
@@ -789,7 +1164,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             ],
         )
 
-    def test_probe_evidence_binds_current_lock_and_rejects_stale_pyright(self) -> None:
+    def test_probe_evidence_binds_stable_identity_across_extraction_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             lock_path = root / "lock.json"
@@ -883,6 +1258,42 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             TOOLCHAIN._validate_toolchain_probe_evidence(
                 probe_path, lock_path, provisioned_identity
             )
+
+            relocated_verifier_clean_identity = copy.deepcopy(provisioned_identity)
+            relocated_verifier_clean_identity["toolchain_root"] = str(
+                (root / "different-bundle-extraction" / "toolchain").resolve()
+            )
+            TOOLCHAIN._validate_toolchain_probe_evidence(
+                probe_path, lock_path, relocated_verifier_clean_identity
+            )
+
+            relative_recorded_root = TOOLCHAIN.load_json_object(
+                probe_path, "test probe"
+            )
+            relative_recorded_root["toolchain_root"] = "relative/toolchain"
+            relative_recorded_root.pop("probe_digest")
+            relative_recorded_root["probe_digest"] = TOOLCHAIN.sha256_bytes(
+                TOOLCHAIN.canonical_json(relative_recorded_root)
+            )
+            TOOLCHAIN.write_canonical_json(probe_path, relative_recorded_root)
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError,
+                "toolchain probe roots must be absolute paths",
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, provisioned_identity
+                )
+
+            probe_path = publish_probe(server_receipt)
+            relative_current_root = copy.deepcopy(provisioned_identity)
+            relative_current_root["toolchain_root"] = "relative/toolchain"
+            with self.assertRaisesRegex(
+                TOOLCHAIN.ToolchainError,
+                "toolchain probe roots must be absolute paths",
+            ):
+                TOOLCHAIN._validate_toolchain_probe_evidence(
+                    probe_path, lock_path, relative_current_root
+                )
 
             stale_pyright = copy.deepcopy(server_receipt)
             stale_pyright.update(

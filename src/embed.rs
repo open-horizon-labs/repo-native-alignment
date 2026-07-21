@@ -2,10 +2,20 @@
 #[path = "embed/real.rs"]
 mod real;
 
+#[path = "embed/generation.rs"]
+pub mod generation;
+
 #[cfg(feature = "embeddings")]
 pub use real::*;
 
-pub const EMBEDDING_MODEL_NAME: &str = "MiniLM-L6-v2";
+pub const EMBEDDING_MODEL_NAME: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+#[cfg(not(feature = "embeddings"))]
+pub fn require_metal_device() -> anyhow::Result<generation::DeviceAttestation> {
+    anyhow::bail!(
+        "strict embedding execution requires an artifact built with embeddings and Metal support"
+    )
+}
 
 #[cfg(not(feature = "embeddings"))]
 use std::path::Path;
@@ -131,8 +141,47 @@ impl EmbeddingIndex {
         Ok(Self)
     }
 
+    pub async fn new_strict(_repo_root: &Path) -> Result<Self> {
+        Err(anyhow!(
+            "strict embedding execution requires an artifact built with embeddings and Metal support"
+        ))
+    }
+
+    pub(crate) async fn new_for_reconciliation(_repo_root: &Path) -> Result<Self> {
+        Ok(Self)
+    }
+
     pub async fn has_table(&self) -> Result<bool> {
         Ok(false)
+    }
+
+    pub fn active_generation_manifest(&self) -> Option<generation::GenerationManifest> {
+        None
+    }
+
+    pub fn verified_generation_evidence(
+        &self,
+    ) -> Result<
+        Option<(
+            generation::GenerationManifest,
+            generation::SemanticVerificationReceipt,
+        )>,
+    > {
+        Ok(None)
+    }
+
+    pub async fn verified_generation_evidence_for_persisted_graph(
+        &self,
+        _nodes: &[crate::graph::Node],
+        _edges: &[crate::graph::Edge],
+        _business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<
+        Option<(
+            generation::GenerationManifest,
+            generation::SemanticVerificationReceipt,
+        )>,
+    > {
+        Ok(None)
     }
 
     pub async fn ensure_fts_index(&self) {}
@@ -151,6 +200,18 @@ impl EmbeddingIndex {
         &self,
         _repo_root: &Path,
         _symbols: &[crate::graph::Node],
+        _business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<usize> {
+        Err(anyhow!(
+            "embeddings support is not compiled in; rebuild with --features embeddings"
+        ))
+    }
+
+    pub async fn index_all_with_persisted_graph_and_business_context(
+        &self,
+        _repo_root: &Path,
+        _symbols: &[crate::graph::Node],
+        _edges: &[crate::graph::Edge],
         _business_context: &crate::business_context::BusinessContextAdmission,
     ) -> Result<usize> {
         Err(anyhow!(
@@ -198,6 +259,19 @@ impl EmbeddingIndex {
         _filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
         Ok(SearchOutcome::NotReady)
+    }
+
+    pub async fn search_with_filters_strict(
+        &self,
+        _query: &str,
+        _artifact_types: Option<&[String]>,
+        _limit: usize,
+        _mode: SearchMode,
+        _filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
+        Err(anyhow!(
+            "strict semantic search requires an artifact built with embeddings and Metal support"
+        ))
     }
 }
 

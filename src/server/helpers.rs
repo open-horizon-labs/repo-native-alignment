@@ -418,20 +418,8 @@ pub(crate) fn format_node_entry_with_root(
             entry.push_str(&format!(" edges:{}", edge_count));
         }
         entry.push_str(&format!("\n  `{}`", display_id));
-        if include_body && !n.body.is_empty() {
-            let body_text = if minify_body {
-                crate::code::minify::minify_body(&n.body, &n.language)
-            } else {
-                n.body.clone()
-            };
-            let lang_hint = match n.language.as_str() {
-                "typescript" => "typescript",
-                "rust" => "rust",
-                "python" => "python",
-                "go" => "go",
-                _ => "",
-            };
-            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
+        if include_body && (!n.body.is_empty() || minify_body) {
+            append_rendered_body(&mut entry, n, minify_body);
         }
         entry
     } else {
@@ -563,22 +551,37 @@ pub(crate) fn format_node_entry_with_root(
         if !incoming.is_empty() {
             entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
         }
-        if include_body && !n.body.is_empty() {
-            let body_text = if minify_body {
-                crate::code::minify::minify_body(&n.body, &n.language)
-            } else {
-                n.body.clone()
-            };
-            let lang_hint = match n.language.as_str() {
-                "typescript" => "typescript",
-                "rust" => "rust",
-                "python" => "python",
-                "go" => "go",
-                _ => "",
-            };
-            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
+        if include_body && (!n.body.is_empty() || minify_body) {
+            append_rendered_body(&mut entry, n, minify_body);
         }
         entry
+    }
+}
+
+fn append_rendered_body(entry: &mut String, node: &graph::Node, minify: bool) {
+    let lang_hint = match node.language.as_str() {
+        "typescript" => "typescript",
+        "rust" => "rust",
+        "python" => "python",
+        "go" => "go",
+        _ => "",
+    };
+
+    if !minify {
+        entry.push_str(&format_fenced_code_block(&node.body, lang_hint));
+        return;
+    }
+
+    match crate::code::minify::minify_body(&node.body, &node.language) {
+        Ok(minified) => {
+            entry.push_str(&format!("\n  body_minification.v1 {}", minified.provenance));
+            entry.push_str(&format_fenced_code_block(&minified.body, lang_hint));
+        }
+        Err(error) => {
+            // The structured error is deliberately content-free. Strict failures never
+            // emit a fence or any source body bytes.
+            entry.push_str(&format!("\n  body_minification.v1 failure {error}"));
+        }
     }
 }
 
@@ -1443,6 +1446,51 @@ mod tests {
         assert!(full.contains("````typescript"));
         assert!(full.contains("const fenced = \"```\";"));
         assert!(full.contains("const inline = `value`;"));
+    }
+
+    #[test]
+    fn test_minified_body_provenance_is_delivered_compact_and_full() {
+        let mut node = make_test_node("structural_fn");
+        node.language = "typescript".to_string();
+        node.body = "const longName = 1;".to_string();
+        let index = GraphIndex::new();
+        let compact = format_node_entry_with_root(&node, &index, true, None, true, true);
+        let full = format_node_entry_with_root(&node, &index, false, None, true, true);
+        let marker = "body_minification.v1 provenance=structural_ast wrapper=false";
+        assert!(compact.contains(marker), "got: {compact}");
+        assert!(full.contains(marker), "got: {full}");
+    }
+
+    #[test]
+    fn test_strict_minification_failure_delivers_no_body() {
+        let mut node = make_test_node("invalid_fn");
+        node.language = "typescript".to_string();
+        node.body = "const broken = \"unterminated-sensitive-value".to_string();
+        let index = GraphIndex::new();
+        for compact in [true, false] {
+            let rendered = format_node_entry_with_root(&node, &index, compact, None, true, true);
+            assert!(rendered.contains(
+                "body_minification.v1 failure language=typescript stage=wrapper_parse reason=syntax_error"
+            ));
+            assert!(!rendered.contains("sensitive-value"), "got: {rendered}");
+            assert!(
+                !rendered.contains("```"),
+                "strict failure emitted a body: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_strict_minification_delivers_failure_without_fence() {
+        let node = make_test_node("empty_fn");
+        let index = GraphIndex::new();
+        for compact in [true, false] {
+            let rendered = format_node_entry_with_root(&node, &index, compact, None, true, true);
+            assert!(rendered.contains(
+                "body_minification.v1 failure language=rust stage=input_validation reason=empty_body"
+            ));
+            assert!(!rendered.contains("```"), "got: {rendered}");
+        }
     }
 
     // ── format_freshness_full with embedding status ─────────────────

@@ -243,7 +243,14 @@ struct SearchArgs {
     nodes: Option<String>,
     #[arg(long)]
     search_mode: Option<String>,
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     include_artifacts: bool,
     #[arg(long, default_value_t = true)]
     include_markdown: bool,
@@ -863,10 +870,6 @@ async fn async_main() -> anyhow::Result<()> {
             }
             if args.full {
                 eprintln!("Full pipeline scan: {}", repo_root.display());
-                let scan_started_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
                 let handler = RnaHandler {
                     repo_root: repo_root.clone(),
                     business_context: BusinessContextAdmission::new(business_context_mode),
@@ -899,26 +902,47 @@ async fn async_main() -> anyhow::Result<()> {
                     let graph = graph_snapshot.as_ref().as_ref().ok_or_else(|| {
                         anyhow::anyhow!("full scan completed without a graph snapshot")
                     })?;
-                    let completeness =
-                        repo_native_alignment::lsp_completeness::build_and_persist_report(
+                    let readiness =
+                        repo_native_alignment::lsp_completeness::load_readiness_check_with_graph(
                             &repo_root,
                             business_context_mode,
                             &graph.nodes,
                             &graph.edges,
-                            &result.lsp_entries,
-                            &result.report.related_job_ids,
-                            scan_started_at_ms,
                         )?;
+                    let completeness = &readiness.report;
                     eprintln!(
-                        "LSP completeness: {} included file(s), {} violation(s), digest={}",
+                        "LSP completeness: {} included file(s), {} per-file violation(s), {} compatibility violation(s), digest={}",
                         completeness.summary.included_files,
                         completeness.violations.len(),
+                        readiness.compatibility_violations.len(),
                         completeness.digest,
                     );
-                    if !completeness.is_ready() {
+                    const MAX_COMPATIBILITY_DIAGNOSTICS: usize = 5;
+                    for (index, violation) in readiness
+                        .compatibility_violations
+                        .iter()
+                        .take(MAX_COMPATIBILITY_DIAGNOSTICS)
+                        .enumerate()
+                    {
+                        eprintln!(
+                            "  compatibility violation {}: {:?}: {}",
+                            index + 1,
+                            violation.code,
+                            violation.detail,
+                        );
+                    }
+                    if readiness.compatibility_violations.len() > MAX_COMPATIBILITY_DIAGNOSTICS {
+                        eprintln!(
+                            "  ... {} additional compatibility violation(s) omitted",
+                            readiness.compatibility_violations.len()
+                                - MAX_COMPATIBILITY_DIAGNOSTICS,
+                        );
+                    }
+                    if !readiness.ready {
                         anyhow::bail!(
-                            "benchmark LSP completeness blocked by {} per-file violation(s); inspect {}",
+                            "benchmark LSP completeness blocked by {} per-file and {} compatibility violation(s); inspect the captured benchmark scan-log artifact above for compatibility details and {} for persisted per-file details",
                             completeness.violations.len(),
+                            readiness.compatibility_violations.len(),
                             repo_native_alignment::lsp_completeness::report_path(&repo_root)
                                 .display(),
                         );
@@ -1721,6 +1745,37 @@ async fn async_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
+
+    #[test]
+    fn search_cli_preserves_default_and_accepts_explicit_artifact_exclusion() {
+        for (arguments, expected) in [
+            (vec!["repo-native-alignment", "search", "query"], true),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-artifacts",
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-artifacts=false",
+                ],
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("search CLI should parse");
+            let Some(Commands::Search(args)) = cli.command else {
+                panic!("expected search command");
+            };
+            assert_eq!(args.include_artifacts, expected);
+        }
+    }
 
     #[test]
     fn lsp_readiness_cli_exposes_checkout_and_aggregate_modes() {

@@ -39,6 +39,13 @@ pub mod rerank {
             "rerank support is not compiled in; rebuild with --features embeddings"
         ))
     }
+
+    pub fn rerank_results_strict(
+        query: &str,
+        candidates: &[RerankCandidate],
+    ) -> Result<Vec<RerankedResult>> {
+        rerank_results(query, candidates)
+    }
 }
 pub mod roots;
 pub mod scanner;

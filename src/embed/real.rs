@@ -1,12 +1,22 @@
-use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use anyhow::{Context, Result};
-use arrow_array::{Array as ArrowArray, Float32Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array as ArrowArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
+use crate::embed::generation::{
+    self, CoverageManifest, CoverageRow, DeviceAttestation, GenerationManifest,
+    SemanticBuildContract, SemanticIdentity, SemanticVerificationReceipt,
+};
 use crate::git;
 use crate::ranking;
 
@@ -87,6 +97,143 @@ pub enum SearchMode {
     Semantic,
 }
 
+/// Score representation returned by LanceDB for the query that actually ran.
+///
+/// Hybrid search and its non-strict vector fallback have different schemas, so
+/// this is deliberately tracked alongside the batches instead of inferred from
+/// whichever score-like column happens to be present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalScoreKind {
+    Keyword,
+    Semantic,
+    HybridRrf,
+}
+
+impl RetrievalScoreKind {
+    fn column(self) -> &'static str {
+        match self {
+            Self::Keyword => "_score",
+            Self::Semantic => "_distance",
+            Self::HybridRrf => "_relevance_score",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Semantic => "semantic",
+            Self::HybridRrf => "hybrid RRF",
+        }
+    }
+
+    fn default_raw_score(self) -> f32 {
+        match self {
+            Self::Keyword | Self::HybridRrf => 0.5,
+            Self::Semantic => 2.0,
+        }
+    }
+
+    fn normalize(self, raw: f32) -> f32 {
+        match self {
+            Self::Keyword | Self::HybridRrf => {
+                let score = raw.max(0.0);
+                score / (1.0 + score)
+            }
+            Self::Semantic => (1.0 - raw).max(0.0),
+        }
+    }
+}
+
+fn validated_retrieval_score_column(
+    batch: &RecordBatch,
+    kind: RetrievalScoreKind,
+    strict: bool,
+) -> Result<Option<&Float32Array>> {
+    let column_name = kind.column();
+    let column = match batch.column_by_name(column_name) {
+        Some(column) => column,
+        None if strict => anyhow::bail!(
+            "strict {} search result is missing required score column `{}`",
+            kind.label(),
+            column_name
+        ),
+        None => return Ok(None),
+    };
+    let scores = match column.as_any().downcast_ref::<Float32Array>() {
+        Some(scores) => scores,
+        None if strict => anyhow::bail!(
+            "strict {} search score column `{}` must be Float32, found {:?}",
+            kind.label(),
+            column_name,
+            column.data_type()
+        ),
+        None => return Ok(None),
+    };
+    Ok(Some(scores))
+}
+
+fn retrieval_score(
+    scores: Option<&Float32Array>,
+    row: usize,
+    kind: RetrievalScoreKind,
+    strict: bool,
+) -> Result<f32> {
+    let Some(scores) = scores else {
+        return Ok(kind.normalize(kind.default_raw_score()));
+    };
+    let column_name = kind.column();
+    if scores.is_null(row) {
+        if strict {
+            anyhow::bail!(
+                "strict {} search score column `{}` is null at row {}",
+                kind.label(),
+                column_name,
+                row
+            );
+        }
+        return Ok(kind.normalize(kind.default_raw_score()));
+    }
+
+    let raw = scores.value(row);
+    if !raw.is_finite() {
+        if strict {
+            anyhow::bail!(
+                "strict {} search score column `{}` contains a non-finite value at row {}",
+                kind.label(),
+                column_name,
+                row
+            );
+        }
+        return Ok(kind.normalize(kind.default_raw_score()));
+    }
+    Ok(kind.normalize(raw))
+}
+
+fn rank_search_results(results: &mut [SearchResult]) {
+    results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+}
+
+/// Sealed handles must validate graph/current-pointer and runtime asset identity
+/// for every query, regardless of the explicitly requested retrieval mode.
+fn requires_sealed_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
+    require_metal
+}
+
+/// Keep `current.json` as the final commit point for an immutable generation.
+///
+/// The validator closure deliberately runs immediately before publication so
+/// any late asset-integrity failure leaves the previously published pointer
+/// untouched. All asynchronous table/vector/graph reopen checks must already
+/// have completed before this helper is called.
+fn publish_generation_after_final_validation<V, P>(validate: V, publish: P) -> Result<()>
+where
+    V: FnOnce() -> Result<()>,
+    P: FnOnce() -> Result<()>,
+{
+    validate()?;
+    publish()
+}
+
 /// Adaptive batch sizing constants (TCP slow-start style).
 /// Instead of a fixed batch size that may saturate unified memory bandwidth
 /// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
@@ -104,6 +251,71 @@ const BACKOFF_THRESHOLD: f64 = 2.0;
 const RECENT_COMMIT_LIMIT: usize = 100;
 /// Number of PR merge commits to embed for structural context.
 const PR_MERGE_LIMIT: usize = 50;
+const EMBEDDING_DIMENSION: usize = 384;
+static UNPUBLISHED_SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Ephemeral Lance handle used before the first immutable generation exists.
+///
+/// This database is only a placeholder for APIs such as `has_table`; generation
+/// building writes to its own digest-bound staging tree. Keeping the placeholder
+/// outside `.oh/.cache/embeddings` prevents a successful publication from
+/// leaving undeclared bytes in an otherwise verifier-clean semantic cache.
+#[derive(Debug)]
+struct UnpublishedScratchRoot {
+    root: PathBuf,
+}
+
+impl UnpublishedScratchRoot {
+    fn new() -> Result<Self> {
+        let parent = std::env::temp_dir()
+            .join("repo-native-alignment")
+            .join("embedding-scratch");
+        fs::create_dir_all(&parent).with_context(|| {
+            format!(
+                "failed to create unpublished semantic scratch parent {}",
+                parent.display()
+            )
+        })?;
+
+        loop {
+            let sequence = UNPUBLISHED_SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = parent.join(format!("unpublished.{}.{}", std::process::id(), sequence));
+            match fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create unpublished semantic scratch root {}",
+                            root.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    fn lance_root(&self) -> PathBuf {
+        self.root.join("lance")
+    }
+}
+
+impl Drop for UnpublishedScratchRoot {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root)
+            && error.kind() != ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove unpublished semantic scratch root {}: {error}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+fn sealed_semantic_bundle_build() -> bool {
+    option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
+}
 
 /// Maximum character budget for code embedding text.
 ///
@@ -149,6 +361,180 @@ fn embedding_schema(dim: usize) -> Schema {
             false,
         ),
     ])
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingCandidate {
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    text: String,
+    canonical_input_digest: String,
+    file_path: Option<String>,
+    language: Option<String>,
+    subsystem: Option<String>,
+    cyclomatic: Option<i32>,
+}
+
+impl EmbeddingCandidate {
+    fn new(
+        id: String,
+        kind: String,
+        title: String,
+        body: String,
+        text: String,
+        file_path: Option<String>,
+        language: Option<String>,
+        subsystem: Option<String>,
+        cyclomatic: Option<i32>,
+    ) -> Result<Self> {
+        // A vector is a pure function of the exact encoder text and semantic
+        // identity. Target row identity and scalar metadata are verified and
+        // rebuilt separately, so they must not invalidate reusable payloads.
+        let canonical_input_digest = generation::sha256_bytes(text.as_bytes());
+        Ok(Self {
+            id,
+            kind,
+            title,
+            body,
+            text,
+            canonical_input_digest,
+            file_path,
+            language,
+            subsystem,
+            cyclomatic,
+        })
+    }
+
+    fn text_hash(&self) -> String {
+        blake3::hash(self.text.as_bytes()).to_hex().to_string()
+    }
+}
+
+fn collect_generation_candidates(
+    repo_root: &Path,
+    symbols: &[crate::graph::Node],
+    business_context: &crate::business_context::BusinessContextAdmission,
+) -> Result<Vec<EmbeddingCandidate>> {
+    let mut candidates = Vec::new();
+
+    if business_context.admit_git_history_producer() {
+        match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
+            Ok(commits) => {
+                for commit in commits {
+                    let changed_files = commit
+                        .changed_files
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let body = format!("{}\n\nFiles: {}", commit.message, changed_files);
+                    let title = commit
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or(&commit.message)
+                        .to_string();
+                    candidates.push(EmbeddingCandidate::new(
+                        commit.short_hash,
+                        "commit".to_string(),
+                        title,
+                        body.clone(),
+                        body,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?);
+                }
+            }
+            Err(error) => tracing::debug!(
+                "EmbeddingIndex: failed to load commits for {}: {}",
+                repo_root.display(),
+                error
+            ),
+        }
+
+        if let Ok((merge_nodes, _)) =
+            git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT))
+        {
+            let mut seen_merge_shas = BTreeSet::new();
+            for node in merge_nodes {
+                let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                if !seen_merge_shas.insert(short.clone()) {
+                    continue;
+                }
+                let branch = node
+                    .metadata
+                    .get("branch_name")
+                    .cloned()
+                    .unwrap_or_default();
+                let files = node
+                    .metadata
+                    .get("files_changed")
+                    .cloned()
+                    .unwrap_or_default();
+                let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
+                candidates.push(EmbeddingCandidate::new(
+                    format!("merge:{short}"),
+                    "merge".to_string(),
+                    node.signature,
+                    body.clone(),
+                    body,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?);
+            }
+        }
+    }
+
+    for node in symbols
+        .iter()
+        .filter(|node| node.id.root != "external" && node.id.kind.is_embeddable())
+    {
+        let text = node_embedding_text(node);
+        let (file_path, language, subsystem, cyclomatic) = node_scalar_filters(node);
+        candidates.push(EmbeddingCandidate::new(
+            node.stable_id(),
+            node_embedding_kind(node),
+            node_embedding_title(node),
+            format!(
+                "{}\n\n{}:{}",
+                node.signature,
+                node.id.file.display(),
+                node.line_start
+            ),
+            text,
+            file_path,
+            language,
+            subsystem,
+            cyclomatic,
+        )?);
+    }
+
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    for pair in candidates.windows(2) {
+        if pair[0].id == pair[1].id {
+            anyhow::bail!(
+                "semantic target contains duplicate stable identity {}",
+                pair[0].id
+            );
+        }
+    }
+    Ok(candidates)
+}
+
+fn candidate_input_digest(candidates: &[EmbeddingCandidate]) -> Result<String> {
+    generation::canonical_input_digest(candidates.iter().map(|candidate| {
+        (
+            candidate.id.clone(),
+            candidate.canonical_input_digest.clone(),
+        )
+    }))
 }
 
 /// Build embedding text for a code node within the MiniLM-L6-v2 token budget.
@@ -292,6 +678,18 @@ fn build_artifact_embedding_text(
 // embed.rs still owns the text-building logic (budget, truncation) but
 // the indexing loops no longer test `oh_kind` directly.
 
+fn stable_code_embedding_metadata(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    // Body text already carries source-level syntax. Only these two semantic
+    // enrichments belong in the encoder input; ranking, subsystem, response,
+    // provenance, path, and job metadata are rebuilt as target row scalars.
+    ["doc_comment", "inferred_types"]
+        .into_iter()
+        .filter_map(|key| metadata.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect()
+}
+
 /// Build embedding text for any graph node, dispatching by node properties.
 fn node_embedding_text(node: &crate::graph::Node) -> String {
     if node.metadata.contains_key("oh_kind") {
@@ -299,7 +697,11 @@ fn node_embedding_text(node: &crate::graph::Node) -> String {
     } else {
         match &node.id.kind {
             crate::graph::NodeKind::MarkdownSection => truncate_chars(&node.body, 500).to_string(),
-            _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
+            _ => build_code_embedding_text(
+                &node.id.name,
+                &node.body,
+                &stable_code_embedding_metadata(&node.metadata),
+            ),
         }
     }
 }
@@ -366,15 +768,34 @@ fn node_scalar_filters(
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
+    new_model_with_policy(false).map(|(model, _)| model)
+}
+
+fn new_model_with_policy(
+    require_metal: bool,
+) -> Result<(metal_candle::embeddings::EmbeddingModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
-    let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
-        tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
-        candle_core::Device::Cpu
-    });
+    let device = match candle_core::Device::new_metal(0) {
+        Ok(device) => device,
+        Err(error) if require_metal => {
+            anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
+        }
+        Err(_) => {
+            tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+            candle_core::Device::Cpu
+        }
+    };
     #[cfg(not(feature = "metal"))]
-    let device = candle_core::Device::Cpu;
+    let device = {
+        if require_metal {
+            anyhow::bail!(
+                "strict embedding execution requires an artifact built with the `metal` feature"
+            );
+        }
+        candle_core::Device::Cpu
+    };
 
     #[cfg(feature = "metal")]
     let device_name = if matches!(device, candle_core::Device::Metal(_)) {
@@ -384,6 +805,26 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     };
     #[cfg(not(feature = "metal"))]
     let device_name = "CPU";
+    let observed_metal = matches!(device, candle_core::Device::Metal(_));
+    if require_metal && !observed_metal {
+        anyhow::bail!("strict embedding execution forbids Metal-to-CPU fallback");
+    }
+    let artifact_sha256 = generation::sha256_file(
+        &std::env::current_exe().context("failed to resolve running RNA artifact")?,
+    )?;
+    let attestation = DeviceAttestation {
+        required_device: if require_metal { "metal" } else { "any" }.to_string(),
+        observed_device: if observed_metal { "metal" } else { "cpu" }.to_string(),
+        backend: if observed_metal {
+            "candle-metal"
+        } else {
+            "candle-cpu"
+        }
+        .to_string(),
+        device_index: observed_metal.then_some(0),
+        artifact_sha256,
+    };
+
     let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
 
     let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
@@ -392,20 +833,81 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     )
     .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}", e));
 
-    match &model {
-        Ok(m) => tracing::info!(
-            "EmbeddingIndex: MiniLM-L6-v2 ready on {} (dim={}) in {:?}",
-            device_name,
-            m.dimension(),
-            start.elapsed()
-        ),
-        Err(err) => tracing::warn!(
-            "EmbeddingIndex: model load failed in {:?}: {}",
-            start.elapsed(),
-            err
-        ),
+    match model {
+        Ok(m) => {
+            if m.dimension() != EMBEDDING_DIMENSION {
+                anyhow::bail!(
+                    "embedding model dimension mismatch: expected {}, observed {}",
+                    EMBEDDING_DIMENSION,
+                    m.dimension()
+                );
+            }
+            tracing::info!(
+                "EmbeddingIndex: MiniLM-L6-v2 ready on {} (dim={}) in {:?}",
+                device_name,
+                m.dimension(),
+                start.elapsed()
+            );
+            Ok((m, attestation))
+        }
+        Err(err) => {
+            tracing::warn!(
+                "EmbeddingIndex: model load failed in {:?}: {}",
+                start.elapsed(),
+                err
+            );
+            Err(err)
+        }
     }
-    model
+}
+
+/// Fail closed unless the exact running artifact can initialize Candle Metal device 0.
+/// This does not load model weights or execute an embedding.
+pub fn require_metal_device() -> Result<DeviceAttestation> {
+    #[cfg(feature = "metal")]
+    {
+        let device = candle_core::Device::new_metal(0).map_err(|error| {
+            anyhow::anyhow!("strict embedding execution requires Metal: {error}")
+        })?;
+        if !matches!(device, candle_core::Device::Metal(_)) {
+            anyhow::bail!("strict embedding execution observed a non-Metal device");
+        }
+        let artifact = std::env::current_exe().context("failed to resolve running RNA artifact")?;
+        return Ok(DeviceAttestation {
+            required_device: "metal".to_string(),
+            observed_device: "metal".to_string(),
+            backend: "candle-metal".to_string(),
+            device_index: Some(0),
+            artifact_sha256: generation::sha256_file(&artifact)?,
+        });
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        anyhow::bail!(
+            "strict embedding execution requires an artifact built with the `metal` feature"
+        )
+    }
+}
+
+fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
+    if require_metal {
+        return require_metal_device();
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(attestation) = require_metal_device() {
+        return Ok(DeviceAttestation {
+            required_device: "any".to_string(),
+            ..attestation
+        });
+    }
+    let executable = std::env::current_exe().context("failed to resolve running RNA artifact")?;
+    Ok(DeviceAttestation {
+        required_device: "any".to_string(),
+        observed_device: "cpu".to_string(),
+        backend: "candle-cpu".to_string(),
+        device_index: None,
+        artifact_sha256: generation::sha256_file(&executable)?,
+    })
 }
 
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
@@ -514,8 +1016,91 @@ async fn embed_texts_with_model(
 /// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
 #[derive(Clone)]
 pub struct EmbeddingIndex {
-    db: lancedb::Connection,
+    // Keep this field before `_unpublished_scratch`: Rust drops fields in
+    // declaration order, so the Lance connection closes before scratch cleanup.
+    active_generation: Arc<RwLock<ActiveGeneration>>,
     table_name: String,
+    repo_root: Arc<PathBuf>,
+    require_metal: bool,
+    _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
+}
+
+/// A published generation is queryable only after it matches the current graph.
+/// Reconciliation is the sole exception: it must be able to open a verified prior
+/// generation after a structural update so exact vectors can be copied into the
+/// next graph-bound generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationOpenPurpose {
+    Serving,
+    Reconciliation,
+}
+
+fn requires_active_generation_graph_validation(
+    purpose: GenerationOpenPurpose,
+    require_metal: bool,
+    asset_seeding: bool,
+    has_active_generation: bool,
+) -> bool {
+    purpose == GenerationOpenPurpose::Serving
+        && require_metal
+        && !asset_seeding
+        && has_active_generation
+}
+
+/// The query handle and the generation identity it serves must move together.
+/// Keeping them under one lock prevents a publisher from exposing a new Lance
+/// connection with the old generation evidence (or the reverse).
+struct ActiveGeneration {
+    db: lancedb::Connection,
+    manifest: Option<GenerationManifest>,
+}
+
+fn validate_generation_graph_evidence(
+    repo_root: &Path,
+    context_mode: crate::business_context::BusinessContextMode,
+    nodes: &[crate::graph::Node],
+    edges: &[crate::graph::Edge],
+    manifest: &GenerationManifest,
+) -> Result<()> {
+    let target_graph_digest = generation::target_graph_digest(nodes)?;
+    if target_graph_digest != manifest.target_graph_digest {
+        anyhow::bail!(
+            "semantic generation target graph does not match the persisted graph delivered to the caller"
+        );
+    }
+    let readiness = crate::lsp_completeness::load_readiness_check_with_graph(
+        repo_root,
+        context_mode,
+        nodes,
+        edges,
+    )
+    .context("failed to bind semantic evidence to the current LSP completeness report")?;
+    if !readiness.ready {
+        anyhow::bail!(
+            "semantic generation graph binding is not full-inventory READY: {}",
+            readiness.human_summary()
+        );
+    }
+    if readiness.report.graph_snapshot_digest != manifest.structural_graph_snapshot_digest {
+        anyhow::bail!(
+            "semantic generation structural snapshot does not match the current persisted graph/report"
+        );
+    }
+    Ok(())
+}
+
+fn generation_business_context_mode(
+    manifest: &GenerationManifest,
+) -> Result<crate::business_context::BusinessContextMode> {
+    manifest
+        .semantic_identity
+        .flags
+        .get("business_context_mode")
+        .ok_or_else(|| {
+            anyhow::anyhow!("sealed semantic generation omits business_context_mode identity")
+        })?
+        .parse()
+        .context("sealed semantic generation has an invalid business_context_mode identity")
 }
 
 /// Result of a semantic search — either results or "not ready yet."
@@ -555,6 +1140,369 @@ fn required_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a 
         })
 }
 
+#[derive(Debug, Clone)]
+struct MaterializedEmbeddingRow {
+    kind: String,
+    title: String,
+    body: String,
+    text_hash: String,
+    file_path: Option<String>,
+    language: Option<String>,
+    subsystem: Option<String>,
+    cyclomatic: Option<i32>,
+    vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalEncoderInput<'a> {
+    canonical_input_digest: &'a str,
+    text: &'a str,
+    candidate_ids: Vec<&'a str>,
+}
+
+fn group_canonical_encoder_inputs<'a>(
+    candidates: impl IntoIterator<Item = &'a EmbeddingCandidate>,
+) -> Result<Vec<CanonicalEncoderInput<'a>>> {
+    let mut groups = BTreeMap::<&str, CanonicalEncoderInput<'a>>::new();
+    for candidate in candidates {
+        if let Some(group) = groups.get_mut(candidate.canonical_input_digest.as_str()) {
+            if group.text.as_bytes() != candidate.text.as_bytes() {
+                anyhow::bail!(
+                    "canonical encoder input digest collision maps to different text payloads"
+                );
+            }
+            group.candidate_ids.push(candidate.id.as_str());
+        } else {
+            groups.insert(
+                candidate.canonical_input_digest.as_str(),
+                CanonicalEncoderInput {
+                    canonical_input_digest: candidate.canonical_input_digest.as_str(),
+                    text: candidate.text.as_str(),
+                    candidate_ids: vec![candidate.id.as_str()],
+                },
+            );
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
+fn fan_out_encoded_vector(
+    vectors: &mut BTreeMap<String, Vec<f32>>,
+    input: &CanonicalEncoderInput<'_>,
+    vector: Vec<f32>,
+) -> Result<()> {
+    if generation::sha256_bytes(input.text.as_bytes()) != input.canonical_input_digest {
+        anyhow::bail!("canonical encoder input digest does not match exact text payload");
+    }
+    generation::vector_sha256(&vector, EMBEDDING_DIMENSION)?;
+    for candidate_id in &input.candidate_ids {
+        if vectors
+            .insert((*candidate_id).to_string(), vector.clone())
+            .is_some()
+        {
+            anyhow::bail!("embedding output attempted duplicate candidate {candidate_id}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_vector_mapping(
+    candidates: &[EmbeddingCandidate],
+    vectors: &BTreeMap<String, Vec<f32>>,
+) -> Result<()> {
+    let mut vector_hashes_by_input = BTreeMap::<&str, String>::new();
+    for candidate in candidates {
+        let vector = vectors.get(&candidate.id).ok_or_else(|| {
+            anyhow::anyhow!("semantic vector output missing candidate {}", candidate.id)
+        })?;
+        let vector_sha256 = generation::vector_sha256(vector, EMBEDDING_DIMENSION)?;
+        if let Some(existing_sha256) =
+            vector_hashes_by_input.get(candidate.canonical_input_digest.as_str())
+        {
+            if existing_sha256 != &vector_sha256 {
+                anyhow::bail!(
+                    "target semantic generation maps one canonical encoder input to conflicting vector payloads"
+                );
+            }
+        } else {
+            vector_hashes_by_input.insert(candidate.canonical_input_digest.as_str(), vector_sha256);
+        }
+    }
+    Ok(())
+}
+
+fn retain_reusable_vector(
+    vectors_by_input: &mut BTreeMap<String, (String, Vec<f32>)>,
+    canonical_input_digest: &str,
+    vector_sha256: String,
+    vector: &[f32],
+) -> Result<()> {
+    if let Some((existing_sha256, existing_vector)) =
+        vectors_by_input.get(canonical_input_digest)
+    {
+        if existing_sha256 != &vector_sha256 || existing_vector.as_slice() != vector {
+            anyhow::bail!(
+                "prior semantic generation maps one canonical encoder input to conflicting vector payloads"
+            );
+        }
+    } else {
+        vectors_by_input.insert(
+            canonical_input_digest.to_string(),
+            (vector_sha256, vector.to_vec()),
+        );
+    }
+    Ok(())
+}
+
+fn generation_record_batch(
+    candidates: &[EmbeddingCandidate],
+    vectors: &BTreeMap<String, Vec<f32>>,
+) -> Result<RecordBatch> {
+    let mut ids = Vec::with_capacity(candidates.len());
+    let mut kinds = Vec::with_capacity(candidates.len());
+    let mut titles = Vec::with_capacity(candidates.len());
+    let mut bodies = Vec::with_capacity(candidates.len());
+    let mut text_hashes = Vec::with_capacity(candidates.len());
+    let mut file_paths = Vec::with_capacity(candidates.len());
+    let mut languages = Vec::with_capacity(candidates.len());
+    let mut subsystems = Vec::with_capacity(candidates.len());
+    let mut cyclomatics = Vec::with_capacity(candidates.len());
+    let mut flat_vectors = Vec::with_capacity(candidates.len() * EMBEDDING_DIMENSION);
+
+    for candidate in candidates {
+        let vector = vectors.get(&candidate.id).ok_or_else(|| {
+            anyhow::anyhow!("semantic vector output missing candidate {}", candidate.id)
+        })?;
+        generation::vector_sha256(vector, EMBEDDING_DIMENSION)?;
+        ids.push(candidate.id.clone());
+        kinds.push(candidate.kind.clone());
+        titles.push(candidate.title.clone());
+        bodies.push(candidate.body.clone());
+        text_hashes.push(candidate.text_hash());
+        file_paths.push(candidate.file_path.clone());
+        languages.push(candidate.language.clone());
+        subsystems.push(candidate.subsystem.clone());
+        cyclomatics.push(candidate.cyclomatic);
+        flat_vectors.extend_from_slice(vector);
+    }
+
+    let schema = Arc::new(embedding_schema(EMBEDDING_DIMENSION));
+    let values = Arc::new(Float32Array::from(flat_vectors));
+    let vectors = Arc::new(FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        EMBEDDING_DIMENSION as i32,
+        values,
+        None,
+    )?) as Arc<dyn arrow_array::Array>;
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(file_paths)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(languages)) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(subsystems)) as Arc<dyn arrow_array::Array>,
+            Arc::new(Int32Array::from(cyclomatics)) as Arc<dyn arrow_array::Array>,
+            vectors,
+        ],
+    )
+    .map_err(Into::into)
+}
+
+fn optional_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow::anyhow!("semantic generation schema missing `{name}` column"))?;
+    column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("semantic generation `{name}` column must be Utf8"))
+}
+
+fn optional_i32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow::anyhow!("semantic generation schema missing `{name}` column"))?;
+    column
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| anyhow::anyhow!("semantic generation `{name}` column must be Int32"))
+}
+
+async fn read_materialized_generation(
+    db: &lancedb::Connection,
+    table_name: &str,
+) -> Result<BTreeMap<String, MaterializedEmbeddingRow>> {
+    use futures::TryStreamExt;
+
+    let table = db
+        .open_table(table_name)
+        .execute()
+        .await
+        .context("failed to fresh-reopen semantic generation table")?;
+    let stream = table
+        .query()
+        .select(lancedb::query::Select::columns(&[
+            "id",
+            "kind",
+            "title",
+            "body",
+            "text_hash",
+            "file_path",
+            "language",
+            "subsystem",
+            "cyclomatic",
+            "vector",
+        ]))
+        .execute()
+        .await
+        .context("failed to query semantic generation coverage")?;
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .context("failed to collect semantic generation coverage")?;
+    let mut rows = BTreeMap::new();
+    for batch in &batches {
+        let ids = required_string_column(batch, "id")?;
+        let kinds = required_string_column(batch, "kind")?;
+        let titles = required_string_column(batch, "title")?;
+        let bodies = required_string_column(batch, "body")?;
+        let text_hashes = required_string_column(batch, "text_hash")?;
+        let file_paths = optional_string_column(batch, "file_path")?;
+        let languages = optional_string_column(batch, "language")?;
+        let subsystems = optional_string_column(batch, "subsystem")?;
+        let cyclomatics = optional_i32_column(batch, "cyclomatic")?;
+        let vectors = batch
+            .column_by_name("vector")
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("semantic generation `vector` column must be FixedSizeList")
+            })?;
+        if vectors.value_length() != EMBEDDING_DIMENSION as i32 {
+            anyhow::bail!(
+                "semantic generation vector dimension mismatch: expected {}, observed {}",
+                EMBEDDING_DIMENSION,
+                vectors.value_length()
+            );
+        }
+
+        for row_index in 0..batch.num_rows() {
+            if ids.is_null(row_index)
+                || kinds.is_null(row_index)
+                || titles.is_null(row_index)
+                || bodies.is_null(row_index)
+                || text_hashes.is_null(row_index)
+                || vectors.is_null(row_index)
+            {
+                anyhow::bail!("semantic generation contains a null required value");
+            }
+            let values = vectors.value(row_index);
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow::anyhow!("semantic vector payload must be Float32"))?;
+            let vector = values
+                .iter()
+                .map(|value| {
+                    value.ok_or_else(|| anyhow::anyhow!("semantic vector contains a null value"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            generation::vector_sha256(&vector, EMBEDDING_DIMENSION)?;
+            let id = ids.value(row_index).to_string();
+            let materialized = MaterializedEmbeddingRow {
+                kind: kinds.value(row_index).to_string(),
+                title: titles.value(row_index).to_string(),
+                body: bodies.value(row_index).to_string(),
+                text_hash: text_hashes.value(row_index).to_string(),
+                file_path: (!file_paths.is_null(row_index))
+                    .then(|| file_paths.value(row_index).to_string()),
+                language: (!languages.is_null(row_index))
+                    .then(|| languages.value(row_index).to_string()),
+                subsystem: (!subsystems.is_null(row_index))
+                    .then(|| subsystems.value(row_index).to_string()),
+                cyclomatic: (!cyclomatics.is_null(row_index)).then(|| cyclomatics.value(row_index)),
+                vector,
+            };
+            if rows.insert(id.clone(), materialized).is_some() {
+                anyhow::bail!("semantic generation contains duplicate row id {id}");
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn verify_materialized_rows(
+    candidates: &[EmbeddingCandidate],
+    rows: &BTreeMap<String, MaterializedEmbeddingRow>,
+    expected_vector_hashes: &BTreeMap<String, String>,
+) -> Result<Vec<CoverageRow>> {
+    if rows.len() != candidates.len() {
+        anyhow::bail!(
+            "semantic generation row coverage mismatch: expected {}, observed {}",
+            candidates.len(),
+            rows.len()
+        );
+    }
+    let expected_ids = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let observed_ids = rows.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if expected_ids != observed_ids {
+        let missing = expected_ids.difference(&observed_ids).count();
+        let orphan = observed_ids.difference(&expected_ids).count();
+        anyhow::bail!(
+            "semantic generation identity coverage mismatch: missing {}, orphan {}",
+            missing,
+            orphan
+        );
+    }
+    let expected_vector_ids = expected_vector_hashes
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected_vector_ids != expected_ids {
+        anyhow::bail!("semantic expected-vector identity coverage mismatch");
+    }
+
+    let mut coverage = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let row = rows
+            .get(&candidate.id)
+            .expect("identity sets checked above");
+        if row.kind != candidate.kind
+            || row.title != candidate.title
+            || row.body != candidate.body
+            || row.text_hash != candidate.text_hash()
+            || row.file_path != candidate.file_path
+            || row.language != candidate.language
+            || row.subsystem != candidate.subsystem
+            || row.cyclomatic != candidate.cyclomatic
+        {
+            anyhow::bail!(
+                "semantic generation scalar/metadata row mismatch for {}",
+                candidate.id
+            );
+        }
+        let vector_sha256 = generation::vector_sha256(&row.vector, EMBEDDING_DIMENSION)?;
+        if expected_vector_hashes.get(&candidate.id) != Some(&vector_sha256) {
+            anyhow::bail!(
+                "semantic generation vector payload mismatch for {}",
+                candidate.id
+            );
+        }
+        coverage.push(CoverageRow {
+            id: candidate.id.clone(),
+            canonical_input_digest: candidate.canonical_input_digest.clone(),
+            vector_sha256,
+        });
+    }
+    Ok(coverage)
+}
+
 /// A search result with the artifact and its relevance score.
 pub struct SearchResult {
     pub id: String,
@@ -591,9 +1539,99 @@ impl SearchResult {
 }
 
 impl EmbeddingIndex {
-    /// Create or open the embedding index. Stores data in memory.
+    /// Create or open the currently published immutable semantic generation.
     pub async fn new(repo_root: &Path) -> Result<Self> {
-        let db_path = repo_root.join(".oh").join(".cache").join("lance");
+        let require_metal = sealed_semantic_bundle_build();
+        if require_metal {
+            require_metal_device()?;
+        }
+        Self::new_with_policy(repo_root, require_metal, GenerationOpenPurpose::Serving).await
+    }
+
+    /// Open the semantic index with the #786 fail-closed execution policy.
+    /// Building or querying through this handle never falls back from Metal to CPU.
+    pub async fn new_strict(repo_root: &Path) -> Result<Self> {
+        require_metal_device()?;
+        Self::new_with_policy(repo_root, true, GenerationOpenPurpose::Serving).await
+    }
+
+    /// Open a verified prior generation only for immutable generation rebuilding.
+    ///
+    /// This preserves the strict artifact, model, tokenizer, reranker, and Metal
+    /// identity checks below. It deliberately defers only the active generation's
+    /// graph-readiness check because reconciliation binds and validates the newly
+    /// published generation against the freshly reopened target graph.
+    pub(crate) async fn new_for_reconciliation(repo_root: &Path) -> Result<Self> {
+        let require_metal = sealed_semantic_bundle_build();
+        if require_metal {
+            require_metal_device()?;
+        }
+        Self::new_with_policy(
+            repo_root,
+            require_metal,
+            GenerationOpenPurpose::Reconciliation,
+        )
+        .await
+    }
+
+    async fn new_with_policy(
+        repo_root: &Path,
+        require_metal: bool,
+        purpose: GenerationOpenPurpose,
+    ) -> Result<Self> {
+        let expected_asset_digests = if require_metal && !generation::semantic_asset_seeding() {
+            let digests = generation::runtime_asset_digests()?;
+            generation::verify_runtime_encoder_assets()?;
+            Some(digests)
+        } else {
+            None
+        };
+        let current = if generation::semantic_asset_seeding() {
+            None
+        } else {
+            generation::load_current_generation(repo_root)?
+        };
+        let (db_path, active_manifest, unpublished_scratch) = match current {
+            Some((_, manifest, _, _)) => {
+                if require_metal {
+                    let executable = std::env::current_exe()
+                        .context("failed to resolve running RNA artifact")?;
+                    let artifact_sha256 = generation::sha256_file(&executable)?;
+                    if manifest.semantic_identity.artifact_sha256 != artifact_sha256
+                        || manifest.device_attestation.required_device != "metal"
+                        || manifest.device_attestation.observed_device != "metal"
+                        || manifest.device_attestation.backend != "candle-metal"
+                    {
+                        anyhow::bail!(
+                            "sealed semantic bundle refuses a generation from a different artifact or device policy"
+                        );
+                    }
+                    let (model_files, model, tokenizer, reranker) = expected_asset_digests
+                        .as_ref()
+                        .expect("strict non-seeding asset identity loaded above");
+                    if &manifest.semantic_identity.model_files_digest != model_files
+                        || &manifest.semantic_identity.model_sha256 != model
+                        || &manifest.semantic_identity.tokenizer_sha256 != tokenizer
+                        || &manifest.semantic_identity.reranker_files_digest != reranker
+                    {
+                        anyhow::bail!(
+                            "sealed semantic bundle refuses a generation with different model/tokenizer/reranker assets"
+                        );
+                    }
+                }
+                (
+                    generation::generation_root(repo_root, &manifest.generation_digest)?
+                        .join("lance"),
+                    Some(manifest),
+                    None,
+                )
+            }
+            None => {
+                let scratch = Arc::new(UnpublishedScratchRoot::new()?);
+                let path = scratch.lance_root();
+                (path, None, Some(scratch))
+            }
+        };
         std::fs::create_dir_all(&db_path)?;
         tracing::debug!("EmbeddingIndex: opening LanceDB at {}", db_path.display());
         let open_start = std::time::Instant::now();
@@ -608,10 +1646,159 @@ impl EmbeddingIndex {
             open_start.elapsed()
         );
 
-        Ok(Self {
-            db,
+        let index = Self {
+            active_generation: Arc::new(RwLock::new(ActiveGeneration {
+                db,
+                manifest: active_manifest,
+            })),
             table_name: "artifacts".to_string(),
-        })
+            repo_root: Arc::new(repo_root.to_path_buf()),
+            require_metal,
+            _unpublished_scratch: unpublished_scratch,
+        };
+        if requires_active_generation_graph_validation(
+            purpose,
+            require_metal,
+            generation::semantic_asset_seeding(),
+            index.active_generation_manifest().is_some(),
+        ) {
+            index.validate_active_generation_graph().await?;
+        }
+        Ok(index)
+    }
+
+    fn db(&self) -> lancedb::Connection {
+        self.active_generation
+            .read()
+            .expect("embedding generation lock poisoned")
+            .db
+            .clone()
+    }
+
+    fn replace_active_generation(&self, db: lancedb::Connection, manifest: GenerationManifest) {
+        *self
+            .active_generation
+            .write()
+            .expect("embedding generation lock poisoned") = ActiveGeneration {
+            db,
+            manifest: Some(manifest),
+        };
+    }
+
+    pub fn active_generation_manifest(&self) -> Option<GenerationManifest> {
+        self.active_generation
+            .read()
+            .expect("embedding generation lock poisoned")
+            .manifest
+            .clone()
+    }
+
+    pub fn verified_generation_evidence(
+        &self,
+    ) -> Result<Option<(GenerationManifest, SemanticVerificationReceipt)>> {
+        // Hold one read lock while resolving the on-disk pointer so publication
+        // cannot swap the serving handle between the identity checks below.
+        let active = self
+            .active_generation
+            .read()
+            .expect("embedding generation lock poisoned");
+        let current = generation::load_current_generation(&self.repo_root)?;
+        match (&active.manifest, current) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => anyhow::bail!(
+                "semantic current pointer is published but this query handle has no active generation"
+            ),
+            (Some(_), None) => anyhow::bail!(
+                "semantic query handle has an active generation but current.json is missing"
+            ),
+            (Some(active_manifest), Some((pointer, manifest, _, verification))) => {
+                if active_manifest != &manifest
+                    || pointer.generation_digest != active_manifest.generation_digest
+                {
+                    anyhow::bail!(
+                        "semantic query handle generation does not match the verified current pointer"
+                    );
+                }
+                let expected_lance = generation::generation_root(
+                    &self.repo_root,
+                    &active_manifest.generation_digest,
+                )?
+                .join("lance");
+                let expected_uri = expected_lance.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("semantic generation path is not valid UTF-8")
+                })?;
+                if active.db.uri() != expected_uri {
+                    anyhow::bail!(
+                        "semantic query handle database does not match the verified generation tree"
+                    );
+                }
+                Ok(Some((manifest, verification)))
+            }
+        }
+    }
+
+    /// Return verifier-clean evidence only when it is bound to both the graph
+    /// supplied by the caller and a fresh reopen of the currently persisted
+    /// graph/report. This is the only evidence API suitable for READY status.
+    pub async fn verified_generation_evidence_for_persisted_graph(
+        &self,
+        nodes: &[crate::graph::Node],
+        edges: &[crate::graph::Edge],
+        business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<Option<(GenerationManifest, SemanticVerificationReceipt)>> {
+        let evidence = self.verified_generation_evidence()?;
+        let Some((manifest, _)) = evidence.as_ref() else {
+            return Ok(None);
+        };
+        validate_generation_graph_evidence(
+            &self.repo_root,
+            business_context.mode(),
+            nodes,
+            edges,
+            manifest,
+        )?;
+        let reopened = crate::server::load_graph_from_lance(&self.repo_root)
+            .await
+            .context("failed to fresh-reopen persisted graph for semantic READY evidence")?;
+        validate_generation_graph_evidence(
+            &self.repo_root,
+            business_context.mode(),
+            &reopened.nodes,
+            &reopened.edges,
+            manifest,
+        )?;
+        if self.verified_generation_evidence()? != evidence {
+            anyhow::bail!(
+                "semantic generation changed while binding READY evidence to the persisted graph"
+            );
+        }
+        Ok(evidence)
+    }
+
+    async fn validate_active_generation_graph(&self) -> Result<()> {
+        let manifest = self.active_generation_manifest().ok_or_else(|| {
+            anyhow::anyhow!("strict semantic query handle has no active generation")
+        })?;
+        let context_mode = generation_business_context_mode(&manifest)?;
+        let reopened = crate::server::load_graph_from_lance(&self.repo_root)
+            .await
+            .context("failed to fresh-reopen persisted graph for strict semantic serving")?;
+        validate_generation_graph_evidence(
+            &self.repo_root,
+            context_mode,
+            &reopened.nodes,
+            &reopened.edges,
+            &manifest,
+        )?;
+        let (verified_manifest, _) = self.verified_generation_evidence()?.ok_or_else(|| {
+            anyhow::anyhow!("strict semantic query handle has no published verified generation")
+        })?;
+        if verified_manifest != manifest {
+            anyhow::bail!(
+                "strict semantic generation changed while binding the serving handle to the persisted graph"
+            );
+        }
+        Ok(())
     }
 
     /// Check if the embedding table exists.
@@ -619,7 +1806,7 @@ impl EmbeddingIndex {
     /// Returns `Ok(true)` if the table exists, `Ok(false)` if it does not,
     /// and propagates unexpected errors instead of swallowing them.
     pub async fn has_table(&self) -> Result<bool> {
-        match self.db.open_table(&self.table_name).execute().await {
+        match self.db().open_table(&self.table_name).execute().await {
             Ok(_) => Ok(true),
             Err(lancedb::Error::TableNotFound { .. }) => Ok(false),
             Err(e) => Err(anyhow::anyhow!("Failed to check embedding table: {}", e)),
@@ -676,11 +1863,41 @@ impl EmbeddingIndex {
         );
     }
 
+    async fn create_fts_index_strict(&self, table: &lancedb::Table) -> Result<()> {
+        table
+            .create_index(&["title"], lancedb::index::Index::FTS(Default::default()))
+            .replace(true)
+            .execute()
+            .await
+            .context("strict semantic generation failed to build title FTS index")?;
+        table
+            .create_index(&["body"], lancedb::index::Index::FTS(Default::default()))
+            .replace(true)
+            .execute()
+            .await
+            .context("strict semantic generation failed to build body FTS index")?;
+        table
+            .create_index(
+                &["file_path"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+            .context("strict semantic generation failed to build file_path FTS index")?;
+        Ok(())
+    }
+
     /// Ensure FTS indexes exist on an existing embedding table.
     /// No-op if the indexes already exist (LanceDB replace=true is idempotent).
     /// Called when reusing a cached table that may predate FTS support.
     pub async fn ensure_fts_index(&self) {
-        match self.db.open_table(&self.table_name).execute().await {
+        if self.active_generation_manifest().is_some() {
+            // Strict immutable generations create and verify all FTS indexes in
+            // staging; reopening must never mutate the published generation.
+            return;
+        }
+        match self.db().open_table(&self.table_name).execute().await {
             Ok(table) => self.create_fts_index(&table).await,
             Err(lancedb::Error::TableNotFound { .. }) => {
                 // No table to index yet.
@@ -720,6 +1937,44 @@ impl EmbeddingIndex {
             .await
     }
 
+    /// Build a semantic generation under an explicit structural/scan contract.
+    /// The sealed #786 artifact uses the same path automatically from `new()`.
+    pub async fn index_all_with_symbols_strict(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+        edges: &[crate::graph::Edge],
+        business_context: &crate::business_context::BusinessContextAdmission,
+        contract: SemanticBuildContract,
+    ) -> Result<usize> {
+        contract.validate()?;
+        if !contract.require_metal {
+            anyhow::bail!("strict semantic generation contract must require Metal");
+        }
+        self.index_all_generation(
+            repo_root,
+            symbols,
+            business_context,
+            Some(contract),
+            Some(edges),
+        )
+        .await
+    }
+
+    /// Reconcile one complete semantic generation against the exact freshly
+    /// reopened persisted graph. Sealed builds require this API so readiness
+    /// is revalidated against both nodes and edges at the semantic commit seam.
+    pub async fn index_all_with_persisted_graph_and_business_context(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+        edges: &[crate::graph::Edge],
+        business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<usize> {
+        self.index_all_generation(repo_root, symbols, business_context, None, Some(edges))
+            .await
+    }
+
     /// Index recent git commits only (no graph nodes). Rebuilds the table from scratch.
     pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
         self.index_all_inner(
@@ -740,9 +1995,14 @@ impl EmbeddingIndex {
         if nodes.is_empty() {
             return Ok(0);
         }
+        if self.active_generation_manifest().is_some() {
+            anyhow::bail!(
+                "immutable semantic generations reject targeted in-place reindex; reconcile the complete reopened target graph"
+            );
+        }
 
         // Open table first — if it doesn't exist, nothing to update.
-        let table = match self.db.open_table(&self.table_name).execute().await {
+        let table = match self.db().open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(_) => {
                 // Table not yet created — nothing to update.
@@ -1006,6 +2266,474 @@ impl EmbeddingIndex {
         symbols: &[crate::graph::Node],
         business_context: &crate::business_context::BusinessContextAdmission,
     ) -> Result<usize> {
+        self.index_all_generation(repo_root, symbols, business_context, None, None)
+            .await
+    }
+
+    async fn index_all_generation(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+        business_context: &crate::business_context::BusinessContextAdmission,
+        contract: Option<SemanticBuildContract>,
+        persisted_edges: Option<&[crate::graph::Edge]>,
+    ) -> Result<usize> {
+        if repo_root != self.repo_root.as_path() {
+            anyhow::bail!(
+                "semantic generation target {} does not match index root {}",
+                repo_root.display(),
+                self.repo_root.display()
+            );
+        }
+        let candidates = collect_generation_candidates(repo_root, symbols, business_context)?;
+        let canonical_input_digest = candidate_input_digest(&candidates)?;
+        let target_graph_digest = generation::target_graph_digest(symbols)?;
+        let require_metal = contract
+            .as_ref()
+            .map_or(self.require_metal, |contract| contract.require_metal);
+        if self.require_metal && !require_metal {
+            anyhow::bail!("sealed semantic bundle cannot relax its Metal execution policy");
+        }
+
+        let mut flags = contract
+            .as_ref()
+            .map(|contract| contract.flags.clone())
+            .unwrap_or_default();
+        flags.insert(
+            "business_context_git_history".to_string(),
+            (!business_context.mode().is_disabled()).to_string(),
+        );
+        flags.insert(
+            "code_embed_char_budget".to_string(),
+            CODE_EMBED_CHAR_BUDGET.to_string(),
+        );
+        flags.insert(
+            "recent_commit_limit".to_string(),
+            RECENT_COMMIT_LIMIT.to_string(),
+        );
+        flags.insert("pr_merge_limit".to_string(), PR_MERGE_LIMIT.to_string());
+        flags.insert("require_metal".to_string(), require_metal.to_string());
+        flags.insert("target_graph_authoritative".to_string(), "true".to_string());
+        flags.insert("rerank_required".to_string(), require_metal.to_string());
+        flags.insert(
+            "asset_seeding".to_string(),
+            generation::semantic_asset_seeding().to_string(),
+        );
+        let structural_graph_snapshot_digest = if !generation::semantic_asset_seeding()
+            && let Some(persisted_edges) = persisted_edges
+        {
+            let readiness = crate::lsp_completeness::load_readiness_check_with_graph(
+                repo_root,
+                business_context.mode(),
+                symbols,
+                persisted_edges,
+            )
+            .context(
+                "authoritative semantic generation requires a fresh full-graph LSP completeness report",
+            )?;
+            if !readiness.ready {
+                anyhow::bail!(
+                    "authoritative semantic generation requires full LSP READY: {}",
+                    readiness.human_summary()
+                );
+            }
+            generation::validate_digest(
+                "LSP completeness graph_snapshot_digest",
+                &readiness.report.graph_snapshot_digest,
+            )?;
+            flags.insert(
+                "lsp_config_digest".to_string(),
+                readiness.report.identity.config_digest.clone(),
+            );
+            flags.insert(
+                "lsp_policy_digest".to_string(),
+                readiness.report.identity.policy_digest.clone(),
+            );
+            flags.insert(
+                "business_context_mode".to_string(),
+                readiness.report.identity.context_mode.clone(),
+            );
+            flags.insert(
+                "graph_schema_version".to_string(),
+                readiness.report.identity.graph_schema_version.to_string(),
+            );
+            if let Some(contract) = &contract
+                && contract.structural_graph_snapshot_digest
+                    != readiness.report.graph_snapshot_digest
+            {
+                anyhow::bail!(
+                    "semantic build contract does not match the fresh READY structural graph snapshot"
+                );
+            }
+            readiness.report.graph_snapshot_digest
+        } else if require_metal && !generation::semantic_asset_seeding() {
+            anyhow::bail!(
+                "sealed semantic generation requires freshly reopened persisted nodes and edges"
+            )
+        } else {
+            contract
+                .as_ref()
+                .map(|contract| contract.structural_graph_snapshot_digest.clone())
+                .unwrap_or_else(|| target_graph_digest.clone())
+        };
+        let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        if require_metal && !generation::semantic_asset_seeding() {
+            generation::verify_runtime_encoder_assets()?;
+        }
+        let identity_digest = identity.digest()?;
+        let generation_digest = generation::generation_digest(
+            &identity,
+            &canonical_input_digest,
+            &target_graph_digest,
+            &structural_graph_snapshot_digest,
+        )?;
+
+        let prior = generation::load_current_generation(repo_root)?;
+        let mut prior_generation_digest = None;
+        let mut reusable_vectors = BTreeMap::new();
+        let mut prior_row_ids = BTreeSet::new();
+        if let Some((pointer, prior_manifest, prior_coverage, prior_verification)) = &prior {
+            prior_generation_digest = Some(pointer.generation_digest.clone());
+            prior_row_ids.extend(prior_coverage.rows.iter().map(|row| row.id.clone()));
+            if prior_manifest.semantic_identity == identity {
+                let prior_path =
+                    generation::generation_root(repo_root, &pointer.generation_digest)?
+                        .join("lance");
+                let prior_db = lancedb::connect(prior_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("semantic generation path is not valid UTF-8")
+                })?)
+                .execute()
+                .await
+                .context("failed to open prior immutable semantic generation")?;
+                let prior_rows = read_materialized_generation(&prior_db, &self.table_name).await?;
+                let prior_coverage_rows = prior_coverage
+                    .rows
+                    .iter()
+                    .map(|row| (row.id.as_str(), row))
+                    .collect::<BTreeMap<_, _>>();
+                if prior_rows.len() != prior_coverage_rows.len()
+                    || prior_verification.row_count != prior_rows.len()
+                {
+                    anyhow::bail!("prior semantic generation coverage is not one-to-one");
+                }
+                let mut prior_vectors_by_input = BTreeMap::new();
+                for (id, row) in &prior_rows {
+                    let coverage = prior_coverage_rows.get(id.as_str()).ok_or_else(|| {
+                        anyhow::anyhow!("prior semantic generation contains orphan row {id}")
+                    })?;
+                    let vector_sha256 =
+                        generation::vector_sha256(&row.vector, EMBEDDING_DIMENSION)?;
+                    if vector_sha256 != coverage.vector_sha256 {
+                        anyhow::bail!(
+                            "prior semantic generation vector checksum mismatch for {id}"
+                        );
+                    }
+                    retain_reusable_vector(
+                        &mut prior_vectors_by_input,
+                        &coverage.canonical_input_digest,
+                        vector_sha256,
+                        &row.vector,
+                    )?;
+                }
+
+                if pointer.generation_digest == generation_digest {
+                    let expected_prior_hashes = prior_coverage
+                        .rows
+                        .iter()
+                        .map(|row| (row.id.clone(), row.vector_sha256.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    let coverage =
+                        verify_materialized_rows(&candidates, &prior_rows, &expected_prior_hashes)?;
+                    if coverage != prior_coverage.rows {
+                        anyhow::bail!(
+                            "identical semantic generation coverage changed after fresh reopen"
+                        );
+                    }
+                    self.replace_active_generation(prior_db, prior_manifest.clone());
+                    return Ok(0);
+                }
+
+                let target_inputs = candidates
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            candidate.id.clone(),
+                            candidate.canonical_input_digest.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let reuse_plan = generation::plan_vector_reuse(
+                    Some(&prior_manifest.semantic_identity),
+                    &identity,
+                    &prior_coverage.rows,
+                    &target_inputs,
+                )?;
+                let reusable_ids = reuse_plan.reused_ids.into_iter().collect::<BTreeSet<_>>();
+                for candidate in &candidates {
+                    if reusable_ids.contains(&candidate.id) {
+                        let (_, vector) = prior_vectors_by_input
+                            .get(&candidate.canonical_input_digest)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "vector reuse plan selected an unavailable canonical encoder input"
+                                )
+                            })?;
+                        reusable_vectors.insert(candidate.id.clone(), vector.clone());
+                    }
+                }
+            }
+        }
+
+        let mut vectors = reusable_vectors;
+        let to_encode = candidates
+            .iter()
+            .filter(|candidate| !vectors.contains_key(&candidate.id))
+            .collect::<Vec<_>>();
+        let encoder_inputs = group_canonical_encoder_inputs(to_encode.iter().copied())?;
+        let encoded_vector_count = to_encode.len();
+        let target_ids = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let purged_row_count = prior_row_ids
+            .iter()
+            .filter(|id| !target_ids.contains(id.as_str()))
+            .count();
+        tracing::info!(
+            prior_rows = prior_row_ids.len(),
+            target_rows = candidates.len(),
+            reused_vectors = vectors.len(),
+            encoded_vectors = encoded_vector_count,
+            encoded_inputs = encoder_inputs.len(),
+            purged_rows = purged_row_count,
+            "EmbeddingIndex: value-addressed vector plan"
+        );
+        let mut device_attestation = attest_available_device(require_metal)?;
+        if !encoder_inputs.is_empty() {
+            let (model, observed_attestation) = new_model_with_policy(require_metal)?;
+            device_attestation = observed_attestation;
+            const ENCODE_BATCH_SIZE: usize = 2048;
+            for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
+                let output = embed_texts_with_model(
+                    &model,
+                    batch.iter().map(|input| input.text.to_string()).collect(),
+                )
+                .await?;
+                if output.len() != batch.len() {
+                    anyhow::bail!(
+                        "embedding output count mismatch: requested {}, observed {}",
+                        batch.len(),
+                        output.len()
+                    );
+                }
+                for (input, vector) in batch.iter().zip(output) {
+                    fan_out_encoded_vector(&mut vectors, input, vector)?;
+                }
+            }
+        }
+        if vectors.len() != candidates.len() {
+            anyhow::bail!(
+                "semantic vector coverage mismatch before persistence: expected {}, observed {}",
+                candidates.len(),
+                vectors.len()
+            );
+        }
+        validate_canonical_vector_mapping(&candidates, &vectors)?;
+        let expected_vector_hashes = vectors
+            .iter()
+            .map(|(id, vector)| {
+                Ok((
+                    id.clone(),
+                    generation::vector_sha256(vector, EMBEDDING_DIMENSION)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if require_metal && !generation::semantic_asset_seeding() {
+            // Re-hash immediately after encoder inference (or verified vector
+            // reuse) so a cache mutation cannot be hidden by the identity read
+            // performed before model initialization.
+            generation::verify_runtime_encoder_assets()?;
+        }
+        if generation::semantic_asset_seeding() {
+            anyhow::bail!(
+                "SEMANTIC_ASSET_SEEDING_COMPLETE: encoder assets acquired; publication and READY are forbidden"
+            );
+        }
+
+        let staging_root = generation::new_staging_root(repo_root, &generation_digest)?;
+        let lance_root = staging_root.join("lance");
+        std::fs::create_dir_all(&lance_root)?;
+        let staging_db = lancedb::connect(
+            lance_root
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("semantic staging path is not valid UTF-8"))?,
+        )
+        .execute()
+        .await
+        .context("failed to create staged semantic Lance database")?;
+
+        const WRITE_BATCH_SIZE: usize = 2048;
+        if candidates.is_empty() {
+            staging_db
+                .create_table(&self.table_name, generation_record_batch(&[], &vectors)?)
+                .execute()
+                .await
+                .context("failed to create empty semantic generation table")?;
+        } else {
+            for (index, batch_candidates) in candidates.chunks(WRITE_BATCH_SIZE).enumerate() {
+                let batch = generation_record_batch(batch_candidates, &vectors)?;
+                if index == 0 {
+                    staging_db
+                        .create_table(&self.table_name, batch)
+                        .execute()
+                        .await
+                        .context("failed to create staged semantic generation table")?;
+                } else {
+                    staging_db
+                        .open_table(&self.table_name)
+                        .execute()
+                        .await?
+                        .add(batch)
+                        .execute()
+                        .await
+                        .context("failed to append staged semantic generation batch")?;
+                }
+            }
+        }
+        let table = staging_db
+            .open_table(&self.table_name)
+            .execute()
+            .await
+            .context("failed to reopen staged semantic table for FTS")?;
+        self.create_fts_index_strict(&table).await?;
+        drop(table);
+        drop(staging_db);
+
+        let reopened_staging_db = lancedb::connect(
+            lance_root
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("semantic staging path is not valid UTF-8"))?,
+        )
+        .execute()
+        .await
+        .context("failed to fresh-reopen staged semantic generation")?;
+        let materialized =
+            read_materialized_generation(&reopened_staging_db, &self.table_name).await?;
+        let coverage_rows =
+            verify_materialized_rows(&candidates, &materialized, &expected_vector_hashes)?;
+        drop(reopened_staging_db);
+
+        let coverage = CoverageManifest {
+            schema_version: generation::COVERAGE_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            semantic_identity_digest: identity_digest.clone(),
+            canonical_input_digest: canonical_input_digest.clone(),
+            target_graph_digest: target_graph_digest.clone(),
+            structural_graph_snapshot_digest: structural_graph_snapshot_digest.clone(),
+            row_count: coverage_rows.len(),
+            rows: coverage_rows,
+        };
+        let coverage_digest = coverage.digest()?;
+        let lance_tree_digest = generation::tree_digest(&lance_root)?;
+        let manifest = GenerationManifest {
+            schema_version: generation::GENERATION_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            semantic_identity: identity.clone(),
+            semantic_identity_digest: identity_digest,
+            canonical_input_digest,
+            target_graph_digest: target_graph_digest.clone(),
+            structural_graph_snapshot_digest: structural_graph_snapshot_digest.clone(),
+            row_count: candidates.len(),
+            coverage_digest: coverage_digest.clone(),
+            lance_tree_digest: lance_tree_digest.clone(),
+            reused_vector_count: candidates.len() - encoded_vector_count,
+            encoded_vector_count,
+            prior_generation_digest,
+            created_by_artifact_sha256: identity.artifact_sha256.clone(),
+            device_attestation,
+        };
+        let manifest_sha256 =
+            generation::write_generation_evidence(&staging_root, &coverage, &manifest)?;
+        let verification = SemanticVerificationReceipt {
+            schema_version: generation::VERIFICATION_SCHEMA_VERSION,
+            generation_digest: generation_digest.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            coverage_digest,
+            lance_tree_digest,
+            structural_graph_snapshot_digest,
+            target_graph_digest,
+            row_count: candidates.len(),
+            one_to_one_coverage: true,
+            fresh_reopen_ready: true,
+        };
+        generation::write_verification_evidence(&staging_root, &verification, &manifest)?;
+        let final_root =
+            generation::promote_staging_generation(repo_root, &staging_root, &generation_digest)?;
+
+        let final_db = lancedb::connect(
+            final_root
+                .join("lance")
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("semantic generation path is not valid UTF-8"))?,
+        )
+        .execute()
+        .await
+        .context("failed to fresh-reopen promoted semantic generation")?;
+        let final_rows = read_materialized_generation(&final_db, &self.table_name).await?;
+        if verify_materialized_rows(&candidates, &final_rows, &expected_vector_hashes)?
+            != coverage.rows
+        {
+            anyhow::bail!("promoted semantic generation coverage changed after fresh reopen");
+        }
+        let (verified_manifest, verified_coverage, _) = generation::verify_generation_files(
+            repo_root,
+            &generation_digest,
+            Some(&manifest_sha256),
+        )?;
+        if verified_manifest != manifest || verified_coverage != coverage {
+            anyhow::bail!("promoted semantic generation evidence changed before publication");
+        }
+        let current_graph = crate::server::load_graph_from_lance(repo_root)
+            .await
+            .context(
+                "failed to fresh-reopen persisted graph immediately before semantic publication",
+            )?;
+        validate_generation_graph_evidence(
+            repo_root,
+            business_context.mode(),
+            &current_graph.nodes,
+            &current_graph.edges,
+            &manifest,
+        )?;
+        publish_generation_after_final_validation(
+            || {
+                if require_metal {
+                    // This is the last fallible external-input validation. It
+                    // must finish before current.json can name the generation.
+                    generation::verify_runtime_encoder_assets()?;
+                }
+                Ok(())
+            },
+            || {
+                generation::publish_current_generation(
+                    repo_root,
+                    &generation_digest,
+                    &manifest_sha256,
+                    &verification,
+                )
+            },
+        )?;
+        self.replace_active_generation(final_db, manifest);
+        Ok(encoded_vector_count)
+    }
+
+    #[allow(dead_code)]
+    async fn index_all_legacy_inner(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+        business_context: &crate::business_context::BusinessContextAdmission,
+    ) -> Result<usize> {
         let index_start = std::time::Instant::now();
         tracing::info!(
             "EmbeddingIndex: rebuilding full index for {}",
@@ -1205,7 +2933,7 @@ impl EmbeddingIndex {
         // to existing tables via add() — a schema mismatch is a fatal error at write time.
         let (table_exists, to_embed) = if table_exists {
             let table = self
-                .db
+                .db()
                 .open_table(&self.table_name)
                 .execute()
                 .await
@@ -1229,7 +2957,7 @@ impl EmbeddingIndex {
                     existing_hashes.is_some(),
                     has_file_path_col,
                 );
-                if let Err(e) = self.db.drop_table(&self.table_name, &[]).await {
+                if let Err(e) = self.db().drop_table(&self.table_name, &[]).await {
                     tracing::debug!(
                         "EmbeddingIndex: drop_table failed (proceeding with create): {}",
                         e
@@ -1280,7 +3008,7 @@ impl EmbeddingIndex {
             // changed (to_embed) vs unchanged (kept in-place).
             if table_exists {
                 let table = self
-                    .db
+                    .db()
                     .open_table(&self.table_name)
                     .execute()
                     .await
@@ -1385,7 +3113,7 @@ impl EmbeddingIndex {
 
                 if !table_exists && batch_idx == 0 {
                     // First batch on a fresh table: create it
-                    self.db
+                    self.db()
                         .create_table(&self.table_name, batch)
                         .execute()
                         .await
@@ -1396,7 +3124,7 @@ impl EmbeddingIndex {
                     // For existing tables, rows to re-embed were already deleted
                     // above (#332).
                     let table = self
-                        .db
+                        .db()
                         .open_table(&self.table_name)
                         .execute()
                         .await
@@ -1436,7 +3164,7 @@ impl EmbeddingIndex {
         }
 
         // --- Compact lance to reclaim space (#298) ---
-        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+        if let Ok(table) = self.db().open_table(&self.table_name).execute().await {
             let compact_start = std::time::Instant::now();
             match table.optimize(lancedb::table::OptimizeAction::All).await {
                 Ok(_stats) => {
@@ -1453,7 +3181,7 @@ impl EmbeddingIndex {
 
         // Build FTS index for hybrid search (BM25 on title + body).
         // Best-effort: failure is logged but does not fail the indexing operation.
-        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+        if let Ok(table) = self.db().open_table(&self.table_name).execute().await {
             self.create_fts_index(&table).await;
         } else {
             tracing::warn!(
@@ -1473,7 +3201,7 @@ impl EmbeddingIndex {
         use futures::TryStreamExt;
 
         let table = self
-            .db
+            .db()
             .open_table(&self.table_name)
             .execute()
             .await
@@ -1574,7 +3302,53 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
-        let table = match self.db.open_table(&self.table_name).execute().await {
+        if requires_sealed_query_validation(self.require_metal, mode) {
+            return self
+                .search_with_filters_strict(query, artifact_types, limit, mode, filters)
+                .await;
+        }
+        self.search_with_filters_policy(query, artifact_types, limit, mode, filters, false)
+            .await
+    }
+
+    /// Strict semantic search used by the sealed #786 artifact.
+    /// Metal, the requested search mode, every result schema, and hybrid FTS
+    /// must succeed exactly; no vector-only or partial-batch fallback is allowed.
+    pub async fn search_with_filters_strict(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
+        if generation::semantic_asset_seeding() {
+            anyhow::bail!("strict semantic search is forbidden during asset seeding");
+        }
+        self.validate_active_generation_graph().await?;
+        require_metal_device()?;
+        generation::verify_runtime_encoder_assets()?;
+        let outcome = self
+            .search_with_filters_policy(query, artifact_types, limit, mode, filters, true)
+            .await?;
+        generation::verify_runtime_encoder_assets()?;
+        self.validate_active_generation_graph().await?;
+        Ok(outcome)
+    }
+
+    async fn search_with_filters_policy(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+        strict: bool,
+    ) -> Result<SearchOutcome> {
+        if strict && generation::semantic_asset_seeding() {
+            anyhow::bail!("strict semantic search is forbidden during asset seeding");
+        }
+        let table = match self.db().open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -1611,7 +3385,7 @@ impl EmbeddingIndex {
 
         use futures::TryStreamExt;
 
-        let batches: Vec<RecordBatch> = match mode {
+        let (batches, score_kind): (Vec<RecordBatch>, RetrievalScoreKind) = match mode {
             SearchMode::Keyword => {
                 // Pure BM25 full-text search — no embedding needed.
                 let fts_query = FullTextSearchQuery::new(query.to_string());
@@ -1620,12 +3394,18 @@ impl EmbeddingIndex {
                     q = q.only_if(sql.clone());
                 }
                 let results = q.execute().await.context("FTS keyword search failed")?;
-                results.try_collect().await?
+                (results.try_collect().await?, RetrievalScoreKind::Keyword)
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding =
-                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?;
+                let query_embedding = if strict {
+                    let (model, _) = new_model_with_policy(true)?;
+                    single_query_embedding(
+                        embed_texts_with_model(&model, vec![query.to_string()]).await?,
+                    )?
+                } else {
+                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?
+                };
                 let mut search = table
                     .vector_search(query_embedding)
                     .context("Failed to create vector search")?
@@ -1635,14 +3415,20 @@ impl EmbeddingIndex {
                     search = search.only_if(sql.clone());
                 }
                 let results = search.execute().await.context("Vector search failed")?;
-                results.try_collect().await?
+                (results.try_collect().await?, RetrievalScoreKind::Semantic)
             }
             SearchMode::Hybrid => {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding =
-                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?;
+                let query_embedding = if strict {
+                    let (model, _) = new_model_with_policy(true)?;
+                    single_query_embedding(
+                        embed_texts_with_model(&model, vec![query.to_string()]).await?,
+                    )?
+                } else {
+                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?
+                };
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
@@ -1657,7 +3443,12 @@ impl EmbeddingIndex {
                     .await;
 
                 match hybrid_result {
-                    Ok(stream) => stream.try_collect().await?,
+                    Ok(stream) => (stream.try_collect().await?, RetrievalScoreKind::HybridRrf),
+                    Err(error) if strict => {
+                        return Err(error).context(
+                            "strict hybrid semantic search failed; vector-only fallback is forbidden",
+                        );
+                    }
                     Err(e) => {
                         // FTS index may not exist yet (first run before index_all
                         // completes, or old cache). Fall back to pure vector search.
@@ -1674,7 +3465,7 @@ impl EmbeddingIndex {
                             .execute()
                             .await
                             .context("Fallback vector search failed")?;
-                        results.try_collect().await?
+                        (results.try_collect().await?, RetrievalScoreKind::Semantic)
                     }
                 }
             }
@@ -1682,14 +3473,13 @@ impl EmbeddingIndex {
 
         let mut search_results = Vec::new();
 
-        // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
-        // Detect which column is present by checking ANY batch — not just the first.
-        // The first batch may be skipped (missing required columns) when hybrid search
-        // with a pre-filter returns a partial schema, so checking only the first batch
-        // could misdetect the score column. (#400)
-        let has_score_col = batches.iter().any(|b| b.column_by_name("_score").is_some());
-
         for batch in &batches {
+            // Validate the mode-specific score schema once per batch before
+            // row filtering. Strict retrieval must reject malformed empty or
+            // fully filtered batches instead of silently accepting them.
+            let score_column =
+                validated_retrieval_score_column(batch, score_kind, strict)?;
+
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
             // RecordBatches that are missing table columns — only FTS-indexed
             // columns may be present. Guard against this rather than panicking.
@@ -1702,6 +3492,12 @@ impl EmbeddingIndex {
                 .filter(|col| batch.column_by_name(col).is_none())
                 .collect();
             if !missing.is_empty() {
+                if strict {
+                    anyhow::bail!(
+                        "strict semantic search result is missing required columns: {}",
+                        missing.join(", ")
+                    );
+                }
                 tracing::warn!(
                     missing_columns = ?missing,
                     schema = ?batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
@@ -1726,34 +3522,11 @@ impl EmbeddingIndex {
                     continue;
                 }
 
-                let raw_score = if has_score_col {
-                    // RRF / BM25 `_score` — higher is better.
-                    // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
-                    // BM25 scores can exceed 1.0 for highly relevant short docs.
-                    // Use monotonic s/(1+s) transform to map [0, inf) -> [0, 1)
-                    // while preserving ranking order. A hard clamp at 1.0 would
-                    // destroy differentiation among high-scoring results.
-                    //
-                    // _score column presence was checked on first batch; if a
-                    // subsequent batch is missing it, fall back to 0.5 (neutral).
-                    let s = batch
-                        .column_by_name("_score")
-                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-                        .map(|arr| arr.value(i))
-                        .unwrap_or(0.5);
-                    let s = s.max(0.0);
-                    s / (1.0 + s)
-                } else {
-                    // Cosine distance [0, 2]: convert to similarity.
-                    // If _distance is absent (shouldn't happen in vector mode,
-                    // but guard defensively), treat as maximum distance → 0 score.
-                    let d = batch
-                        .column_by_name("_distance")
-                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-                        .map(|arr| arr.value(i))
-                        .unwrap_or(2.0);
-                    (1.0 - d).max(0.0)
-                };
+                // LanceDB 0.31 uses a different score column for each query
+                // family: BM25 `_score`, vector `_distance`, and hybrid RRF
+                // `_relevance_score`. The non-strict hybrid fallback is a real
+                // vector query and therefore intentionally uses `_distance`.
+                let raw_score = retrieval_score(score_column, i, score_kind, strict)?;
 
                 // Demote test files: reduce score so production code ranks above
                 // test code at similar distances.
@@ -1772,11 +3545,7 @@ impl EmbeddingIndex {
         }
 
         // Re-sort by adjusted score (descending) and truncate.
-        search_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rank_search_results(&mut search_results);
         search_results.truncate(limit);
 
         Ok(SearchOutcome::Results(search_results))
@@ -1785,12 +3554,66 @@ impl EmbeddingIndex {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{Float32Array, Int32Array, RecordBatch};
+
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
-        EmbeddingIndex, SearchFilters, SearchResult, build_artifact_embedding_text,
-        build_code_embedding_text, node_embedding_kind, node_embedding_text, node_embedding_title,
-        node_scalar_filters, required_string_column, single_query_embedding, truncate_chars,
+        EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
+        MaterializedEmbeddingRow, RetrievalScoreKind, SearchFilters, SearchMode, SearchResult,
+        UnpublishedScratchRoot, build_artifact_embedding_text, build_code_embedding_text,
+        fan_out_encoded_vector, group_canonical_encoder_inputs, node_embedding_kind,
+        node_embedding_text, node_embedding_title, node_scalar_filters,
+        publish_generation_after_final_validation, rank_search_results, required_string_column,
+        requires_active_generation_graph_validation, requires_sealed_query_validation,
+        retain_reusable_vector, retrieval_score, single_query_embedding, truncate_chars,
+        validate_canonical_vector_mapping, validated_retrieval_score_column,
+        verify_materialized_rows,
     };
+
+    #[test]
+    fn sealed_handle_validates_explicit_semantic_mode() {
+        assert!(requires_sealed_query_validation(true, SearchMode::Semantic));
+        assert!(!requires_sealed_query_validation(
+            false,
+            SearchMode::Semantic
+        ));
+    }
+
+    #[test]
+    fn stale_generation_is_rejected_for_serving_but_available_to_reconciliation() {
+        assert!(requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            false,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Reconciliation,
+            true,
+            false,
+            true,
+        ));
+
+        // The exemption is not a general strict-open bypass.
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            true,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            false,
+            false,
+            true,
+        ));
+        assert!(!requires_active_generation_graph_validation(
+            GenerationOpenPurpose::Serving,
+            true,
+            false,
+            false,
+        ));
+    }
 
     #[test]
     fn single_query_embedding_rejects_missing_or_malformed_output() {
@@ -1823,6 +3646,457 @@ mod tests {
         assert!(error.contains("`id` must be Utf8"));
         assert!(error.contains("Int32"));
     }
+
+    fn score_batch(name: &str, values: arrow_array::ArrayRef) -> RecordBatch {
+        RecordBatch::try_from_iter([(name, values)]).unwrap()
+    }
+
+    fn score_at(
+        batch: &RecordBatch,
+        row: usize,
+        kind: RetrievalScoreKind,
+        strict: bool,
+    ) -> anyhow::Result<f32> {
+        let scores = validated_retrieval_score_column(batch, kind, strict)?;
+        retrieval_score(scores, row, kind, strict)
+    }
+
+    #[test]
+    fn retrieval_scores_use_the_lancedb_031_mode_specific_columns() {
+        use std::sync::Arc;
+
+        let keyword = score_batch("_score", Arc::new(Float32Array::from(vec![3.0])));
+        let semantic = score_batch("_distance", Arc::new(Float32Array::from(vec![0.25])));
+        let hybrid = RecordBatch::try_from_iter([
+            (
+                "_relevance_score",
+                Arc::new(Float32Array::from(vec![0.03])) as arrow_array::ArrayRef,
+            ),
+            (
+                "_distance",
+                Arc::new(Float32Array::from(vec![1.75])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            score_at(&keyword, 0, RetrievalScoreKind::Keyword, true).unwrap(),
+            0.75
+        );
+        assert_eq!(
+            score_at(&semantic, 0, RetrievalScoreKind::Semantic, true).unwrap(),
+            0.75
+        );
+        let hybrid_score =
+            score_at(&hybrid, 0, RetrievalScoreKind::HybridRrf, true).unwrap();
+        assert!((hybrid_score - (0.03 / 1.03)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn strict_hybrid_rrf_score_contract_fails_closed() {
+        use std::sync::Arc;
+
+        let legacy_name = score_batch("_score", Arc::new(Float32Array::from(vec![0.03])));
+        let missing = score_at(&legacy_name, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("`_relevance_score`"));
+        assert!(missing.contains("missing"));
+
+        let wrong_type = score_batch("_relevance_score", Arc::new(Int32Array::from(vec![1])));
+        let wrong_type = score_at(&wrong_type, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("must be Float32"));
+
+        let null_score = score_batch("_relevance_score", Arc::new(Float32Array::from(vec![None])));
+        let null_score = score_at(&null_score, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(null_score.contains("is null"));
+
+        let non_finite = score_batch(
+            "_relevance_score",
+            Arc::new(Float32Array::from(vec![f32::NAN])),
+        );
+        let non_finite = score_at(&non_finite, 0, RetrievalScoreKind::HybridRrf, true)
+            .unwrap_err()
+            .to_string();
+        assert!(non_finite.contains("non-finite"));
+    }
+
+    #[test]
+    fn strict_score_schema_rejects_malformed_zero_row_batches() {
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let missing = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+        )])
+        .unwrap();
+        let missing = validated_retrieval_score_column(
+            &missing,
+            RetrievalScoreKind::HybridRrf,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("`_relevance_score`"));
+        assert!(missing.contains("missing"));
+
+        let wrong_type = score_batch(
+            "_relevance_score",
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+        );
+        let wrong_type = validated_retrieval_score_column(
+            &wrong_type,
+            RetrievalScoreKind::HybridRrf,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_type.contains("must be Float32"));
+    }
+
+    #[test]
+    fn non_strict_hybrid_vector_fallback_uses_distance() {
+        use std::sync::Arc;
+
+        let fallback = score_batch("_distance", Arc::new(Float32Array::from(vec![0.125])));
+        assert_eq!(
+            score_at(&fallback, 0, RetrievalScoreKind::Semantic, false).unwrap(),
+            0.875
+        );
+    }
+
+    #[test]
+    fn retrieval_ranking_breaks_score_ties_by_stable_id() {
+        let mut results = vec![
+            SearchResult {
+                id: "stable:z".to_string(),
+                kind: "code:function".to_string(),
+                title: "z".to_string(),
+                body: String::new(),
+                score: 0.75,
+            },
+            SearchResult {
+                id: "stable:a".to_string(),
+                kind: "code:function".to_string(),
+                title: "a".to_string(),
+                body: String::new(),
+                score: 0.75,
+            },
+            SearchResult {
+                id: "stable:m".to_string(),
+                kind: "code:function".to_string(),
+                title: "m".to_string(),
+                body: String::new(),
+                score: 0.9,
+            },
+        ];
+
+        rank_search_results(&mut results);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable:m", "stable:a", "stable:z"]
+        );
+    }
+
+    #[test]
+    fn value_addressed_digest_depends_only_on_exact_encoder_text() {
+        let first = EmbeddingCandidate::new(
+            "old-id".into(),
+            "code:function".into(),
+            "old title".into(),
+            "fn value()\n\nold.py:10".into(),
+            "value fn value()".into(),
+            Some("old.py".into()),
+            Some("python".into()),
+            Some("old-subsystem".into()),
+            Some(1),
+        )
+        .unwrap();
+        let renamed = EmbeddingCandidate::new(
+            "new-id".into(),
+            "code:function".into(),
+            "new title".into(),
+            "fn value()\n\nnew.py:90".into(),
+            "value fn value()".into(),
+            Some("new.py".into()),
+            Some("python".into()),
+            Some("new-subsystem".into()),
+            Some(99),
+        )
+        .unwrap();
+        let changed = EmbeddingCandidate::new(
+            "new-id".into(),
+            "code:function".into(),
+            "new title".into(),
+            "fn value()\n\nnew.py:90".into(),
+            "value fn value() changed".into(),
+            Some("new.py".into()),
+            Some("python".into()),
+            Some("new-subsystem".into()),
+            Some(99),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.canonical_input_digest,
+            renamed.canonical_input_digest
+        );
+        assert_ne!(
+            first.canonical_input_digest,
+            changed.canonical_input_digest
+        );
+    }
+
+    #[test]
+    fn value_addressed_input_ignores_derived_graph_metadata() {
+        let mut first_metadata = BTreeMap::from([
+            ("doc_comment".to_string(), "Stable intent".to_string()),
+            ("inferred_types".to_string(), "Result[str]".to_string()),
+            ("importance".to_string(), "0.01".to_string()),
+            ("subsystem".to_string(), "first".to_string()),
+            ("lsp_document_symbol_payload_digest".to_string(), "one".to_string()),
+        ]);
+        let first = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata.clone(),
+        );
+        first_metadata.insert("importance".to_string(), "0.99".to_string());
+        first_metadata.insert("subsystem".to_string(), "second".to_string());
+        first_metadata.insert(
+            "lsp_document_symbol_payload_digest".to_string(),
+            "two".to_string(),
+        );
+        let derived_changed = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata.clone(),
+        );
+        assert_eq!(
+            node_embedding_text(&first),
+            node_embedding_text(&derived_changed)
+        );
+
+        first_metadata.insert("doc_comment".to_string(), "Changed intent".to_string());
+        let semantic_changed = make_test_node(
+            "value",
+            crate::graph::NodeKind::Function,
+            "fn value() {}",
+            first_metadata,
+        );
+        assert_ne!(
+            node_embedding_text(&first),
+            node_embedding_text(&semantic_changed)
+        );
+    }
+
+    #[test]
+    fn value_addressed_conflicting_payloads_fail_closed() {
+        let mut reusable = BTreeMap::new();
+        retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
+        retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
+        let error = retain_reusable_vector(
+            &mut reusable,
+            "input",
+            "b".repeat(64),
+            &[0.5],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("conflicting vector payloads"));
+    }
+
+    #[test]
+    fn value_addressed_duplicate_inputs_encode_once_and_fan_out_exactly() {
+        let first = EmbeddingCandidate::new(
+            "first-id".into(),
+            "code:function".into(),
+            "first".into(),
+            "fn first()".into(),
+            "shared encoder input".into(),
+            Some("first.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let second = EmbeddingCandidate::new(
+            "second-id".into(),
+            "code:function".into(),
+            "second".into(),
+            "fn second()".into(),
+            "shared encoder input".into(),
+            Some("second.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let changed = EmbeddingCandidate::new(
+            "changed-id".into(),
+            "code:function".into(),
+            "changed".into(),
+            "fn changed()".into(),
+            "different encoder input".into(),
+            Some("changed.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let candidates = vec![first, second, changed];
+        let inputs = group_canonical_encoder_inputs(&candidates).unwrap();
+        assert_eq!(inputs.len(), 2);
+        let shared = inputs
+            .iter()
+            .find(|input| input.candidate_ids.len() == 2)
+            .unwrap();
+        assert_eq!(
+            shared.candidate_ids,
+            vec!["first-id", "second-id"],
+            "target row identity must not duplicate encoder work"
+        );
+
+        let shared_vector = vec![0.25; EMBEDDING_DIMENSION];
+        let mut vectors = BTreeMap::new();
+        fan_out_encoded_vector(&mut vectors, shared, shared_vector.clone()).unwrap();
+        let unique = inputs
+            .iter()
+            .find(|input| input.candidate_ids.len() == 1)
+            .unwrap();
+        fan_out_encoded_vector(&mut vectors, unique, vec![0.5; EMBEDDING_DIMENSION]).unwrap();
+
+        assert_eq!(vectors["first-id"], shared_vector);
+        assert_eq!(vectors["second-id"], vectors["first-id"]);
+        validate_canonical_vector_mapping(&candidates, &vectors).unwrap();
+    }
+
+    #[test]
+    fn value_addressed_target_conflicting_payloads_fail_closed() {
+        let first = EmbeddingCandidate::new(
+            "first-id".into(),
+            "code:function".into(),
+            "first".into(),
+            "fn first()".into(),
+            "shared encoder input".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let second = EmbeddingCandidate::new(
+            "second-id".into(),
+            "code:function".into(),
+            "second".into(),
+            "fn second()".into(),
+            "shared encoder input".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let candidates = vec![first, second];
+        let vectors = BTreeMap::from([
+            ("first-id".to_string(), vec![0.25; EMBEDDING_DIMENSION]),
+            ("second-id".to_string(), vec![0.5; EMBEDDING_DIMENSION]),
+        ]);
+
+        let error = validate_canonical_vector_mapping(&candidates, &vectors)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting vector payloads"));
+    }
+
+    #[test]
+    fn materialized_generation_rejects_vector_payload_drift() {
+        let candidate = EmbeddingCandidate::new(
+            "node-1".into(),
+            "code:function".into(),
+            "function one".into(),
+            "fn one()".into(),
+            "one fn one()".into(),
+            Some("src/lib.rs".into()),
+            Some("rust".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let original_vector = vec![0.25; EMBEDDING_DIMENSION];
+        let expected_hash =
+            crate::embed::generation::vector_sha256(&original_vector, EMBEDDING_DIMENSION).unwrap();
+        let mut changed_vector = original_vector;
+        changed_vector[0] = 0.5;
+        let rows = BTreeMap::from([(
+            candidate.id.clone(),
+            MaterializedEmbeddingRow {
+                kind: candidate.kind.clone(),
+                title: candidate.title.clone(),
+                body: candidate.body.clone(),
+                text_hash: candidate.text_hash(),
+                file_path: candidate.file_path.clone(),
+                language: candidate.language.clone(),
+                subsystem: candidate.subsystem.clone(),
+                cyclomatic: candidate.cyclomatic,
+                vector: changed_vector,
+            },
+        )]);
+        let expected = BTreeMap::from([(candidate.id.clone(), expected_hash)]);
+
+        let error = verify_materialized_rows(&[candidate], &rows, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vector payload mismatch"));
+    }
+
+    #[test]
+    fn failed_final_validation_preserves_the_previous_current_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current = tmp.path().join("current.json");
+        std::fs::write(&current, b"previous-generation").unwrap();
+        let publication_attempted = std::cell::Cell::new(false);
+
+        let error = publish_generation_after_final_validation(
+            || anyhow::bail!("late asset digest mismatch"),
+            || {
+                publication_attempted.set(true);
+                std::fs::write(&current, b"new-generation")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("asset digest mismatch"));
+        assert!(!publication_attempted.get());
+        assert_eq!(std::fs::read(&current).unwrap(), b"previous-generation");
+    }
+
+    #[test]
+    fn unpublished_scratch_lives_until_last_clone_and_is_ephemeral() {
+        let scratch = std::sync::Arc::new(UnpublishedScratchRoot::new().unwrap());
+        let path = scratch.root.clone();
+        let clone = std::sync::Arc::clone(&scratch);
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path.is_dir());
+
+        drop(scratch);
+        assert!(path.is_dir());
+        drop(clone);
+
+        assert!(!path.exists());
+    }
     use std::collections::BTreeMap;
 
     #[test]
@@ -1854,6 +4128,12 @@ mod tests {
             !idx.has_table().await.unwrap(),
             "has_table should be false on fresh DB"
         );
+        assert!(
+            !crate::embed::generation::semantic_root(&repo_root)
+                .join("staging")
+                .exists(),
+            "an unpublished handle must not write into the archivable semantic cache"
+        );
     }
 
     #[tokio::test]
@@ -1861,16 +4141,41 @@ mod tests {
         use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
 
         let tmp = tempfile::tempdir().unwrap();
-        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
         let business_context = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let nodes = Vec::<crate::graph::Node>::new();
+        let edges = Vec::<crate::graph::Edge>::new();
+        crate::server::persist_graph_to_lance(tmp.path(), &nodes, &edges)
+            .await
+            .unwrap();
+        let identity =
+            crate::lsp_completeness::current_report_identity(tmp.path(), business_context.mode())
+                .unwrap();
+        let report = crate::lsp_completeness::LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            &nodes,
+            &edges,
+        );
+        crate::lsp_completeness::persist_report(tmp.path(), &report).unwrap();
+        let idx = EmbeddingIndex::new(tmp.path()).await.unwrap();
 
         let indexed = idx
-            .index_all_with_symbols_and_business_context(tmp.path(), &[], &business_context)
+            .index_all_with_persisted_graph_and_business_context(
+                tmp.path(),
+                &nodes,
+                &edges,
+                &business_context,
+            )
             .await
             .unwrap();
 
         assert_eq!(indexed, 0);
-        assert_eq!(business_context.counts().git_history_producers, 2);
+        assert_eq!(business_context.counts().git_history_producers, 1);
+        let staging = crate::embed::generation::semantic_root(tmp.path()).join("staging");
+        assert!(
+            !staging.exists() || std::fs::read_dir(staging).unwrap().next().is_none(),
+            "successful publication must leave no semantic staging members"
+        );
     }
 
     #[tokio::test]
@@ -2654,8 +4959,6 @@ mod tests {
 
     // ── SearchMode tests ───────────────────────────────────────────────
 
-    use super::SearchMode;
-
     #[test]
     fn search_mode_default_is_hybrid() {
         assert_eq!(SearchMode::default(), SearchMode::Hybrid);
@@ -2832,7 +5135,12 @@ mod tests {
         assert_eq!(count2, 0, "node_a unchanged, should skip via BLAKE3 hash");
 
         // Verify stale row is truly gone by querying text hashes for node_b
-        let table = idx.db.open_table(&idx.table_name).execute().await.unwrap();
+        let table = idx
+            .db()
+            .open_table(&idx.table_name)
+            .execute()
+            .await
+            .unwrap();
         let hashes = idx.query_text_hashes(&table, &[&node_b_id]).await;
         match hashes {
             Some(map) => {
@@ -3256,59 +5564,6 @@ mod tests {
     /// When the first batch is missing required columns (and gets skipped), later
     /// batches may have _score. has_score_col must still be true so they use the
     /// correct scoring branch.
-    #[test]
-    fn has_score_col_detected_from_any_batch() {
-        use arrow_array::{Float32Array, RecordBatch, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
-        // No _score column either.
-        let schema_incomplete = Schema::new(vec![Field::new("title", DataType::Utf8, false)]);
-        let batch_incomplete = RecordBatch::try_new(
-            Arc::new(schema_incomplete),
-            vec![Arc::new(StringArray::from(vec!["stub"]))],
-        )
-        .expect("should build incomplete batch");
-
-        // Batch 1: complete batch with _score (simulates valid hybrid search result).
-        let schema_complete = Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("title", DataType::Utf8, false),
-            Field::new("body", DataType::Utf8, false),
-            Field::new("_score", DataType::Float32, false),
-        ]);
-        let batch_complete = RecordBatch::try_new(
-            Arc::new(schema_complete),
-            vec![
-                Arc::new(StringArray::from(vec!["id1"])),
-                Arc::new(StringArray::from(vec!["function"])),
-                Arc::new(StringArray::from(vec!["title1"])),
-                Arc::new(StringArray::from(vec!["body1"])),
-                Arc::new(Float32Array::from(vec![0.8f32])),
-            ],
-        )
-        .expect("should build complete batch");
-
-        let batches = vec![batch_incomplete, batch_complete];
-
-        // Simulate the has_score_col detection from the fix (any batch, not just first).
-        let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
-        let has_score_col_first = batches
-            .first()
-            .is_some_and(|b| b.column_by_name("_score").is_some());
-
-        assert!(
-            has_score_col_any,
-            "should detect _score from any batch, but iter().any() returned false"
-        );
-        assert!(
-            !has_score_col_first,
-            "first batch does not have _score — verifying that first-only detection is wrong"
-        );
-    }
-
     // ── #599: unified node embedding helpers ──────────────────────────────
 
     fn make_test_node(
