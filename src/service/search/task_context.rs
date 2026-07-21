@@ -114,6 +114,13 @@ pub(crate) enum TaskContextError {
     ConflictingDuplicate {
         evidence_id: String,
     },
+    BundleCost {
+        reason: String,
+    },
+    BundleCostExceedsBudget {
+        actual: usize,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for TaskContextError {
@@ -148,6 +155,13 @@ impl fmt::Display for TaskContextError {
             Self::ConflictingDuplicate { evidence_id } => write!(
                 formatter,
                 "candidate {evidence_id:?} was supplied with conflicting metadata"
+            ),
+            Self::BundleCost { reason } => {
+                write!(formatter, "canonical task bundle cost failed: {reason}")
+            }
+            Self::BundleCostExceedsBudget { actual, limit } => write!(
+                formatter,
+                "canonical task bundle fixed sections cost {actual} bytes; budget is {limit}"
             ),
         }
     }
@@ -716,10 +730,55 @@ struct CoverageGain {
     facets: BTreeSet<TaskFacet>,
 }
 
+#[cfg(test)]
 pub(crate) fn select_context(
     candidates: Vec<EvidenceCandidate>,
     policy: &SelectionPolicy,
 ) -> Result<ContextSelection, TaskContextError> {
+    let costs = candidates
+        .iter()
+        .map(|candidate| (candidate.evidence_id.clone(), candidate.rendered_cost))
+        .collect::<BTreeMap<_, _>>();
+    select_context_with_cost(candidates, policy, |selected_ids| {
+        Ok(selected_ids
+            .iter()
+            .filter_map(|id| costs.get(id))
+            .copied()
+            .sum())
+    })
+}
+
+/// Select task context against the canonical cost of the complete provisional
+/// bundle. The callback receives every selected identity in deterministic
+/// selection order and must include shared projection overhead, coalesced
+/// bodies, and task-only metadata—not standalone record costs.
+#[cfg(test)]
+pub(crate) fn select_context_with_cost<F>(
+    candidates: Vec<EvidenceCandidate>,
+    policy: &SelectionPolicy,
+    bundle_cost: F,
+) -> Result<ContextSelection, TaskContextError>
+where
+    F: FnMut(&[String]) -> Result<usize, TaskContextError>,
+{
+    select_context_with_cost_and_interactions(candidates, policy, bundle_cost, |_, _| Vec::new())
+}
+
+pub(crate) type FutureInteractionKey = (String, String, String, String);
+pub(crate) type FutureInteractionSignature = Vec<(String, Vec<FutureInteractionKey>)>;
+
+/// Select task context while preserving graph relationships whose rendered
+/// cost can appear only after a remaining candidate is selected.
+pub(crate) fn select_context_with_cost_and_interactions<F, G>(
+    candidates: Vec<EvidenceCandidate>,
+    policy: &SelectionPolicy,
+    mut bundle_cost: F,
+    mut interaction_signature: G,
+) -> Result<ContextSelection, TaskContextError>
+where
+    F: FnMut(&[String]) -> Result<usize, TaskContextError>,
+    G: FnMut(&[String], &[String]) -> FutureInteractionSignature,
+{
     validate_policy(policy)?;
     if candidates.len() > policy.candidate_limit {
         return Err(TaskContextError::TooManyCandidates {
@@ -737,7 +796,14 @@ pub(crate) fn select_context(
     let mut covered_lanes = BTreeSet::new();
     let mut covered_facets = BTreeSet::new();
     let mut file_counts = BTreeMap::<String, usize>::new();
-    let mut rendered_cost = 0usize;
+    let mut source_plan = BTreeMap::<String, Vec<(u32, u32)>>::new();
+    let mut rendered_cost = bundle_cost(&[])?;
+    if rendered_cost > policy.rendered_budget {
+        return Err(TaskContextError::BundleCostExceedsBudget {
+            actual: rendered_cost,
+            limit: policy.rendered_budget,
+        });
+    }
 
     let mut exact = candidates
         .values()
@@ -750,9 +816,15 @@ pub(crate) fn select_context(
     });
 
     for candidate in exact {
+        let mut provisional_ids = selected
+            .iter()
+            .map(|selected: &SelectedEvidence| selected.evidence_id.clone())
+            .collect::<Vec<_>>();
+        provisional_ids.push(candidate.evidence_id.clone());
+        let provisional_cost = bundle_cost(&provisional_ids)?;
         let reason = if candidate.rendered_cost > policy.per_record_limit {
             Some(OmissionReason::ExactRecordTooLarge)
-        } else if rendered_cost + candidate.rendered_cost > policy.rendered_budget {
+        } else if provisional_cost > policy.rendered_budget {
             Some(OmissionReason::ExactBudgetExhausted)
         } else {
             None
@@ -766,11 +838,12 @@ pub(crate) fn select_context(
             continue;
         }
 
-        rendered_cost += candidate.rendered_cost;
+        rendered_cost = provisional_cost;
         selected_ids.insert(candidate.evidence_id.clone());
         *file_counts
             .entry(candidate.source.path.clone())
             .or_default() += 1;
+        add_source_range(&mut source_plan, &candidate.source);
         covered_roles.extend(candidate.roles.iter().copied());
         covered_lanes.extend(candidate.lanes.iter().copied());
         covered_facets.extend(candidate.facets.iter().copied());
@@ -796,6 +869,9 @@ pub(crate) fn select_context(
         lane_mask: lane_mask(&covered_lanes),
         facet_mask: facet_mask(&covered_facets),
         file_counts: file_counts.clone(),
+        source_plan: source_plan.clone(),
+        future_overlap_signature: Vec::new(),
+        future_interaction_signature: Vec::new(),
         channel_rank_sum: 0,
     }];
     let initially_relevant_files = eligible
@@ -815,13 +891,12 @@ pub(crate) fn select_context(
         let mut expanded = Vec::with_capacity(frontier.len().saturating_mul(2));
         for state in &frontier {
             expanded.push(state.clone());
-            if state.rendered_cost + candidate.rendered_cost > policy.rendered_budget
-                || state
-                    .file_counts
-                    .get(&candidate.source.path)
-                    .copied()
-                    .unwrap_or(0)
-                    >= policy.per_file_limit
+            if state
+                .file_counts
+                .get(&candidate.source.path)
+                .copied()
+                .unwrap_or(0)
+                >= policy.per_file_limit
             {
                 continue;
             }
@@ -837,7 +912,17 @@ pub(crate) fn select_context(
             }
 
             let mut added = state.clone();
-            added.rendered_cost += candidate.rendered_cost;
+            let mut provisional_ids = selected
+                .iter()
+                .map(|selected| selected.evidence_id.clone())
+                .collect::<Vec<_>>();
+            provisional_ids.extend(added.selected_ids.iter().cloned());
+            provisional_ids.push(candidate.evidence_id.clone());
+            let provisional_cost = bundle_cost(&provisional_ids)?;
+            if provisional_cost > policy.rendered_budget {
+                continue;
+            }
+            added.rendered_cost = provisional_cost;
             added.role_mask |= candidate_role_mask;
             added.lane_mask |= candidate_lane_mask;
             added.facet_mask |= candidate_facet_mask;
@@ -845,6 +930,7 @@ pub(crate) fn select_context(
                 .file_counts
                 .entry(candidate.source.path.clone())
                 .or_default() += 1;
+            add_source_range(&mut added.source_plan, &candidate.source);
             added.channel_rank_sum += u64::from(candidate.channel_rank);
             added.selected_ids.push(candidate.evidence_id.clone());
             expanded.push(added);
@@ -857,10 +943,23 @@ pub(crate) fn select_context(
             .iter()
             .map(|candidate| candidate.source.path.clone())
             .collect::<BTreeSet<_>>();
+        let remaining_ids = eligible[index + 1..]
+            .iter()
+            .map(|candidate| candidate.evidence_id.clone())
+            .collect::<Vec<_>>();
         for state in &mut expanded {
             state
                 .file_counts
                 .retain(|path, _| active_files.contains(path));
+            state.future_overlap_signature =
+                future_overlap_signature(&state.source_plan, &eligible[index + 1..]);
+            let mut provisional_ids = selected
+                .iter()
+                .map(|selected| selected.evidence_id.clone())
+                .collect::<Vec<_>>();
+            provisional_ids.extend(state.selected_ids.iter().cloned());
+            state.future_interaction_signature =
+                interaction_signature(&provisional_ids, &remaining_ids);
         }
         frontier = pareto_frontier(expanded);
         if frontier.len() > policy.state_limit {
@@ -875,6 +974,7 @@ pub(crate) fn select_context(
         .into_iter()
         .max_by(selection_state_cmp)
         .expect("selection frontier always contains the empty state");
+    rendered_cost = best.rendered_cost;
     for evidence_id in best.selected_ids {
         let candidate = candidates
             .get(&evidence_id)
@@ -886,7 +986,6 @@ pub(crate) fn select_context(
             &covered_lanes,
             &covered_facets,
         );
-        rendered_cost += candidate.rendered_cost;
         selected_ids.insert(candidate.evidence_id.clone());
         *file_counts
             .entry(candidate.source.path.clone())
@@ -910,9 +1009,15 @@ pub(crate) fn select_context(
         {
             continue;
         }
+        let mut provisional_ids = selected
+            .iter()
+            .map(|selected| selected.evidence_id.clone())
+            .collect::<Vec<_>>();
+        provisional_ids.push(candidate.evidence_id.clone());
+        let provisional_cost = bundle_cost(&provisional_ids)?;
         let reason = if candidate.rendered_cost > policy.per_record_limit {
             OmissionReason::RecordTooLarge
-        } else if rendered_cost + candidate.rendered_cost > policy.rendered_budget {
+        } else if provisional_cost > policy.rendered_budget {
             OmissionReason::BudgetExhausted
         } else if candidate.exact_reference.is_none()
             && file_counts
@@ -956,7 +1061,47 @@ struct SelectionState {
     lane_mask: u16,
     facet_mask: u8,
     file_counts: BTreeMap<String, usize>,
+    /// Canonical coalesced source geometry. Non-additive bundle costs may only
+    /// dominate another state when future source overlap will be identical.
+    source_plan: BTreeMap<String, Vec<(u32, u32)>>,
+    future_overlap_signature: Vec<(String, bool)>,
+    future_interaction_signature: FutureInteractionSignature,
     channel_rank_sum: u64,
+}
+
+fn add_source_range(plan: &mut BTreeMap<String, Vec<(u32, u32)>>, source: &SourceAnchor) {
+    let ranges = plan.entry(source.path.clone()).or_default();
+    ranges.push((source.start_line, source.end_line));
+    ranges.sort();
+    let mut coalesced = Vec::<(u32, u32)>::new();
+    for (start, end) in ranges.drain(..) {
+        if let Some((_, previous_end)) = coalesced.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            coalesced.push((start, end));
+        }
+    }
+    *ranges = coalesced;
+}
+
+fn future_overlap_signature(
+    plan: &BTreeMap<String, Vec<(u32, u32)>>,
+    remaining: &[&EvidenceCandidate],
+) -> Vec<(String, bool)> {
+    remaining
+        .iter()
+        .map(|candidate| {
+            let overlaps = plan.get(&candidate.source.path).is_some_and(|ranges| {
+                ranges.iter().any(|(start, end)| {
+                    candidate.source.start_line <= end.saturating_add(1)
+                        && *start <= candidate.source.end_line.saturating_add(1)
+                })
+            });
+            (candidate.evidence_id.clone(), overlaps)
+        })
+        .collect()
 }
 
 fn role_bit(role: ContextRole) -> u16 {
@@ -1024,28 +1169,33 @@ fn selection_state_cmp(left: &SelectionState, right: &SelectionState) -> Orderin
         .then_with(|| right.selected_ids.cmp(&left.selected_ids))
 }
 
-fn file_capacity_no_worse(left: &BTreeMap<String, usize>, right: &BTreeMap<String, usize>) -> bool {
-    left.iter()
-        .all(|(path, count)| *count <= right.get(path).copied().unwrap_or(0))
-}
-
 fn state_dominates(left: &SelectionState, right: &SelectionState) -> bool {
-    let coverage_no_worse = left.role_mask | right.role_mask == left.role_mask
-        && left.lane_mask | right.lane_mask == left.lane_mask
-        && left.facet_mask | right.facet_mask == left.facet_mask;
+    // Coverage must be equal: selection-reason text is rendered from the
+    // prior masks, so a superset can have different future bundle bytes.
+    let coverage_equal = left.role_mask == right.role_mask
+        && left.lane_mask == right.lane_mask
+        && left.facet_mask == right.facet_mask;
+    let source_interactions_equivalent = left.source_plan == right.source_plan
+        || (left
+            .future_overlap_signature
+            .iter()
+            .all(|(_, overlaps)| !overlaps)
+            && right
+                .future_overlap_signature
+                .iter()
+                .all(|(_, overlaps)| !overlaps));
     let resources_no_worse = left.rendered_cost <= right.rendered_cost
         && left.channel_rank_sum <= right.channel_rank_sum
-        && file_capacity_no_worse(&left.file_counts, &right.file_counts);
-    if !coverage_no_worse || !resources_no_worse {
+        && left.file_counts == right.file_counts
+        && source_interactions_equivalent
+        && left.future_interaction_signature == right.future_interaction_signature
+        && left.selected_ids.len() == right.selected_ids.len();
+    if !coverage_equal || !resources_no_worse {
         return false;
     }
 
-    left.role_mask != right.role_mask
-        || left.lane_mask != right.lane_mask
-        || left.facet_mask != right.facet_mask
-        || left.rendered_cost != right.rendered_cost
+    left.rendered_cost != right.rendered_cost
         || left.channel_rank_sum != right.channel_rank_sum
-        || left.file_counts != right.file_counts
         || left.selected_ids <= right.selected_ids
 }
 
@@ -1500,5 +1650,175 @@ mod tests {
             } if newly_covered_roles
                 == &set([ContextRole::EditableSource, ContextRole::Test])
         ));
+    }
+
+    #[test]
+    fn acceptance_remediation_canonical_bundle_cost_controls_coalesced_selection_and_fixed_overhead()
+     {
+        let policy = SelectionPolicy {
+            rendered_budget: 120,
+            per_record_limit: 120,
+            candidate_limit: 8,
+            per_file_limit: 4,
+            state_limit: 32,
+            required_roles: set([ContextRole::EditableSource, ContextRole::Test]),
+        };
+        let candidates = vec![
+            candidate(
+                "source",
+                90,
+                [ContextRole::EditableSource],
+                [RetrievalLane::EditableSource],
+            ),
+            candidate("test", 90, [ContextRole::Test], [RetrievalLane::Tests]),
+        ];
+        let selected = select_context_with_cost(candidates.clone(), &policy, |ids| {
+            Ok(match ids.len() {
+                0 => 40,  // fixed task-only sections
+                1 => 90,  // one canonical record response
+                2 => 110, // shared framing/coalescing makes the pair fit
+                _ => unreachable!(),
+            })
+        })
+        .unwrap();
+        assert_eq!(selected.selected.len(), 2);
+        assert_eq!(selected.rendered_cost, 110);
+        assert!(selected.missing_roles.is_empty());
+
+        let fixed_heavy = SelectionPolicy {
+            rendered_budget: 100,
+            per_record_limit: 100,
+            required_roles: set([ContextRole::EditableSource]),
+            ..policy
+        };
+        let rejected = select_context_with_cost(candidates, &fixed_heavy, |ids| {
+            Ok(if ids.is_empty() { 80 } else { 110 })
+        })
+        .unwrap();
+        assert!(rejected.selected.is_empty());
+        assert_eq!(rejected.rendered_cost, 80);
+        assert!(
+            rejected
+                .omitted
+                .iter()
+                .any(|omitted| omitted.reason == OmissionReason::BudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn acceptance_remediation_disjoint_future_plans_prune_combinatorial_alternatives() {
+        let obligations = [
+            (ContextRole::EditableSource, RetrievalLane::EditableSource),
+            (
+                ContextRole::DefinitionOrApiState,
+                RetrievalLane::DefinitionOrState,
+            ),
+            (ContextRole::Test, RetrievalLane::Tests),
+            (ContextRole::BehavioralAnalogue, RetrievalLane::Analogues),
+        ];
+        let mut candidates = Vec::new();
+        for (role_index, (role, lane)) in obligations.into_iter().enumerate() {
+            for alternative in 0..6 {
+                candidates.push(candidate(
+                    &format!("role-{role_index}-alternative-{alternative}"),
+                    2,
+                    [role],
+                    [lane],
+                ));
+            }
+        }
+        let policy = SelectionPolicy {
+            rendered_budget: 40,
+            per_record_limit: 40,
+            candidate_limit: 32,
+            per_file_limit: 1,
+            state_limit: 1_024,
+            required_roles: obligations.into_iter().map(|(role, _)| role).collect(),
+        };
+        let selection =
+            select_context_with_cost(candidates, &policy, |ids| Ok(20 + ids.len() * 2)).unwrap();
+        assert_eq!(selection.selected.len(), 4);
+        assert!(selection.missing_roles.is_empty());
+        assert_eq!(selection.rendered_cost, 28);
+    }
+
+    #[test]
+    fn acceptance_remediation_relationship_interaction_preserves_future_optimum() {
+        let candidates = vec![
+            candidate(
+                "a",
+                20,
+                [ContextRole::EditableSource],
+                [RetrievalLane::EditableSource],
+            ),
+            candidate(
+                "b",
+                21,
+                [ContextRole::EditableSource],
+                [RetrievalLane::EditableSource],
+            ),
+            candidate("future", 20, [ContextRole::Test], [RetrievalLane::Tests]),
+        ];
+        let policy = SelectionPolicy {
+            rendered_budget: 50,
+            per_record_limit: 50,
+            candidate_limit: 8,
+            per_file_limit: 1,
+            state_limit: 32,
+            required_roles: set([ContextRole::EditableSource, ContextRole::Test]),
+        };
+        let selection = select_context_with_cost_and_interactions(
+            candidates,
+            &policy,
+            |ids| {
+                let has_a = ids.iter().any(|id| id == "a");
+                let has_b = ids.iter().any(|id| id == "b");
+                let has_future = ids.iter().any(|id| id == "future");
+                Ok(if has_a && has_future {
+                    80
+                } else if has_b && has_future {
+                    30
+                } else if has_a {
+                    20
+                } else if has_b {
+                    21
+                } else if has_future {
+                    20
+                } else {
+                    10
+                })
+            },
+            |selected, remaining| {
+                remaining
+                    .iter()
+                    .map(|remaining_id| {
+                        let relationships =
+                            if remaining_id == "future" && selected.iter().any(|id| id == "a") {
+                                vec![(
+                                    "a".into(),
+                                    "calls".into(),
+                                    "future".into(),
+                                    "lsp High".into(),
+                                )]
+                            } else {
+                                Vec::new()
+                            };
+                        (remaining_id.clone(), relationships)
+                    })
+                    .collect()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection
+                .selected
+                .iter()
+                .map(|selected| selected.evidence_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "future"]
+        );
+        assert_eq!(selection.rendered_cost, 30);
+        assert!(selection.missing_roles.is_empty());
     }
 }

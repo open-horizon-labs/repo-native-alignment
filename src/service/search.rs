@@ -198,6 +198,13 @@ fn validate_search_experience(params: &SearchParams) -> Result<(), String> {
         return Err("context_roles/context_facets require context_mode=task".to_string());
     }
     if context_mode.is_some() {
+        if let Some(direction) = params.direction.as_deref().map(str::trim)
+            && !matches!(direction, "incoming" | "outgoing" | "both")
+        {
+            return Err(format!(
+                "unknown task-context direction `{direction}`; allowed values: incoming, outgoing, both"
+            ));
+        }
         if params.hops.unwrap_or(1) > MAX_CONTEXT_HOPS {
             return Err(format!(
                 "task-context hops cannot exceed {MAX_CONTEXT_HOPS}"
@@ -2379,7 +2386,7 @@ fn evidence_capsule_capability(records: &[SelectedRecord]) -> CapabilityStatus {
 const TASK_LANE_CANDIDATE_LIMIT: usize = 12;
 const TASK_GRAPH_CANDIDATE_LIMIT: usize = 64;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TaskAdapterOutput {
     records: Vec<SelectedRecord>,
     relationships: Vec<ProjectedRelationship>,
@@ -2437,24 +2444,39 @@ async fn task_records(
         match resolution.resolution {
             ExactResolution::Hit(candidate) => {
                 exact_hits += 1;
+                let Some(node) = candidate_nodes.get(&candidate.evidence_id).copied() else {
+                    output.omissions.push(ProjectionOmission {
+                        record_id: Some(candidate.evidence_id),
+                        source: None,
+                        code: OmissionCode::MissingSource,
+                        detail: format!(
+                            "exact reference {:?} resolved outside the filtered task graph",
+                            resolution.reference.raw
+                        ),
+                    });
+                    continue;
+                };
+                let roles = exact_task_roles(node);
                 let fused = single_channel_fused(
                     &candidate.evidence_id,
                     EvidenceChannel::ExactLexical,
                     ScoreKind::ExactMatchTier,
                 );
-                merge_task_assembly(
-                    &mut assemblies,
-                    fused,
-                    TaskRole::EditableSource,
-                    TaskLane::ExactReference,
-                    task_facet_for_role(TaskRole::EditableSource),
-                    Some(resolution.reference.raw.clone()),
-                    0,
-                    format!(
-                        "exact reference {:?} resolved across the full filtered graph",
-                        resolution.reference.raw
-                    ),
-                );
+                for role in roles {
+                    merge_task_assembly(
+                        &mut assemblies,
+                        fused.clone(),
+                        role,
+                        TaskLane::ExactReference,
+                        task_facet_for_role(role),
+                        Some(resolution.reference.raw.clone()),
+                        0,
+                        format!(
+                            "exact reference {:?} resolved as eligible role {role:?} across the full filtered graph",
+                            resolution.reference.raw
+                        ),
+                    );
+                }
             }
             ExactResolution::Ambiguous(candidates) => output.omissions.push(ProjectionOmission {
                 record_id: None,
@@ -2793,7 +2815,6 @@ async fn task_records(
             );
             records.push(selected);
         }
-        let rendered_cost = rendered_task_bundle_cost(params, &reader, &records)?;
         typed.insert(
             id.clone(),
             TaskEvidenceCandidate {
@@ -2801,7 +2822,9 @@ async fn task_records(
                 roles: assembly.roles.clone(),
                 lanes: assembly.lanes.clone(),
                 facets: assembly.facets.clone(),
-                rendered_cost,
+                // Replaced below with the exact canonical singleton bundle
+                // cost once fixed task-only sections are available.
+                rendered_cost: 1,
                 exact_reference: assembly.exact_reference.clone(),
                 source: SourceAnchor {
                     path: source.path,
@@ -2829,91 +2852,75 @@ async fn task_records(
             .filter_map(|role| task_role_from_str(role))
             .collect();
     }
-    let selection = task_context::select_context(typed.values().cloned().collect(), &policy)
-        .map_err(|error| error.to_string())?;
+    let request = projection_request(params, SearchIntent::Implement);
+    let default_task_capabilities = default_capabilities(ctx, request.projection).await;
+    let base_output = output;
+
+    // A record-level cap is evaluated in the same currency as selection: the
+    // canonical final task response with that identity selected and every
+    // fixed task-only section present.
+    let candidate_ids = typed.keys().cloned().collect::<Vec<_>>();
+    for id in candidate_ids {
+        let singleton = [id.clone()];
+        let cost = rendered_task_bundle_cost(
+            params,
+            &reader,
+            &singleton,
+            &bundles,
+            &typed,
+            &assemblies,
+            &candidate_nodes,
+            &product_score_audit,
+            &base_output,
+            &policy.required_roles,
+            &default_task_capabilities,
+            edge_index,
+        )?;
+        if let Some(candidate) = typed.get_mut(&id) {
+            candidate.rendered_cost = cost.max(1);
+        }
+    }
+
+    let selection = task_context::select_context_with_cost_and_interactions(
+        typed.values().cloned().collect(),
+        &policy,
+        |selected_ids| {
+            rendered_task_bundle_cost(
+                params,
+                &reader,
+                selected_ids,
+                &bundles,
+                &typed,
+                &assemblies,
+                &candidate_nodes,
+                &product_score_audit,
+                &base_output,
+                &policy.required_roles,
+                &default_task_capabilities,
+                edge_index,
+            )
+            .map_err(|reason| task_context::TaskContextError::BundleCost { reason })
+        },
+        |selected_ids, remaining_ids| {
+            task_future_interaction_signature(selected_ids, remaining_ids, edge_index)
+        },
+    )
+    .map_err(|error| error.to_string())?;
     let selected_ids = selection
         .selected
         .iter()
-        .map(|selected| selected.evidence_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for (rank, selected) in selection.selected.iter().enumerate() {
-        let reason = task_selection_reason(&selected.reason);
-        if let Some(records) = bundles.get_mut(&selected.evidence_id) {
-            for record in records {
-                record.selection_rank = rank;
-                record.selection.reason = format!("{}; {reason}", record.selection.reason);
-                output.records.push(record.clone());
-            }
-        }
-    }
-    let omission_reasons = selection
-        .omitted
-        .iter()
-        .map(|omitted| {
-            (
-                omitted.evidence_id.as_str(),
-                format!("{:?}", omitted.reason),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for (rank, (id, assembly)) in assemblies.iter().enumerate() {
-        let Some(node) = candidate_nodes.get(id).copied() else {
-            continue;
-        };
-        let selected = selected_ids.contains(id.as_str());
-        let mut audit = candidate_audit_from_fused(
-            node,
-            &assembly.fused,
-            rank,
-            selected,
-            if selected {
-                "selected by exact-first maximum-coverage projection cost"
-            } else {
-                omission_reasons
-                    .get(id.as_str())
-                    .map(String::as_str)
-                    .unwrap_or("omitted without marginal role/lane/facet coverage")
-            },
-        );
-        append_product_score_audit(
-            &mut audit.evidence,
-            product_score_audit.get(id).map(Vec::as_slice),
-        );
-        output.candidate_audit.push(audit);
-    }
-    for omitted in &selection.omitted {
-        output.omissions.push(ProjectionOmission {
-            record_id: Some(omitted.evidence_id.clone()),
-            source: candidate_nodes
-                .get(&omitted.evidence_id)
-                .and_then(|node| node_source_span(node)),
-            code: OmissionCode::RenderBudget,
-            detail: format!("task selector omission: {:?}", omitted.reason),
-        });
-    }
-    for role in &selection.missing_roles {
-        output.omissions.push(ProjectionOmission {
-            record_id: None,
-            source: None,
-            code: OmissionCode::MissingSource,
-            detail: format!("required task context role {role:?} is not covered"),
-        });
-    }
-    output.capabilities.push(CapabilityStatus {
-        capability: "task_context_selection".into(),
-        state: if selection.missing_roles.is_empty() {
-            CapabilityState::Ready
-        } else {
-            CapabilityState::Degraded
-        },
-        detail: format!(
-            "selected {} of {} candidates at {} rendered bytes; missing_roles={:?}",
-            selection.selected.len(),
-            typed.len(),
-            selection.rendered_cost,
-            selection.missing_roles
-        ),
-    });
+        .map(|selected| selected.evidence_id.clone())
+        .collect::<Vec<_>>();
+    let output = materialize_task_output(
+        &selected_ids,
+        &bundles,
+        &typed,
+        &assemblies,
+        &candidate_nodes,
+        &product_score_audit,
+        &base_output,
+        &policy.required_roles,
+    );
     Ok(output)
 }
 
@@ -3288,20 +3295,192 @@ fn expand_task_graph(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn materialize_task_output(
+    selected_ids: &[String],
+    bundles: &BTreeMap<String, Vec<SelectedRecord>>,
+    typed: &BTreeMap<String, TaskEvidenceCandidate>,
+    assemblies: &BTreeMap<String, TaskAssembly>,
+    candidate_nodes: &BTreeMap<String, &Node>,
+    product_score_audit: &BTreeMap<String, Vec<ProductScoreAudit>>,
+    base_output: &TaskAdapterOutput,
+    required_roles: &BTreeSet<TaskRole>,
+) -> TaskAdapterOutput {
+    let mut output = base_output.clone();
+    let selected_set = selected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut covered_roles = BTreeSet::new();
+    let mut covered_lanes = BTreeSet::new();
+    let mut covered_facets = BTreeSet::new();
+
+    for (rank, id) in selected_ids.iter().enumerate() {
+        let Some(candidate) = typed.get(id) else {
+            continue;
+        };
+        let reason = if let Some(reference) = candidate.exact_reference.clone() {
+            TaskSelectionReason::ExactReference { reference }
+        } else {
+            TaskSelectionReason::CoveragePerCost {
+                newly_covered_roles: candidate
+                    .roles
+                    .intersection(required_roles)
+                    .filter(|role| !covered_roles.contains(*role))
+                    .copied()
+                    .collect(),
+                newly_covered_lanes: candidate
+                    .lanes
+                    .difference(&covered_lanes)
+                    .copied()
+                    .collect(),
+                newly_covered_facets: candidate
+                    .facets
+                    .difference(&covered_facets)
+                    .copied()
+                    .collect(),
+            }
+        };
+        covered_roles.extend(candidate.roles.iter().copied());
+        covered_lanes.extend(candidate.lanes.iter().copied());
+        covered_facets.extend(candidate.facets.iter().copied());
+        let reason = task_selection_reason(&reason);
+        if let Some(records) = bundles.get(id) {
+            for mut record in records.clone() {
+                record.selection_rank = rank;
+                record.selection.reason = format!("{}; {reason}", record.selection.reason);
+                output.records.push(record);
+            }
+        }
+    }
+
+    for (rank, (id, assembly)) in assemblies.iter().enumerate() {
+        let Some(node) = candidate_nodes.get(id).copied() else {
+            continue;
+        };
+        let selected = selected_set.contains(id);
+        let mut audit = candidate_audit_from_fused(
+            node,
+            &assembly.fused,
+            rank,
+            selected,
+            if selected {
+                "selected by exact-first maximum coverage under canonical final task-bundle cost"
+            } else {
+                "omitted by canonical final task-bundle coverage, diversity, or budget selection"
+            },
+        );
+        append_product_score_audit(
+            &mut audit.evidence,
+            product_score_audit.get(id).map(Vec::as_slice),
+        );
+        output.candidate_audit.push(audit);
+    }
+    for id in typed.keys() {
+        if selected_set.contains(id) {
+            continue;
+        }
+        output.omissions.push(ProjectionOmission {
+            record_id: Some(id.clone()),
+            source: candidate_nodes
+                .get(id)
+                .copied()
+                .and_then(node_source_span),
+            code: OmissionCode::RenderBudget,
+            detail: "task candidate was not selected by canonical final-bundle coverage, diversity, or budget optimization".into(),
+        });
+    }
+    let missing_roles = required_roles
+        .difference(&covered_roles)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for role in &missing_roles {
+        output.omissions.push(ProjectionOmission {
+            record_id: None,
+            source: None,
+            code: OmissionCode::MissingSource,
+            detail: format!("required task context role {role:?} is not covered"),
+        });
+    }
+    output.capabilities.push(CapabilityStatus {
+        capability: "task_context_selection".into(),
+        state: if missing_roles.is_empty() {
+            CapabilityState::Ready
+        } else {
+            CapabilityState::Degraded
+        },
+        // Do not put the measured cost in the response being measured: that
+        // would make task admission self-referential.
+        detail: format!(
+            "selected {} of {} candidates using canonical final-bundle cost; missing_roles={missing_roles:?}",
+            selected_ids.len(),
+            typed.len()
+        ),
+    });
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rendered_task_bundle_cost(
     params: &SearchParams,
     reader: &source::SourceReader,
-    records: &[SelectedRecord],
+    selected_ids: &[String],
+    bundles: &BTreeMap<String, Vec<SelectedRecord>>,
+    typed: &BTreeMap<String, TaskEvidenceCandidate>,
+    assemblies: &BTreeMap<String, TaskAssembly>,
+    candidate_nodes: &BTreeMap<String, &Node>,
+    product_score_audit: &BTreeMap<String, Vec<ProductScoreAudit>>,
+    base_output: &TaskAdapterOutput,
+    required_roles: &BTreeSet<TaskRole>,
+    default_task_capabilities: &[CapabilityStatus],
+    edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<usize, String> {
+    let mut output = materialize_task_output(
+        selected_ids,
+        bundles,
+        typed,
+        assemblies,
+        candidate_nodes,
+        product_score_audit,
+        base_output,
+        required_roles,
+    );
+    let mut seen_records = BTreeSet::new();
+    output.records.retain(|record| {
+        seen_records.insert((record.identity.node_id.clone(), record.selection.role))
+    });
+    output.records.sort_by(|left, right| {
+        left.selection_rank
+            .cmp(&right.selection_rank)
+            .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
+            .then_with(|| left.selection.role.cmp(&right.selection.role))
+    });
+    output
+        .capabilities
+        .push(evidence_capsule_capability(&output.records));
+    output
+        .capabilities
+        .extend_from_slice(default_task_capabilities);
+    output.capabilities = merge_capabilities(output.capabilities);
+    output
+        .relationships
+        .extend(projected_relationships(edge_index, &output.records));
+    output.relationships.sort();
+    output.relationships.dedup();
+    output.candidate_audit.sort_by(|left, right| {
+        left.candidate_rank
+            .cmp(&right.candidate_rank)
+            .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
+    });
+
     let mut request = projection_request(params, SearchIntent::Implement);
-    request.projection = SearchProjection::Evidence;
     request.budget.max_rendered_bytes = None;
     request.budget.max_estimated_tokens = None;
     let plan = projection::plan_projection(
         request,
         ProjectionInput {
-            records: records.to_vec(),
-            ..Default::default()
+            records: output.records,
+            candidate_audit: output.candidate_audit,
+            relationships: output.relationships,
+            omissions: output.omissions,
+            capabilities: output.capabilities,
         },
         reader,
     );
@@ -3367,6 +3546,42 @@ fn projection_role_for_task(role: TaskRole) -> ProjectionRole {
         TaskRole::CallerOrImpact => ProjectionRole::CallerOrImpact,
         TaskRole::ProposalDelta => ProjectionRole::ProposalDelta,
     }
+}
+
+/// Derive the roles an exact graph record can truthfully satisfy. Exact-first
+/// pinning controls priority only; it must not relabel tests or API/state
+/// declarations as editable implementation source.
+fn exact_task_roles(node: &Node) -> BTreeSet<TaskRole> {
+    if default_role(node) == ProjectionRole::Test {
+        return BTreeSet::from([TaskRole::Test]);
+    }
+
+    let mut roles = BTreeSet::new();
+    if matches!(
+        &node.id.kind,
+        NodeKind::Function | NodeKind::Impl | NodeKind::Macro | NodeKind::ApiEndpoint
+    ) {
+        roles.insert(TaskRole::EditableSource);
+    }
+    if matches!(
+        &node.id.kind,
+        NodeKind::Struct
+            | NodeKind::Trait
+            | NodeKind::Enum
+            | NodeKind::TypeAlias
+            | NodeKind::Const
+            | NodeKind::Field
+            | NodeKind::EnumVariant
+            | NodeKind::ProtoMessage
+            | NodeKind::SqlTable
+            | NodeKind::ApiEndpoint
+    ) {
+        roles.insert(TaskRole::DefinitionOrApiState);
+    }
+    if roles.is_empty() {
+        roles.insert(TaskRole::DirectDependency);
+    }
+    roles
 }
 
 fn task_lane_for_role(role: TaskRole) -> TaskLane {
@@ -3468,7 +3683,8 @@ fn live_graph_delta_card(
         &limits,
     )
     .map_err(|error| format!("proposal rejected: {error}"))?;
-    enrich_live_graph_delta(&mut overlay, ctx, edge_index);
+    let source_reader = projection_source_reader(params, ctx.repo_root)?;
+    enrich_live_graph_delta(&mut overlay, ctx, edge_index, &source_reader);
     let mut endpoint_pairs = overlay
         .edge_additions
         .iter()
@@ -3498,10 +3714,275 @@ fn live_graph_delta_card(
     .map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SourceBehaviorProfile {
+    features: BTreeMap<graph_delta::BehavioralDeltaKind, BTreeMap<String, u32>>,
+}
+
+impl SourceBehaviorProfile {
+    fn record(&mut self, kind: graph_delta::BehavioralDeltaKind, feature: impl Into<String>) {
+        *self
+            .features
+            .entry(kind)
+            .or_default()
+            .entry(feature.into())
+            .or_default() += 1;
+    }
+
+    fn remove(&mut self, kind: graph_delta::BehavioralDeltaKind, feature: &str) {
+        let Some(features) = self.features.get_mut(&kind) else {
+            return;
+        };
+        let Some(count) = features.get_mut(feature) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            features.remove(feature);
+        }
+    }
+
+    fn values(&self, kind: graph_delta::BehavioralDeltaKind) -> BTreeSet<String> {
+        self.features
+            .get(&kind)
+            .into_iter()
+            .flat_map(|features| features.iter())
+            .map(|(feature, count)| format!("{feature}:{count}"))
+            .collect()
+    }
+
+    fn shared(&self, other: &Self) -> BTreeSet<String> {
+        behavior_profile_kinds()
+            .into_iter()
+            .flat_map(|kind| {
+                let left = self.features.get(&kind).cloned().unwrap_or_default();
+                let right = other.features.get(&kind).cloned().unwrap_or_default();
+                left.keys()
+                    .filter(|feature| right.contains_key(*feature))
+                    .map(|feature| format!("{}={feature}", behavior_kind_name(kind)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
+fn behavior_profile_kinds() -> [graph_delta::BehavioralDeltaKind; 6] {
+    [
+        graph_delta::BehavioralDeltaKind::BypassedCall,
+        graph_delta::BehavioralDeltaKind::BranchBehavior,
+        graph_delta::BehavioralDeltaKind::Reconciliation,
+        graph_delta::BehavioralDeltaKind::Representation,
+        graph_delta::BehavioralDeltaKind::ErrorPath,
+        graph_delta::BehavioralDeltaKind::StatePropagation,
+    ]
+}
+
+fn behavior_kind_name(kind: graph_delta::BehavioralDeltaKind) -> &'static str {
+    match kind {
+        graph_delta::BehavioralDeltaKind::BypassedCall => "helper_calls",
+        graph_delta::BehavioralDeltaKind::BranchBehavior => "branches",
+        graph_delta::BehavioralDeltaKind::Reconciliation => "reconciliation",
+        graph_delta::BehavioralDeltaKind::Representation => "representation",
+        graph_delta::BehavioralDeltaKind::ErrorPath => "error_paths",
+        graph_delta::BehavioralDeltaKind::StatePropagation => "state_propagation",
+        graph_delta::BehavioralDeltaKind::Other => "other",
+    }
+}
+
+fn source_behavior_profile(
+    node: &Node,
+    reader: &source::SourceReader,
+    edge_index: &ProjectedEdgeIndex<'_>,
+) -> Result<SourceBehaviorProfile, String> {
+    let span =
+        node_source_span(node).ok_or_else(|| "node has no current source span".to_string())?;
+    let text = reader.read(&span).map_err(|error| error.to_string())?.text;
+    let mut profile = SourceBehaviorProfile::default();
+    for edge in edge_index.outgoing(&node.stable_id()) {
+        match &edge.kind {
+            EdgeKind::Calls => profile.record(
+                graph_delta::BehavioralDeltaKind::BypassedCall,
+                edge.to.to_stable_id(),
+            ),
+            EdgeKind::HasField | EdgeKind::References | EdgeKind::ReferencedBy => profile.record(
+                graph_delta::BehavioralDeltaKind::StatePropagation,
+                edge.to.name.clone(),
+            ),
+            _ => {}
+        }
+    }
+    for line in text.lines() {
+        record_text_behavior_features(&mut profile, line, graph_delta::ChangedLineKind::Added);
+    }
+    Ok(profile)
+}
+
+fn behavior_words(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| !(character == '_' || character.is_ascii_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn record_text_behavior_features(
+    profile: &mut SourceBehaviorProfile,
+    text: &str,
+    change: graph_delta::ChangedLineKind,
+) {
+    let words = behavior_words(text);
+    for (kind, markers) in [
+        (
+            graph_delta::BehavioralDeltaKind::BranchBehavior,
+            &["if", "else", "elif", "match", "switch", "case", "guard"][..],
+        ),
+        (
+            graph_delta::BehavioralDeltaKind::Reconciliation,
+            &[
+                "dedupe",
+                "deduplicate",
+                "merge",
+                "reconcile",
+                "sync",
+                "synchronize",
+            ][..],
+        ),
+        (
+            graph_delta::BehavioralDeltaKind::Representation,
+            &[
+                "encode",
+                "decode",
+                "serialize",
+                "deserialize",
+                "format",
+                "render",
+            ][..],
+        ),
+        (
+            graph_delta::BehavioralDeltaKind::ErrorPath,
+            &[
+                "error", "err", "raise", "throw", "catch", "except", "panic", "bail",
+            ][..],
+        ),
+        (
+            graph_delta::BehavioralDeltaKind::StatePropagation,
+            &["state", "status", "cache", "context", "metadata"][..],
+        ),
+    ] {
+        for marker in markers {
+            if words.contains(*marker) {
+                match change {
+                    graph_delta::ChangedLineKind::Added => profile.record(kind, *marker),
+                    graph_delta::ChangedLineKind::Removed => profile.remove(kind, marker),
+                }
+            }
+        }
+    }
+}
+
+fn apply_proposal_behavior(
+    profile: &mut SourceBehaviorProfile,
+    lines: &[graph_delta::ChangedLineFact],
+    relationships: &[graph_delta::ChangedRelationshipFact],
+) {
+    for line in lines {
+        record_text_behavior_features(profile, &line.text, line.kind);
+        for fact in relationships.iter().filter(|fact| {
+            fact.grounding.path == line.grounding.path
+                && fact.grounding.proposal_line == line.grounding.proposal_line
+        }) {
+            let Some(kind) = (match fact.kind {
+                // Helper calls use only uniquely corroborated overlay edges so
+                // their feature identity is the exact stable target ID.
+                graph_delta::InferredRelationshipKind::Call => None,
+                graph_delta::InferredRelationshipKind::Reference
+                | graph_delta::InferredRelationshipKind::Registration
+                | graph_delta::InferredRelationshipKind::AttributeOrStateReference => {
+                    Some(graph_delta::BehavioralDeltaKind::StatePropagation)
+                }
+            }) else {
+                continue;
+            };
+            match fact.change {
+                graph_delta::ChangedLineKind::Added => profile.record(kind, fact.target.clone()),
+                graph_delta::ChangedLineKind::Removed => profile.remove(kind, &fact.target),
+            }
+        }
+    }
+}
+
+fn source_backed_behavioral_contrasts(
+    proposed: &SourceBehaviorProfile,
+    analogue: &SourceBehaviorProfile,
+    proposal_loci: &BTreeMap<graph_delta::BehavioralDeltaKind, graph_delta::EvidenceGrounding>,
+    current_locus: &graph_delta::EvidenceGrounding,
+    analogue_locus: &graph_delta::EvidenceGrounding,
+) -> Vec<graph_delta::BehavioralDelta> {
+    behavior_profile_kinds()
+        .into_iter()
+        .filter_map(|kind| {
+            let proposed = proposed.values(kind);
+            let existing = analogue.values(kind);
+            if proposed == existing {
+                return None;
+            }
+            let proposal_only = proposed.difference(&existing).cloned().collect::<Vec<_>>();
+            let analogue_only = existing.difference(&proposed).cloned().collect::<Vec<_>>();
+            Some(graph_delta::BehavioralDelta {
+                kind,
+                label: format!(
+                    "{} source-backed contrast: proposal_only=[{}]; analogue_only=[{}]",
+                    behavior_kind_name(kind),
+                    proposal_only.join(","),
+                    analogue_only.join(",")
+                ),
+                changed_locus: proposal_loci.get(&kind).unwrap_or(current_locus).clone(),
+                analogue_locus: Some(analogue_locus.clone()),
+            })
+        })
+        .collect()
+}
+
+fn proposal_behavior_loci(
+    lines: &[graph_delta::ChangedLineFact],
+    relationships: &[graph_delta::ChangedRelationshipFact],
+) -> BTreeMap<graph_delta::BehavioralDeltaKind, graph_delta::EvidenceGrounding> {
+    let mut loci = BTreeMap::new();
+    for line in lines {
+        let grounding = graph_delta::EvidenceGrounding::Proposal(line.grounding.clone());
+        let mut line_profile = SourceBehaviorProfile::default();
+        record_text_behavior_features(
+            &mut line_profile,
+            &line.text,
+            graph_delta::ChangedLineKind::Added,
+        );
+        for kind in line_profile.features.keys() {
+            loci.entry(*kind).or_insert_with(|| grounding.clone());
+        }
+        for fact in relationships.iter().filter(|fact| {
+            fact.grounding.path == line.grounding.path
+                && fact.grounding.proposal_line == line.grounding.proposal_line
+        }) {
+            let kind = match fact.kind {
+                graph_delta::InferredRelationshipKind::Call => {
+                    graph_delta::BehavioralDeltaKind::BypassedCall
+                }
+                graph_delta::InferredRelationshipKind::Reference
+                | graph_delta::InferredRelationshipKind::Registration
+                | graph_delta::InferredRelationshipKind::AttributeOrStateReference => {
+                    graph_delta::BehavioralDeltaKind::StatePropagation
+                }
+            };
+            loci.entry(kind).or_insert_with(|| grounding.clone());
+        }
+    }
+    loci
+}
+
 fn enrich_live_graph_delta(
     overlay: &mut graph_delta::EphemeralOverlay,
     ctx: &SearchContext<'_>,
     edge_index: &ProjectedEdgeIndex<'_>,
+    source_reader: &source::SourceReader,
 ) {
     let mut grounded = BTreeMap::<(String, u32), String>::new();
     let mut changed_nodes = BTreeSet::new();
@@ -3509,18 +3990,7 @@ fn enrich_live_graph_delta(
     for file in &overlay.changed_files {
         for hunk in &file.hunks {
             for line in &hunk.changed_lines {
-                let current_line = match line.kind {
-                    graph_delta::ChangedLineKind::Added => line.grounding.new_line,
-                    graph_delta::ChangedLineKind::Removed => line.grounding.old_line,
-                };
-                let Some(current_line) = current_line else {
-                    misses.push((
-                        line.grounding.clone(),
-                        "changed line has no current coordinate",
-                    ));
-                    continue;
-                };
-                match unique_node_at_line(ctx, &file.path, current_line) {
+                match pre_edit_node_for_changed_line(ctx, file, hunk, line) {
                     Ok(node) => {
                         let id = node.stable_id();
                         grounded.insert(
@@ -3617,15 +4087,68 @@ fn enrich_live_graph_delta(
         }
     }
 
+    let mut changed_lines_by_node = BTreeMap::<String, Vec<graph_delta::ChangedLineFact>>::new();
+    for file in &overlay.changed_files {
+        for hunk in &file.hunks {
+            for line in &hunk.changed_lines {
+                if let Some(id) =
+                    grounded.get(&(line.grounding.path.clone(), line.grounding.proposal_line))
+                {
+                    changed_lines_by_node
+                        .entry(id.clone())
+                        .or_default()
+                        .push(line.clone());
+                }
+            }
+        }
+    }
+    for lines in changed_lines_by_node.values_mut() {
+        lines.sort_by_key(|line| line.grounding.proposal_line);
+        lines.dedup();
+    }
+
     let mut analogue_count = 0usize;
     for changed_id in &changed_nodes {
         let Some(changed) = find_node(ctx.graph_state, changed_id) else {
             continue;
         };
-        let changed_edges = outgoing_edge_kinds(edge_index, changed_id);
         let Some(changed_grounding) = graph_delta_node_grounding(changed) else {
             continue;
         };
+        let Ok(mut proposed_profile) = source_behavior_profile(changed, source_reader, edge_index)
+        else {
+            continue;
+        };
+        let changed_lines = changed_lines_by_node
+            .get(changed_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        apply_proposal_behavior(&mut proposed_profile, changed_lines, &overlay.relationships);
+        for removed in overlay
+            .edge_removals
+            .iter()
+            .filter(|edge| edge.from == *changed_id)
+        {
+            let kind = if removed.kind == EdgeKind::Calls.to_string() {
+                graph_delta::BehavioralDeltaKind::BypassedCall
+            } else {
+                graph_delta::BehavioralDeltaKind::StatePropagation
+            };
+            proposed_profile.remove(kind, &removed.to);
+        }
+        for added in overlay
+            .edge_additions
+            .iter()
+            .filter(|edge| edge.key.from == *changed_id)
+        {
+            let kind = if added.key.kind == EdgeKind::Calls.to_string() {
+                graph_delta::BehavioralDeltaKind::BypassedCall
+            } else {
+                graph_delta::BehavioralDeltaKind::StatePropagation
+            };
+            proposed_profile.record(kind, added.key.to.clone());
+        }
+        let proposal_loci = proposal_behavior_loci(changed_lines, &overlay.relationships);
         let mut candidates = ctx
             .graph_state
             .nodes
@@ -3634,17 +4157,21 @@ fn enrich_live_graph_delta(
                 candidate.stable_id() != *changed_id && candidate.id.kind == changed.id.kind
             })
             .filter_map(|candidate| {
-                let candidate_edges = outgoing_edge_kinds(edge_index, &candidate.stable_id());
-                let overlap = candidate_edges.intersection(&changed_edges).count();
-                (overlap > 0).then_some((
-                    std::cmp::Reverse(overlap),
+                let profile = source_behavior_profile(candidate, source_reader, edge_index).ok()?;
+                let shared = proposed_profile.shared(&profile);
+                (!shared.is_empty()).then_some((
+                    std::cmp::Reverse(shared.len()),
                     candidate.stable_id(),
                     candidate,
+                    profile,
+                    shared,
                 ))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        for (std::cmp::Reverse(overlap), _, analogue) in candidates.into_iter().take(2) {
+        for (std::cmp::Reverse(_), _, analogue, analogue_profile, shared) in
+            candidates.into_iter().take(2)
+        {
             if analogue_count >= 8 {
                 break;
             }
@@ -3665,20 +4192,19 @@ fn enrich_live_graph_delta(
                     grounding: analogue_grounding.clone(),
                 },
                 similarity_basis: format!(
-                    "same symbol kind and {overlap} shared outgoing typed edge kinds"
+                    "source-backed proposal/analogue behavior shared: {}",
+                    shared.into_iter().collect::<Vec<_>>().join(",")
                 ),
             });
             overlay
                 .behavioral_deltas
-                .push(graph_delta::BehavioralDelta {
-                    kind: graph_delta::BehavioralDeltaKind::Other,
-                    label: format!(
-                        "compare proposed behavior at {} with {}",
-                        changed.id.name, analogue.id.name
-                    ),
-                    changed_locus: changed_grounding.clone(),
-                    analogue_locus: Some(analogue_grounding),
-                });
+                .extend(source_backed_behavioral_contrasts(
+                    &proposed_profile,
+                    &analogue_profile,
+                    &proposal_loci,
+                    &changed_grounding,
+                    &analogue_grounding,
+                ));
         }
     }
 
@@ -3735,7 +4261,9 @@ fn enrich_live_graph_delta(
         } else {
             graph_delta::CapabilityState::Ready
         },
-        format!("retained {analogue_count} source-grounded structural analogues"),
+        format!(
+            "retained {analogue_count} source-backed behavioral analogues with explicit shared/missing feature contrasts"
+        ),
     );
     set_graph_delta_capability(
         &mut overlay.capabilities,
@@ -3751,6 +4279,70 @@ fn enrich_live_graph_delta(
             overlay.edge_removals.len()
         ),
     );
+}
+
+/// Resolve a changed proposal line only against coordinates that exist in the
+/// immutable pre-edit graph. Removed lines have an exact old coordinate.
+/// Added lines instead use the narrowest current node enclosing the hunk's
+/// old range; hunks without pre-edit context remain proposal-only.
+fn pre_edit_node_for_changed_line<'a>(
+    ctx: &'a SearchContext<'_>,
+    file: &graph_delta::ChangedFileFact,
+    hunk: &graph_delta::ChangedHunkFact,
+    line: &graph_delta::ChangedLineFact,
+) -> Result<&'a Node, &'static str> {
+    if let Some(old_line) = line.grounding.old_line {
+        return unique_node_at_line(ctx, &file.path, old_line);
+    }
+    if line.kind != graph_delta::ChangedLineKind::Added || hunk.old_count == 0 {
+        return Err("changed line has no pre-edit coordinate and remains proposal-only");
+    }
+    let new_line = line
+        .grounding
+        .new_line
+        .ok_or("added line has no new hunk coordinate")?;
+    let new_offset = new_line
+        .checked_sub(hunk.new_start)
+        .ok_or("added line precedes its hunk")?;
+    let prior_added = hunk
+        .changed_lines
+        .iter()
+        .filter(|changed| {
+            changed.kind == graph_delta::ChangedLineKind::Added
+                && changed.grounding.proposal_line < line.grounding.proposal_line
+        })
+        .count() as u32;
+    let prior_removed = hunk
+        .changed_lines
+        .iter()
+        .filter(|changed| {
+            changed.kind == graph_delta::ChangedLineKind::Removed
+                && changed.grounding.proposal_line < line.grounding.proposal_line
+        })
+        .count() as u32;
+    let old_gap = hunk
+        .old_start
+        .checked_add(new_offset)
+        .and_then(|value| value.checked_sub(prior_added))
+        .and_then(|value| value.checked_add(prior_removed))
+        .ok_or("added line cannot map to a bounded old-side insertion gap")?;
+    let old_end_exclusive = hunk
+        .old_start
+        .checked_add(hunk.old_count)
+        .ok_or("hunk old range overflows")?;
+    let before = old_gap
+        .checked_sub(1)
+        .filter(|value| *value >= hunk.old_start);
+    let after = (old_gap < old_end_exclusive).then_some(old_gap);
+    let (Some(before), Some(after)) = (before, after) else {
+        return Err("added line lacks old-side context on both sides and remains proposal-only");
+    };
+    let before_node = unique_node_at_line(ctx, &file.path, before)?;
+    let after_node = unique_node_at_line(ctx, &file.path, after)?;
+    if before_node.stable_id() != after_node.stable_id() {
+        return Err("added line crosses pre-edit symbol boundaries and remains proposal-only");
+    }
+    Ok(before_node)
 }
 
 fn unique_node_at_line<'a>(
@@ -3876,14 +4468,6 @@ fn graph_delta_impact_kind(node: &Node, caller: bool) -> graph_delta::ImpactKind
     } else {
         graph_delta::ImpactKind::EditableLocus
     }
-}
-
-fn outgoing_edge_kinds(edge_index: &ProjectedEdgeIndex<'_>, id: &str) -> BTreeSet<String> {
-    edge_index
-        .outgoing(id)
-        .iter()
-        .map(|edge| edge.kind.to_string())
-        .collect()
 }
 
 fn set_graph_delta_capability(
@@ -4309,10 +4893,9 @@ fn graph_delta_grounding_node<'a>(
             unique_node_at_line(ctx, &span.path, span.start_line)
         }
         graph_delta::EvidenceGrounding::Proposal(line) => {
-            let current_line = line
-                .new_line
-                .or(line.old_line)
-                .ok_or("proposal line has no current coordinate")?;
+            let current_line = line.old_line.ok_or(
+                "added proposal line has no exact pre-edit coordinate; it remains proposal-only",
+            )?;
             unique_node_at_line(ctx, &line.path, current_line)
         }
     }
@@ -5704,6 +6287,48 @@ fn projected_relationships(
     relationships.sort();
     relationships.dedup();
     relationships
+}
+
+fn task_future_interaction_signature(
+    selected_ids: &[String],
+    remaining_ids: &[String],
+    edge_index: &ProjectedEdgeIndex<'_>,
+) -> task_context::FutureInteractionSignature {
+    let selected = selected_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    remaining_ids
+        .iter()
+        .map(|remaining_id| {
+            let mut relationships = BTreeSet::new();
+            for selected_id in &selected {
+                for edge in edge_index.outgoing(selected_id) {
+                    let to = edge.to.to_stable_id();
+                    if to == *remaining_id {
+                        relationships.insert((
+                            edge.from.to_stable_id(),
+                            edge.kind.to_string(),
+                            to,
+                            format!("{} {:?}", edge.source, edge.confidence),
+                        ));
+                    }
+                }
+            }
+            for edge in edge_index.outgoing(remaining_id) {
+                let to = edge.to.to_stable_id();
+                if selected.contains(to.as_str()) {
+                    relationships.insert((
+                        edge.from.to_stable_id(),
+                        edge.kind.to_string(),
+                        to,
+                        format!("{} {:?}", edge.source, edge.confidence),
+                    ));
+                }
+            }
+            (remaining_id.clone(), relationships.into_iter().collect())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12880,5 +13505,219 @@ mod tests {
         assert!(card.contains("graph_delta_route"));
         assert!(!seed_neighbors.contains("role:"));
         assert!(!seed_impact.contains("role:"));
+    }
+
+    #[test]
+    fn acceptance_remediation_task_direction_validation_fails_closed_and_accepts_both() {
+        let mut params = SearchParams {
+            query: Some("change behavior".into()),
+            context_mode: Some("task".into()),
+            direction: Some("sideways".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_search_experience(&params),
+            Err("unknown task-context direction `sideways`; allowed values: incoming, outgoing, both".into())
+        );
+        params.direction = Some("both".into());
+        assert!(validate_search_experience(&params).is_ok());
+    }
+
+    #[test]
+    fn acceptance_remediation_exact_task_roles_preserve_test_and_definition_truth() {
+        let mut test = make_node("test_task_roles", NodeKind::Function, "tests/task.rs");
+        test.metadata.insert("is_test".into(), "true".into());
+        let definition = make_node("TaskState", NodeKind::Struct, "src/task.rs");
+
+        assert_eq!(exact_task_roles(&test), BTreeSet::from([TaskRole::Test]));
+        assert_eq!(
+            task_facet_for_role(*exact_task_roles(&test).first().unwrap()),
+            TaskFacet::Test
+        );
+        assert_eq!(
+            exact_task_roles(&definition),
+            BTreeSet::from([TaskRole::DefinitionOrApiState])
+        );
+        assert_eq!(
+            task_facet_for_role(*exact_task_roles(&definition).first().unwrap()),
+            TaskFacet::ApiOrState
+        );
+    }
+
+    #[test]
+    fn acceptance_remediation_added_line_uses_only_same_symbol_old_side_context() {
+        let mut before = make_node("before", NodeKind::Function, "src/lib.rs");
+        before.line_start = 1;
+        before.line_end = 9;
+        let mut after = make_node("after", NodeKind::Function, "src/lib.rs");
+        after.line_start = 10;
+        after.line_end = 20;
+        let boundary_graph = make_graph_state(vec![before, after]);
+        let repository = tempfile::tempdir().unwrap();
+        let boundary_ctx = make_search_context(&boundary_graph, repository.path());
+        let added = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Added,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "src/lib.rs".into(),
+                proposal_line: 5,
+                old_line: None,
+                new_line: Some(10),
+            },
+            text: "inserted();".into(),
+        };
+        let hunk = graph_delta::ChangedHunkFact {
+            proposal_header_line: 4,
+            old_start: 9,
+            old_count: 2,
+            new_start: 9,
+            new_count: 3,
+            changed_lines: vec![added.clone()],
+        };
+        let file = graph_delta::ChangedFileFact {
+            root: "local".into(),
+            path: "src/lib.rs".into(),
+            hunks: vec![hunk.clone()],
+        };
+        assert!(pre_edit_node_for_changed_line(&boundary_ctx, &file, &hunk, &added).is_err());
+
+        let mut enclosing = make_node("enclosing", NodeKind::Function, "src/lib.rs");
+        enclosing.line_start = 1;
+        enclosing.line_end = 20;
+        let enclosing_graph = make_graph_state(vec![enclosing]);
+        let enclosing_ctx = make_search_context(&enclosing_graph, repository.path());
+        assert_eq!(
+            pre_edit_node_for_changed_line(&enclosing_ctx, &file, &hunk, &added)
+                .unwrap()
+                .id
+                .name,
+            "enclosing"
+        );
+        let proposal_grounding = graph_delta::EvidenceGrounding::Proposal(added.grounding);
+        assert!(graph_delta_grounding_node(&proposal_grounding, &enclosing_ctx).is_err());
+    }
+
+    #[test]
+    fn acceptance_remediation_source_backed_behavior_contrasts_cover_all_typed_classes_and_loci() {
+        let mut proposed = SourceBehaviorProfile::default();
+        let mut analogue = SourceBehaviorProfile::default();
+        for kind in behavior_profile_kinds() {
+            proposed.record(kind, "shared");
+            analogue.record(kind, "shared");
+            proposed.record(kind, "proposal-only");
+            analogue.record(kind, "analogue-only");
+        }
+        // Whole bodies are classified line-by-line: removing one occurrence
+        // must not erase the same branch behavior retained on another line.
+        record_text_behavior_features(
+            &mut proposed,
+            "if first",
+            graph_delta::ChangedLineKind::Added,
+        );
+        record_text_behavior_features(
+            &mut proposed,
+            "if second",
+            graph_delta::ChangedLineKind::Added,
+        );
+        record_text_behavior_features(
+            &mut proposed,
+            "if first",
+            graph_delta::ChangedLineKind::Removed,
+        );
+        assert!(
+            proposed
+                .values(graph_delta::BehavioralDeltaKind::BranchBehavior)
+                .contains("if:1")
+        );
+
+        let changed = graph_delta::EvidenceGrounding::Proposal(graph_delta::ProposalLine {
+            root: "local".into(),
+            path: "src/lib.rs".into(),
+            proposal_line: 7,
+            old_line: None,
+            new_line: Some(12),
+        });
+        let source = graph_delta::EvidenceGrounding::CurrentSource(graph_delta::SourceSpan {
+            root: "local".into(),
+            path: "src/analogue.rs".into(),
+            start_line: 3,
+            end_line: 9,
+        });
+        let current = graph_delta::EvidenceGrounding::CurrentSource(graph_delta::SourceSpan {
+            root: "local".into(),
+            path: "src/lib.rs".into(),
+            start_line: 10,
+            end_line: 20,
+        });
+        let helper_changed = graph_delta::EvidenceGrounding::Proposal(graph_delta::ProposalLine {
+            root: "local".into(),
+            path: "src/lib.rs".into(),
+            proposal_line: 8,
+            old_line: Some(13),
+            new_line: None,
+        });
+        let loci = BTreeMap::from([
+            (graph_delta::BehavioralDeltaKind::BranchBehavior, changed),
+            (
+                graph_delta::BehavioralDeltaKind::BypassedCall,
+                helper_changed,
+            ),
+        ]);
+        let deltas =
+            source_backed_behavioral_contrasts(&proposed, &analogue, &loci, &current, &source);
+        assert_eq!(deltas.len(), 6);
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.kind)
+                .collect::<BTreeSet<_>>(),
+            behavior_profile_kinds().into_iter().collect()
+        );
+        assert!(deltas.iter().all(|delta| {
+            delta.kind != graph_delta::BehavioralDeltaKind::Other
+                && matches!(
+                    delta.analogue_locus,
+                    Some(graph_delta::EvidenceGrounding::CurrentSource(_))
+                )
+                && delta.label.contains("proposal_only")
+                && delta.label.contains("analogue_only")
+        }));
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == graph_delta::BehavioralDeltaKind::BranchBehavior
+                && matches!(
+                    delta.changed_locus,
+                    graph_delta::EvidenceGrounding::Proposal(graph_delta::ProposalLine {
+                        proposal_line: 7,
+                        ..
+                    })
+                )
+        }));
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == graph_delta::BehavioralDeltaKind::BypassedCall
+                && matches!(
+                    delta.changed_locus,
+                    graph_delta::EvidenceGrounding::Proposal(graph_delta::ProposalLine {
+                        proposal_line: 8,
+                        ..
+                    })
+                )
+        }));
+        assert!(
+            deltas
+                .iter()
+                .filter(|delta| !matches!(
+                    delta.kind,
+                    graph_delta::BehavioralDeltaKind::BranchBehavior
+                        | graph_delta::BehavioralDeltaKind::BypassedCall
+                ))
+                .all(|delta| matches!(
+                    delta.changed_locus,
+                    graph_delta::EvidenceGrounding::CurrentSource(_)
+                ))
+        );
+        assert_eq!(
+            deltas,
+            source_backed_behavioral_contrasts(&proposed, &analogue, &loci, &current, &source)
+        );
     }
 }
