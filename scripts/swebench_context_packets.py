@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -293,13 +293,112 @@ def validate_artifact_receipt(
     return sha256(canonical_json(dict(receipt)))
 
 
+def validate_frozen_lock(expected_bundle_digest: str) -> str:
+    root = ROOT.resolve()
+    errors: list[str] = []
+    if PROTOCOL._has_symlink_component(root, PROTOCOL.LOCK_REL.parts):
+        raise PacketError("frozen protocol lock path is unsafe")
+    lock_path = root / PROTOCOL.LOCK_REL
+    lock_bytes = lock_path.read_bytes()
+    if PROTOCOL.SECRET_VALUE.search(lock_bytes.decode("utf-8", errors="ignore")):
+        errors.append("credential-shaped value in lock manifest")
+    lock = PROTOCOL.load_json_object(lock_path, "frozen protocol lock")
+    if set(lock) != {
+        "schema_version", "algorithm", "material_format", "files", "bundle_sha256"
+    }:
+        errors.append("lock field set drift")
+    if type(lock.get("schema_version")) is not int or lock.get("schema_version") != 1:
+        errors.append("lock schema_version drift")
+    if lock.get("algorithm") != "sha256":
+        errors.append("lock algorithm drift")
+    if lock.get("material_format") != PROTOCOL.LOCK_MATERIAL_FORMAT:
+        errors.append("lock material format drift")
+    entries = lock.get("files")
+    if not isinstance(entries, list) or not entries:
+        errors.append("lock files are invalid")
+        entries = []
+    paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
+    if paths != list(PROTOCOL.EXPECTED_LOCK_PATHS):
+        errors.append("lock path set/order drift")
+    for ordinal, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256"}:
+            errors.append(f"lock entry {ordinal} field set drift")
+            continue
+        raw_path = entry.get("path")
+        byte_length = entry.get("bytes")
+        digest = entry.get("sha256")
+        if type(byte_length) is not int or byte_length < 0:
+            errors.append(f"lock entry {ordinal} byte length drift")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            errors.append(f"lock entry {ordinal} digest is invalid")
+        if not isinstance(raw_path, str):
+            errors.append(f"lock entry {ordinal} path is unsafe")
+            continue
+        relative = PurePosixPath(raw_path)
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or "\\" in raw_path
+            or raw_path != relative.as_posix()
+            or PROTOCOL._has_symlink_component(root, relative.parts)
+        ):
+            errors.append(f"lock entry {ordinal} path is unsafe")
+            continue
+        candidate = root.joinpath(*relative.parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            errors.append(f"lock entry {ordinal} path is unsafe or missing")
+            continue
+        if not resolved.is_file():
+            errors.append(f"lock entry {ordinal} file is missing")
+            continue
+        data = resolved.read_bytes()
+        if len(data) != byte_length:
+            errors.append(f"lock entry {ordinal} byte length drift")
+        if sha256(data) != digest:
+            errors.append(f"lock entry {ordinal} digest drift")
+        if PROTOCOL.SECRET_VALUE.search(data.decode("utf-8", errors="ignore")):
+            errors.append("credential-shaped value in locked file")
+    material_digest = sha256(PROTOCOL._lock_material(entries))
+    if lock.get("bundle_sha256") != material_digest:
+        errors.append("bundle digest mismatch in lock")
+    if material_digest != expected_bundle_digest:
+        errors.append("frozen protocol bundle external digest mismatch")
+    if PROTOCOL._has_symlink_component(root, PROTOCOL.DIGEST_REL.parts):
+        errors.append("protocol digest path is unsafe")
+    else:
+        digest_path = root / PROTOCOL.DIGEST_REL
+        if not digest_path.is_file() or digest_path.is_symlink():
+            errors.append("protocol digest file is unsafe or missing")
+        else:
+            try:
+                digest_file = digest_path.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError):
+                errors.append("protocol digest file is invalid")
+            else:
+                if digest_file != material_digest:
+                    errors.append("protocol.sha256 does not match bundle")
+    if errors:
+        raise PacketError("frozen protocol lock validation failed: " + "; ".join(errors[:8]))
+    return material_digest
+
+
 def validate_frozen_inputs(expected_bundle_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        PROTOCOL.validate_bundle(ROOT, expected_digest=expected_bundle_digest)
-    except ValueError as error:
-        raise PacketError("frozen protocol validation failed") from error
+    validate_frozen_lock(expected_bundle_digest)
     protocol = PROTOCOL.load_json_object(DEFAULT_PROTOCOL, "frozen protocol")
     population = PROTOCOL.load_json_object(DEFAULT_POPULATION, "frozen population")
+    errors: list[str] = []
+    if sha256_file(DEFAULT_PROTOCOL) != PROTOCOL.EXPECTED_PROTOCOL_SHA256:
+        errors.append("frozen protocol digest mismatch")
+    if sha256_file(DEFAULT_POPULATION) != PROTOCOL.EXPECTED_POPULATION_SHA256:
+        errors.append("frozen population digest mismatch")
+    PROTOCOL.validate_protocol(protocol, errors)
+    PROTOCOL.validate_population(population, errors)
+    if errors:
+        raise PacketError("frozen protocol validation failed: " + "; ".join(errors[:8]))
     return protocol, population
 
 

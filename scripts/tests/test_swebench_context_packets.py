@@ -407,19 +407,29 @@ class SwebenchContextPacketTests(unittest.TestCase):
             )
             self.assertEqual(preamble["full_payload"], "VALUE = 1\r\nOTHER = 2\r\n")
 
-    def test_frozen_inputs_use_full_locked_bundle_validation(self) -> None:
+    def test_frozen_inputs_use_exact_lock_members_without_sibling_inventory(self) -> None:
+        expected_digest = (
+            ROOT / "benchmark/swebench-act-context/protocol.sha256"
+        ).read_text(encoding="ascii").strip()
+        self.assertEqual(PACKETS.validate_frozen_lock(expected_digest), expected_digest)
         protocol = {"protocol_id": "rna-act-context-swebench-v1"}
         population = {"instances": []}
         with (
-            mock.patch.object(PACKETS.PROTOCOL, "validate_bundle") as validate,
+            mock.patch.object(PACKETS, "validate_frozen_lock") as validate,
             mock.patch.object(
                 PACKETS.PROTOCOL,
                 "load_json_object",
                 side_effect=(protocol, population),
             ),
+            mock.patch.object(PACKETS.PROTOCOL, "validate_protocol"),
+            mock.patch.object(PACKETS.PROTOCOL, "validate_population"),
+            mock.patch.object(PACKETS, "sha256_file", side_effect=(
+                PACKETS.PROTOCOL.EXPECTED_PROTOCOL_SHA256,
+                PACKETS.PROTOCOL.EXPECTED_POPULATION_SHA256,
+            )),
         ):
-            self.assertEqual(PACKETS.validate_frozen_inputs("a" * 64), (protocol, population))
-        validate.assert_called_once_with(PACKETS.ROOT, expected_digest="a" * 64)
+            self.assertEqual(PACKETS.validate_frozen_inputs(expected_digest), (protocol, population))
+        validate.assert_called_once_with(expected_digest)
 
     def test_command_protocol_rejects_non_exact_search_argv(self) -> None:
         source = json.loads(
