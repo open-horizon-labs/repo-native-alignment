@@ -1026,6 +1026,102 @@ struct FlatCodeSymbolSearch<'a> {
     strict_failure: Option<&'static str>,
 }
 
+fn markdown_search_section(
+    params: &SearchParams,
+    query_str: &str,
+    ctx: &SearchContext<'_>,
+    limit: usize,
+) -> Option<String> {
+    if !params.include_markdown || query_str.is_empty() {
+        return None;
+    }
+
+    let paths = crate::walk::walk_repo_files(ctx.repo_root, &["md", "rst"]).ok()?;
+    let chunks: Vec<_> = paths
+        .into_iter()
+        .flat_map(|path| match crate::markdown::parse_markdown_file(&path) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                tracing::warn!("Failed to parse {}: {}", path.display(), error);
+                Vec::new()
+            }
+        })
+        .filter(|chunk| {
+            let repository_path = chunk
+                .file_path
+                .strip_prefix(ctx.repo_root)
+                .unwrap_or(&chunk.file_path);
+            ctx.business_context.admit_repository_file(repository_path)
+        })
+        .collect();
+    let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(ctx.repo_root.to_path_buf())
+            .with_worktrees(ctx.repo_root)
+            .with_claude_memory(ctx.repo_root)
+            .with_agent_memories(ctx.repo_root)
+            .with_declared_roots(ctx.repo_root);
+        let root_path = workspace
+            .resolved_roots()
+            .into_iter()
+            .find(|root| root.slug.eq_ignore_ascii_case(slug))
+            .map(|root| root.path);
+        if let Some(root_path) = root_path {
+            chunks
+                .into_iter()
+                .filter(|chunk| chunk.file_path.starts_with(&root_path))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        chunks
+    };
+    let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
+    if scored.is_empty() {
+        return None;
+    }
+
+    let markdown = scored
+        .iter()
+        .take(limit)
+        .map(|scored| {
+            format!(
+                "- (score: {:.2}) {}",
+                scored.score,
+                scored.chunk.to_markdown()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    Some(format!(
+        "### Markdown ({} result(s))\n\n{}",
+        scored.len().min(limit),
+        markdown
+    ))
+}
+
+fn append_flat_search_tail_sections(
+    sections: &mut Vec<String>,
+    strict_semantic: bool,
+    params: &SearchParams,
+    query_str: &str,
+    ctx: &SearchContext<'_>,
+    limit: usize,
+) {
+    if strict_semantic {
+        sections.push(
+            "### Strict semantic qualification\n\n\
+             `status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`"
+                .to_string(),
+        );
+    }
+
+    if let Some(markdown) = markdown_search_section(params, query_str, ctx, limit) {
+        sections.push(markdown);
+    }
+}
+
 async fn search_flat(
     params: &SearchParams,
     query: Option<&str>,
@@ -1101,10 +1197,10 @@ async fn search_flat(
         ));
     }
 
-    // Strict qualification emits only the candidate set that passed both
-    // hybrid retrieval and the cross-encoder. Ordinary search can still add
-    // artifact and Markdown result classes, whose independent renderers do not
-    // currently participate in that one-to-one rerank contract.
+    // Artifacts remain ordinary-search-only because their embedding scorer does
+    // not participate in strict qualification's one-to-one code rerank contract.
+    // Repository Markdown/RST is source-ranked independently and appended later
+    // without changing the qualified code candidate set or its order.
     if !strict_semantic
         && params.include_artifacts
         && !query_str.is_empty()
@@ -1155,67 +1251,14 @@ async fn search_flat(
         sections.push(diagnostic.render());
     }
 
-    if strict_semantic {
-        sections.push(
-            "### Strict semantic qualification\n\n\
-             `status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`"
-                .to_string(),
-        );
-    }
-
-    if !strict_semantic
-        && params.include_markdown
-        && !query_str.is_empty()
-        && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root)
-    {
-        let chunks: Vec<_> = chunks
-            .into_iter()
-            .filter(|chunk| {
-                let repository_path = chunk
-                    .file_path
-                    .strip_prefix(ctx.repo_root)
-                    .unwrap_or(&chunk.file_path);
-                ctx.business_context.admit_repository_file(repository_path)
-            })
-            .collect();
-        let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
-            let workspace = crate::roots::WorkspaceConfig::load()
-                .with_primary_root(ctx.repo_root.to_path_buf())
-                .with_worktrees(ctx.repo_root)
-                .with_claude_memory(ctx.repo_root)
-                .with_agent_memories(ctx.repo_root)
-                .with_declared_roots(ctx.repo_root);
-            let root_path = workspace
-                .resolved_roots()
-                .into_iter()
-                .find(|r| r.slug.eq_ignore_ascii_case(slug))
-                .map(|r| r.path);
-            if let Some(rp) = root_path {
-                chunks
-                    .into_iter()
-                    .filter(|c| c.file_path.starts_with(&rp))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            chunks
-        };
-        let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
-        if !scored.is_empty() {
-            let md = scored
-                .iter()
-                .take(limit)
-                .map(|sc| format!("- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown()))
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
-            sections.push(format!(
-                "### Markdown ({} result(s))\n\n{}",
-                scored.len().min(limit),
-                md
-            ));
-        }
-    }
+    append_flat_search_tail_sections(
+        &mut sections,
+        strict_semantic,
+        params,
+        query_str,
+        ctx,
+        limit,
+    );
 
     let freshness = if params.verbose {
         format_verbose_readiness(
@@ -2916,6 +2959,7 @@ mod tests {
     use crate::graph::{ExtractionSource, NodeId};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     fn make_node(name: &str, kind: NodeKind, file: &str) -> Node {
         Node {
@@ -4675,6 +4719,139 @@ mod tests {
         let result = search(&params, &ctx).await;
         assert!(result.contains("accepts only a flat query"));
         assert!(!result.contains("target"));
+    }
+
+    #[test]
+    fn strict_semantic_renderer_keeps_twenty_code_results_and_repository_docs() {
+        let repo = TempDir::new().expect("create repository fixture");
+        std::fs::write(
+            repo.path().join("README.md"),
+            "# Context packet evidence\n\nREADME context packet evidence for agent discovery.\n",
+        )
+        .expect("write README fixture");
+        std::fs::create_dir_all(repo.path().join("docs")).expect("create nested docs fixture");
+        std::fs::write(
+            repo.path().join("docs/configuration.rst"),
+            "Context packet evidence\n=======================\n\nNested RST context packet evidence for configuration.\n",
+        )
+        .expect("write RST fixture");
+        for index in 0..20 {
+            std::fs::write(
+                repo.path().join(format!("docs/filler_{index:02}.md")),
+                format!(
+                    "# Supporting note {index:02}\n\ncontext packet evidence filler {index:02}.\n"
+                ),
+            )
+            .expect("write Markdown limit fixture");
+        }
+
+        let nodes = (0..20)
+            .map(|index| {
+                make_node(
+                    &format!("context_packet_{index:02}"),
+                    NodeKind::Function,
+                    &format!("src/context_{index:02}.rs"),
+                )
+            })
+            .collect();
+        let graph_state = make_graph_state(nodes);
+        let ctx = make_search_context(&graph_state, repo.path());
+        let params = SearchParams {
+            query: Some("context packet evidence".into()),
+            search_mode: Some("strict".into()),
+            rerank: true,
+            limit: Some(20),
+            include_artifacts: false,
+            include_markdown: true,
+            ..Default::default()
+        };
+        assert!(strict_semantic_requested(&params));
+        assert_eq!(
+            parse_search_mode(params.search_mode.as_deref()),
+            SearchMode::Hybrid
+        );
+
+        let strict_docs = markdown_search_section(&params, "context packet evidence", &ctx, 20)
+            .expect("strict rendering must include repository documentation");
+        let mut ordinary_params = params.clone();
+        ordinary_params.search_mode = Some("hybrid".into());
+        ordinary_params.rerank = false;
+        let ordinary_docs =
+            markdown_search_section(&ordinary_params, "context packet evidence", &ctx, 20)
+                .expect("ordinary rendering must include repository documentation");
+        assert_eq!(strict_docs, ordinary_docs);
+        assert_eq!(
+            strict_docs,
+            markdown_search_section(&params, "context packet evidence", &ctx, 20)
+                .expect("repeated rendering must be deterministic")
+        );
+        assert!(strict_docs.starts_with("### Markdown (20 result(s))"));
+        assert_eq!(strict_docs.matches("- (score:").count(), 20);
+        assert!(strict_docs.contains("README context packet evidence for agent discovery."));
+        assert!(strict_docs.contains("Nested RST context packet evidence for configuration."));
+
+        let mut markdown_disabled = params.clone();
+        markdown_disabled.include_markdown = false;
+        assert!(
+            markdown_search_section(&markdown_disabled, "context packet evidence", &ctx, 20)
+                .is_none()
+        );
+        assert!(markdown_search_section(&params, "", &ctx, 20).is_none());
+
+        let code = graph_state
+            .nodes
+            .iter()
+            .map(|node| {
+                format_node_entry_with_root(
+                    node,
+                    &graph_state.index,
+                    params.compact,
+                    None,
+                    false,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut sections = vec![format!("### Code symbols (20 result(s))\n\n{code}")];
+        append_flat_search_tail_sections(
+            &mut sections,
+            true,
+            &params,
+            "context packet evidence",
+            &ctx,
+            20,
+        );
+        let output = format!(
+            "## Search: \"context packet evidence\"\n\n{}",
+            sections.join("\n\n")
+        );
+
+        assert!(output.contains("### Code symbols (20 result(s))"));
+        assert_eq!(output.matches("**function**").count(), 20);
+        assert!(output.contains(
+            "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
+        ));
+        assert!(output.contains("### Markdown (20 result(s))"));
+        assert!(output.contains("README context packet evidence for agent discovery."));
+        assert!(output.contains("Nested RST context packet evidence for configuration."));
+        assert!(output.contains(&repo.path().join("README.md").display().to_string()));
+        assert!(
+            output.contains(
+                &repo
+                    .path()
+                    .join("docs/configuration.rst")
+                    .display()
+                    .to_string()
+            )
+        );
+
+        let code_position = output.find("### Code symbols").expect("code section");
+        let ready_position = output
+            .find("### Strict semantic qualification")
+            .expect("strict READY section");
+        let docs_position = output.find("### Markdown").expect("Markdown section");
+        assert!(code_position < ready_position && ready_position < docs_position);
     }
 
     /// Empty query with no filters returns empty results (via the search function).
