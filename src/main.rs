@@ -271,6 +271,39 @@ struct SearchArgs {
     /// Show index stats (default: true for CLI, false for MCP)
     #[arg(long, default_value_t = true)]
     verbose: bool,
+    /// Output projection: agent (default) or evidence.
+    #[arg(long)]
+    projection: Option<String>,
+    /// Body policy: complete, focused_span, signature_only, minified, or none.
+    #[arg(long)]
+    body_policy: Option<String>,
+    /// Maximum final rendered UTF-8 bytes.
+    #[arg(long)]
+    max_output_bytes: Option<usize>,
+    /// Maximum estimated rendered tokens (not provider usage).
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
+    /// Maximum source-body UTF-8 bytes per selected record.
+    #[arg(long)]
+    max_body_bytes: Option<usize>,
+    /// Maximum source-body UTF-8 bytes across all records after coalescing.
+    #[arg(long)]
+    max_total_body_bytes: Option<usize>,
+    /// Opt-in context mode: task or graph-delta-beta.
+    #[arg(long)]
+    context_mode: Option<String>,
+    /// Comma-separated task roles: editable_source, definition_or_api_state,
+    /// test, behavioral_analogue, direct_dependency, caller_or_impact,
+    /// proposal_delta.
+    #[arg(long)]
+    context_roles: Option<String>,
+    /// Comma-separated task facets: behavior, api_or_state, test, analogue,
+    /// proposal.
+    #[arg(long)]
+    context_facets: Option<String>,
+    /// Unified diff or structured edit sketch for graph-delta beta.
+    #[arg(long)]
+    proposal: Option<String>,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -1480,6 +1513,26 @@ async fn async_main() -> anyhow::Result<()> {
                 include_body: args.include_body,
                 minify_body: args.minify_body,
                 verbose: args.verbose,
+                projection: args.projection.clone(),
+                body_policy: args.body_policy.clone(),
+                max_output_bytes: args.max_output_bytes,
+                max_output_tokens: args.max_output_tokens,
+                max_body_bytes: args.max_body_bytes,
+                max_total_body_bytes: args.max_total_body_bytes,
+                context_mode: args.context_mode.clone(),
+                context_roles: args.context_roles.as_ref().map(|values| {
+                    values
+                        .split(',')
+                        .map(|value| value.trim().to_string())
+                        .collect()
+                }),
+                context_facets: args.context_facets.as_ref().map(|values| {
+                    values
+                        .split(',')
+                        .map(|value| value.trim().to_string())
+                        .collect()
+                }),
+                proposal: args.proposal.clone(),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             // Include lsp_only subdirectory root slugs in non_code_slugs so they're not

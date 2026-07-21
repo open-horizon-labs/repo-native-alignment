@@ -214,7 +214,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Retrieve bounded current-filesystem source with `file` + `line`/`end_line` (or `file="path:line:column"`; maximum 200 lines). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` (default for MCP) for cross-encoder precision. Use `include_body: true` (requires `node` or `nodes`) to return function bodies; add `minify_body: true` to strip comments and shorten locals with a legend (tree-sitter AST for TS/JS, Rust, Python, Go; text fallback for others). |
+| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). The default `agent` projection keeps action context concise; `projection="evidence"` exposes ranking/audit details. Final rendered budgets and explicit body policies prevent duplicate or silently partial source. Opt into role-aware bundles with `context_mode="task"` or the non-mutating `context_mode="graph-delta-beta"`. Existing exact source, subsystem, compact, rerank, and body controls remain available. |
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase), durable Pass 1 queue snapshots (pending, in-flight, completed, failed, skipped, exhausted, resumed/retried counts, phase counts, oldest work, and bounded actionable exhaustion samples) from `.oh/.cache/lsp_pass1_work_items.json`, and recent OperationReport history from `.oh/.cache/operation_reports.json`. Interrupted queues resume only eligible work: completed output and skipped state are carried forward only when the node input fingerprint is unchanged. OperationReports persist the same queue snapshot for post-run inspection. Includes LSP servers available to install for each root's detected languages. |
@@ -239,6 +239,8 @@ rule supplies valid evidence.
 **Index-updating indicator:** When the background scanner is actively rebuilding the index (triggered by a HEAD change), `search`, `repo_map`, and `outcome_progress` responses append: `_Index updating in background — results reflect last complete scan._` No note appears when the index is current. This is informational — results are still valid, just from the previous complete scan.
 
 **Search degradation:** If semantic scoring fails after a graph is mapped, `search` keeps the graph available, returns bounded lexical/graph results, and appends content-safe component/model/index diagnostics. Rebuild the embeddings capability for that root and retry semantic search; the diagnostic deliberately omits query text, file paths, and panic payloads.
+
+See [Search projections and task context](docs/search-context.md) for projection fields, rendered-cost semantics, body policies, task roles/facets, and the opt-in graph-delta beta contract.
 
 ### CLI ↔ MCP Equivalence
 

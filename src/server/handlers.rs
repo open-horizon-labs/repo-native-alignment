@@ -962,6 +962,15 @@ mod tests {
         }
     }
 
+    fn call_tool_text(result: &CallToolResult) -> String {
+        serde_json::to_value(result)
+            .expect("CallToolResult serializes")
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .expect("search returns one MCP text content item")
+            .to_owned()
+    }
+
     // ── is_building indicator tests ─────────────────────────────────────
 
     /// Verify the note text and `is_building()` logic in isolation.
@@ -1177,9 +1186,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_search_generated_defaults_current_repo_use_live_graph() {
-        let repo_root = std::env::current_dir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let repo_root = repo.path().to_path_buf();
         let handler = make_handler(&repo_root);
         let symbol = "rna_generated_default_live_graph_probe";
+        std::fs::write(
+            repo_root.join("src/generated_default_live.rs"),
+            format!("pub fn {symbol}() -> &'static str {{\n    \"live\"\n}}\n"),
+        )
+        .unwrap();
         let root_slug = handler.primary_root_slug();
 
         let node = Node {
@@ -1230,12 +1246,23 @@ mod tests {
         .unwrap();
 
         let result = handler.handle_search(args).await.unwrap();
-        let rendered = serde_json::to_string(&result).unwrap();
+        let rendered = call_tool_text(&result);
 
         assert!(
             rendered.contains(symbol),
             "generated-default current-repo search should return live graph symbol: {rendered}"
         );
+        assert!(rendered.starts_with("# RNA search context\n\n- projection: agent\n"));
+        assert!(rendered.contains("- body_policy: signature_only\n"));
+        assert!(rendered.contains("- selected_records: 1\n"));
+        assert!(rendered.contains(&format!(
+            "[{}] src/generated_default_live.rs:1-3",
+            handler.primary_root_slug()
+        )));
+        assert!(rendered.contains(&format!(
+            "- signature: ` pub fn {}() -> &'static str `",
+            symbol
+        )));
         assert!(
             !rendered.contains("Empty nodes list"),
             "empty generated nodes must not force batch mode: {rendered}"
@@ -1296,7 +1323,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let rendered = serde_json::to_string(&result).unwrap();
+        let rendered = call_tool_text(&result);
 
         let returned_symbols = symbols
             .iter()
@@ -1306,7 +1333,11 @@ mod tests {
             returned_symbols == 1,
             "fallback should return exactly one mapped symbol at limit=1: {rendered}"
         );
-        assert!(rendered.contains("failure=task_panic"), "got: {rendered}");
+        assert!(rendered.starts_with("# RNA search context\n\n- projection: agent\n"));
+        assert!(rendered.contains("- body_policy: signature_only\n"));
+        assert!(rendered.contains("- selected_records: 1\n"));
+        assert!(rendered.contains(&format!("[{}] src/lib.rs:", handler.primary_root_slug())));
+        assert!(rendered.contains("- channel:"), "got: {rendered}");
         assert!(!rendered.contains("customer.rs"), "got: {rendered}");
     }
 

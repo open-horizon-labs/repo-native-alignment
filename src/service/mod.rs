@@ -61,6 +61,26 @@ pub struct SearchParams {
     pub include_body: bool,
     pub minify_body: bool,
     pub verbose: bool,
+    /// Agent-facing output (default) or exhaustive evidence projection.
+    pub projection: Option<String>,
+    /// Source body policy for projected/task-context results.
+    pub body_policy: Option<String>,
+    /// Hard cap on the final rendered UTF-8 byte length.
+    pub max_output_bytes: Option<usize>,
+    /// Hard cap on the explicitly estimated rendered token count.
+    pub max_output_tokens: Option<usize>,
+    /// Hard cap on source bytes contributed by any one selected record.
+    pub max_body_bytes: Option<usize>,
+    /// Hard cap on source bytes across all selected records after coalescing.
+    pub max_total_body_bytes: Option<usize>,
+    /// Opt-in context mode: `task` or `graph-delta-beta`.
+    pub context_mode: Option<String>,
+    /// Requested task-context evidence roles.
+    pub context_roles: Option<Vec<String>>,
+    /// Requested task-context query facets.
+    pub context_facets: Option<Vec<String>>,
+    /// Bounded unified diff or structured edit sketch for graph-delta beta.
+    pub proposal: Option<String>,
 }
 
 impl Default for SearchParams {
@@ -98,6 +118,16 @@ impl Default for SearchParams {
             include_body: false,
             minify_body: false,
             verbose: false,
+            projection: None,
+            body_policy: None,
+            max_output_bytes: None,
+            max_output_tokens: None,
+            max_body_bytes: None,
+            max_total_body_bytes: None,
+            context_mode: None,
+            context_roles: None,
+            context_facets: None,
+            proposal: None,
         }
     }
 }
@@ -170,6 +200,16 @@ impl SearchParams {
             include_body: args.include_body.unwrap_or(false),
             minify_body: args.minify_body.unwrap_or(false),
             verbose: args.verbose.unwrap_or(false),
+            projection: non_blank_optional(&args.projection),
+            body_policy: non_blank_optional(&args.body_policy),
+            max_output_bytes: args.max_output_bytes.map(|value| value as usize),
+            max_output_tokens: args.max_output_tokens.map(|value| value as usize),
+            max_body_bytes: args.max_body_bytes.map(|value| value as usize),
+            max_total_body_bytes: args.max_total_body_bytes.map(|value| value as usize),
+            context_mode: non_blank_optional(&args.context_mode),
+            context_roles: non_empty_string_vec(&args.context_roles),
+            context_facets: non_empty_string_vec(&args.context_facets),
+            proposal: args.proposal.clone(),
         }
     }
 }
@@ -340,6 +380,60 @@ mod tests {
 
         assert_eq!(params.edge_types, Some(vec!["calls".to_string()]));
         assert_eq!(params.artifact_types, Some(vec!["outcome".to_string()]));
+    }
+
+    #[test]
+    fn from_mcp_search_preserves_projection_and_task_context_contract() {
+        let proposal = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let search: Search = serde_json::from_value(json!({
+            "query": "Fix `render` and its named test",
+            "projection": " evidence ",
+            "body_policy": " focused_span ",
+            "max_output_bytes": 12000,
+            "max_output_tokens": 3000,
+            "max_body_bytes": 2048,
+            "max_total_body_bytes": 8192,
+            "context_mode": " task ",
+            "context_roles": [" editable_source ", "", "test"],
+            "context_facets": [" behavior ", "api_or_state"],
+            "proposal": proposal
+        }))
+        .unwrap();
+
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.projection.as_deref(), Some("evidence"));
+        assert_eq!(params.body_policy.as_deref(), Some("focused_span"));
+        assert_eq!(params.max_output_bytes, Some(12000));
+        assert_eq!(params.max_output_tokens, Some(3000));
+        assert_eq!(params.max_body_bytes, Some(2048));
+        assert_eq!(params.max_total_body_bytes, Some(8192));
+        assert_eq!(params.context_mode.as_deref(), Some("task"));
+        assert_eq!(
+            params.context_roles,
+            Some(vec!["editable_source".to_string(), "test".to_string()])
+        );
+        assert_eq!(
+            params.context_facets,
+            Some(vec!["behavior".to_string(), "api_or_state".to_string()])
+        );
+        assert_eq!(params.proposal.as_deref(), Some(proposal));
+    }
+
+    #[test]
+    fn search_context_controls_default_to_ordinary_agent_search() {
+        let params = SearchParams::default();
+
+        assert!(params.projection.is_none());
+        assert!(params.body_policy.is_none());
+        assert!(params.max_output_bytes.is_none());
+        assert!(params.max_output_tokens.is_none());
+        assert!(params.max_body_bytes.is_none());
+        assert!(params.max_total_body_bytes.is_none());
+        assert!(params.context_mode.is_none());
+        assert!(params.context_roles.is_none());
+        assert!(params.context_facets.is_none());
+        assert!(params.proposal.is_none());
     }
 }
 

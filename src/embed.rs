@@ -87,12 +87,101 @@ pub enum SearchMode {
     Semantic,
 }
 
+/// Retrieval channel that actually executed after any allowed fallback.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutedSearchMode {
+    Keyword,
+    Semantic,
+    HybridRrf,
+}
+
+/// Explicit product policy for test-path results.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestResultPolicy {
+    Demote,
+    Neutral,
+}
+
+/// Native score emitted by the retrieval backend before product transforms.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeScoreKind {
+    Bm25,
+    CosineDistance,
+    HybridRrfRelevance,
+}
+
+/// Whether a native value came from the backend or a deterministic fallback.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeScoreSource {
+    Backend,
+    DeterministicFallback,
+}
+
+/// Deterministic normalization applied before product ranking policy.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreNormalization {
+    NonNegativeSaturation,
+    OneMinusDistanceFloorZero,
+}
+
+/// Product adjustment applied after score normalization.
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreAdjustment {
+    None,
+    TestPathDemotion70Percent,
+}
+
+#[cfg(not(feature = "embeddings"))]
+impl ScoreAdjustment {
+    pub const fn factor(self) -> f32 {
+        match self {
+            Self::None => 1.0,
+            Self::TestPathDemotion70Percent => 0.7,
+        }
+    }
+}
+
+/// Score audit record aligned with one returned [`SearchResult`].
+#[cfg(not(feature = "embeddings"))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchScoreProvenance {
+    pub result_id: String,
+    pub native_kind: NativeScoreKind,
+    pub native_value: f32,
+    pub native_source: NativeScoreSource,
+    pub normalization: ScoreNormalization,
+    pub normalized_score: f32,
+    pub adjustment: ScoreAdjustment,
+}
+
+#[cfg(not(feature = "embeddings"))]
+impl SearchScoreProvenance {
+    pub fn product_score(&self) -> f32 {
+        self.normalized_score * self.adjustment.factor()
+    }
+}
+
 #[cfg(not(feature = "embeddings"))]
 pub enum SearchOutcome {
     /// Index is ready; here are the results (may be empty).
     Results(Vec<SearchResult>),
     /// Embedding support is not compiled in or the table is not ready.
     NotReady,
+}
+
+/// Search result plus truthful execution metadata for calibrated product fusion.
+#[cfg(not(feature = "embeddings"))]
+pub struct ObservedSearchOutcome {
+    pub outcome: SearchOutcome,
+    pub executed_mode: Option<ExecutedSearchMode>,
+    /// Same order as `SearchOutcome::Results`; empty for `NotReady`.
+    pub score_provenance: Vec<SearchScoreProvenance>,
 }
 
 #[cfg(not(feature = "embeddings"))]
@@ -259,6 +348,22 @@ impl EmbeddingIndex {
         _filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
         Ok(SearchOutcome::NotReady)
+    }
+
+    pub async fn search_with_filters_observed(
+        &self,
+        _query: &str,
+        _artifact_types: Option<&[String]>,
+        _limit: usize,
+        _mode: SearchMode,
+        _filters: &SearchFilters,
+        _test_policy: TestResultPolicy,
+    ) -> Result<ObservedSearchOutcome> {
+        Ok(ObservedSearchOutcome {
+            outcome: SearchOutcome::NotReady,
+            executed_mode: None,
+            score_provenance: Vec::new(),
+        })
     }
 
     pub async fn search_with_filters_strict(
