@@ -38,7 +38,14 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
                         f"{graph_result_count} result(s)\n"
                     )
                 elif "--include-body" in args:
-                    stdout = f"`{selected}`\n```rust\nfn fixture() {{}}\n```\n"
+                    minification = (
+                        "body_minification.v1 provenance=structural_ast wrapper=false\n"
+                        if "--minify-body" in args
+                        else ""
+                    )
+                    stdout = (
+                        f"`{selected}`\n{minification}```rust\nfn fixture() {{}}\n```\n"
+                    )
                 else:
                     stdout = (
                         f"{STRUCTURAL.COMBINED_STRICT_SEARCH_SENTINEL}\n"

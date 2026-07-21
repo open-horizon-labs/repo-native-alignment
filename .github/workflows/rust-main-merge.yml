@@ -189,9 +189,13 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --no-default-features
 
-      - name: SWE-bench RNA wrapper fixture tests
+      - name: SWE-bench Python fixture tests
         if: needs.changes.outputs.rust == 'true'
-        run: python3 -m unittest scripts/tests/test_swebench_rna_one.py
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_swebench_rna_one \
+            scripts.tests.test_swebench_context_packets \
+            scripts.tests.test_swebench_combined_cache
 
   smoke:
     needs: changes
