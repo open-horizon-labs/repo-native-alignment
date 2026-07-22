@@ -36,7 +36,8 @@
     "prompt_transport": "stdin",
     "stop_rule": "one initial Claude Code session per arm; C+ alone receives one resumed revision turn; stop on terminal response, registered dollar budget, or wall timeout; no evaluator feedback and no retry",
     "workspace_rule": "byte-identical separate pristine source-only checkouts at the registered base commit, with no git remote and no .oh cache visible to the model",
-    "case_13398_A_prompt_sha256": "81bdb7858000e310ac7f3d0d76557130a0ba74108291b8e96893d016ffab3db8"
+    "case_13398_A_prompt_sha256": "81bdb7858000e310ac7f3d0d76557130a0ba74108291b8e96893d016ffab3db8",
+    "case_8707_A_prompt_sha256": "fd8f818724ffb35673142ddc9d8f5b0a51cc244db3c939dc17a1a3727ee20675"
   },
   "rna_treatment_construction": {
     "query": "the exact registered problem-statement bytes as the sole positional query",
