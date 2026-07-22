@@ -2001,6 +2001,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         include_body: false,
         minify_body: false,
         verbose: false,
+        ..Default::default()
     };
 
     let output = crate::service::search(&params, &ctx).await;

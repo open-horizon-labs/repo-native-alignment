@@ -1,0 +1,938 @@
+//! Canonical agent/evidence rendering with self-inclusive cost accounting.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use super::model::*;
+use super::projection::utf8_prefix;
+
+const ESTIMATE_NAME: &str = "unicode_chars_div_4_ceiling";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderError {
+    BudgetTooSmall { minimum: RenderCost },
+    AccountingDidNotConverge,
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BudgetTooSmall { minimum } => write!(
+                f,
+                "render budget is smaller than the non-body response ({} bytes, {} estimated tokens)",
+                minimum.utf8_bytes, minimum.estimated_tokens
+            ),
+            Self::AccountingDidNotConverge => {
+                f.write_str("self-inclusive render accounting did not converge")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedResponse, RenderError> {
+    let mut plan = plan.clone();
+    let attempts = plan
+        .spans
+        .len()
+        .saturating_mul(2)
+        .saturating_add(plan.candidate_audit.len())
+        .saturating_add(plan.records.len())
+        .saturating_add(1);
+    for _ in 0..attempts {
+        let (text, accounting) = render_once(&plan)?;
+        if within_budget(&accounting.total, &plan.request.budget) {
+            return Ok(RenderedResponse {
+                text,
+                accounting,
+                plan,
+            });
+        }
+        if !shrink_last_body(&mut plan, &accounting.total)
+            && !shrink_last_candidate_audit(&mut plan)
+            && !shrink_last_record_evidence(&mut plan)
+        {
+            return Err(RenderError::BudgetTooSmall {
+                minimum: accounting.total,
+            });
+        }
+    }
+    Err(RenderError::AccountingDidNotConverge)
+}
+
+fn shrink_last_candidate_audit(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.len() <= 1 {
+        return false;
+    }
+    plan.candidate_audit.pop();
+    let detail = "candidate audit truncated to satisfy the final rendered budget; retry with a larger budget for the complete audit";
+    if !plan.omissions.iter().any(|omission| {
+        omission.record_id.is_none()
+            && omission.source.is_none()
+            && omission.code == OmissionCode::RenderBudget
+            && omission.detail == detail
+    }) {
+        plan.omissions.push(ProjectionOmission {
+            record_id: None,
+            source: None,
+            code: OmissionCode::RenderBudget,
+            detail: detail.to_string(),
+        });
+        plan.omissions.sort_by(|a, b| {
+            a.record_id
+                .cmp(&b.record_id)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.detail.cmp(&b.detail))
+        });
+    }
+    true
+}
+
+fn shrink_last_record_evidence(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.projection != SearchProjection::Evidence {
+        return false;
+    }
+    let Some(record) = plan
+        .records
+        .iter_mut()
+        .rev()
+        .find(|record| {
+            record.evidence != SelectionEvidence::default() && record.evidence_handle.is_some()
+        })
+    else {
+        return false;
+    };
+    let record_id = record.identity.node_id.clone();
+    record.evidence = SelectionEvidence::default();
+    let detail = "selected record audit detail omitted to satisfy the final rendered budget; hydrate evidence for the complete audit";
+    if !plan.omissions.iter().any(|omission| {
+        omission.record_id.as_deref() == Some(record_id.as_str())
+            && omission.code == OmissionCode::RenderBudget
+            && omission.detail == detail
+    }) {
+        plan.omissions.push(ProjectionOmission {
+            record_id: Some(record_id),
+            source: None,
+            code: OmissionCode::RenderBudget,
+            detail: detail.to_string(),
+        });
+        plan.omissions.sort_by(|a, b| {
+            a.record_id
+                .cmp(&b.record_id)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.detail.cmp(&b.detail))
+        });
+    }
+    true
+}
+
+fn within_budget(cost: &RenderCost, budget: &ProjectionBudget) -> bool {
+    budget
+        .max_rendered_bytes
+        .is_none_or(|limit| cost.utf8_bytes <= limit)
+        && budget
+            .max_estimated_tokens
+            .is_none_or(|limit| cost.estimated_tokens <= limit)
+}
+
+fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
+    let Some(index) = plan.spans.iter().rposition(|span| !span.text.is_empty()) else {
+        return false;
+    };
+    let span = &plan.spans[index];
+    let byte_reduction = plan
+        .request
+        .budget
+        .max_rendered_bytes
+        .map_or(0, |limit| cost.utf8_bytes.saturating_sub(limit));
+    let allowed_chars = plan
+        .request
+        .budget
+        .max_estimated_tokens
+        .map(|limit| limit.saturating_mul(4));
+    let char_reduction = allowed_chars.map_or(0, |limit| cost.unicode_chars.saturating_sub(limit));
+    let target_bytes = span.text.len().saturating_sub(byte_reduction.max(1));
+    let target_chars = span.text.chars().count().saturating_sub(char_reduction);
+    let by_bytes = utf8_prefix(&span.text, target_bytes);
+    let prefix: String = by_bytes.chars().take(target_chars).collect();
+
+    if prefix.is_empty() {
+        let removed = plan.spans.remove(index);
+        update_records(plan, &removed, BodyRepresentation::SignatureOnly, true);
+        for mapping in removed.mappings {
+            add_budget_omission(
+                plan,
+                &mapping,
+                "body omitted to satisfy the final rendered budget",
+            );
+        }
+    } else {
+        let mut affected = Vec::new();
+        {
+            let span = &mut plan.spans[index];
+            span.text = prefix;
+            span.representation = BodyRepresentation::Truncated;
+            for mapping in &mut span.mappings {
+                mapping.coverage = SpanCoverage::Partial;
+                affected.push(mapping.clone());
+            }
+        }
+        let snapshot = plan.spans[index].clone();
+        update_records(plan, &snapshot, BodyRepresentation::Truncated, false);
+        for mapping in affected {
+            add_budget_omission(
+                plan,
+                &mapping,
+                "body truncated to satisfy the final rendered budget",
+            );
+        }
+    }
+    true
+}
+
+fn update_records(
+    plan: &mut ProjectionPlan,
+    span: &ProjectedSpan,
+    body: BodyRepresentation,
+    remove_span: bool,
+) {
+    let span_id = span.source.stable_id();
+    for mapping in &span.mappings {
+        for record in plan.records.iter_mut().filter(|record| {
+            record.selection_rank == mapping.selection_rank
+                && record.identity.node_id == mapping.record_id
+        }) {
+            record.body = body;
+            if remove_span {
+                record.span_ids.retain(|id| id != &span_id);
+            }
+        }
+    }
+}
+
+fn add_budget_omission(plan: &mut ProjectionPlan, mapping: &SpanMapping, detail: &str) {
+    let omission = ProjectionOmission {
+        record_id: Some(mapping.record_id.clone()),
+        source: Some(mapping.requested.clone()),
+        code: OmissionCode::RenderBudget,
+        detail: detail.to_string(),
+    };
+    if !plan.omissions.contains(&omission) {
+        plan.omissions.push(omission);
+    }
+    plan.omissions.sort_by(|a, b| {
+        a.record_id
+            .cmp(&b.record_id)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.code.cmp(&b.code))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+}
+
+fn render_once(plan: &ProjectionPlan) -> Result<(String, RenderAccounting), RenderError> {
+    let fixed = [
+        (CostSection::Headers, render_headers(plan)),
+        (CostSection::Metadata, render_metadata(plan)),
+        (CostSection::Bodies, render_bodies(plan)),
+        (CostSection::Relationships, render_relationships(plan)),
+    ];
+    let mut footer = String::new();
+    for _ in 0..64 {
+        let accounting = accounting(&fixed, &footer);
+        let next = render_footer(&accounting);
+        if next == footer {
+            let mut text = String::new();
+            for (_, section) in &fixed {
+                text.push_str(section);
+            }
+            text.push_str(&footer);
+            debug_assert_eq!(text.len(), accounting.total.utf8_bytes);
+            debug_assert_eq!(text.chars().count(), accounting.total.unicode_chars);
+            return Ok((text, accounting));
+        }
+        footer = next;
+    }
+    Err(RenderError::AccountingDidNotConverge)
+}
+
+fn accounting(fixed: &[(CostSection, String)], footer: &str) -> RenderAccounting {
+    let mut sections = BTreeMap::new();
+    for (kind, text) in fixed {
+        sections.insert(*kind, measure(text));
+    }
+    sections.insert(CostSection::Footer, measure(footer));
+    let utf8_bytes = sections.values().map(|cost| cost.utf8_bytes).sum();
+    let unicode_chars = sections.values().map(|cost| cost.unicode_chars).sum();
+    RenderAccounting {
+        total: RenderCost {
+            utf8_bytes,
+            unicode_chars,
+            estimated_tokens: estimate_tokens(unicode_chars),
+        },
+        sections,
+        estimate_name: ESTIMATE_NAME.to_string(),
+        provider_usage: false,
+    }
+}
+
+fn measure(value: &str) -> RenderCost {
+    let unicode_chars = value.chars().count();
+    RenderCost {
+        utf8_bytes: value.len(),
+        unicode_chars,
+        estimated_tokens: estimate_tokens(unicode_chars),
+    }
+}
+
+fn estimate_tokens(chars: usize) -> usize {
+    chars.saturating_add(3) / 4
+}
+
+fn render_headers(plan: &ProjectionPlan) -> String {
+    format!(
+        "# RNA search context\n\n- projection: {}\n- intent: {}\n- body_policy: {}\n- selected_records: {}\n",
+        plan.request.projection,
+        plan.request.intent,
+        plan.request.body_policy,
+        plan.records.len()
+    )
+}
+
+fn render_metadata(plan: &ProjectionPlan) -> String {
+    let mut output = String::new();
+    if !plan.capabilities.is_empty() {
+        output.push_str("\n## Capability status\n");
+        for capability in &plan.capabilities {
+            output.push_str(&format!(
+                "\n- {}: {}",
+                one_line(&capability.capability),
+                capability.state
+            ));
+            if plan.request.projection == SearchProjection::Evidence
+                && !capability.detail.is_empty()
+            {
+                output.push_str(&format!(" — {}", one_line(&capability.detail)));
+            }
+        }
+        output.push('\n');
+    }
+    output.push_str("\n## Results\n");
+    if plan.records.is_empty() {
+        output.push_str("\nNo selected records.\n");
+    }
+    for record in &plan.records {
+        let location = record.identity.source.as_ref().map_or_else(
+            || "no source".to_string(),
+            |span| {
+                format!(
+                    "[{}] {}:{}-{}",
+                    span.root, span.path, span.start_line, span.end_line
+                )
+            },
+        );
+        output.push_str(&format!(
+            "\n{}. {} `{}` — {}\n   - id: {}\n   - signature: {}\n   - channel: {}; reason: {}\n   - body: {}\n",
+            record.selection_rank + 1,
+            one_line(&record.symbol.kind),
+            one_line(&record.symbol.name),
+            location,
+            inline_code(&record.identity.node_id),
+            inline_code(&one_line(&record.symbol.signature)),
+            record.selection.channel,
+            one_line(&record.selection.reason),
+            record.body,
+        ));
+        if let Some(role) = record.selection.role {
+            output.push_str(&format!("   - role: {role}\n"));
+        }
+        if let Some(lane) = record.selection.lane {
+            output.push_str(&format!("   - lane: {lane}\n"));
+        }
+        if let Some(source) = &record.symbol.extraction_source {
+            output.push_str(&format!(
+                "   - extraction_source: src:{}\n",
+                one_line(source)
+            ));
+        }
+        for (name, value) in &record.symbol.declared_metadata {
+            output.push_str(&format!(
+                "   - metadata.{}: {}\n",
+                one_line(name),
+                one_line(value)
+            ));
+        }
+        if let Some(handle) = &record.source_handle {
+            output.push_str(&format!(
+                "   - hydrate_source: {}\n",
+                inline_code(&handle.encode())
+            ));
+        }
+        if let Some(handle) = &record.evidence_handle {
+            output.push_str(&format!(
+                "   - hydrate_evidence: {}\n",
+                inline_code(&handle.encode())
+            ));
+        }
+        if plan.request.projection == SearchProjection::Evidence {
+            render_evidence(&mut output, &record.evidence);
+        }
+    }
+    if plan.request.projection == SearchProjection::Evidence && !plan.candidate_audit.is_empty() {
+        output.push_str("\n## Candidate audit\n");
+        for candidate in &plan.candidate_audit {
+            let location = candidate.identity.source.as_ref().map_or_else(
+                || "no source".to_string(),
+                |span| {
+                    format!(
+                        "[{}] {}:{}-{}",
+                        span.root, span.path, span.start_line, span.end_line
+                    )
+                },
+            );
+            output.push_str(&format!(
+                "\n{}. {} — {}; disposition={}; reason={}\n",
+                candidate.candidate_rank,
+                inline_code(&candidate.identity.node_id),
+                location,
+                candidate.disposition,
+                one_line(&candidate.reason),
+            ));
+            render_evidence(&mut output, &candidate.evidence);
+        }
+    }
+    if !plan.omissions.is_empty() {
+        output.push_str("\n## Omissions and degradation\n");
+        for omission in &plan.omissions {
+            output.push_str(&format!(
+                "\n- {}: {}",
+                omission.code,
+                one_line(&omission.detail)
+            ));
+            if let Some(record) = &omission.record_id {
+                output.push_str(&format!("; record={}", inline_code(record)));
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn render_evidence(output: &mut String, evidence: &SelectionEvidence) {
+    if let Some(rank) = evidence.candidate_rank {
+        output.push_str(&format!("   - evidence.candidate_rank: {rank}\n"));
+    }
+    if let Some(hash) = &evidence.content_hash {
+        output.push_str(&format!(
+            "   - evidence.content_hash: {}\n",
+            inline_code(hash)
+        ));
+    }
+    for (name, score) in &evidence.raw_scores {
+        output.push_str(&format!(
+            "   - evidence.score.{}: {}\n",
+            one_line(name),
+            one_line(score)
+        ));
+    }
+    let mut provenance = evidence.provenance.clone();
+    provenance.sort();
+    for item in provenance {
+        output.push_str(&format!(
+            "   - evidence.provenance: {} — {}\n",
+            one_line(&item.source),
+            one_line(&item.detail)
+        ));
+    }
+    for (name, diagnostic) in &evidence.diagnostics {
+        output.push_str(&format!(
+            "   - evidence.diagnostic.{}: {}\n",
+            one_line(name),
+            one_line(diagnostic)
+        ));
+    }
+}
+
+fn render_bodies(plan: &ProjectionPlan) -> String {
+    if plan.spans.is_empty() {
+        return String::new();
+    }
+    let mut output = "\n## Source bodies\n".to_string();
+    for span in &plan.spans {
+        output.push_str(&format!(
+            "\n### [{}] `{}`:{}-{} ({})\n",
+            span.source.root,
+            span.source.path,
+            span.source.start_line,
+            span.source.end_line,
+            span.representation
+        ));
+        output.push_str(&format!(
+            "- hydrate: {}\n",
+            inline_code(&span.hydration.encode())
+        ));
+        for mapping in &span.mappings {
+            output.push_str(&format!(
+                "- satisfies: {} role={} channel={} coverage={} reason={}\n",
+                inline_code(&mapping.record_id),
+                mapping
+                    .selection
+                    .role
+                    .map_or("unknown", ContextRole::as_str),
+                mapping.selection.channel,
+                mapping.coverage,
+                one_line(&mapping.selection.reason)
+            ));
+        }
+        let fence = safe_fence(&span.text);
+        output.push_str(&format!("\n{fence}text\n{}{fence}\n", span.text));
+    }
+    output
+}
+
+fn render_relationships(plan: &ProjectionPlan) -> String {
+    if plan.relationships.is_empty() {
+        return String::new();
+    }
+    let mut output = "\n## Relationships\n".to_string();
+    for relationship in &plan.relationships {
+        output.push_str(&format!(
+            "\n- {} --{}--> {}: {}",
+            inline_code(&relationship.from),
+            one_line(&relationship.kind),
+            inline_code(&relationship.to),
+            one_line(&relationship.reason)
+        ));
+    }
+    output.push('\n');
+    output
+}
+
+fn render_footer(accounting: &RenderAccounting) -> String {
+    let section = |kind| accounting.sections.get(&kind).copied().unwrap_or_default();
+    let mut output = format!(
+        "\n## Render accounting\n\n- total: bytes={} chars={} estimated_tokens={}\n- estimate: {} (deterministic estimate; not provider usage)\n- sections:\n",
+        accounting.total.utf8_bytes,
+        accounting.total.unicode_chars,
+        accounting.total.estimated_tokens,
+        accounting.estimate_name
+    );
+    for kind in [
+        CostSection::Headers,
+        CostSection::Bodies,
+        CostSection::Relationships,
+        CostSection::Metadata,
+        CostSection::Footer,
+    ] {
+        let cost = section(kind);
+        output.push_str(&format!(
+            "  - {kind}: bytes={} chars={} estimated_tokens={}\n",
+            cost.utf8_bytes, cost.unicode_chars, cost.estimated_tokens
+        ));
+    }
+    output
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn inline_code(value: &str) -> String {
+    let longest = value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.saturating_add(1).max(1));
+    format!("{fence} {value} {fence}")
+}
+
+fn safe_fence(value: &str) -> String {
+    let longest = value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    "`".repeat(longest.saturating_add(1).max(3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(projection: SearchProjection) -> ProjectionPlan {
+        let source = SourceSpan {
+            root: "repo".into(),
+            path: "src/ü.rs".into(),
+            start_line: 1,
+            end_line: 1,
+        };
+        let selection = SelectionSummary {
+            channel: SelectionChannel::Semantic,
+            reason: "useful".into(),
+            role: Some(ContextRole::DefinitionOrApiState),
+            lane: Some(RetrievalLane::DefinitionOrState),
+        };
+        let mut evidence = SelectionEvidence::default();
+        evidence.raw_scores.insert("cosine".into(), "0.75".into());
+        evidence.content_hash = Some("secret-hash".into());
+        ProjectionPlan {
+            request: ProjectionRequest {
+                projection,
+                body_policy: BodyPolicy::Complete,
+                ..Default::default()
+            },
+            records: vec![ProjectedRecord {
+                selection_rank: 0,
+                identity: RecordIdentity {
+                    node_id: "node".into(),
+                    source: Some(source.clone()),
+                },
+                symbol: SymbolSummary {
+                    name: "β".into(),
+                    kind: "function".into(),
+                    language: "rust".into(),
+                    signature: "fn β()".into(),
+                    extraction_source: None,
+                    declared_metadata: BTreeMap::new(),
+                },
+                selection: selection.clone(),
+                evidence,
+                body: BodyRepresentation::Complete,
+                span_ids: vec![source.stable_id()],
+                source_handle: Some(HydrationHandle::source("node", source.clone())),
+                evidence_handle: Some(HydrationHandle::evidence("node")),
+            }],
+            candidate_audit: vec![CandidateAudit {
+                candidate_rank: 2,
+                identity: RecordIdentity {
+                    node_id: "omitted-node".into(),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "outside bounded selection".into(),
+                evidence: SelectionEvidence {
+                    content_hash: Some("audit-secret-hash".into()),
+                    ..Default::default()
+                },
+            }],
+            spans: vec![ProjectedSpan {
+                source: source.clone(),
+                text: "β();\n".into(),
+                representation: BodyRepresentation::Complete,
+                mappings: vec![SpanMapping {
+                    record_id: "node".into(),
+                    selection_rank: 0,
+                    selection,
+                    requested: source.clone(),
+                    coverage: SpanCoverage::Complete,
+                }],
+                hydration: HydrationHandle::source("node", source),
+            }],
+            relationships: vec![],
+            omissions: vec![],
+            capabilities: vec![CapabilityStatus {
+                capability: "lsp".into(),
+                state: CapabilityState::Unavailable,
+                detail: "internal-scorer-path=/tmp/private-model".into(),
+            }],
+        }
+    }
+
+    fn empty_plan(projection: SearchProjection) -> ProjectionPlan {
+        ProjectionPlan {
+            request: ProjectionRequest {
+                projection,
+                ..Default::default()
+            },
+            records: Vec::new(),
+            candidate_audit: Vec::new(),
+            spans: Vec::new(),
+            relationships: Vec::new(),
+            omissions: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn unicode_signature_plan() -> ProjectionPlan {
+        ProjectionPlan {
+            request: ProjectionRequest::default(),
+            records: vec![ProjectedRecord {
+                selection_rank: 0,
+                identity: RecordIdentity {
+                    node_id: "node:β".into(),
+                    source: Some(SourceSpan {
+                        root: "répo".into(),
+                        path: "src/ü.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    }),
+                },
+                symbol: SymbolSummary {
+                    name: "β".into(),
+                    kind: "function".into(),
+                    language: "rust".into(),
+                    signature: "fn β()".into(),
+                    extraction_source: None,
+                    declared_metadata: BTreeMap::new(),
+                },
+                selection: SelectionSummary {
+                    channel: SelectionChannel::Exact,
+                    reason: "café match".into(),
+                    role: Some(ContextRole::EditableSource),
+                    lane: Some(RetrievalLane::ExactReference),
+                },
+                evidence: SelectionEvidence::default(),
+                body: BodyRepresentation::SignatureOnly,
+                span_ids: Vec::new(),
+                source_handle: None,
+                evidence_handle: None,
+            }],
+            candidate_audit: Vec::new(),
+            spans: Vec::new(),
+            relationships: Vec::new(),
+            omissions: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_agent_and_evidence_outputs_match_exact_byte_goldens() {
+        const AGENT: &str = "# RNA search context\n\n- projection: agent\n- intent: discover\n- body_policy: signature_only\n- selected_records: 0\n\n## Results\n\nNo selected records.\n\n## Render accounting\n\n- total: bytes=575 chars=575 estimated_tokens=144\n- estimate: unicode_chars_div_4_ceiling (deterministic estimate; not provider usage)\n- sections:\n  - headers: bytes=113 chars=113 estimated_tokens=29\n  - bodies: bytes=0 chars=0 estimated_tokens=0\n  - relationships: bytes=0 chars=0 estimated_tokens=0\n  - metadata: bytes=34 chars=34 estimated_tokens=9\n  - footer: bytes=428 chars=428 estimated_tokens=107\n";
+        const EVIDENCE: &str = "# RNA search context\n\n- projection: evidence\n- intent: discover\n- body_policy: signature_only\n- selected_records: 0\n\n## Results\n\nNo selected records.\n\n## Render accounting\n\n- total: bytes=578 chars=578 estimated_tokens=145\n- estimate: unicode_chars_div_4_ceiling (deterministic estimate; not provider usage)\n- sections:\n  - headers: bytes=116 chars=116 estimated_tokens=29\n  - bodies: bytes=0 chars=0 estimated_tokens=0\n  - relationships: bytes=0 chars=0 estimated_tokens=0\n  - metadata: bytes=34 chars=34 estimated_tokens=9\n  - footer: bytes=428 chars=428 estimated_tokens=107\n";
+
+        assert_eq!(
+            render_projection(&empty_plan(SearchProjection::Agent))
+                .unwrap()
+                .text,
+            AGENT
+        );
+        assert_eq!(
+            render_projection(&empty_plan(SearchProjection::Evidence))
+                .unwrap()
+                .text,
+            EVIDENCE
+        );
+    }
+
+    #[test]
+    fn unicode_signature_output_matches_exact_byte_golden() {
+        const GOLDEN: &str = "# RNA search context\n\n- projection: agent\n- intent: discover\n- body_policy: signature_only\n- selected_records: 1\n\n## Results\n\n1. function `β` — [répo] src/ü.rs:1-1\n   - id: ` node:β `\n   - signature: ` fn β() `\n   - channel: exact; reason: café match\n   - body: signature_only\n   - role: editable_source\n   - lane: exact_reference\n\n## Render accounting\n\n- total: bytes=770 chars=762 estimated_tokens=191\n- estimate: unicode_chars_div_4_ceiling (deterministic estimate; not provider usage)\n- sections:\n  - headers: bytes=113 chars=113 estimated_tokens=29\n  - bodies: bytes=0 chars=0 estimated_tokens=0\n  - relationships: bytes=0 chars=0 estimated_tokens=0\n  - metadata: bytes=226 chars=218 estimated_tokens=55\n  - footer: bytes=431 chars=431 estimated_tokens=108\n";
+
+        assert_eq!(
+            render_projection(&unicode_signature_plan()).unwrap().text,
+            GOLDEN
+        );
+    }
+
+    #[test]
+    fn evidence_output_with_candidate_audit_matches_exact_byte_golden() {
+        const GOLDEN: &str = "# RNA search context\n\n- projection: evidence\n- intent: discover\n- body_policy: signature_only\n- selected_records: 1\n\n## Capability status\n\n- semantic_search: degraded — model=/tmp/private\n\n## Results\n\n1. function `β` — [répo] src/ü.rs:1-1\n   - id: ` node:β `\n   - signature: ` fn β() `\n   - channel: exact; reason: café match\n   - body: signature_only\n   - role: editable_source\n   - lane: exact_reference\n   - evidence.candidate_rank: 1\n   - evidence.content_hash: ` hash-β `\n   - evidence.score.vector_distance: 0.25\n   - evidence.provenance: vector — rank=1\n   - evidence.diagnostic.tie_break: stable_id\n\n## Candidate audit\n\n2. ` node:γ ` — no source; disposition=omitted; reason=outside limit\n   - evidence.candidate_rank: 2\n   - evidence.content_hash: ` hash-γ `\n   - evidence.score.lexical: 3\n\n## Render accounting\n\n- total: bytes=1250 chars=1233 estimated_tokens=309\n- estimate: unicode_chars_div_4_ceiling (deterministic estimate; not provider usage)\n- sections:\n  - headers: bytes=116 chars=116 estimated_tokens=29\n  - bodies: bytes=0 chars=0 estimated_tokens=0\n  - relationships: bytes=0 chars=0 estimated_tokens=0\n  - metadata: bytes=700 chars=683 estimated_tokens=171\n  - footer: bytes=434 chars=434 estimated_tokens=109\n";
+        let mut input = unicode_signature_plan();
+        input.request.projection = SearchProjection::Evidence;
+        input.records[0].evidence = SelectionEvidence {
+            raw_scores: BTreeMap::from([("vector_distance".into(), "0.25".into())]),
+            content_hash: Some("hash-β".into()),
+            candidate_rank: Some(1),
+            provenance: vec![EvidenceProvenance {
+                source: "vector".into(),
+                detail: "rank=1".into(),
+            }],
+            diagnostics: BTreeMap::from([("tie_break".into(), "stable_id".into())]),
+        };
+        input.candidate_audit = vec![CandidateAudit {
+            candidate_rank: 2,
+            identity: RecordIdentity {
+                node_id: "node:γ".into(),
+                source: None,
+            },
+            disposition: CandidateDisposition::Omitted,
+            reason: "outside limit".into(),
+            evidence: SelectionEvidence {
+                raw_scores: BTreeMap::from([("lexical".into(), "3".into())]),
+                content_hash: Some("hash-γ".into()),
+                candidate_rank: Some(2),
+                ..Default::default()
+            },
+        }];
+        input.capabilities = vec![CapabilityStatus {
+            capability: "semantic_search".into(),
+            state: CapabilityState::Degraded,
+            detail: "model=/tmp/private".into(),
+        }];
+
+        assert_eq!(render_projection(&input).unwrap().text, GOLDEN);
+    }
+
+    #[test]
+    fn agent_omits_evidence_but_handle_retains_it() {
+        let action = render_projection(&plan(SearchProjection::Agent)).unwrap();
+        assert!(!action.text.contains("secret-hash"));
+        assert!(!action.text.contains("cosine"));
+        assert!(!action.text.contains("audit-secret-hash"));
+        assert!(!action.text.contains("outside bounded selection"));
+        assert!(!action.text.contains("internal-scorer-path"));
+        assert!(action.text.contains("- lsp: unavailable"));
+        assert!(action.text.contains("hydrate_evidence"));
+        let evidence = render_projection(&plan(SearchProjection::Evidence)).unwrap();
+        assert!(evidence.text.contains("secret-hash"));
+        assert!(evidence.text.contains("cosine"));
+        assert!(evidence.text.contains("audit-secret-hash"));
+        assert!(evidence.text.contains("outside bounded selection"));
+        assert!(evidence.text.contains("internal-scorer-path"));
+    }
+
+    #[test]
+    fn footer_accounts_for_itself_and_unicode() {
+        let rendered = render_projection(&plan(SearchProjection::Agent)).unwrap();
+        assert_eq!(rendered.text.len(), rendered.accounting.total.utf8_bytes);
+        assert_eq!(
+            rendered.text.chars().count(),
+            rendered.accounting.total.unicode_chars
+        );
+        assert_eq!(
+            rendered
+                .accounting
+                .sections
+                .values()
+                .map(|cost| cost.utf8_bytes)
+                .sum::<usize>(),
+            rendered.accounting.total.utf8_bytes
+        );
+        assert!(!rendered.accounting.provider_usage);
+        assert_eq!(
+            render_projection(&plan(SearchProjection::Agent))
+                .unwrap()
+                .text,
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn persisted_plan_reopens_to_byte_identical_output() {
+        let original = plan(SearchProjection::Evidence);
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let reopened: ProjectionPlan = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            render_projection(&original).unwrap().text.as_bytes(),
+            render_projection(&reopened).unwrap().text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn empty_agent_projection_is_explicit_and_accounted() {
+        let empty = ProjectionPlan {
+            request: ProjectionRequest::default(),
+            records: Vec::new(),
+            candidate_audit: Vec::new(),
+            spans: Vec::new(),
+            relationships: Vec::new(),
+            omissions: Vec::new(),
+            capabilities: Vec::new(),
+        };
+
+        let rendered = render_projection(&empty).unwrap();
+
+        assert!(rendered.text.contains("No selected records."));
+        assert!(rendered.text.contains("projection: agent"));
+        assert_eq!(rendered.text.len(), rendered.accounting.total.utf8_bytes);
+        assert!(!rendered.accounting.provider_usage);
+    }
+
+    #[test]
+    fn impossible_budget_returns_a_typed_error() {
+        let mut input = plan(SearchProjection::Agent);
+        input.request.budget.max_rendered_bytes = Some(1);
+        assert!(matches!(
+            render_projection(&input),
+            Err(RenderError::BudgetTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_budget_deterministically_trims_candidate_audit_after_bodies() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(4_096);
+        input.candidate_audit = (1..=200)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank:02}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "bounded candidate was not selected; deterministic audit detail ".repeat(3),
+                evidence: SelectionEvidence {
+                    candidate_rank: Some(rank),
+                    content_hash: Some(format!("hash-{rank:02}")),
+                    diagnostics: BTreeMap::from([(
+                        "tie_break".into(),
+                        "stable identity after calibrated channel ranks".into(),
+                    )]),
+                    ..Default::default()
+                },
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.text.len() <= 4_096);
+        assert!(rendered.text.contains("## Candidate audit"));
+        assert!(rendered.text.contains("candidate audit truncated"));
+        assert!(!rendered.plan.candidate_audit.is_empty());
+        assert!(rendered.plan.candidate_audit.len() < 100);
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn evidence_budget_preserves_selected_identities_while_omitting_duplicate_audit_detail() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(6_000);
+        input.spans.clear();
+        input.records = (0..8)
+            .map(|rank| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("selected-{rank}");
+                record.evidence.diagnostics.insert(
+                    "complete_audit".into(),
+                    format!("record-{rank}-").repeat(120),
+                );
+                record
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.text.len() <= 6_000);
+        assert_eq!(rendered.plan.records.len(), 8);
+        assert_eq!(rendered.plan.candidate_audit.len(), 1);
+        assert!(
+            rendered
+                .plan
+                .records
+                .iter()
+                .any(|record| record.evidence == SelectionEvidence::default())
+        );
+        assert!(
+            rendered
+                .text
+                .contains("selected record audit detail omitted")
+        );
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn non_graph_record_does_not_emit_a_dead_evidence_handle() {
+        let mut input = plan(SearchProjection::Agent);
+        input.records[0].evidence_handle = None;
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(!rendered.text.contains("hydrate_evidence:"));
+        assert!(rendered.text.contains("hydrate_source:"));
+    }
+}

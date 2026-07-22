@@ -113,9 +113,10 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path) — equivalent to the `graph` CLI command. Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members). Use `limit` to control max results (flat default: 10, traversal default: 1). Use `include_body: true` to return function bodies; add `minify_body: true` to strip comments and shorten locals."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Ordinary search defaults to the concise `agent` projection; request `projection: evidence` for channel ranks, normalized contributions, tie-breaks, omissions, and diagnostics. Bound the complete rendered response with `max_output_bytes` or `max_output_tokens`; bound source separately with `max_body_bytes` and `max_total_body_bytes`; choose an explicit `body_policy` (complete/focused_span/signature_only/minified/none). Set `context_mode: task` for bounded role-aware implementation context, or opt into the non-mutating `graph-delta-beta` mode with a proposal. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path). Use `compact: true` to save tokens, `rerank: true` for natural-language queries, and subsystem/depth/limit filters to constrain selection."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Search {
     /// Search query (name, keyword, or natural language)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +234,52 @@ pub struct Search {
     /// Show index stats footer (default: false for MCP, true for CLI)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbose: Option<bool>,
+    /// Output projection: `agent` (default) or `evidence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<String>,
+    /// Body policy: `complete`, `focused_span`, `signature_only`, `minified`, or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_policy: Option<String>,
+    /// Maximum final rendered UTF-8 bytes (bounded by the service hard limit).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_bytes: Option<u32>,
+    /// Maximum estimated rendered tokens (an estimate, never provider usage).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<u32>,
+    /// Maximum source-body UTF-8 bytes per selected record.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_body_bytes: Option<u32>,
+    /// Maximum source-body UTF-8 bytes across all selected records after coalescing.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_total_body_bytes: Option<u32>,
+    /// Opt-in context mode: `task` or experimental `graph-delta-beta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// Task roles: editable_source, definition_or_api_state, test, behavioral_analogue, direct_dependency, caller_or_impact, proposal_delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_roles: Option<Vec<String>>,
+    /// Requested task facets: behavior, api_or_state, test, analogue, proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_facets: Option<Vec<String>>,
+    /// Bounded unified diff or structured edit sketch for graph-delta beta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
 }
 
 fn default_true() -> Option<bool> {
@@ -284,6 +331,22 @@ mod tests {
         assert_eq!(s.query, Some("handle_call_tool_request".to_string()));
         assert!(s.mode.is_none());
         assert!(s.node.is_none());
+    }
+
+    #[test]
+    fn search_rejects_unknown_context_knobs() {
+        let error = parse_search(json!({
+            "query": "render",
+            "context_mode": "task",
+            "unbounded_magic": true
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `unbounded_magic`")
+        );
     }
 
     #[test]
@@ -438,13 +501,17 @@ mod tests {
     }
 
     #[test]
-    fn test_search_extra_fields_ignored() {
-        let s = parse_search(json!({
+    fn test_search_extra_fields_are_rejected() {
+        let error = parse_search(json!({
             "query": "test",
             "unknown_field": "should be ignored",
             "another_unknown": 42
-        }));
-        assert!(s.is_ok());
+        }))
+        .expect_err("search input must reject fields outside the published schema");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected serde error: {error}"
+        );
     }
 
     #[test]
@@ -754,6 +821,16 @@ mod tests {
             "Search markdown sections (default: true)",
             "Artifact filter: outcome, signal, guardrail, metis, commit",
             "Filter to a specific subsystem (from repo_map)",
+            "Output projection: `agent` (default) or `evidence`.",
+            "Body policy: `complete`, `focused_span`, `signature_only`, `minified`, or `none`.",
+            "Maximum final rendered UTF-8 bytes (bounded by the service hard limit).",
+            "Maximum estimated rendered tokens (an estimate, never provider usage).",
+            "Maximum source-body UTF-8 bytes per selected record.",
+            "Maximum source-body UTF-8 bytes across all selected records after coalescing.",
+            "Opt-in context mode: `task` or experimental `graph-delta-beta`.",
+            "Task roles: editable_source, definition_or_api_state, test, behavioral_analogue, direct_dependency, caller_or_impact, proposal_delta.",
+            "Requested task facets: behavior, api_or_state, test, analogue, proposal.",
+            "Bounded unified diff or structured edit sketch for graph-delta beta.",
             // RepoMap
             "Number of top symbols (default: 15)",
             // Shared

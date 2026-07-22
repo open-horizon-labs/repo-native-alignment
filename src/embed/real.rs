@@ -97,56 +97,167 @@ pub enum SearchMode {
     Semantic,
 }
 
-/// Score representation returned by LanceDB for the query that actually ran.
-///
-/// Hybrid search and its non-strict vector fallback have different schemas, so
-/// this is deliberately tracked alongside the batches instead of inferred from
-/// whichever score-like column happens to be present.
+/// Retrieval channel that actually executed after any allowed fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetrievalScoreKind {
+pub enum ExecutedSearchMode {
     Keyword,
     Semantic,
     HybridRrf,
 }
 
-impl RetrievalScoreKind {
+/// Explicit product policy for test-path results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestResultPolicy {
+    Demote,
+    Neutral,
+}
+
+/// Native score representation returned by LanceDB for the query that actually ran.
+///
+/// Hybrid search and its non-strict vector fallback have different schemas, so
+/// this is deliberately tracked alongside the batches instead of inferred from
+/// whichever score-like column happens to be present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeScoreKind {
+    Bm25,
+    CosineDistance,
+    HybridRrfRelevance,
+}
+
+impl From<NativeScoreKind> for ExecutedSearchMode {
+    fn from(value: NativeScoreKind) -> Self {
+        match value {
+            NativeScoreKind::Bm25 => Self::Keyword,
+            NativeScoreKind::CosineDistance => Self::Semantic,
+            NativeScoreKind::HybridRrfRelevance => Self::HybridRrf,
+        }
+    }
+}
+
+/// Whether a score was supplied by LanceDB or substituted by non-strict policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeScoreSource {
+    Backend,
+    DeterministicFallback,
+}
+
+/// Deterministic normalization applied to a backend-native score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreNormalization {
+    /// `max(value, 0) / (1 + max(value, 0))`.
+    NonNegativeSaturation,
+    /// `max(1 - distance, 0)`.
+    OneMinusDistanceFloorZero,
+}
+
+/// Product adjustment applied after score normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreAdjustment {
+    None,
+    TestPathDemotion70Percent,
+}
+
+impl ScoreAdjustment {
+    pub const fn factor(self) -> f32 {
+        match self {
+            Self::None => 1.0,
+            Self::TestPathDemotion70Percent => 0.7,
+        }
+    }
+}
+
+/// Audit record for the transforms leading to one product ranking score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchScoreProvenance {
+    pub result_id: String,
+    pub native_kind: NativeScoreKind,
+    pub native_value: f32,
+    pub native_source: NativeScoreSource,
+    pub normalization: ScoreNormalization,
+    pub normalized_score: f32,
+    pub adjustment: ScoreAdjustment,
+}
+
+impl SearchScoreProvenance {
+    pub fn product_score(&self) -> f32 {
+        self.normalized_score * self.adjustment.factor()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RetrievedScore {
+    native_value: f32,
+    native_source: NativeScoreSource,
+    normalized_score: f32,
+}
+
+/// Resolve the score/backend contract from the operation that actually ran.
+/// `hybrid_vector_fallback` is meaningful only for non-strict hybrid product
+/// search; strict callers reject that fallback before reaching this seam.
+fn product_retrieval_score_kind(
+    requested: SearchMode,
+    hybrid_vector_fallback: bool,
+) -> NativeScoreKind {
+    match (requested, hybrid_vector_fallback) {
+        (SearchMode::Hybrid, true) => NativeScoreKind::CosineDistance,
+        (SearchMode::Hybrid, false) => NativeScoreKind::HybridRrfRelevance,
+        (SearchMode::Keyword, _) => NativeScoreKind::Bm25,
+        (SearchMode::Semantic, _) => NativeScoreKind::CosineDistance,
+    }
+}
+
+fn score_adjustment(stable_id: &str, policy: TestResultPolicy) -> ScoreAdjustment {
+    match (ranking::is_test_path(stable_id), policy) {
+        (true, TestResultPolicy::Demote) => ScoreAdjustment::TestPathDemotion70Percent,
+        _ => ScoreAdjustment::None,
+    }
+}
+
+impl NativeScoreKind {
     fn column(self) -> &'static str {
         match self {
-            Self::Keyword => "_score",
-            Self::Semantic => "_distance",
-            Self::HybridRrf => "_relevance_score",
+            Self::Bm25 => "_score",
+            Self::CosineDistance => "_distance",
+            Self::HybridRrfRelevance => "_relevance_score",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::Keyword => "keyword",
-            Self::Semantic => "semantic",
-            Self::HybridRrf => "hybrid RRF",
+            Self::Bm25 => "BM25",
+            Self::CosineDistance => "cosine distance",
+            Self::HybridRrfRelevance => "hybrid RRF relevance",
         }
     }
 
     fn default_raw_score(self) -> f32 {
         match self {
-            Self::Keyword | Self::HybridRrf => 0.5,
-            Self::Semantic => 2.0,
+            Self::Bm25 | Self::HybridRrfRelevance => 0.5,
+            Self::CosineDistance => 2.0,
+        }
+    }
+
+    const fn normalization(self) -> ScoreNormalization {
+        match self {
+            Self::Bm25 | Self::HybridRrfRelevance => ScoreNormalization::NonNegativeSaturation,
+            Self::CosineDistance => ScoreNormalization::OneMinusDistanceFloorZero,
         }
     }
 
     fn normalize(self, raw: f32) -> f32 {
         match self {
-            Self::Keyword | Self::HybridRrf => {
+            Self::Bm25 | Self::HybridRrfRelevance => {
                 let score = raw.max(0.0);
                 score / (1.0 + score)
             }
-            Self::Semantic => (1.0 - raw).max(0.0),
+            Self::CosineDistance => (1.0 - raw).max(0.0),
         }
     }
 }
 
 fn validated_retrieval_score_column(
     batch: &RecordBatch,
-    kind: RetrievalScoreKind,
+    kind: NativeScoreKind,
     strict: bool,
 ) -> Result<Option<&Float32Array>> {
     let column_name = kind.column();
@@ -175,11 +286,16 @@ fn validated_retrieval_score_column(
 fn retrieval_score(
     scores: Option<&Float32Array>,
     row: usize,
-    kind: RetrievalScoreKind,
+    kind: NativeScoreKind,
     strict: bool,
-) -> Result<f32> {
+) -> Result<RetrievedScore> {
     let Some(scores) = scores else {
-        return Ok(kind.normalize(kind.default_raw_score()));
+        let native_value = kind.default_raw_score();
+        return Ok(RetrievedScore {
+            native_value,
+            native_source: NativeScoreSource::DeterministicFallback,
+            normalized_score: kind.normalize(native_value),
+        });
     };
     let column_name = kind.column();
     if scores.is_null(row) {
@@ -191,7 +307,12 @@ fn retrieval_score(
                 row
             );
         }
-        return Ok(kind.normalize(kind.default_raw_score()));
+        let native_value = kind.default_raw_score();
+        return Ok(RetrievedScore {
+            native_value,
+            native_source: NativeScoreSource::DeterministicFallback,
+            normalized_score: kind.normalize(native_value),
+        });
     }
 
     let raw = scores.value(row);
@@ -204,9 +325,18 @@ fn retrieval_score(
                 row
             );
         }
-        return Ok(kind.normalize(kind.default_raw_score()));
+        let native_value = kind.default_raw_score();
+        return Ok(RetrievedScore {
+            native_value,
+            native_source: NativeScoreSource::DeterministicFallback,
+            normalized_score: kind.normalize(native_value),
+        });
     }
-    Ok(kind.normalize(raw))
+    Ok(RetrievedScore {
+        native_value: raw,
+        native_source: NativeScoreSource::Backend,
+        normalized_score: kind.normalize(raw),
+    })
 }
 
 fn rank_search_results(results: &mut [SearchResult]) {
@@ -686,7 +816,11 @@ fn stable_code_embedding_metadata(
     // provenance, path, and job metadata are rebuilt as target row scalars.
     ["doc_comment", "inferred_types"]
         .into_iter()
-        .filter_map(|key| metadata.get(key).map(|value| (key.to_string(), value.clone())))
+        .filter_map(|key| {
+            metadata
+                .get(key)
+                .map(|value| (key.to_string(), value.clone()))
+        })
         .collect()
 }
 
@@ -1111,6 +1245,14 @@ pub enum SearchOutcome {
     NotReady,
 }
 
+/// Search result plus truthful execution metadata for calibrated product fusion.
+pub struct ObservedSearchOutcome {
+    pub outcome: SearchOutcome,
+    pub executed_mode: Option<ExecutedSearchMode>,
+    /// Same order as `SearchOutcome::Results`; empty for `NotReady`.
+    pub score_provenance: Vec<SearchScoreProvenance>,
+}
+
 fn single_query_embedding(mut embeddings: Vec<Vec<f32>>) -> Result<Vec<f32>> {
     if embeddings.len() != 1 {
         anyhow::bail!(
@@ -1237,9 +1379,7 @@ fn retain_reusable_vector(
     vector_sha256: String,
     vector: &[f32],
 ) -> Result<()> {
-    if let Some((existing_sha256, existing_vector)) =
-        vectors_by_input.get(canonical_input_digest)
-    {
+    if let Some((existing_sha256, existing_vector)) = vectors_by_input.get(canonical_input_digest) {
         if existing_sha256 != &vector_sha256 || existing_vector.as_slice() != vector {
             anyhow::bail!(
                 "prior semantic generation maps one canonical encoder input to conflicting vector payloads"
@@ -3307,8 +3447,45 @@ impl EmbeddingIndex {
                 .search_with_filters_strict(query, artifact_types, limit, mode, filters)
                 .await;
         }
-        self.search_with_filters_policy(query, artifact_types, limit, mode, filters, false)
-            .await
+        self.search_with_filters_policy(
+            query,
+            artifact_types,
+            limit,
+            mode,
+            filters,
+            false,
+            TestResultPolicy::Demote,
+        )
+        .await
+    }
+
+    /// Product-search variant that exposes the channel that actually executed.
+    /// This keeps hybrid-to-vector fallback truthful at the fusion boundary and
+    /// makes test-path handling an explicit caller policy.
+    pub async fn search_with_filters_observed(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+        test_policy: TestResultPolicy,
+    ) -> Result<ObservedSearchOutcome> {
+        if requires_sealed_query_validation(self.require_metal, mode) {
+            return self
+                .search_with_filters_strict_observed(query, artifact_types, limit, mode, filters)
+                .await;
+        }
+        self.search_with_filters_policy_observed(
+            query,
+            artifact_types,
+            limit,
+            mode,
+            filters,
+            false,
+            test_policy,
+        )
+        .await
     }
 
     /// Strict semantic search used by the sealed #786 artifact.
@@ -3322,18 +3499,43 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
+        Ok(self
+            .search_with_filters_strict_observed(query, artifact_types, limit, mode, filters)
+            .await?
+            .outcome)
+    }
+
+    async fn search_with_filters_strict_observed(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+    ) -> Result<ObservedSearchOutcome> {
         if generation::semantic_asset_seeding() {
             anyhow::bail!("strict semantic search is forbidden during asset seeding");
         }
         self.validate_active_generation_graph().await?;
         require_metal_device()?;
         generation::verify_runtime_encoder_assets()?;
-        let outcome = self
-            .search_with_filters_policy(query, artifact_types, limit, mode, filters, true)
+        let mut observed = self
+            .search_with_filters_policy_observed(
+                query,
+                artifact_types,
+                limit,
+                mode,
+                filters,
+                true,
+                TestResultPolicy::Demote,
+            )
             .await?;
+        // Preserve the pre-existing strict observed contract, which reports the
+        // requested backend even when the strict table is not ready.
+        observed.executed_mode = Some(product_retrieval_score_kind(mode, false).into());
         generation::verify_runtime_encoder_assets()?;
         self.validate_active_generation_graph().await?;
-        Ok(outcome)
+        Ok(observed)
     }
 
     async fn search_with_filters_policy(
@@ -3344,7 +3546,32 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
         strict: bool,
+        test_policy: TestResultPolicy,
     ) -> Result<SearchOutcome> {
+        Ok(self
+            .search_with_filters_policy_observed(
+                query,
+                artifact_types,
+                limit,
+                mode,
+                filters,
+                strict,
+                test_policy,
+            )
+            .await?
+            .outcome)
+    }
+
+    async fn search_with_filters_policy_observed(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+        strict: bool,
+        test_policy: TestResultPolicy,
+    ) -> Result<ObservedSearchOutcome> {
         if strict && generation::semantic_asset_seeding() {
             anyhow::bail!("strict semantic search is forbidden during asset seeding");
         }
@@ -3356,7 +3583,11 @@ impl EmbeddingIndex {
                     || msg.contains("does not exist")
                     || msg.contains("not found")
                 {
-                    return Ok(SearchOutcome::NotReady);
+                    return Ok(ObservedSearchOutcome {
+                        outcome: SearchOutcome::NotReady,
+                        executed_mode: None,
+                        score_provenance: Vec::new(),
+                    });
                 }
                 return Err(e).context("Failed to open embedding table");
             }
@@ -3385,7 +3616,7 @@ impl EmbeddingIndex {
 
         use futures::TryStreamExt;
 
-        let (batches, score_kind): (Vec<RecordBatch>, RetrievalScoreKind) = match mode {
+        let (batches, score_kind): (Vec<RecordBatch>, NativeScoreKind) = match mode {
             SearchMode::Keyword => {
                 // Pure BM25 full-text search — no embedding needed.
                 let fts_query = FullTextSearchQuery::new(query.to_string());
@@ -3394,7 +3625,10 @@ impl EmbeddingIndex {
                     q = q.only_if(sql.clone());
                 }
                 let results = q.execute().await.context("FTS keyword search failed")?;
-                (results.try_collect().await?, RetrievalScoreKind::Keyword)
+                (
+                    results.try_collect().await?,
+                    product_retrieval_score_kind(mode, false),
+                )
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
@@ -3415,7 +3649,10 @@ impl EmbeddingIndex {
                     search = search.only_if(sql.clone());
                 }
                 let results = search.execute().await.context("Vector search failed")?;
-                (results.try_collect().await?, RetrievalScoreKind::Semantic)
+                (
+                    results.try_collect().await?,
+                    product_retrieval_score_kind(mode, false),
+                )
             }
             SearchMode::Hybrid => {
                 // Hybrid: BM25 + vector with RRF fusion.
@@ -3443,7 +3680,10 @@ impl EmbeddingIndex {
                     .await;
 
                 match hybrid_result {
-                    Ok(stream) => (stream.try_collect().await?, RetrievalScoreKind::HybridRrf),
+                    Ok(stream) => (
+                        stream.try_collect().await?,
+                        product_retrieval_score_kind(mode, false),
+                    ),
                     Err(error) if strict => {
                         return Err(error).context(
                             "strict hybrid semantic search failed; vector-only fallback is forbidden",
@@ -3465,20 +3705,23 @@ impl EmbeddingIndex {
                             .execute()
                             .await
                             .context("Fallback vector search failed")?;
-                        (results.try_collect().await?, RetrievalScoreKind::Semantic)
+                        (
+                            results.try_collect().await?,
+                            product_retrieval_score_kind(mode, true),
+                        )
                     }
                 }
             }
         };
 
         let mut search_results = Vec::new();
+        let mut score_provenance_by_id = BTreeMap::new();
 
         for batch in &batches {
             // Validate the mode-specific score schema once per batch before
             // row filtering. Strict retrieval must reject malformed empty or
             // fully filtered batches instead of silently accepting them.
-            let score_column =
-                validated_retrieval_score_column(batch, score_kind, strict)?;
+            let score_column = validated_retrieval_score_column(batch, score_kind, strict)?;
 
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
             // RecordBatches that are missing table columns — only FTS-indexed
@@ -3526,13 +3769,24 @@ impl EmbeddingIndex {
                 // family: BM25 `_score`, vector `_distance`, and hybrid RRF
                 // `_relevance_score`. The non-strict hybrid fallback is a real
                 // vector query and therefore intentionally uses `_distance`.
-                let raw_score = retrieval_score(score_column, i, score_kind, strict)?;
+                let retrieved = retrieval_score(score_column, i, score_kind, strict)?;
 
                 // Demote test files: reduce score so production code ranks above
                 // test code at similar distances.
                 let id_str = ids.value(i).to_string();
-                let is_test = ranking::is_test_path(&id_str);
-                let score = if is_test { raw_score * 0.7 } else { raw_score };
+                let adjustment = score_adjustment(&id_str, test_policy);
+                let provenance = SearchScoreProvenance {
+                    result_id: id_str.clone(),
+                    native_kind: score_kind,
+                    native_value: retrieved.native_value,
+                    native_source: retrieved.native_source,
+                    normalization: score_kind.normalization(),
+                    normalized_score: retrieved.normalized_score,
+                    adjustment,
+                };
+                let score = provenance.product_score();
+
+                score_provenance_by_id.insert(id_str.clone(), provenance);
 
                 search_results.push(SearchResult {
                     id: id_str,
@@ -3547,8 +3801,21 @@ impl EmbeddingIndex {
         // Re-sort by adjusted score (descending) and truncate.
         rank_search_results(&mut search_results);
         search_results.truncate(limit);
+        let score_provenance = search_results
+            .iter()
+            .map(|result| {
+                score_provenance_by_id
+                    .get(&result.id)
+                    .expect("every returned result has score provenance")
+                    .clone()
+            })
+            .collect();
 
-        Ok(SearchOutcome::Results(search_results))
+        Ok(ObservedSearchOutcome {
+            outcome: SearchOutcome::Results(search_results),
+            executed_mode: Some(score_kind.into()),
+            score_provenance,
+        })
     }
 }
 
@@ -3558,16 +3825,17 @@ mod tests {
 
     use super::{
         BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
-        EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, GenerationOpenPurpose,
-        MaterializedEmbeddingRow, RetrievalScoreKind, SearchFilters, SearchMode, SearchResult,
-        UnpublishedScratchRoot, build_artifact_embedding_text, build_code_embedding_text,
-        fan_out_encoded_vector, group_canonical_encoder_inputs, node_embedding_kind,
-        node_embedding_text, node_embedding_title, node_scalar_filters,
-        publish_generation_after_final_validation, rank_search_results, required_string_column,
-        requires_active_generation_graph_validation, requires_sealed_query_validation,
-        retain_reusable_vector, retrieval_score, single_query_embedding, truncate_chars,
-        validate_canonical_vector_mapping, validated_retrieval_score_column,
-        verify_materialized_rows,
+        EMBEDDING_DIMENSION, EmbeddingCandidate, EmbeddingIndex, ExecutedSearchMode,
+        GenerationOpenPurpose, MaterializedEmbeddingRow, NativeScoreKind, NativeScoreSource,
+        ScoreAdjustment, ScoreNormalization, SearchFilters, SearchMode, SearchResult,
+        TestResultPolicy, UnpublishedScratchRoot, build_artifact_embedding_text,
+        build_code_embedding_text, fan_out_encoded_vector, group_canonical_encoder_inputs,
+        node_embedding_kind, node_embedding_text, node_embedding_title, node_scalar_filters,
+        product_retrieval_score_kind, publish_generation_after_final_validation,
+        rank_search_results, required_string_column, requires_active_generation_graph_validation,
+        requires_sealed_query_validation, retain_reusable_vector, retrieval_score,
+        single_query_embedding, truncate_chars, validate_canonical_vector_mapping,
+        validated_retrieval_score_column, verify_materialized_rows,
     };
 
     #[test]
@@ -3577,6 +3845,50 @@ mod tests {
             false,
             SearchMode::Semantic
         ));
+    }
+
+    #[test]
+    fn product_search_reports_actual_executed_backend_after_hybrid_fallback() {
+        let cases = [
+            (SearchMode::Keyword, false, ExecutedSearchMode::Keyword),
+            (SearchMode::Semantic, false, ExecutedSearchMode::Semantic),
+            (SearchMode::Hybrid, false, ExecutedSearchMode::HybridRrf),
+            (SearchMode::Hybrid, true, ExecutedSearchMode::Semantic),
+        ];
+
+        for (requested, hybrid_vector_fallback, expected) in cases {
+            let actual: ExecutedSearchMode =
+                product_retrieval_score_kind(requested, hybrid_vector_fallback).into();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn product_search_test_intent_controls_test_path_demotion() {
+        let production = "src/service/search.rs:search:function";
+        let test = "tests/search_projection.rs:task_context_test:function";
+        let raw_score = 0.8;
+
+        let production_adjustment = super::score_adjustment(production, TestResultPolicy::Demote);
+        let test_adjustment = super::score_adjustment(test, TestResultPolicy::Demote);
+        let neutral_adjustment = super::score_adjustment(test, TestResultPolicy::Neutral);
+
+        assert_eq!(production_adjustment, ScoreAdjustment::None);
+        assert_eq!(test_adjustment, ScoreAdjustment::TestPathDemotion70Percent);
+        assert_eq!(neutral_adjustment, ScoreAdjustment::None);
+        assert_eq!(raw_score * production_adjustment.factor(), raw_score);
+        assert_eq!(raw_score * test_adjustment.factor(), raw_score * 0.7);
+
+        let provenance = super::SearchScoreProvenance {
+            result_id: test.to_string(),
+            native_kind: NativeScoreKind::CosineDistance,
+            native_value: 0.2,
+            native_source: NativeScoreSource::Backend,
+            normalization: ScoreNormalization::OneMinusDistanceFloorZero,
+            normalized_score: raw_score,
+            adjustment: test_adjustment,
+        };
+        assert_eq!(provenance.product_score(), raw_score * 0.7);
     }
 
     #[test]
@@ -3654,9 +3966,9 @@ mod tests {
     fn score_at(
         batch: &RecordBatch,
         row: usize,
-        kind: RetrievalScoreKind,
+        kind: NativeScoreKind,
         strict: bool,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<super::RetrievedScore> {
         let scores = validated_retrieval_score_column(batch, kind, strict)?;
         retrieval_score(scores, row, kind, strict)
     }
@@ -3679,17 +3991,22 @@ mod tests {
         ])
         .unwrap();
 
+        let keyword_score = score_at(&keyword, 0, NativeScoreKind::Bm25, true).unwrap();
+        assert_eq!(keyword_score.native_value, 3.0);
+        assert_eq!(keyword_score.normalized_score, 0.75);
+        assert_eq!(keyword_score.native_source, NativeScoreSource::Backend);
         assert_eq!(
-            score_at(&keyword, 0, RetrievalScoreKind::Keyword, true).unwrap(),
-            0.75
+            NativeScoreKind::Bm25.normalization(),
+            ScoreNormalization::NonNegativeSaturation
         );
-        assert_eq!(
-            score_at(&semantic, 0, RetrievalScoreKind::Semantic, true).unwrap(),
-            0.75
-        );
-        let hybrid_score =
-            score_at(&hybrid, 0, RetrievalScoreKind::HybridRrf, true).unwrap();
-        assert!((hybrid_score - (0.03 / 1.03)).abs() < f32::EPSILON);
+        let semantic_score = score_at(&semantic, 0, NativeScoreKind::CosineDistance, true).unwrap();
+        assert_eq!(semantic_score.native_value, 0.25);
+        assert_eq!(semantic_score.normalized_score, 0.75);
+        assert_eq!(semantic_score.native_source, NativeScoreSource::Backend);
+        let hybrid_score = score_at(&hybrid, 0, NativeScoreKind::HybridRrfRelevance, true).unwrap();
+        assert!((hybrid_score.native_value - 0.03).abs() < f32::EPSILON);
+        assert!((hybrid_score.normalized_score - (0.03 / 1.03)).abs() < f32::EPSILON);
+        assert_eq!(hybrid_score.native_source, NativeScoreSource::Backend);
     }
 
     #[test]
@@ -3697,20 +4014,20 @@ mod tests {
         use std::sync::Arc;
 
         let legacy_name = score_batch("_score", Arc::new(Float32Array::from(vec![0.03])));
-        let missing = score_at(&legacy_name, 0, RetrievalScoreKind::HybridRrf, true)
+        let missing = score_at(&legacy_name, 0, NativeScoreKind::HybridRrfRelevance, true)
             .unwrap_err()
             .to_string();
         assert!(missing.contains("`_relevance_score`"));
         assert!(missing.contains("missing"));
 
         let wrong_type = score_batch("_relevance_score", Arc::new(Int32Array::from(vec![1])));
-        let wrong_type = score_at(&wrong_type, 0, RetrievalScoreKind::HybridRrf, true)
+        let wrong_type = score_at(&wrong_type, 0, NativeScoreKind::HybridRrfRelevance, true)
             .unwrap_err()
             .to_string();
         assert!(wrong_type.contains("must be Float32"));
 
         let null_score = score_batch("_relevance_score", Arc::new(Float32Array::from(vec![None])));
-        let null_score = score_at(&null_score, 0, RetrievalScoreKind::HybridRrf, true)
+        let null_score = score_at(&null_score, 0, NativeScoreKind::HybridRrfRelevance, true)
             .unwrap_err()
             .to_string();
         assert!(null_score.contains("is null"));
@@ -3719,7 +4036,7 @@ mod tests {
             "_relevance_score",
             Arc::new(Float32Array::from(vec![f32::NAN])),
         );
-        let non_finite = score_at(&non_finite, 0, RetrievalScoreKind::HybridRrf, true)
+        let non_finite = score_at(&non_finite, 0, NativeScoreKind::HybridRrfRelevance, true)
             .unwrap_err()
             .to_string();
         assert!(non_finite.contains("non-finite"));
@@ -3735,13 +4052,10 @@ mod tests {
             Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
         )])
         .unwrap();
-        let missing = validated_retrieval_score_column(
-            &missing,
-            RetrievalScoreKind::HybridRrf,
-            true,
-        )
-        .unwrap_err()
-        .to_string();
+        let missing =
+            validated_retrieval_score_column(&missing, NativeScoreKind::HybridRrfRelevance, true)
+                .unwrap_err()
+                .to_string();
         assert!(missing.contains("`_relevance_score`"));
         assert!(missing.contains("missing"));
 
@@ -3751,7 +4065,7 @@ mod tests {
         );
         let wrong_type = validated_retrieval_score_column(
             &wrong_type,
-            RetrievalScoreKind::HybridRrf,
+            NativeScoreKind::HybridRrfRelevance,
             true,
         )
         .unwrap_err()
@@ -3764,10 +4078,26 @@ mod tests {
         use std::sync::Arc;
 
         let fallback = score_batch("_distance", Arc::new(Float32Array::from(vec![0.125])));
+        let score = score_at(&fallback, 0, NativeScoreKind::CosineDistance, false).unwrap();
+        assert_eq!(score.native_value, 0.125);
+        assert_eq!(score.native_source, NativeScoreSource::Backend);
+        assert_eq!(score.normalized_score, 0.875);
         assert_eq!(
-            score_at(&fallback, 0, RetrievalScoreKind::Semantic, false).unwrap(),
-            0.875
+            NativeScoreKind::CosineDistance.normalization(),
+            ScoreNormalization::OneMinusDistanceFloorZero
         );
+    }
+
+    #[test]
+    fn missing_non_strict_score_is_explicitly_a_deterministic_fallback() {
+        let score = retrieval_score(None, 0, NativeScoreKind::CosineDistance, false).unwrap();
+
+        assert_eq!(score.native_value, 2.0);
+        assert_eq!(
+            score.native_source,
+            NativeScoreSource::DeterministicFallback
+        );
+        assert_eq!(score.normalized_score, 0.0);
     }
 
     #[test]
@@ -3845,14 +4175,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            first.canonical_input_digest,
-            renamed.canonical_input_digest
-        );
-        assert_ne!(
-            first.canonical_input_digest,
-            changed.canonical_input_digest
-        );
+        assert_eq!(first.canonical_input_digest, renamed.canonical_input_digest);
+        assert_ne!(first.canonical_input_digest, changed.canonical_input_digest);
     }
 
     #[test]
@@ -3862,7 +4186,10 @@ mod tests {
             ("inferred_types".to_string(), "Result[str]".to_string()),
             ("importance".to_string(), "0.01".to_string()),
             ("subsystem".to_string(), "first".to_string()),
-            ("lsp_document_symbol_payload_digest".to_string(), "one".to_string()),
+            (
+                "lsp_document_symbol_payload_digest".to_string(),
+                "one".to_string(),
+            ),
         ]);
         let first = make_test_node(
             "value",
@@ -3905,14 +4232,9 @@ mod tests {
         let mut reusable = BTreeMap::new();
         retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
         retain_reusable_vector(&mut reusable, "input", "a".repeat(64), &[0.25]).unwrap();
-        let error = retain_reusable_vector(
-            &mut reusable,
-            "input",
-            "b".repeat(64),
-            &[0.5],
-        )
-        .unwrap_err()
-        .to_string();
+        let error = retain_reusable_vector(&mut reusable, "input", "b".repeat(64), &[0.5])
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("conflicting vector payloads"));
     }
 

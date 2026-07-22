@@ -1,6 +1,7 @@
 import process from "node:process";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -20,34 +21,49 @@ const workItemLedgerPath = path.join(
 const previousWorkItemLedger = fs.existsSync(workItemLedgerPath)
   ? fs.readFileSync(workItemLedgerPath)
   : null;
-const now = Date.now();
-fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
-fs.writeFileSync(
-  workItemLedgerPath,
-  JSON.stringify({
-    schema_version: 4,
-    records: {
-      "mcp-smoke:0": {
-        schema_version: 4,
-        job_id: "mcp-smoke",
-        item_id: 0,
-        repo: repoPath,
-        root: "fixture",
-        file: "src/main.rs",
-        node_id: "fixture:src/main.rs:main:function",
-        node_name: "main",
-        node_kind: "function",
-        requested_operations: ["textDocument/references"],
-        state: "in_flight",
-        attempt_count: 1,
-        current_phase: "mcp_smoke_probe",
-        created_at_ms: now,
-        updated_at_ms: now,
-        started_at_ms: now,
+let syntheticWorkItemLedgerInstalled = false;
+
+function installSyntheticWorkItemLedger() {
+  const now = Date.now();
+  fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
+  fs.writeFileSync(
+    workItemLedgerPath,
+    JSON.stringify({
+      schema_version: 4,
+      records: {
+        "mcp-smoke:0": {
+          schema_version: 4,
+          job_id: "mcp-smoke",
+          item_id: 0,
+          repo: repoPath,
+          root: "fixture",
+          file: "src/main.rs",
+          node_id: "fixture:src/main.rs:main:function",
+          node_name: "main",
+          node_kind: "function",
+          requested_operations: ["textDocument/references"],
+          state: "in_flight",
+          attempt_count: 1,
+          current_phase: "mcp_smoke_probe",
+          created_at_ms: now,
+          updated_at_ms: now,
+          started_at_ms: now,
+        },
       },
-    },
-  }),
-);
+    }),
+  );
+  syntheticWorkItemLedgerInstalled = true;
+}
+
+function restoreWorkItemLedger() {
+  if (!syntheticWorkItemLedgerInstalled) return;
+  if (previousWorkItemLedger) {
+    fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
+  } else {
+    fs.rmSync(workItemLedgerPath, { force: true });
+  }
+  syntheticWorkItemLedgerInstalled = false;
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -74,6 +90,38 @@ function assertContains(label, text, needle) {
   }
 }
 
+function assertNotContains(label, text, needle) {
+  if (typeof text !== "string") {
+    fail(label, `Expected string, got ${typeof text}`);
+    return;
+  }
+  if (text.includes(needle)) {
+    fail(label, `Did not expect "${needle}" in response`);
+  } else {
+    pass(label);
+  }
+}
+
+function assertMatches(label, text, pattern) {
+  if (typeof text !== "string") {
+    fail(label, `Expected string, got ${typeof text}`);
+    return;
+  }
+  if (!pattern.test(text)) {
+    fail(label, `Expected ${pattern} in response (got ${text.length} chars)`);
+  } else {
+    pass(label);
+  }
+}
+
+function assertEqual(label, actual, expected) {
+  if (actual !== expected) {
+    fail(label, `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  } else {
+    pass(label);
+  }
+}
+
 function assertNonEmpty(label, items) {
   if (!Array.isArray(items) || items.length === 0) {
     fail(label, `Expected non-empty array, got ${JSON.stringify(items)}`);
@@ -91,6 +139,91 @@ function extractText(result) {
     .join("\n");
 }
 
+function sha256File(filePath) {
+  return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function assertRenderedBudget(label, text, maxBytes) {
+  const actualBytes = Buffer.byteLength(text, "utf8");
+  if (actualBytes > maxBytes) {
+    fail(label, `Rendered ${actualBytes} UTF-8 bytes, budget was ${maxBytes}`);
+    return;
+  }
+  const accounting = text.match(
+    /- total: bytes=(\d+) chars=(\d+) estimated_tokens=(\d+)/,
+  );
+  if (!accounting) {
+    fail(label, "Missing final render accounting");
+    return;
+  }
+  const accountedBytes = Number.parseInt(accounting[1], 10);
+  if (accountedBytes !== actualBytes) {
+    fail(
+      label,
+      `Footer accounts for ${accountedBytes} bytes, actual MCP text is ${actualBytes}`,
+    );
+    return;
+  }
+  pass(label);
+}
+
+function sourceBodyBytes(text) {
+  const start = text.indexOf("\n## Source bodies\n");
+  if (start === -1) return 0;
+  const remainder = text.slice(start + "\n## Source bodies\n".length);
+  const sectionEnds = [
+    remainder.indexOf("\n## Relationships\n"),
+    remainder.indexOf("\n## Render accounting\n"),
+  ].filter((offset) => offset >= 0);
+  const section = remainder.slice(
+    0,
+    sectionEnds.length > 0 ? Math.min(...sectionEnds) : remainder.length,
+  );
+  let bytes = 0;
+  for (const match of section.matchAll(/^(`{3,})text\n([\s\S]*?)\1$/gm)) {
+    bytes += Buffer.byteLength(match[2], "utf8");
+  }
+  return bytes;
+}
+
+function assertTaskRoleOrDegradation(text, role) {
+  if (text.includes(`role: ${role}`)) {
+    pass(`task context delivers role ${role}`);
+    return;
+  }
+  const omissionHeading = "\n## Omissions and degradation\n";
+  const omissionStart = text.indexOf(omissionHeading);
+  const omissionRemainder =
+    omissionStart === -1
+      ? ""
+      : text.slice(omissionStart + omissionHeading.length);
+  const nextHeading = omissionRemainder.indexOf("\n## ");
+  const omissionSection = omissionRemainder.slice(
+    0,
+    nextHeading === -1 ? omissionRemainder.length : nextHeading,
+  );
+  const debugRole = role
+    .split("_")
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join("");
+  const roleNames = [role, debugRole].map((name) => name.toLowerCase());
+  const roleSpecificDegradation = omissionSection
+    .split(/\n(?=- )/)
+    .some(
+      (entry) =>
+        roleNames.some((name) => entry.toLowerCase().includes(name)) &&
+        /\b(?:degraded|unavailable|missing|omitted|not covered)\b/i.test(entry),
+    );
+  if (roleSpecificDegradation) {
+    pass(`task context truthfully degrades role ${role}`);
+  } else {
+    fail(
+      `task context delivers or degrades role ${role}`,
+      "Role was absent without a role-specific capability/omission explanation",
+    );
+  }
+}
+
 async function callSearchWithRetry(args) {
   const maxAttempts = 12;
   const delayMs = 500;
@@ -103,7 +236,10 @@ async function callSearchWithRetry(args) {
     });
     text = extractText(result);
 
-    if (!text.includes("Index building")) {
+    const prewarmStillAttachingSemanticIndex = text.includes(
+      "Strict semantic qualification FAILED: `embedding index is not attached`",
+    );
+    if (!text.includes("Index building") && !prewarmStillAttachingSemanticIndex) {
       return text;
     }
 
@@ -112,9 +248,14 @@ async function callSearchWithRetry(args) {
     }
   }
 
-  if (text.includes("Index building")) {
+  if (
+    text.includes("Index building") ||
+    text.includes(
+      "Strict semantic qualification FAILED: `embedding index is not attached`",
+    )
+  ) {
     throw new Error(
-      `search remained in "Index building" state after ${maxAttempts} attempts`
+      `search remained in a transient prewarm state after ${maxAttempts} attempts`
     );
   }
   return text;
@@ -164,6 +305,34 @@ try {
     }
   }
 
+  const searchTool = tools.find((tool) => tool.name === "search");
+  const searchProperties = searchTool?.inputSchema?.properties ?? {};
+  for (const property of [
+    "projection",
+    "body_policy",
+    "max_output_bytes",
+    "max_output_tokens",
+    "max_body_bytes",
+    "max_total_body_bytes",
+    "context_mode",
+    "context_roles",
+    "context_facets",
+    "proposal",
+  ]) {
+    if (Object.hasOwn(searchProperties, property)) {
+      pass(`search MCP schema exposes ${property}`);
+    } else {
+      fail(`search MCP schema exposes ${property}`, "property missing from inputSchema");
+    }
+  }
+  for (const contractTerm of ["agent", "evidence", "task", "graph-delta-beta"]) {
+    assertContains(
+      `search MCP description advertises ${contractTerm}`,
+      searchTool?.description ?? "",
+      contractTerm,
+    );
+  }
+
   // ── 2. search (with artifacts) ──────────────────────────────────────────
   console.log("\n── search (artifacts) ──");
   const searchCtxText = await callSearchWithRetry({
@@ -207,7 +376,199 @@ try {
     "benchmark per-file LSP completeness",
   );
 
-  // ── 4a. persisted local-knowledge provenance ────────────────────────────
+  // ── 4a. projected search contract ───────────────────────────────────────
+  console.log("\n── search (agent/evidence projections) ──");
+  const agentProjectionText = await callSearchWithRetry({
+    query: "hello",
+    body_policy: "signature_only",
+    max_output_bytes: 8192,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 3,
+  });
+  assertContains("default action projection is agent", agentProjectionText, "- projection: agent");
+  assertContains(
+    "agent projection reports final render cost",
+    agentProjectionText,
+    "## Render accounting",
+  );
+  for (const auditOnly of [
+    "evidence.candidate_rank",
+    "evidence.content_hash",
+    "evidence.score.",
+    "evidence.provenance",
+    "evidence.diagnostic.",
+    "## Candidate audit",
+  ]) {
+    assertNotContains(`agent projection omits ${auditOnly}`, agentProjectionText, auditOnly);
+  }
+
+  const evidenceProjectionText = await callSearchWithRetry({
+    query: "hello",
+    projection: "evidence",
+    body_policy: "signature_only",
+    max_output_bytes: 16384,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 3,
+  });
+  assertContains(
+    "explicit audit projection is evidence",
+    evidenceProjectionText,
+    "- projection: evidence",
+  );
+  assertMatches(
+    "evidence projection exposes typed selection audit",
+    evidenceProjectionText,
+    /evidence\.(?:candidate_rank|content_hash|score\.|provenance|diagnostic\.)/,
+  );
+  assertContains(
+    "evidence projection exposes bounded candidate dispositions",
+    evidenceProjectionText,
+    "## Candidate audit",
+  );
+  assertRenderedBudget("evidence projection accounts for final MCP bytes", evidenceProjectionText, 16384);
+
+  // A one-byte body budget is intentionally binding for every source symbol in
+  // the fixture. The final output budget is checked against the actual MCP text,
+  // not a pre-render estimate.
+  console.log("\n── search (render/body budgets) ──");
+  const outputBudgetBytes = 8192;
+  const bodyBudgetBytes = 1;
+  const budgetedProjectionText = await callSearchWithRetry({
+    query: "hello",
+    projection: "agent",
+    body_policy: "complete",
+    max_output_bytes: outputBudgetBytes,
+    max_body_bytes: bodyBudgetBytes,
+    max_total_body_bytes: bodyBudgetBytes,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 3,
+  });
+  assertRenderedBudget(
+    "MCP search honors final rendered output budget",
+    budgetedProjectionText,
+    outputBudgetBytes,
+  );
+  const emittedBodyBytes = sourceBodyBytes(budgetedProjectionText);
+  if (emittedBodyBytes <= bodyBudgetBytes) {
+    pass("MCP search honors per-record and aggregate body budgets");
+  } else {
+    fail(
+      "MCP search honors per-record and aggregate body budgets",
+      `Rendered ${emittedBodyBytes} source-body bytes, budget was ${bodyBudgetBytes}`,
+    );
+  }
+  assertNotContains(
+    "binding body budget is not mislabeled complete",
+    budgetedProjectionText,
+    "- body: complete",
+  );
+  assertMatches(
+    "binding body budget reports a typed omission",
+    budgetedProjectionText,
+    /- (?:per_record_body_cap|total_body_cap):/,
+  );
+
+  // ── 4b. role-aware task context ─────────────────────────────────────────
+  console.log("\n── search (task context) ──");
+  const taskContextText = await callSearchWithRetry({
+    query: "Fix `hello` in lib.rs and update `test_hello`",
+    projection: "agent",
+    context_mode: "task",
+    context_roles: ["editable_source", "test", "caller_or_impact"],
+    context_facets: ["behavior", "test"],
+    body_policy: "focused_span",
+    max_output_bytes: 16384,
+    include_artifacts: false,
+    include_markdown: false,
+  });
+  assertContains(
+    "task mode reports exact-reference capability",
+    taskContextText,
+    "task_exact_reference_resolution",
+  );
+  assertContains(
+    "task mode reports bounded selection capability",
+    taskContextText,
+    "task_context_selection",
+  );
+  assertMatches("task mode emits a typed role", taskContextText, /\n   - role: [a-z_]+\n/);
+  assertMatches("task mode emits a typed retrieval lane", taskContextText, /\n   - lane: [a-z_]+\n/);
+  assertTaskRoleOrDegradation(taskContextText, "editable_source");
+  assertTaskRoleOrDegradation(taskContextText, "test");
+  assertTaskRoleOrDegradation(taskContextText, "caller_or_impact");
+  assertRenderedBudget("task context honors the final output budget", taskContextText, 16384);
+
+  // ── 4c. non-mutating graph-delta beta ───────────────────────────────────
+  console.log("\n── search (graph-delta beta) ──");
+  const proposalTarget = path.join(repoPath, "lib.rs");
+  const proposalTargetBefore = sha256File(proposalTarget);
+  const stableGraphQuery = {
+    query: "hello",
+    projection: "agent",
+    body_policy: "none",
+    max_output_bytes: 8192,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 1,
+  };
+  const graphViewBefore = await callSearchWithRetry(stableGraphQuery);
+  const graphDeltaText = await callSearchWithRetry({
+    query: "Review the proposed hello behavior change",
+    projection: "evidence",
+    context_mode: "graph-delta-beta",
+    proposal: [
+      "diff --git a/lib.rs b/lib.rs",
+      "--- a/lib.rs",
+      "+++ b/lib.rs",
+      "@@ -2,1 +2,1 @@",
+      '-pub fn hello() -> &\'static str { "world" }',
+      '+pub fn hello() -> &\'static str { "rna" }',
+    ].join("\n"),
+    body_policy: "signature_only",
+    max_output_bytes: 16384,
+    include_artifacts: false,
+    include_markdown: false,
+  });
+  assertContains("graph-delta returns the canonical card projection", graphDeltaText, "role: proposal_delta");
+  assertContains("graph-delta returns the proposal lane", graphDeltaText, "lane: proposal_delta");
+  assertContains("graph-delta returns capability state", graphDeltaText, "## Capability status");
+  for (const capability of [
+    "graph_delta_proposal_parsing",
+    "graph_delta_live_graph_inference",
+    "graph_delta_route_analysis",
+    "graph_delta_card_coverage",
+    "graph_delta_changed_files",
+    "graph_delta_affected_locus_checklist",
+    "proposal_overlay_persistence",
+  ]) {
+    assertMatches(
+      `graph-delta reports ${capability} capability`,
+      graphDeltaText,
+      new RegExp(`${capability}: (?:ready|degraded|unavailable)`),
+    );
+  }
+  assertContains(
+    "graph-delta returns explicit omissions/degradation",
+    graphDeltaText,
+    "## Omissions and degradation",
+  );
+  assertRenderedBudget("graph-delta honors the final output budget", graphDeltaText, 16384);
+  assertEqual(
+    "graph-delta does not mutate its proposed source file",
+    sha256File(proposalTarget),
+    proposalTargetBefore,
+  );
+  const graphViewAfter = await callSearchWithRetry(stableGraphQuery);
+  assertEqual(
+    "graph-delta does not mutate the published graph view",
+    createHash("sha256").update(graphViewAfter).digest("hex"),
+    createHash("sha256").update(graphViewBefore).digest("hex"),
+  );
+
+  // ── 4d. persisted local-knowledge provenance ────────────────────────────
   console.log("\n── search (local-knowledge provenance) ──");
   const provenanceText = await callSearchWithRetry({
     query: "quote.mcp-provenance",
@@ -307,6 +668,10 @@ try {
 
   // ── 6. list_roots ───────────────────────────────────────────────────────
   console.log("\n── list_roots ──");
+  // The durable work ledger is part of semantic readiness identity. Install
+  // this synthetic queue only for the list_roots assertion, after every
+  // semantic query, then restore it before any later search.
+  installSyntheticWorkItemLedger();
   const rootsResult = await client.callTool({ name: "list_roots", arguments: {} });
   const rootsText = extractText(rootsResult);
   assertContains("list_roots response contains 'Workspace Roots'", rootsText, "Workspace Roots");
@@ -321,6 +686,7 @@ try {
     rootsText,
     "mcp_smoke_probe=1",
   );
+  restoreWorkItemLedger();
 
   // ── 7. search (neighbors depth=2) ──────────────────────────────────────
   // Verifies that the depth parameter is accepted and processed through the
@@ -372,11 +738,7 @@ try {
   fs.rmSync(path.join(repoPath, ".oh", ".cache", "construction_error.rmeta"), {
     force: true,
   });
-  if (previousWorkItemLedger) {
-    fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
-  } else {
-    fs.rmSync(workItemLedgerPath, { force: true });
-  }
+  restoreWorkItemLedger();
 }
 
 if (failures > 0) process.exit(1);

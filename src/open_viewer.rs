@@ -232,6 +232,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 include_body: false,
                 minify_body: false,
                 verbose: false,
+                ..Default::default()
             };
             let ctx = SearchContext {
                 graph_state: &state.graph,
