@@ -23,6 +23,96 @@
     "c_plus_revision_budget_usd": 3.0,
     "terminal_evaluations_per_arm": 1
   },
+  "agent_invocation": {
+    "initial_wall_timeout_seconds": 1200,
+    "revision_wall_timeout_seconds": 600,
+    "tools": "Bash,Edit,Read,Write,Glob,Grep",
+    "safe_mode": true,
+    "strict_empty_mcp_config": true,
+    "disallowed_tools": [
+      "WebSearch",
+      "WebFetch"
+    ],
+    "prompt_transport": "stdin",
+    "stop_rule": "one initial Claude Code session per arm; C+ alone receives one resumed revision turn; stop on terminal response, registered dollar budget, or wall timeout; no evaluator feedback and no retry",
+    "workspace_rule": "byte-identical separate pristine source-only checkouts at the registered base commit, with no git remote and no .oh cache visible to the model",
+    "case_13398_A_prompt_sha256": "81bdb7858000e310ac7f3d0d76557130a0ba74108291b8e96893d016ffab3db8"
+  },
+  "rna_treatment_construction": {
+    "query": "the exact registered problem-statement bytes as the sole positional query",
+    "acquisition": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=evidence",
+        "--body-policy=none",
+        "--limit=20",
+        "--max-output-bytes=160000",
+        "--max-output-tokens=40000"
+      ]
+    },
+    "ranked_body_hydration": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=4000",
+        "--max-total-body-bytes=30000",
+        "--max-output-bytes=60000",
+        "--max-output-tokens=15000"
+      ]
+    },
+    "task_boundaries": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=3000",
+        "--max-total-body-bytes=20000",
+        "--max-output-bytes=50000",
+        "--max-output-tokens=12500",
+        "--context-mode=task",
+        "--context-roles=editable_source,definition_or_api_state,test,behavioral_analogue,direct_dependency,caller_or_impact",
+        "--context-facets=behavior,api_or_state,test,analogue"
+      ],
+      "lane_policy": "request every registered role, preserve every role receipt and omission reason, and never fill an empty lane manually or with an LLM"
+    },
+    "graph_delta": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=3000",
+        "--max-total-body-bytes=16000",
+        "--max-output-bytes=40000",
+        "--max-output-tokens=10000",
+        "--context-mode=graph-delta-beta",
+        "--proposal=<exact terminal first-stage unified diff bytes>"
+      ],
+      "novelty_rule": "remove records whose stable node identity already appeared in B acquisition/hydration or C+ task-boundary packets; preserve the unfiltered receipt and record every removed identity; never substitute"
+    },
+    "fail_closed": [
+      "exact #822 artifact, binary, manifest, repository commit, tree, and case identities match",
+      "fresh reopen reports strict READY with semantic search and rerank available",
+      "acquisition selects one or more stable node identities and every selected identity hydrates",
+      "task-boundary output contains receipts for every registered role, including explicit omission reasons for empty lanes",
+      "all rendered packet bytes and SHA-256 identities are frozen before the corresponding model call"
+    ]
+  },
+  "pre_registration_diagnostics": {
+    "invalid_A_attempt": "one A process was started before this exact addendum, interrupted after 89.374 seconds and $0.7090892, received no evaluator output, and is excluded from every comparison",
+    "old_semantic_cache": "the retained aa92ece semantic generation was rejected by exact #822 and is excluded; structural evidence may be retained while embeddings are rebuilt and sealed by exact #822"
+  },
   "cases": [
     {
       "instance_id": "astropy__astropy-13398",
@@ -59,7 +149,8 @@
     }
   },
   "shared_policy": {
-    "same_checkout": true,
+    "separate_pristine_checkouts": true,
+    "same_base_commit_and_tree": true,
     "same_base_agent_tools": true,
     "same_visible_test_policy": true,
     "same_initial_model_budget": true,
