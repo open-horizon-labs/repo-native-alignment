@@ -188,7 +188,7 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
     _, selection = load_ref_json(receipt.get("selection"), "selection", errors)
     if isinstance(manifest, dict) and manifest.get("schema_version") != runner.RUN_SCHEMA:
         errors.append("run_manifest_schema_mismatch")
-    if isinstance(registration, dict) and registration.get("schema_version") != "issue825-treatment-registration-v2":
+    if isinstance(registration, dict) and registration.get("schema_version") != "issue825-treatment-registration-v3":
         errors.append("registration_schema_mismatch")
     if isinstance(selection, dict) and selection.get("schema_version") != "issue825-fresh-pair-selection-v2":
         errors.append("selection_schema_mismatch")

@@ -65,7 +65,7 @@ class Fixture:
             },
         ]
         registration = {
-            "schema_version": "issue825-treatment-registration-v2",
+            "schema_version": "issue825-treatment-registration-v3",
             "issue": 825,
             "dataset": {"arrow_sha256": DATASET_SHA},
         }

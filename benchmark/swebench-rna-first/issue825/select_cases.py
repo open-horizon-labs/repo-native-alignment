@@ -170,7 +170,7 @@ def main() -> int:
         arguments.registration.resolve(),
         arguments.exclusions.resolve(),
     )
-    if registration.get("schema_version") != "issue825-treatment-registration-v2":
+    if registration.get("schema_version") != "issue825-treatment-registration-v3":
         raise SelectionError("registration schema is not the frozen v2 schema")
     dataset = registration.get("dataset")
     selector = registration.get("selector")

@@ -485,7 +485,7 @@ def validate_plan(path: Path) -> dict[str, Any]:
     selection = json.loads(selection_bytes)
     require(registration.get("issue") == 825, "registration issue mismatch")
     require(
-        registration.get("schema_version") == "issue825-treatment-registration-v2",
+        registration.get("schema_version") == "issue825-treatment-registration-v3",
         "registration schema mismatch",
     )
     require(
