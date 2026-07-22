@@ -1,16 +1,16 @@
 {
-  "schema_version": "issue825-treatment-registration-v2",
-  "state": "corrected_treatment_frozen_before_any_v2_case_selection",
-  "frozen_at_utc": "2026-07-22T17:29:39Z",
+  "schema_version": "issue825-treatment-registration-v3",
+  "state": "corrected_postfix_setup_qualification_frozen_before_any_v3_model_call",
+  "frozen_at_utc": "2026-07-22T21:50:34Z",
   "issue": 825,
   "pull_request": 826,
   "supersedes": {
-    "registration_commit": "1ad44dac1e8610d075dcf893766eb642ac393fb3",
-    "registration_sha256": "1df182680c4f2f0cec64510e1832506bf7fa6888758579babc4a0d7d47a8249c",
-    "selection_commit": "67da51a17497b3ad09227687c00201e8c98be0b1",
-    "reason": "v1 omitted the complete prior-exposure population, selected an oracle/evaluator-exposed case, and did not enforce an identical ordinary confinement layer"
+    "registration_commit": "1cd0d5a977253c0cace18121c93d11850464bbe8",
+    "registration_sha256": "0a1603eb9f24c28dd5c3b407f2f86b8945ca5e1a9666b0753121d8125eb6b1cd",
+    "selection_commit": "429784cc89cfec8ee01256ae13c865cea51009c2",
+    "reason": "attempt 4 exposed a generic pre-model repository-origin identity defect and incorrect provider token semantics; its two treatment models never started, its evidence remains immutable, and the same-case retry is qualification only"
   },
-  "issue_body_sha256": "7fede739b15915f3b8752971c19a5afec276794e222d790bdf7c8aebd9943cbe",
+  "issue_body_sha256": "870ed49d8410a0631b654c9f6281db6493cbcb733fe4e647af80423db1fa274d",
   "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
   "dataset": {
     "name": "SWE-bench_Verified",
@@ -22,7 +22,7 @@
   "selector": {
     "seed": "rna-first-sonnet-selector-v1",
     "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
-    "algorithm_version": "issue825-selector-v2",
+    "algorithm_version": "issue825-selector-v3",
     "pairs": 2,
     "schedule": "lower_rank_A_then_T; higher_rank_T_then_A; same_case_serial; maximum_two_cases_concurrent",
     "case_replacement_after_model_start": false,
@@ -67,7 +67,7 @@
     "result_limit": 10,
     "required_status": "READY",
     "required_capabilities": ["embeddings=true","retrieval=hybrid","rerank=true","metal=true","fallback=false"],
-    "required_identity_binding": ["repository_commit","repository_tree","root","producer_commit","rna_binary_sha256","rna_launcher_sha256","cache_archive_sha256","cache_manifest_sha256","operational_cache_inventory_sha256"],
+    "required_identity_binding": ["repository","repository_commit","repository_tree","root","producer_commit","rna_binary_sha256","rna_launcher_sha256","cache_archive_sha256","cache_manifest_sha256","operational_cache_inventory_sha256"],
     "minimum_stable_code_node_ids": 1,
     "raw_cli_bytes_preserved": true,
     "valid_empty_title_results": false,
@@ -91,22 +91,22 @@
   "registered_files": {
     "system_prefix_sha256": "a23028ce7d62befac18cf0316f2af8d7e201f55acb40095f32b4a737f0754df1",
     "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
-    "rna_query_sha256": "942dec08cf31c544a18e2dcee682602622d8d6264bfa3f5907b40304dd8ec395",
-    "rna_traverse_sha256": "81f29edcc953a66bbe846ee779a21c619780d3dbb521896a9e77965de353551f",
+    "rna_query_sha256": "84725ed5eb69f1d11541b3a3ef7f60bb5e69888386b51b1f5aba27bc5f828370",
+    "rna_traverse_sha256": "74040d02691778a512e80a80fc572b723c145dade93ceace68a6df2140be7767",
     "tool_supervisor_sha256": "316bf70b52c817402ad0813a3f665f15782fb08ab10d70f65d571d9bee7533a3",
-    "supervisor_template_sha256": "0b46e01cf4f047774b8e3479e9e177db9375c71314f34819684ca45c67fb5222",
+    "supervisor_template_sha256": "f3229d0768cc7032bcf6eb000794c662c6253e017b817400bb8e4518cd1c0749",
     "claude_settings_template_sha256": "04a5b9b0fe65bceb4f4bfff9868f6a97197805dca76c6d0f2faebc30126f3634",
     "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e",
     "common_supervisor_sha256": "863642fbab706405571c3b606ed3f13dd67fdf62151201492448f19d01d4692b",
     "case_selector_sha256": "5fdb73447f64a3f739c63143a05d11680444ae57285f00a9da75cede81e8464e",
-    "runner_sha256": "0a907b71c30c2874ebd6445cfbe2f92c474b51466255666bb276432c305faab5",
-    "verifier_sha256": "d38a25b69b4e0ad64831bfd065a2a5e4297741d24d96d5e84427ea92d8286589",
+    "runner_sha256": "bccfc2b36d99b74efccdac7426b691fe1cc8eed4c55a2ad2f4f1bf2de500946b",
+    "verifier_sha256": "9f4cdb32786586d34a879459aa38514e303c59bb8456e5d061c4815c2de491de",
     "exclusions_sha256": "0077a1960a17fbbbf95d3debf6d2376148fbbaeb919fd8b80a94b4503f99cfd8",
-    "evaluator_runner_sha256": "0e45541dc8e1720a17c70f1f4d909a0e02d7ac07a21c0f8ee04d5227dbc554d2",
+    "evaluator_runner_sha256": "6a0599eb1b6e095ae41e409e62cbba8469e18235bbef3c4f71f18660abaebb1e",
     "evaluator_plan_template_sha256": "acf42b47270a81f9db17fec37f5c9ff05fb127e047a3390dec229b0077efa970",
-    "result_selector_sha256": "ed84e8e6dddaec194286ba865ebaeafcb7e74f6e410a641eca64792b33e72164",
-    "selector_harness_tests_sha256": "0943fbaecb9c5aa0d280646e0f6cb01df2d73dd3229159c9030138061e5629e0",
-    "evaluator_tests_sha256": "a4e064e45f20f78acb237a6358e2690a9491d0848c5fe7e0381410a5fc15d798"
+    "result_selector_sha256": "87ede78bfb3a7910eab63951c021760ce1c75ffd8bb0ff4efb62c294479eaf06",
+    "selector_harness_tests_sha256": "3af21ecebfbf2fb3da055706e0f2f6926a3eba5dc91fc6164eb672130a2cf9e7",
+    "evaluator_tests_sha256": "18ccedbe63466f72d53a624c7b5499a55453cbb455825f14e5832ef681e16212"
   },
   "cache_preparation": {
     "artifact": "exact successful PR 826/f073088635e25a8962199a7784472b45b435cff5 CI semantic bundle only",
@@ -129,7 +129,8 @@
     "prerequisite": "both T episodes policy-compliant and all other resolution/regression outcomes verifier-clean; otherwise no treatment or inconclusive as registered",
     "reject_if": "T resolves fewer or causes more total PASS_TO_PASS regressions",
     "select_efficacy_if": "T resolves more without more regressions, or tied resolution with fewer regressions",
-    "select_efficiency_if_exact_efficacy_tie": "input_plus_output_tokens at least 15 percent lower, or tokens no more than 5 percent higher and RNA_plus_model wall at least 20 percent lower",
-    "token_total": "provider input_tokens plus output_tokens; cached input is a subset and reasoning is reported separately"
+    "select_efficiency_if_exact_efficacy_tie": "whole-invocation provider_total_tokens at least 15 percent lower, or tokens no more than 5 percent higher and RNA_plus_model wall at least 20 percent lower",
+    "token_total": "sum once across every model in the invocation of provider input_tokens plus cache_creation_input_tokens plus cache_read_input_tokens plus output_tokens; reasoning is reported separately and is not added again",
+    "request_accounting": "CLI num_turns, transcript-observed unique provider response messages, and provider requests are separate; provider_requests is null when the pinned CLI does not expose it"
   }
 }

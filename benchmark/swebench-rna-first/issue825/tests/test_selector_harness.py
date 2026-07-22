@@ -53,6 +53,10 @@ class WrapperFixture:
         (self.repo / ".gitignore").write_text(".oh/.cache/\n")
         (self.repo / "tracked.py").write_text("value = 1\n")
         subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", "https://github.com/repo/repo.git"],
+            check=True,
+        )
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Fixture"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "fixture@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "add", ".gitignore", "tracked.py"], check=True)
@@ -124,11 +128,13 @@ else:
         self.readiness.write_bytes(canonical({"status": "READY"}))
         self.identity = self.evidence / "identity.json"
         identity = {
-            "schema_version": "issue825-runtime-identity-v1",
+            "schema_version": "issue825-runtime-identity-v2",
             "case_id": "repo__repo-1",
             "base_commit": self.base_commit,
             "base_tree": self.base_tree,
             "root": "repo-root",
+            "expected_repository_identity": "repo/repo",
+            "live_repository_identity": "repo/repo",
             "index_checkout": str(self.repo),
             "producer_commit": "c" * 40,
             "launcher_path": str(self.launcher),
@@ -160,13 +166,14 @@ else:
         (self.evidence / "query").mkdir()
         (self.evidence / "query/projection.stdout").write_bytes(projection)
         self.config = {
-            "schema_version": "rna-supervisor-config-v2",
+            "schema_version": "rna-supervisor-config-v3",
             "policy": "treatment",
             "launcher": str(self.launcher),
             "binary": str(self.binary),
             "repo": str(self.repo),
             "checkout": str(self.checkout),
             "root": "repo-root",
+            "expected_repository_identity": "repo/repo",
             "initial_response": str(self.evidence / "query/projection.stdout"),
             "initial_response_sha256": sha(projection),
             "initial_ids": ["foo.py:target:function"],
@@ -383,8 +390,101 @@ class RnaWrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 42)
             self.assertIn(b"live_checkout_not_pristine", result.stderr)
 
+    def test_live_origin_mutation_after_preflight_fails_every_rna_wrapper(self):
+        invocations = (
+            ("query", ["--query-sha256", None], 42),
+            ("wrapper", ["--node", "foo.py:target:function", "--mode", "neighbors"], 43),
+        )
+        for attribute, args, expected_returncode in invocations:
+            with self.subTest(wrapper=attribute), tempfile.TemporaryDirectory() as tmp:
+                fixture = self.fixture(tmp)
+                subprocess.run(
+                    [
+                        "git", "-C", str(fixture.repo), "remote", "set-url", "origin",
+                        "https://github.com/other/repository.git",
+                    ],
+                    check=True,
+                )
+                actual_args = [
+                    fixture.config["expected_query_sha256"] if item is None else item
+                    for item in args
+                ]
+                result = fixture.invoke(getattr(fixture, attribute), actual_args)
+                self.assertEqual(result.returncode, expected_returncode)
+                self.assertIn(b"live_repository_identity", result.stderr)
+
 
 class RunnerAndVerifierTests(unittest.TestCase):
+    def test_failed_acquisition_retains_exact_command_and_wrapper_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "rna_query.py"
+            wrapper.write_text(
+                "#!/usr/bin/env python3\nimport sys\nprint('partial projection')\n"
+                "print('RNA_QUERY_STATUS=ERROR readiness', file=sys.stderr)\nraise SystemExit(42)\n"
+            )
+            wrapper.chmod(0o755)
+            evidence = root / "evidence"
+            with self.assertRaises(run_selector.TreatmentAcquisitionFailure) as failure:
+                run_selector.acquire_treatment(
+                    SimpleNamespace(case_id="repo__repo-1", root="repo-root"),
+                    {"rna_query.py": wrapper},
+                    evidence,
+                    {"expected_query_sha256": "a" * 64},
+                )
+            retained = failure.exception.evidence
+            self.assertEqual(retained["schema_version"], run_selector.QUERY_EVIDENCE_SCHEMA)
+            self.assertFalse(retained["succeeded"])
+            self.assertEqual(
+                retained["wrapper_command"],
+                [str(wrapper), "--query-sha256", "a" * 64],
+            )
+            self.assertEqual(retained["wrapper_returncode"], 42)
+            self.assertEqual(run_selector.check_ref(retained["wrapper_stdout"], "stdout")[1], b"partial projection\n")
+            self.assertEqual(
+                run_selector.check_ref(retained["wrapper_stderr"], "stderr")[1],
+                b"RNA_QUERY_STATUS=ERROR readiness\n",
+            )
+
+    def test_index_repository_identity_rejects_local_origin_and_accepts_github_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "index"
+            checkout.mkdir()
+            subprocess.run(["git", "-C", str(checkout), "init", "-q"], check=True)
+            subprocess.run(
+                ["git", "-C", str(checkout), "remote", "add", "origin", str(root / "seed")],
+                check=True,
+            )
+            manifest = {"core": {"repository": "django/django"}}
+            with self.assertRaises(run_selector.FailClosed) as failure:
+                run_selector.verify_index_repository_identity(
+                    checkout,
+                    manifest,
+                    "django__django-16379.cache.index_checkout",
+                )
+            self.assertEqual(
+                str(failure.exception),
+                "django__django-16379.cache.index_checkout.origin is not a canonical GitHub HTTPS or SSH URL",
+            )
+
+            for origin in (
+                "https://github.com/django/django.git",
+                "git@github.com:django/django.git",
+                "ssh://git@github.com/django/django.git",
+            ):
+                subprocess.run(
+                    ["git", "-C", str(checkout), "remote", "set-url", "origin", origin],
+                    check=True,
+                )
+                expected, live = run_selector.verify_index_repository_identity(
+                    checkout,
+                    manifest,
+                    "django__django-16379.cache.index_checkout",
+                )
+                self.assertEqual(expected, "django/django")
+                self.assertEqual(live, "django/django")
+
     def test_claude_command_is_frozen_and_differs_only_by_treatment_system(self):
         runtime = {
             "model": "claude-sonnet-5", "effort": "high", "permission_mode": "bypassPermissions",
@@ -403,23 +503,130 @@ class RunnerAndVerifierTests(unittest.TestCase):
         self.assertEqual(t[:-2], a)
         self.assertEqual(t[-2:], ["--append-system-prompt-file", "/system"])
 
-    def test_token_ledger_does_not_double_count_model_usage(self):
+    def test_token_ledger_prefers_whole_invocation_model_usage_without_double_counting(self):
         summary = {
-            "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 7},
-            "modelUsage": {"claude": {"inputTokens": 999, "outputTokens": 999}},
+            "usage": {"input_tokens": 999, "output_tokens": 999},
+            "modelUsage": {
+                "claude-sonnet": {
+                    "inputTokens": 11,
+                    "cacheCreationInputTokens": 13,
+                    "cacheReadInputTokens": 17,
+                    "outputTokens": 19,
+                    "reasoningTokens": 23,
+                },
+                "claude-haiku": {
+                    "inputTokens": 2,
+                    "cacheCreationInputTokens": 5,
+                    "cacheReadInputTokens": 7,
+                    "outputTokens": 3,
+                    "reasoningTokens": 11,
+                },
+            },
             "num_turns": 3,
         }
         ledger = run_selector.token_ledger(summary)
         self.assertTrue(ledger["valid"])
-        self.assertEqual(ledger["input_plus_output_tokens"], 14)
-        self.assertEqual(ledger["cache_read_input_tokens"], 7)
+        self.assertEqual(ledger["schema_version"], "issue825-token-ledger-v3")
+        self.assertEqual(ledger["source"], "whole_invocation_model_usage")
+        self.assertEqual(ledger["input_tokens"], 13)
+        self.assertEqual(ledger["cache_creation_input_tokens"], 18)
+        self.assertEqual(ledger["cache_read_input_tokens"], 24)
+        self.assertEqual(ledger["output_tokens"], 22)
+        self.assertEqual(ledger["provider_total_tokens"], 77)
+        self.assertEqual(ledger["reasoning_tokens"], 34)
+        self.assertEqual(ledger["cli_turns"], 3)
+        self.assertIsNone(ledger["provider_requests"])
+
+    def test_token_ledger_rejects_present_malformed_optional_counter(self):
+        ledger = run_selector.token_ledger({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_read_input_tokens": -1,
+            },
+            "num_turns": 2,
+        })
+        self.assertFalse(ledger["valid"])
+        self.assertIsNone(ledger["provider_total_tokens"])
+
+    def test_provider_responses_are_independently_counted_from_retained_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            transcript.write_bytes(b"\n".join((
+                canonical({"type": "assistant", "message": {"role": "assistant", "id": "msg-1"}}).rstrip(),
+                canonical({"type": "assistant", "message": {"role": "assistant", "id": "msg-1"}}).rstrip(),
+                canonical({"type": "user", "message": {"role": "user"}}).rstrip(),
+                canonical({"type": "assistant", "message": {"role": "assistant", "id": "msg-2"}}).rstrip(),
+            )) + b"\n")
+            observed = run_selector.transcript_provider_response_count([
+                {"source_path": "/private/source", "retained": ref(transcript)},
+            ])
+            self.assertEqual(observed, 2)
+            ledger = run_selector.token_ledger(
+                {"usage": {"input_tokens": 1, "output_tokens": 2}, "num_turns": 4},
+                provider_responses=observed,
+            )
+            self.assertEqual(ledger["cli_turns"], 4)
+            self.assertEqual(ledger["provider_responses"], 2)
+            self.assertIsNone(ledger["provider_requests"])
+
+    def test_token_ledger_top_level_fallback_uses_all_provider_components(self):
+        ledger = run_selector.token_ledger({
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 4,
+                "reasoning_tokens": 8,
+            },
+            "num_turns": 2,
+        })
+        self.assertTrue(ledger["valid"])
+        self.assertEqual(ledger["source"], "top_level_usage")
+        self.assertEqual(ledger["provider_total_tokens"], 26)
+        self.assertEqual(ledger["reasoning_tokens"], 8)
 
     def test_missing_token_usage_is_invalid_not_zero(self):
         ledger = run_selector.token_ledger({"valid_json": True, "num_turns": 2})
         self.assertFalse(ledger["valid"])
+        self.assertTrue(ledger["model_invoked"])
         self.assertIsNone(ledger["input_tokens"])
         self.assertIsNone(ledger["output_tokens"])
-        self.assertIsNone(ledger["input_plus_output_tokens"])
+        self.assertIsNone(ledger["provider_total_tokens"])
+
+    def test_pre_model_absence_is_valid_only_in_noncompliant_no_model_context(self):
+        ledger = run_selector.token_ledger({}, model_invoked=False)
+        self.assertTrue(ledger["valid"])
+        self.assertFalse(ledger["model_invoked"])
+        self.assertIsNone(ledger["provider_total_tokens"])
+        self.assertEqual(ledger["cli_turns"], 0)
+        self.assertEqual(ledger["provider_responses"], 0)
+        receipt = {
+            "returncode": None,
+            "policy_compliant": False,
+            "evaluator_authorized": False,
+            "timing_ledger": {"model_wall_seconds": 0.0},
+        }
+        errors = []
+        verify_selector.validate_token_ledger(ledger, receipt, errors)
+        self.assertEqual(errors, [])
+
+        invoked_without_usage = run_selector.token_ledger(
+            {"valid_json": True, "num_turns": 1},
+            model_invoked=True,
+        )
+        errors = []
+        verify_selector.validate_token_ledger(invoked_without_usage, receipt, errors)
+        self.assertIn("token_usage_not_observed", errors)
+        self.assertIn("token_provider_total_tokens_invalid", errors)
+
+        errors = []
+        verify_selector.validate_token_ledger(
+            ledger,
+            {**receipt, "policy_compliant": True},
+            errors,
+        )
+        self.assertEqual(errors, ["token_no_model_context_invalid"])
 
     def test_dry_run_never_calls_execute(self):
         prepared = object()
@@ -459,8 +666,13 @@ class RunnerAndVerifierTests(unittest.TestCase):
                 "treatment_system": None, "query_evidence": None,
                 "stdout": None, "stderr": None, "transcripts": [],
                 "actor_tool_ledger": ref(actor), "supervisor": {},
-                "token_ledger": {"input_tokens": 0, "output_tokens": 0, "input_plus_output_tokens": 0,
-                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "reasoning_tokens": 0},
+                "token_ledger": {"schema_version": run_selector.TOKEN_LEDGER_SCHEMA, "valid": True,
+                    "errors": [], "source": "top_level_usage", "model_invoked": True,
+                    "input_tokens": 0,
+                    "output_tokens": 0, "provider_total_tokens": 0,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                    "reasoning_tokens": 0, "cli_turns": 0,
+                    "provider_responses": None, "provider_requests": None},
                 "timing_ledger": {"rna_preprocessing_seconds": 0.0, "model_wall_seconds": 0.0,
                     "combined_pre_evaluator_wall_seconds": 0.0},
                 "terminal_patch": None, "official_evaluator_invoked": False,
@@ -486,7 +698,7 @@ class RunnerAndVerifierTests(unittest.TestCase):
                 results.append({
                     "case_id": path.parents[1].name, "arm": arm, "evidence_complete": True,
                     "policy_compliant": True, "evaluator_authorized": True,
-                    "token_ledger": {"input_plus_output_tokens": 10 + index},
+                    "token_ledger": {"provider_total_tokens": 10 + index},
                     "timing_ledger": {"combined_pre_evaluator_wall_seconds": 1.5},
                 })
             with mock.patch.object(verify_selector, "verify_episode", side_effect=results):

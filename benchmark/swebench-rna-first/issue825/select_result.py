@@ -13,7 +13,7 @@ from typing import Any, Mapping
 import evaluator_runner as evaluator
 
 
-RESULT_SCHEMA = "issue825-selector-result-v1"
+RESULT_SCHEMA = "issue825-selector-result-v2"
 
 
 def _as_decimal(value: int | float) -> Decimal:
@@ -394,7 +394,7 @@ def episode_metrics(
         "evaluator_authorized": verification["evaluator_authorized"],
         "provider_input_tokens": token_ledger["input_tokens"],
         "provider_output_tokens": token_ledger["output_tokens"],
-        "provider_input_plus_output_tokens": token_ledger["input_plus_output_tokens"],
+        "provider_total_tokens": token_ledger["provider_total_tokens"],
         "model_wall_seconds": timing["model_wall_seconds"],
         "rna_preprocessing_seconds": timing["rna_preprocessing_seconds"],
         "combined_pre_evaluator_wall_seconds": timing["combined_pre_evaluator_wall_seconds"],
@@ -430,7 +430,7 @@ def decide_registered(metrics: list[Mapping[str, Any]]) -> dict[str, Any]:
         return {
             "resolved": sum(item["resolved"] is True for item in items),
             "pass_to_pass_regressions": sum(item["pass_to_pass_regressions"] for item in items),
-            "provider_input_plus_output_tokens": sum(item["provider_input_plus_output_tokens"] for item in items),
+            "provider_total_tokens": sum(item["provider_total_tokens"] for item in items),
             "combined_pre_evaluator_wall_seconds": sum(
                 (_as_decimal(item["combined_pre_evaluator_wall_seconds"]) for item in items),
                 Decimal("0"),
@@ -473,13 +473,13 @@ def decide_registered(metrics: list[Mapping[str, Any]]) -> dict[str, Any]:
             **common,
         }
     token_reduction = (
-        a["provider_input_plus_output_tokens"] > 0
-        and 100 * t["provider_input_plus_output_tokens"]
-        <= 85 * a["provider_input_plus_output_tokens"]
+        a["provider_total_tokens"] > 0
+        and 100 * t["provider_total_tokens"]
+        <= 85 * a["provider_total_tokens"]
     )
     token_within_five = (
-        100 * t["provider_input_plus_output_tokens"]
-        <= 105 * a["provider_input_plus_output_tokens"]
+        100 * t["provider_total_tokens"]
+        <= 105 * a["provider_total_tokens"]
     )
     time_reduction = (
         a["combined_pre_evaluator_wall_seconds"] > 0

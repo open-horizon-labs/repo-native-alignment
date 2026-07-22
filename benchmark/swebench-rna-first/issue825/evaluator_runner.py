@@ -41,6 +41,7 @@ EVALUATION_SCHEMA = "issue825-official-evaluation-receipt-v1"
 SKIP_SCHEMA = "issue825-official-evaluation-skip-v1"
 FAILURE_SCHEMA = "issue825-official-evaluation-failure-v1"
 BATCH_SCHEMA = "issue825-official-evaluation-batch-v1"
+TOKEN_LEDGER_SCHEMA = "issue825-token-ledger-v3"
 ALLOWED_ARMS = {"A", "T"}
 ARM_POLICIES = {"A": "control", "T": "treatment"}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -306,18 +307,84 @@ def validate_episode_input(
 
     token_ledger = receipt.get("token_ledger")
     require(isinstance(token_ledger, dict), "episode token ledger missing")
-    for key in ("input_tokens", "output_tokens", "input_plus_output_tokens"):
-        require(
-            type(token_ledger.get(key)) is int and token_ledger[key] >= 0,
-            f"episode token ledger {key} invalid",
-        )
     require(
-        token_ledger["input_plus_output_tokens"]
-        == token_ledger["input_tokens"] + token_ledger["output_tokens"],
-        "episode token total double-counts or omits provider tokens",
+        token_ledger.get("schema_version") == TOKEN_LEDGER_SCHEMA
+        and token_ledger.get("valid") is True
+        and token_ledger.get("errors") == [],
+        "episode token ledger v3 invalid",
     )
     timing = receipt.get("timing_ledger")
     require(isinstance(timing, dict), "episode timing ledger missing")
+    if token_ledger.get("model_invoked") is False:
+        require(
+            disposition == "noncompliant"
+            and receipt.get("returncode") is None
+            and timing.get("model_wall_seconds") == 0
+            and receipt.get("policy_compliant") is False
+            and receipt.get("evaluator_authorized") is False,
+            "no-model token ledger is not confined to a pre-model noncompliant episode",
+        )
+        require(
+            token_ledger.get("source") == "model_not_invoked"
+            and token_ledger.get("cli_turns") == 0
+            and token_ledger.get("provider_responses") == 0
+            and token_ledger.get("provider_requests") == 0
+            and all(
+                token_ledger.get(key) is None
+                for key in (
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "output_tokens",
+                    "provider_total_tokens",
+                    "reasoning_tokens",
+                )
+            ),
+            "no-model token ledger must record null provider counters",
+        )
+    else:
+        require(
+            token_ledger.get("model_invoked") is True,
+            "episode token ledger model invocation state invalid",
+        )
+        for key in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+            "provider_total_tokens",
+            "reasoning_tokens",
+            "cli_turns",
+        ):
+            require(
+                type(token_ledger.get(key)) is int and token_ledger[key] >= 0,
+                f"episode token ledger {key} invalid",
+            )
+        require(
+            token_ledger.get("provider_responses") is None
+            or (
+                type(token_ledger["provider_responses"]) is int
+                and token_ledger["provider_responses"] >= 0
+            ),
+            "episode token ledger provider_responses invalid",
+        )
+        require(
+            token_ledger.get("provider_requests") is None,
+            "episode token ledger must not conflate CLI turns with provider requests",
+        )
+        require(
+            token_ledger["provider_total_tokens"]
+            == token_ledger["input_tokens"]
+            + token_ledger["cache_creation_input_tokens"]
+            + token_ledger["cache_read_input_tokens"]
+            + token_ledger["output_tokens"],
+            "episode token total double-counts or omits provider tokens",
+        )
+    if evaluator_authorized:
+        require(
+            token_ledger.get("model_invoked") is True,
+            "authorized patch lacks full model token evidence",
+        )
     require(verification.get("token_ledger") == token_ledger, "verifier token ledger mismatch")
     require(verification.get("timing_ledger") == timing, "verifier timing ledger mismatch")
     for key in (

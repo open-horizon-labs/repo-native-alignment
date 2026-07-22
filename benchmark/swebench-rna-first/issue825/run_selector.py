@@ -29,8 +29,10 @@ from typing import Any, Mapping, Sequence
 
 
 RUN_SCHEMA = "issue825-selector-run-v1"
-IDENTITY_SCHEMA = "issue825-runtime-identity-v1"
+IDENTITY_SCHEMA = "issue825-runtime-identity-v2"
 RECEIPT_SCHEMA = "issue825-episode-receipt-v1"
+TOKEN_LEDGER_SCHEMA = "issue825-token-ledger-v3"
+QUERY_EVIDENCE_SCHEMA = "issue825-query-evidence-v2"
 EMPTY_MCP_BYTES = b'{"mcpServers":{}}\n'
 READY_SENTINEL = "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
 SOURCE = Path(__file__).resolve().parent
@@ -56,6 +58,15 @@ REGISTERED_FILE_NAMES = {
 
 class FailClosed(RuntimeError):
     """A frozen identity or evidence precondition did not hold."""
+
+
+class TreatmentAcquisitionFailure(FailClosed):
+    """RNA acquisition failed after immutable query-attempt evidence was retained."""
+
+    def __init__(self, message: str, evidence: dict[str, Any], elapsed: float):
+        super().__init__(message)
+        self.evidence = evidence
+        self.elapsed = elapsed
 
 
 def utc_now() -> str:
@@ -197,6 +208,61 @@ def clean_status(checkout: Path) -> bytes:
     return git(checkout, "status", "--porcelain=v1", "--untracked-files=all").stdout
 
 
+GITHUB_REPOSITORY_PATTERN = re.compile(
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/"
+    r"(?P<repository>[A-Za-z0-9._-]+)"
+)
+
+
+def canonical_repository_slug(value: Any, where: str) -> str:
+    require(isinstance(value, str), f"{where} must be a canonical owner/repository identity")
+    match = GITHUB_REPOSITORY_PATTERN.fullmatch(value)
+    require(match is not None, f"{where} must be a canonical owner/repository identity")
+    return f"{match.group('owner').lower()}/{match.group('repository').lower()}"
+
+
+def canonical_github_origin(value: Any, where: str) -> str:
+    require(
+        isinstance(value, str),
+        f"{where} is not a canonical GitHub HTTPS or SSH URL",
+    )
+    candidate = value.removesuffix("/").removesuffix(".git")
+    for prefix in (
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ):
+        if candidate.startswith(prefix):
+            return canonical_repository_slug(candidate.removeprefix(prefix), where)
+    raise FailClosed(f"{where} is not a canonical GitHub HTTPS or SSH URL")
+
+
+def verify_index_repository_identity(
+    checkout: Path,
+    cache_manifest: Any,
+    where: str,
+) -> tuple[str, str]:
+    require(isinstance(cache_manifest, dict), f"{where}.cache_manifest must be an object")
+    core = cache_manifest.get("core")
+    require(isinstance(core, dict), f"{where}.cache_manifest.core must be an object")
+    expected = canonical_repository_slug(
+        core.get("repository"),
+        f"{where}.cache_manifest.core.repository",
+    )
+    origin = git(checkout, "remote", "get-url", "--all", "origin", check=False)
+    urls = origin.stdout.decode("utf-8", errors="replace").splitlines()
+    require(
+        origin.returncode == 0 and len(urls) == 1,
+        f"{where}.origin must resolve to exactly one GitHub remote URL",
+    )
+    live = canonical_github_origin(urls[0], f"{where}.origin")
+    require(
+        live == expected,
+        f"{where} repository identity mismatch: cache manifest={expected}, git origin={live}",
+    )
+    return expected, live
+
+
 def verify_checkout(path_text: str, commit: str, tree: str, where: str, *, cache: bool = False) -> Path:
     checkout = Path(path_text)
     require(checkout.is_absolute() and checkout.is_dir() and not checkout.is_symlink(), f"{where} invalid")
@@ -254,42 +320,70 @@ def usage_value(usage: Mapping[str, Any], snake: str, camel: str) -> int | None:
     return observed_numeric(value)
 
 
-def token_ledger(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """Use one provider source; never add top-level usage to modelUsage."""
+def optional_usage_value(usage: Mapping[str, Any], snake: str, camel: str) -> int | None:
+    if snake in usage:
+        return observed_numeric(usage[snake])
+    if camel in usage:
+        return observed_numeric(usage[camel])
+    return 0
+
+
+def normalize_provider_usage(usage: Mapping[str, Any]) -> dict[str, int] | None:
+    input_tokens = usage_value(usage, "input_tokens", "inputTokens")
+    output_tokens = usage_value(usage, "output_tokens", "outputTokens")
+    if input_tokens is None or output_tokens is None:
+        return None
+    reasoning = optional_usage_value(usage, "reasoning_tokens", "reasoningTokens")
+    details = usage.get("output_tokens_details")
+    if reasoning == 0 and isinstance(details, dict):
+        reasoning = optional_usage_value(details, "reasoning_tokens", "reasoningTokens")
+    cache_creation = optional_usage_value(
+        usage, "cache_creation_input_tokens", "cacheCreationInputTokens"
+    )
+    cache_read = optional_usage_value(
+        usage, "cache_read_input_tokens", "cacheReadInputTokens"
+    )
+    if any(value is None for value in (reasoning, cache_creation, cache_read)):
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
+        "reasoning_tokens": reasoning,
+    }
+
+
+def token_ledger(
+    summary: Mapping[str, Any],
+    *,
+    model_invoked: bool = True,
+    provider_responses: int | None = None,
+) -> dict[str, Any]:
+    """Count provider token components once; never add reasoning to the total."""
+    if not model_invoked:
+        return {
+            "schema_version": TOKEN_LEDGER_SCHEMA,
+            "valid": True,
+            "errors": [],
+            "source": "model_not_invoked",
+            "model_invoked": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_creation_input_tokens": None,
+            "cache_read_input_tokens": None,
+            "provider_total_tokens": None,
+            "reasoning_tokens": None,
+            "cli_turns": 0,
+            "provider_responses": 0,
+            "provider_requests": 0,
+        }
     source = "unavailable"
     normalized: dict[str, int] | None = None
-    usage = summary.get("usage")
-    if isinstance(usage, dict):
-        input_tokens = usage_value(usage, "input_tokens", "inputTokens")
-        output_tokens = usage_value(usage, "output_tokens", "outputTokens")
-        if input_tokens is not None and output_tokens is not None:
-            source = "top_level_usage"
-            reasoning = usage_value(usage, "reasoning_tokens", "reasoningTokens")
-            details = usage.get("output_tokens_details")
-            if reasoning is None and isinstance(details, dict):
-                reasoning = usage_value(details, "reasoning_tokens", "reasoningTokens")
-            normalized = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": usage_value(
-                    usage, "cache_creation_input_tokens", "cacheCreationInputTokens"
-                ) or 0,
-                "cache_read_input_tokens": usage_value(
-                    usage, "cache_read_input_tokens", "cacheReadInputTokens"
-                ) or 0,
-                "reasoning_tokens": reasoning or 0,
-            }
-    if normalized is None:
+    if "modelUsage" in summary:
+        source = "whole_invocation_model_usage"
         model_usage = summary.get("modelUsage")
-        candidates: list[Mapping[str, Any]] = []
-        if isinstance(model_usage, dict):
-            for entry in model_usage.values():
-                if not isinstance(entry, dict):
-                    continue
-                candidate = entry.get("usage", entry)
-                if isinstance(candidate, dict):
-                    candidates.append(candidate)
-        if candidates:
+        if isinstance(model_usage, dict) and model_usage:
             totals = {
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -297,50 +391,64 @@ def token_ledger(summary: Mapping[str, Any]) -> dict[str, Any]:
                 "cache_read_input_tokens": 0,
                 "reasoning_tokens": 0,
             }
-            valid = True
-            for candidate in candidates:
-                input_tokens = usage_value(candidate, "input_tokens", "inputTokens")
-                output_tokens = usage_value(candidate, "output_tokens", "outputTokens")
-                if input_tokens is None or output_tokens is None:
-                    valid = False
+            for entry in model_usage.values():
+                if not isinstance(entry, dict):
                     break
-                totals["input_tokens"] += input_tokens
-                totals["output_tokens"] += output_tokens
-                totals["cache_creation_input_tokens"] += usage_value(
-                    candidate, "cache_creation_input_tokens", "cacheCreationInputTokens"
-                ) or 0
-                totals["cache_read_input_tokens"] += usage_value(
-                    candidate, "cache_read_input_tokens", "cacheReadInputTokens"
-                ) or 0
-                totals["reasoning_tokens"] += usage_value(
-                    candidate, "reasoning_tokens", "reasoningTokens"
-                ) or 0
-            if valid:
-                source = "model_usage_sum"
+                candidate = entry.get("usage", entry)
+                if not isinstance(candidate, dict):
+                    break
+                observed = normalize_provider_usage(candidate)
+                if observed is None:
+                    break
+                for key in totals:
+                    totals[key] += observed[key]
+            else:
                 normalized = totals
-    provider_requests = observed_numeric(summary.get("num_turns"))
-    if normalized is None or provider_requests is None:
+    else:
+        source = "top_level_usage"
+        usage = summary.get("usage")
+        if isinstance(usage, dict):
+            normalized = normalize_provider_usage(usage)
+    cli_turns = observed_numeric(summary.get("num_turns"))
+    if type(provider_responses) is not int or provider_responses < 0:
+        provider_responses = None
+    if normalized is None or cli_turns is None:
         return {
-            "schema_version": "issue825-token-ledger-v2",
+            "schema_version": TOKEN_LEDGER_SCHEMA,
             "valid": False,
             "errors": ["missing_or_invalid_observed_provider_usage"],
             "source": source,
+            "model_invoked": True,
             "input_tokens": None,
             "output_tokens": None,
-            "input_plus_output_tokens": None,
             "cache_creation_input_tokens": None,
             "cache_read_input_tokens": None,
+            "provider_total_tokens": None,
             "reasoning_tokens": None,
-            "provider_requests": provider_requests,
+            "cli_turns": cli_turns,
+            "provider_responses": provider_responses,
+            "provider_requests": None,
         }
+    provider_total_tokens = sum(
+        normalized[key]
+        for key in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        )
+    )
     return {
-        "schema_version": "issue825-token-ledger-v2",
+        "schema_version": TOKEN_LEDGER_SCHEMA,
         "valid": True,
         "errors": [],
         "source": source,
+        "model_invoked": True,
         **normalized,
-        "input_plus_output_tokens": normalized["input_tokens"] + normalized["output_tokens"],
-        "provider_requests": provider_requests,
+        "provider_total_tokens": provider_total_tokens,
+        "cli_turns": cli_turns,
+        "provider_responses": provider_responses,
+        "provider_requests": None,
     }
 
 
@@ -432,6 +540,8 @@ class PreparedCase:
     cache_refs: dict[str, dict[str, Any]]
     cache_bindings: tuple[dict[str, Any], ...]
     cache_inventory_sha256: str
+    expected_repository_identity: str
+    live_repository_identity: str
     arm_order: tuple[str, str]
     checkouts: dict[str, Path]
     sessions: dict[str, str]
@@ -533,7 +643,15 @@ def verify_cache(
     commit: str,
     tree: str,
     registration: Mapping[str, Any],
-) -> tuple[Path, str, dict[str, dict[str, Any]], tuple[dict[str, Any], ...], str]:
+) -> tuple[
+    Path,
+    str,
+    dict[str, dict[str, Any]],
+    tuple[dict[str, Any], ...],
+    str,
+    str,
+    str,
+]:
     exact_keys(
         value,
         {"index_checkout", "root", "archive", "manifest", "verification_receipt", "readiness_report", "bindings"},
@@ -552,6 +670,11 @@ def verify_cache(
                 documents[name] = json.loads(data)
             except json.JSONDecodeError as exc:
                 raise FailClosed(f"{case_id}.cache.{name} is not JSON") from exc
+    expected_repository, live_repository = verify_index_repository_identity(
+        checkout,
+        documents["manifest"],
+        f"{case_id}.cache.index_checkout",
+    )
     expected = {
         "repository_commit": commit,
         "repository_tree": tree,
@@ -581,7 +704,15 @@ def verify_cache(
         seen.add(label)
         normalized.append(dict(binding))
     require(seen == REQUIRED_CACHE_BINDINGS, f"{case_id} cache bindings incomplete: {sorted(REQUIRED_CACHE_BINDINGS - seen)}")
-    return checkout, root, refs, tuple(normalized), expected["operational_cache_inventory_sha256"]
+    return (
+        checkout,
+        root,
+        refs,
+        tuple(normalized),
+        expected["operational_cache_inventory_sha256"],
+        expected_repository,
+        live_repository,
+    )
 
 
 def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions: bool = False) -> PreparedRun:
@@ -609,7 +740,7 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
 
     registration_path, registration_bytes = check_ref(manifest["registration"], "manifest.registration")
     registration = read_json(registration_path)
-    require(registration.get("schema_version") == "issue825-treatment-registration-v2", "registration schema mismatch")
+    require(registration.get("schema_version") == "issue825-treatment-registration-v3", "registration schema mismatch")
     validate_registered_sources(registration)
     registration_ref = dict(manifest["registration"])
 
@@ -651,7 +782,15 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
         require(sha_bytes(problem) == chosen.get("problem_statement_sha256"), f"{where} problem statement mismatch")
         _, prompt = check_ref(case["user_prompt"], f"{where}.user_prompt")
         require(prompt.count(problem) == 1 and prompt.endswith(problem), f"{where} prompt must contain exact problem once at end")
-        index_checkout, root, cache_refs, cache_bindings, cache_inventory = verify_cache(
+        (
+            index_checkout,
+            root,
+            cache_refs,
+            cache_bindings,
+            cache_inventory,
+            expected_repository,
+            live_repository,
+        ) = verify_cache(
             case["cache"], case_id=case_id, commit=case["base_commit"], tree=case["base_tree"], registration=registration
         )
         require(index_checkout not in checkouts, f"index checkout reused: {index_checkout}")
@@ -683,7 +822,10 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
                 rank=case["rank"], case_id=case_id, base_commit=case["base_commit"], base_tree=case["base_tree"],
                 problem=problem, prompt=prompt, title=title_bytes(problem), index_checkout=index_checkout,
                 root=root, cache_refs=cache_refs, cache_bindings=cache_bindings,
-                cache_inventory_sha256=cache_inventory, arm_order=arm_order,
+                cache_inventory_sha256=cache_inventory,
+                expected_repository_identity=expected_repository,
+                live_repository_identity=live_repository,
+                arm_order=arm_order,
                 checkouts=arm_checkouts, sessions=arm_sessions,
             )
         )
@@ -746,6 +888,8 @@ def make_identity(prepared: PreparedRun, case: PreparedCase) -> dict[str, Any]:
         "base_tree": case.base_tree,
         "root": case.root,
         "index_checkout": str(case.index_checkout),
+        "expected_repository_identity": case.expected_repository_identity,
+        "live_repository_identity": case.live_repository_identity,
         "producer_commit": prepared.registration["rna_artifact"]["producer_commit"],
         "launcher_path": str(prepared.launcher_path),
         "launcher_sha256": prepared.rna_refs["launcher"]["sha256"],
@@ -784,13 +928,14 @@ def configure_episode(
     wrapper = harness_paths["rna_traverse.py"]
     query_wrapper = harness_paths["rna_query.py"]
     config = {
-        "schema_version": "rna-supervisor-config-v2",
+        "schema_version": "rna-supervisor-config-v3",
         "policy": "control" if arm == "A" else "treatment",
         "launcher": str(prepared.launcher_path),
         "binary": str(prepared.binary_path),
         "repo": str(case.index_checkout),
         "checkout": str(case.checkouts[arm]),
         "root": case.root,
+        "expected_repository_identity": case.expected_repository_identity,
         "initial_response": str(evidence / "query/projection.stdout"),
         "initial_response_sha256": None,
         "initial_ids": [],
@@ -847,50 +992,76 @@ def acquire_treatment(
         "--query-sha256",
         config["expected_query_sha256"],
     ]
+    started_at = utc_now()
     started = time.monotonic()
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    process_started = True
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError as exc:
+        process_started = False
+        result = subprocess.CompletedProcess(command, 126, b"", str(exc).encode())
     elapsed = time.monotonic() - started
     projection_path = evidence / "query/projection.stdout"
     wrapper_stderr = evidence / "query/wrapper.stderr"
     atomic_write(projection_path, result.stdout)
     atomic_write(wrapper_stderr, result.stderr)
-    require(result.returncode == 0, f"{case.case_id} exact-title RNA query failed: {result.stderr.decode(errors='replace')}")
     receipt_path = evidence / "query/title-query.json"
-    require(receipt_path.is_file(), f"{case.case_id} query wrapper did not retain raw receipt")
-    receipt = read_json(receipt_path)
-    require(receipt.get("identity_sha256") == config["expected_identity_sha256"], "query identity mismatch")
-    require(receipt.get("root") == case.root, "query root mismatch")
-    require(receipt.get("returncode") == 0, "query raw launcher failed")
-    text = result.stdout.decode("utf-8", errors="strict")
-    require(READY_SENTINEL in text, "query projection missing exact READY sentinel")
-    ids = stable_code_ids(text)
-    require(ids, "query projection returned no stable code IDs")
-    require(receipt.get("projected_stable_code_ids") == ids, "query projected stable IDs mismatch")
-    require(
-        all(f"`{item}`".encode() in result.stdout for item in ids),
-        "query authorized an ID absent from injected response bytes",
-    )
-    config["initial_ids"] = ids
-    config["initial_response"] = str(projection_path)
-    config["initial_response_sha256"] = sha_bytes(result.stdout)
-    atomic_write(harness_paths["config"], canonical(config))
-    atomic_write(evidence / "supervisor-config.json", canonical(config))
-    prefix = (SOURCE / "system-prefix.txt").read_bytes()
-    suffix = (SOURCE / "system-suffix.txt").read_bytes().replace(b"__TRAVERSAL_WRAPPER__", str(harness_paths["rna_traverse.py"]).encode())
-    opaque_call = f"rna_query --query-sha256 {config['expected_query_sha256']}\n".encode()
-    system = prefix + opaque_call + b"\nRNA TOOL RESPONSE\n" + result.stdout + suffix
     query_evidence = {
+        "schema_version": QUERY_EVIDENCE_SCHEMA,
+        "acquisition_started": True,
+        "process_started": process_started,
+        "started_at": started_at,
+        "succeeded": False,
+        "failure": None,
         "wrapper_command": command,
         "wrapper_returncode": result.returncode,
         "wrapper_stdout": file_ref(projection_path),
         "wrapper_stderr": file_ref(wrapper_stderr),
-        "raw_receipt": file_ref(receipt_path),
-        "raw_stdout": receipt["stdout"],
-        "raw_stderr": receipt["stderr"],
-        "projected_stable_code_ids": ids,
-        "raw_stable_code_ids": receipt.get("raw_stable_code_ids"),
+        "raw_receipt": file_ref(receipt_path) if receipt_path.is_file() else None,
+        "raw_stdout": None,
+        "raw_stderr": None,
+        "projected_stable_code_ids": [],
+        "raw_stable_code_ids": [],
         "elapsed_seconds": elapsed,
     }
+    try:
+        receipt: Mapping[str, Any] | None = None
+        if receipt_path.is_file():
+            loaded_receipt = read_json(receipt_path)
+            require(isinstance(loaded_receipt, dict), "query raw receipt must be an object")
+            receipt = loaded_receipt
+            query_evidence["raw_stdout"] = receipt.get("stdout")
+            query_evidence["raw_stderr"] = receipt.get("stderr")
+            query_evidence["raw_stable_code_ids"] = receipt.get("raw_stable_code_ids")
+        require(process_started, f"{case.case_id} exact-title RNA query did not start")
+        require(result.returncode == 0, f"{case.case_id} exact-title RNA query failed: {result.stderr.decode(errors='replace')}")
+        require(receipt is not None, f"{case.case_id} query wrapper did not retain raw receipt")
+        require(receipt.get("identity_sha256") == config["expected_identity_sha256"], "query identity mismatch")
+        require(receipt.get("root") == case.root, "query root mismatch")
+        require(receipt.get("returncode") == 0, "query raw launcher failed")
+        text = result.stdout.decode("utf-8", errors="strict")
+        require(READY_SENTINEL in text, "query projection missing exact READY sentinel")
+        ids = stable_code_ids(text)
+        require(ids, "query projection returned no stable code IDs")
+        require(receipt.get("projected_stable_code_ids") == ids, "query projected stable IDs mismatch")
+        require(
+            all(f"`{item}`".encode() in result.stdout for item in ids),
+            "query authorized an ID absent from injected response bytes",
+        )
+        query_evidence["projected_stable_code_ids"] = ids
+        config["initial_ids"] = ids
+        config["initial_response"] = str(projection_path)
+        config["initial_response_sha256"] = sha_bytes(result.stdout)
+        atomic_write(harness_paths["config"], canonical(config))
+        atomic_write(evidence / "supervisor-config.json", canonical(config))
+        prefix = (SOURCE / "system-prefix.txt").read_bytes()
+        suffix = (SOURCE / "system-suffix.txt").read_bytes().replace(b"__TRAVERSAL_WRAPPER__", str(harness_paths["rna_traverse.py"]).encode())
+        opaque_call = f"rna_query --query-sha256 {config['expected_query_sha256']}\n".encode()
+        system = prefix + opaque_call + b"\nRNA TOOL RESPONSE\n" + result.stdout + suffix
+    except (FailClosed, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        query_evidence["failure"] = f"{type(exc).__name__}:{exc}"
+        raise TreatmentAcquisitionFailure(str(exc), query_evidence, elapsed) from exc
+    query_evidence["succeeded"] = True
     return system, ids, elapsed, query_evidence
 
 
@@ -944,6 +1115,34 @@ def copy_transcripts(session: str, evidence: Path) -> list[dict[str, Any]]:
         shutil.copyfile(source, destination)
         destinations.append({"source_path": str(source), "retained": file_ref(destination)})
     return destinations
+
+
+def transcript_provider_response_count(transcripts: Sequence[Mapping[str, Any]]) -> int | None:
+    """Count unique retained Anthropic assistant message IDs, not API requests."""
+    message_ids: set[str] = set()
+    if not transcripts:
+        return None
+    try:
+        for transcript in transcripts:
+            retained = transcript.get("retained")
+            path, data = check_ref(retained, "retained transcript")
+            del path
+            for line in data.splitlines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict) or event.get("type") != "assistant":
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    return None
+                message_id = message.get("id")
+                if not isinstance(message_id, str) or not message_id:
+                    return None
+                message_ids.add(message_id)
+    except (FailClosed, OSError, json.JSONDecodeError):
+        return None
+    return len(message_ids) if message_ids else None
 
 
 def build_actor_tool_ledger(
@@ -1080,6 +1279,7 @@ def failed_pre_model_receipt(
     config: Mapping[str, Any],
     reason: str,
     rna_seconds: float,
+    query_evidence: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
@@ -1096,7 +1296,7 @@ def failed_pre_model_receipt(
         "runtime_identity": file_ref(identity_path),
         "prompt": None,
         "treatment_system": None,
-        "query_evidence": None,
+        "query_evidence": dict(query_evidence) if query_evidence is not None else None,
         "command": None,
         "started_at": None,
         "ended_at": utc_now(),
@@ -1115,7 +1315,7 @@ def failed_pre_model_receipt(
             "rna_events": [],
         },
         "actor_tool_ledger": None,
-        "token_ledger": token_ledger({}),
+        "token_ledger": token_ledger({}, model_invoked=False),
         "timing_ledger": {
             "rna_preprocessing_seconds": rna_seconds,
             "model_wall_seconds": 0.0,
@@ -1151,11 +1351,18 @@ def launch_episode(
         query_started = time.monotonic()
         try:
             treatment_system, _, rna_seconds, query_evidence = acquire_treatment(case, harness_paths, evidence, config)
+        except TreatmentAcquisitionFailure as exc:
+            return failed_pre_model_receipt(
+                prepared, case, arm, episode, evidence, identity_path, config,
+                f"rna_preprocessing_failed:{type(exc).__name__}:{exc}", exc.elapsed,
+                exc.evidence,
+            )
         except Exception as exc:
             rna_seconds = time.monotonic() - query_started
             return failed_pre_model_receipt(
                 prepared, case, arm, episode, evidence, identity_path, config,
                 f"rna_preprocessing_failed:{type(exc).__name__}:{exc}", rna_seconds,
+                query_evidence,
             )
         treatment_system_path = episode / "treatment-system.bin"
         atomic_write(treatment_system_path, treatment_system)
@@ -1196,7 +1403,6 @@ def launch_episode(
     wall = time.monotonic() - started
     ended_at = utc_now()
     summary = safe_summary(stdout_path)
-    tokens = token_ledger(summary)
     patch, untracked = capture_patch(case.checkouts[arm])
     patch_path = episode / "terminal.patch"
     atomic_write(patch_path, patch)
@@ -1205,6 +1411,11 @@ def launch_episode(
     status_path = evidence / "post-status.bin"
     atomic_write(status_path, status)
     transcripts = copy_transcripts(case.sessions[arm], evidence)
+    tokens = token_ledger(
+        summary,
+        model_invoked=True,
+        provider_responses=transcript_provider_response_count(transcripts),
+    )
     compliant, errors = treatment_compliance(config, evidence, arm)
     if timed_out:
         errors.append("model_wall_timeout")
@@ -1363,6 +1574,8 @@ def preflight_summary(prepared: PreparedRun) -> dict[str, Any]:
                 "base_commit": case.base_commit,
                 "base_tree": case.base_tree,
                 "root": case.root,
+                "expected_repository_identity": case.expected_repository_identity,
+                "live_repository_identity": case.live_repository_identity,
                 "cache_archive_sha256": case.cache_refs["archive"]["sha256"],
                 "cache_manifest_sha256": case.cache_refs["manifest"]["sha256"],
                 "prompt_sha256_A": sha_bytes(case.prompt),

@@ -38,6 +38,7 @@ class Fixture:
         patch_keys: set[tuple[int, str]],
         noncompliant_keys: set[tuple[int, str]] = frozenset(),
         incomplete_keys: set[tuple[int, str]] = frozenset(),
+        pre_model_keys: set[tuple[int, str]] = frozenset(),
         arm_tokens: dict[str, int] | None = None,
     ) -> None:
         self.root = root
@@ -86,20 +87,47 @@ class Fixture:
                         directory / "terminal.patch",
                         f"diff --git a/{arm} b/{arm}\n+synthetic {key}\n".encode(),
                     )
-                compliant = key not in noncompliant_keys
+                pre_model = key in pre_model_keys
+                compliant = key not in noncompliant_keys and not pre_model
                 complete = key not in incomplete_keys
                 receipt_authorized = compliant and patch_ref is not None
                 authorized = receipt_authorized and complete
                 token_total = self.arm_tokens[arm]
-                token_ledger = {
+                token_ledger = ({
+                    "schema_version": runner.TOKEN_LEDGER_SCHEMA,
+                    "valid": True,
+                    "errors": [],
+                    "source": "model_not_invoked",
+                    "model_invoked": False,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cache_creation_input_tokens": None,
+                    "cache_read_input_tokens": None,
+                    "provider_total_tokens": None,
+                    "reasoning_tokens": None,
+                    "cli_turns": 0,
+                    "provider_responses": 0,
+                    "provider_requests": 0,
+                } if pre_model else {
+                    "schema_version": runner.TOKEN_LEDGER_SCHEMA,
+                    "valid": True,
+                    "errors": [],
+                    "source": "whole_invocation_model_usage",
+                    "model_invoked": True,
                     "input_tokens": token_total - 100,
                     "output_tokens": 100,
-                    "input_plus_output_tokens": token_total,
-                }
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "provider_total_tokens": token_total,
+                    "reasoning_tokens": 0,
+                    "cli_turns": 1,
+                    "provider_responses": None,
+                    "provider_requests": None,
+                })
                 timing_ledger = {
-                    "model_wall_seconds": 100.0,
-                    "rna_preprocessing_seconds": 0.0,
-                    "combined_pre_evaluator_wall_seconds": 100.0,
+                    "model_wall_seconds": 0.0 if pre_model else 100.0,
+                    "rna_preprocessing_seconds": 1.0 if pre_model else 0.0,
+                    "combined_pre_evaluator_wall_seconds": 1.0 if pre_model else 100.0,
                 }
                 receipt = {
                     "schema_version": "issue825-episode-receipt-v1",
@@ -115,6 +143,7 @@ class Fixture:
                     "evidence_complete": True,
                     "errors": [] if compliant else ["synthetic_policy_failure"],
                     "evaluator_authorized": receipt_authorized,
+                    "returncode": None if pre_model else 0,
                     "official_evaluator_invoked": False,
                     "token_ledger": token_ledger,
                     "timing_ledger": timing_ledger,
@@ -199,6 +228,29 @@ class Fixture:
 
 
 class EvaluatorToolsTests(unittest.TestCase):
+    def test_plan_accepts_pre_model_t_failures_with_null_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys={(1, "A"), (2, "A")},
+                pre_model_keys={(1, "T"), (2, "T")},
+            )
+            plan = fixture.validated_plan()
+            dispositions = {
+                (item["episode"]["rank"], item["episode"]["arm"]): item["disposition"]
+                for item in plan["_validated_episodes"]
+            }
+            self.assertEqual(dispositions[(1, "A")], "evaluate")
+            self.assertEqual(dispositions[(2, "A")], "evaluate")
+            self.assertEqual(dispositions[(1, "T")], "noncompliant")
+            self.assertEqual(dispositions[(2, "T")], "noncompliant")
+            runner.seal_all(plan)
+            seal_set = runner.validate_seal_set(plan)
+            self.assertEqual(
+                sum(item["seal"]["disposition"] == "evaluate" for item in seal_set["seals"]),
+                2,
+            )
+
     def test_seal_routes_only_compliant_nonempty_patches_and_claim_is_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Fixture(
@@ -616,7 +668,7 @@ class EvaluatorToolsTests(unittest.TestCase):
                         "outcome_valid": True,
                         "resolved": arm == "A",
                         "pass_to_pass_regressions": 0,
-                        "provider_input_plus_output_tokens": 100,
+                        "provider_total_tokens": 100,
                         "combined_pre_evaluator_wall_seconds": 100.0,
                     }
                 )
@@ -685,7 +737,7 @@ class EvaluatorToolsTests(unittest.TestCase):
                 "outcome_valid": True,
                 "resolved": False,
                 "pass_to_pass_regressions": 0,
-                "provider_input_plus_output_tokens": 0,
+                "provider_total_tokens": 0,
                 "combined_pre_evaluator_wall_seconds": 0.0,
             }
             for rank in (1, 2)
@@ -704,7 +756,7 @@ class EvaluatorToolsTests(unittest.TestCase):
                 "outcome_valid": True,
                 "resolved": False,
                 "pass_to_pass_regressions": 0,
-                "provider_input_plus_output_tokens": 100 if arm == "A" else None,
+                "provider_total_tokens": 100 if arm == "A" else None,
                 "combined_pre_evaluator_wall_seconds": 100.0,
             }
             for rank in (1, 2)

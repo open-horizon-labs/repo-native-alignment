@@ -21,6 +21,10 @@ CODE_KINDS = {
     "class", "const", "enum", "function", "interface", "method", "module",
     "struct", "trait", "type", "type_alias", "union",
 }
+GITHUB_REPOSITORY_PATTERN = re.compile(
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/"
+    r"(?P<repository>[A-Za-z0-9._-]+)"
+)
 
 
 def canonical(value: object) -> bytes:
@@ -81,6 +85,27 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.decode("utf-8", errors="strict").strip()
 
 
+def canonical_repository_slug(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("repository_identity")
+    match = GITHUB_REPOSITORY_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError("repository_identity")
+    return f"{match.group('owner').lower()}/{match.group('repository').lower()}"
+
+
+def canonical_github_origin(value: str) -> str:
+    candidate = value.removesuffix("/").removesuffix(".git")
+    for prefix in (
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ):
+        if candidate.startswith(prefix):
+            return canonical_repository_slug(candidate.removeprefix(prefix))
+    raise ValueError("live_repository_origin")
+
+
 def require_live_state(identity: dict) -> None:
     repo = Path(CONFIG["repo"])
     if not repo.is_dir() or repo.is_symlink():
@@ -91,6 +116,14 @@ def require_live_state(identity: dict) -> None:
         raise ValueError("live_tree")
     if git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
         raise ValueError("live_checkout_not_pristine")
+    origins = git(repo, "remote", "get-url", "--all", "origin").splitlines()
+    if len(origins) != 1:
+        raise ValueError("live_repository_origin_count")
+    live_repository = canonical_github_origin(origins[0])
+    if live_repository != CONFIG["expected_repository_identity"]:
+        raise ValueError("live_repository_identity")
+    if identity.get("live_repository_identity") != live_repository:
+        raise ValueError("identity_live_repository_identity")
     observed = cache_inventory_sha256(repo / ".oh/.cache")
     if observed != CONFIG["expected_cache_inventory_sha256"]:
         raise ValueError("live_cache_inventory")
@@ -99,13 +132,17 @@ def require_live_state(identity: dict) -> None:
 
 
 def require_identity() -> dict:
+    if CONFIG.get("schema_version") != "rna-supervisor-config-v3":
+        raise ValueError("supervisor_config_schema")
     path = Path(CONFIG["identity_receipt"])
     if not path.is_file() or path.is_symlink() or sha_file(path) != CONFIG["expected_identity_sha256"]:
         raise ValueError("identity_receipt")
     identity = json.loads(path.read_text())
     expected = {
-        "schema_version": "issue825-runtime-identity-v1",
+        "schema_version": "issue825-runtime-identity-v2",
         "root": CONFIG["root"],
+        "expected_repository_identity": CONFIG["expected_repository_identity"],
+        "live_repository_identity": CONFIG["expected_repository_identity"],
         "base_commit": CONFIG["expected_base_commit"],
         "base_tree": CONFIG["expected_base_tree"],
         "producer_commit": CONFIG["expected_producer_commit"],
@@ -176,6 +213,7 @@ def persist_raw(
         "cache_archive_sha256": identity["cache_archive_sha256"],
         "launcher_sha256": identity["launcher_sha256"],
         "binary_sha256": identity["binary_sha256"],
+        "repository_identity": identity["live_repository_identity"],
         "elapsed_seconds": elapsed,
         "returncode": result.returncode,
         "stdout": {"path": str(stdout_path), "bytes": len(result.stdout), "sha256": sha(result.stdout)},

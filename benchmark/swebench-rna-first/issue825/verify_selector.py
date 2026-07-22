@@ -96,6 +96,81 @@ def exact_first_treatment_action(
         errors.append("first_tool_not_exact_injected_rna_neighbors")
 
 
+TOKEN_COUNTER_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+    "provider_total_tokens",
+    "reasoning_tokens",
+)
+
+
+def validate_token_ledger(
+    ledger: Any,
+    receipt: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(ledger, dict):
+        errors.append("token_ledger_invalid")
+        return
+    if ledger.get("schema_version") != runner.TOKEN_LEDGER_SCHEMA:
+        errors.append("token_ledger_schema_invalid")
+    if ledger.get("valid") is not True or ledger.get("errors") != []:
+        errors.append("token_usage_not_observed")
+
+    model_invoked = ledger.get("model_invoked")
+    if model_invoked is False:
+        if ledger.get("source") != "model_not_invoked":
+            errors.append("token_no_model_source_invalid")
+        for key in TOKEN_COUNTER_FIELDS:
+            if ledger.get(key) is not None:
+                errors.append(f"token_{key}_must_be_null_without_model")
+        for key in ("cli_turns", "provider_responses", "provider_requests"):
+            if ledger.get(key) != 0:
+                errors.append(f"token_{key}_must_be_zero_without_model")
+        timing = receipt.get("timing_ledger")
+        no_model_context = (
+            receipt.get("returncode") is None
+            and isinstance(timing, dict)
+            and timing.get("model_wall_seconds") == 0
+            and receipt.get("policy_compliant") is False
+            and receipt.get("evaluator_authorized") is False
+        )
+        if not no_model_context:
+            errors.append("token_no_model_context_invalid")
+        return
+    if model_invoked is not True:
+        errors.append("token_model_invoked_invalid")
+        return
+
+    counters_valid = True
+    for key in TOKEN_COUNTER_FIELDS:
+        if type(ledger.get(key)) is not int or ledger[key] < 0:
+            errors.append(f"token_{key}_invalid")
+            counters_valid = False
+    if type(ledger.get("cli_turns")) is not int or ledger["cli_turns"] < 0:
+        errors.append("token_cli_turns_invalid")
+    if ledger.get("provider_responses") is not None and (
+        type(ledger["provider_responses"]) is not int or ledger["provider_responses"] < 0
+    ):
+        errors.append("token_provider_responses_invalid")
+    if ledger.get("provider_requests") is not None:
+        errors.append("token_provider_requests_must_be_unavailable")
+    if counters_valid:
+        expected_total = sum(
+            ledger[key]
+            for key in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+            )
+        )
+        if ledger.get("provider_total_tokens") != expected_total:
+            errors.append("token_provider_total_mismatch")
+
+
 def verify_episode(receipt_path: Path) -> dict[str, Any]:
     receipt_path = receipt_path.resolve(strict=True)
     episode_ref = runner.file_ref(receipt_path)
@@ -154,6 +229,19 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
         for key, value in required_identity.items():
             if identity.get(key) != value:
                 errors.append(f"runtime_identity_{key}_mismatch")
+        expected_repository = identity.get("expected_repository_identity")
+        live_repository = identity.get("live_repository_identity")
+        try:
+            expected_repository = runner.canonical_repository_slug(
+                expected_repository, "runtime_identity.expected_repository_identity"
+            )
+            live_repository = runner.canonical_repository_slug(
+                live_repository, "runtime_identity.live_repository_identity"
+            )
+        except runner.FailClosed as exc:
+            errors.append(f"runtime_identity_repository:{exc}")
+        if expected_repository != live_repository:
+            errors.append("runtime_identity_repository_mismatch")
         bindings = ((case or {}).get("cache") or {}).get("bindings", [])
         inventory = [
             item.get("equals") for item in bindings
@@ -188,6 +276,13 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
 
     system_ref = receipt.get("treatment_system")
     query = receipt.get("query_evidence")
+    token_context = receipt.get("token_ledger")
+    pre_model_failure = (
+        isinstance(token_context, dict)
+        and token_context.get("model_invoked") is False
+        and command is None
+        and receipt.get("returncode") is None
+    )
     system = b""
     if arm == "A":
         if system_ref is not None or query is not None:
@@ -199,46 +294,75 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
         errors.append("treatment_missing_system")
 
     query_projection = b""
+    if arm == "T" and query is None:
+        errors.append("treatment_missing_query_evidence")
     if query is not None:
         if not isinstance(query, dict):
             errors.append("query_evidence_invalid")
         else:
-            _, raw_receipt = load_ref_json(query.get("raw_receipt"), "query_raw_receipt", errors)
-            wrapper_ref = query.get("wrapper_stdout")
-            check_ref(wrapper_ref, "query_wrapper_stdout", errors)
+            if query.get("schema_version") != runner.QUERY_EVIDENCE_SCHEMA:
+                errors.append("query_evidence_schema_invalid")
+            if query.get("acquisition_started") is not True:
+                errors.append("query_acquisition_not_recorded")
+            wrapper_returncode = query.get("wrapper_returncode")
+            if type(wrapper_returncode) is not int:
+                errors.append("query_wrapper_returncode_invalid")
+            check_ref(query.get("wrapper_stdout"), "query_wrapper_stdout", errors)
             check_ref(query.get("wrapper_stderr"), "query_wrapper_stderr", errors)
+            raw_receipt = None
+            if query.get("raw_receipt") is not None:
+                _, raw_receipt = load_ref_json(query.get("raw_receipt"), "query_raw_receipt", errors)
             if isinstance(raw_receipt, dict):
                 check_ref(raw_receipt.get("stdout"), "query_raw_stdout", errors)
                 check_ref(raw_receipt.get("stderr"), "query_raw_stderr", errors)
-                if raw_receipt.get("returncode") != 0:
-                    errors.append("query_raw_returncode_nonzero")
-                if not raw_receipt.get("projected_stable_code_ids"):
-                    errors.append("query_no_stable_code_ids")
                 if isinstance(identity, dict):
                     if raw_receipt.get("root") != identity.get("root"):
                         errors.append("query_root_mismatch")
                     if raw_receipt.get("cache_manifest_sha256") != identity.get("cache_manifest_sha256"):
                         errors.append("query_cache_identity_mismatch")
+                    if raw_receipt.get("repository_identity") != identity.get("live_repository_identity"):
+                        errors.append("query_repository_identity_mismatch")
             wrapper_path, wrapper_bytes = check_ref(query.get("wrapper_stdout"), "query_wrapper_stdout_repeat", errors)
             del wrapper_path
             query_projection = wrapper_bytes or b""
-            if wrapper_bytes is not None and runner.READY_SENTINEL.encode() not in wrapper_bytes:
-                errors.append("query_projection_missing_exact_readiness")
-            if wrapper_bytes is not None:
-                try:
-                    projected_ids = runner.stable_code_ids(wrapper_bytes.decode("utf-8", errors="strict"))
-                except UnicodeError:
-                    projected_ids = []
-                    errors.append("query_projection_not_utf8")
-                if not isinstance(raw_receipt, dict) or raw_receipt.get("projected_stable_code_ids") != projected_ids:
-                    errors.append("query_projected_ids_not_reproducible")
-                if query.get("projected_stable_code_ids") != projected_ids:
-                    errors.append("query_evidence_projected_ids_mismatch")
-            if isinstance(raw_receipt, dict):
-                raw_path, raw_bytes = check_ref(raw_receipt.get("stdout"), "query_raw_stdout_repeat", errors)
-                del raw_path
-                if raw_bytes is not None and runner.READY_SENTINEL.encode() not in raw_bytes:
-                    errors.append("query_raw_missing_exact_readiness")
+            if query.get("succeeded") is True:
+                if pre_model_failure or wrapper_returncode != 0 or query.get("failure") is not None:
+                    errors.append("query_success_state_invalid")
+                if not isinstance(raw_receipt, dict):
+                    errors.append("query_success_missing_raw_receipt")
+                else:
+                    if raw_receipt.get("returncode") != 0:
+                        errors.append("query_raw_returncode_nonzero")
+                    if not raw_receipt.get("projected_stable_code_ids"):
+                        errors.append("query_no_stable_code_ids")
+                if wrapper_bytes is not None and runner.READY_SENTINEL.encode() not in wrapper_bytes:
+                    errors.append("query_projection_missing_exact_readiness")
+                if wrapper_bytes is not None:
+                    try:
+                        projected_ids = runner.stable_code_ids(wrapper_bytes.decode("utf-8", errors="strict"))
+                    except UnicodeError:
+                        projected_ids = []
+                        errors.append("query_projection_not_utf8")
+                    if not isinstance(raw_receipt, dict) or raw_receipt.get("projected_stable_code_ids") != projected_ids:
+                        errors.append("query_projected_ids_not_reproducible")
+                    if query.get("projected_stable_code_ids") != projected_ids:
+                        errors.append("query_evidence_projected_ids_mismatch")
+                if isinstance(raw_receipt, dict):
+                    raw_path, raw_bytes = check_ref(raw_receipt.get("stdout"), "query_raw_stdout_repeat", errors)
+                    del raw_path
+                    if raw_bytes is not None and runner.READY_SENTINEL.encode() not in raw_bytes:
+                        errors.append("query_raw_missing_exact_readiness")
+            else:
+                if not pre_model_failure:
+                    errors.append("query_failure_outside_pre_model_episode")
+                if not isinstance(query.get("failure"), str) or not query["failure"]:
+                    errors.append("query_failure_reason_missing")
+                receipt_errors = receipt.get("errors")
+                if not isinstance(receipt_errors, list) or not any(
+                    isinstance(item, str) and item.startswith("rna_preprocessing_failed:")
+                    for item in receipt_errors
+                ):
+                    errors.append("query_failure_not_bound_to_episode_error")
 
     stdout_summary: dict[str, Any] = {}
     if receipt.get("stdout") is not None:
@@ -247,11 +371,16 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             stdout_summary = runner.safe_summary(stdout_path)
     if receipt.get("stderr") is not None:
         check_ref(receipt.get("stderr"), "stderr", errors)
-    for index, transcript in enumerate(receipt.get("transcripts", [])):
+    transcripts = receipt.get("transcripts", [])
+    if not isinstance(transcripts, list):
+        errors.append("transcripts_invalid")
+        transcripts = []
+    for index, transcript in enumerate(transcripts):
         if not isinstance(transcript, dict):
             errors.append(f"transcript_{index}_invalid")
         else:
             check_ref(transcript.get("retained"), f"transcript_{index}", errors)
+    observed_provider_responses = runner.transcript_provider_response_count(transcripts)
 
     actor: dict[str, Any] = {}
     if receipt.get("actor_tool_ledger") is not None:
@@ -274,8 +403,20 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             _, loaded_config = load_ref_json(supervisor["config"], "supervisor_config", errors)
             if isinstance(loaded_config, dict):
                 supervisor_config = loaded_config
+                if loaded_config.get("schema_version") != "rna-supervisor-config-v3":
+                    errors.append("supervisor_config_schema_mismatch")
                 if receipt.get("runtime_identity", {}).get("sha256") != loaded_config.get("expected_identity_sha256"):
                     errors.append("supervisor_identity_mismatch")
+                if isinstance(identity, dict) and loaded_config.get("expected_repository_identity") != identity.get("expected_repository_identity"):
+                    errors.append("supervisor_repository_identity_mismatch")
+                if isinstance(query, dict):
+                    expected_query_command = [
+                        loaded_config.get("query_wrapper"),
+                        "--query-sha256",
+                        loaded_config.get("expected_query_sha256"),
+                    ]
+                    if query.get("wrapper_command") != expected_query_command:
+                        errors.append("query_wrapper_command_mismatch")
         if supervisor.get("common_hook_ledger") is not None:
             common_path, _ = check_ref(supervisor["common_hook_ledger"], "common_hook_ledger", errors)
             if common_path:
@@ -339,26 +480,14 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                 fatal_seen = True
 
     ledger = receipt.get("token_ledger")
-    if not isinstance(ledger, dict):
-        errors.append("token_ledger_invalid")
-    else:
-        if ledger.get("schema_version") != "issue825-token-ledger-v2":
-            errors.append("token_ledger_schema_invalid")
-        if ledger.get("valid") is not True or ledger.get("errors") != []:
-            errors.append("token_usage_not_observed")
-        for key in (
-            "input_tokens", "output_tokens", "input_plus_output_tokens",
-            "cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens",
-        ):
-            if type(ledger.get(key)) is not int or ledger[key] < 0:
-                errors.append(f"token_{key}_invalid")
-        if type(ledger.get("provider_requests")) is not int or ledger["provider_requests"] < 0:
-            errors.append("token_provider_requests_invalid")
-        if not errors or all(not item.startswith("token_") for item in errors):
-            if ledger.get("input_plus_output_tokens") != ledger.get("input_tokens", 0) + ledger.get("output_tokens", 0):
-                errors.append("token_total_double_count_or_mismatch")
+    validate_token_ledger(ledger, receipt, errors)
+    if isinstance(ledger, dict):
         if stdout_summary.get("valid_json") is True and receipt.get("stdout") is not None:
-            expected = runner.token_ledger(stdout_summary)
+            expected = runner.token_ledger(
+                stdout_summary,
+                model_invoked=True,
+                provider_responses=observed_provider_responses,
+            )
             if any(ledger.get(key) != expected.get(key) for key in expected if key != "schema_version"):
                 errors.append("token_ledger_not_reproducible")
 
@@ -424,22 +553,24 @@ def verify_run(output_root: Path) -> dict[str, Any]:
     by_arm: dict[str, dict[str, Any]] = {}
     for arm in ("A", "T"):
         selected = [item for item in results if item.get("arm") == arm]
+        token_totals = [
+            (item.get("token_ledger") or {}).get("provider_total_tokens")
+            for item in selected
+        ]
         by_arm[arm] = {
             "episodes": len(selected),
             "verifier_clean": sum(item.get("evidence_complete") is True for item in selected),
             "policy_compliant": sum(item.get("policy_compliant") is True for item in selected),
             "evaluator_authorized": sum(item.get("evaluator_authorized") is True for item in selected),
-            "input_plus_output_tokens": sum(
-                value if type(value) is int else 0
-                for value in (
-                    (item.get("token_ledger") or {}).get("input_plus_output_tokens")
-                    for item in selected
-                )
+            "provider_total_tokens": (
+                sum(token_totals)
+                if token_totals and all(type(value) is int for value in token_totals)
+                else None
             ),
             "combined_pre_evaluator_wall_seconds": sum((item.get("timing_ledger") or {}).get("combined_pre_evaluator_wall_seconds", 0) for item in selected),
         }
     return {
-        "schema_version": "issue825-selector-evidence-aggregate-v1",
+        "schema_version": "issue825-selector-evidence-aggregate-v2",
         "output_root": str(output_root.resolve()),
         "episodes": results,
         "by_arm": by_arm,
