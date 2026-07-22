@@ -38,6 +38,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
         .len()
         .saturating_mul(2)
         .saturating_add(plan.candidate_audit.len())
+        .saturating_add(plan.records.len())
         .saturating_add(1);
     for _ in 0..attempts {
         let (text, accounting) = render_once(&plan)?;
@@ -50,6 +51,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
         }
         if !shrink_last_body(&mut plan, &accounting.total)
             && !shrink_last_candidate_audit(&mut plan)
+            && !shrink_last_record_evidence(&mut plan)
         {
             return Err(RenderError::BudgetTooSmall {
                 minimum: accounting.total,
@@ -60,10 +62,10 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
 }
 
 fn shrink_last_candidate_audit(plan: &mut ProjectionPlan) -> bool {
-    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.pop().is_none()
-    {
+    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.len() <= 1 {
         return false;
     }
+    plan.candidate_audit.pop();
     let detail = "candidate audit truncated to satisfy the final rendered budget; retry with a larger budget for the complete audit";
     if !plan.omissions.iter().any(|omission| {
         omission.record_id.is_none()
@@ -73,6 +75,43 @@ fn shrink_last_candidate_audit(plan: &mut ProjectionPlan) -> bool {
     }) {
         plan.omissions.push(ProjectionOmission {
             record_id: None,
+            source: None,
+            code: OmissionCode::RenderBudget,
+            detail: detail.to_string(),
+        });
+        plan.omissions.sort_by(|a, b| {
+            a.record_id
+                .cmp(&b.record_id)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.detail.cmp(&b.detail))
+        });
+    }
+    true
+}
+
+fn shrink_last_record_evidence(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.projection != SearchProjection::Evidence {
+        return false;
+    }
+    let Some(record) = plan
+        .records
+        .iter_mut()
+        .rev()
+        .find(|record| record.evidence != SelectionEvidence::default())
+    else {
+        return false;
+    };
+    let record_id = record.identity.node_id.clone();
+    record.evidence = SelectionEvidence::default();
+    let detail = "selected record audit detail omitted to satisfy the final rendered budget; hydrate evidence for the complete audit";
+    if !plan.omissions.iter().any(|omission| {
+        omission.record_id.as_deref() == Some(record_id.as_str())
+            && omission.code == OmissionCode::RenderBudget
+            && omission.detail == detail
+    }) {
+        plan.omissions.push(ProjectionOmission {
+            record_id: Some(record_id),
             source: None,
             code: OmissionCode::RenderBudget,
             detail: detail.to_string(),
@@ -843,6 +882,44 @@ mod tests {
         assert!(rendered.text.contains("candidate audit truncated"));
         assert!(!rendered.plan.candidate_audit.is_empty());
         assert!(rendered.plan.candidate_audit.len() < 100);
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn evidence_budget_preserves_selected_identities_while_omitting_duplicate_audit_detail() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(6_000);
+        input.spans.clear();
+        input.records = (0..8)
+            .map(|rank| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("selected-{rank}");
+                record.evidence.diagnostics.insert(
+                    "complete_audit".into(),
+                    format!("record-{rank}-").repeat(120),
+                );
+                record
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.text.len() <= 6_000);
+        assert_eq!(rendered.plan.records.len(), 8);
+        assert_eq!(rendered.plan.candidate_audit.len(), 1);
+        assert!(
+            rendered
+                .plan
+                .records
+                .iter()
+                .any(|record| record.evidence == SelectionEvidence::default())
+        );
+        assert!(
+            rendered
+                .text
+                .contains("selected record audit detail omitted")
+        );
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
