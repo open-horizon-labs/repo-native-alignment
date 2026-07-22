@@ -1,14 +1,14 @@
 {
   "schema_version": "issue825-treatment-registration-v3",
-  "state": "corrected_postfix_setup_qualification_frozen_before_any_v3_model_call",
-  "frozen_at_utc": "2026-07-22T21:50:34Z",
+  "state": "corrected_graph_terminal_setup_qualification_frozen_before_attempt_7",
+  "frozen_at_utc": "2026-07-22T22:14:17Z",
   "issue": 825,
   "pull_request": 826,
   "supersedes": {
-    "registration_commit": "1cd0d5a977253c0cace18121c93d11850464bbe8",
-    "registration_sha256": "0a1603eb9f24c28dd5c3b407f2f86b8945ca5e1a9666b0753121d8125eb6b1cd",
-    "selection_commit": "429784cc89cfec8ee01256ae13c865cea51009c2",
-    "reason": "attempt 4 exposed a generic pre-model repository-origin identity defect and incorrect provider token semantics; its two treatment models never started, its evidence remains immutable, and the same-case retry is qualification only"
+    "registration_commit": "2fca6bbab853092445a4b66280c08feeaa6a53c6",
+    "registration_sha256": "25fa15510069bf545704d819fb6241e135c6218d081dec996de5d90b8d037c35",
+    "selection_commit": "627c68b233df5bbc2b8080adfc4550e30d5ca83f",
+    "reason": "attempt 6 proved canonical repository identity and exact-title READY acquisition, then exposed a setup defect: the supervisor incorrectly required the strict hybrid acquisition sentinel in node-mode graph output. Both treatment episodes were terminated on their first required traversal before a valid treatment response or patch; all attempt 6 evidence remains immutable, and the same-case attempt 7 retry is qualification only"
   },
   "issue_body_sha256": "870ed49d8410a0631b654c9f6281db6493cbcb733fe4e647af80423db1fa274d",
   "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
@@ -84,6 +84,7 @@
     "tools_after_valid_first_response": "ordinary identical Bash/Edit/Read/Write/Glob/Grep and visible-test surface",
     "tools_after_error": "none; hook denies and runner terminates",
     "later_rna_calls": "optional; same status rules",
+    "rna_traversal_validation": "the bound exact-title acquisition must retain the exact strict READY sentinel; each node-mode graph response must carry one valid Index terminal, one Capability readiness section, and one ready benchmark per-file completeness terminal with full nonzero coverage, zero violations, and a digest matching the bound fresh-reopen readiness report",
     "path_provenance_restriction_after_valid_response": false,
     "common_checkout_confinement": "identical common_supervisor.py hook for A and T; the same pair-private wrapper path is present for both arms",
     "manual_or_llm_rna_fallback": false
@@ -92,7 +93,7 @@
     "system_prefix_sha256": "a23028ce7d62befac18cf0316f2af8d7e201f55acb40095f32b4a737f0754df1",
     "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
     "rna_query_sha256": "84725ed5eb69f1d11541b3a3ef7f60bb5e69888386b51b1f5aba27bc5f828370",
-    "rna_traverse_sha256": "74040d02691778a512e80a80fc572b723c145dade93ceace68a6df2140be7767",
+    "rna_traverse_sha256": "5574ff5f4267a2bea9c2c81a810fb3e57198f6c6825bf37f6a25ec9bd5113f5c",
     "tool_supervisor_sha256": "316bf70b52c817402ad0813a3f665f15782fb08ab10d70f65d571d9bee7533a3",
     "supervisor_template_sha256": "f3229d0768cc7032bcf6eb000794c662c6253e017b817400bb8e4518cd1c0749",
     "claude_settings_template_sha256": "04a5b9b0fe65bceb4f4bfff9868f6a97197805dca76c6d0f2faebc30126f3634",
@@ -105,7 +106,7 @@
     "evaluator_runner_sha256": "7c52bc67bb67ef018c1f94ded357bb11e9c24d6dd59b80b4a500ffe52fad74d6",
     "evaluator_plan_template_sha256": "acf42b47270a81f9db17fec37f5c9ff05fb127e047a3390dec229b0077efa970",
     "result_selector_sha256": "87ede78bfb3a7910eab63951c021760ce1c75ffd8bb0ff4efb62c294479eaf06",
-    "selector_harness_tests_sha256": "3af21ecebfbf2fb3da055706e0f2f6926a3eba5dc91fc6164eb672130a2cf9e7",
+    "selector_harness_tests_sha256": "8699e4eacdd4bc38bd869f691779d7f85224e46c7f5702a40521fc8b6177f204",
     "evaluator_tests_sha256": "052858fffaedac6e32d906ab5bf4334fd1fa671053102d3dfb3e72ac6047df29"
   },
   "cache_preparation": {
@@ -123,6 +124,7 @@
     "evaluator_feedback_to_model": false,
     "compliant_no_patch": "unresolved; no evaluator",
     "treatment_nonadherence": "unresolved intention-to-treat; no evaluator; no retry",
+    "setup_failure_retry": "a retained harness or environment failure before a valid treatment traversal response may be corrected and rerun only as a new immutable qualification attempt; it is not selection evidence",
     "retain_all_failures": true
   },
   "selection": {

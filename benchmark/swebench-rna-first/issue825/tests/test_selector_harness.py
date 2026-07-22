@@ -96,7 +96,13 @@ if '--node' in sys.argv:
         print('  `foo.py:helper:function`')
     print('*Index: 2 symbols · schema v1*')
     print('### Capability readiness')
-    print(ready)
+    print('- **extracted graph / exact search**: ready — 2 symbols available without LSP or embeddings')
+    if mode == 'degraded_completeness':
+        print('- **benchmark per-file LSP completeness**: partial/degraded — 1/2 included files covered; 1 violation(s); digest=' + 'a' * 64)
+    elif mode == 'malformed_completeness':
+        print('- **benchmark per-file LSP completeness**: ready — 1/2 included files covered; 0 violation(s); digest=' + 'a' * 64)
+    else:
+        print('- **benchmark per-file LSP completeness**: ready — 1/1 included files covered; 0 violation(s); digest=' + 'a' * 64)
 else:
     print('## Search: "Bug title"')
     print('- **function** `target` `foo.py`:1-1')
@@ -125,7 +131,14 @@ else:
             "operational_cache_inventory_sha256": self.cache_inventory_sha256,
         }))
         self.readiness = root / "readiness.json"
-        self.readiness.write_bytes(canonical({"status": "READY"}))
+        self.readiness.write_bytes(canonical({
+            "status": "READY",
+            "readiness": {
+                "ready": True,
+                "compatibility_violations": [],
+                "report_digest": "a" * 64,
+            },
+        }))
         self.identity = self.evidence / "identity.json"
         identity = {
             "schema_version": "issue825-runtime-identity-v2",
@@ -325,6 +338,33 @@ class RnaWrapperTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 state = json.loads(Path(fixture.config["state"]).read_text())
                 self.assertEqual(state["first_traversal_status"], expected)
+                raw_node_output = (fixture.evidence / "rna-events/0001.stdout").read_text()
+                self.assertNotIn(run_selector.READY_SENTINEL, raw_node_output)
+                receipt = json.loads((fixture.evidence / "rna-events/0001.json").read_text())
+                self.assertEqual(receipt["benchmark_completeness"], {
+                    "status": "ready",
+                    "covered_files": 1,
+                    "total_files": 1,
+                    "violations": 0,
+                    "report_digest": "a" * 64,
+                })
+
+    def test_node_traversal_rejects_degraded_or_incomplete_benchmark_coverage(self):
+        for mode, reason in (
+            ("degraded_completeness", "benchmark_completeness_not_ready"),
+            ("malformed_completeness", "benchmark_completeness_coverage_mismatch"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                fixture = self.fixture(tmp)
+                result = fixture.invoke(
+                    fixture.wrapper,
+                    ["--node", "foo.py:target:function", "--mode", "neighbors"],
+                    mode=mode,
+                )
+                self.assertEqual(result.returncode, 43)
+                self.assertIn(reason.encode(), result.stderr)
+                state = json.loads(Path(fixture.config["state"]).read_text())
+                self.assertTrue(state["fatal"])
 
     def test_uninjected_first_fails_and_freezes_later_tools(self):
         with tempfile.TemporaryDirectory() as tmp:

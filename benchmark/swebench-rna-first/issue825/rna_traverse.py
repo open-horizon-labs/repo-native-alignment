@@ -18,6 +18,13 @@ HERE = Path(__file__).resolve().parent.parent
 CONFIG = json.loads((HERE / "config/supervisor.json").read_text())
 EMPTY_RE = re.compile(r"^No (?:dependents|neighbors) found for `[^`]+` within [0-9]+ hops\.$")
 READY = "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
+INDEX_RE = re.compile(r"^\*Index: [1-9][0-9]* symbols .* schema v[0-9]+.*\*$")
+BENCHMARK_COMPLETENESS_PREFIX = "- **benchmark per-file LSP completeness**:"
+BENCHMARK_COMPLETENESS_RE = re.compile(
+    r"^- \*\*benchmark per-file LSP completeness\*\*: ready — "
+    r"(?P<covered>[0-9]+)/(?P<total>[0-9]+) included files covered; "
+    r"0 violation\(s\); digest=(?P<digest>[0-9a-f]{64})$"
+)
 CODE_KINDS = {
     "class", "const", "enum", "function", "interface", "method", "module",
     "struct", "trait", "type", "type_alias", "union",
@@ -141,6 +148,51 @@ def stable_code_ids(text: str) -> list[str]:
     return sorted(ids)
 
 
+def bound_readiness_report_digest(identity: dict) -> str:
+    ref = identity["readiness_report"]
+    report = json.loads(Path(ref["path"]).read_text(encoding="utf-8", errors="strict"))
+    if report.get("status") != "READY":
+        raise ValueError("readiness_report_status")
+    readiness = report.get("readiness")
+    if not isinstance(readiness, dict) or readiness.get("ready") is not True:
+        raise ValueError("readiness_report_not_ready")
+    if readiness.get("compatibility_violations") != []:
+        raise ValueError("readiness_report_compatibility_violations")
+    digest = readiness.get("report_digest")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("readiness_report_digest")
+    return digest
+
+
+def graph_terminal_completeness(text: str, expected_digest: str) -> dict:
+    lines = text.splitlines()
+    index_lines = [line for line in lines if INDEX_RE.fullmatch(line)]
+    if len(index_lines) != 1 or lines.count("### Capability readiness") != 1:
+        raise ValueError("missing_terminal_identity")
+    completeness_lines = [
+        line for line in lines if line.startswith(BENCHMARK_COMPLETENESS_PREFIX)
+    ]
+    if len(completeness_lines) != 1:
+        raise ValueError("benchmark_completeness_missing_or_ambiguous")
+    match = BENCHMARK_COMPLETENESS_RE.fullmatch(completeness_lines[0])
+    if match is None:
+        raise ValueError("benchmark_completeness_not_ready")
+    covered = int(match.group("covered"))
+    total = int(match.group("total"))
+    if total <= 0 or covered != total:
+        raise ValueError("benchmark_completeness_coverage_mismatch")
+    digest = match.group("digest")
+    if digest != expected_digest:
+        raise ValueError("benchmark_completeness_digest_mismatch")
+    return {
+        "status": "ready",
+        "covered_files": covered,
+        "total_files": total,
+        "violations": 0,
+        "report_digest": digest,
+    }
+
+
 def require_identity() -> dict:
     if CONFIG.get("schema_version") != "rna-supervisor-config-v3":
         raise ValueError("supervisor_config_schema")
@@ -163,6 +215,7 @@ def require_identity() -> dict:
         "binary_sha256": CONFIG["expected_binary_sha256"],
         "cache_bindings_verified": True,
         "fresh_reopen_ready": True,
+        "readiness_sentinel": READY,
     }
     for key, value in expected.items():
         if identity.get(key) != value:
@@ -183,6 +236,7 @@ def require_identity() -> dict:
         bound = Path(ref["path"])
         if not bound.is_file() or bound.is_symlink() or bound.stat().st_size != ref["bytes"] or sha_file(bound) != ref["sha256"]:
             raise ValueError(f"identity_{name}_tampered")
+    identity["bound_readiness_report_digest"] = bound_readiness_report_digest(identity)
     require_live_state(identity)
     return identity
 
@@ -250,6 +304,8 @@ def main() -> int:
         ):
             raise ValueError("initial_response_identity")
         response = response_path.read_text(encoding="utf-8", errors="strict")
+        if not any(line.strip("`") == READY for line in response.splitlines()):
+            raise ValueError("initial_response_readiness")
         initial_ids = set(stable_code_ids(response))
         if initial_ids != set(CONFIG["initial_ids"]):
             raise ValueError("initial_response_ids")
@@ -298,10 +354,13 @@ def main() -> int:
 
     if result.returncode != 0:
         return fail(state, f"launcher_exit_{result.returncode}", receipt)
-    if "*Index:" not in text or "### Capability readiness" not in text:
-        return fail(state, "missing_terminal_identity", receipt)
-    if not any(line.strip("`") == READY for line in text.splitlines()):
-        return fail(state, "readiness_not_exact", receipt)
+    try:
+        completeness = graph_terminal_completeness(
+            text, identity["bound_readiness_report_digest"]
+        )
+    except ValueError as exc:
+        return fail(state, str(exc), receipt)
+    receipt["benchmark_completeness"] = completeness
 
     graph_start = text.find("## Graph")
     index_start = text.find("*Index:")
