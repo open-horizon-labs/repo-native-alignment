@@ -1752,6 +1752,13 @@ async fn async_main() -> anyhow::Result<()> {
     match cli.transport.as_str() {
         "stdio" => {
             init_tracing("warn", log_path.as_deref());
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                tracing::warn!("{}; MCP semantic search will be unavailable", msg);
+            })
+            .await
+            {
+                handler.embed_index.store(Arc::new(Some(embed_idx)));
+            }
             let transport = rust_mcp_sdk::StdioTransport::new(Default::default())
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
             let server = rust_mcp_sdk::mcp_server::server_runtime::create_server(
@@ -1770,6 +1777,13 @@ async fn async_main() -> anyhow::Result<()> {
         }
         "http" => {
             init_tracing("info", log_path.as_deref());
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                tracing::warn!("{}; MCP semantic search will be unavailable", msg);
+            })
+            .await
+            {
+                handler.embed_index.store(Arc::new(Some(embed_idx)));
+            }
             let server = rust_mcp_sdk::mcp_server::hyper_server::create_server(
                 server_details(),
                 handler.to_mcp_server_handler(),
