@@ -1,9 +1,15 @@
 {
-  "schema_version": "issue825-treatment-registration-v1",
-  "state": "treatment_frozen_before_fresh_case_selection",
-  "frozen_at_utc": "2026-07-22T16:33:05Z",
+  "schema_version": "issue825-treatment-registration-v2",
+  "state": "corrected_treatment_frozen_before_any_v2_case_selection",
+  "frozen_at_utc": "2026-07-22T17:29:39Z",
   "issue": 825,
   "pull_request": 826,
+  "supersedes": {
+    "registration_commit": "1ad44dac1e8610d075dcf893766eb642ac393fb3",
+    "registration_sha256": "1df182680c4f2f0cec64510e1832506bf7fa6888758579babc4a0d7d47a8249c",
+    "selection_commit": "67da51a17497b3ad09227687c00201e8c98be0b1",
+    "reason": "v1 omitted the complete prior-exposure population, selected an oracle/evaluator-exposed case, and did not enforce an identical ordinary confinement layer"
+  },
   "issue_body_sha256": "7fede739b15915f3b8752971c19a5afec276794e222d790bdf7c8aebd9943cbe",
   "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
   "dataset": {
@@ -16,17 +22,16 @@
   "selector": {
     "seed": "rna-first-sonnet-selector-v1",
     "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
+    "algorithm_version": "issue825-selector-v2",
     "pairs": 2,
     "schedule": "lower_rank_A_then_T; higher_rank_T_then_A; same_case_serial; maximum_two_cases_concurrent",
     "case_replacement_after_model_start": false,
-    "exclusions": [
-      {"instance_id":"astropy__astropy-13398","reason":"prior development/model/evaluator exposure"},
-      {"instance_id":"astropy__astropy-14369","reason":"prior development/model/evaluator exposure"},
-      {"instance_id":"astropy__astropy-8707","reason":"prior development/model/evaluator exposure"},
-      {"instance_id":"astropy__astropy-14096","reason":"prior development/model/evaluator exposure"},
-      {"instance_id":"django__django-15731","reason":"conservatively excluded because it was ranked before this byte-exact registration commit; no problem text/model/evaluator exposure"},
-      {"instance_id":"sympy__sympy-22714","reason":"conservatively excluded because it was ranked before this byte-exact registration commit; no problem text/model/evaluator exposure"}
-    ]
+    "exclusions_path": "benchmark/swebench-rna-first/issue825/exclusions.json",
+    "exclusions_file_sha256": "0077a1960a17fbbbf95d3debf6d2376148fbbaeb919fd8b80a94b4503f99cfd8",
+    "excluded_ids_sha256": "b83c1764828f9f3d9d2377b35c394a501a56bcd7d8336fffa1385717dd519f24",
+    "excluded_rows": 77,
+    "eligible_rows": 423,
+    "remaining_eligible_population_ranked_before_this_registration_commit": false
   },
   "rna_artifact": {
     "producer_commit": "d17eb5b063aef81d0d96fd2e84b684b4c7c6d97c",
@@ -62,6 +67,9 @@
     "result_limit": 10,
     "required_status": "READY",
     "required_capabilities": ["embeddings=true","retrieval=hybrid","rerank=true","metal=true","fallback=false"],
+    "required_identity_binding": ["repository_commit","repository_tree","root","producer_commit","rna_binary_sha256","rna_launcher_sha256","cache_archive_sha256","cache_manifest_sha256","operational_cache_inventory_sha256"],
+    "minimum_stable_code_node_ids": 1,
+    "raw_cli_bytes_preserved": true,
     "valid_empty_title_results": false,
     "manual_or_llm_replacement": false
   },
@@ -77,17 +85,38 @@
     "tools_after_error": "none; hook denies and runner terminates",
     "later_rna_calls": "optional; same status rules",
     "path_provenance_restriction_after_valid_response": false,
+    "common_checkout_confinement": "identical common_supervisor.py hook for A and T; the same pair-private wrapper path is present for both arms",
     "manual_or_llm_rna_fallback": false
   },
   "registered_files": {
     "system_prefix_sha256": "a23028ce7d62befac18cf0316f2af8d7e201f55acb40095f32b4a737f0754df1",
     "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
-    "rna_query_sha256": "7f4c32d47d7d2ecc263acd8dac85a175f7bf7680231138f002dd017b18ce139a",
-    "rna_traverse_sha256": "11ef89a5526e6e520fe0f182ba42d2ece47f7fb020986c836ca7c8469070a800",
+    "rna_query_sha256": "942dec08cf31c544a18e2dcee682602622d8d6264bfa3f5907b40304dd8ec395",
+    "rna_traverse_sha256": "81f29edcc953a66bbe846ee779a21c619780d3dbb521896a9e77965de353551f",
     "tool_supervisor_sha256": "316bf70b52c817402ad0813a3f665f15782fb08ab10d70f65d571d9bee7533a3",
-    "supervisor_template_sha256": "390c7fbeffcb9dde3369736d455cc71cfd6ced677be752a4fc34444cde9c465a",
-    "claude_settings_template_sha256": "31d6236bd008ed228de596ebf036b318e9b664f8adb242938088966a0673565d",
-    "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e"
+    "supervisor_template_sha256": "0b46e01cf4f047774b8e3479e9e177db9375c71314f34819684ca45c67fb5222",
+    "claude_settings_template_sha256": "04a5b9b0fe65bceb4f4bfff9868f6a97197805dca76c6d0f2faebc30126f3634",
+    "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e",
+    "common_supervisor_sha256": "863642fbab706405571c3b606ed3f13dd67fdf62151201492448f19d01d4692b",
+    "case_selector_sha256": "5fdb73447f64a3f739c63143a05d11680444ae57285f00a9da75cede81e8464e",
+    "runner_sha256": "0a907b71c30c2874ebd6445cfbe2f92c474b51466255666bb276432c305faab5",
+    "verifier_sha256": "d38a25b69b4e0ad64831bfd065a2a5e4297741d24d96d5e84427ea92d8286589",
+    "exclusions_sha256": "0077a1960a17fbbbf95d3debf6d2376148fbbaeb919fd8b80a94b4503f99cfd8",
+    "evaluator_runner_sha256": "0e45541dc8e1720a17c70f1f4d909a0e02d7ac07a21c0f8ee04d5227dbc554d2",
+    "evaluator_plan_template_sha256": "acf42b47270a81f9db17fec37f5c9ff05fb127e047a3390dec229b0077efa970",
+    "result_selector_sha256": "ed84e8e6dddaec194286ba865ebaeafcb7e74f6e410a641eca64792b33e72164",
+    "selector_harness_tests_sha256": "0943fbaecb9c5aa0d280646e0f6cb01df2d73dd3229159c9030138061e5629e0",
+    "evaluator_tests_sha256": "a4e064e45f20f78acb237a6358e2690a9491d0848c5fe7e0381410a5fc15d798"
+  },
+  "cache_preparation": {
+    "artifact": "exact successful PR 822 CI semantic bundle only",
+    "local_source_build_allowed": false,
+    "selected_case_mode": "cold exact-tree in-place index for each selected repository",
+    "scan_argv": ["--business-context","disabled","scan","--repo","<immutable-index-checkout>","--full","--timings"],
+    "fresh_process_readiness_required": true,
+    "live_checkout_and_operational_cache_inventory_revalidated_before_each_rna_call": true,
+    "strict_hybrid_metal_query_required": true,
+    "model_authorized_before_both_ready": false
   },
   "evaluation": {
     "official_swebench_once_per_policy_compliant_terminal_patch": true,

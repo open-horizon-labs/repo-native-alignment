@@ -17,6 +17,11 @@ import time
 HERE = Path(__file__).resolve().parent.parent
 CONFIG = json.loads((HERE / "config/supervisor.json").read_text())
 EMPTY_RE = re.compile(r"^No (?:dependents|neighbors) found for `[^`]+` within [0-9]+ hops\.$")
+READY = "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
+CODE_KINDS = {
+    "class", "const", "enum", "function", "interface", "method", "module",
+    "struct", "trait", "type", "type_alias", "union",
+}
 
 
 def canonical(value: object) -> bytes:
@@ -25,6 +30,124 @@ def canonical(value: object) -> bytes:
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cache_inventory_sha256(cache: Path) -> str:
+    if not cache.is_dir() or cache.is_symlink():
+        raise ValueError("operational_cache")
+    members: list[dict] = []
+    for path in sorted(cache.rglob("*"), key=lambda item: item.relative_to(cache).as_posix()):
+        relative = path.relative_to(cache).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"operational_cache_symlink:{relative}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"operational_cache_non_file:{relative}")
+        before = path.stat()
+        digest = sha_file(path)
+        after = path.stat()
+        if (
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+        ) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise ValueError(f"operational_cache_changed:{relative}")
+        members.append({"path": relative, "bytes": after.st_size, "sha256": digest})
+    if not members:
+        raise ValueError("operational_cache_empty")
+    return sha(canonical({
+        "schema_version": "issue825-operational-cache-inventory-v1",
+        "members": members,
+    }))
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"git_{'_'.join(args)}")
+    return result.stdout.decode("utf-8", errors="strict").strip()
+
+
+def require_live_state(identity: dict) -> None:
+    repo = Path(CONFIG["repo"])
+    if not repo.is_dir() or repo.is_symlink():
+        raise ValueError("live_repo")
+    if git(repo, "rev-parse", "HEAD") != CONFIG["expected_base_commit"]:
+        raise ValueError("live_HEAD")
+    if git(repo, "rev-parse", "HEAD^{tree}") != CONFIG["expected_base_tree"]:
+        raise ValueError("live_tree")
+    if git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("live_checkout_not_pristine")
+    observed = cache_inventory_sha256(repo / ".oh/.cache")
+    if observed != CONFIG["expected_cache_inventory_sha256"]:
+        raise ValueError("live_cache_inventory")
+    if identity.get("operational_cache_inventory_sha256") != observed:
+        raise ValueError("identity_cache_inventory")
+
+
+def stable_code_ids(text: str) -> list[str]:
+    ids: set[str] = set()
+    for candidate in re.findall(r"`([^`\r\n]+)`", text):
+        parts = candidate.rsplit(":", 1)
+        if len(parts) == 2 and parts[1] in CODE_KINDS and ":" in parts[0] and not any(ch.isspace() for ch in candidate):
+            ids.add(candidate)
+    return sorted(ids)
+
+
+def require_identity() -> dict:
+    path = Path(CONFIG["identity_receipt"])
+    if not path.is_file() or path.is_symlink() or sha_file(path) != CONFIG["expected_identity_sha256"]:
+        raise ValueError("identity_receipt")
+    identity = json.loads(path.read_text())
+    expected = {
+        "schema_version": "issue825-runtime-identity-v1",
+        "root": CONFIG["root"],
+        "base_commit": CONFIG["expected_base_commit"],
+        "base_tree": CONFIG["expected_base_tree"],
+        "producer_commit": CONFIG["expected_producer_commit"],
+        "cache_manifest_sha256": CONFIG["expected_cache_manifest_sha256"],
+        "cache_archive_sha256": CONFIG["expected_cache_archive_sha256"],
+        "operational_cache_inventory_sha256": CONFIG["expected_cache_inventory_sha256"],
+        "launcher_sha256": CONFIG["expected_launcher_sha256"],
+        "binary_sha256": CONFIG["expected_binary_sha256"],
+        "cache_bindings_verified": True,
+        "fresh_reopen_ready": True,
+    }
+    for key, value in expected.items():
+        if identity.get(key) != value:
+            raise ValueError(f"identity_{key}")
+    if Path(identity.get("index_checkout", "")).resolve(strict=True) != Path(CONFIG["repo"]).resolve(strict=True):
+        raise ValueError("identity_index_checkout")
+    if Path(identity.get("launcher_path", "")).resolve(strict=True) != Path(CONFIG["launcher"]).resolve(strict=True):
+        raise ValueError("identity_launcher_path")
+    if sha_file(Path(CONFIG["launcher"])) != CONFIG["expected_launcher_sha256"]:
+        raise ValueError("launcher_tampered")
+    binary = Path(identity.get("binary_path", ""))
+    if not binary.is_file() or binary.is_symlink() or sha_file(binary) != CONFIG["expected_binary_sha256"]:
+        raise ValueError("binary_tampered")
+    for name in ("cache_manifest", "cache_verification_receipt", "readiness_report"):
+        ref = identity.get(name)
+        if not isinstance(ref, dict) or set(ref) != {"path", "sha256", "bytes"}:
+            raise ValueError(f"identity_{name}")
+        bound = Path(ref["path"])
+        if not bound.is_file() or bound.is_symlink() or bound.stat().st_size != ref["bytes"] or sha_file(bound) != ref["sha256"]:
+            raise ValueError(f"identity_{name}_tampered")
+    require_live_state(identity)
+    return identity
 
 
 def read_state() -> dict:
@@ -74,9 +197,27 @@ def main() -> int:
         print("RNA_STATUS=ERROR reason=episode_already_fatal", file=sys.stderr)
         return 43
 
+    try:
+        identity = require_identity()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return fail(state, f"identity:{exc}")
+
     sequence = int(state.get("rna_calls", 0)) + 1
     state["rna_calls"] = sequence
-    initial_ids = set(CONFIG["initial_ids"])
+    response_path = Path(CONFIG["initial_response"])
+    try:
+        if (
+            not response_path.is_file()
+            or response_path.is_symlink()
+            or sha_file(response_path) != CONFIG["initial_response_sha256"]
+        ):
+            raise ValueError("initial_response_identity")
+        response = response_path.read_text(encoding="utf-8", errors="strict")
+        initial_ids = set(stable_code_ids(response))
+        if initial_ids != set(CONFIG["initial_ids"]):
+            raise ValueError("initial_response_ids")
+    except (OSError, UnicodeError, ValueError) as exc:
+        return fail(state, f"injected_response:{exc}")
     if not state.get("first_traversal_succeeded"):
         if args.mode != "neighbors":
             receipt = {"schema_version":"rna-traversal-receipt-v1","sequence":sequence,"node":args.node,"mode":args.mode,"argv":[],"returncode":None,"elapsed_seconds":0.0,"stdout_bytes":0,"stdout_sha256":sha(b""),"stderr_bytes":0,"stderr_sha256":sha(b""),"_stdout":b"","_stderr":b""}
@@ -102,6 +243,12 @@ def main() -> int:
         "mode": args.mode,
         "argv": argv,
         "returncode": result.returncode,
+        "root": CONFIG["root"],
+        "identity_sha256": CONFIG["expected_identity_sha256"],
+        "cache_manifest_sha256": identity["cache_manifest_sha256"],
+        "cache_archive_sha256": identity["cache_archive_sha256"],
+        "launcher_sha256": identity["launcher_sha256"],
+        "binary_sha256": identity["binary_sha256"],
         "elapsed_seconds": elapsed,
         "stdout_bytes": len(stdout),
         "stdout_sha256": sha(stdout),
@@ -115,6 +262,8 @@ def main() -> int:
         return fail(state, f"launcher_exit_{result.returncode}", receipt)
     if "*Index:" not in text or "### Capability readiness" not in text:
         return fail(state, "missing_terminal_identity", receipt)
+    if not any(line.strip("`") == READY for line in text.splitlines()):
+        return fail(state, "readiness_not_exact", receipt)
 
     graph_start = text.find("## Graph")
     index_start = text.find("*Index:")
