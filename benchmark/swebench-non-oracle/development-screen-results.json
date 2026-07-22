@@ -1,0 +1,285 @@
+{
+  "schema": "swebench-non-oracle-development-screen-results-v1",
+  "issue": 816,
+  "status": "COMPLETE_ELIGIBLE_SUBSET",
+  "registration": {
+    "commit": "ff240a9fe658bbeb155b7f9d2949845d9db297e0",
+    "document_sha256": "0bb3be243132bf061e28ae69cefc7e872cb758b920fc1825475007e9b25fb22a",
+    "run_manifest_sha256": "fd2be798f860e77cc81b7ac48ff4992e0528681c695be2feb2b6320218f30648"
+  },
+  "decision": {
+    "eligible_arm": "A",
+    "treatment": "no_rna_treatment",
+    "selection_order": [
+      "official_resolution",
+      "pass_to_pass_regressions",
+      "total_tokens",
+      "total_cost_usd",
+      "end_to_end_wall_ms"
+    ],
+    "reason": "A and B tied at one of two resolved cases and five PASS_TO_PASS regressions; A won the third registered criterion with 10,677,364 versus 14,004,672 total tokens.",
+    "claim_boundary": "This rejects the registered passive packet-injection treatment. It does not establish that an RNA-directed tool-usage policy is ineffective because observable evidence did not establish B treatment uptake."
+  },
+  "evidence": {
+    "root": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z",
+    "final_manifest_sha256": "c6d0f89852e6b6767c20af4b5925f5f8e9f2c83639d4d0e857ebda26e5549f64",
+    "final_report_sha256": "120aeb81d61c9287e45c1f9d6a048c2eea773b160211fbbe271e0d6de51f03a5",
+    "cplus_diagnostic_sidecar_sha256": "075b5b3a89befb30f260473a442084074e08ba0187ebc86df4059ec8733ee41f",
+    "cplus_infrastructure_failure_sha256": "d4258b84c51f1471aa1d3a05f27e30739c18141f5673221f25665c211a4f76f9",
+    "evaluator_batch_receipt_sha256": "1596abcdba68f6c52488c83cd638b49c277b966f50e43ae2d7518ceef6a928d2",
+    "evaluator_script_sha256": "d71f2f8bd417180ae7448107fb9a7678b6ea241d84c93ac478d86c3dd07cd7b4",
+    "evaluator_plan_sha256": "a745867b03a3ff073fbc047d243a758882e8af7821c62265b7f51e22917b0e78",
+    "aggregator_sha256": "e99e525bc04197e299e9c9f488b271ddefbe66c19966d9c7ee2ad14bb153232c",
+    "aggregator_regression_sha256": "d4dd7bc444342ee201d3c013772a47f5a24c9deebaf8082bb12403601320ae5b",
+    "rna_uptake_audit_sha256": "8be7f475a2c98bf4abf5c53149934f9a44d6c696239d9f1e292cf3c1102f6e55"
+  },
+  "official_evaluator": {
+    "authorized": 4,
+    "started": 4,
+    "recorded": 4,
+    "infrastructure_failures": 0,
+    "max_parallel": 2,
+    "same_case_serialized": true,
+    "remaining_containers": 0,
+    "fresh_harness_review": "APPROVE"
+  },
+  "episodes": [
+    {
+      "instance_id": "astropy__astropy-13398",
+      "arm": "A",
+      "eligible": true,
+      "run_status": "complete",
+      "resolved": false,
+      "fail_to_pass": {"passed": 0, "total": 4},
+      "pass_to_pass": {"passed": 63, "total": 68, "regressions": 5},
+      "turns": 103,
+      "tokens": {"input": 2339, "cache_creation": 149551, "cache_read": 9012434, "output": 42361, "total": 9206685},
+      "cost_usd": "4.2390002",
+      "model_wall_ms": 719997,
+      "rna_work_ms": 0,
+      "end_to_end_wall_ms": 719997,
+      "patch_sha256": "eb566b529439c4dc55f1f49318fdf1e3f5aca08dd48b538d0f0e12f0177b1060",
+      "official_report_sha256": "584cf4388f61fa1327ca8650902c895bf0ed11591e425e424d270a85ba44e211"
+    },
+    {
+      "instance_id": "astropy__astropy-13398",
+      "arm": "B",
+      "eligible": true,
+      "run_status": "registered_timeout_terminal_patch",
+      "resolved": false,
+      "fail_to_pass": {"passed": 0, "total": 4},
+      "pass_to_pass": {"passed": 63, "total": 68, "regressions": 5},
+      "turns": 100,
+      "tokens": {"input": 9149, "cache_creation": 193100, "cache_read": 10533804, "output": 79747, "total": 10815800},
+      "cost_usd": "5.5242812",
+      "model_wall_ms": 1199767,
+      "rna_work_ms": 28665,
+      "end_to_end_wall_ms": 1228432,
+      "model_receipt_sha256": "a8ffc0c0da4a041ccfb2c7da2ae5d5304a18dc1b5a5a7948d1d685b43b30444d",
+      "patch_sha256": "e1548dd95c8bc1a78ca4fb48cbc688d72cca1f156f7e360d2b3428e901ac8ca8",
+      "evaluator_receipt_sha256": "d50d2c53361f1249191ee4d373c32b48f18ec876ab95cefbe96f0035cd8e4838",
+      "official_report_sha256": "584cf4388f61fa1327ca8650902c895bf0ed11591e425e424d270a85ba44e211"
+    },
+    {
+      "instance_id": "astropy__astropy-13398",
+      "arm": "C+",
+      "eligible": false,
+      "run_status": "infrastructure_failed_before_revision",
+      "diagnostic_initial_patch_only": true,
+      "resolved": false,
+      "fail_to_pass": {"passed": 0, "total": 4},
+      "pass_to_pass": {"passed": 63, "total": 68, "regressions": 5},
+      "turns": 53,
+      "tokens": {"input": 18511, "cache_creation": 115820, "cache_read": 4003109, "output": 23559, "total": 4160999},
+      "cost_usd": "2.2677507",
+      "model_wall_ms": 399608,
+      "rna_work_ms": 377900,
+      "end_to_end_wall_ms": 777508,
+      "model_receipt_sha256": "a9de50ddedcb90d9a02f193a072f20d3dd824598137bc65942aeaa64cea3f19e",
+      "patch_sha256": "6323a7c68edd31f893c1e3dbbe273880be4185c9f881ae769f67cd4e87ffa5c5",
+      "evaluator_receipt_sha256": "331a9a08f004f2b291df9339caa84400f4be3dfda28139fa85068d391a215719",
+      "diagnostic_report_sha256": "584cf4388f61fa1327ca8650902c895bf0ed11591e425e424d270a85ba44e211"
+    },
+    {
+      "instance_id": "astropy__astropy-14096",
+      "arm": "A",
+      "eligible": true,
+      "run_status": "complete_transcript_recovery",
+      "resolved": true,
+      "fail_to_pass": {"passed": 1, "total": 1},
+      "pass_to_pass": {"passed": 426, "total": 426, "regressions": 0},
+      "turns": 43,
+      "tokens": {"input": 86, "cache_creation": 41727, "cache_read": 1413679, "output": 15187, "total": 1470679},
+      "cost_usd": "0.9025287",
+      "model_wall_ms": 364605,
+      "rna_work_ms": 0,
+      "end_to_end_wall_ms": 364605,
+      "patch_sha256": "c949f84a9828bd2c58282ad05fafd558b96d4ef1ef39378f5cb43fe07b48752e",
+      "official_report_sha256": "b83e0b1a3d3276f3a24051e581f4ba72819d4b0c40de92f1e39ed0bdfc7f148e"
+    },
+    {
+      "instance_id": "astropy__astropy-14096",
+      "arm": "B",
+      "eligible": true,
+      "run_status": "complete",
+      "resolved": true,
+      "fail_to_pass": {"passed": 1, "total": 1},
+      "pass_to_pass": {"passed": 426, "total": 426, "regressions": 0},
+      "turns": 46,
+      "tokens": {"input": 16328, "cache_creation": 95889, "cache_read": 3045899, "output": 30756, "total": 3188872},
+      "cost_usd": "1.9667457",
+      "model_wall_ms": 436676,
+      "rna_work_ms": 28799,
+      "end_to_end_wall_ms": 465475,
+      "model_receipt_sha256": "0829be8ba45d1aa988c9a4783fbdd5493464784840e5010952ac4bae2890a639",
+      "patch_sha256": "cda66d11ea8f20d14bcd9a4b411ad44f9541b5a55f6d9fdd267661cd9846ae2e",
+      "evaluator_receipt_sha256": "4b45620c71dc97f603956949b7099f545d6306ce6dabea882eb3d042426e8094",
+      "official_report_sha256": "b83e0b1a3d3276f3a24051e581f4ba72819d4b0c40de92f1e39ed0bdfc7f148e"
+    },
+    {
+      "instance_id": "astropy__astropy-14096",
+      "arm": "C+",
+      "eligible": false,
+      "run_status": "infrastructure_failed_before_revision",
+      "diagnostic_initial_patch_only": true,
+      "resolved": true,
+      "fail_to_pass": {"passed": 1, "total": 1},
+      "pass_to_pass": {"passed": 426, "total": 426, "regressions": 0},
+      "turns": 32,
+      "tokens": {"input": 28932, "cache_creation": 88893, "cache_read": 2155527, "output": 14304, "total": 2287656},
+      "cost_usd": "1.4234561",
+      "model_wall_ms": 228894,
+      "rna_work_ms": 384808,
+      "end_to_end_wall_ms": 613702,
+      "model_receipt_sha256": "11a261685eeeaac9377109c80c8540a3744133c5e4d93c2e50dfe0b1cf58938f",
+      "patch_sha256": "5ec12420bb6dbe63480bb5d071eb7cdcd490cc490ec0cae6739fc59bc273d25c",
+      "evaluator_receipt_sha256": "994d021070ee8731226d50f04c7e7c1c10e72f230424baed33d7d6bd448d345c",
+      "diagnostic_report_sha256": "b83e0b1a3d3276f3a24051e581f4ba72819d4b0c40de92f1e39ed0bdfc7f148e"
+    }
+  ],
+  "manipulation_check": {
+    "status": "UPTAKE_NOT_DEMONSTRATED",
+    "classification": "RNA packet delivered byte-for-byte, followed predominantly by checkout rediscovery; 13398 has weak circumstantial use only and 14096 use is not demonstrated",
+    "assistant_rna_context_citations": 0,
+    "outcome_identity": [
+      {
+        "instance_id": "astropy__astropy-13398",
+        "a_b_official_report_sha256_equal": true,
+        "official_report_sha256": "584cf4388f61fa1327ca8650902c895bf0ed11591e425e424d270a85ba44e211",
+        "a_b_total_tokens_equal": false,
+        "a_total_tokens": 9206685,
+        "b_total_tokens": 10815800,
+        "b_minus_a_total_tokens": 1609115
+      },
+      {
+        "instance_id": "astropy__astropy-14096",
+        "a_b_official_report_sha256_equal": true,
+        "official_report_sha256": "b83e0b1a3d3276f3a24051e581f4ba72819d4b0c40de92f1e39ed0bdfc7f148e",
+        "a_b_total_tokens_equal": false,
+        "a_total_tokens": 1470679,
+        "b_total_tokens": 3188872,
+        "b_minus_a_total_tokens": 1718193
+      }
+    ],
+    "tool_usage": [
+      {
+        "instance_id": "astropy__astropy-13398",
+        "arm": "A",
+        "total_tool_calls": 102,
+        "by_tool": {"Bash": 81, "Edit": 6, "Read": 14, "Write": 1},
+        "rna_cli_calls": 0,
+        "bash_grep_or_rg_calls": 20,
+        "bash_find_calls": 2,
+        "bash_cat_calls": 3,
+        "bash_sed_calls": 7,
+        "first_localization_action": "filesystem find for ITRS/AltAz/HADec frame files"
+      },
+      {
+        "instance_id": "astropy__astropy-13398",
+        "arm": "B",
+        "total_tool_calls": 98,
+        "by_tool": {"Bash": 72, "Edit": 11, "Read": 13, "Write": 2},
+        "rna_cli_calls": 0,
+        "bash_grep_or_rg_calls": 18,
+        "bash_find_calls": 11,
+        "bash_cat_calls": 5,
+        "bash_sed_calls": 2,
+        "first_localization_action": "filesystem find for ITRS/AltAz/HADec frame files"
+      },
+      {
+        "instance_id": "astropy__astropy-14096",
+        "arm": "A",
+        "total_tool_calls": 42,
+        "by_tool": {"Bash": 35, "Edit": 2, "Grep": 2, "Read": 3},
+        "rna_cli_calls": 0,
+        "bash_grep_or_rg_calls": 9,
+        "direct_grep_tool_calls": 2,
+        "combined_grep_or_rg_calls": 11,
+        "bash_find_calls": 3,
+        "bash_cat_calls": 3,
+        "bash_sed_calls": 0,
+        "first_localization_action": "grep __getattr__/__setattr__ in sky_coordinate.py"
+      },
+      {
+        "instance_id": "astropy__astropy-14096",
+        "arm": "B",
+        "total_tool_calls": 45,
+        "by_tool": {"Bash": 37, "Edit": 4, "Read": 4},
+        "rna_cli_calls": 0,
+        "bash_grep_or_rg_calls": 10,
+        "direct_grep_tool_calls": 0,
+        "combined_grep_or_rg_calls": 10,
+        "bash_find_calls": 5,
+        "bash_cat_calls": 1,
+        "bash_sed_calls": 1,
+        "first_localization_action": "grep __getattr__/__setattr__/__delattr__ in sky_coordinate.py"
+      }
+    ],
+    "cases": [
+      {
+        "instance_id": "astropy__astropy-13398",
+        "packet_sha256": "29ce72aeb19c99913d05b9dd5146f777c8e37f8321157ee47fa7af624d6dcb38",
+        "packet_bytes": 19405,
+        "b_prompt_bytes": 25754,
+        "tool_calls": 98,
+        "packet_files_explicitly_read": 2,
+        "packet_files_total": 4,
+        "finding": "B began with filesystem find and repeated substantially the same frame-file localization sequence as A."
+      },
+      {
+        "instance_id": "astropy__astropy-14096",
+        "packet_sha256": "3706c387c7f134cfcec7aa6ef7cb334184e0ef825855abce37206e1bb60f32b1",
+        "packet_bytes": 57242,
+        "b_prompt_bytes": 59250,
+        "tool_calls": 45,
+        "packet_files_touched": 3,
+        "packet_files_total": 12,
+        "target_symbol_in_packet": false,
+        "missing_target_symbol": "SkyCoord.__getattr__",
+        "finding": "A and B both began by grepping __getattr__/__setattr__ in sky_coordinate.py, reading it, and building nearly the same property reproducer."
+      }
+    ],
+    "harness_constraint": "Claude CLI was invoked with --safe-mode and an empty strict MCP configuration, which disabled MCP/hooks; the treatment neither exposed an RNA MCP tool nor directed an RNA CLI workflow through Bash."
+  },
+  "cplus_failure": {
+    "status": "INELIGIBLE",
+    "reason": "Neither case reached the registered graph-delta critique/revision stage after the single allowed remediation.",
+    "revision_model_calls": 0,
+    "official_diagnostic_evaluations": 2,
+    "causal_claim": "No claim about completed C+ or graph-versus-revision effects is supported."
+  },
+  "limitations": [
+    "This N=2 development screen selects a policy; it is not a confirmatory effect estimate.",
+    "The registered B packet-injection manipulation was delivered, but observable evidence did not establish uptake.",
+    "The 14096 semantic packet omitted the actual target symbol.",
+    "C+ never completed its registered revision stage and is excluded from selection.",
+    "RNA timing covers receipt-backed CLI operations but omits deterministic projection and rendering overhead; wall time was not decision-relevant because selection stopped at tokens.",
+    "The 13398 B run retained its terminal patch at the registered 1,200-second wall limit.",
+    "The 14096 A result was recovered from a SHA-bound completed transcript after a host restart."
+  ],
+  "downstream": {
+    "issue_817_disposition": "not_authorized_by_issue_816",
+    "reason": "No eligible RNA treatment was selected, so issue 816 supplies no T arm to freeze or confirm. Issue 817 must not start from this result.",
+    "future_work_boundary": "A corrected RNA-directed tool-usage policy requires a new separately preregistered development trial; it must not be retrofitted into this result."
+  }
+}
