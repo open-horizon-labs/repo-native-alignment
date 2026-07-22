@@ -33,7 +33,12 @@ impl std::error::Error for RenderError {}
 
 pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedResponse, RenderError> {
     let mut plan = plan.clone();
-    let attempts = plan.spans.len().saturating_mul(2).saturating_add(64);
+    let attempts = plan
+        .spans
+        .len()
+        .saturating_mul(2)
+        .saturating_add(plan.candidate_audit.len())
+        .saturating_add(1);
     for _ in 0..attempts {
         let (text, accounting) = render_once(&plan)?;
         if within_budget(&accounting.total, &plan.request.budget) {
@@ -810,7 +815,7 @@ mod tests {
     fn evidence_budget_deterministically_trims_candidate_audit_after_bodies() {
         let mut input = plan(SearchProjection::Evidence);
         input.request.budget.max_rendered_bytes = Some(4_096);
-        input.candidate_audit = (1..=20)
+        input.candidate_audit = (1..=200)
             .map(|rank| CandidateAudit {
                 candidate_rank: rank,
                 identity: RecordIdentity {
@@ -837,7 +842,7 @@ mod tests {
         assert!(rendered.text.contains("## Candidate audit"));
         assert!(rendered.text.contains("candidate audit truncated"));
         assert!(!rendered.plan.candidate_audit.is_empty());
-        assert!(rendered.plan.candidate_audit.len() < 20);
+        assert!(rendered.plan.candidate_audit.len() < 100);
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 

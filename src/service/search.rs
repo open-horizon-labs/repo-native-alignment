@@ -4311,8 +4311,8 @@ fn pre_edit_node_for_changed_line<'a>(
     if line.kind != graph_delta::ChangedLineKind::Added || hunk.old_count == 0 {
         return Err("changed line has no pre-edit coordinate and remains proposal-only");
     }
-    if let Some(old_line) = paired_replacement_old_line(hunk, line) {
-        return unique_node_at_line(ctx, &file.path, old_line);
+    if let Some(node) = replacement_block_pre_edit_node(ctx, file, hunk, line)? {
+        return Ok(node);
     }
     let new_line = line
         .grounding
@@ -4362,52 +4362,71 @@ fn pre_edit_node_for_changed_line<'a>(
     Ok(before_node)
 }
 
-fn paired_replacement_old_line(
+fn replacement_block_pre_edit_node<'a>(
+    ctx: &'a SearchContext<'_>,
+    file: &graph_delta::ChangedFileFact,
     hunk: &graph_delta::ChangedHunkFact,
     line: &graph_delta::ChangedLineFact,
-) -> Option<u32> {
+) -> Result<Option<&'a Node>, &'static str> {
     let line_index = hunk.changed_lines.iter().position(|candidate| {
         candidate.kind == line.kind
             && candidate.grounding.proposal_line == line.grounding.proposal_line
-    })?;
+    });
+    let Some(line_index) = line_index else {
+        return Ok(None);
+    };
     let mut added_start = line_index;
     while added_start > 0 {
         let previous = &hunk.changed_lines[added_start - 1];
         let current = &hunk.changed_lines[added_start];
         if previous.kind != graph_delta::ChangedLineKind::Added
-            || previous.grounding.proposal_line + 1 != current.grounding.proposal_line
+            || previous.grounding.proposal_line.checked_add(1)
+                != Some(current.grounding.proposal_line)
         {
             break;
         }
         added_start -= 1;
     }
     if added_start == 0 {
-        return None;
+        return Ok(None);
     }
     let removed_end = added_start;
     let last_removed = &hunk.changed_lines[removed_end - 1];
     if last_removed.kind != graph_delta::ChangedLineKind::Removed
-        || last_removed.grounding.proposal_line + 1
-            != hunk.changed_lines[added_start].grounding.proposal_line
+        || last_removed.grounding.proposal_line.checked_add(1)
+            != Some(hunk.changed_lines[added_start].grounding.proposal_line)
     {
-        return None;
+        return Ok(None);
     }
     let mut removed_start = removed_end - 1;
     while removed_start > 0 {
         let previous = &hunk.changed_lines[removed_start - 1];
         let current = &hunk.changed_lines[removed_start];
         if previous.kind != graph_delta::ChangedLineKind::Removed
-            || previous.grounding.proposal_line + 1 != current.grounding.proposal_line
+            || previous.grounding.proposal_line.checked_add(1)
+                != Some(current.grounding.proposal_line)
         {
             break;
         }
         removed_start -= 1;
     }
-    let added_offset = line_index.checked_sub(added_start)?;
-    hunk.changed_lines
-        .get(removed_start + added_offset)
-        .filter(|_| removed_start + added_offset < removed_end)
-        .and_then(|removed| removed.grounding.old_line)
+    let mut replacement_node = None;
+    for removed in &hunk.changed_lines[removed_start..removed_end] {
+        let old_line = removed
+            .grounding
+            .old_line
+            .ok_or("replacement removal has no pre-edit coordinate")?;
+        let node = unique_node_at_line(ctx, &file.path, old_line)?;
+        if replacement_node
+            .is_some_and(|candidate: &Node| candidate.stable_id() != node.stable_id())
+        {
+            return Err(
+                "replacement block spans multiple pre-edit symbols and remains proposal-only",
+            );
+        }
+        replacement_node = Some(node);
+    }
+    Ok(replacement_node)
 }
 
 fn unique_node_at_line<'a>(
@@ -13859,6 +13878,88 @@ mod tests {
                 .stable_id(),
             source.stable_id()
         );
+    }
+
+    #[test]
+    fn acceptance_delivery_multi_symbol_replacement_remains_proposal_only() {
+        let mut first = make_node("first", NodeKind::Function, "lib.rs");
+        first.line_start = 2;
+        first.line_end = 2;
+        let mut second = make_node("second", NodeKind::Function, "lib.rs");
+        second.line_start = 3;
+        second.line_end = 3;
+        let graph = make_graph_state(vec![first, second]);
+        let repository = tempfile::tempdir().unwrap();
+        let ctx = make_search_context(&graph, repository.path());
+        let removed_first = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Removed,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 5,
+                old_line: Some(2),
+                new_line: None,
+            },
+            text: "pub fn first() {}".into(),
+        };
+        let removed_second = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Removed,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 6,
+                old_line: Some(3),
+                new_line: None,
+            },
+            text: "pub fn second() {}".into(),
+        };
+        let added_second = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Added,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 7,
+                old_line: None,
+                new_line: Some(2),
+            },
+            text: "pub fn second() {}".into(),
+        };
+        let added_first = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Added,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 8,
+                old_line: None,
+                new_line: Some(3),
+            },
+            text: "pub fn first() {}".into(),
+        };
+        let hunk = graph_delta::ChangedHunkFact {
+            proposal_header_line: 4,
+            old_start: 2,
+            old_count: 2,
+            new_start: 2,
+            new_count: 2,
+            changed_lines: vec![
+                removed_first,
+                removed_second,
+                added_second.clone(),
+                added_first.clone(),
+            ],
+        };
+        let file = graph_delta::ChangedFileFact {
+            root: "local".into(),
+            path: "lib.rs".into(),
+            hunks: vec![hunk.clone()],
+        };
+
+        for added in [&added_second, &added_first] {
+            assert_eq!(
+                pre_edit_node_for_changed_line(&ctx, &file, &hunk, added).unwrap_err(),
+                "replacement block spans multiple pre-edit symbols and remains proposal-only"
+            );
+        }
     }
 
     #[tokio::test]
