@@ -98,7 +98,9 @@ fn shrink_last_record_evidence(plan: &mut ProjectionPlan) -> bool {
         .records
         .iter_mut()
         .rev()
-        .find(|record| record.evidence != SelectionEvidence::default())
+        .find(|record| {
+            record.evidence != SelectionEvidence::default() && record.evidence_handle.is_some()
+        })
     else {
         return false;
     };
