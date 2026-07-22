@@ -601,6 +601,90 @@
         "A/14096's recovered transport record is adequate for terminal efficacy but has weaker cost and token provenance than an ordinary top-level Claude result; disclose this if efficiency breaks a tie.",
         "C+ combines graph-boundary evidence with one extra revision call, so any C+ advantage selects an operational policy but does not identify graph evidence separately from revision compute."
       ]
+    },
+    {
+      "id": "816-cplus-delta-mechanics-v3",
+      "amended_at": "2026-07-22T12:25:14.994784Z",
+      "effective_for_arm": "C+ proposal-dependent revision only",
+      "knowledge_state": {
+        "A_B_and_C_plus_initial_outcomes_observed": true,
+        "C_plus_revision_model_calls_started": false,
+        "official_evaluator_or_test_feedback_observed_for_B_or_C_plus": false,
+        "scope": "one consolidated exploratory mechanics remediation before either C+ revision",
+        "v1_delta_attempts_observed": true
+      },
+      "disclosure": [
+        "Both original registered delta attempts remain immutable fail-closed evidence and were not retried under v1.",
+        "V2 is a post-initial, pre-revision exploratory amendment and cannot support a pristine preregistered estimate.",
+        "13398 requires #814 structured input because the exact first-stage patch creates a real new file.",
+        "14096 requires a raw audit cap above the observed 181236-byte/45299-token non-body response."
+      ],
+      "effective_mechanics": {
+        "producer": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/build_cplus_delta_v2.py",
+          "bytes": 35975,
+          "sha256": "2f864c40368a1585f28f143768b87da1d247d64bafc10cc50ab4c5abfaff9d90"
+        },
+        "policy": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/frozen-policy.json",
+          "bytes": 3472,
+          "sha256": "79c3c1145144d50c6c31bf60018dbc4930946aad1ff413acba939d6e079a0ff1"
+        },
+        "query_flags": [
+          "--search-mode=hybrid",
+          "--rerank",
+          "--include-artifacts=false",
+          "--projection=agent",
+          "--body-policy=focused_span",
+          "--limit=20",
+          "--max-body-bytes=3000",
+          "--max-total-body-bytes=16000",
+          "--max-output-bytes=256000",
+          "--max-output-tokens=64000",
+          "--context-mode=graph-delta-beta"
+        ],
+        "query_gate": "exact Git registration commit containing this amendment is required before the single v2 query attempt per case",
+        "single_attempt_per_case": true,
+        "structured_proposals": {
+          "astropy__astropy-13398": {
+            "proposal": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-13398.structured-proposal.json",
+              "bytes": 114286,
+              "sha256": "8b5c1481d30425e3fe3926079d5ef503fe78196aa6b69992af8f3b7082f7eff0"
+            },
+            "conversion_receipt": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-13398.conversion-receipt.json",
+              "bytes": 14643,
+              "sha256": "758171b0eedb74e7a6895b8b6577a1442bc970b0371314be9924e1c1f7dd2aa8"
+            }
+          },
+          "astropy__astropy-14096": {
+            "proposal": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-14096.structured-proposal.json",
+              "bytes": 24189,
+              "sha256": "6de9abb631b0afedda70ab31c314fa2c5156edcaac5ac67d7e46e06b496d2763"
+            },
+            "conversion_receipt": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-14096.conversion-receipt.json",
+              "bytes": 6615,
+              "sha256": "069d30f4860c287e4669820b5c62a64221bd072329e15665b3925adb0455e33f"
+            }
+          }
+        },
+        "lossless_binding": "Each structured changed-file/hunk/line fact round-trips to the exact stage-one unified diff; an audit-only deferred omission carries the raw diff base64 envelope and is removed by live enrichment before model rendering.",
+        "v1_utility": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v1/build_cplus_delta.py",
+          "bytes": 38439,
+          "sha256": "7b4f48ddc1ce848e133919f0b4ce810d377aaea10b57b57a5f843e46340fae2f"
+        }
+      },
+      "unchanged": [
+        "exact stage-one patch bytes and base commit/tree",
+        "model-visible 3000-byte per-body and 16000-byte total-body limits",
+        "stable-ID/exact-span novelty filter",
+        "3 USD revision budget, 600 second timeout, same-session single revision, no retry",
+        "no evaluator/test/gold feedback and no manual/LLM selection"
+      ]
     }
   ]
 }
