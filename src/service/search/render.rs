@@ -43,13 +43,44 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
                 plan,
             });
         }
-        if !shrink_last_body(&mut plan, &accounting.total) {
+        if !shrink_last_body(&mut plan, &accounting.total)
+            && !shrink_last_candidate_audit(&mut plan)
+        {
             return Err(RenderError::BudgetTooSmall {
                 minimum: accounting.total,
             });
         }
     }
     Err(RenderError::AccountingDidNotConverge)
+}
+
+fn shrink_last_candidate_audit(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.pop().is_none()
+    {
+        return false;
+    }
+    let detail = "candidate audit truncated to satisfy the final rendered budget; retry with a larger budget for the complete audit";
+    if !plan.omissions.iter().any(|omission| {
+        omission.record_id.is_none()
+            && omission.source.is_none()
+            && omission.code == OmissionCode::RenderBudget
+            && omission.detail == detail
+    }) {
+        plan.omissions.push(ProjectionOmission {
+            record_id: None,
+            source: None,
+            code: OmissionCode::RenderBudget,
+            detail: detail.to_string(),
+        });
+        plan.omissions.sort_by(|a, b| {
+            a.record_id
+                .cmp(&b.record_id)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.detail.cmp(&b.detail))
+        });
+    }
+    true
 }
 
 fn within_budget(cost: &RenderCost, budget: &ProjectionBudget) -> bool {
@@ -273,6 +304,19 @@ fn render_metadata(plan: &ProjectionPlan) -> String {
         }
         if let Some(lane) = record.selection.lane {
             output.push_str(&format!("   - lane: {lane}\n"));
+        }
+        if let Some(source) = &record.symbol.extraction_source {
+            output.push_str(&format!(
+                "   - extraction_source: src:{}\n",
+                one_line(source)
+            ));
+        }
+        for (name, value) in &record.symbol.declared_metadata {
+            output.push_str(&format!(
+                "   - metadata.{}: {}\n",
+                one_line(name),
+                one_line(value)
+            ));
         }
         if let Some(handle) = &record.source_handle {
             output.push_str(&format!(
@@ -505,6 +549,8 @@ mod tests {
                     kind: "function".into(),
                     language: "rust".into(),
                     signature: "fn β()".into(),
+                    extraction_source: None,
+                    declared_metadata: BTreeMap::new(),
                 },
                 selection: selection.clone(),
                 evidence,
@@ -583,6 +629,8 @@ mod tests {
                     kind: "function".into(),
                     language: "rust".into(),
                     signature: "fn β()".into(),
+                    extraction_source: None,
+                    declared_metadata: BTreeMap::new(),
                 },
                 selection: SelectionSummary {
                     channel: SelectionChannel::Exact,
@@ -756,6 +804,41 @@ mod tests {
             render_projection(&input),
             Err(RenderError::BudgetTooSmall { .. })
         ));
+    }
+
+    #[test]
+    fn evidence_budget_deterministically_trims_candidate_audit_after_bodies() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(4_096);
+        input.candidate_audit = (1..=20)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank:02}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "bounded candidate was not selected; deterministic audit detail ".repeat(3),
+                evidence: SelectionEvidence {
+                    candidate_rank: Some(rank),
+                    content_hash: Some(format!("hash-{rank:02}")),
+                    diagnostics: BTreeMap::from([(
+                        "tie_break".into(),
+                        "stable identity after calibrated channel ranks".into(),
+                    )]),
+                    ..Default::default()
+                },
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.text.len() <= 4_096);
+        assert!(rendered.text.contains("## Candidate audit"));
+        assert!(rendered.text.contains("candidate audit truncated"));
+        assert!(!rendered.plan.candidate_audit.is_empty());
+        assert!(rendered.plan.candidate_audit.len() < 20);
+        assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
     #[test]

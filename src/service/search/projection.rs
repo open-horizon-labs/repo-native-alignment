@@ -707,6 +707,8 @@ mod tests {
                 kind: "function".into(),
                 language: "text".into(),
                 signature: format!("fn {id}()"),
+                extraction_source: None,
+                declared_metadata: BTreeMap::new(),
             },
             selection: SelectionSummary {
                 channel: SelectionChannel::Exact,

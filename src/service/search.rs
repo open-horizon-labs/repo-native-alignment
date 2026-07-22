@@ -1548,6 +1548,8 @@ fn selected_for_source_span_hydration(
             kind: "source_span".into(),
             language: "text".into(),
             signature: display,
+            extraction_source: None,
+            declared_metadata: BTreeMap::new(),
         },
         selection: SelectionSummary {
             channel: SelectionChannel::Exact,
@@ -2153,6 +2155,8 @@ fn projected_live_markdown_records(
                     kind: "markdown_section".into(),
                     language: language.into(),
                     signature,
+                    extraction_source: None,
+                    declared_metadata: BTreeMap::new(),
                 },
                 selection: SelectionSummary {
                     channel: SelectionChannel::Markdown,
@@ -2325,6 +2329,8 @@ fn selected_from_embedding_result(
             kind: result.kind,
             language: "text".into(),
             signature,
+            extraction_source: None,
+            declared_metadata: BTreeMap::new(),
         },
         selection: SelectionSummary {
             channel: SelectionChannel::Artifact,
@@ -4305,6 +4311,9 @@ fn pre_edit_node_for_changed_line<'a>(
     if line.kind != graph_delta::ChangedLineKind::Added || hunk.old_count == 0 {
         return Err("changed line has no pre-edit coordinate and remains proposal-only");
     }
+    if let Some(old_line) = paired_replacement_old_line(hunk, line) {
+        return unique_node_at_line(ctx, &file.path, old_line);
+    }
     let new_line = line
         .grounding
         .new_line
@@ -4353,6 +4362,54 @@ fn pre_edit_node_for_changed_line<'a>(
     Ok(before_node)
 }
 
+fn paired_replacement_old_line(
+    hunk: &graph_delta::ChangedHunkFact,
+    line: &graph_delta::ChangedLineFact,
+) -> Option<u32> {
+    let line_index = hunk.changed_lines.iter().position(|candidate| {
+        candidate.kind == line.kind
+            && candidate.grounding.proposal_line == line.grounding.proposal_line
+    })?;
+    let mut added_start = line_index;
+    while added_start > 0 {
+        let previous = &hunk.changed_lines[added_start - 1];
+        let current = &hunk.changed_lines[added_start];
+        if previous.kind != graph_delta::ChangedLineKind::Added
+            || previous.grounding.proposal_line + 1 != current.grounding.proposal_line
+        {
+            break;
+        }
+        added_start -= 1;
+    }
+    if added_start == 0 {
+        return None;
+    }
+    let removed_end = added_start;
+    let last_removed = &hunk.changed_lines[removed_end - 1];
+    if last_removed.kind != graph_delta::ChangedLineKind::Removed
+        || last_removed.grounding.proposal_line + 1
+            != hunk.changed_lines[added_start].grounding.proposal_line
+    {
+        return None;
+    }
+    let mut removed_start = removed_end - 1;
+    while removed_start > 0 {
+        let previous = &hunk.changed_lines[removed_start - 1];
+        let current = &hunk.changed_lines[removed_start];
+        if previous.kind != graph_delta::ChangedLineKind::Removed
+            || previous.grounding.proposal_line + 1 != current.grounding.proposal_line
+        {
+            break;
+        }
+        removed_start -= 1;
+    }
+    let added_offset = line_index.checked_sub(added_start)?;
+    hunk.changed_lines
+        .get(removed_start + added_offset)
+        .filter(|_| removed_start + added_offset < removed_end)
+        .and_then(|removed| removed.grounding.old_line)
+}
+
 fn unique_node_at_line<'a>(
     ctx: &'a SearchContext<'_>,
     path: &str,
@@ -4381,17 +4438,35 @@ fn unique_node_at_line<'a>(
         left.line_end
             .saturating_sub(left.line_start)
             .cmp(&right.line_end.saturating_sub(right.line_start))
+            .then_with(|| {
+                let left_synthetic = left
+                    .metadata
+                    .get("synthetic")
+                    .is_some_and(|value| value == "true");
+                let right_synthetic = right
+                    .metadata
+                    .get("synthetic")
+                    .is_some_and(|value| value == "true");
+                left_synthetic.cmp(&right_synthetic)
+            })
             .then_with(|| left.stable_id().cmp(&right.stable_id()))
     });
     let Some(best) = candidates.first().copied() else {
         return Err("no current graph node contains the changed line");
     };
     let best_width = best.line_end.saturating_sub(best.line_start);
-    if candidates
-        .iter()
-        .skip(1)
-        .any(|candidate| candidate.line_end.saturating_sub(candidate.line_start) == best_width)
-    {
+    let best_synthetic = best
+        .metadata
+        .get("synthetic")
+        .is_some_and(|value| value == "true");
+    if candidates.iter().skip(1).any(|candidate| {
+        candidate.line_end.saturating_sub(candidate.line_start) == best_width
+            && candidate
+                .metadata
+                .get("synthetic")
+                .is_some_and(|value| value == "true")
+                == best_synthetic
+    }) {
         return Err("multiple equally specific current graph nodes contain the changed line");
     }
     Ok(best)
@@ -4528,6 +4603,58 @@ fn graph_delta_projection(
             detail: format!("graph-delta {:?}: {}", omission.code, omission.detail),
         })
         .collect::<Vec<_>>();
+
+    // Proposal lines are first-class, source-grounded evidence even when an
+    // added line has no pre-edit coordinate or current graph node. Keep the
+    // conservative live-graph inference degradation, but do not erase the
+    // proposal itself from the graph-delta card.
+    for file in &card.changed_files {
+        for hunk in &file.hunks {
+            for line in &hunk.changed_lines {
+                let grounding = graph_delta::EvidenceGrounding::Proposal(line.grounding.clone());
+                let id = grounding.stable_hydration_key();
+                let change = format!("{:?}", line.kind).to_ascii_lowercase();
+                by_role
+                    .entry((id.clone(), ProjectionRole::ProposalDelta))
+                    .or_insert_with(|| SelectedRecord {
+                        selection_rank: 0,
+                        identity: RecordIdentity {
+                            node_id: id.clone(),
+                            source: None,
+                        },
+                        symbol: SymbolSummary {
+                            name: format!("{}:{}", file.path, line.grounding.proposal_line),
+                            kind: format!("proposal_{change}_line"),
+                            language: "diff".into(),
+                            signature: line.text.clone(),
+                            extraction_source: None,
+                            declared_metadata: BTreeMap::new(),
+                        },
+                        selection: SelectionSummary {
+                            channel: SelectionChannel::Graph,
+                            reason: format!("explicit {change} proposal line grounded by {id}"),
+                            role: Some(ProjectionRole::ProposalDelta),
+                            lane: Some(ProjectionLane::ProposalDelta),
+                        },
+                        evidence: SelectionEvidence {
+                            content_hash: Some(
+                                blake3::hash(line.text.as_bytes()).to_hex().to_string(),
+                            ),
+                            provenance: vec![EvidenceProvenance {
+                                source: "proposal".into(),
+                                detail: format!(
+                                    "{} line {} from validated bounded unified diff",
+                                    file.path, line.grounding.proposal_line
+                                ),
+                            }],
+                            ..Default::default()
+                        },
+                        evidence_hydration: None,
+                        focused_span: None,
+                    });
+            }
+        }
+    }
 
     for impact in &card.impacted_loci {
         insert_graph_delta_impact(
@@ -5392,6 +5519,15 @@ enum NodeDeliveryClass {
 fn node_delivery_class(node: &Node) -> NodeDeliveryClass {
     if node.metadata.contains_key("oh_kind") || node.id.kind == NodeKind::PrMerge {
         NodeDeliveryClass::Artifact
+    } else if node
+        .metadata
+        .get("local_knowledge")
+        .is_some_and(|value| value == "true")
+    {
+        // A frontmatter-declared domain entity is a persisted graph record,
+        // not a generic Markdown search chunk. Preserve exact graph lookup
+        // even when callers disable live Markdown expansion.
+        NodeDeliveryClass::Code
     } else if node.id.kind == NodeKind::MarkdownSection
         || matches!(
             node.language.to_ascii_lowercase().as_str(),
@@ -5491,11 +5627,27 @@ fn find_node<'a>(graph: &'a GraphState, id: &str) -> Option<&'a Node> {
 }
 
 fn symbol_summary(node: &Node) -> SymbolSummary {
+    let local_knowledge = node
+        .metadata
+        .get("local_knowledge")
+        .is_some_and(|value| value == "true");
     SymbolSummary {
         name: node.id.name.clone(),
         kind: node.id.kind.to_string(),
         language: node.language.clone(),
         signature: node.signature.clone(),
+        extraction_source: local_knowledge.then(|| node.source.to_string()),
+        declared_metadata: if local_knowledge {
+            node.metadata
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("rna.metadata.")
+                        .map(|name| (name.to_string(), value.clone()))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        },
     }
 }
 
@@ -12723,6 +12875,8 @@ mod tests {
                 kind: "metis".into(),
                 language: "text".into(),
                 signature: "truncated".into(),
+                extraction_source: None,
+                declared_metadata: BTreeMap::new(),
             },
             selection: SelectionSummary {
                 channel: SelectionChannel::Artifact,
@@ -13624,6 +13778,10 @@ mod tests {
         let mut source = make_node("hello", NodeKind::Function, "lib.rs");
         source.line_start = 2;
         source.line_end = 2;
+        let mut literal = make_node("world", NodeKind::Const, "lib.rs");
+        literal.line_start = 2;
+        literal.line_end = 2;
+        literal.metadata.insert("synthetic".into(), "true".into());
         let mut proof = make_node(
             "hello@proof",
             NodeKind::Other("lsp_document_symbol".into()),
@@ -13631,13 +13789,199 @@ mod tests {
         );
         proof.line_start = 2;
         proof.line_end = 2;
-        let graph = make_graph_state(vec![source.clone(), proof]);
+        let graph = make_graph_state(vec![source.clone(), literal, proof]);
         let repository = tempfile::tempdir().unwrap();
         let ctx = make_search_context(&graph, repository.path());
 
         assert_eq!(
             unique_node_at_line(&ctx, "lib.rs", 2).unwrap().stable_id(),
             source.stable_id()
+        );
+
+        let mut ambiguous = make_node("also_hello", NodeKind::Function, "lib.rs");
+        ambiguous.line_start = 2;
+        ambiguous.line_end = 2;
+        let ambiguous_graph = make_graph_state(vec![source, ambiguous]);
+        let ambiguous_ctx = make_search_context(&ambiguous_graph, repository.path());
+        assert_eq!(
+            unique_node_at_line(&ambiguous_ctx, "lib.rs", 2).unwrap_err(),
+            "multiple equally specific current graph nodes contain the changed line"
+        );
+    }
+
+    #[test]
+    fn acceptance_delivery_replacement_addition_uses_paired_removed_coordinate() {
+        let mut source = make_node("hello", NodeKind::Function, "lib.rs");
+        source.line_start = 2;
+        source.line_end = 2;
+        let graph = make_graph_state(vec![source.clone()]);
+        let repository = tempfile::tempdir().unwrap();
+        let ctx = make_search_context(&graph, repository.path());
+        let removed = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Removed,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 5,
+                old_line: Some(2),
+                new_line: None,
+            },
+            text: "pub fn hello() { old(); }".into(),
+        };
+        let added = graph_delta::ChangedLineFact {
+            kind: graph_delta::ChangedLineKind::Added,
+            grounding: graph_delta::ProposalLine {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                proposal_line: 6,
+                old_line: None,
+                new_line: Some(2),
+            },
+            text: "pub fn hello() { new(); }".into(),
+        };
+        let hunk = graph_delta::ChangedHunkFact {
+            proposal_header_line: 4,
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            changed_lines: vec![removed, added.clone()],
+        };
+        let file = graph_delta::ChangedFileFact {
+            root: "local".into(),
+            path: "lib.rs".into(),
+            hunks: vec![hunk.clone()],
+        };
+
+        assert_eq!(
+            pre_edit_node_for_changed_line(&ctx, &file, &hunk, &added)
+                .unwrap()
+                .stable_id(),
+            source.stable_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_delivery_local_knowledge_remains_exactly_searchable_without_markdown_expansion()
+     {
+        let mut quote = make_node(
+            "quote.mcp-provenance",
+            NodeKind::Other("quote".into()),
+            "provenance.md",
+        );
+        quote.language = "markdown".into();
+        quote.source = ExtractionSource::Markdown;
+        quote
+            .metadata
+            .insert("local_knowledge".into(), "true".into());
+        quote.metadata.insert("rna.kind".into(), "quote".into());
+        quote
+            .metadata
+            .insert("rna.id".into(), "quote.mcp-provenance".into());
+        quote
+            .metadata
+            .insert("rna.name".into(), "MCP provenance smoke fixture".into());
+        quote
+            .metadata
+            .insert("rna.metadata.public_use".into(), "mcp_verified".into());
+        let mut section = make_node("section", NodeKind::MarkdownSection, "provenance.md");
+        section.language = "markdown".into();
+
+        assert_eq!(node_delivery_class(&quote), NodeDeliveryClass::Code);
+        assert_eq!(node_delivery_class(&section), NodeDeliveryClass::Markdown);
+
+        let graph = make_graph_state(vec![quote]);
+        let repository = tempfile::tempdir().unwrap();
+        let ctx = make_search_context(&graph, repository.path());
+        let output = search(
+            &SearchParams {
+                query: Some("quote.mcp-provenance".into()),
+                compact: true,
+                limit: Some(3),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(output.contains("quote.mcp-provenance"), "{output}");
+        assert!(output.contains("src:markdown"), "{output}");
+        assert!(output.contains("mcp_verified"), "{output}");
+    }
+
+    #[test]
+    fn acceptance_delivery_graph_delta_keeps_proposal_only_lines_as_typed_records() {
+        let card = graph_delta::GraphDeltaCard {
+            beta: true,
+            capabilities: Vec::new(),
+            changed_files: vec![graph_delta::ChangedFileFact {
+                root: "local".into(),
+                path: "lib.rs".into(),
+                hunks: vec![graph_delta::ChangedHunkFact {
+                    proposal_header_line: 4,
+                    old_start: 2,
+                    old_count: 1,
+                    new_start: 2,
+                    new_count: 1,
+                    changed_lines: vec![graph_delta::ChangedLineFact {
+                        kind: graph_delta::ChangedLineKind::Added,
+                        grounding: graph_delta::ProposalLine {
+                            root: "local".into(),
+                            path: "lib.rs".into(),
+                            proposal_line: 6,
+                            old_line: None,
+                            new_line: Some(2),
+                        },
+                        text: "pub fn hello() { proposed(); }".into(),
+                    }],
+                }],
+            }],
+            routes: Vec::new(),
+            changed_edges: Vec::new(),
+            impacted_loci: Vec::new(),
+            impacted_tests: Vec::new(),
+            impacted_state_or_api: Vec::new(),
+            bypassed_loci: Vec::new(),
+            behavioral_deltas: Vec::new(),
+            behavioral_analogues: Vec::new(),
+            affected_locus_checklist: Vec::new(),
+            omissions: Vec::new(),
+        };
+        let graph = make_graph_state(Vec::new());
+        let repository = tempfile::tempdir().unwrap();
+        let ctx = make_search_context(&graph, repository.path());
+
+        let (records, _, _, _, _) = graph_delta_projection(
+            &card,
+            &SearchParams {
+                limit: Some(4),
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].selection.role,
+            Some(ProjectionRole::ProposalDelta)
+        );
+        assert_eq!(
+            records[0].selection.lane,
+            Some(ProjectionLane::ProposalDelta)
+        );
+        assert_eq!(records[0].symbol.kind, "proposal_added_line");
+        assert_eq!(
+            records[0].symbol.signature,
+            "pub fn hello() { proposed(); }"
+        );
+        assert!(records[0].identity.source.is_none());
+        assert!(
+            records[0]
+                .identity
+                .node_id
+                .starts_with("graph-delta:v1:proposal:")
         );
     }
 

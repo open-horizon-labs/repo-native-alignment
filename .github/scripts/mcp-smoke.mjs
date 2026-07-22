@@ -21,34 +21,49 @@ const workItemLedgerPath = path.join(
 const previousWorkItemLedger = fs.existsSync(workItemLedgerPath)
   ? fs.readFileSync(workItemLedgerPath)
   : null;
-const now = Date.now();
-fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
-fs.writeFileSync(
-  workItemLedgerPath,
-  JSON.stringify({
-    schema_version: 4,
-    records: {
-      "mcp-smoke:0": {
-        schema_version: 4,
-        job_id: "mcp-smoke",
-        item_id: 0,
-        repo: repoPath,
-        root: "fixture",
-        file: "src/main.rs",
-        node_id: "fixture:src/main.rs:main:function",
-        node_name: "main",
-        node_kind: "function",
-        requested_operations: ["textDocument/references"],
-        state: "in_flight",
-        attempt_count: 1,
-        current_phase: "mcp_smoke_probe",
-        created_at_ms: now,
-        updated_at_ms: now,
-        started_at_ms: now,
+let syntheticWorkItemLedgerInstalled = false;
+
+function installSyntheticWorkItemLedger() {
+  const now = Date.now();
+  fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
+  fs.writeFileSync(
+    workItemLedgerPath,
+    JSON.stringify({
+      schema_version: 4,
+      records: {
+        "mcp-smoke:0": {
+          schema_version: 4,
+          job_id: "mcp-smoke",
+          item_id: 0,
+          repo: repoPath,
+          root: "fixture",
+          file: "src/main.rs",
+          node_id: "fixture:src/main.rs:main:function",
+          node_name: "main",
+          node_kind: "function",
+          requested_operations: ["textDocument/references"],
+          state: "in_flight",
+          attempt_count: 1,
+          current_phase: "mcp_smoke_probe",
+          created_at_ms: now,
+          updated_at_ms: now,
+          started_at_ms: now,
+        },
       },
-    },
-  }),
-);
+    }),
+  );
+  syntheticWorkItemLedgerInstalled = true;
+}
+
+function restoreWorkItemLedger() {
+  if (!syntheticWorkItemLedgerInstalled) return;
+  if (previousWorkItemLedger) {
+    fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
+  } else {
+    fs.rmSync(workItemLedgerPath, { force: true });
+  }
+  syntheticWorkItemLedgerInstalled = false;
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -653,6 +668,10 @@ try {
 
   // ── 6. list_roots ───────────────────────────────────────────────────────
   console.log("\n── list_roots ──");
+  // The durable work ledger is part of semantic readiness identity. Install
+  // this synthetic queue only for the list_roots assertion, after every
+  // semantic query, then restore it before any later search.
+  installSyntheticWorkItemLedger();
   const rootsResult = await client.callTool({ name: "list_roots", arguments: {} });
   const rootsText = extractText(rootsResult);
   assertContains("list_roots response contains 'Workspace Roots'", rootsText, "Workspace Roots");
@@ -667,6 +686,7 @@ try {
     rootsText,
     "mcp_smoke_probe=1",
   );
+  restoreWorkItemLedger();
 
   // ── 7. search (neighbors depth=2) ──────────────────────────────────────
   // Verifies that the depth parameter is accepted and processed through the
@@ -718,11 +738,7 @@ try {
   fs.rmSync(path.join(repoPath, ".oh", ".cache", "construction_error.rmeta"), {
     force: true,
   });
-  if (previousWorkItemLedger) {
-    fs.writeFileSync(workItemLedgerPath, previousWorkItemLedger);
-  } else {
-    fs.rmSync(workItemLedgerPath, { force: true });
-  }
+  restoreWorkItemLedger();
 }
 
 if (failures > 0) process.exit(1);

@@ -286,6 +286,8 @@ pub(crate) struct SymbolSummary {
     pub(crate) kind: String,
     pub(crate) language: String,
     pub(crate) signature: String,
+    pub(crate) extraction_source: Option<String>,
+    pub(crate) declared_metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
