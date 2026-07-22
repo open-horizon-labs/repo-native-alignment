@@ -34,12 +34,12 @@
     "remaining_eligible_population_ranked_before_this_registration_commit": false
   },
   "rna_artifact": {
-    "producer_commit": "d17eb5b063aef81d0d96fd2e84b684b4c7c6d97c",
-    "binary_sha256": "0ffd79040a424116404fe79ad0aa0a9e198f80d5aba22600c9edfb23fce06536",
-    "launcher_sha256": "0ce6498db2d92733d16b16e2ec0bacae2264999bf60b49cb0156b6ee61d87d0c",
-    "bundle_manifest_sha256": "49a66e130a780df518e4d582915c27f8dd0c6f72ef1726d1de0027f7f9984aad",
-    "archive_sha256": "a75a718e744def7eae3655229cee2268a627737a2d8be82dd7b774a4065b9b3c",
-    "verification_receipt_sha256": "7d65a33b33ba2cb58f39d6d95e572011296f7c585d90c8f7e037347b8c48d505",
+    "producer_commit": "f073088635e25a8962199a7784472b45b435cff5",
+    "binary_sha256": "801015e4ffb75d05270c1402388b678222078bf2f109351bb6a5961849e95622",
+    "launcher_sha256": "37d45cb2ed5d89f632a8044235ad8adcbf77b005a4e255b87cce400246ee862d",
+    "bundle_manifest_sha256": "fb32c35f6790e0f4195e9e82562ccc408cd94a1bfcbdd56b4fa58cb908d2b619",
+    "archive_sha256": "afd3bed34d64fbb7175c4c767c52c514a058b3ba45462c839837af7bf6c56a43",
+    "verification_receipt_sha256": "80e70d50251db1f6b821be353f165a6628aacddcce677951d19017ce384e17ee",
     "local_source_build_allowed": false
   },
   "model_runtime": {
@@ -109,7 +109,7 @@
     "evaluator_tests_sha256": "a4e064e45f20f78acb237a6358e2690a9491d0848c5fe7e0381410a5fc15d798"
   },
   "cache_preparation": {
-    "artifact": "exact successful PR 822 CI semantic bundle only",
+    "artifact": "exact successful PR 826/f073088635e25a8962199a7784472b45b435cff5 CI semantic bundle only",
     "local_source_build_allowed": false,
     "selected_case_mode": "cold exact-tree in-place index for each selected repository",
     "scan_argv": ["--business-context","disabled","scan","--repo","<immutable-index-checkout>","--full","--timings"],
