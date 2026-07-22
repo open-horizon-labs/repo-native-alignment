@@ -1,0 +1,690 @@
+{
+  "schema": "rna-non-oracle-development-screen-v1",
+  "registered_at": "2026-07-22T04:15:00Z",
+  "parent_issue": 815,
+  "issue": 816,
+  "dataset": {
+    "name": "SWE-bench_Verified",
+    "configuration": "SWE-bench___swe-bench_verified/default/0.0.0/91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+    "arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+  },
+  "runtime": {
+    "rna_source_commit": "d17eb5b063aef81d0d96fd2e84b684b4c7c6d97c",
+    "rna_binary_sha256": "0ffd79040a424116404fe79ad0aa0a9e198f80d5aba22600c9edfb23fce06536",
+    "rna_artifact_id": 8517613929,
+    "rna_artifact_sha256": "888e2f657d6b71a3eb1531ef5596fa7120ef256de261ac9c964c33db625827ea",
+    "rna_manifest_sha256": "49a66e130a780df518e4d582915c27f8dd0c6f72ef1726d1de0027f7f9984aad",
+    "claude_cli_version": "2.1.216",
+    "model_argument": "claude-sonnet-5",
+    "effort": "high",
+    "permission_mode": "bypassPermissions",
+    "network_policy": "no agent network; WebFetch and WebSearch disabled",
+    "initial_stage_budget_usd": 8.0,
+    "c_plus_revision_budget_usd": 3.0,
+    "terminal_evaluations_per_arm": 1
+  },
+  "agent_invocation": {
+    "initial_wall_timeout_seconds": 1200,
+    "revision_wall_timeout_seconds": 600,
+    "tools": "Bash,Edit,Read,Write,Glob,Grep",
+    "safe_mode": true,
+    "strict_empty_mcp_config": true,
+    "disallowed_tools": [
+      "WebSearch",
+      "WebFetch"
+    ],
+    "prompt_transport": "stdin",
+    "stop_rule": "one initial Claude Code session per arm; C+ alone receives one resumed revision turn; stop on terminal response, registered dollar budget, or wall timeout; no evaluator feedback and no retry",
+    "workspace_rule": "byte-identical separate pristine source-only checkouts at the registered base commit, with no git remote and no .oh cache visible to the model",
+    "case_13398_A_prompt_sha256": "81bdb7858000e310ac7f3d0d76557130a0ba74108291b8e96893d016ffab3db8",
+    "excluded_case_8707_A_prompt_sha256": "fd8f818724ffb35673142ddc9d8f5b0a51cc244db3c939dc17a1a3727ee20675",
+    "case_14096_A_prompt_sha256": "bd3595eac38e7adb734d1752961260c1f60d236a4cf200ff9594da050794ec6b"
+  },
+  "rna_treatment_construction": {
+    "query": "the exact registered problem-statement bytes as the sole positional query",
+    "acquisition": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=evidence",
+        "--body-policy=none",
+        "--limit=20",
+        "--max-output-bytes=160000",
+        "--max-output-tokens=40000"
+      ]
+    },
+    "ranked_body_hydration": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=4000",
+        "--max-total-body-bytes=30000",
+        "--max-output-bytes=60000",
+        "--max-output-tokens=15000"
+      ]
+    },
+    "task_boundaries": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=3000",
+        "--max-total-body-bytes=20000",
+        "--max-output-bytes=50000",
+        "--max-output-tokens=12500",
+        "--context-mode=task",
+        "--context-roles=editable_source,definition_or_api_state,test,behavioral_analogue,direct_dependency,caller_or_impact",
+        "--context-facets=behavior,api_or_state,test,analogue"
+      ],
+      "lane_policy": "request every registered role, preserve every role receipt and omission reason, and never fill an empty lane manually or with an LLM"
+    },
+    "graph_delta": {
+      "flags": [
+        "--search-mode=hybrid",
+        "--rerank",
+        "--include-artifacts=false",
+        "--projection=agent",
+        "--body-policy=focused_span",
+        "--limit=20",
+        "--max-body-bytes=3000",
+        "--max-total-body-bytes=16000",
+        "--max-output-bytes=40000",
+        "--max-output-tokens=10000",
+        "--context-mode=graph-delta-beta",
+        "--proposal=<exact terminal first-stage unified diff bytes>"
+      ],
+      "novelty_rule": "remove records whose stable node identity already appeared in B acquisition/hydration or C+ task-boundary packets; preserve the unfiltered receipt and record every removed identity; never substitute"
+    },
+    "fail_closed": [
+      "exact #822 artifact, binary, manifest, repository commit, tree, and case identities match",
+      "fresh reopen reports strict READY with semantic search and rerank available",
+      "acquisition selects one or more stable node identities and every selected identity hydrates",
+      "task-boundary output contains receipts for every registered role, including explicit omission reasons for empty lanes",
+      "all rendered packet bytes and SHA-256 identities are frozen before the corresponding model call"
+    ]
+  },
+  "pre_registration_diagnostics": {
+    "invalid_A_attempt": "one A process was started before this exact addendum, interrupted after 89.374 seconds and $0.7090892, received no evaluator output, and is excluded from every comparison",
+    "old_semantic_cache": "the retained aa92ece semantic generation was rejected by exact #822 and is excluded; structural evidence may be retained while embeddings are rebuilt and sealed by exact #822",
+    "replaced_case_8707": "excluded after its exact #822 cold scan failed strict READY on three repository .templ files with no locked language server; its completed A call and terminal evaluation remain diagnostic-only, no RNA arm will run, and astropy__astropy-14096 is frozen as the fresh replacement before any model call on that case"
+  },
+  "cases": [
+    {
+      "instance_id": "astropy__astropy-13398",
+      "repository": "astropy/astropy",
+      "base_commit": "6500928dc0e57be8f06d1162eacc3ba5e2eff692",
+      "problem_statement_utf8_bytes": 5323,
+      "problem_statement_sha256": "c26c8dc258dc5cb9dd34f30bdbaaed3f19a8ada137e0f19d81d7f57dc5f11bba",
+      "role": "known efficacy and regression-safety stress test",
+      "prior_outcomes": "development-only; prior evaluator-feedback resolution is invalid for C+"
+    },
+    {
+      "instance_id": "astropy__astropy-14096",
+      "repository": "astropy/astropy",
+      "base_commit": "1a4462d72eb03f30dc83a879b1dd57aac8b2c18b",
+      "problem_statement_utf8_bytes": 982,
+      "problem_statement_sha256": "938971021e89cd882f6ea33d61202fe7aa0091d7be4748b100ddc7e164db90cd",
+      "role": "previously unrun fresh development case replacing an exact-artifact inventory incompatibility",
+      "prior_outcomes": "none"
+    }
+  ],
+  "arms": {
+    "A": {
+      "name": "bare tool-enabled agent",
+      "initial_context": "problem statement only"
+    },
+    "B": {
+      "name": "strict RNA semantic acquisition",
+      "initial_context": "problem statement plus deterministic strict hybrid/rerank agent projection and ranked-body hydration"
+    },
+    "C+": {
+      "name": "semantic plus graph boundaries plus bounded revision",
+      "initial_context": "B plus deterministic task-context boundary roles",
+      "revision": "one resumed turn containing only novel graph-delta-beta evidence derived from the terminal first-stage diff"
+    }
+  },
+  "shared_policy": {
+    "separate_pristine_checkouts": true,
+    "same_base_commit_and_tree": true,
+    "same_base_agent_tools": true,
+    "same_visible_test_policy": true,
+    "same_initial_model_budget": true,
+    "gold_patch_hidden_until_terminal_evaluation": true,
+    "test_patch_hidden_until_terminal_evaluation": true,
+    "fail_to_pass_hidden_until_terminal_evaluation": true,
+    "evaluator_output_never_returned_to_agent": true,
+    "manual_or_llm_retrieval_fallback": false,
+    "official_swebench_terminal_evaluator": true
+  },
+  "selection_order": [
+    "official_resolution",
+    "pass_to_pass_regression_preservation",
+    "total_tokens",
+    "total_cost_usd",
+    "end_to_end_wall_time"
+  ],
+  "confirmatory_exclusion": [
+    "astropy__astropy-13398",
+    "astropy__astropy-14369",
+    "astropy__astropy-8707",
+    "astropy__astropy-14096"
+  ],
+  "causal_limit": "A C+ advantage selects an operational treatment but does not separately identify graph-context and revision-call effects without a later C or compute-matched ablation.",
+  "oracle_arm": null,
+  "preregistration_amendments": [
+    {
+      "id": "816-treatment-construction-mechanics-v2",
+      "amended_at": "2026-07-22T11:55:34Z",
+      "base_document_sha256": "f3a9cd7384373ae501b3a48ce30df605d2b861dddb5a6354b1777f80ac568aca",
+      "base_git_head": "793b70cb5394cc1d3e18af43a03cd1993db2d27b",
+      "effective_for_arms": [
+        "B",
+        "C+"
+      ],
+      "knowledge_state": {
+        "A_outcomes_observed": true,
+        "B_or_C_plus_model_calls_started": false,
+        "retrieval_and_projection_dry_runs_observed": true,
+        "amendment_scope": "treatment-construction mechanics only after both A controls terminated and before any B or C+ model call"
+      },
+      "reason": [
+        "The earlier whole-issue query included hidden GitHub template comments and did not reliably localize both development cases.",
+        "RNA queries must bind the exact populated root rather than depend on ambient root selection.",
+        "Raw renderer metadata can exceed the earlier output limits and must be retained out of band rather than enter model context.",
+        "The exact #822 artifact cannot source-address the injected checkout through native hydration, so ranked stable identities require deterministic verifier-bound tracked-source slicing.",
+        "The exact #822 native task selector does not implement the registered negative-test, rejection-path, validation-consumer, error-path, caller, and analogue boundary lanes; its failed probes remain diagnostic only.",
+        "C+ boundary candidates therefore come only from typed one-hop graph traversal rooted at the frozen B identities under a case-independent policy."
+      ],
+      "unchanged_json_pointers": [
+        "/runtime",
+        "/agent_invocation",
+        "/cases",
+        "/arms",
+        "/shared_policy",
+        "/selection_order",
+        "/causal_limit",
+        "/oracle_arm"
+      ],
+      "supersedes_json_pointers": [
+        "/rna_treatment_construction/query",
+        "/rna_treatment_construction/acquisition",
+        "/rna_treatment_construction/ranked_body_hydration",
+        "/rna_treatment_construction/task_boundaries",
+        "/rna_treatment_construction/graph_delta",
+        "/rna_treatment_construction/fail_closed"
+      ],
+      "effective_treatment_construction": {
+        "model_problem_statement": {
+          "policy": "The model receives the exact raw registered UTF-8 problem-statement bytes; the retrieval-query transform does not alter those prompt bytes."
+        },
+        "retrieval_query": {
+          "policy_id": "salient-query-v1",
+          "transform": "Remove non-overlapping <!--.*?--> byte spans with DOTALL non-greedy matching. From the remaining bytes select the first non-empty line and every equal-delimiter inline backtick span outside fenced code blocks, retaining delimiters, duplicates, and source order. Join components with one LF and no trailing separator. Perform no other trimming, normalization, or line-ending conversion.",
+          "language_filter": "--language=python",
+          "generator": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/salient-query-v1/run_probe.py",
+            "bytes": 16693,
+            "sha256": "07091f531da5c139fc841564f188c23b07c73b641c5935909e3a85a415dae653"
+          },
+          "preserved_output_revalidator": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/salient-query-v1/revalidate_preserved.py",
+            "sha256": "cfa75cdb84af5989cee3d47e8a3a3718d009e2b5f7f24b220cadb15588b5efb1"
+          },
+          "summary_revalidated": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/salient-query-v1/summary-revalidated.json",
+            "sha256": "b2c83b7bd4bc740287d0d27d39a5f0799cb3cc635e1cd48b8428af273342c601",
+            "verdict": "mechanically valid for both cases using preserved stdout only; no RNA rerun"
+          },
+          "cases": {
+            "astropy__astropy-13398": {
+              "raw_issue_utf8_bytes": 5323,
+              "raw_issue_sha256": "c26c8dc258dc5cb9dd34f30bdbaaed3f19a8ada137e0f19d81d7f57dc5f11bba",
+              "html_comment_stripped_utf8_bytes": 4434,
+              "html_comment_stripped_sha256": "876fd0ad143f431be851d7c20261e946260bc9afed140d1be84db4c20b66c24f",
+              "salient_query_utf8_bytes": 186,
+              "salient_query_sha256": "65ad3458f2c42298238b3bed40aef40977d7d46907c1bd68c78df7844058c9e0",
+              "root": "checkout",
+              "argv_sha256": "46954461d82cb984f1a355b4626afbb22e867af40a03d323b651356b8db4d638",
+              "raw_stdout_bytes": 37287,
+              "raw_stdout_sha256": "b8a365d7c01c08cfcad428530ac8021a4a3080ce377ee4e75c22ab4b0e5875ab",
+              "raw_stderr_bytes": 422,
+              "raw_stderr_sha256": "54740fbb0ec8bfe072c005912bc3317597499edab35d87ea36aaa6e290595784"
+            },
+            "astropy__astropy-14096": {
+              "raw_issue_utf8_bytes": 982,
+              "raw_issue_sha256": "938971021e89cd882f6ea33d61202fe7aa0091d7be4748b100ddc7e164db90cd",
+              "html_comment_stripped_utf8_bytes": 982,
+              "html_comment_stripped_sha256": "938971021e89cd882f6ea33d61202fe7aa0091d7be4748b100ddc7e164db90cd",
+              "salient_query_utf8_bytes": 114,
+              "salient_query_sha256": "32fd29bf86670faff5295a570799bb9c36b11e8efae220d7946202e6ce98c404",
+              "root": "astropy-astropy-14096",
+              "argv_sha256": "e618178d582d06f2b586aa8ee2cc447703f7bee58e8d9c4c8561ff61045659b1",
+              "raw_stdout_bytes": 159869,
+              "raw_stdout_sha256": "d534067cacb68079acfcfac0b46235a5a1a25691b78a76aa3242c9f79dd0d036",
+              "raw_stderr_bytes": 422,
+              "raw_stderr_sha256": "634c4a671562a58a2d1cd0ab6be12851c212f4a2e3670818ddad94cc1253650b"
+            }
+          }
+        },
+        "root_and_readiness_binding": {
+          "astropy__astropy-13398": {
+            "root": "checkout",
+            "commit": "6500928dc0e57be8f06d1162eacc3ba5e2eff692",
+            "tree": "059e0f861b196c0e3d666cbef9c8b13281c31b9f",
+            "status": "READY",
+            "included_files": 1615,
+            "completeness_violations": 0,
+            "completeness_digest": "965a519a1e3449523c6bca80d15ee9de66bf7e937e9ad6d59abb1a2ff770c2d0",
+            "completeness_report_sha256": "86b6c21fbc37997e454980c80c962e37a138ecf97ca3789b996bb8ec0dcb7ff5",
+            "extract_completed_sha256": "70699553f0ca79b2b99647bf792a1c7071268ff959a5aa5ae6a260f80c9a982c",
+            "lsp_completed_sha256": "70699553f0ca79b2b99647bf792a1c7071268ff959a5aa5ae6a260f80c9a982c",
+            "graph_snapshot_digest": "79828d9e5c9a58c3999ecc4cb5e33fd838e9df2b88638ac77fe70734d01a8623",
+            "semantic_generation_digest": "5167c4d1cbbb910debe2da43f1f1779a565aa33f8c333540b0803b14bbe6b1af",
+            "semantic_manifest_sha256": "cb981c055169910cd00f67ae9c9445df625ba1283d23b1f74e1ec0723a5f6a83",
+            "semantic_pointer_sha256": "ea4483cc726488e3ec26bda16a0f03f56cdd2fcd1889caec746b8c53eae47ea2"
+          },
+          "astropy__astropy-14096": {
+            "root": "astropy-astropy-14096",
+            "commit": "1a4462d72eb03f30dc83a879b1dd57aac8b2c18b",
+            "tree": "d57ee70657df0c1ff39fb3ca89b07aadae6ca3f6",
+            "status": "READY",
+            "included_files": 1664,
+            "completeness_violations": 0,
+            "completeness_digest": "f70b6a9a58c1d00491e80aefdf9169a91b6aae561b1d23794b5dce4393553761",
+            "completeness_report_sha256": "3070de7636b83e923a8af794a73d89e8bd7c970591d95639d6b49e5d0aeaa5d1",
+            "extract_completed_sha256": "23ff9218470e52d1a91fe16326321048d04d5aa94093e6e09efc3d6420fc5690",
+            "lsp_completed_sha256": "23ff9218470e52d1a91fe16326321048d04d5aa94093e6e09efc3d6420fc5690",
+            "graph_snapshot_digest": "990c0963f51a6ddee95863d653cae645026e3797c1a22c9c34eaada1625f2e5b",
+            "semantic_generation_digest": "559d1f1ce8213fd080c1a6b8738c7a4ab61be3184b31b0cbc8363c7e5dffaa4c",
+            "semantic_manifest_sha256": "3ed9e66856a876af204bc528a146249ec7582e418633540427b82dad64de1a0e",
+            "semantic_pointer_sha256": "1899c58c7e5ebc09a9d3806d38baa67c1a0936dcd06cde58492925f12b5f17fa"
+          },
+          "requirement": "Each command and retained receipt must match the registered root, commit, tree, exact #822 binary, strict READY status, zero completeness violations, semantic generation, and rerank availability."
+        },
+        "semantic_acquisition": {
+          "flags": [
+            "--search-mode=hybrid",
+            "--rerank",
+            "--include-artifacts=false",
+            "--projection=agent",
+            "--body-policy=focused_span",
+            "--limit=20",
+            "--max-body-bytes=4000",
+            "--max-total-body-bytes=30000",
+            "--max-output-bytes=160000",
+            "--max-output-tokens=40000",
+            "--language=python"
+          ],
+          "raw_capture_policy": "Preserve complete stdout, stderr, argv, receipt, hashes, readiness sections, capability sections, and renderer accounting out of band. Any truncation or incomplete terminal section fails closed.",
+          "revalidation_disclosure": "The initial validator falsely marked multiline const/import stable IDs missing. The sha-bound preserved stdout was reparsed without an RNA rerun; summary-revalidated.json is authoritative and reports 20 of 20 stable identities for both cases."
+        },
+        "ranked_source_projection": {
+          "projector": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/project_ranked_code.py",
+            "bytes": 37587,
+            "sha256": "f02adfa2e4d9db1cf354f2226700fcaed4d4cf020bb1bd44ee69069cce1592bf"
+          },
+          "correction_receipt": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/salient-v1/projector-correction-receipt.json",
+            "sha256": "00c686f6928dd849fa14daa6693484e8691922e999ff58c3825f22110ce966ec"
+          },
+          "eligibility": "Retain every RNA-selected identity with the expected root, a tracked .py path, a valid non-empty source span, and kind other than markdown_section. No other node-kind filter, manual selection, LLM selection, or case-specific rule is permitted.",
+          "ordering": "Preserve ascending RNA rank; the first exact stable identity wins only for exact-ID duplication.",
+          "hydration": {
+            "method": "Resolve only each retained stable identity's exact path and line span against the clean verifier-matched checkout, require the tracked git blob, and use scripts/swebench_context_packets.py::source_slice.",
+            "source_module_path": "/Users/muness/src/open-horizon-labs/repo-native-alignment-816/scripts/swebench_context_packets.py",
+            "source_module_sha256": "3aaffdd227880ba807bc78867ed8cd03e6604802b718fe939b375153541204f0",
+            "source_module_git_blob": "99d0ea606208abfac0b849ed60f802def74c9b4f",
+            "span_deduplication": "Identical path/start/end/git-blob spans emit one inline body while every RNA rank and stable identity remains in the manifest receipt."
+          },
+          "model_visible_policy": "Only ranked identity, tracked source address, and hydrated source body enter the model packet. Capability, readiness, renderer accounting, documentation, warnings, and omissions remain out of band.",
+          "cases": {
+            "astropy__astropy-13398": {
+              "manifest_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/salient-v1/astropy__astropy-13398/astropy__astropy-13398.projection-manifest.json",
+              "manifest_bytes": 23499,
+              "manifest_sha256": "844f2a78105fa5bb145e13c70035dfbb58e2a49f1ad0e55c9dda37f7fd22e707",
+              "selected_identities": 20,
+              "packet_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/salient-v1/astropy__astropy-13398/astropy__astropy-13398.code-context.txt",
+              "packet_utf8_bytes": 19405,
+              "packet_estimated_tokens": 4852,
+              "packet_sha256": "29ce72aeb19c99913d05b9dd5146f777c8e37f8321157ee47fa7af624d6dcb38"
+            },
+            "astropy__astropy-14096": {
+              "manifest_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/salient-v1/astropy__astropy-14096-attempt2/astropy__astropy-14096.projection-manifest.json",
+              "manifest_bytes": 46662,
+              "manifest_sha256": "b4d2a778c368c340f7e80666f869c894c4bd281511032e306d0b9870134fe857",
+              "selected_identities": 20,
+              "packet_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/projection-prototype/salient-v1/astropy__astropy-14096-attempt2/astropy__astropy-14096.code-context.txt",
+              "packet_utf8_bytes": 57242,
+              "packet_estimated_tokens": 14311,
+              "packet_sha256": "3706c387c7f134cfcec7aa6ef7cb334184e0ef825855abce37206e1bb60f32b1"
+            }
+          }
+        },
+        "c_plus_graph_boundaries": {
+          "selection_authority": "Typed one-hop RNA graph neighbors of the frozen arm-B stable identities only; neither issue terms nor native task-context output contribute candidates.",
+          "producer": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/graph_boundary_projector.py",
+            "bytes": 32993,
+            "sha256": "0984ceafb1522482ddebd3e0c9fa418ce0c79f1bf26f2d16929379a4c0d62f5d"
+          },
+          "policy": {
+            "sha256": "83c124c01dcb3fb1267272a76ad5cf7b1a1be4773a656e2c7da7f7343832441c",
+            "case_specific_terms": [],
+            "query": "For each of the 20 frozen B identities, run exact #822 search --repo <clean-checkout> --root=<registered-root> --node <seed> --mode=neighbors --direction=<incoming then outgoing> --hops=1 --limit=100 --compact, yielding exactly 40 traversal receipts per case.",
+            "candidate_requirements": "Every candidate must carry a stable identity, typed edge and seed provenance, tracked UTF-8 source span, and git-blob verification. Exclude B identities, any source span overlapping B, non-source records, and non-allowlisted source extensions.",
+            "lane_order": [
+              "negative_tests",
+              "rejection_paths",
+              "validation_consumers",
+              "error_paths",
+              "callers",
+              "analogues"
+            ],
+            "lane_limits": {
+              "negative_tests": 6,
+              "rejection_paths": 4,
+              "validation_consumers": 4,
+              "error_paths": 4,
+              "callers": 6,
+              "analogues": 4
+            },
+            "body_limits": {
+              "max_selected": 24,
+              "max_body_bytes": 3500,
+              "max_total_body_bytes": 30000,
+              "truncation_head_bytes": 2600,
+              "truncation_tail_bytes": 800
+            },
+            "classification": "Use only the canonical case-independent edge/token predicates serialized in the policy artifact. Empty lanes remain explicitly empty; no fallback impact search, lexical relabeling of B seeds, substitution, manual selection, or LLM selection is allowed.",
+            "ordering": "primary lane order, then minimum B-seed rank, then stable identity",
+            "deduplication": "stable identity, identical tracked source span, and all B source spans"
+          },
+          "aggregate_summary": {
+            "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/salient-v1-final.json",
+            "sha256": "71ace338fbd3307fe114f1291c68e153162c6fb25db909705e3a9abc7226643d"
+          },
+          "native_task_selector": "Diagnostic only and never model-visible. Failed native-role probes do not authorize fallback or candidate selection.",
+          "cases": {
+            "astropy__astropy-13398": {
+              "seed_manifest_sha256": "844f2a78105fa5bb145e13c70035dfbb58e2a49f1ad0e55c9dda37f7fd22e707",
+              "traversal_query_count": 40,
+              "traversal_summary_sha256": "2cb8a4df17e0cf08a503529f47505adee55766910b2f40b87e6d2150176b08a4",
+              "manifest_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/salient-v1-case13398-v1/manifest.json",
+              "manifest_bytes": 3505,
+              "manifest_sha256": "3dd467dc8ccfdbfec2e72855f78b7e9fa59cf666cb9b94fcafceee4093546bcf",
+              "selected_identities": 16,
+              "primary_lane_counts": {
+                "negative_tests": 2,
+                "rejection_paths": 4,
+                "validation_consumers": 2,
+                "error_paths": 2,
+                "callers": 6,
+                "analogues": 0
+              },
+              "packet_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/salient-v1-case13398-v1/graph-boundary-context.txt",
+              "packet_utf8_bytes": 29290,
+              "packet_sha256": "a816f0c5e65ad2ac93b5c1f511e3c7032fa464c5422b31c0f4f8e7746e962037"
+            },
+            "astropy__astropy-14096": {
+              "seed_manifest_sha256": "b4d2a778c368c340f7e80666f869c894c4bd281511032e306d0b9870134fe857",
+              "traversal_query_count": 40,
+              "traversal_summary_sha256": "686e39fbb3c208d93655e0d2b58b3dcb611f56a12bd8fb9a02a1bc82877711fa",
+              "manifest_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/salient-v1-case14096-v1/manifest.json",
+              "manifest_bytes": 3528,
+              "manifest_sha256": "c47f1859aac3269c3cab8f47af546de4d24469f27507fd6cb63caeff20375148",
+              "selected_identities": 20,
+              "primary_lane_counts": {
+                "negative_tests": 6,
+                "rejection_paths": 4,
+                "validation_consumers": 2,
+                "error_paths": 4,
+                "callers": 4,
+                "analogues": 0
+              },
+              "packet_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/graph-boundary-projector/salient-v1-case14096-v1/graph-boundary-context.txt",
+              "packet_utf8_bytes": 41388,
+              "packet_sha256": "f32a112f5ecf2983d8469990d9dafffa3076d51db9e8f3204f70bd0dcbbc5978"
+            }
+          }
+        },
+        "c_plus_revision": {
+          "policy": "After C+'s first terminal draft, run the registered exact-root graph-delta-beta query once using the exact terminal unified diff bytes as proposal. Preserve the complete raw receipt at 160000 output bytes and 40000 output tokens. Remove identities and tracked source spans already present in the frozen B and initial C+ manifests, preserve every removal receipt, freeze the novel packet and hashes before resuming the same Claude session once, and never provide test or evaluator output.",
+          "future_receipt_rule": "Proposal-dependent raw and model-visible hashes are necessarily created after the first-stage diff, but the command, root binding, novelty algorithm, 3000 per-body byte limit, 16000 total-body byte limit, 3 USD budget, 600 second timeout, and no-retry stop rule are frozen by this amendment."
+        },
+        "fail_closed": {
+          "process_checks": [
+            "exit status is zero",
+            "stdout and stderr contain no Error:, Fatal:, Invalid search context:, unknown context_mode, context_roles/context_facets require context_mode=task, or invalid task-context selection policy diagnostic",
+            "the parsed search result contains every required terminal section and no truncation marker"
+          ],
+          "identity_checks": [
+            "exact #822 artifact, binary, manifest, launcher, repository commit, tree, root, case identity, and query SHA match",
+            "strict READY, zero completeness violations, semantic generation, and rerank capability match the registered receipts",
+            "reported selected count equals parsed stable-identity count and is non-zero",
+            "every selected B identity remains in the B manifest and hydrates from a tracked git-blob-verified .py source span",
+            "every selected C+ identity has typed one-hop edge and B-seed provenance, is not a B identity or overlapping B span, and hydrates from a tracked git-blob-verified source span",
+            "every boundary lane has either selected receipts or an explicit empty-lane receipt",
+            "all raw outputs, manifests, packets, prompts, and orchestration inputs match their registered byte counts and SHA-256 identities"
+          ],
+          "native_source_diagnostic_exception": "The exact preserved RNA outputs' native source-root hydration warning is audit evidence, not authorization to omit bodies. It is accepted only because every selected B identity is independently hydrated and verified by the registered projector; any external hydration miss fails the arm.",
+          "rule": "Exit status zero alone is never success; any missing field, mismatch, unexpected diagnostic, truncation, partial archive, projection omission, or hash drift aborts before the model call."
+        },
+        "frozen_model_orchestration": {
+          "manifest_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/model-orchestration/frozen-run-manifest.json",
+          "manifest_bytes": 8286,
+          "manifest_sha256": "fd2be798f860e77cc81b7ac48ff4992e0528681c695be2feb2b6320218f30648",
+          "orchestrator_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/model-orchestration/orchestrate_screen.py",
+          "orchestrator_bytes": 37523,
+          "orchestrator_sha256": "06cfff0c98eb63e29967d0d13b9189aba6c8838b9701cbfe139efb2e31f7e542",
+          "strict_empty_mcp_path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/model-orchestration/empty-mcp.json",
+          "strict_empty_mcp_bytes": 18,
+          "strict_empty_mcp_sha256": "e93fc8db2b1bd77107fe6c758bca9545fa864cf7cce8ab93a7b2b93a1d566a7b",
+          "global_preflight": "return code 0 with all expected output paths absent and no model calls",
+          "initial_prompts": {
+            "astropy__astropy-13398": {
+              "B": {
+                "session_id": "81613398-0000-4000-8000-00000000000b",
+                "utf8_bytes": 25754,
+                "sha256": "a52cfe33480615802ffa3b2a865f37aed387dd4b9388811584a020cb22f956e6"
+              },
+              "C+": {
+                "session_id": "81613398-0000-4000-8000-00000000000c",
+                "utf8_bytes": 55617,
+                "sha256": "5846cb78e262c2b5c5eab2af39c3532f878738611ae79310958cb2b24ef44774"
+              }
+            },
+            "astropy__astropy-14096": {
+              "B": {
+                "session_id": "81614096-0000-4000-8000-00000000000b",
+                "utf8_bytes": 59250,
+                "sha256": "ed264b892f1767796da8990a36c3db1ee874a5683d163702b4ffd6b7a6a8355d"
+              },
+              "C+": {
+                "session_id": "81614096-0000-4000-8000-00000000000c",
+                "utf8_bytes": 101211,
+                "sha256": "e425737e8f17131780eae2faeecfb2a068566a3d513f93a07908679bd05675ac"
+              }
+            }
+          }
+        }
+      },
+      "observed_control_outcomes": {
+        "astropy__astropy-13398": {
+          "observed_before_amendment": true,
+          "session_id": "81613398-0000-4000-8000-00000000000a",
+          "terminal_reason": "completed",
+          "stop_reason": "end_turn",
+          "model_wall_ms": 719997,
+          "model_api_ms": 571630,
+          "claude_cli_turns": 103,
+          "unique_sonnet_messages": 100,
+          "usage": {
+            "input_tokens": 200,
+            "cache_creation_input_tokens": 149551,
+            "cache_read_input_tokens": 9012434,
+            "output_tokens": 42342
+          },
+          "model_usage": {
+            "claude-sonnet-5": {
+              "input_tokens": 200,
+              "cache_creation_input_tokens": 149551,
+              "cache_read_input_tokens": 9012434,
+              "output_tokens": 42342,
+              "cost_usd": 4.2367662
+            },
+            "claude-haiku-4-5-20251001": {
+              "input_tokens": 2139,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "output_tokens": 19,
+              "cost_usd": 0.002234
+            }
+          },
+          "total_cost_usd": 4.2390002,
+          "permission_denials": [],
+          "result_json_sha256": "0a66a7602003f3f69b370e3584c5c93cfab66fe73bf0db1fbf29bfcd5498d69e",
+          "terminal_patch_sha256": "eb566b529439c4dc55f1f49318fdf1e3f5aca08dd48b538d0f0e12f0177b1060",
+          "official_evaluation": {
+            "resolved": false,
+            "fail_to_pass_passed": 0,
+            "fail_to_pass_total": 4,
+            "pass_to_pass_regressions": 5,
+            "report_sha256": "584cf4388f61fa1327ca8650902c895bf0ed11591e425e424d270a85ba44e211"
+          }
+        },
+        "astropy__astropy-14096": {
+          "observed_before_amendment": true,
+          "session_id": "81614096-0000-4000-8000-00000000000a",
+          "recovery_disclosure": "The Codex host restarted after the terminal end_turn but before the Claude CLI top-level result object was retained. The one-shot session was not resumed or rerun; usage and terminal response were reconstructed from the retained transcript.",
+          "terminal_reason": "completed",
+          "stop_reason": "end_turn",
+          "model_wall_ms": 364605,
+          "unique_sonnet_messages": 43,
+          "usage": {
+            "input_tokens": 86,
+            "cache_creation_input_tokens": 41727,
+            "cache_read_input_tokens": 1413679,
+            "output_tokens": 15187
+          },
+          "reconstructed_sonnet_cost_usd": 0.9025287,
+          "transcript_sha256": "ba0dc88ef0d3197707807fa2adc021e222e4fccaa960d3aaef46f8fc607a63e2",
+          "terminal_response_sha256": "bb70a08c1e754df6ab95ea4064d1a393228a8b9c51d8da0b9462d5933868b0de",
+          "recovery_record_sha256": "b7981390f9fd9695229049d99637c8947978c048e7fb798e54f58d40c8545d46",
+          "terminal_patch_sha256": "c949f84a9828bd2c58282ad05fafd558b96d4ef1ef39378f5cb43fe07b48752e",
+          "official_evaluation": {
+            "resolved": true,
+            "fail_to_pass_passed": 1,
+            "fail_to_pass_total": 1,
+            "pass_to_pass_passed": 426,
+            "pass_to_pass_total": 426,
+            "pass_to_pass_regressions": 0,
+            "report_sha256": "b83e0b1a3d3276f3a24051e581f4ba72819d4b0c40de92f1e39ed0bdfc7f148e"
+          }
+        }
+      },
+      "validity_caveats": [
+        "This amendment is post-control and pre-treatment, so #816 remains an exploratory development screen rather than a pristine preregistration; #817 must freeze the chosen treatment independently.",
+        "The model-visible issue bytes remain exact, but salient-query-v1 replaces the original exact whole-issue retrieval query. Any report must distinguish model prompt identity from retrieval-query identity.",
+        "The salient query and code-only projection were selected after diagnosing failed retrieval mechanics. They are generic and frozen before treatment calls, but this development-stage choice can favor the treatment and cannot support an unbiased confirmatory estimate.",
+        "External tracked-source hydration and packet projection are part of the treatment. Their exact producers, manifests, source spans, blobs, packets, and hashes are therefore required evidence rather than incidental preprocessing.",
+        "C+ conceptual lanes are frozen generic classifications over typed one-hop graph candidates. They are not native #822 task-role outputs and cannot establish that the native task selector itself is effective.",
+        "The single fresh development case has weak B localization despite mechanically valid retrieval, so treatment selection remains noisy and must be confirmed on #817's disjoint population.",
+        "A/14096's recovered transport record is adequate for terminal efficacy but has weaker cost and token provenance than an ordinary top-level Claude result; disclose this if efficiency breaks a tie.",
+        "C+ combines graph-boundary evidence with one extra revision call, so any C+ advantage selects an operational policy but does not identify graph evidence separately from revision compute."
+      ]
+    },
+    {
+      "id": "816-cplus-delta-mechanics-v3",
+      "amended_at": "2026-07-22T12:25:14.994784Z",
+      "effective_for_arm": "C+ proposal-dependent revision only",
+      "knowledge_state": {
+        "A_B_and_C_plus_initial_outcomes_observed": true,
+        "C_plus_revision_model_calls_started": false,
+        "official_evaluator_or_test_feedback_observed_for_B_or_C_plus": false,
+        "scope": "one consolidated exploratory mechanics remediation before either C+ revision",
+        "v1_delta_attempts_observed": true
+      },
+      "disclosure": [
+        "Both original registered delta attempts remain immutable fail-closed evidence and were not retried under v1.",
+        "V2 is a post-initial, pre-revision exploratory amendment and cannot support a pristine preregistered estimate.",
+        "13398 requires #814 structured input because the exact first-stage patch creates a real new file.",
+        "14096 requires a raw audit cap above the observed 181236-byte/45299-token non-body response."
+      ],
+      "effective_mechanics": {
+        "producer": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/build_cplus_delta_v2.py",
+          "bytes": 35975,
+          "sha256": "2f864c40368a1585f28f143768b87da1d247d64bafc10cc50ab4c5abfaff9d90"
+        },
+        "policy": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/frozen-policy.json",
+          "bytes": 3472,
+          "sha256": "79c3c1145144d50c6c31bf60018dbc4930946aad1ff413acba939d6e079a0ff1"
+        },
+        "query_flags": [
+          "--search-mode=hybrid",
+          "--rerank",
+          "--include-artifacts=false",
+          "--projection=agent",
+          "--body-policy=focused_span",
+          "--limit=20",
+          "--max-body-bytes=3000",
+          "--max-total-body-bytes=16000",
+          "--max-output-bytes=256000",
+          "--max-output-tokens=64000",
+          "--context-mode=graph-delta-beta"
+        ],
+        "query_gate": "exact Git registration commit containing this amendment is required before the single v2 query attempt per case",
+        "single_attempt_per_case": true,
+        "structured_proposals": {
+          "astropy__astropy-13398": {
+            "proposal": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-13398.structured-proposal.json",
+              "bytes": 114286,
+              "sha256": "8b5c1481d30425e3fe3926079d5ef503fe78196aa6b69992af8f3b7082f7eff0"
+            },
+            "conversion_receipt": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-13398.conversion-receipt.json",
+              "bytes": 14643,
+              "sha256": "758171b0eedb74e7a6895b8b6577a1442bc970b0371314be9924e1c1f7dd2aa8"
+            }
+          },
+          "astropy__astropy-14096": {
+            "proposal": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-14096.structured-proposal.json",
+              "bytes": 24189,
+              "sha256": "6de9abb631b0afedda70ab31c314fa2c5156edcaac5ac67d7e46e06b496d2763"
+            },
+            "conversion_receipt": {
+              "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v2/structured-proposals/astropy__astropy-14096.conversion-receipt.json",
+              "bytes": 6615,
+              "sha256": "069d30f4860c287e4669820b5c62a64221bd072329e15665b3925adb0455e33f"
+            }
+          }
+        },
+        "lossless_binding": "Each structured changed-file/hunk/line fact round-trips to the exact stage-one unified diff; an audit-only deferred omission carries the raw diff base64 envelope and is removed by live enrichment before model rendering.",
+        "v1_utility": {
+          "path": "/Users/muness/swebench-evidence/issue816-development-screen-20260722T1015Z/cplus-delta-v1/build_cplus_delta.py",
+          "bytes": 38439,
+          "sha256": "7b4f48ddc1ce848e133919f0b4ce810d377aaea10b57b57a5f843e46340fae2f"
+        }
+      },
+      "unchanged": [
+        "exact stage-one patch bytes and base commit/tree",
+        "model-visible 3000-byte per-body and 16000-byte total-body limits",
+        "stable-ID/exact-span novelty filter",
+        "3 USD revision budget, 600 second timeout, same-session single revision, no retry",
+        "no evaluator/test/gold feedback and no manual/LLM selection"
+      ]
+    }
+  ]
+}
