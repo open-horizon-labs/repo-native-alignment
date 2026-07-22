@@ -1,0 +1,87 @@
+{
+  "schema": "rna-non-oracle-development-screen-v1",
+  "registered_at": "2026-07-22T04:15:00Z",
+  "parent_issue": 815,
+  "issue": 816,
+  "dataset": {
+    "name": "SWE-bench_Verified",
+    "configuration": "SWE-bench___swe-bench_verified/default/0.0.0/91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+    "arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+  },
+  "runtime": {
+    "rna_source_commit": "d17eb5b063aef81d0d96fd2e84b684b4c7c6d97c",
+    "rna_binary_sha256": "0ffd79040a424116404fe79ad0aa0a9e198f80d5aba22600c9edfb23fce06536",
+    "rna_artifact_id": 8517613929,
+    "rna_artifact_sha256": "888e2f657d6b71a3eb1531ef5596fa7120ef256de261ac9c964c33db625827ea",
+    "rna_manifest_sha256": "49a66e130a780df518e4d582915c27f8dd0c6f72ef1726d1de0027f7f9984aad",
+    "claude_cli_version": "2.1.216",
+    "model_argument": "claude-sonnet-5",
+    "effort": "high",
+    "permission_mode": "bypassPermissions",
+    "network_policy": "no agent network; WebFetch and WebSearch disabled",
+    "initial_stage_budget_usd": 8.0,
+    "c_plus_revision_budget_usd": 3.0,
+    "terminal_evaluations_per_arm": 1
+  },
+  "cases": [
+    {
+      "instance_id": "astropy__astropy-13398",
+      "repository": "astropy/astropy",
+      "base_commit": "6500928dc0e57be8f06d1162eacc3ba5e2eff692",
+      "problem_statement_utf8_bytes": 5323,
+      "problem_statement_sha256": "c26c8dc258dc5cb9dd34f30bdbaaed3f19a8ada137e0f19d81d7f57dc5f11bba",
+      "role": "known efficacy and regression-safety stress test",
+      "prior_outcomes": "development-only; prior evaluator-feedback resolution is invalid for C+"
+    },
+    {
+      "instance_id": "astropy__astropy-8707",
+      "repository": "astropy/astropy",
+      "base_commit": "a85a0747c54bac75e9c3b2fe436b105ea029d6cf",
+      "problem_statement_utf8_bytes": 840,
+      "problem_statement_sha256": "f7420a19ba5b0c807396a84da376d8303e69ff66d0216c332adf099da589a714",
+      "role": "previously unrun fresh development case",
+      "prior_outcomes": "none"
+    }
+  ],
+  "arms": {
+    "A": {
+      "name": "bare tool-enabled agent",
+      "initial_context": "problem statement only"
+    },
+    "B": {
+      "name": "strict RNA semantic acquisition",
+      "initial_context": "problem statement plus deterministic strict hybrid/rerank agent projection and ranked-body hydration"
+    },
+    "C+": {
+      "name": "semantic plus graph boundaries plus bounded revision",
+      "initial_context": "B plus deterministic task-context boundary roles",
+      "revision": "one resumed turn containing only novel graph-delta-beta evidence derived from the terminal first-stage diff"
+    }
+  },
+  "shared_policy": {
+    "same_checkout": true,
+    "same_base_agent_tools": true,
+    "same_visible_test_policy": true,
+    "same_initial_model_budget": true,
+    "gold_patch_hidden_until_terminal_evaluation": true,
+    "test_patch_hidden_until_terminal_evaluation": true,
+    "fail_to_pass_hidden_until_terminal_evaluation": true,
+    "evaluator_output_never_returned_to_agent": true,
+    "manual_or_llm_retrieval_fallback": false,
+    "official_swebench_terminal_evaluator": true
+  },
+  "selection_order": [
+    "official_resolution",
+    "pass_to_pass_regression_preservation",
+    "total_tokens",
+    "total_cost_usd",
+    "end_to_end_wall_time"
+  ],
+  "confirmatory_exclusion": [
+    "astropy__astropy-13398",
+    "astropy__astropy-14369",
+    "astropy__astropy-8707"
+  ],
+  "causal_limit": "A C+ advantage selects an operational treatment but does not separately identify graph-context and revision-call effects without a later C or compute-matched ablation.",
+  "oracle_arm": null
+}
