@@ -574,6 +574,25 @@ def validate_registered_sources(registration: Mapping[str, Any]) -> None:
         require(registered.get(key) == sha_file(SOURCE / filename), f"registered source hash mismatch: {filename}")
 
 
+def validate_authoritative_selection(
+    selection: Mapping[str, Any], registration_bytes: bytes
+) -> None:
+    require(selection.get("authoritative") is True, "selection is not authoritative")
+    require(selection.get("state") == "selected_pre_model", "selection state is not selected_pre_model")
+    require(
+        selection.get("problem_statements_inspected_by_human_before_selection") is False,
+        "selection permits prior human problem-statement inspection",
+    )
+    require(
+        selection.get("gold_or_outcomes_inspected_before_selection") is False,
+        "selection permits prior gold/outcome inspection",
+    )
+    require(
+        selection.get("registration_sha256") == sha_bytes(registration_bytes),
+        "selection binds another registration",
+    )
+
+
 def verify_runtime(manifest: Mapping[str, Any], registration: Mapping[str, Any]) -> tuple[Path, str]:
     runtime = registration["model_runtime"]
     require(runtime == {
@@ -747,7 +766,7 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
     selection_path, _ = check_ref(manifest["selection"], "manifest.selection")
     selection = read_json(selection_path)
     require(selection.get("schema_version") == "issue825-fresh-pair-selection-v2", "selection schema mismatch")
-    require(selection.get("registration_sha256") == sha_bytes(registration_bytes), "selection binds another registration")
+    validate_authoritative_selection(selection, registration_bytes)
     selected = selection.get("cases")
     require(isinstance(selected, list) and len(selected) == 2, "selection must contain exactly two cases")
 

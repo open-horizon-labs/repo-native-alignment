@@ -20,6 +20,8 @@ sys.path.insert(0, str(HERE))
 
 import common_supervisor
 import run_selector
+import select_cases
+import select_result
 import verify_selector
 
 
@@ -746,6 +748,104 @@ class RunnerAndVerifierTests(unittest.TestCase):
             self.assertTrue(aggregate["all_four_verifier_clean"])
             self.assertEqual(aggregate["by_arm"]["A"]["episodes"], 2)
             self.assertEqual(aggregate["by_arm"]["T"]["combined_pre_evaluator_wall_seconds"], 3.0)
+
+
+class ResultAggregationAuthorityTests(unittest.TestCase):
+    def winning_treatment_metrics(self) -> list[dict]:
+        metrics = []
+        for rank in (1, 2):
+            for arm in ("A", "T"):
+                metrics.append({
+                    "rank": rank,
+                    "arm": arm,
+                    "policy_compliant": True,
+                    "evidence_complete": True,
+                    "outcome_valid": True,
+                    "resolved": arm == "T",
+                    "pass_to_pass_regressions": 0,
+                    "provider_total_tokens": 100,
+                    "combined_pre_evaluator_wall_seconds": 10,
+                })
+        return metrics
+
+    def test_non_authoritative_qualification_can_never_select_treatment(self):
+        decision = select_result.decide_for_selection(
+            {
+                "authoritative": False,
+                "state": "postfix_setup_qualification_not_selection_evidence",
+            },
+            self.winning_treatment_metrics(),
+        )
+        self.assertEqual(decision["decision"], "no_selection")
+        self.assertEqual(decision["classification"], "non_authoritative_qualification")
+        self.assertFalse(decision["selection_authoritative"])
+        self.assertEqual(
+            decision["selection_state"],
+            "postfix_setup_qualification_not_selection_evidence",
+        )
+
+    def test_authoritative_selection_still_applies_registered_decision(self):
+        decision = select_result.decide_for_selection(
+            {
+                "authoritative": True,
+                "state": "selected_pre_model",
+                "problem_statements_inspected_by_human_before_selection": False,
+                "gold_or_outcomes_inspected_before_selection": False,
+            },
+            self.winning_treatment_metrics(),
+        )
+        self.assertEqual(decision["decision"], "selected_T")
+        self.assertEqual(decision["classification"], "efficacy_selection")
+        self.assertTrue(decision["selection_authoritative"])
+
+    def test_missing_or_malformed_authority_fails_closed(self):
+        invalid = (
+            {},
+            {"authoritative": None},
+            {"authoritative": 1},
+            {"authoritative": "false"},
+        )
+        for selection in invalid:
+            with self.subTest(selection=selection), self.assertRaises(
+                select_result.evaluator.FailClosed
+            ):
+                select_result.decide_for_selection(
+                    selection,
+                    self.winning_treatment_metrics(),
+                )
+
+    def test_authoritative_selection_requires_frozen_state_and_inspection_flags(self):
+        base = {
+            "authoritative": True,
+            "state": "selected_pre_model",
+            "problem_statements_inspected_by_human_before_selection": False,
+            "gold_or_outcomes_inspected_before_selection": False,
+        }
+        invalid_updates = (
+            {"state": "postfix_setup_qualification_not_selection_evidence"},
+            {"problem_statements_inspected_by_human_before_selection": True},
+            {"gold_or_outcomes_inspected_before_selection": True},
+        )
+        for update in invalid_updates:
+            with self.subTest(update=update), self.assertRaises(
+                select_result.evaluator.FailClosed
+            ):
+                select_result.decide_for_selection(
+                    {**base, **update},
+                    self.winning_treatment_metrics(),
+                )
+
+
+class FrozenSelectorRegistrationTests(unittest.TestCase):
+    def test_selector_version_and_population_match_runtime(self):
+        registration = json.loads((HERE / "registration.json").read_text())
+        exclusions = json.loads((HERE / "exclusions.json").read_text())
+        self.assertEqual(registration["selector"]["algorithm_version"], "issue825-selector-v3")
+        self.assertEqual(registration["selector"]["excluded_rows"], select_cases.EXPECTED_EXCLUDED)
+        self.assertEqual(registration["selector"]["eligible_rows"], select_cases.EXPECTED_ELIGIBLE)
+        self.assertEqual(exclusions["excluded_count"], select_cases.EXPECTED_EXCLUDED)
+        self.assertEqual(exclusions["eligible_count"], select_cases.EXPECTED_ELIGIBLE)
+        self.assertEqual(len(exclusions["excluded_instance_ids"]), select_cases.EXPECTED_EXCLUDED)
 
 
 if __name__ == "__main__":

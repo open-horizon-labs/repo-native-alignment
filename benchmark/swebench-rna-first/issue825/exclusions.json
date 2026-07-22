@@ -26,6 +26,13 @@
         "sympy__sympy-19783",
         "sympy__sympy-22714"
       ]
+    },
+    {
+      "kind": "issue825_setup_qualification_exposure",
+      "instance_ids": [
+        "django__django-12276",
+        "sphinx-doc__sphinx-9711"
+      ]
     }
   ],
   "excluded_instance_ids": [
@@ -41,6 +48,7 @@
     "django__django-11734",
     "django__django-11885",
     "django__django-12155",
+    "django__django-12276",
     "django__django-12325",
     "django__django-12406",
     "django__django-12741",
@@ -96,6 +104,7 @@
     "sphinx-doc__sphinx-8551",
     "sphinx-doc__sphinx-8593",
     "sphinx-doc__sphinx-9461",
+    "sphinx-doc__sphinx-9711",
     "sympy__sympy-13091",
     "sympy__sympy-13877",
     "sympy__sympy-14248",
@@ -107,6 +116,6 @@
     "sympy__sympy-22080",
     "sympy__sympy-22714"
   ],
-  "excluded_count": 77,
-  "eligible_count": 423
+  "excluded_count": 79,
+  "eligible_count": 421
 }

@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import evaluator_runner as runner
+import run_selector as selector_runner
 import select_result
 
 
@@ -69,11 +70,16 @@ class Fixture:
             "issue": 825,
             "dataset": {"arrow_sha256": DATASET_SHA},
         }
+        registration_ref = write_json(self.evidence / "registration.json", registration)
         selection = {
             "schema_version": "issue825-fresh-pair-selection-v2",
+            "state": "selected_pre_model",
+            "authoritative": True,
+            "registration_sha256": registration_ref["sha256"],
+            "problem_statements_inspected_by_human_before_selection": False,
+            "gold_or_outcomes_inspected_before_selection": False,
             "cases": self.cases,
         }
-        registration_ref = write_json(self.evidence / "registration.json", registration)
         selection_ref = write_json(self.evidence / "selection.json", selection)
 
         episodes = []
@@ -225,6 +231,78 @@ class Fixture:
 
     def validated_plan(self) -> dict[str, object]:
         return runner.validate_plan(self.plan_path)
+
+
+class AuthoritativeSelectionInputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registration_bytes = runner.canonical_json_bytes(
+            {"schema_version": "issue825-treatment-registration-v3", "issue": 825}
+        )
+        self.valid_selection = {
+            "authoritative": True,
+            "state": "selected_pre_model",
+            "problem_statements_inspected_by_human_before_selection": False,
+            "gold_or_outcomes_inspected_before_selection": False,
+            "registration_sha256": runner.sha256_bytes(self.registration_bytes),
+        }
+
+    def validators(self):
+        return (
+            (selector_runner.validate_authoritative_selection, selector_runner.FailClosed),
+            (runner.validate_authoritative_selection, runner.FailClosed),
+        )
+
+    def test_exact_authoritative_selection_is_accepted_by_run_and_evaluator(self) -> None:
+        for validator, _ in self.validators():
+            with self.subTest(validator=validator.__module__):
+                validator(dict(self.valid_selection), self.registration_bytes)
+
+    def test_setup_qualification_and_inspected_inputs_are_rejected(self) -> None:
+        invalid_updates = (
+            {"authoritative": False},
+            {"authoritative": 1},
+            {"state": "postfix_setup_qualification_not_selection_evidence"},
+            {"problem_statements_inspected_by_human_before_selection": True},
+            {"problem_statements_inspected_by_human_before_selection": 0},
+            {"gold_or_outcomes_inspected_before_selection": True},
+            {"gold_or_outcomes_inspected_before_selection": 0},
+            {"registration_sha256": "0" * 64},
+        )
+        for validator, failure in self.validators():
+            for update in invalid_updates:
+                selection = {**self.valid_selection, **update}
+                with self.subTest(validator=validator.__module__, update=update):
+                    with self.assertRaises(failure):
+                        validator(selection, self.registration_bytes)
+
+    def test_missing_authority_fields_are_rejected(self) -> None:
+        required = (
+            "authoritative",
+            "state",
+            "problem_statements_inspected_by_human_before_selection",
+            "gold_or_outcomes_inspected_before_selection",
+            "registration_sha256",
+        )
+        for validator, failure in self.validators():
+            for key in required:
+                selection = dict(self.valid_selection)
+                del selection[key]
+                with self.subTest(validator=validator.__module__, missing=key):
+                    with self.assertRaises(failure):
+                        validator(selection, self.registration_bytes)
+
+    def test_evaluator_plan_rejects_setup_qualification_before_episode_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), patch_keys=set())
+            plan = runner.read_json(fixture.plan_path)
+            selection_path = Path(plan["selection"]["path"])
+            selection = runner.read_json(selection_path)
+            selection["authoritative"] = False
+            selection["state"] = "postfix_setup_qualification_not_selection_evidence"
+            plan["selection"] = write_json(selection_path, selection)
+            fixture.plan_path.write_bytes(runner.canonical_json_bytes(plan))
+            with self.assertRaisesRegex(runner.FailClosed, "selection is not authoritative"):
+                fixture.validated_plan()
 
 
 class EvaluatorToolsTests(unittest.TestCase):

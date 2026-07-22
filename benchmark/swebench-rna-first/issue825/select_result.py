@@ -506,6 +506,45 @@ def decide_registered(metrics: list[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def decide_for_selection(
+    selection: Mapping[str, Any],
+    metrics: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    authoritative = selection.get("authoritative")
+    evaluator.require(
+        type(authoritative) is bool,
+        "selection authoritative flag is missing or malformed",
+    )
+    if not authoritative:
+        return {
+            "decision": "no_selection",
+            "classification": "non_authoritative_qualification",
+            "reason": (
+                "the bound selection is explicitly non-authoritative; "
+                "qualification evidence cannot select a treatment"
+            ),
+            "selection_authoritative": False,
+            "selection_state": selection.get("state"),
+        }
+    evaluator.require(
+        selection.get("state") == "selected_pre_model",
+        "authoritative selection state is not selected_pre_model",
+    )
+    evaluator.require(
+        selection.get("problem_statements_inspected_by_human_before_selection") is False,
+        "authoritative selection permits prior human problem-statement inspection",
+    )
+    evaluator.require(
+        selection.get("gold_or_outcomes_inspected_before_selection") is False,
+        "authoritative selection permits prior gold/outcome inspection",
+    )
+    return {
+        "selection_authoritative": True,
+        "selection_state": selection.get("state"),
+        **decide_registered(metrics),
+    }
+
+
 def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
     plan = evaluator.validate_plan(plan_path.resolve(strict=True))
     seal_set = evaluator.validate_seal_set(plan)
@@ -568,7 +607,7 @@ def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
         "batch recorded-evaluation count mismatch",
     )
     evaluator.require(batch.get("zero_invocation_receipts") == 4 - expected_authorized, "batch zero-call count mismatch")
-    decision = decide_registered(metrics)
+    decision = decide_for_selection(plan["_selection"], metrics)
     payload = {
         "schema_version": RESULT_SCHEMA,
         "computed_at": evaluator.utc_now(),

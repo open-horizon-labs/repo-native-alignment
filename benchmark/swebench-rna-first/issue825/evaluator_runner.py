@@ -81,6 +81,25 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def validate_authoritative_selection(
+    selection: Mapping[str, Any], registration_bytes: bytes
+) -> None:
+    require(selection.get("authoritative") is True, "selection is not authoritative")
+    require(selection.get("state") == "selected_pre_model", "selection state is not selected_pre_model")
+    require(
+        selection.get("problem_statements_inspected_by_human_before_selection") is False,
+        "selection permits prior human problem-statement inspection",
+    )
+    require(
+        selection.get("gold_or_outcomes_inspected_before_selection") is False,
+        "selection permits prior gold/outcome inspection",
+    )
+    require(
+        selection.get("registration_sha256") == sha256_bytes(registration_bytes),
+        "selection binds another registration",
+    )
+
+
 def write_exclusive(path: Path, data: bytes, mode: int = 0o444) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -492,6 +511,7 @@ def validate_plan(path: Path) -> dict[str, Any]:
         selection.get("schema_version") == "issue825-fresh-pair-selection-v2",
         "selection schema mismatch",
     )
+    validate_authoritative_selection(selection, registration_bytes)
 
     evaluator = _require_exact_keys(
         plan["evaluator"],

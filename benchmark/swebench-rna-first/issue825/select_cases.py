@@ -18,8 +18,8 @@ from typing import Any
 
 SCHEMA = "issue825-fresh-pair-selection-v2"
 EXPECTED_ROWS = 500
-EXPECTED_EXCLUDED = 77
-EXPECTED_ELIGIBLE = 423
+EXPECTED_EXCLUDED = 79
+EXPECTED_ELIGIBLE = 421
 EXPECTED_SEED = "rna-first-sonnet-selector-v1"
 EXPECTED_RANKING = "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)"
 REGISTRATION_PATH = "benchmark/swebench-rna-first/issue825/registration.json"
@@ -171,7 +171,7 @@ def main() -> int:
         arguments.exclusions.resolve(),
     )
     if registration.get("schema_version") != "issue825-treatment-registration-v3":
-        raise SelectionError("registration schema is not the frozen v2 schema")
+        raise SelectionError("registration schema is not the frozen v3 schema")
     dataset = registration.get("dataset")
     selector = registration.get("selector")
     if not isinstance(dataset, dict) or not isinstance(selector, dict):
@@ -184,7 +184,7 @@ def main() -> int:
         raise SelectionError("selector seed differs from the frozen seed")
     if selector.get("ranking") != EXPECTED_RANKING:
         raise SelectionError("selector ranking differs from the frozen algorithm")
-    if selector.get("algorithm_version") != "issue825-selector-v2":
+    if selector.get("algorithm_version") != "issue825-selector-v3":
         raise SelectionError("selector algorithm version is invalid")
 
     if exclusions.get("schema_version") != "issue825-exclusions-v2":

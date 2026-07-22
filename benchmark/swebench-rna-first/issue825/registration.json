@@ -1,16 +1,16 @@
 {
   "schema_version": "issue825-treatment-registration-v3",
-  "state": "corrected_graph_terminal_setup_qualification_frozen_before_attempt_7",
-  "frozen_at_utc": "2026-07-22T22:14:17Z",
+  "state": "authoritative_fresh_selector_frozen_before_ranking",
+  "frozen_at_utc": "2026-07-22T22:47:27Z",
   "issue": 825,
   "pull_request": 826,
   "supersedes": {
-    "registration_commit": "2fca6bbab853092445a4b66280c08feeaa6a53c6",
-    "registration_sha256": "25fa15510069bf545704d819fb6241e135c6218d081dec996de5d90b8d037c35",
-    "selection_commit": "627c68b233df5bbc2b8080adfc4550e30d5ca83f",
-    "reason": "attempt 6 proved canonical repository identity and exact-title READY acquisition, then exposed a setup defect: the supervisor incorrectly required the strict hybrid acquisition sentinel in node-mode graph output. Both treatment episodes were terminated on their first required traversal before a valid treatment response or patch; all attempt 6 evidence remains immutable, and the same-case attempt 7 retry is qualification only"
+    "registration_commit": "359464b445b6548a26575797f4bcec1e66559873",
+    "registration_sha256": "d130478e303feb1b95ee62161e8f4c8e3c2c7d1976feb1cb026844f8a59148f5",
+    "selection_commit": "359464b445b6548a26575797f4bcec1e66559873",
+    "reason": "attempt 7 completed the retained same-case setup qualification with four verifier-clean episodes and official outcomes, but its selection was explicitly non-authoritative (selection SHA-256 d0c1d024518ffc3a8114760c83d0d3620db60c91e674f7efb96b1aa6af23e9b5). The exposed cases are now excluded, execution and evaluation require an authoritative selected_pre_model receipt, and non-authoritative qualification cannot select a treatment"
   },
-  "issue_body_sha256": "870ed49d8410a0631b654c9f6281db6493cbcb733fe4e647af80423db1fa274d",
+  "issue_body_sha256": "a6da4f886a888fd724746a758604a860c5cb9e3245554d76d5641c2b041f8093",
   "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
   "dataset": {
     "name": "SWE-bench_Verified",
@@ -27,10 +27,10 @@
     "schedule": "lower_rank_A_then_T; higher_rank_T_then_A; same_case_serial; maximum_two_cases_concurrent",
     "case_replacement_after_model_start": false,
     "exclusions_path": "benchmark/swebench-rna-first/issue825/exclusions.json",
-    "exclusions_file_sha256": "0077a1960a17fbbbf95d3debf6d2376148fbbaeb919fd8b80a94b4503f99cfd8",
-    "excluded_ids_sha256": "b83c1764828f9f3d9d2377b35c394a501a56bcd7d8336fffa1385717dd519f24",
-    "excluded_rows": 77,
-    "eligible_rows": 423,
+    "exclusions_file_sha256": "6887390983da7b9d668f66d75569d92ab8bd14b9e3c461f9fe5bb00e7d2bf1b9",
+    "excluded_ids_sha256": "7790aec743b0c12289812fedad1957e97bc5dee0af2e52b5f14409cdc3bb6b8c",
+    "excluded_rows": 79,
+    "eligible_rows": 421,
     "remaining_eligible_population_ranked_before_this_registration_commit": false
   },
   "rna_artifact": {
@@ -99,15 +99,15 @@
     "claude_settings_template_sha256": "04a5b9b0fe65bceb4f4bfff9868f6a97197805dca76c6d0f2faebc30126f3634",
     "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e",
     "common_supervisor_sha256": "863642fbab706405571c3b606ed3f13dd67fdf62151201492448f19d01d4692b",
-    "case_selector_sha256": "ee19c6033b5d3b5b4d6a3067bc31598cb82136ff88d6fdc83ce79e2d35a9d313",
-    "runner_sha256": "bccfc2b36d99b74efccdac7426b691fe1cc8eed4c55a2ad2f4f1bf2de500946b",
+    "case_selector_sha256": "9ad6ed00d5d372d8fca13c1d6ca668d618f47acd172e15cc58432af59527432d",
+    "runner_sha256": "e6d6f4be53796894b24021289c0cbdc3186bbeb31f811417841fab389ef24684",
     "verifier_sha256": "610a4247c53107c5f2fe76fd9b4e37a6aea747769e73c25e608b4a1b95f7d41d",
-    "exclusions_sha256": "0077a1960a17fbbbf95d3debf6d2376148fbbaeb919fd8b80a94b4503f99cfd8",
-    "evaluator_runner_sha256": "7c52bc67bb67ef018c1f94ded357bb11e9c24d6dd59b80b4a500ffe52fad74d6",
+    "exclusions_sha256": "6887390983da7b9d668f66d75569d92ab8bd14b9e3c461f9fe5bb00e7d2bf1b9",
+    "evaluator_runner_sha256": "3c37872685b5d4d05d1f981cfea54e0897bef0697843c0df93fa695647b112d9",
     "evaluator_plan_template_sha256": "acf42b47270a81f9db17fec37f5c9ff05fb127e047a3390dec229b0077efa970",
-    "result_selector_sha256": "87ede78bfb3a7910eab63951c021760ce1c75ffd8bb0ff4efb62c294479eaf06",
-    "selector_harness_tests_sha256": "8699e4eacdd4bc38bd869f691779d7f85224e46c7f5702a40521fc8b6177f204",
-    "evaluator_tests_sha256": "052858fffaedac6e32d906ab5bf4334fd1fa671053102d3dfb3e72ac6047df29"
+    "result_selector_sha256": "5a5809f1547943d870f01c4dc64324d1d87d0b7451c5c35be3cf4fd169ff1ec4",
+    "selector_harness_tests_sha256": "c533ff4da6da0afad84a75fedbb8defcb3dab0cbb4e14e7f5204994abf7b5e6b",
+    "evaluator_tests_sha256": "6fe5b31156dd3c73ea4813d4eed191103c90a2028ce184092eba654251659b4d"
   },
   "cache_preparation": {
     "artifact": "exact successful PR 826/f073088635e25a8962199a7784472b45b435cff5 CI semantic bundle only",
