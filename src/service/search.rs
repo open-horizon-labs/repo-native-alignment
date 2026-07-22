@@ -298,8 +298,12 @@ fn sealed_semantic_bundle() -> bool {
         && option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
 }
 
-const fn use_verified_reranker_loader(strict_semantic: bool, sealed_bundle: bool) -> bool {
-    strict_semantic || sealed_bundle
+const fn use_verified_reranker_loader(
+    strict_semantic: bool,
+    sealed_bundle: bool,
+    asset_seeding: bool,
+) -> bool {
+    strict_semantic || (sealed_bundle && !asset_seeding)
 }
 
 fn semantic_asset_seeding() -> bool {
@@ -7436,8 +7440,11 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // executor during ONNX model inference (and possible first-time
         // model download/initialization).
         let query_owned = query_str.to_string();
-        let verified_reranker =
-            use_verified_reranker_loader(strict_semantic, sealed_semantic_bundle());
+        let verified_reranker = use_verified_reranker_loader(
+            strict_semantic,
+            sealed_semantic_bundle(),
+            semantic_asset_seeding(),
+        );
         let rerank_result = tokio::task::spawn_blocking(move || {
             if verified_reranker {
                 rerank_results_strict(&query_owned, &candidates)
@@ -13636,10 +13643,11 @@ mod tests {
 
     #[test]
     fn acceptance_delivery_sealed_product_queries_use_verified_reranker_loader() {
-        assert!(!use_verified_reranker_loader(false, false));
-        assert!(use_verified_reranker_loader(true, false));
-        assert!(use_verified_reranker_loader(false, true));
-        assert!(use_verified_reranker_loader(true, true));
+        assert!(!use_verified_reranker_loader(false, false, false));
+        assert!(use_verified_reranker_loader(true, false, false));
+        assert!(use_verified_reranker_loader(false, true, false));
+        assert!(use_verified_reranker_loader(true, true, false));
+        assert!(!use_verified_reranker_loader(false, true, true));
     }
 
     #[test]
