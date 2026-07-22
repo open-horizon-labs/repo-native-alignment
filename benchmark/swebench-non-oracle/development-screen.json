@@ -37,7 +37,8 @@
     "stop_rule": "one initial Claude Code session per arm; C+ alone receives one resumed revision turn; stop on terminal response, registered dollar budget, or wall timeout; no evaluator feedback and no retry",
     "workspace_rule": "byte-identical separate pristine source-only checkouts at the registered base commit, with no git remote and no .oh cache visible to the model",
     "case_13398_A_prompt_sha256": "81bdb7858000e310ac7f3d0d76557130a0ba74108291b8e96893d016ffab3db8",
-    "case_8707_A_prompt_sha256": "fd8f818724ffb35673142ddc9d8f5b0a51cc244db3c939dc17a1a3727ee20675"
+    "excluded_case_8707_A_prompt_sha256": "fd8f818724ffb35673142ddc9d8f5b0a51cc244db3c939dc17a1a3727ee20675",
+    "case_14096_A_prompt_sha256": "bd3595eac38e7adb734d1752961260c1f60d236a4cf200ff9594da050794ec6b"
   },
   "rna_treatment_construction": {
     "query": "the exact registered problem-statement bytes as the sole positional query",
@@ -112,7 +113,8 @@
   },
   "pre_registration_diagnostics": {
     "invalid_A_attempt": "one A process was started before this exact addendum, interrupted after 89.374 seconds and $0.7090892, received no evaluator output, and is excluded from every comparison",
-    "old_semantic_cache": "the retained aa92ece semantic generation was rejected by exact #822 and is excluded; structural evidence may be retained while embeddings are rebuilt and sealed by exact #822"
+    "old_semantic_cache": "the retained aa92ece semantic generation was rejected by exact #822 and is excluded; structural evidence may be retained while embeddings are rebuilt and sealed by exact #822",
+    "replaced_case_8707": "excluded after its exact #822 cold scan failed strict READY on three repository .templ files with no locked language server; its completed A call and terminal evaluation remain diagnostic-only, no RNA arm will run, and astropy__astropy-14096 is frozen as the fresh replacement before any model call on that case"
   },
   "cases": [
     {
@@ -125,12 +127,12 @@
       "prior_outcomes": "development-only; prior evaluator-feedback resolution is invalid for C+"
     },
     {
-      "instance_id": "astropy__astropy-8707",
+      "instance_id": "astropy__astropy-14096",
       "repository": "astropy/astropy",
-      "base_commit": "a85a0747c54bac75e9c3b2fe436b105ea029d6cf",
-      "problem_statement_utf8_bytes": 840,
-      "problem_statement_sha256": "f7420a19ba5b0c807396a84da376d8303e69ff66d0216c332adf099da589a714",
-      "role": "previously unrun fresh development case",
+      "base_commit": "1a4462d72eb03f30dc83a879b1dd57aac8b2c18b",
+      "problem_statement_utf8_bytes": 982,
+      "problem_statement_sha256": "938971021e89cd882f6ea33d61202fe7aa0091d7be4748b100ddc7e164db90cd",
+      "role": "previously unrun fresh development case replacing an exact-artifact inventory incompatibility",
       "prior_outcomes": "none"
     }
   ],
@@ -172,7 +174,8 @@
   "confirmatory_exclusion": [
     "astropy__astropy-13398",
     "astropy__astropy-14369",
-    "astropy__astropy-8707"
+    "astropy__astropy-8707",
+    "astropy__astropy-14096"
   ],
   "causal_limit": "A C+ advantage selects an operational treatment but does not separately identify graph-context and revision-call effects without a later C or compute-matched ablation.",
   "oracle_arm": null
