@@ -346,7 +346,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             "typescript",
             "typescript-language-server",
             &["--stdio"],
-            &["ts", "tsx", "js", "jsx"]
+            &["ts", "tsx", "js", "jsx", "js_t"]
         )
     },
     BuiltinLspDescriptor {
@@ -1145,7 +1145,7 @@ fn lsp_language_id(inventory_language: &str, path: &Path) -> String {
         }
         "typescript" | "deno" => match path.extension().and_then(|extension| extension.to_str()) {
             Some("tsx") => "typescriptreact".to_string(),
-            Some("js") => "javascript".to_string(),
+            Some("js" | "js_t") => "javascript".to_string(),
             Some("jsx") => "javascriptreact".to_string(),
             _ => "typescript".to_string(),
         },
@@ -4602,6 +4602,18 @@ mod tests {
         std::fs::write(&path, [b'l', b'e', b'g', b'a', b'c', b'y', 0xff]).unwrap();
         let text = read_lsp_text(&path).expect("legacy inventory text must be seedable");
         assert_eq!(text, "legacy\u{fffd}");
+    }
+
+    #[test]
+    fn issue825_js_template_descriptor_and_language_id() {
+        let path = Path::new("sphinx/themes/basic/static/documentation_options.js_t");
+        assert_eq!(lsp_language_id("typescript", path), "javascript");
+        assert_eq!(
+            builtin_lsp_descriptor_for_path(path)
+                .expect("tracked JavaScript templates require a locked descriptor")
+                .language(),
+            "typescript"
+        );
     }
 
     #[test]

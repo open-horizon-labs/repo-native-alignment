@@ -31,7 +31,7 @@ impl JavaScriptExtractor {
 
 impl Extractor for JavaScriptExtractor {
     fn extensions(&self) -> &[&str] {
-        &["js", "jsx", "mjs", "cjs"]
+        &["js", "jsx", "mjs", "cjs", "js_t"]
     }
 
     fn name(&self) -> &str {
@@ -1051,6 +1051,27 @@ export const API_KEY = "secret";
             defines.len(),
             1,
             "Exported const should have module-level Defines edge"
+        );
+    }
+
+    #[test]
+    fn issue825_jinja_javascript_template_is_addressable() {
+        let extractor = JavaScriptExtractor::new();
+        assert!(extractor.extensions().contains(&"js_t"));
+
+        let result = extractor
+            .extract(
+                Path::new("themes/basic/static/documentation_options.js_t"),
+                r#"const DOCUMENTATION_OPTIONS = {URL_ROOT: "{{ url_root }}"};"#,
+            )
+            .expect("tracked JavaScript templates must remain structurally addressable");
+
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| node.id.name == "DOCUMENTATION_OPTIONS"),
+            "the JavaScript body must be extracted rather than merely extension-mapped"
         );
     }
 }
