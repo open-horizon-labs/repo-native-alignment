@@ -1,0 +1,106 @@
+{
+  "schema_version": "issue825-treatment-registration-v1",
+  "state": "treatment_frozen_before_fresh_case_selection",
+  "frozen_at_utc": "2026-07-22T16:33:05Z",
+  "issue": 825,
+  "pull_request": 826,
+  "issue_body_sha256": "7fede739b15915f3b8752971c19a5afec276794e222d790bdf7c8aebd9943cbe",
+  "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
+  "dataset": {
+    "name": "SWE-bench_Verified",
+    "configuration": "SWE-bench___swe-bench_verified/default/0.0.0/91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+    "split": "test",
+    "rows": 500,
+    "arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+  },
+  "selector": {
+    "seed": "rna-first-sonnet-selector-v1",
+    "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
+    "pairs": 2,
+    "schedule": "lower_rank_A_then_T; higher_rank_T_then_A; same_case_serial; maximum_two_cases_concurrent",
+    "case_replacement_after_model_start": false,
+    "exclusions": [
+      {"instance_id":"astropy__astropy-13398","reason":"prior development/model/evaluator exposure"},
+      {"instance_id":"astropy__astropy-14369","reason":"prior development/model/evaluator exposure"},
+      {"instance_id":"astropy__astropy-8707","reason":"prior development/model/evaluator exposure"},
+      {"instance_id":"astropy__astropy-14096","reason":"prior development/model/evaluator exposure"},
+      {"instance_id":"django__django-15731","reason":"conservatively excluded because it was ranked before this byte-exact registration commit; no problem text/model/evaluator exposure"},
+      {"instance_id":"sympy__sympy-22714","reason":"conservatively excluded because it was ranked before this byte-exact registration commit; no problem text/model/evaluator exposure"}
+    ]
+  },
+  "rna_artifact": {
+    "producer_commit": "d17eb5b063aef81d0d96fd2e84b684b4c7c6d97c",
+    "binary_sha256": "0ffd79040a424116404fe79ad0aa0a9e198f80d5aba22600c9edfb23fce06536",
+    "launcher_sha256": "0ce6498db2d92733d16b16e2ec0bacae2264999bf60b49cb0156b6ee61d87d0c",
+    "bundle_manifest_sha256": "49a66e130a780df518e4d582915c27f8dd0c6f72ef1726d1de0027f7f9984aad",
+    "archive_sha256": "a75a718e744def7eae3655229cee2268a627737a2d8be82dd7b774a4065b9b3c",
+    "verification_receipt_sha256": "7d65a33b33ba2cb58f39d6d95e572011296f7c585d90c8f7e037347b8c48d505",
+    "local_source_build_allowed": false
+  },
+  "model_runtime": {
+    "cli": "Claude Code",
+    "cli_version": "2.1.216",
+    "cli_sha256": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+    "model": "claude-sonnet-5",
+    "effort": "high",
+    "wall_seconds": 600,
+    "budget_usd": 3.0,
+    "invocations_per_episode": 1,
+    "resume_allowed": false,
+    "model_retry_allowed": false,
+    "permission_mode": "bypassPermissions",
+    "safe_mode": false,
+    "tools": ["Bash","Edit","Read","Write","Glob","Grep"],
+    "disallowed_tools": ["WebSearch","WebFetch"],
+    "strict_empty_mcp_sha256": "e93fc8db2b1bd77107fe6c758bca9545fa864cf7cce8ab93a7b2b93a1d566a7b"
+  },
+  "title_acquisition": {
+    "source": "frozen problem_statement UTF-8 bytes",
+    "transform": "offset zero to first LF; remove only a CR immediately before that LF; if no LF use all bytes",
+    "normalization": false,
+    "query_argv_suffix": ["search","--repo","<immutable-index-checkout>","--root","<bound-root>","--compact","--include-artifacts=false","--limit=10","<exact-title>"],
+    "result_limit": 10,
+    "required_status": "READY",
+    "required_capabilities": ["embeddings=true","retrieval=hybrid","rerank=true","metal=true","fallback=false"],
+    "valid_empty_title_results": false,
+    "manual_or_llm_replacement": false
+  },
+  "arms": {
+    "A": "byte-exact standard user prompt and standard tool-enabled Sonnet agent; no RNA identity, response, directive, or worked interaction",
+    "T": "same user prompt/runtime plus appended-system exact-title RNA interaction and mandatory first live neighbors traversal"
+  },
+  "treatment_policy": {
+    "first_model_tool": "exact unchained traversal wrapper --node <model-selected injected ID> --mode neighbors",
+    "valid_rna_statuses": ["OK_NONEMPTY","OK_EMPTY"],
+    "fatal_rna_status": "ERROR",
+    "tools_after_valid_first_response": "ordinary identical Bash/Edit/Read/Write/Glob/Grep and visible-test surface",
+    "tools_after_error": "none; hook denies and runner terminates",
+    "later_rna_calls": "optional; same status rules",
+    "path_provenance_restriction_after_valid_response": false,
+    "manual_or_llm_rna_fallback": false
+  },
+  "registered_files": {
+    "system_prefix_sha256": "a23028ce7d62befac18cf0316f2af8d7e201f55acb40095f32b4a737f0754df1",
+    "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
+    "rna_query_sha256": "7f4c32d47d7d2ecc263acd8dac85a175f7bf7680231138f002dd017b18ce139a",
+    "rna_traverse_sha256": "11ef89a5526e6e520fe0f182ba42d2ece47f7fb020986c836ca7c8469070a800",
+    "tool_supervisor_sha256": "316bf70b52c817402ad0813a3f665f15782fb08ab10d70f65d571d9bee7533a3",
+    "supervisor_template_sha256": "390c7fbeffcb9dde3369736d455cc71cfd6ced677be752a4fc34444cde9c465a",
+    "claude_settings_template_sha256": "31d6236bd008ed228de596ebf036b318e9b664f8adb242938088966a0673565d",
+    "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e"
+  },
+  "evaluation": {
+    "official_swebench_once_per_policy_compliant_terminal_patch": true,
+    "evaluator_feedback_to_model": false,
+    "compliant_no_patch": "unresolved; no evaluator",
+    "treatment_nonadherence": "unresolved intention-to-treat; no evaluator; no retry",
+    "retain_all_failures": true
+  },
+  "selection": {
+    "prerequisite": "both T episodes policy-compliant and all other resolution/regression outcomes verifier-clean; otherwise no treatment or inconclusive as registered",
+    "reject_if": "T resolves fewer or causes more total PASS_TO_PASS regressions",
+    "select_efficacy_if": "T resolves more without more regressions, or tied resolution with fewer regressions",
+    "select_efficiency_if_exact_efficacy_tie": "input_plus_output_tokens at least 15 percent lower, or tokens no more than 5 percent higher and RNA_plus_model wall at least 20 percent lower",
+    "token_total": "provider input_tokens plus output_tokens; cached input is a subset and reasoning is reported separately"
+  }
+}

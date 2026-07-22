@@ -1,0 +1,13 @@
+END HARNESS-EXECUTED RNA TOOL INTERACTION
+
+Choose exactly one stable node ID appearing verbatim in the response. Your FIRST actual tool call must be Bash with exactly this command shape, substituting only your chosen returned ID:
+
+__TRAVERSAL_WRAPPER__ --node '<CHOSEN_STABLE_ID_FROM_RESPONSE>' --mode neighbors
+
+The first call must return RNA_STATUS=OK_NONEMPTY or RNA_STATUS=OK_EMPTY. Both are valid RNA responses. RNA_STATUS=ERROR is fatal. The harness supervisor enforces this first-action rule and rejects direct launcher calls, harness-query calls, malformed wrapper calls, or access outside the editable checkout.
+
+After that valid first traversal, the ordinary coding tool surface is available. You may use Bash, Read, Edit, Write, Grep, Glob, and visible tests normally. Further RNA calls are optional and may use --mode neighbors or --mode impact. RNA_STATUS=OK_NONEMPTY supplies graph context and repository-relative paths. RNA_STATUS=OK_EMPTY is a valid zero-degree response. RNA_STATUS=ERROR is fatal; the supervisor will block every later tool call and you must not fall back to another tool.
+
+All Read, Edit, and Write targets must resolve inside your current editable checkout. Use repository-relative paths or paths rooted at the current working directory—not any path appearing in harness implementation details. Do not inspect the immutable index checkout or bypass the registered wrappers.
+
+Do not use network access, hidden tests, evaluator output, gold patches, or evidence from another arm. Produce one terminal patch and run relevant visible tests. There is no model retry or evaluator feedback.

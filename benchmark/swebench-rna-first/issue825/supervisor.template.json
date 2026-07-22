@@ -1,0 +1,18 @@
+{
+  "schema_version": "rna-supervisor-config-v1",
+  "policy": "__CONTROL_OR_TREATMENT__",
+  "launcher": "__PINNED_RNA_LAUNCHER__",
+  "repo": "__IMMUTABLE_INDEX_CHECKOUT__",
+  "checkout": "__EDITABLE_CHECKOUT__",
+  "root": "__RNA_ROOT__",
+  "initial_response": "__HARNESS_RESPONSE__",
+  "initial_ids": ["__STABLE_ID__"],
+  "wrapper": "__TRAVERSAL_WRAPPER__",
+  "query_wrapper": "__QUERY_WRAPPER__",
+  "state": "__SUPERVISOR_STATE__",
+  "lock": "__SUPERVISOR_LOCK__",
+  "hook_ledger": "__HOOK_LEDGER__",
+  "rna_events": "__RNA_EVENTS_DIRECTORY__",
+  "expected_query_sha256": "__TITLE_QUERY_SHA256__",
+  "result_limit": 10
+}
