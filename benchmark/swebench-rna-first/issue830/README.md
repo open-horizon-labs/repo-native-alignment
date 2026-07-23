@@ -15,6 +15,15 @@ defects. This successor:
 - prepares only the Django cache under the new producer identity; and
 - preserves the original SymPy A→T and Django T→A order.
 
+The first issue #830 launch also stopped before any model process or episode
+receipt. It exposed two pre-model harness/setup defects: a false secret-name
+match on the tokenizer provenance digest and tracked Django documentation
+symlinks that static preflight had not audited. The successor closure retains
+that failure, binds the shared exact-name correction, requires gateway-Python
+and private-tree validation during preflight, and records the exact-tree
+`core.symlinks=false` Django checkout preparation. Cases, order, model,
+treatment, budget, timeout, evaluator, and retry policy remain unchanged.
+
 `successor-lineage.json` is the human-readable lineage contract. The generated
 `registration.json` embeds that object and remains executable by the issue #827
 runner. `selection.json` is published in a later commit so its
