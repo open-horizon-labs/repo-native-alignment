@@ -1922,6 +1922,7 @@ def acquire_treatment(
         "raw_stderr": None,
         "projected_stable_code_ids": [],
         "raw_stable_code_ids": [],
+        "projection_authorization_sha256": None,
         "elapsed_seconds": elapsed,
     }
     try:
@@ -1932,7 +1933,9 @@ def acquire_treatment(
             receipt = loaded_receipt
             query_evidence["raw_stdout"] = receipt.get("stdout")
             query_evidence["raw_stderr"] = receipt.get("stderr")
-            query_evidence["raw_stable_code_ids"] = receipt.get("raw_stable_code_ids")
+            query_evidence["raw_stable_code_ids"] = receipt.get(
+                "raw_stable_code_ids_observational_only"
+            )
         require(process_started, f"{case.case_id} exact-title RNA query did not start")
         require(not timed_out, f"{case.case_id} exact-title RNA query timed out")
         require(result.returncode == 0, f"{case.case_id} exact-title RNA query failed: {result.stderr.decode(errors='replace')}")
@@ -1944,15 +1947,51 @@ def acquire_treatment(
         require(READY_SENTINEL in text, "query projection missing exact READY sentinel")
         ids = stable_code_ids(text)
         require(ids, "query projection returned no stable code IDs")
-        require(receipt.get("projected_stable_code_ids") == ids, "query projected stable IDs mismatch")
+        expected_authorization_source = frontier_replay.source(
+            0,
+            "injected_query_projection",
+            "INJECTED_QUERY",
+            result.stdout,
+            result.stdout,
+        )
+        projection_authorization = receipt.get("projection_authorization")
+        projection_authorization_sha256 = receipt.get(
+            "projection_authorization_sha256"
+        )
+        require(
+            isinstance(projection_authorization, dict),
+            "query raw receipt missing projection authorization",
+        )
+        require(
+            projection_authorization
+            == expected_authorization_source["projection_authorization"],
+            "query projection authorization does not match injected response",
+        )
+        require(
+            projection_authorization_sha256
+            == expected_authorization_source[
+                "projection_authorization_sha256"
+            ],
+            "query projection authorization hash mismatch",
+        )
+        require(
+            projection_authorization.get("stable_code_ids") == ids,
+            "query projection authorization stable IDs mismatch",
+        )
         require(
             all(f"`{item}`".encode() in result.stdout for item in ids),
             "query authorized an ID absent from injected response bytes",
         )
         query_evidence["projected_stable_code_ids"] = ids
+        query_evidence["projection_authorization_sha256"] = (
+            projection_authorization_sha256
+        )
         config["initial_ids"] = ids
         config["initial_response"] = str(projection_path)
         config["initial_response_sha256"] = sha_bytes(result.stdout)
+        config["initial_authorization_sha256"] = (
+            projection_authorization_sha256
+        )
         atomic_write(harness_paths["config"], canonical(config))
         atomic_write(evidence / "supervisor-config.json", canonical(config))
         prefix = (SOURCE / "system-prefix.txt").read_bytes()

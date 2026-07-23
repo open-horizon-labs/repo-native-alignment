@@ -81,6 +81,23 @@ def exact_first_treatment_action(
     except UnicodeError:
         projected_ids = []
         errors.append("query_projection_not_utf8")
+    else:
+        expected_authorization = frontier_replay.source(
+            0,
+            "injected_query_projection",
+            "INJECTED_QUERY",
+            projection,
+            projection,
+        )
+        if (
+            config.get("initial_authorization_sha256")
+            != expected_authorization[
+                "projection_authorization_sha256"
+            ]
+        ):
+            errors.append(
+                "configured_projection_authorization_sha_mismatch"
+            )
     initial_ids = config.get("initial_ids")
     if initial_ids != projected_ids:
         errors.append("configured_ids_not_exactly_projected")
@@ -537,8 +554,6 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                 else:
                     if raw_receipt.get("returncode") != 0:
                         errors.append("query_raw_returncode_nonzero")
-                    if not raw_receipt.get("projected_stable_code_ids"):
-                        errors.append("query_no_stable_code_ids")
                 if wrapper_bytes is not None and runner.READY_SENTINEL.encode() not in wrapper_bytes:
                     errors.append("query_projection_missing_exact_readiness")
                 if wrapper_bytes is not None:
@@ -547,8 +562,57 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                     except UnicodeError:
                         projected_ids = []
                         errors.append("query_projection_not_utf8")
-                    if not isinstance(raw_receipt, dict) or raw_receipt.get("projected_stable_code_ids") != projected_ids:
-                        errors.append("query_projected_ids_not_reproducible")
+                        projection_is_utf8 = False
+                    else:
+                        projection_is_utf8 = True
+                    if not projected_ids:
+                        errors.append("query_no_stable_code_ids")
+                    if projection_is_utf8:
+                        expected_authorization = frontier_replay.source(
+                            0,
+                            "injected_query_projection",
+                            "INJECTED_QUERY",
+                            wrapper_bytes,
+                            wrapper_bytes,
+                        )
+                        if not isinstance(raw_receipt, dict):
+                            errors.append(
+                                "query_projection_authorization_missing"
+                            )
+                        else:
+                            if (
+                                raw_receipt.get(
+                                    "projection_authorization"
+                                )
+                                != expected_authorization[
+                                    "projection_authorization"
+                                ]
+                            ):
+                                errors.append(
+                                    "query_projection_authorization_mismatch"
+                                )
+                            if (
+                                raw_receipt.get(
+                                    "projection_authorization_sha256"
+                                )
+                                != expected_authorization[
+                                    "projection_authorization_sha256"
+                                ]
+                            ):
+                                errors.append(
+                                    "query_projection_authorization_hash_mismatch"
+                                )
+                            if (
+                                query.get(
+                                    "projection_authorization_sha256"
+                                )
+                                != raw_receipt.get(
+                                    "projection_authorization_sha256"
+                                )
+                            ):
+                                errors.append(
+                                    "query_evidence_authorization_hash_mismatch"
+                                )
                     if query.get("projected_stable_code_ids") != projected_ids:
                         errors.append("query_evidence_projected_ids_mismatch")
                 if isinstance(raw_receipt, dict):

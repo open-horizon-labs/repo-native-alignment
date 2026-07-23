@@ -864,6 +864,314 @@ class RunnerAndVerifierTests(unittest.TestCase):
             ):
                 run_selector.verify_gateway_python_identity(wrong_python)
 
+    def acquisition_fixture(
+        self,
+        root: Path,
+        *,
+        authorization_mutation=None,
+    ):
+        projection = (
+            b'## Search: "Bug title"\n'
+            b"- **function** `target` `foo.py`:1-1\n"
+            b"  `foo.py:target:function`\n\n"
+            b"`status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`\n"
+        )
+        authorization = live_identity.derive_projection_authorization(
+            projection
+        )
+        authorization_sha256 = sha(canonical(authorization))
+        receipt = {
+            "identity_sha256": "a" * 64,
+            "root": "repo-root",
+            "returncode": 0,
+            "projection_authorization": authorization,
+            "projection_authorization_sha256": authorization_sha256,
+            "raw_stable_code_ids_observational_only": [
+                "foo.py:hidden:function",
+                "foo.py:target:function",
+            ],
+        }
+        if authorization_mutation is not None:
+            authorization_mutation(receipt)
+
+        evidence = root / "evidence"
+        query = evidence / "query"
+        query.mkdir(parents=True)
+        raw_stdout = query / "title-query.stdout"
+        raw_stderr = query / "title-query.stderr"
+        raw_stdout.write_bytes(projection)
+        raw_stderr.write_bytes(b"")
+        receipt["stdout"] = ref(raw_stdout)
+        receipt["stderr"] = ref(raw_stderr)
+        (query / "title-query.json").write_bytes(canonical(receipt))
+
+        wrapper = root / "rna_query.py"
+        wrapper.write_text("#!/usr/bin/env python3\n")
+        wrapper.chmod(0o755)
+        profile = root / "trusted-rna.sb"
+        profile.write_text("(version 1)\n(allow default)\n")
+        environment = root / "canonical-environment.json"
+        environment.write_text("{}\n")
+        harness_config = root / "harness/config/supervisor.json"
+        config = {
+            "expected_query_sha256": "b" * 64,
+            "expected_identity_sha256": "a" * 64,
+            "sandbox_exec": str(Path(sys.executable).resolve()),
+            "trusted_rna_seatbelt_profile": str(profile),
+            "gateway_python": str(Path(sys.executable).resolve()),
+            "checkout": str(root),
+            "trusted_rna_env": {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(root),
+            },
+            "trusted_rna_timeout_seconds": 5,
+            "trusted_rna_environment": str(environment),
+            "trusted_rna_read_roots": [str(root)],
+            "trusted_rna_write_roots": [str(root)],
+        }
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            projection,
+            b"",
+        )
+        return {
+            "authorization_sha256": authorization_sha256,
+            "case": SimpleNamespace(
+                case_id="repo__repo-1",
+                root="repo-root",
+            ),
+            "completed": completed,
+            "config": config,
+            "evidence": evidence,
+            "harness_paths": {
+                "config": harness_config,
+                "rna_query.py": wrapper,
+                "rna_traverse.py": root / "rna_traverse.py",
+            },
+        }
+
+    def test_successful_acquisition_binds_authenticated_projection_to_config(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.acquisition_fixture(Path(tmp))
+            with mock.patch.object(
+                run_selector.subprocess,
+                "run",
+                return_value=fixture["completed"],
+            ):
+                _system, ids, _elapsed, query_evidence = (
+                    run_selector.acquire_treatment(
+                        fixture["case"],
+                        fixture["harness_paths"],
+                        fixture["evidence"],
+                        fixture["config"],
+                    )
+                )
+
+            self.assertEqual(ids, ["foo.py:target:function"])
+            self.assertEqual(
+                fixture["config"]["initial_authorization_sha256"],
+                fixture["authorization_sha256"],
+            )
+            self.assertEqual(
+                query_evidence["projection_authorization_sha256"],
+                fixture["authorization_sha256"],
+            )
+            self.assertEqual(
+                query_evidence["raw_stable_code_ids"],
+                [
+                    "foo.py:hidden:function",
+                    "foo.py:target:function",
+                ],
+            )
+            for path in (
+                fixture["harness_paths"]["config"],
+                fixture["evidence"] / "supervisor-config.json",
+            ):
+                persisted = json.loads(path.read_bytes())
+                self.assertEqual(
+                    persisted["initial_authorization_sha256"],
+                    fixture["authorization_sha256"],
+                )
+
+    def test_acquisition_rejects_missing_or_mismatched_raw_authorization(
+        self,
+    ):
+        mutations = {
+            "missing": lambda receipt: (
+                receipt.pop("projection_authorization"),
+                receipt.pop("projection_authorization_sha256"),
+            ),
+            "authorization_mismatch": lambda receipt: receipt[
+                "projection_authorization"
+            ].update({"projection_sha256": "f" * 64}),
+            "hash_mismatch": lambda receipt: receipt.update(
+                {"projection_authorization_sha256": "f" * 64}
+            ),
+        }
+        for name, mutation in mutations.items():
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                fixture = self.acquisition_fixture(
+                    Path(tmp),
+                    authorization_mutation=mutation,
+                )
+                with (
+                    mock.patch.object(
+                        run_selector.subprocess,
+                        "run",
+                        return_value=fixture["completed"],
+                    ),
+                    self.assertRaises(
+                        run_selector.TreatmentAcquisitionFailure
+                    ),
+                ):
+                    run_selector.acquire_treatment(
+                        fixture["case"],
+                        fixture["harness_paths"],
+                        fixture["evidence"],
+                        fixture["config"],
+                    )
+                self.assertNotIn(
+                    "initial_authorization_sha256",
+                    fixture["config"],
+                )
+                self.assertFalse(
+                    fixture["harness_paths"]["config"].exists()
+                )
+
+    def test_first_treatment_action_binds_configured_authorization_hash(self):
+        projection = (
+            b'## Search: "Bug title"\n'
+            b"  `foo.py:target:function`\n\n"
+            b"`status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`\n"
+        )
+        wrapper = "/private/rna_traverse.py"
+        actor = {
+            "actions": [{
+                "actor": "model",
+                "tool": "Bash",
+                "bash_command": (
+                    f"{wrapper} --node foo.py:target:function "
+                    "--mode neighbors"
+                ),
+                "common_decision": "replace_allow",
+                "treatment_decision": "allow",
+            }],
+        }
+        config = {
+            "wrapper": wrapper,
+            "initial_ids": ["foo.py:target:function"],
+            "initial_response_sha256": sha(projection),
+            "initial_authorization_sha256": sha(canonical(
+                live_identity.derive_projection_authorization(projection)
+            )),
+        }
+        system = (
+            b"Your FIRST actual tool call must be Bash with exactly this "
+            b"command shape\n"
+            + wrapper.encode()
+            + b"\n"
+            + projection
+        )
+        errors = []
+        verify_selector.exact_first_treatment_action(
+            actor, config, system, projection, errors
+        )
+        self.assertEqual(errors, [])
+
+        errors = []
+        verify_selector.exact_first_treatment_action(
+            actor,
+            {**config, "initial_authorization_sha256": "f" * 64},
+            system,
+            projection,
+            errors,
+        )
+        self.assertEqual(
+            errors,
+            ["configured_projection_authorization_sha_mismatch"],
+        )
+
+    def test_verify_episode_retains_non_utf8_projection_as_invalid_evidence(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projection = root / "projection.stdout"
+            projection.write_bytes(b"\xff")
+            stderr = root / "wrapper.stderr"
+            stderr.write_bytes(b"")
+            receipt = root / "episode-receipt.json"
+            receipt.write_bytes(canonical({
+                "schema_version": run_selector.RECEIPT_SCHEMA,
+                "case_id": "repo__repo-1",
+                "rank": 1,
+                "arm": "T",
+                "policy": "treatment",
+                "run_manifest": None,
+                "registration": None,
+                "selection": None,
+                "runtime_identity": None,
+                "prompt": None,
+                "command": None,
+                "treatment_system": None,
+                "query_evidence": {
+                    "schema_version": run_selector.QUERY_EVIDENCE_SCHEMA,
+                    "acquisition_started": True,
+                    "wrapper_returncode": 0,
+                    "wrapper_stdout": ref(projection),
+                    "wrapper_stderr": ref(stderr),
+                    "raw_receipt": None,
+                    "succeeded": True,
+                    "failure": None,
+                    "projected_stable_code_ids": [],
+                    "projection_authorization_sha256": None,
+                },
+                "stdout": None,
+                "stderr": None,
+                "transcripts": [],
+                "actor_tool_ledger": None,
+                "supervisor": {},
+                "token_ledger": {
+                    "schema_version": provider_usage.SCHEMA_VERSION,
+                    "valid": True,
+                    "errors": [],
+                    "source": "top_level_usage",
+                    "model_invoked": True,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "provider_total_tokens": 2,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cli_turns": 0,
+                    "provider_responses": 1,
+                    "provider_requests": None,
+                },
+                "timing_ledger": {
+                    "rna_preprocessing_seconds": 0.0,
+                    "model_wall_seconds": 0.0,
+                    "combined_pre_evaluator_wall_seconds": 0.0,
+                },
+                "terminal_patch": None,
+                "official_evaluator_invoked": False,
+                "evaluator_authorized": False,
+                "policy_compliant": False,
+                "evidence_complete": False,
+                "returncode": None,
+                "timed_out": False,
+                "errors": [],
+            }))
+
+            result = verify_selector.verify_episode(receipt)
+            self.assertIn("query_projection_not_utf8", result["errors"])
+            self.assertIn("query_no_stable_code_ids", result["errors"])
+
     def test_failed_acquisition_retains_exact_command_and_wrapper_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
