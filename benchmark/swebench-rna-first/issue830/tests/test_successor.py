@@ -57,6 +57,20 @@ class SuccessorRegistrationTests(unittest.TestCase):
                 )
 
             changed = copy.deepcopy(lineage)
+            changed["retained_pre_model_attempts"][1][
+                "model_processes_started"
+            ] = 1
+            registration_path.write_bytes((HERE / "registration.json").read_bytes())
+            lineage_path.write_text(json.dumps(changed))
+            with self.assertRaises(verify_successor.SuccessorVerificationError):
+                verify_successor.verify_registration(
+                    registration_path,
+                    lineage_path,
+                    HERE / "qualification-closure.manifest.json",
+                    None,
+                )
+
+            changed = copy.deepcopy(lineage)
             changed["prior_activity"]["model_calls"] = 1
             registration_path.write_bytes((HERE / "registration.json").read_bytes())
             lineage_path.write_text(json.dumps(changed))

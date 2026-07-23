@@ -40,6 +40,55 @@ def ref(path: Path) -> dict:
     return {"path": str(path), "bytes": len(data), "sha256": sha(data)}
 
 
+class MaterializedEntrypointTests(unittest.TestCase):
+    def test_trusted_entrypoints_import_only_materialized_siblings_with_safe_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = run_selector.materialize_harness(root, "A")
+            paths["config"].write_text(
+                json.dumps({"lock": str(root / "entrypoint.lock")})
+            )
+            hostile = root / "hostile"
+            hostile.mkdir()
+            for name in (
+                "bash_gateway.py",
+                "frontier_replay.py",
+                "isolation.py",
+                "live_identity.py",
+            ):
+                (hostile / name).write_text(
+                    f"raise RuntimeError('HOSTILE_SHADOW:{name}')\n"
+                )
+            environment = {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": str(hostile),
+                "PYTHONSAFEPATH": "1",
+            }
+            for name in (
+                "trusted_rna_broker.py",
+                "rna_query.py",
+                "rna_traverse.py",
+            ):
+                with self.subTest(entrypoint=name):
+                    result = subprocess.run(
+                        [sys.executable, str(paths[name]), "--help"],
+                        cwd=hostile,
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stderr.decode(errors="replace"),
+                    )
+                    self.assertIn(b"usage:", result.stdout)
+                    self.assertNotIn(b"HOSTILE_SHADOW", result.stderr)
+
+
 class WrapperFixture:
     def __init__(self, root: Path):
         self.root = root

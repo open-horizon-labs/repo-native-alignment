@@ -134,7 +134,7 @@ def verify_registration(
         "lineage imports prior activity",
     )
     require(
-        lineage.get("schema_version") == "issue830-successor-lineage-v2",
+        lineage.get("schema_version") == "issue830-successor-lineage-v3",
         "successor lineage schema drift",
     )
     require(
@@ -160,7 +160,31 @@ def verify_registration(
                 "run_manifest_sha256": (
                     "6753cc3f0b2c1b153df80955d517fe0801bbc8a3d5cc71e572b40dfaa2404fac"
                 ),
-            }
+            },
+            {
+                "authorization_requests": 0,
+                "credential_worker_invocations": 0,
+                "episode_receipt_sha256": (
+                    "e8a2bbf3767d84c6dbf58fb7851aa86cfb91372425d4528783e388f305186f33"
+                ),
+                "episode_receipts": 1,
+                "failure_codes": [
+                    "trusted RNA broker exited before ready: 1",
+                    "ModuleNotFoundError: No module named 'live_identity'",
+                ],
+                "invocation_result_sha256": (
+                    "66dea20ee76ed72cf6462afb9bd055465fef1b928e4d28d4030fd159f6a6589c"
+                ),
+                "invocation_start_sha256": (
+                    "c60de68cfe6039627e1afedc8b84c99227aa6489bb4a2e74e43c41dc3cda2d9a"
+                ),
+                "model_processes_started": 0,
+                "official_evaluator_invocations": 0,
+                "provider_requests": 0,
+                "run_manifest_sha256": (
+                    "30bcfda77be360fb3fcbc7a77cf6e40dd42e0cb3852f90bb09fd5af6cee875cf"
+                ),
+            },
         ],
         "retained pre-model attempt drift",
     )

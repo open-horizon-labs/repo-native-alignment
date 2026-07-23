@@ -22,6 +22,8 @@ import sys
 import time
 from typing import Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve(strict=True).parent))
+
 import bash_gateway
 from isolation import (
     BROKER_READY_SCHEMA,

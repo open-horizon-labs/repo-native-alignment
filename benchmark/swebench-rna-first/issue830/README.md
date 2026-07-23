@@ -24,6 +24,15 @@ and private-tree validation during preflight, and records the exact-tree
 `core.symlinks=false` Django checkout preparation. Cases, order, model,
 treatment, budget, timeout, evaluator, and retry policy remain unchanged.
 
+The second issue #830 launch likewise stopped before Claude. Its retained token
+ledger records `model_invoked=false`, zero provider requests, and zero CLI
+turns. The exact canonical environment enables `PYTHONSAFEPATH=1`, exposing
+three materialized trusted-plane entrypoints that had relied on Python
+implicitly adding their script directory. Those entrypoints now explicitly
+prepend only their own resolved, digest-bound, private-tree-audited materialized
+directory. Safe-path mode remains enabled; neither the checkout, current
+working directory, nor an ambient `PYTHONPATH` becomes trusted.
+
 `successor-lineage.json` is the human-readable lineage contract. The generated
 `registration.json` embeds that object and remains executable by the issue #827
 runner. `selection.json` is published in a later commit so its
