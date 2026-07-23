@@ -134,6 +134,37 @@ def verify_registration(
         "lineage imports prior activity",
     )
     require(
+        lineage.get("schema_version") == "issue830-successor-lineage-v2",
+        "successor lineage schema drift",
+    )
+    require(
+        lineage.get("retained_pre_model_attempts")
+        == [
+            {
+                "authorization_requests": 0,
+                "credential_worker_invocations": 0,
+                "episode_receipts": 0,
+                "failure_codes": [
+                    "trusted RNA canonical environment contract invalid",
+                    "private_tree_contains_symlink",
+                ],
+                "invocation_result_sha256": (
+                    "811418802aa634d361ccc74c9af26f2e008a87904914f05c75c553e771bae7c0"
+                ),
+                "invocation_start_sha256": (
+                    "24a908fa91ebac510ef84129bfc5b9ccd9232a904d150bc797fef99d375b4d5e"
+                ),
+                "model_processes_started": 0,
+                "official_evaluator_invocations": 0,
+                "provider_requests": 0,
+                "run_manifest_sha256": (
+                    "6753cc3f0b2c1b153df80955d517fe0801bbc8a3d5cc71e572b40dfaa2404fac"
+                ),
+            }
+        ],
+        "retained pre-model attempt drift",
+    )
+    require(
         lineage.get("runtime_authorization")
         == {
             "episode_budget_usd": 6.0,

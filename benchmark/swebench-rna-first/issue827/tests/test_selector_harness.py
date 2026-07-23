@@ -706,6 +706,16 @@ class RnaWrapperTests(unittest.TestCase):
 
 
 class RunnerAndVerifierTests(unittest.TestCase):
+    def test_registered_gateway_python_must_match_invoking_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wrong_python = Path(tmp) / "python"
+            wrong_python.write_bytes(b"not the invoking interpreter")
+            with self.assertRaisesRegex(
+                run_selector.FailClosed,
+                "gateway Python differs from runner Python",
+            ):
+                run_selector.verify_gateway_python_identity(wrong_python)
+
     def test_failed_acquisition_retains_exact_command_and_wrapper_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1155,6 +1165,36 @@ class CheckoutHygieneTests(unittest.TestCase):
             ):
                 run_selector.verify_checkout(
                     str(checkout), commit, tree, "arm prelaunch"
+                )
+
+    def test_model_checkout_preflight_rejects_tracked_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout, _, _ = self.fixture(Path(tmp).resolve())
+            (checkout / "tracked-link.py").symlink_to("tracked.py")
+            subprocess.run(
+                ["git", "-C", str(checkout), "add", "tracked-link.py"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "commit", "-qm", "tracked link"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
+            tree = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD^{tree}"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
+            with self.assertRaisesRegex(
+                run_selector.FailClosed,
+                "private-tree audit failed: private_tree_contains_symlink",
+            ):
+                run_selector.verify_model_checkout(
+                    str(checkout), commit, tree, "arm"
                 )
 
     def test_model_checkout_rejects_other_untracked_and_ignored_material(self):

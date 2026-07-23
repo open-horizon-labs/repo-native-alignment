@@ -25,10 +25,10 @@ from isolation import (
     MAX_WORKER_REQUEST_BYTES,
     REQUEST_ID_RE,
     REQUEST_SCHEMA,
-    SECRET_ENV_PARTS,
     TEARDOWN_SCHEMA,
     build_docker_worker_argv,
     canonical,
+    is_secret_env_name,
     parse_strace_directory,
     sha256_bytes,
     sha256_file,
@@ -403,7 +403,7 @@ def _fixed_host_env(config: Mapping[str, object], key: str) -> dict[str, str]:
                 name not in permitted
                 if canonical_trusted is None
                 else re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
-                or any(secret in name.upper() for secret in SECRET_ENV_PARTS)
+                or is_secret_env_name(name)
             )
             or not isinstance(raw, str)
             or "\x00" in raw

@@ -33,8 +33,8 @@ from isolation import (
     IsolationViolation,
     REQUEST_ID_RE,
     REQUEST_SCHEMA,
-    SECRET_ENV_PARTS,
     canonical,
+    is_secret_env_name,
     sha256_bytes,
     sha256_file,
 )
@@ -320,7 +320,7 @@ def serve(config: Mapping[str, object], config_sha256: str) -> int:
             for value in injected_environment.values()
         )
         or any(
-            any(secret in name.upper() for secret in SECRET_ENV_PARTS)
+            is_secret_env_name(name)
             for name in os.environ
         )
     ):
@@ -352,12 +352,10 @@ def serve(config: Mapping[str, object], config_sha256: str) -> int:
             "credential_environment_names": sorted(
                 name
                 for name in os.environ
-                if any(secret in name.upper() for secret in SECRET_ENV_PARTS)
+                if is_secret_env_name(name)
             ),
             "provider_environment_inherited": not all(
-                not any(
-                    secret in name.upper() for secret in SECRET_ENV_PARTS
-                )
+                not is_secret_env_name(name)
                 for name in os.environ
             ),
         }

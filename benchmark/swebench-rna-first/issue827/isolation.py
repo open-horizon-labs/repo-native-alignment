@@ -69,6 +69,7 @@ SECRET_ENV_PARTS = (
     "AUTH",
     "COOKIE",
 )
+NON_SECRET_ENV_NAMES = frozenset({"RNA_EMBEDDING_TOKENIZER_SHA256"})
 NATIVE_TOOLS = {"Read", "Edit", "Write", "Glob", "Grep"}
 WRITE_TOOLS = {"Edit", "Write"}
 TRACE_TERMINAL_RE = re.compile(
@@ -101,6 +102,16 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def is_secret_env_name(name: object) -> bool:
+    """Preserve fail-closed substring checks except for exact proven-safe names."""
+
+    return (
+        isinstance(name, str)
+        and name not in NON_SECRET_ENV_NAMES
+        and any(part in name.upper() for part in SECRET_ENV_PARTS)
+    )
 
 
 class IsolationViolation(RuntimeError):
@@ -670,7 +681,7 @@ def validate_worker_config(config: Mapping[str, object]) -> dict[str, object]:
             not isinstance(name, str)
             or ENV_NAME_RE.fullmatch(name) is None
             or name not in SAFE_WORKER_ENV
-            or any(part in name for part in SECRET_ENV_PARTS)
+            or is_secret_env_name(name)
             or not isinstance(value, str)
             or "\x00" in value
         ):

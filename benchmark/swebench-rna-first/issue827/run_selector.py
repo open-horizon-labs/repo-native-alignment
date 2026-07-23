@@ -318,6 +318,24 @@ def verify_checkout(path_text: str, commit: str, tree: str, where: str, *, cache
     return checkout
 
 
+def verify_model_checkout(
+    path_text: str,
+    commit: str,
+    tree: str,
+    where: str,
+) -> Path:
+    """Verify model checkout identity and its private-tree isolation boundary."""
+
+    checkout = verify_checkout(path_text, commit, tree, where)
+    try:
+        isolation.audit_private_tree(checkout)
+    except isolation.IsolationViolation as exc:
+        raise FailClosed(
+            f"{where} private-tree audit failed: {exc.code}"
+        ) from exc
+    return checkout
+
+
 def title_bytes(problem: bytes) -> bytes:
     offset = problem.find(b"\n")
     title = problem if offset < 0 else problem[:offset]
@@ -553,7 +571,7 @@ def _fixed_isolation_registration(registration: Mapping[str, Any]) -> dict[str, 
     for name, item in env.items():
         require(
             name in isolation.SAFE_WORKER_ENV
-            and not any(secret in name for secret in isolation.SECRET_ENV_PARTS)
+            and not isolation.is_secret_env_name(name)
             and isinstance(item, str)
             and "\x00" not in item,
             f"worker environment entry forbidden: {name}",
@@ -561,6 +579,15 @@ def _fixed_isolation_registration(registration: Mapping[str, Any]) -> dict[str, 
     for key in ("trace_allowed_path_prefixes", "trace_forbidden_static_fragments"):
         require(isinstance(value[key], list) and value[key] and all(isinstance(item, str) and item for item in value[key]), f"isolation {key} invalid")
     return dict(value)
+
+
+def verify_gateway_python_identity(gateway_python: Path) -> Path:
+    """Require the invoking interpreter to be the registered gateway Python."""
+
+    registered = gateway_python.resolve(strict=True)
+    invoking = Path(sys.executable).resolve(strict=True)
+    require(registered == invoking, "gateway Python differs from runner Python")
+    return registered
 
 
 def verify_isolation_host(
@@ -598,7 +625,7 @@ def verify_isolation_host(
         require(path.is_absolute() and path.is_file() and not path.is_symlink(), f"isolation {name} path invalid")
         require(value[name]["sha256"] == fixed[expected_key], f"isolation {name} not registration bound")
         paths[name] = path
-    require(paths["gateway_python"].resolve(strict=True) == Path(sys.executable).resolve(strict=True), "gateway Python differs from runner Python")
+    verify_gateway_python_identity(paths["gateway_python"])
     require(
         paths["sandbox_exec"] == Path("/usr/bin/sandbox-exec"),
         "trusted RNA requires exact /usr/bin/sandbox-exec",
@@ -1107,7 +1134,12 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
         arm_sessions: dict[str, str] = {}
         for arm in ("A", "T"):
             exact_keys(arms[arm], {"checkout", "session_id"}, f"{where}.arms.{arm}")
-            checkout = verify_checkout(arms[arm]["checkout"], case["base_commit"], case["base_tree"], f"{where}.arms.{arm}.checkout")
+            checkout = verify_model_checkout(
+                arms[arm]["checkout"],
+                case["base_commit"],
+                case["base_tree"],
+                f"{where}.arms.{arm}.checkout",
+            )
             require(checkout not in checkouts, f"checkout reused: {checkout}")
             checkouts.add(checkout)
             try:
@@ -1398,10 +1430,7 @@ def configure_episode(
         and all(
             isinstance(name, str)
             and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
-            and not any(
-                secret in name.upper()
-                for secret in isolation.SECRET_ENV_PARTS
-            )
+            and not isolation.is_secret_env_name(name)
             and isinstance(value, str)
             and "\x00" not in value
             and "\n" not in value
@@ -1757,7 +1786,7 @@ def acquire_treatment(
     }
     require(
         all(
-            not any(secret in name for secret in isolation.SECRET_ENV_PARTS)
+            not isolation.is_secret_env_name(name)
             for name in trusted_environment
         ),
         "trusted RNA acquisition environment contains credential material",
@@ -1952,7 +1981,7 @@ def start_trusted_rna_broker(
     }
     require(
         all(
-            not any(secret in name for secret in isolation.SECRET_ENV_PARTS)
+            not isolation.is_secret_env_name(name)
             for name in environment
         ),
         "trusted RNA broker environment contains credential material",

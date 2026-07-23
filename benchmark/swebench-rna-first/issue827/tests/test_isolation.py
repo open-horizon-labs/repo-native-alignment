@@ -40,6 +40,7 @@ from isolation import (
     canonical,
     generate_outer_seatbelt_profile,
     generate_trusted_rna_seatbelt_profile,
+    is_secret_env_name,
     mint_request,
     parse_strace_directory,
     sha256_bytes,
@@ -51,6 +52,83 @@ from isolation import (
 
 def file_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class SecretEnvironmentNameTests(unittest.TestCase):
+    def test_secret_components_are_blocked_without_tokenizer_false_positive(self):
+        blocked = (
+            "ANTHROPIC_AUTH_TOKEN",
+            "SERVICE_ACCESS_TOKENS",
+            "OPENAI_API_KEY",
+            "OPENAI_API_KEYS",
+            "DATABASE_PASSWORD",
+            "DATABASE_PASSWORDS",
+            "LEGACY_PASSWD",
+            "LEGACY_PASSWDS",
+            "AWS_SECRET_ACCESS_KEY",
+            "CLIENT_SECRETS",
+            "NETRC_CREDENTIAL",
+            "NETRC_CREDENTIALS",
+            "SESSION_COOKIE",
+            "SESSION_COOKIES",
+            "HTTP_AUTHORIZATION",
+            "HTTP_AUTHENTICATION",
+            "MYTOKEN",
+            "AUTHTOKEN",
+            "TOKENIZER",
+            "RNA_EMBEDDING_TOKENIZER_SHA256_EXTRA",
+            "rna_embedding_tokenizer_sha256",
+            "AUTHENTICATED_USER",
+            "COOKIECUTTER_TEMPLATE",
+            "SECRETARY_NAME",
+        )
+        allowed = (
+            "RNA_EMBEDDING_TOKENIZER_SHA256",
+            "PATH",
+            "HOME",
+        )
+        for name in blocked:
+            with self.subTest(name=name):
+                self.assertTrue(is_secret_env_name(name))
+        for name in allowed:
+            with self.subTest(name=name):
+                self.assertFalse(is_secret_env_name(name))
+
+    def test_canonical_trusted_environment_accepts_tokenizer_digest(self):
+        trusted_env = {
+            "PATH": "/usr/bin:/bin",
+            "RNA_EMBEDDING_TOKENIZER_SHA256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = Path(temporary) / "canonical-environment.json"
+            environment.write_bytes(canonical(trusted_env))
+            config = {
+                "trusted_rna_env": trusted_env,
+                "trusted_rna_environment": str(environment),
+            }
+            self.assertEqual(
+                bash_gateway._fixed_host_env(config, "trusted_rna_env"),
+                trusted_env,
+            )
+
+    def test_canonical_trusted_environment_still_rejects_secret_name(self):
+        trusted_env = {
+            "PATH": "/usr/bin:/bin",
+            "ANTHROPIC_AUTH_TOKEN": "not-observed",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = Path(temporary) / "canonical-environment.json"
+            environment.write_bytes(canonical(trusted_env))
+            config = {
+                "trusted_rna_env": trusted_env,
+                "trusted_rna_environment": str(environment),
+            }
+            with self.assertRaises(IsolationViolation) as raised:
+                bash_gateway._fixed_host_env(config, "trusted_rna_env")
+        self.assertEqual(
+            raised.exception.code,
+            "trusted_rna_env_entry_invalid",
+        )
 
 
 class EffectiveRootTests(unittest.TestCase):
