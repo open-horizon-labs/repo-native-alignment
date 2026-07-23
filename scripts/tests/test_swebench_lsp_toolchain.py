@@ -30,6 +30,8 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         for path in (
             "Dockerfile",
             "Dockerfile.prod",
+            "Dockerfile.txt",
+            "Dockerfile.md",
             "doc/Dockerfile.htmldoc",
         ):
             with self.subTest(path=path):

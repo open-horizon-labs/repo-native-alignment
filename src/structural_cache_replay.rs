@@ -233,6 +233,7 @@ pub async fn replay_retained_structural_cache(
         &plan,
         &validations,
         Some(target_job.job_id.clone()),
+        0,
     )?;
     ensure!(
         execution.executed_producer_work_ids.len() == all_work_items.len(),

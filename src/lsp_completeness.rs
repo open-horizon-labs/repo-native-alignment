@@ -1336,6 +1336,7 @@ pub(crate) fn build_and_persist_report_from_evidence(
     inheritance: Option<&crate::structural_cache::VerifiedStructuralCacheAuthorization>,
     execution: Option<&crate::structural_cache::StructuralCacheExecution>,
 ) -> Result<LspCompletenessReport> {
+    let related_job_ids = report_related_job_ids(repo_root, related_job_ids, scan_started_at_ms)?;
     match (inheritance, execution) {
         (Some(authorization), Some(execution)) => {
             if execution.base_archive_sha256 != authorization.authorization.base_archive_sha256
@@ -1362,11 +1363,23 @@ pub(crate) fn build_and_persist_report_from_evidence(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    let authenticated_producer_ids = match (inheritance, execution) {
+        (Some(_), Some(execution)) => Some(
+            execution
+                .executed_producer_work_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+        (None, None) => None,
+        _ => unreachable!("authorization/execution pairing was validated above"),
+    };
     let work_items = select_work_items_for_report(
         crate::extract::lsp::work_items::load_all_records(repo_root)?,
         &related_ids,
         scan_started_at_ms,
         nodes,
+        authenticated_producer_ids.as_ref(),
     )?;
     let jobs = EnrichmentJobLedger::default()
         .all_jobs(repo_root)
@@ -1392,6 +1405,20 @@ pub(crate) fn build_and_persist_report_from_evidence(
     Ok(report)
 }
 
+fn report_related_job_ids(
+    repo_root: &Path,
+    supplied_job_ids: &[String],
+    scan_started_at_ms: u64,
+) -> Result<Vec<String>> {
+    let mut related_job_ids = supplied_job_ids.iter().cloned().collect::<BTreeSet<_>>();
+    for snapshot in
+        crate::extract::lsp::work_items::load_queue_snapshots_since(repo_root, scan_started_at_ms)?
+    {
+        related_job_ids.insert(snapshot.job_id);
+    }
+    Ok(related_job_ids.into_iter().collect())
+}
+
 #[cfg(test)]
 fn filter_work_items_for_related_jobs(
     records: Vec<LspWorkItemRecord>,
@@ -1408,21 +1435,44 @@ fn select_work_items_for_report(
     related_job_ids: &BTreeSet<&str>,
     scan_started_at_ms: u64,
     nodes: &[Node],
+    authenticated_producer_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<LspWorkItemRecord>> {
     let nodes_by_id = nodes
         .iter()
         .map(|node| (node.stable_id(), node))
         .collect::<BTreeMap<_, _>>();
     let mut selected = Vec::new();
+    let mut selected_identities = BTreeSet::new();
+    let mut selected_producer_ids = BTreeSet::new();
+    let mut observed_authenticated_producer_ids = BTreeSet::new();
     for record in records {
+        let producer_id = format!("{}:{}", record.job_id, record.item_id);
         let current_job_record = record.updated_at_ms >= scan_started_at_ms
             && related_job_ids.contains(record.job_id.as_str());
-        let recovered_completed = record.recovery == LspWorkItemRecovery::CarriedCompleted
-            && record.state == LspWorkItemState::Completed;
-        if !current_job_record && !recovered_completed {
+        let authenticated_inherited_record = authenticated_producer_ids
+            .is_some_and(|producer_ids| producer_ids.contains(&producer_id));
+        let eligible = if authenticated_producer_ids.is_some() {
+            authenticated_inherited_record
+        } else {
+            current_job_record
+        };
+        if !eligible {
             continue;
         }
-        if recovered_completed {
+        if !selected_producer_ids.insert(producer_id.clone()) {
+            anyhow::bail!("duplicate LSP producer ID {producer_id}");
+        }
+        if authenticated_inherited_record && record.state != LspWorkItemState::Completed {
+            anyhow::bail!("authenticated LSP producer {producer_id} is not completed");
+        }
+        if authenticated_inherited_record && !related_job_ids.contains(record.job_id.as_str()) {
+            anyhow::bail!(
+                "authenticated LSP producer {producer_id} is outside the current related jobs"
+            );
+        }
+        if record.recovery == LspWorkItemRecovery::CarriedCompleted
+            || authenticated_inherited_record
+        {
             let node = nodes_by_id.get(&record.node_id).with_context(|| {
                 format!(
                     "recovered LSP work {}:{} has no current graph input {}",
@@ -1457,7 +1507,36 @@ fn select_work_items_for_report(
                 );
             }
         }
+        let mut operations = record.requested_operations.clone();
+        operations.sort();
+        if operations.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!(
+                "LSP work {}:{} contains duplicate requested operations",
+                record.job_id,
+                record.item_id
+            );
+        }
+        let identity = (
+            record.node_id.clone(),
+            record.input_hash.clone(),
+            operations,
+        );
+        if !selected_identities.insert(identity) {
+            anyhow::bail!(
+                "duplicate current LSP work identity for {}:{}",
+                record.job_id,
+                record.item_id
+            );
+        }
+        if authenticated_inherited_record {
+            observed_authenticated_producer_ids.insert(producer_id);
+        }
         selected.push(record);
+    }
+    if authenticated_producer_ids
+        .is_some_and(|producer_ids| producer_ids != &observed_authenticated_producer_ids)
+    {
+        anyhow::bail!("structural cache execution names missing LSP producer work");
     }
     selected.sort_by(|left, right| {
         left.file
@@ -2538,6 +2617,11 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if components
         .first()
         .is_some_and(|component| component == ".oh")
@@ -2587,6 +2671,9 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             "file is binary by suffix or contains a NUL byte in its prefix",
         );
     }
+    if filename == "dockerfile" || filename.starts_with("dockerfile.") {
+        return (FileRole::Config, None);
+    }
     if is_text_asset_extension(&extension) {
         return excluded(
             FileRole::ExcludedAsset,
@@ -2601,11 +2688,6 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             "structured or tabular data has no language-server semantics",
         );
     }
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     if matches!(filename.as_str(), ".gitkeep" | ".keep" | "py.typed") {
         return excluded(
             FileRole::ExcludedData,
@@ -3173,7 +3255,13 @@ mod tests {
     #[test]
     fn dockerfile_variants_share_config_inventory_and_descriptor() {
         let repo = tempfile::tempdir().unwrap();
-        for relative in ["Dockerfile", "Dockerfile.prod", "doc/Dockerfile.htmldoc"] {
+        for relative in [
+            "Dockerfile",
+            "Dockerfile.prod",
+            "Dockerfile.txt",
+            "Dockerfile.md",
+            "doc/Dockerfile.htmldoc",
+        ] {
             let path = Path::new(relative);
             let absolute = repo.path().join(path);
             std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
@@ -3264,8 +3352,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn report_joins_outer_enrichment_and_current_pass1_job_ids() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let ledger = crate::extract::lsp::work_items::LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "lsp-pass1-current".to_string(),
+            &[crate::extract::lsp::work_items::LspWorkItemSeed {
+                item_id: 0,
+                node,
+                requested_operations: vec!["references".to_string()],
+                attempt_count: 1,
+            }],
+        )
+        .await
+        .unwrap();
+        ledger.flush().await.unwrap();
+
+        let related =
+            report_related_job_ids(repo.path(), &["call_references-current".to_string()], 0)
+                .unwrap();
+        assert_eq!(
+            related,
+            vec![
+                "call_references-current".to_string(),
+                "lsp-pass1-current".to_string()
+            ]
+        );
+    }
+
     #[test]
-    fn exact_recovered_work_survives_scan_time_and_job_relocation() {
+    fn exact_recovered_work_refreshed_by_current_plan_is_reported() {
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -3307,7 +3439,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(item_id, (operation, edge))| LspWorkItemRecord {
-                job_id: "recovered-before-current-job".to_string(),
+                job_id: "current-enrichment-job".to_string(),
                 item_id,
                 root: source.id.root.clone(),
                 file: source.id.file.to_string_lossy().into_owned(),
@@ -3316,7 +3448,7 @@ mod tests {
                 input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
                 requested_operations: vec![operation.to_string()],
                 state: LspWorkItemState::Completed,
-                updated_at_ms: 1,
+                updated_at_ms: 10_000,
                 recovery: LspWorkItemRecovery::CarriedCompleted,
                 produced_result_ids: BTreeSet::from([edge.stable_id()]),
                 output_edges: vec![edge],
@@ -3330,6 +3462,7 @@ mod tests {
             &BTreeSet::from(["current-enrichment-job"]),
             10_000,
             std::slice::from_ref(&source),
+            None,
         )
         .unwrap();
         assert_eq!(selected.len(), 2);
@@ -3365,24 +3498,159 @@ mod tests {
             source: ExtractionSource::Markdown,
         };
         let tampered = LspWorkItemRecord {
-            job_id: "old-job".to_string(),
+            job_id: "current-job".to_string(),
             root: source.id.root.clone(),
             file: source.id.file.to_string_lossy().into_owned(),
             node_id: source.stable_id(),
             input_hash: "tampered".to_string(),
             requested_operations: vec!["definitions".to_string()],
             state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
             recovery: LspWorkItemRecovery::CarriedCompleted,
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
             vec![tampered],
-            &BTreeSet::new(),
+            &BTreeSet::from(["current-job"]),
             10_000,
             std::slice::from_ref(&source),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn stale_recovered_operation_is_not_reported_without_current_plan_authority() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let stale = LspWorkItemRecord {
+            job_id: "prior-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec!["document_links".to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 1,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+
+        let selected = select_work_items_for_report(
+            vec![stale],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn structural_execution_selects_exact_producer_ids_not_job_siblings() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let record = |item_id, operation: &str| LspWorkItemRecord {
+            job_id: "pass1-job".to_string(),
+            item_id,
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec![operation.to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            ..LspWorkItemRecord::default()
+        };
+
+        let authenticated = BTreeSet::from(["pass1-job:0".to_string()]);
+        let selected = select_work_items_for_report(
+            vec![record(0, "references"), record(1, "document_links")],
+            &BTreeSet::from(["pass1-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            Some(&authenticated),
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].item_id, 0);
+        assert_eq!(
+            selected[0].requested_operations,
+            vec!["references".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_current_work_identity_fails_closed() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let record = |item_id| LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            item_id,
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            ..LspWorkItemRecord::default()
+        };
+
+        let error = select_work_items_for_report(
+            vec![record(0), record(1)],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate current LSP work identity")
+        );
     }
 
     fn included(path: &str, status: FileTerminalStatus) -> FileCoverageRecord {

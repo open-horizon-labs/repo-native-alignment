@@ -3086,6 +3086,8 @@ def classify_path(path: str, prefix: bytes) -> tuple[str, str | None, str]:
         return "excluded_generated", "generated", "generated_or_build_output"
     if extension in BINARY_EXTENSIONS or b"\0" in prefix:
         return "excluded_binary", "binary", "binary_suffix_or_nul_prefix"
+    if filename == "dockerfile" or filename.startswith("dockerfile."):
+        return "config", None, "project_configuration"
     if extension in TEXT_ASSET_EXTENSIONS:
         return "excluded_asset", "asset", "presentation_or_secret_test_asset"
     if extension in TEXT_DATA_EXTENSIONS:
@@ -3111,7 +3113,6 @@ def classify_path(path: str, prefix: bytes) -> tuple[str, str | None, str]:
     if (
         extension in CONFIG_EXTENSIONS
         or filename in CONFIG_FILENAMES
-        or filename.startswith("dockerfile.")
     ):
         return "config", None, "project_configuration"
     if filename.startswith("requirements") or filename == "manifest.in":

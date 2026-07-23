@@ -2481,6 +2481,7 @@ impl RnaHandler {
                         plan,
                         &lsp_validations,
                         incremental_lsp_job_id.clone(),
+                        scan_started_at_ms,
                     )?;
                     crate::structural_cache::write_execution(&self.repo_root, &execution)?;
                 }
