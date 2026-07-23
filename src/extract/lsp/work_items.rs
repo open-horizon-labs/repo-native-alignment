@@ -285,6 +285,10 @@ impl LspWorkItemLedger {
             .iter()
             .map(|seed| (seed.node.stable_id(), seed.requested_operations.clone()))
             .collect::<BTreeSet<_>>();
+        let current_node_ids = seeds
+            .iter()
+            .map(|seed| seed.node.stable_id())
+            .collect::<BTreeSet<_>>();
         let mut prior_by_key = prior_records
             .into_iter()
             .map(|record| {
@@ -398,9 +402,18 @@ impl LspWorkItemLedger {
             !current_item_keys
                 .contains(&(record.node_id.clone(), record.requested_operations.clone()))
         });
-        for (next_item_id, mut record) in (seeds.len()..).zip(remaining_records) {
+        let mut next_item_id = seeds.len();
+        for mut record in remaining_records {
+            if current_node_ids.contains(&record.node_id) {
+                // The graph input still exists, but this exact operation is no
+                // longer in the current capability-aware plan. Retire the old
+                // operation instead of converting it into required work.
+                continue;
+            }
             record.schema_version = STORE_SCHEMA_VERSION;
-            record.item_id = next_item_id;
+            let item_id = next_item_id;
+            next_item_id += 1;
+            record.item_id = item_id;
             record.state = LspWorkItemState::Skipped;
             record.recovery = LspWorkItemRecovery::CarriedSkipped;
             record.last_phase = record.current_phase.take().or(record.last_phase.take());
@@ -409,9 +422,7 @@ impl LspWorkItemLedger {
             record.output_edges.clear();
             record.output_nodes.clear();
             record.last_error = Some(UNMATCHED_REQUIRED_WORK_ERROR.to_string());
-            store
-                .records
-                .insert(record_key(&job_id, next_item_id), record);
+            store.records.insert(record_key(&job_id, item_id), record);
         }
 
         let ledger = Arc::new(Self {
@@ -687,7 +698,7 @@ fn new_record(
     }
 }
 
-fn node_input_hash(node: &Node) -> String {
+pub(crate) fn node_input_hash(node: &Node) -> String {
     let mut hasher = blake3::Hasher::new();
     for value in [
         node.stable_id(),
@@ -1166,6 +1177,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
+    use crate::extract::lsp::policy::LspQueryProfile;
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
     use super::*;
@@ -1504,6 +1516,125 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("no longer present")
+        );
+        assert_eq!(
+            store
+                .records
+                .get("removed-work-job:1")
+                .map(|record| record.item_id),
+            Some(1),
+            "carried audit records must keep their persisted key and item ID aligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_removed_from_current_node_is_retired_not_failed() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut fixture_seeds = seeds(1);
+        let node = fixture_seeds.remove(0).node;
+        let initial = vec![
+            LspWorkItemSeed {
+                item_id: 0,
+                node: node.clone(),
+                requested_operations: vec!["document_links".to_string()],
+                attempt_count: 1,
+            },
+            LspWorkItemSeed {
+                item_id: 1,
+                node: node.clone(),
+                requested_operations: vec!["references".to_string()],
+                attempt_count: 1,
+            },
+        ];
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-operation-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let current = [LspWorkItemSeed {
+            item_id: 0,
+            node,
+            requested_operations: vec!["references".to_string()],
+            attempt_count: 1,
+        }];
+        let resumed = LspWorkItemLedger::begin(repo.path(), &current)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "changed-operation-job");
+        assert!(resumed.should_run(0));
+        assert_eq!(resumed.unmatched_required_count(), 0);
+        let records = load_all_records(repo.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].requested_operations, ["references"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_lsp_output_is_not_new_work_while_source_work_retries() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = node("source");
+        let initial = [LspWorkItemSeed {
+            item_id: 0,
+            node: source.clone(),
+            requested_operations: vec!["references".to_string()],
+            attempt_count: 1,
+        }];
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "persisted-lsp-output-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_phase(0, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut virtual_function = node("callee@lsp");
+        virtual_function.source = ExtractionSource::Lsp;
+        virtual_function
+            .metadata
+            .insert("virtual".to_string(), "true".to_string());
+        let mut document_symbol_proof = node("proof");
+        document_symbol_proof.id.kind = NodeKind::Other("lsp_document_symbol".to_string());
+        document_symbol_proof.source = ExtractionSource::Lsp;
+        let persisted_nodes = repo.path().join("persisted-nodes.json");
+        std::fs::write(
+            &persisted_nodes,
+            serde_json::to_vec(&[source.clone(), virtual_function, document_symbol_proof]).unwrap(),
+        )
+        .unwrap();
+        let reopened: Vec<Node> =
+            serde_json::from_slice(&std::fs::read(persisted_nodes).unwrap()).unwrap();
+        let profile = LspQueryProfile::new("rust", "fixture");
+        let seeds = reopened
+            .into_iter()
+            .filter(|node| profile.accepts_declaration(node))
+            .enumerate()
+            .map(|(item_id, node)| LspWorkItemSeed {
+                item_id,
+                node,
+                requested_operations: vec!["references".to_string()],
+                attempt_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(seeds.len(), 1, "persisted LSP output must schedule no work");
+        assert_eq!(seeds[0].node.stable_id(), source.stable_id());
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds).await.unwrap();
+        assert!(resumed.should_run(0));
+        let records = load_all_records(repo.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recovery, LspWorkItemRecovery::Retried);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.recovery != LspWorkItemRecovery::New)
         );
     }
 

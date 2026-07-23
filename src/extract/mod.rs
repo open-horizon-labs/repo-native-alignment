@@ -372,7 +372,12 @@ impl ExtractorRegistry {
         let mut result = ExtractionResult::default();
 
         for extractor in &self.extractors {
-            if !extractor.extensions().contains(&ext) {
+            let extensions = extractor.extensions();
+            // An extractor that declares the empty extension may own a
+            // filename family (for example Dockerfile and Dockerfile.*).
+            // Let its can_handle predicate make that deterministic decision
+            // even when a variant has a syntactic suffix.
+            if !extensions.contains(&ext) && !extensions.contains(&"") {
                 continue;
             }
             if !extractor.can_handle(path, content) {
@@ -1107,6 +1112,27 @@ mod tests {
                 .any(|n| n.id.kind == crate::graph::NodeKind::Const
                     && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
             "Go should capture string literals"
+        );
+    }
+
+    #[test]
+    fn dockerfile_suffix_variants_reach_the_filename_extractor() {
+        let registry = ExtractorRegistry::with_builtins();
+        for path in ["Dockerfile", "Dockerfile.prod", "doc/Dockerfile.htmldoc"] {
+            let result = registry.extract_file(Path::new(path), "FROM python:3.13\n");
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .any(|node| node.id.name == "python:3.13"),
+                "{path} did not reach the Dockerfile extractor"
+            );
+        }
+        assert!(
+            registry
+                .extract_file(Path::new("doc/NotDockerfile.htmldoc"), "FROM python:3.13\n")
+                .nodes
+                .is_empty()
         );
     }
 

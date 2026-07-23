@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::business_context::BusinessContextMode;
-use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemState};
+use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState};
 use crate::extract::scan_stats::{
     LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION, LspEnrichmentEntry, LspStatus, LspValidationEvidence,
     LspValidationStatus,
@@ -739,44 +739,37 @@ fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
                 detail: "processed file has no persisted LSP request evidence".to_string(),
             });
         }
-        if file.role == FileRole::Docs
-            && file
-                .expected_results
-                .contains(&ExpectedResultKind::DocumentLink)
-        {
-            for capability_name in [
-                "documentSymbolProvider",
-                "documentLinkProvider",
-                "definitionProvider",
-                "referencesProvider",
-            ] {
-                if !file
+        for request in &file.requests_attempted {
+            let required_capability = required_capability_for_method(&request.method);
+            if let Some(capability_name) = required_capability
+                && !file
                     .advertised_capabilities
                     .iter()
                     .any(|capability| capability.name == capability_name && capability.supported)
-                {
-                    violations.push(ReadinessViolation {
-                        code: ReadinessViolationCode::MissingAdvertisedCapabilities,
-                        path: Some(path.clone()),
-                        detail: format!("documentation link requires negotiated {capability_name}"),
-                    });
-                }
+            {
+                violations.push(ReadinessViolation {
+                    code: ReadinessViolationCode::MissingAdvertisedCapabilities,
+                    path: Some(path.clone()),
+                    detail: format!(
+                        "scheduled {} requires negotiated {capability_name}",
+                        request.method
+                    ),
+                });
             }
-            for method in [
-                "textDocument/documentSymbol",
-                "textDocument/documentLink",
-                "textDocument/definition",
-                "textDocument/references",
-            ] {
-                if !file.requests_attempted.iter().any(|request| {
-                    request.method == method && request.outcome == RequestOutcome::Completed
-                }) {
-                    violations.push(ReadinessViolation {
-                        code: ReadinessViolationCode::MissingRequestEvidence,
-                        path: Some(path.clone()),
-                        detail: format!("documentation link requires completed {method}"),
-                    });
-                }
+        }
+        for expected in &file.expected_results {
+            if !file.requests_attempted.iter().any(|request| {
+                request.outcome == RequestOutcome::Completed
+                    && request_method_can_produce(&request.method, *expected)
+            }) {
+                violations.push(ReadinessViolation {
+                    code: ReadinessViolationCode::MissingRequestEvidence,
+                    path: Some(path.clone()),
+                    detail: format!(
+                        "applicable {} output has no completed scheduled request",
+                        expected.as_str()
+                    ),
+                });
             }
         }
 
@@ -805,6 +798,37 @@ fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
     }
 
     violations
+}
+
+fn required_capability_for_method(method: &str) -> Option<&'static str> {
+    match method {
+        "textDocument/documentSymbol" => Some("documentSymbolProvider"),
+        "textDocument/documentLink" => Some("documentLinkProvider"),
+        "textDocument/definition" => Some("definitionProvider"),
+        "textDocument/references" => Some("referencesProvider"),
+        "textDocument/implementation" => Some("implementationProvider"),
+        "textDocument/prepareCallHierarchy+callHierarchy/*" => Some("callHierarchyProvider"),
+        _ => None,
+    }
+}
+
+fn request_method_can_produce(method: &str, expected: ExpectedResultKind) -> bool {
+    match expected {
+        ExpectedResultKind::DocumentSymbol => method == "textDocument/documentSymbol",
+        ExpectedResultKind::Definition => matches!(
+            method,
+            "textDocument/definition"
+                | "textDocument/implementation"
+                | "textDocument/prepareTypeHierarchy+typeHierarchy/*"
+        ),
+        ExpectedResultKind::Reference => method == "textDocument/references",
+        ExpectedResultKind::CallHierarchy => matches!(
+            method,
+            "textDocument/references" | "textDocument/prepareCallHierarchy+callHierarchy/*"
+        ),
+        ExpectedResultKind::DocumentLink => method == "textDocument/documentLink",
+        ExpectedResultKind::Diagnostic => method == "textDocument/diagnostic",
+    }
 }
 
 fn evaluate_evidence(
@@ -1312,6 +1336,7 @@ pub(crate) fn build_and_persist_report_from_evidence(
     inheritance: Option<&crate::structural_cache::VerifiedStructuralCacheAuthorization>,
     execution: Option<&crate::structural_cache::StructuralCacheExecution>,
 ) -> Result<LspCompletenessReport> {
+    let related_job_ids = report_related_job_ids(repo_root, related_job_ids, scan_started_at_ms)?;
     match (inheritance, execution) {
         (Some(authorization), Some(execution)) => {
             if execution.base_archive_sha256 != authorization.authorization.base_archive_sha256
@@ -1338,10 +1363,24 @@ pub(crate) fn build_and_persist_report_from_evidence(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let work_items = filter_work_items_for_related_jobs(
-        crate::extract::lsp::work_items::load_records_since(repo_root, scan_started_at_ms)?,
+    let authenticated_producer_ids = match (inheritance, execution) {
+        (Some(_), Some(execution)) => Some(
+            execution
+                .executed_producer_work_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+        (None, None) => None,
+        _ => unreachable!("authorization/execution pairing was validated above"),
+    };
+    let work_items = select_work_items_for_report(
+        crate::extract::lsp::work_items::load_all_records(repo_root)?,
         &related_ids,
-    );
+        scan_started_at_ms,
+        nodes,
+        authenticated_producer_ids.as_ref(),
+    )?;
     let jobs = EnrichmentJobLedger::default()
         .all_jobs(repo_root)
         .into_iter()
@@ -1366,6 +1405,21 @@ pub(crate) fn build_and_persist_report_from_evidence(
     Ok(report)
 }
 
+fn report_related_job_ids(
+    repo_root: &Path,
+    supplied_job_ids: &[String],
+    scan_started_at_ms: u64,
+) -> Result<Vec<String>> {
+    let mut related_job_ids = supplied_job_ids.iter().cloned().collect::<BTreeSet<_>>();
+    for snapshot in
+        crate::extract::lsp::work_items::load_queue_snapshots_since(repo_root, scan_started_at_ms)?
+    {
+        related_job_ids.insert(snapshot.job_id);
+    }
+    Ok(related_job_ids.into_iter().collect())
+}
+
+#[cfg(test)]
 fn filter_work_items_for_related_jobs(
     records: Vec<LspWorkItemRecord>,
     related_job_ids: &BTreeSet<&str>,
@@ -1374,6 +1428,123 @@ fn filter_work_items_for_related_jobs(
         .into_iter()
         .filter(|record| related_job_ids.contains(record.job_id.as_str()))
         .collect()
+}
+
+fn select_work_items_for_report(
+    records: Vec<LspWorkItemRecord>,
+    related_job_ids: &BTreeSet<&str>,
+    scan_started_at_ms: u64,
+    nodes: &[Node],
+    authenticated_producer_ids: Option<&BTreeSet<String>>,
+) -> Result<Vec<LspWorkItemRecord>> {
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.stable_id(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::new();
+    let mut selected_identities = BTreeSet::new();
+    let mut selected_producer_ids = BTreeSet::new();
+    let mut observed_authenticated_producer_ids = BTreeSet::new();
+    for record in records {
+        let producer_id = format!("{}:{}", record.job_id, record.item_id);
+        let current_job_record = record.updated_at_ms >= scan_started_at_ms
+            && related_job_ids.contains(record.job_id.as_str());
+        let authenticated_inherited_record = authenticated_producer_ids
+            .is_some_and(|producer_ids| producer_ids.contains(&producer_id));
+        let eligible = if authenticated_producer_ids.is_some() {
+            authenticated_inherited_record
+        } else {
+            current_job_record
+        };
+        if !eligible {
+            continue;
+        }
+        if !selected_producer_ids.insert(producer_id.clone()) {
+            anyhow::bail!("duplicate LSP producer ID {producer_id}");
+        }
+        if authenticated_inherited_record && record.state != LspWorkItemState::Completed {
+            anyhow::bail!("authenticated LSP producer {producer_id} is not completed");
+        }
+        if authenticated_inherited_record && !related_job_ids.contains(record.job_id.as_str()) {
+            anyhow::bail!(
+                "authenticated LSP producer {producer_id} is outside the current related jobs"
+            );
+        }
+        if record.recovery == LspWorkItemRecovery::CarriedCompleted
+            || authenticated_inherited_record
+        {
+            let node = nodes_by_id.get(&record.node_id).with_context(|| {
+                format!(
+                    "recovered LSP work {}:{} has no current graph input {}",
+                    record.job_id, record.item_id, record.node_id
+                )
+            })?;
+            let record_path =
+                normalize_repo_relative_path(&record.file).map_err(anyhow::Error::msg)?;
+            let node_path = normalize_repo_relative_path(&node.id.file.to_string_lossy())
+                .map_err(anyhow::Error::msg)?;
+            if record.root != node.id.root
+                || record_path != node_path
+                || record.input_hash != crate::extract::lsp::work_items::node_input_hash(node)
+            {
+                anyhow::bail!(
+                    "recovered LSP work identity mismatch for {}:{}",
+                    record.job_id,
+                    record.item_id
+                );
+            }
+            let output_ids = record
+                .output_edges
+                .iter()
+                .map(Edge::stable_id)
+                .chain(record.output_nodes.iter().map(Node::stable_id))
+                .collect::<BTreeSet<_>>();
+            if output_ids != record.produced_result_ids {
+                anyhow::bail!(
+                    "recovered LSP work output identity mismatch for {}:{}",
+                    record.job_id,
+                    record.item_id
+                );
+            }
+        }
+        let mut operations = record.requested_operations.clone();
+        operations.sort();
+        if operations.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!(
+                "LSP work {}:{} contains duplicate requested operations",
+                record.job_id,
+                record.item_id
+            );
+        }
+        let identity = (
+            record.node_id.clone(),
+            record.input_hash.clone(),
+            operations,
+        );
+        if !selected_identities.insert(identity) {
+            anyhow::bail!(
+                "duplicate current LSP work identity for {}:{}",
+                record.job_id,
+                record.item_id
+            );
+        }
+        if authenticated_inherited_record {
+            observed_authenticated_producer_ids.insert(producer_id);
+        }
+        selected.push(record);
+    }
+    if authenticated_producer_ids
+        .is_some_and(|producer_ids| producer_ids != &observed_authenticated_producer_ids)
+    {
+        anyhow::bail!("structural cache execution names missing LSP producer work");
+    }
+    selected.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    Ok(selected)
 }
 
 pub fn load_readiness_check(
@@ -1534,7 +1705,6 @@ fn build_report(
         .iter()
         .filter_map(|node| normalize_repo_relative_path(&node.id.file.to_string_lossy()).ok())
         .collect::<BTreeSet<_>>();
-    let docs_with_applicable_links = applicable_document_link_paths(repo_root, nodes);
     let mut work_by_path: BTreeMap<String, Vec<&LspWorkItemRecord>> = BTreeMap::new();
     for item in work_items {
         if let Ok(path) = normalize_repo_relative_path(&item.file) {
@@ -1767,16 +1937,8 @@ fn build_report(
             });
             continue;
         }
-        let (mut expected_results, expected_result_ids) =
+        let (expected_results, expected_result_ids) =
             expected_evidence_from_work_items(&records, &validations, &normalized);
-        if role == FileRole::Docs && docs_with_applicable_links.contains(&normalized) {
-            expected_results.extend([
-                ExpectedResultKind::DocumentSymbol,
-                ExpectedResultKind::DocumentLink,
-                ExpectedResultKind::Definition,
-                ExpectedResultKind::Reference,
-            ]);
-        }
         let terminal_status = terminal_status_for_file(
             &normalized,
             &records,
@@ -1850,44 +2012,6 @@ fn build_report(
     report.readiness_validation_requests_by_language = readiness_validation_requests_by_language;
     report.finalize();
     Ok(report)
-}
-
-fn applicable_document_link_paths(repo_root: &Path, nodes: &[Node]) -> BTreeSet<String> {
-    nodes
-        .iter()
-        .filter(|node| node.source == ExtractionSource::Markdown)
-        .filter(|node| node.metadata.get("markdown_kind").map(String::as_str) == Some("link"))
-        .filter_map(|node| {
-            let target = node.metadata.get("link_target")?;
-            let target = target.split('#').next().unwrap_or_default();
-            if target.is_empty()
-                || target.starts_with("http://")
-                || target.starts_with("https://")
-                || target.starts_with("mailto:")
-                || target.starts_with("data:")
-                || Path::new(target).is_absolute()
-            {
-                return None;
-            }
-            let mut resolved = node.id.file.parent().unwrap_or(Path::new("")).to_path_buf();
-            for component in Path::new(target).components() {
-                match component {
-                    Component::CurDir => {}
-                    Component::ParentDir => {
-                        if !resolved.pop() {
-                            return None;
-                        }
-                    }
-                    Component::Normal(segment) => resolved.push(segment),
-                    Component::RootDir | Component::Prefix(_) => return None,
-                }
-            }
-            if !repo_root.join(resolved).is_file() {
-                return None;
-            }
-            normalize_repo_relative_path(&node.id.file.to_string_lossy()).ok()
-        })
-        .collect()
 }
 
 fn evidence_from_work_items(
@@ -2493,6 +2617,11 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if components
         .first()
         .is_some_and(|component| component == ".oh")
@@ -2542,6 +2671,9 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             "file is binary by suffix or contains a NUL byte in its prefix",
         );
     }
+    if filename == "dockerfile" || filename.starts_with("dockerfile.") {
+        return (FileRole::Config, None);
+    }
     if is_text_asset_extension(&extension) {
         return excluded(
             FileRole::ExcludedAsset,
@@ -2556,11 +2688,6 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             "structured or tabular data has no language-server semantics",
         );
     }
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     if matches!(filename.as_str(), ".gitkeep" | ".keep" | "py.typed") {
         return excluded(
             FileRole::ExcludedData,
@@ -2785,16 +2912,17 @@ fn is_config_extension(extension: &str) -> bool {
 }
 
 fn is_config_filename(filename: &str) -> bool {
-    matches!(
-        filename,
-        "cargo.toml"
-            | "dockerfile"
-            | "makefile"
-            | "package.json"
-            | "pyproject.toml"
-            | "setup.cfg"
-            | "tox.ini"
-    )
+    filename.starts_with("dockerfile.")
+        || matches!(
+            filename,
+            "cargo.toml"
+                | "dockerfile"
+                | "makefile"
+                | "package.json"
+                | "pyproject.toml"
+                | "setup.cfg"
+                | "tox.ini"
+        )
 }
 
 fn is_project_document_filename(filename: &str) -> bool {
@@ -3124,6 +3252,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dockerfile_variants_share_config_inventory_and_descriptor() {
+        let repo = tempfile::tempdir().unwrap();
+        for relative in [
+            "Dockerfile",
+            "Dockerfile.prod",
+            "Dockerfile.txt",
+            "Dockerfile.md",
+            "doc/Dockerfile.htmldoc",
+        ] {
+            let path = Path::new(relative);
+            let absolute = repo.path().join(path);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            std::fs::write(&absolute, "FROM python:3.13\n").unwrap();
+            assert_eq!(classify_file(path, &absolute).0, FileRole::Config);
+            let descriptor =
+                crate::extract::lsp::builtin_lsp_descriptor_for_inventory_file(path, &absolute)
+                    .expect("Dockerfile variant has a descriptor");
+            assert_eq!(descriptor.language(), "dockerfile");
+            assert_eq!(descriptor.command(), "docker-langserver");
+        }
+        let negative = Path::new("doc/NotDockerfile.htmldoc");
+        let negative_absolute = repo.path().join(negative);
+        std::fs::write(&negative_absolute, "FROM python:3.13\n").unwrap();
+        assert!(
+            crate::extract::lsp::builtin_lsp_descriptor_for_inventory_file(
+                negative,
+                &negative_absolute
+            )
+            .is_none()
+        );
+    }
+
     fn completed_job(validations: Vec<LspValidationEvidence>) -> EnrichmentJobRecord {
         serde_json::from_value(serde_json::json!({
             "job_id": "job-complete",
@@ -3192,6 +3353,307 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn report_joins_outer_enrichment_and_current_pass1_job_ids() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let ledger = crate::extract::lsp::work_items::LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "lsp-pass1-current".to_string(),
+            &[crate::extract::lsp::work_items::LspWorkItemSeed {
+                item_id: 0,
+                node,
+                requested_operations: vec!["references".to_string()],
+                attempt_count: 1,
+            }],
+        )
+        .await
+        .unwrap();
+        ledger.flush().await.unwrap();
+
+        let related =
+            report_related_job_ids(repo.path(), &["call_references-current".to_string()], 0)
+                .unwrap();
+        assert_eq!(
+            related,
+            vec![
+                "call_references-current".to_string(),
+                "lsp-pass1-current".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_recovered_work_refreshed_by_current_plan_is_reported() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 4,
+            signature: "# Guide".to_string(),
+            body: "See the implementation.".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let target = NodeId {
+            root: "fixture".to_string(),
+            file: PathBuf::from("src/app.py"),
+            name: "implementation".to_string(),
+            kind: NodeKind::Function,
+        };
+        let definition = Edge {
+            from: source.id.clone(),
+            to: target.clone(),
+            kind: EdgeKind::Implements,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let reference = Edge {
+            from: target,
+            to: source.id.clone(),
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+            evidence: Vec::new(),
+        };
+        let records = [("definitions", definition), ("references", reference)]
+            .into_iter()
+            .enumerate()
+            .map(|(item_id, (operation, edge))| LspWorkItemRecord {
+                job_id: "current-enrichment-job".to_string(),
+                item_id,
+                root: source.id.root.clone(),
+                file: source.id.file.to_string_lossy().into_owned(),
+                node_id: source.stable_id(),
+                node_kind: source.id.kind.to_string(),
+                input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+                requested_operations: vec![operation.to_string()],
+                state: LspWorkItemState::Completed,
+                updated_at_ms: 10_000,
+                recovery: LspWorkItemRecovery::CarriedCompleted,
+                produced_result_ids: BTreeSet::from([edge.stable_id()]),
+                output_edges: vec![edge],
+                observed_result_count: 1,
+                ..LspWorkItemRecord::default()
+            })
+            .collect::<Vec<_>>();
+
+        let selected = select_work_items_for_report(
+            records,
+            &BTreeSet::from(["current-enrichment-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2);
+        let refs = selected.iter().collect::<Vec<_>>();
+        let (_, requests) = evidence_from_work_items(&refs, &[], &[]);
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.method == "textDocument/definition")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.method == "textDocument/references")
+        );
+    }
+
+    #[test]
+    fn recovered_work_identity_mismatch_fails_closed() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let tampered = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: "tampered".to_string(),
+            requested_operations: vec!["definitions".to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+        let error = select_work_items_for_report(
+            vec![tampered],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn stale_recovered_operation_is_not_reported_without_current_plan_authority() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let stale = LspWorkItemRecord {
+            job_id: "prior-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec!["document_links".to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 1,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+
+        let selected = select_work_items_for_report(
+            vec![stale],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn structural_execution_selects_exact_producer_ids_not_job_siblings() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let record = |item_id, operation: &str| LspWorkItemRecord {
+            job_id: "pass1-job".to_string(),
+            item_id,
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec![operation.to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            ..LspWorkItemRecord::default()
+        };
+
+        let authenticated = BTreeSet::from(["pass1-job:0".to_string()]);
+        let selected = select_work_items_for_report(
+            vec![record(0, "references"), record(1, "document_links")],
+            &BTreeSet::from(["pass1-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            Some(&authenticated),
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].item_id, 0);
+        assert_eq!(
+            selected[0].requested_operations,
+            vec!["references".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_current_work_identity_fails_closed() {
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/app.py"),
+                name: "implementation".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "def implementation():".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let record = |item_id| LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            item_id,
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
+            requested_operations: vec!["references".to_string()],
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            ..LspWorkItemRecord::default()
+        };
+
+        let error = select_work_items_for_report(
+            vec![record(0), record(1)],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate current LSP work identity")
+        );
+    }
+
     fn included(path: &str, status: FileTerminalStatus) -> FileCoverageRecord {
         FileCoverageRecord {
             path: path.to_string(),
@@ -3199,7 +3661,7 @@ mod tests {
             language: Some("python".to_string()),
             expected_server: Some(server()),
             advertised_capabilities: vec![AdvertisedCapability {
-                name: "textDocument/references".to_string(),
+                name: "referencesProvider".to_string(),
                 supported: true,
             }],
             requests_attempted: vec![RequestAttempt {
@@ -3710,6 +4172,11 @@ mod tests {
             "src/a.py",
             FileTerminalStatus::Processed { result_count: 1 },
         );
+        file.advertised_capabilities = vec![AdvertisedCapability {
+            name: "callHierarchyProvider".to_string(),
+            supported: true,
+        }];
+        file.requests_attempted = evidence_from_work_items(&records, &[], &[]).1;
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&records, &[], "src/a.py");
 
@@ -3785,6 +4252,11 @@ mod tests {
             "src/a.py",
             FileTerminalStatus::Processed { result_count: 1 },
         );
+        file.advertised_capabilities = vec![AdvertisedCapability {
+            name: "callHierarchyProvider".to_string(),
+            supported: true,
+        }];
+        file.requests_attempted = evidence_from_work_items(&records, &[], &[]).1;
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&records, &[], "src/a.py");
 
@@ -4280,6 +4752,8 @@ mod tests {
             FileTerminalStatus::Processed { result_count: 1 },
         );
         file.role = FileRole::Docs;
+        (file.advertised_capabilities, file.requests_attempted) =
+            evidence_from_work_items(&[], &[], &[&validation]);
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&[], &[&validation], "docs/guide.md");
         file.persisted_results = persisted_results_for_path("docs/guide.md", &[], &[]);
@@ -4408,6 +4882,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dockerfile_mock_persists_symbols_and_failure_modes_block_readiness() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lsp_capability_repo/Dockerfile");
+        std::fs::copy(&source, repo.path().join("Dockerfile")).unwrap();
+        let content = std::fs::read_to_string(source).unwrap();
+        let nodes = crate::extract::dockerfile::DockerfileExtractor::new()
+            .extract(Path::new("Dockerfile"), &content)
+            .unwrap()
+            .nodes;
+        assert!(nodes.iter().any(|node| {
+            node.language == "dockerfile"
+                && node.id.file == PathBuf::from("Dockerfile")
+                && node.id.name == "builder"
+        }));
+
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = crate::extract::lsp::LspEnricher::new(
+            "dockerfile",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "dockerfile_features",
+            ],
+            &["<none>"],
+        );
+        let result = enricher
+            .enrich(&nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("mock Dockerfile enrichment succeeds");
+        assert!(!result.aborted, "mock enrichment aborted: {result:?}");
+        let validation = result
+            .lsp_validation
+            .as_ref()
+            .expect("mock retains Dockerfile readiness evidence");
+        assert_eq!(validation.language, "dockerfile");
+        let negotiated = validation
+            .negotiated_capabilities
+            .expect("Dockerfile fixture retains negotiated capabilities");
+        assert!(negotiated.document_symbol_provider);
+        assert!(negotiated.document_link_provider);
+        assert!(negotiated.definition_provider);
+        assert!(!negotiated.references_provider);
+        assert!(!negotiated.call_hierarchy_provider);
+        assert_eq!(validation.symbol_count, Some(2));
+        assert_eq!(validation.document_symbols.len(), 2);
+        assert!(
+            validation
+                .document_symbols
+                .iter()
+                .all(|symbol| symbol.file.as_deref() == Some("Dockerfile")
+                    && symbol.graph_result_id.is_some())
+        );
+
+        let records = crate::extract::lsp::work_items::load_records_since(repo.path(), 0).unwrap();
+        let file_records = records
+            .iter()
+            .filter(|record| record.file == "Dockerfile")
+            .collect::<Vec<_>>();
+        let symbol_record = file_records
+            .iter()
+            .find(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "document_symbols")
+            })
+            .expect("Dockerfile document-symbol request is durable");
+        assert_eq!(symbol_record.state, LspWorkItemState::Completed);
+        assert_eq!(symbol_record.observed_result_count, 2);
+        assert_eq!(symbol_record.output_nodes.len(), 2);
+        let operation_records = file_records
+            .iter()
+            .flat_map(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .map(move |operation| (operation.as_str(), *record))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            operation_records.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["document_links", "document_symbols"])
+        );
+        let document_links = operation_records["document_links"];
+        assert_eq!(document_links.state, LspWorkItemState::Completed);
+        assert_eq!(document_links.observed_result_count, 0);
+        assert!(document_links.output_nodes.is_empty());
+        assert!(document_links.output_edges.is_empty());
+        assert!(
+            file_records
+                .iter()
+                .all(|record| record.state == LspWorkItemState::Completed
+                    && record.last_error.is_none())
+        );
+
+        let jobs = vec![completed_job(vec![validation.clone()])];
+        let status = terminal_status_for_file(
+            "Dockerfile",
+            &file_records,
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &[validation],
+        );
+        let (capabilities, requests) = evidence_from_work_items(&file_records, &[], &[validation]);
+        for record in &file_records {
+            for operation in &record.requested_operations {
+                let method = lsp_method(operation);
+                assert!(requests.iter().any(|request| {
+                    request.method == method
+                        && request.outcome == RequestOutcome::Completed
+                        && request.result_count == Some(record.observed_result_count)
+                }));
+            }
+        }
+        assert!(requests.iter().any(|request| {
+            request.method == "textDocument/documentLink"
+                && request.outcome == RequestOutcome::Completed
+                && request.result_count == Some(0)
+        }));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method == "textDocument/references")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method == "textDocument/definition")
+        );
+        let (expected, expected_ids) =
+            expected_evidence_from_work_items(&file_records, &[validation], "Dockerfile");
+        let mut file = included("Dockerfile", status);
+        file.role = FileRole::Config;
+        file.advertised_capabilities = capabilities;
+        file.requests_attempted = requests;
+        file.expected_results = expected;
+        file.expected_result_ids = expected_ids;
+        file.persisted_results =
+            persisted_results_for_path("Dockerfile", &result.new_nodes, &result.added_edges);
+        assert!(report(vec![file.clone()]).is_ready());
+
+        let mut missing_required_request = file.clone();
+        missing_required_request
+            .requests_attempted
+            .retain(|request| request.method != "textDocument/documentSymbol");
+        assert!(
+            !report(vec![missing_required_request]).is_ready(),
+            "missing required Dockerfile document-symbol request evidence must block readiness"
+        );
+
+        let zero_work = included(
+            "Dockerfile",
+            FileTerminalStatus::NeverProcessed {
+                detail: "zero Dockerfile LSP operations were executed".to_string(),
+            },
+        );
+        assert!(!report(vec![zero_work]).is_ready());
+
+        let mut failed_record = (*symbol_record).clone();
+        failed_record.state = LspWorkItemState::Failed;
+        failed_record.last_error = Some("fixture failure".to_string());
+        let failed_status = terminal_status_for_file(
+            "Dockerfile",
+            &[&failed_record],
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &[validation],
+        );
+        assert!(matches!(failed_status, FileTerminalStatus::Degraded { .. }));
+
+        file.persisted_results = PersistedResults::default();
+        assert!(
+            !report(vec![file]).is_ready(),
+            "discarded Dockerfile document symbols must block readiness"
+        );
+    }
+
+    #[tokio::test]
     async fn binding_final_review_definition_error_persists_failure_and_blocks_readiness() {
         let repo = tempfile::tempdir().unwrap();
         for directory in ["docs", "src", "tests"] {
@@ -4508,26 +5166,6 @@ mod tests {
             include_str!("../tests/fixtures/lsp_capability_repo/docs/guide.md")
                 .contains("the source")
         );
-        let fixture_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_repo");
-        let markdown = crate::extract::markdown::MarkdownExtractor::new();
-        let valid_doc = markdown
-            .extract(
-                Path::new("docs/guide.md"),
-                include_str!("../tests/fixtures/lsp_capability_repo/docs/guide.md"),
-            )
-            .unwrap();
-        let malformed_doc = markdown
-            .extract(
-                Path::new("docs/malformed.md"),
-                include_str!("../tests/fixtures/lsp_capability_repo/docs/malformed.md"),
-            )
-            .unwrap();
-        assert!(
-            applicable_document_link_paths(&fixture_root, &valid_doc.nodes)
-                .contains("docs/guide.md")
-        );
-        assert!(applicable_document_link_paths(&fixture_root, &malformed_doc.nodes).is_empty());
 
         let doc_node = Node {
             id: NodeId {
@@ -4554,7 +5192,7 @@ mod tests {
         .with_negotiated_capabilities(crate::extract::scan_stats::LspNegotiatedCapabilities {
             references_provider: true,
             definition_provider: true,
-            document_link_provider: true,
+            document_link_provider: false,
             document_symbol_provider: true,
             ..crate::extract::scan_stats::LspNegotiatedCapabilities::default()
         })
@@ -4582,14 +5220,6 @@ mod tests {
             Edge {
                 from: doc_node.id.clone(),
                 to: doc_target.clone(),
-                kind: EdgeKind::DependsOn,
-                source: ExtractionSource::Lsp,
-                confidence: Confidence::Confirmed,
-                evidence: Vec::new(),
-            },
-            Edge {
-                from: doc_node.id.clone(),
-                to: doc_target.clone(),
                 kind: EdgeKind::Implements,
                 source: ExtractionSource::Lsp,
                 confidence: Confidence::Confirmed,
@@ -4605,9 +5235,8 @@ mod tests {
             },
         ];
         let mut doc_records = [
-            ("document_links", doc_edges[0].clone()),
-            ("definitions", doc_edges[1].clone()),
-            ("references", doc_edges[2].clone()),
+            ("definitions", doc_edges[0].clone()),
+            ("references", doc_edges[1].clone()),
         ]
         .into_iter()
         .map(|(operation, edge)| LspWorkItemRecord {
@@ -4639,7 +5268,7 @@ mod tests {
         );
         let mut docs_file = included(
             "docs/guide.md",
-            FileTerminalStatus::Processed { result_count: 4 },
+            FileTerminalStatus::Processed { result_count: 3 },
         );
         docs_file.role = FileRole::Docs;
         docs_file.advertised_capabilities = doc_capabilities;
@@ -4651,6 +5280,20 @@ mod tests {
             std::slice::from_ref(&doc_node),
             &doc_edges,
         );
+        assert!(
+            !docs_file
+                .expected_results
+                .contains(&ExpectedResultKind::DocumentLink)
+        );
+        assert!(
+            !docs_file
+                .requests_attempted
+                .iter()
+                .any(|request| request.method == "textDocument/documentLink")
+        );
+        assert!(docs_file.advertised_capabilities.iter().any(|capability| {
+            capability.name == "documentLinkProvider" && !capability.supported
+        }));
         assert!(report(vec![docs_file.clone()]).is_ready());
 
         let mut missing_definition_capability = docs_file.clone();

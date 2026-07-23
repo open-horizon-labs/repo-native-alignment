@@ -1297,6 +1297,7 @@ pub fn build_execution(
     plan: &IncrementalImpactPlan,
     validations: &[crate::extract::scan_stats::LspValidationEvidence],
     execution_job_id: Option<String>,
+    scan_started_at_ms: u64,
 ) -> Result<StructuralCacheExecution> {
     let changed_paths = authorization
         .authorization
@@ -1318,14 +1319,12 @@ pub fn build_execution(
         .values()
         .flat_map(|file| file.producer_work_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let executed_records = crate::extract::lsp::work_items::load_all_records(repo_root)?
-        .into_iter()
-        .filter(|record| {
-            plan.executed_paths.contains(Path::new(&record.file))
-                && !base_producers.contains(&format!("{}:{}", record.job_id, record.item_id))
-                && record.state == crate::extract::lsp::work_items::LspWorkItemState::Completed
-        })
-        .collect::<Vec<_>>();
+    let executed_records = select_execution_work_items(
+        crate::extract::lsp::work_items::load_all_records(repo_root)?,
+        &plan.executed_paths,
+        &base_producers,
+        scan_started_at_ms,
+    );
     let executed_graph_enrichment_operation_count = executed_records
         .iter()
         .map(|record| record.requested_operations.len() as u64)
@@ -1383,6 +1382,23 @@ pub fn build_execution(
         execution_job_id,
         digest: String::new(),
     })
+}
+
+fn select_execution_work_items(
+    records: Vec<crate::extract::lsp::work_items::LspWorkItemRecord>,
+    executed_paths: &BTreeSet<PathBuf>,
+    base_producers: &BTreeSet<String>,
+    scan_started_at_ms: u64,
+) -> Vec<crate::extract::lsp::work_items::LspWorkItemRecord> {
+    records
+        .into_iter()
+        .filter(|record| {
+            executed_paths.contains(Path::new(&record.file))
+                && !base_producers.contains(&format!("{}:{}", record.job_id, record.item_id))
+                && record.updated_at_ms >= scan_started_at_ms
+                && record.state == crate::extract::lsp::work_items::LspWorkItemState::Completed
+        })
+        .collect()
 }
 
 pub fn execution_related_job_ids(execution: &StructuralCacheExecution) -> Result<Vec<String>> {
@@ -1784,6 +1800,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_work_selection_excludes_stale_same_path_history() {
+        let record = |job_id: &str, item_id, updated_at_ms| {
+            crate::extract::lsp::work_items::LspWorkItemRecord {
+                job_id: job_id.to_string(),
+                item_id,
+                file: "src/app.py".to_string(),
+                requested_operations: vec!["references".to_string()],
+                state: crate::extract::lsp::work_items::LspWorkItemState::Completed,
+                updated_at_ms,
+                ..Default::default()
+            }
+        };
+        let selected = select_execution_work_items(
+            vec![
+                record("stale-pass1", 0, 9_999),
+                record("current-pass1", 0, 10_000),
+            ],
+            &BTreeSet::from([PathBuf::from("src/app.py")]),
+            &BTreeSet::new(),
+            10_000,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].job_id, "current-pass1");
+    }
 
     #[test]
     fn signed_runtime_marker_requires_its_authorization_file() {

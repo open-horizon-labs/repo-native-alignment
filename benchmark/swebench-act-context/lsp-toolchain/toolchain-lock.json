@@ -4,8 +4,8 @@
     "os": "macos",
     "architecture": "arm64"
   },
-  "inventory_sha256": "500ff11ba916a697fcdac0747d25d3094b81ab4c816f38df43540fd5018bb5d7",
-  "inventory_digest": "2b52991f0dd3e6b2ebf34053dc59e77ab9e85bb022d154911dfc521cc35009a9",
+  "inventory_sha256": "9cd3c61d6d344a78e484e37f854636cf691b3a23eb97e03ab3f23b273b8c345b",
+  "inventory_digest": "e64cec2d9e1dd120787dc98805b355fdadc4e121ca0fc397db88134b63be38e7",
   "acquisition": {
     "path": "benchmark/swebench-act-context/lsp-toolchain/acquisition/recipes.json",
     "sha256": "a6073c405e637346c4d8d0de1ada73ead13d2c019c6f73ce884bf655da8b4a1a"
@@ -543,6 +543,50 @@
         "file_name": "probe.dot",
         "language_id": "dot",
         "operation": "textDocument/codeAction"
+      }
+    },
+    {
+      "name": "dockerfile-language-server-nodejs",
+      "version": "0.15.0",
+      "license": "MIT",
+      "source_url": "https://registry.npmjs.org/dockerfile-language-server-nodejs/-/dockerfile-language-server-nodejs-0.15.0.tgz",
+      "artifact": "node-lsp-bundle-1.0.0.tar.gz",
+      "artifact_sha256": "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+      "executable": "bin/docker-langserver",
+      "executable_sha256": "55799b249a79f6c2ada3707503fe6f28c1b828ab820998428b1b06d29527cfab",
+      "command": "docker-langserver",
+      "args": [
+        "--stdio"
+      ],
+      "languages": [
+        "dockerfile"
+      ],
+      "extensions": [
+        "<none>"
+      ],
+      "expected_capabilities": [
+        "textDocument/documentSymbol"
+      ],
+      "platform": {
+        "os": "macos",
+        "architecture": "arm64"
+      },
+      "runtime_dependencies": [
+        "node-22.12.0"
+      ],
+      "install": {
+        "kind": "tar",
+        "destination": "servers",
+        "member": ""
+      },
+      "launcher": {
+        "kind": "node",
+        "target": "servers/issue785-node-bundle/node_modules/dockerfile-language-server-nodejs/bin/docker-langserver"
+      },
+      "probe": {
+        "file_name": "Dockerfile",
+        "language_id": "dockerfile",
+        "operation": "textDocument/documentSymbol"
       }
     },
     {
