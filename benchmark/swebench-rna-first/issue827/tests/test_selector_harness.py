@@ -89,6 +89,105 @@ class MaterializedEntrypointTests(unittest.TestCase):
                     self.assertNotIn(b"HOSTILE_SHADOW", result.stderr)
 
 
+class TrustedRnaWriteScopeTests(unittest.TestCase):
+    def layout(
+        self, root: Path
+    ) -> tuple[list[Path], list[Path], list[Path], Path]:
+        evidence = root / "episode/evidence"
+        isolation_root = evidence / "isolation"
+        directories = {
+            "gateway_home": isolation_root / "gateway-private/home",
+            "gateway_tmp": isolation_root / "gateway-private/tmp",
+            "rna_events": evidence / "rna-events",
+            "query_events": evidence / "query",
+            "trusted_rna_state": isolation_root / "trusted-rna-state",
+            "hooks": evidence / "hooks",
+            "requests": isolation_root / "requests",
+            "broker_output": isolation_root / "trusted-rna-broker/output",
+        }
+        for directory in directories.values():
+            directory.mkdir(parents=True)
+        roots = [
+            directories["gateway_home"],
+            directories["gateway_tmp"],
+            directories["rna_events"],
+            directories["query_events"],
+            directories["trusted_rna_state"],
+        ]
+        required = [
+            directories["trusted_rna_state"] / "supervisor-state.json",
+            directories["trusted_rna_state"] / "supervisor.lock",
+            directories["rna_events"],
+            directories["query_events"],
+        ]
+        unrelated = [
+            evidence,
+            evidence / "supervisor-config.json",
+            evidence / "runtime-identity.json",
+            evidence / "common-supervisor-state.json",
+            directories["hooks"],
+            directories["requests"],
+            directories["broker_output"],
+        ]
+        return roots, required, unrelated, evidence
+
+    def test_scope_covers_all_wrapper_outputs_without_broad_evidence_access(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            roots, required, unrelated, _evidence = self.layout(
+                Path(temporary)
+            )
+            run_selector.validate_trusted_rna_write_scope(
+                write_roots=roots,
+                required_paths=required,
+                unrelated_paths=unrelated,
+            )
+            resolved_roots = [path.resolve(strict=True) for path in roots]
+            for path in required:
+                self.assertTrue(
+                    run_selector.path_is_covered_by_root(path, resolved_roots)
+                )
+            for path in unrelated:
+                self.assertFalse(
+                    run_selector.path_is_covered_by_root(path, resolved_roots)
+                )
+
+    def test_missing_query_or_state_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            roots, required, unrelated, _evidence = self.layout(
+                Path(temporary)
+            )
+            for omitted in (roots[-2], roots[-1]):
+                with self.subTest(omitted=omitted), self.assertRaisesRegex(
+                    run_selector.FailClosed,
+                    "do not cover owned path",
+                ):
+                    run_selector.validate_trusted_rna_write_scope(
+                        write_roots=[
+                            path for path in roots if path != omitted
+                        ],
+                        required_paths=required,
+                        unrelated_paths=unrelated,
+                    )
+
+    def test_episode_evidence_or_isolation_root_is_rejected_as_too_broad(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            roots, required, unrelated, evidence = self.layout(Path(temporary))
+            for broad_root in (evidence, evidence / "isolation"):
+                with self.subTest(root=broad_root), self.assertRaisesRegex(
+                    run_selector.FailClosed,
+                    "exposes unrelated episode path",
+                ):
+                    run_selector.validate_trusted_rna_write_scope(
+                        write_roots=[*roots, broad_root],
+                        required_paths=required,
+                        unrelated_paths=unrelated,
+                    )
+
+
 class WrapperFixture:
     def __init__(self, root: Path):
         self.root = root

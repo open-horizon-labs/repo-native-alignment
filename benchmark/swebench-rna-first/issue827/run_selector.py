@@ -1301,6 +1301,33 @@ def make_identity(prepared: PreparedRun, case: PreparedCase) -> dict[str, Any]:
     }
 
 
+def path_is_covered_by_root(path: Path, roots: Sequence[Path]) -> bool:
+    resolved = path.resolve(strict=False)
+    return any(root == resolved or root in resolved.parents for root in roots)
+
+
+def validate_trusted_rna_write_scope(
+    *,
+    write_roots: Sequence[Path],
+    required_paths: Sequence[Path],
+    unrelated_paths: Sequence[Path],
+) -> None:
+    """Prove the inner RNA sandbox can write only its owned episode state."""
+
+    require(bool(write_roots), "trusted RNA write roots are empty")
+    roots = tuple(path.resolve(strict=True) for path in write_roots)
+    for path in required_paths:
+        require(
+            path_is_covered_by_root(path, roots),
+            f"trusted RNA write roots do not cover owned path: {path}",
+        )
+    for path in unrelated_paths:
+        require(
+            not path_is_covered_by_root(path, roots),
+            f"trusted RNA write root exposes unrelated episode path: {path}",
+        )
+
+
 def configure_episode(
     prepared: PreparedRun,
     case: PreparedCase,
@@ -1334,6 +1361,7 @@ def configure_episode(
         "hooks": evidence / "hooks",
         "rna_events": evidence / "rna-events",
         "query_events": evidence / "query",
+        "trusted_rna_state": isolation_root / "trusted-rna-state",
     }
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -1469,6 +1497,7 @@ def configure_episode(
         directories["gateway_tmp"],
         directories["rna_events"],
         directories["query_events"],
+        directories["trusted_rna_state"],
         identity_path,
         trusted_rna_environment,
         *canonical_environment_roots,
@@ -1479,12 +1508,48 @@ def configure_episode(
         directories["gateway_home"],
         directories["gateway_tmp"],
         directories["rna_events"],
+        directories["query_events"],
+        directories["trusted_rna_state"],
     ]
     trusted_rna_read_roots = sorted(
         {path.resolve(strict=True) for path in trusted_rna_read_roots}
     )
     trusted_rna_write_roots = sorted(
         {path.resolve(strict=True) for path in trusted_rna_write_roots}
+    )
+    treatment_state_path = (
+        directories["trusted_rna_state"] / "supervisor-state.json"
+    )
+    treatment_lock_path = directories["trusted_rna_state"] / "supervisor.lock"
+    validate_trusted_rna_write_scope(
+        write_roots=trusted_rna_write_roots,
+        required_paths=[
+            treatment_state_path,
+            treatment_lock_path,
+            directories["rna_events"],
+            directories["query_events"],
+        ],
+        unrelated_paths=[
+            episode,
+            evidence,
+            identity_path,
+            evidence / "supervisor-config.json",
+            evidence / "common-supervisor-state.json",
+            evidence / "common-supervisor.lock",
+            evidence / "hook-guard-state.json",
+            directories["hooks"],
+            directories["requests"],
+            directories["claimed"],
+            directories["revoked"],
+            directories["receipts"],
+            directories["traces"],
+            directories["teardowns"],
+            directories["broker_requests"],
+            directories["broker_claimed"],
+            directories["broker_output"],
+            directories["preflight"],
+            directories["gateway_docker_config"],
+        ],
     )
     forbidden_trusted_roots = [
         sibling.resolve(strict=True),
@@ -1526,9 +1591,9 @@ def configure_episode(
         "__QUERY_WRAPPER__": str(query_wrapper),
         "__HARNESS_ROOT__": str(harness_paths["harness"]),
         "__EPISODE_EVIDENCE_ROOT__": str(evidence),
-        "__SUPERVISOR_STATE__": str(evidence / "supervisor-state.json"),
+        "__SUPERVISOR_STATE__": str(treatment_state_path),
         "__COMMON_SUPERVISOR_STATE__": str(evidence / "common-supervisor-state.json"),
-        "__SUPERVISOR_LOCK__": str(evidence / "supervisor.lock"),
+        "__SUPERVISOR_LOCK__": str(treatment_lock_path),
         "__COMMON_SUPERVISOR_LOCK__": str(evidence / "common-supervisor.lock"),
         "__HOOK_LEDGER__": str(evidence / "hooks/treatment-events.jsonl"),
         "__COMMON_HOOK_LEDGER__": str(evidence / "hooks/common-events.jsonl"),
