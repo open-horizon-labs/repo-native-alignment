@@ -557,6 +557,7 @@ def main() -> int:
         )
 
     argv = [
+        CONFIG["gateway_python"],
         CONFIG["launcher"],
         "search",
         "--repo",

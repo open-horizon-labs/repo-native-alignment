@@ -610,6 +610,7 @@ else:
         self.config = {
             "schema_version": "issue827-supervisor-config-v4",
             "policy": "treatment",
+            "gateway_python": str(Path(sys.executable).resolve(strict=True)),
             "launcher": str(self.launcher),
             "binary": str(self.binary),
             "trusted_rna_environment": str(self.environment),
@@ -773,6 +774,65 @@ class RnaWrapperTests(unittest.TestCase):
             result = fixture.invoke(fixture.query, ["--query-sha256", fixture.config["expected_query_sha256"]], mode="no_metal")
             self.assertEqual(result.returncode, 42)
             self.assertIn(b"readiness", result.stderr)
+
+    def test_query_and_traversal_use_bound_python_for_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(tmp)
+            hostile = Path(tmp) / "hostile-bin"
+            hostile.mkdir()
+            hostile_python = hostile / "python3"
+            hostile_python.write_text("#!/bin/sh\nexit 91\n")
+            hostile_python.chmod(0o755)
+            environment = {
+                **os.environ,
+                "FAKE_MODE": "nonempty",
+                "PATH": str(hostile),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            gateway_python = fixture.config["gateway_python"]
+            query = subprocess.run(
+                [
+                    gateway_python,
+                    str(fixture.query),
+                    "--query-sha256",
+                    fixture.config["expected_query_sha256"],
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(query.returncode, 0, query.stderr)
+            query_receipt = json.loads(
+                (fixture.evidence / "query/title-query.json").read_text()
+            )
+            self.assertEqual(
+                query_receipt["argv"][:2],
+                [gateway_python, str(fixture.launcher)],
+            )
+
+            traversal = subprocess.run(
+                [
+                    gateway_python,
+                    str(fixture.wrapper),
+                    "--node",
+                    "foo.py:target:function",
+                    "--mode",
+                    "neighbors",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(traversal.returncode, 0, traversal.stderr)
+            traversal_receipt = json.loads(
+                (fixture.evidence / "rna-events/0001.json").read_text()
+            )
+            self.assertEqual(
+                traversal_receipt["argv"][:2],
+                [gateway_python, str(fixture.launcher)],
+            )
 
     def test_first_neighbors_accepts_nonempty_and_empty(self):
         for mode, expected in (("nonempty", "OK_NONEMPTY"), ("empty", "OK_EMPTY")):
