@@ -39,12 +39,32 @@ def rejects(root: Path) -> None:
 def test_published_evidence_verifies() -> None:
     result = MODULE.verify(SOURCE / "evidence/amended-selector", SOURCE)
     assert result["valid"] is True
-    assert result["decision"] == "selected_T"
+    assert result["protocol_classification"] == "amended_development_selector"
+    assert result["decision"] == "no_RNA_treatment"
+    assert result["decision_classification"] == "treatment_noncompliance"
+    assert result["decision_reason"] == "at least one T episode failed the mandatory RNA-first manipulation contract"
     assert result["checks"]["original_xarray_symmetric_wall_timeout"] is True
     assert result["checks"]["fresh_amended_xarray_sessions"] is True
     assert result["checks"]["official_evaluations_once"] == 4
+    assert result["checks"]["xarray_T_policy_compliant"] is False
+    assert result["checks"]["xarray_T_forbidden_attempts_proven"] == 2
+    assert result["checks"]["erroneous_post_nonadherence_evaluator_invocations"] == 1
     assert result["aggregates"]["A"]["resolved"] == 2
     assert result["aggregates"]["T"]["resolved"] == 2
+
+
+def test_xarray_t_frozen_policy_violations_are_proven_from_the_ledger() -> None:
+    root = SOURCE / "evidence/amended-selector"
+    violations = MODULE.prove_xarray_t_policy_violations(
+        SOURCE,
+        root / "final/model-evidence/xarray/T/actor-tool-ledger.json",
+    )
+    assert [item["model_action_index"] for item in violations] == [27, 37]
+    assert [item["classification"] for item in violations] == [
+        "forbidden_network_access_attempt",
+        "forbidden_other_arm_evidence_access_attempt",
+    ]
+    assert all(item["allow_decisions"] == {"common": "allow", "treatment": "allow"} for item in violations)
 
 
 def test_tampered_original_timeout_fails_closed(tmp_path: Path) -> None:
@@ -73,6 +93,16 @@ def test_tampered_selection_result_fails_closed(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("tampered final result must fail closed")
+
+
+def test_tampered_superseding_correction_fails_closed(tmp_path: Path) -> None:
+    root = copied_evidence(tmp_path)
+    rewrite(
+        root,
+        "final/superseding-selection-correction.json",
+        lambda value: value["corrected_result"].__setitem__("decision", "selected_T"),
+    )
+    rejects(root)
 
 
 def test_verification_level_evaluator_feedback_fails_closed(tmp_path: Path) -> None:

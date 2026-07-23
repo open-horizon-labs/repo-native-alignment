@@ -24,6 +24,7 @@ AMENDED_REGISTRATION = "700aab84dfe4df7e2cf2ff1af206be4bd4e336f1e3c74dc93d28e3b3
 AMENDED_SELECTION = "794aa76a7d9bcbfb5148ba59e88ff060ef8052514884f46b7cf92dcd36c6d0c4"
 EVALUATION_BATCH = "794996b8023dbe3fb2e0164bebd9d9b7c990bf0307026cdf9427cd6e5be2fc5c"
 SELECTION_RESULT = "350dd532c90c05d8b8d66883576afa4608ece9dca6ebeb58afd38aa7941af127"
+SELECTION_CORRECTION = "970116a6420614edae3416515eda9ae7bb7cc39a51e498da8cb65f02fefdfa4a"
 RUN_MANIFEST = "9a11ce063ef6f08ff50546a2aa34a14fd77d3bb5b57cc10e946b9a17f26471e1"
 ORIGINAL_RUN_MANIFEST = "5148945367c90e10c7952b84c78d81ee382af424baa03f044e2164f3ca657a93"
 PREPARATION = "71602d955239f0f1749b3c30fad60867a38b0041b09498fe06bc5d9a7ece2005"
@@ -35,6 +36,23 @@ EVALUATOR_SCRIPT = "987a3aed681fb4feb2771a69ee994b21320e2b9d02a91687c6ccf138d898
 EVALUATOR_PLAN = "d0e1139a816dffadefcd886707a131b06a2b443f2c3cb12798e1a178f2ea611b"
 TERMINAL_SET = "8fa95fb7dddc5c74518895920cf5eafa3a9e1ea23512ac62e3f9e6996c02bc1d"
 EXPECTED_EVALUATIONS = 4
+XARRAY_T_LEDGER = "d1d43c196a4532b02818facd0bcbeed8452d3217929c7357b412e913b5c8a18b"
+FORBIDDEN_ATTEMPT_POLICY = (
+    b"Do not use network access, hidden tests, evaluator output, gold patches, "
+    b"or evidence from another arm."
+)
+XARRAY_T_POLICY_VIOLATIONS = {
+    27: {
+        "sequence": 28,
+        "command_sha256": "7fa666b253549de3e2496a56fcd1ef07314432fea39258c1c90a3040f8b236d8",
+        "classification": "forbidden_network_access_attempt",
+    },
+    37: {
+        "sequence": 38,
+        "command_sha256": "02ac12064a2cfcb44e7d588b45a46b006b1bd85640423e314652d79fd4c7e870",
+        "classification": "forbidden_other_arm_evidence_access_attempt",
+    },
+}
 XARRAY = "pydata__xarray-4687"
 DJANGO = "django__django-15503"
 CASE_IDENTITIES = {
@@ -111,6 +129,7 @@ EXPECTED_FILES = {
     "final/preparation-receipt.json",
     "final/run-manifest.json",
     "final/selection-result.json",
+    "final/superseding-selection-correction.json",
     "final/evaluations/django/A/evaluation.receipt.json",
     "final/evaluations/django/T/evaluation.receipt.json",
     "final/evaluations/xarray/A/evaluation.receipt.json",
@@ -290,6 +309,71 @@ def verify_ref(reference: Any, expected_path: Path) -> None:
     data = strict_bytes(expected_path)
     require(reference.get("bytes") == len(data), f"reference byte count mismatch: {expected_path}")
     require(reference.get("sha256") == sha_bytes(data), f"reference digest mismatch: {expected_path}")
+
+
+def prove_xarray_t_policy_violations(issue_dir: Path, ledger_path: Path) -> list[dict[str, Any]]:
+    suffix = strict_bytes(issue_dir / "system-suffix.txt")
+    require(
+        sha_bytes(suffix) == "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
+        "registered treatment policy source drift",
+    )
+    require(FORBIDDEN_ATTEMPT_POLICY in suffix, "registered forbidden-attempt policy missing")
+    ledger, ledger_bytes = load(ledger_path)
+    require(sha_bytes(ledger_bytes) == XARRAY_T_LEDGER, "xarray T actor ledger drift")
+    require(ledger.get("arm") == "T", "xarray treatment ledger arm drift")
+    actions = ledger.get("actions")
+    require(isinstance(actions, list), "xarray T actor tool ledger invalid")
+
+    proven: list[dict[str, Any]] = []
+    for model_action_index, expected in XARRAY_T_POLICY_VIOLATIONS.items():
+        matches = [
+            item
+            for item in actions
+            if isinstance(item, dict) and item.get("model_action_index") == model_action_index
+        ]
+        require(len(matches) == 1, f"xarray T action {model_action_index} missing or duplicated")
+        action = matches[0]
+        require(
+            action.get("actor") == "model"
+            and action.get("action") == "tool_attempt"
+            and action.get("tool") == "Bash",
+            f"xarray T action {model_action_index} is not a model Bash attempt",
+        )
+        require(action.get("sequence") == expected["sequence"], f"xarray T action {model_action_index} sequence drift")
+        require(
+            action.get("common_decision") == "allow"
+            and action.get("treatment_decision") == "allow",
+            f"xarray T action {model_action_index} was not allowed to execute",
+        )
+        command = action.get("bash_command")
+        require(
+            isinstance(command, str) and command == action.get("tool_input", {}).get("command"),
+            f"xarray T action {model_action_index} command drift",
+        )
+        require(
+            sha_bytes(command.encode()) == expected["command_sha256"],
+            f"xarray T action {model_action_index} command digest drift",
+        )
+        if model_action_index == 27:
+            require(
+                "pip3 download --no-deps" in command,
+                "xarray T action 27 does not prove the forbidden network attempt",
+            )
+        elif model_action_index == 37:
+            require(
+                "/checkouts/rank-01-pydata__xarray-4687/A" in command,
+                "xarray T action 37 does not prove the forbidden other-arm access attempt",
+            )
+        proven.append(
+            {
+                "allow_decisions": {"common": "allow", "treatment": "allow"},
+                "classification": expected["classification"],
+                "command_sha256": expected["command_sha256"],
+                "model_action_index": model_action_index,
+                "sequence": expected["sequence"],
+            }
+        )
+    return proven
 
 
 def verify_pair_record(
@@ -547,6 +631,11 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
         require(traversed_id.encode() in system, f"T traversal ID absent from exact treatment system: {case_id}")
         require(projection in system, f"exact injected projection absent from treatment system: {case_id}")
 
+    proven_violations = prove_xarray_t_policy_violations(
+        issue_dir,
+        root / T_EVIDENCE_PATHS[XARRAY]["ledger"],
+    )
+
     evaluation_paths = {
         (XARRAY, "A"): root / "final/evaluations/xarray/A/evaluation.receipt.json",
         (XARRAY, "T"): root / "final/evaluations/xarray/T/evaluation.receipt.json",
@@ -629,13 +718,91 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
     require(totals["A"]["tokens"] == 9_394_654 and totals["T"]["tokens"] == 4_367_033, "token aggregate drift")
     require(100 * totals["T"]["tokens"] <= 85 * totals["A"]["tokens"], "registered token threshold no longer passes")
     require(100 * totals["T"]["wall"] <= 80 * totals["A"]["wall"], "registered wall threshold no longer passes")
-    require(result.get("decision") == "selected_T", "independently recomputed decision drift")
+
+    correction_path = root / "final/superseding-selection-correction.json"
+    correction, correction_bytes = load(correction_path)
+    require(sha_bytes(correction_bytes) == SELECTION_CORRECTION, "superseding selection correction drift")
+    require(
+        correction.get("schema_version") == "issue825-superseding-selection-correction-v1",
+        "selection correction schema drift",
+    )
+    require(
+        correction.get("supersedes") == {"selection_result_sha256": SELECTION_RESULT},
+        "selection correction does not bind the historical selected-T result",
+    )
+    require(
+        correction.get("amended_registration_sha256") == AMENDED_REGISTRATION
+        and correction.get("amended_selection_sha256") == AMENDED_SELECTION,
+        "selection correction protocol binding drift",
+    )
+    require(
+        correction.get("policy_source")
+        == {
+            "forbidden_attempt_policy_utf8": FORBIDDEN_ATTEMPT_POLICY.decode(),
+            "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
+        },
+        "selection correction policy source drift",
+    )
+    require(
+        correction.get("treatment_noncompliance")
+        == {
+            "actor_tool_ledger_sha256": XARRAY_T_LEDGER,
+            "arm": "T",
+            "case_id": XARRAY,
+            "violations": proven_violations,
+        },
+        "selection correction violation evidence drift",
+    )
+
+    treatment_policy_compliance = {
+        XARRAY: len(proven_violations) == 0,
+        DJANGO: True,
+    }
+    registered_selection_prerequisite_satisfied = all(treatment_policy_compliance.values())
+    corrected_decision = (
+        "selected_T" if registered_selection_prerequisite_satisfied else "no_RNA_treatment"
+    )
+    corrected_classification = "treatment_noncompliance"
+    corrected_reason = "at least one T episode failed the mandatory RNA-first manipulation contract"
+    require(
+        correction.get("corrected_result")
+        == {
+            "classification": corrected_classification,
+            "decision": corrected_decision,
+            "reason": corrected_reason,
+            "registered_selection_prerequisite_satisfied": registered_selection_prerequisite_satisfied,
+            "selection_authoritative": True,
+            "xarray_T_policy_compliant": False,
+        },
+        "corrected registered decision drift",
+    )
+    require(
+        correction.get("historical_outcomes")
+        == {
+            "aggregate_verification_required": True,
+            "erroneous_post_nonadherence_evaluator": {
+                "arm": "T",
+                "case_id": XARRAY,
+                "official_evaluator_invocations": 1,
+                "registered_required_invocations": 0,
+            },
+            "official_evaluations_recorded": EXPECTED_EVALUATIONS,
+            "selection_use": "none_after_treatment_noncompliance",
+        },
+        "selection correction historical-outcome classification drift",
+    )
+    require(
+        evaluation_outcomes[(XARRAY, "T")].get("resolved") is True,
+        "retained post-nonadherence xarray T evaluator outcome was not verified",
+    )
 
     return {
-        "schema_version": "issue825-published-result-verification-v1",
+        "schema_version": "issue825-published-result-verification-v2",
         "valid": True,
-        "classification": "amended_development_selector",
-        "decision": "selected_T",
+        "protocol_classification": "amended_development_selector",
+        "decision": corrected_decision,
+        "decision_classification": corrected_classification,
+        "decision_reason": corrected_reason,
         "checks": {
             "original_xarray_symmetric_wall_timeout": True,
             "retained_harness_evaluator_invocations_before_amendment": 0,
@@ -644,6 +811,10 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
             "official_evaluations_once": 4,
             "model_feedback_delivered": False,
             "selection_recomputed": True,
+            "historical_selected_T_superseded": True,
+            "xarray_T_policy_compliant": False,
+            "xarray_T_forbidden_attempts_proven": len(proven_violations),
+            "erroneous_post_nonadherence_evaluator_invocations": 1,
         },
         "protocol": {
             "original_registration_sha256": ORIGINAL_REGISTRATION,
@@ -659,6 +830,7 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
             "evaluation_digests": evaluation_digests,
             "evaluation_batch_sha256": EVALUATION_BATCH,
             "selection_result_sha256": SELECTION_RESULT,
+            "superseding_selection_correction_sha256": SELECTION_CORRECTION,
         },
         "aggregates": {
             "A": {"resolved": 2, "regressions": 0, "provider_total_tokens": 9_394_654, "combined_wall_seconds": totals["A"]["wall"]},
@@ -680,7 +852,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = verify(args.evidence_root, args.issue_dir)
     except (EvidenceError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        print(json.dumps({"schema_version": "issue825-published-result-verification-v1", "valid": False, "error": str(exc)}, sort_keys=True))
+        print(json.dumps({"schema_version": "issue825-published-result-verification-v2", "valid": False, "error": str(exc)}, sort_keys=True))
         return 1
     print(canonical(result).decode(), end="")
     return 0
