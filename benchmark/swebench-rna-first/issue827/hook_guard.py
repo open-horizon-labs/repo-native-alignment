@@ -81,21 +81,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def stop_document(reason: str) -> dict[str, object]:
+def stop_document(reason: str, event_name: str) -> dict[str, object]:
     message = f"#827 hook guard terminated the episode: {reason}"
-    return {
+    document: dict[str, object] = {
         "continue": False,
         "stopReason": message,
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
+    }
+    if event_name == "PreToolUse":
+        document["hookSpecificOutput"] = {
+            "hookEventName": event_name,
             "permissionDecision": "deny",
             "permissionDecisionReason": message,
-        },
-    }
+        }
+    elif event_name in {"PostToolUse", "PostToolUseFailure"}:
+        document["decision"] = "block"
+        document["reason"] = message
+    return document
 
 
-def emit_stop(reason: str) -> None:
-    sys.stdout.buffer.write(canonical(stop_document(reason)))
+def emit_stop(reason: str, event_name: str) -> None:
+    sys.stdout.buffer.write(canonical(stop_document(reason, event_name)))
     sys.stdout.buffer.flush()
 
 
@@ -567,7 +572,7 @@ def run_child(
 
 
 def validate_child_response(
-    returncode: int, stdout: bytes, stderr: bytes
+    returncode: int, stdout: bytes, stderr: bytes, event_name: str
 ) -> tuple[str, dict[str, object] | None]:
     if returncode != 0:
         raise GuardFailure("hook_guard_child_crash", returncode=returncode)
@@ -583,9 +588,25 @@ def validate_child_response(
         raise GuardFailure("hook_guard_child_output_invalid") from exc
     if not isinstance(document, dict):
         raise GuardFailure("hook_guard_child_output_not_object")
+    if event_name in {"PostToolUse", "PostToolUseFailure"}:
+        if (
+            document.get("continue") is not False
+            or not isinstance(document.get("stopReason"), str)
+            or not document["stopReason"]
+            or document.get("decision") != "block"
+            or not isinstance(document.get("reason"), str)
+            or not document["reason"]
+            or "hookSpecificOutput" in document
+        ):
+            raise GuardFailure("hook_guard_child_denial_not_terminal")
+        return "deny", document
+    if event_name != "PreToolUse":
+        raise GuardFailure("hook_guard_child_event_unsupported")
     specific = document.get("hookSpecificOutput")
     if not isinstance(specific, dict):
         raise GuardFailure("hook_guard_child_specific_output_missing")
+    if specific.get("hookEventName") != event_name:
+        raise GuardFailure("hook_guard_child_event_name_mismatch")
     decision = specific.get("permissionDecision")
     if decision == "deny":
         if (
@@ -648,7 +669,7 @@ def fail(
         # The stop response is the final containment boundary even if evidence
         # storage itself is unavailable.
         pass
-    emit_stop(code)
+    emit_stop(code, str(event.get("hook_event_name", "unknown")))
     return 0
 
 
@@ -691,7 +712,10 @@ def execute(argv: Sequence[str], raw_event: bytes) -> int:
         )
         try:
             disposition, document = validate_child_response(
-                returncode, stdout, stderr
+                returncode,
+                stdout,
+                stderr,
+                str(event.get("hook_event_name", "unknown")),
             )
         except GuardFailure as failure:
             failure.details.setdefault("returncode", returncode)
@@ -820,12 +844,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(exc, GuardFailure)
             else f"hook_guard_internal_{type(exc).__name__}"
         )
+        try:
+            event = validate_event(raw_event)
+        except GuardFailure:
+            event = {"hook_event_name": "unknown"}
         hint = _evidence_hint(arguments)
         if hint is not None and hint.is_dir() and not hint.is_symlink():
-            try:
-                event = validate_event(raw_event)
-            except GuardFailure:
-                event = {"hook_event_name": "unknown"}
             try:
                 record(
                     config={},
@@ -844,7 +868,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             except BaseException:
                 pass
-        emit_stop(code)
+        emit_stop(
+            code,
+            str(event.get("hook_event_name", "unknown")),
+        )
         return 0
 
 

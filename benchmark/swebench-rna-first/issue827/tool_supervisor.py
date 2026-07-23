@@ -22,17 +22,22 @@ from isolation import (
 HERE = Path(__file__).resolve().parent.parent
 
 
-def terminal_denial(reason: str) -> dict[str, object]:
+def terminal_denial(reason: str, event_name: str) -> dict[str, object]:
     message = f"RNA treatment terminated: {reason}"
-    return {
+    document: dict[str, object] = {
         "continue": False,
         "stopReason": message,
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
+    }
+    if event_name == "PreToolUse":
+        document["hookSpecificOutput"] = {
+            "hookEventName": event_name,
             "permissionDecision": "deny",
             "permissionDecisionReason": message,
-        },
-    }
+        }
+    elif event_name in {"PostToolUse", "PostToolUseFailure"}:
+        document["decision"] = "block"
+        document["reason"] = message
+    return document
 
 
 def load_config() -> dict:
@@ -115,7 +120,14 @@ def deny(
     write_state(config, current)
     violation = IsolationViolation(reason)
     log(config, event, "deny", reason, violation=violation)
-    print(json.dumps(terminal_denial(reason), sort_keys=True))
+    print(
+        json.dumps(
+            terminal_denial(
+                reason, str(event.get("hook_event_name", "unknown"))
+            ),
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -288,8 +300,13 @@ def handle(event: dict, config: dict) -> int:
 
 
 def main() -> int:
+    event_name = "unknown"
     try:
         event = json.load(sys.stdin)
+        if isinstance(event, dict) and isinstance(
+            event.get("hook_event_name"), str
+        ):
+            event_name = event["hook_event_name"]
         config = load_config()
         lock = Path(str(config["lock"]))
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +318,8 @@ def main() -> int:
             json.dumps(
                 terminal_denial(
                     "RNA supervisor failed closed: "
-                    f"{type(exc).__name__}"
+                    f"{type(exc).__name__}",
+                    event_name,
                 ),
                 sort_keys=True,
             )

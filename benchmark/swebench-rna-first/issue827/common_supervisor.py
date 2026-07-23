@@ -91,19 +91,28 @@ def common_fatal(config: Mapping[str, object]) -> bool:
 
 def hook_output(
     *,
+    event_name: str,
     decision: str,
     reason: str,
     updated_input: Mapping[str, object] | None = None,
     terminate: bool = False,
 ) -> None:
-    output: dict[str, object] = {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
-        "permissionDecisionReason": reason,
-    }
-    if updated_input is not None:
-        output["updatedInput"] = dict(updated_input)
-    document: dict[str, object] = {"hookSpecificOutput": output}
+    document: dict[str, object] = {}
+    if event_name == "PreToolUse":
+        output: dict[str, object] = {
+            "hookEventName": event_name,
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+        if updated_input is not None:
+            output["updatedInput"] = dict(updated_input)
+        document["hookSpecificOutput"] = output
+    elif event_name in {"PostToolUse", "PostToolUseFailure"}:
+        if updated_input is not None:
+            raise ValueError("updated input is only valid for PreToolUse")
+        if decision == "deny":
+            document["decision"] = "block"
+            document["reason"] = reason
     if terminate:
         document["continue"] = False
         document["stopReason"] = reason
@@ -151,6 +160,7 @@ def _deny(
         violation=violation,
     )
     hook_output(
+        event_name=str(event.get("hook_event_name", "unknown")),
         decision="deny",
         reason=f"common episode confinement: {violation.code}",
         terminate=True,
@@ -322,6 +332,7 @@ def handle(event: dict, config: dict) -> int:
                 payload=payload,
             )
             hook_output(
+                event_name="PreToolUse",
                 decision="allow",
                 reason="Bash replaced by single-use #827 gateway request",
                 updated_input=updated,
@@ -373,8 +384,13 @@ def handle(event: dict, config: dict) -> int:
 
 
 def main() -> int:
+    event_name = "unknown"
     try:
         event = json.load(sys.stdin)
+        if isinstance(event, dict) and isinstance(
+            event.get("hook_event_name"), str
+        ):
+            event_name = event["hook_event_name"]
         config = load_config()
         lock = Path(str(config["common_lock"]))
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -385,6 +401,7 @@ def main() -> int:
         # A normal Python failure is denied in-band. Process death/timeout is
         # covered by the static allow-only gateway permission configuration.
         hook_output(
+            event_name=event_name,
             decision="deny",
             reason=f"common supervisor failed closed: {type(exc).__name__}",
             terminate=True,

@@ -54,7 +54,7 @@ import time
 counter = Path(os.environ["FAKE_CHILD_COUNTER"])
 count = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(count + 1))
-json.load(sys.stdin)
+event = json.load(sys.stdin)
 mode = os.environ.get("FAKE_CHILD_MODE", "allow")
 if mode == "crash":
     raise SystemExit(23)
@@ -74,24 +74,30 @@ elif mode == "unterminated_deny":
     }))
 elif mode == "deny":
     message = "fixture denied"
-    print(json.dumps({
+    document = {
         "continue": False,
         "stopReason": message,
-        "hookSpecificOutput": {
+    }
+    if event["hook_event_name"] == "PreToolUse":
+        document["hookSpecificOutput"] = {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": message,
-        },
-    }))
+        }
+    else:
+        document["decision"] = "block"
+        document["reason"] = message
+    print(json.dumps(document))
 elif mode == "allow":
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "fixture allowed",
-            "updatedInput": {"command": "registered gateway"},
-        },
-    }))
+    if event["hook_event_name"] == "PreToolUse":
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "fixture allowed",
+                "updatedInput": {"command": "registered gateway"},
+            },
+        }))
 elif mode == "empty":
     pass
 else:
@@ -160,16 +166,36 @@ else:
 
 
 class HookGuardTests(unittest.TestCase):
-    def assert_terminal(self, result: subprocess.CompletedProcess[bytes]) -> dict:
+    def assert_terminal(
+        self,
+        result: subprocess.CompletedProcess[bytes],
+        event_name: str = "PreToolUse",
+    ) -> dict:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, b"")
         document = json.loads(result.stdout)
         self.assertIs(document["continue"], False)
         self.assertTrue(document["stopReason"])
-        specific = document["hookSpecificOutput"]
-        self.assertEqual(specific["permissionDecision"], "deny")
-        self.assertTrue(specific["permissionDecisionReason"])
+        if event_name == "PreToolUse":
+            specific = document["hookSpecificOutput"]
+            self.assertEqual(specific["hookEventName"], event_name)
+            self.assertEqual(specific["permissionDecision"], "deny")
+            self.assertTrue(specific["permissionDecisionReason"])
+        else:
+            self.assertNotIn("hookSpecificOutput", document)
+            self.assertEqual(document["decision"], "block")
+            self.assertTrue(document["reason"])
         return document
+
+    def test_post_failure_denial_uses_matching_event_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = GuardFixture(Path(temporary))
+            event = {
+                **fixture.event,
+                "hook_event_name": "PostToolUseFailure",
+            }
+            result = fixture.invoke("deny", event=event)
+            self.assert_terminal(result, "PostToolUseFailure")
 
     def test_valid_allow_is_forwarded_and_evidenced(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -329,7 +355,7 @@ class HookGuardTests(unittest.TestCase):
                 "hook_event_name": "PostToolUse",
             }
             result = fixture.invoke("allow", event=post)
-            self.assert_terminal(result)
+            self.assert_terminal(result, "PostToolUse")
             self.assertIn(
                 b"native_tool_post_without_matching_pre", result.stdout
             )
@@ -368,6 +394,22 @@ class HookGuardTests(unittest.TestCase):
             self.assertEqual(
                 state["fatal_reason"], "hook_guard_config_invalid"
             )
+
+    def test_argument_failure_without_hint_still_uses_event_schema(self):
+        event = {
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_use_id": "fixture-tool",
+        }
+        result = subprocess.run(
+            [sys.executable, str(HERE / "hook_guard.py")],
+            input=canonical(event),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        document = self.assert_terminal(result, "PostToolUseFailure")
+        self.assertIn("hook_guard_arguments_invalid", document["stopReason"])
 
     def test_template_registers_only_guard_wrapped_supervisors(self):
         template = json.loads(
@@ -422,6 +464,31 @@ class ExistingSupervisorTerminationTests(unittest.TestCase):
                 document["hookSpecificOutput"]["permissionDecision"], "deny"
             )
 
+    def test_common_post_failure_denial_matches_event_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {
+                "policy": "control",
+                "common_state": str(root / "common-state.json"),
+                "common_hook_ledger": str(root / "common-ledger.jsonl"),
+            }
+            event = {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_use_id": "tool",
+            }
+            output = io.StringIO()
+            with redirect_stdout(output):
+                common_supervisor._deny(
+                    event,
+                    config,
+                    common_supervisor.IsolationViolation("fixture_denial"),
+                )
+            document = json.loads(output.getvalue())
+            self.assertIs(document["continue"], False)
+            self.assertEqual(document["decision"], "block")
+            self.assertNotIn("hookSpecificOutput", document)
+
     def test_treatment_in_process_denial_both_denies_and_stops(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -452,6 +519,36 @@ class ExistingSupervisorTerminationTests(unittest.TestCase):
             self.assertEqual(
                 document["hookSpecificOutput"]["permissionDecision"], "deny"
             )
+
+    def test_treatment_post_failure_denial_matches_event_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = {
+                "policy": "treatment",
+                "state": str(root / "state.json"),
+                "hook_ledger": str(root / "ledger.jsonl"),
+            }
+            event = {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_use_id": "tool",
+            }
+            current = {
+                "schema_version": "issue827-rna-supervisor-state-v1",
+                "fatal": False,
+                "first_traversal_succeeded": False,
+                "model_tool_attempts": 1,
+                "rna_calls": 0,
+            }
+            output = io.StringIO()
+            with redirect_stdout(output):
+                tool_supervisor.deny(
+                    event, config, current, "fixture_denial"
+                )
+            document = json.loads(output.getvalue())
+            self.assertIs(document["continue"], False)
+            self.assertEqual(document["decision"], "block")
+            self.assertNotIn("hookSpecificOutput", document)
 
 
 if __name__ == "__main__":
