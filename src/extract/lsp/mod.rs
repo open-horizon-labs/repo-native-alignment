@@ -583,6 +583,12 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ]
     ),
     builtin_lsp!(
+        "dockerfile",
+        "docker-langserver",
+        &["--stdio"],
+        &["<none>"]
+    ),
+    builtin_lsp!(
         "batch",
         "rna-cohort-language-server",
         &["--language", "batch"],
@@ -741,7 +747,7 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let special_language = if filename == "dockerfile" || filename.starts_with("dockerfile.") {
-        Some("config")
+        Some("dockerfile")
     } else if filename == "code.sample" {
         Some("python")
     } else if filename == "tox.ini.sample" {
@@ -4555,7 +4561,7 @@ mod tests {
         let servers = inventory["servers"]
             .as_array()
             .expect("descriptor inventory servers must be an array");
-        assert_eq!(servers.len(), 31, "frozen cohort language count drifted");
+        assert_eq!(servers.len(), 32, "frozen cohort language count drifted");
 
         for profile in servers {
             let languages = profile["languages"]

@@ -2,7 +2,8 @@
 """Deterministic stdio LSP fixture for capability/readiness CLI checks.
 
 Set RNA_LSP_FIXTURE_SCENARIO (or the first argument) to document_zero
-(default), document_features, document_definition_error, python_features,
+(default), document_features, document_definition_error, dockerfile_features,
+python_features,
 call_hierarchy_unmapped, compile_command_override, workspace, method_not_found,
 crash, or timeout. The
 deterministic feature scenarios exercise initialization and response evidence
@@ -165,6 +166,12 @@ def main():
                     "documentLinkProvider": {"resolveProvider": False},
                     "documentSymbolProvider": True,
                 }
+            elif scenario == "dockerfile_features":
+                capabilities = {
+                    "definitionProvider": True,
+                    "documentLinkProvider": {"resolveProvider": False},
+                    "documentSymbolProvider": True,
+                }
             elif scenario == "python_features":
                 capabilities = {
                     "referencesProvider": True,
@@ -226,6 +233,28 @@ def main():
                                 "end": {"line": 2, "character": 68},
                             },
                         }
+                    ],
+                )
+            elif scenario == "dockerfile_features":
+                result(
+                    request_id,
+                    [
+                        {
+                            "name": "builder",
+                            "kind": 2,
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 29},
+                            },
+                        },
+                        {
+                            "name": "runtime",
+                            "kind": 2,
+                            "range": {
+                                "start": {"line": 2, "character": 0},
+                                "end": {"line": 2, "character": 23},
+                            },
+                        },
                     ],
                 )
             elif scenario == "python_features":
@@ -308,6 +337,8 @@ def main():
         ):
             uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
             result(request_id, document_link_result(uri))
+        elif method == "textDocument/documentLink" and scenario == "dockerfile_features":
+            result(request_id, [])
         elif method == "textDocument/definition" and scenario in (
             "document_features",
             "document_definition_error",
@@ -319,6 +350,8 @@ def main():
                     request_id,
                     [{"uri": repository_file_uri(message, "src/app.py"), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}],
                 )
+        elif method == "textDocument/definition" and scenario == "dockerfile_features":
+            result(request_id, [])
         elif method == "textDocument/references" and scenario in (
             "document_features",
             "document_definition_error",

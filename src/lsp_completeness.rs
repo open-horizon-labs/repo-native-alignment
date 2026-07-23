@@ -3270,7 +3270,8 @@ mod tests {
             let descriptor =
                 crate::extract::lsp::builtin_lsp_descriptor_for_inventory_file(path, &absolute)
                     .expect("Dockerfile variant has a descriptor");
-            assert_eq!(descriptor.language(), "config");
+            assert_eq!(descriptor.language(), "dockerfile");
+            assert_eq!(descriptor.command(), "docker-langserver");
         }
         let negative = Path::new("doc/NotDockerfile.htmldoc");
         let negative_absolute = repo.path().join(negative);
@@ -4877,6 +4878,190 @@ mod tests {
         assert!(
             !report(files).is_ready(),
             "nested document cannot inherit README symbol persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn dockerfile_mock_persists_symbols_and_failure_modes_block_readiness() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lsp_capability_repo/Dockerfile");
+        std::fs::copy(&source, repo.path().join("Dockerfile")).unwrap();
+        let content = std::fs::read_to_string(source).unwrap();
+        let nodes = crate::extract::dockerfile::DockerfileExtractor::new()
+            .extract(Path::new("Dockerfile"), &content)
+            .unwrap()
+            .nodes;
+        assert!(nodes.iter().any(|node| {
+            node.language == "dockerfile"
+                && node.id.file == PathBuf::from("Dockerfile")
+                && node.id.name == "builder"
+        }));
+
+        let fixture_server =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp_capability_server.py");
+        let enricher = crate::extract::lsp::LspEnricher::new(
+            "dockerfile",
+            "python3",
+            &[
+                fixture_server.to_str().expect("UTF-8 fixture path"),
+                "dockerfile_features",
+            ],
+            &["<none>"],
+        );
+        let result = enricher
+            .enrich(&nodes, &GraphIndex::new(), repo.path())
+            .await
+            .expect("mock Dockerfile enrichment succeeds");
+        assert!(!result.aborted, "mock enrichment aborted: {result:?}");
+        let validation = result
+            .lsp_validation
+            .as_ref()
+            .expect("mock retains Dockerfile readiness evidence");
+        assert_eq!(validation.language, "dockerfile");
+        let negotiated = validation
+            .negotiated_capabilities
+            .expect("Dockerfile fixture retains negotiated capabilities");
+        assert!(negotiated.document_symbol_provider);
+        assert!(negotiated.document_link_provider);
+        assert!(negotiated.definition_provider);
+        assert!(!negotiated.references_provider);
+        assert!(!negotiated.call_hierarchy_provider);
+        assert_eq!(validation.symbol_count, Some(2));
+        assert_eq!(validation.document_symbols.len(), 2);
+        assert!(
+            validation
+                .document_symbols
+                .iter()
+                .all(|symbol| symbol.file.as_deref() == Some("Dockerfile")
+                    && symbol.graph_result_id.is_some())
+        );
+
+        let records = crate::extract::lsp::work_items::load_records_since(repo.path(), 0).unwrap();
+        let file_records = records
+            .iter()
+            .filter(|record| record.file == "Dockerfile")
+            .collect::<Vec<_>>();
+        let symbol_record = file_records
+            .iter()
+            .find(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .any(|operation| operation == "document_symbols")
+            })
+            .expect("Dockerfile document-symbol request is durable");
+        assert_eq!(symbol_record.state, LspWorkItemState::Completed);
+        assert_eq!(symbol_record.observed_result_count, 2);
+        assert_eq!(symbol_record.output_nodes.len(), 2);
+        let operation_records = file_records
+            .iter()
+            .flat_map(|record| {
+                record
+                    .requested_operations
+                    .iter()
+                    .map(move |operation| (operation.as_str(), *record))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            operation_records.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["document_links", "document_symbols"])
+        );
+        let document_links = operation_records["document_links"];
+        assert_eq!(document_links.state, LspWorkItemState::Completed);
+        assert_eq!(document_links.observed_result_count, 0);
+        assert!(document_links.output_nodes.is_empty());
+        assert!(document_links.output_edges.is_empty());
+        assert!(
+            file_records
+                .iter()
+                .all(|record| record.state == LspWorkItemState::Completed
+                    && record.last_error.is_none())
+        );
+
+        let jobs = vec![completed_job(vec![validation.clone()])];
+        let status = terminal_status_for_file(
+            "Dockerfile",
+            &file_records,
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &[validation],
+        );
+        let (capabilities, requests) = evidence_from_work_items(&file_records, &[], &[validation]);
+        for record in &file_records {
+            for operation in &record.requested_operations {
+                let method = lsp_method(operation);
+                assert!(requests.iter().any(|request| {
+                    request.method == method
+                        && request.outcome == RequestOutcome::Completed
+                        && request.result_count == Some(record.observed_result_count)
+                }));
+            }
+        }
+        assert!(requests.iter().any(|request| {
+            request.method == "textDocument/documentLink"
+                && request.outcome == RequestOutcome::Completed
+                && request.result_count == Some(0)
+        }));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method == "textDocument/references")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method == "textDocument/definition")
+        );
+        let (expected, expected_ids) =
+            expected_evidence_from_work_items(&file_records, &[validation], "Dockerfile");
+        let mut file = included("Dockerfile", status);
+        file.role = FileRole::Config;
+        file.advertised_capabilities = capabilities;
+        file.requests_attempted = requests;
+        file.expected_results = expected;
+        file.expected_result_ids = expected_ids;
+        file.persisted_results =
+            persisted_results_for_path("Dockerfile", &result.new_nodes, &result.added_edges);
+        assert!(report(vec![file.clone()]).is_ready());
+
+        let mut missing_required_request = file.clone();
+        missing_required_request
+            .requests_attempted
+            .retain(|request| request.method != "textDocument/documentSymbol");
+        assert!(
+            !report(vec![missing_required_request]).is_ready(),
+            "missing required Dockerfile document-symbol request evidence must block readiness"
+        );
+
+        let zero_work = included(
+            "Dockerfile",
+            FileTerminalStatus::NeverProcessed {
+                detail: "zero Dockerfile LSP operations were executed".to_string(),
+            },
+        );
+        assert!(!report(vec![zero_work]).is_ready());
+
+        let mut failed_record = (*symbol_record).clone();
+        failed_record.state = LspWorkItemState::Failed;
+        failed_record.last_error = Some("fixture failure".to_string());
+        let failed_status = terminal_status_for_file(
+            "Dockerfile",
+            &[&failed_record],
+            &[],
+            true,
+            &server(),
+            &jobs,
+            &[validation],
+        );
+        assert!(matches!(failed_status, FileTerminalStatus::Degraded { .. }));
+
+        file.persisted_results = PersistedResults::default();
+        assert!(
+            !report(vec![file]).is_ready(),
+            "discarded Dockerfile document symbols must block readiness"
         );
     }
 

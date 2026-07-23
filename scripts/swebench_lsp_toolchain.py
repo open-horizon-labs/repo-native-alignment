@@ -3150,7 +3150,7 @@ def language_for_path(path: str, prefix: bytes, role: str) -> str:
     components = [component.lower() for component in pure.parts]
 
     if filename == "dockerfile" or filename.startswith("dockerfile."):
-        return "config"
+        return "dockerfile"
     if extension == "sample":
         if filename == "code.sample":
             return "python"

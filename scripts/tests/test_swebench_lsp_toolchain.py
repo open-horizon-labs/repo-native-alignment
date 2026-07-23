@@ -26,7 +26,7 @@ SPEC.loader.exec_module(TOOLCHAIN)
 
 
 class SwebenchLspToolchainTests(unittest.TestCase):
-    def test_dockerfile_variants_share_config_inventory_partition(self) -> None:
+    def test_dockerfile_variants_share_dockerfile_inventory_partition(self) -> None:
         for path in (
             "Dockerfile",
             "Dockerfile.prod",
@@ -44,7 +44,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
                     TOOLCHAIN.language_for_path(
                         path, b"FROM python:3.13\n", role
                     ),
-                    "config",
+                    "dockerfile",
                 )
         role, _, _ = TOOLCHAIN.classify_path(
             "doc/NotDockerfile.htmldoc", b"FROM python:3.13\n"
@@ -737,6 +737,32 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertEqual(
             python_server["executable_sha256"],
             "d471718bb618c4e6e7c30549da6efdd8eca8abea138dc1dec1524564bc4da396",
+        )
+        dockerfile_server = next(
+            server
+            for server in lock["servers"]
+            if server["languages"] == ["dockerfile"]
+        )
+        self.assertEqual(dockerfile_server["name"], "dockerfile-language-server-nodejs")
+        self.assertEqual(dockerfile_server["version"], "0.15.0")
+        self.assertEqual(dockerfile_server["command"], "docker-langserver")
+        self.assertEqual(dockerfile_server["args"], ["--stdio"])
+        self.assertEqual(
+            dockerfile_server["artifact_sha256"],
+            "22b2ec0e19d69d529da3d990aac60b1a16071e5975c08e15d17ead5e4cdd39c9",
+        )
+        self.assertEqual(
+            dockerfile_server["executable_sha256"],
+            "55799b249a79f6c2ada3707503fe6f28c1b828ab820998428b1b06d29527cfab",
+        )
+        node_package = TOOLCHAIN.load_json_object(
+            ROOT
+            / "benchmark/swebench-act-context/lsp-toolchain/acquisition/node/package.json",
+            "node LSP bundle package",
+        )
+        self.assertEqual(
+            node_package["dependencies"]["dockerfile-language-server-nodejs"],
+            "0.15.0",
         )
         result = TOOLCHAIN.verify_lock(
             ROOT / "benchmark/swebench-act-context/lsp-toolchain/toolchain-lock.json",
