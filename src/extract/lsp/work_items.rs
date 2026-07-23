@@ -285,6 +285,10 @@ impl LspWorkItemLedger {
             .iter()
             .map(|seed| (seed.node.stable_id(), seed.requested_operations.clone()))
             .collect::<BTreeSet<_>>();
+        let current_node_ids = seeds
+            .iter()
+            .map(|seed| seed.node.stable_id())
+            .collect::<BTreeSet<_>>();
         let mut prior_by_key = prior_records
             .into_iter()
             .map(|record| {
@@ -398,9 +402,18 @@ impl LspWorkItemLedger {
             !current_item_keys
                 .contains(&(record.node_id.clone(), record.requested_operations.clone()))
         });
-        for (next_item_id, mut record) in (seeds.len()..).zip(remaining_records) {
+        let mut next_item_id = seeds.len();
+        for mut record in remaining_records {
+            if current_node_ids.contains(&record.node_id) {
+                // The graph input still exists, but this exact operation is no
+                // longer in the current capability-aware plan. Retire the old
+                // operation instead of converting it into required work.
+                continue;
+            }
             record.schema_version = STORE_SCHEMA_VERSION;
-            record.item_id = next_item_id;
+            let item_id = next_item_id;
+            next_item_id += 1;
+            record.item_id = item_id;
             record.state = LspWorkItemState::Skipped;
             record.recovery = LspWorkItemRecovery::CarriedSkipped;
             record.last_phase = record.current_phase.take().or(record.last_phase.take());
@@ -411,7 +424,7 @@ impl LspWorkItemLedger {
             record.last_error = Some(UNMATCHED_REQUIRED_WORK_ERROR.to_string());
             store
                 .records
-                .insert(record_key(&job_id, next_item_id), record);
+                .insert(record_key(&job_id, item_id), record);
         }
 
         let ledger = Arc::new(Self {
@@ -1505,6 +1518,59 @@ mod tests {
                 .unwrap()
                 .contains("no longer present")
         );
+        assert_eq!(
+            store.records.get("removed-work-job:1").map(|record| record.item_id),
+            Some(1),
+            "carried audit records must keep their persisted key and item ID aligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_removed_from_current_node_is_retired_not_failed() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut fixture_seeds = seeds(1);
+        let node = fixture_seeds.remove(0).node;
+        let initial = vec![
+            LspWorkItemSeed {
+                item_id: 0,
+                node: node.clone(),
+                requested_operations: vec!["document_links".to_string()],
+                attempt_count: 1,
+            },
+            LspWorkItemSeed {
+                item_id: 1,
+                node: node.clone(),
+                requested_operations: vec!["references".to_string()],
+                attempt_count: 1,
+            },
+        ];
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-operation-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.mark_phase(1, "requesting_references").await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let current = [LspWorkItemSeed {
+            item_id: 0,
+            node,
+            requested_operations: vec!["references".to_string()],
+            attempt_count: 1,
+        }];
+        let resumed = LspWorkItemLedger::begin(repo.path(), &current)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.job_id(), "changed-operation-job");
+        assert!(resumed.should_run(0));
+        assert_eq!(resumed.unmatched_required_count(), 0);
+        let records = load_all_records(repo.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].requested_operations, ["references"]);
     }
 
     #[tokio::test]
