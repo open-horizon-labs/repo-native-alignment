@@ -3392,7 +3392,7 @@ mod tests {
             language: Some("python".to_string()),
             expected_server: Some(server()),
             advertised_capabilities: vec![AdvertisedCapability {
-                name: "textDocument/references".to_string(),
+                name: "referencesProvider".to_string(),
                 supported: true,
             }],
             requests_attempted: vec![RequestAttempt {
@@ -3903,6 +3903,11 @@ mod tests {
             "src/a.py",
             FileTerminalStatus::Processed { result_count: 1 },
         );
+        file.advertised_capabilities = vec![AdvertisedCapability {
+            name: "callHierarchyProvider".to_string(),
+            supported: true,
+        }];
+        file.requests_attempted = evidence_from_work_items(&records, &[], &[]).1;
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&records, &[], "src/a.py");
 
@@ -3978,6 +3983,11 @@ mod tests {
             "src/a.py",
             FileTerminalStatus::Processed { result_count: 1 },
         );
+        file.advertised_capabilities = vec![AdvertisedCapability {
+            name: "callHierarchyProvider".to_string(),
+            supported: true,
+        }];
+        file.requests_attempted = evidence_from_work_items(&records, &[], &[]).1;
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&records, &[], "src/a.py");
 
@@ -4473,6 +4483,8 @@ mod tests {
             FileTerminalStatus::Processed { result_count: 1 },
         );
         file.role = FileRole::Docs;
+        (file.advertised_capabilities, file.requests_attempted) =
+            evidence_from_work_items(&[], &[], &[&validation]);
         (file.expected_results, file.expected_result_ids) =
             expected_evidence_from_work_items(&[], &[&validation], "docs/guide.md");
         file.persisted_results = persisted_results_for_path("docs/guide.md", &[], &[]);
