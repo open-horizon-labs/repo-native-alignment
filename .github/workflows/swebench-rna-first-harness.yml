@@ -6,11 +6,13 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "benchmark/swebench-rna-first/issue827/**"
+      - "benchmark/swebench-rna-first/issue830/**"
       - ".github/workflows/swebench-rna-first-harness.yml"
   push:
     branches: [main]
     paths:
       - "benchmark/swebench-rna-first/issue827/**"
+      - "benchmark/swebench-rna-first/issue830/**"
       - ".github/workflows/swebench-rna-first-harness.yml"
   workflow_dispatch:
 
@@ -34,3 +36,7 @@ jobs:
             -p 'test_*.py' \
             -v
           python3 benchmark/swebench-rna-first/issue827/test_evaluator_tools.py
+          python3 -m unittest discover \
+            -s benchmark/swebench-rna-first/issue830/tests \
+            -p 'test_*.py' \
+            -v
