@@ -188,6 +188,115 @@ class TrustedRnaWriteScopeTests(unittest.TestCase):
                     )
 
 
+class TrustedGitBindingTests(unittest.TestCase):
+    def test_binding_preserves_canonical_environment_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            git_binary = root / "git"
+            git_binary.write_bytes(b"fixture git")
+            environment = {
+                "PATH": "/registered/path/without/git",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "RNA_UNRELATED": "unchanged",
+            }
+            before = canonical(environment)
+            config: dict[str, object] = {"trusted_rna_env": {"stale": "value"}}
+            run_selector.bind_trusted_rna_git(
+                config,
+                git_binary=git_binary,
+                git_binary_sha256=sha(git_binary.read_bytes()),
+                canonical_environment=environment,
+            )
+            self.assertEqual(canonical(environment), before)
+            self.assertEqual(canonical(config["trusted_rna_env"]), before)
+            self.assertEqual(
+                config["trusted_rna_env"]["PATH"],
+                "/registered/path/without/git",
+            )
+            self.assertEqual(config["git_binary"], str(git_binary))
+            self.assertEqual(
+                config["git_binary_sha256"], sha(git_binary.read_bytes())
+            )
+
+    def test_binding_rejects_relative_symlink_or_digest_mismatch(self) -> None:
+        environment = {
+            "PATH": "/registered/path/without/git",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            git_binary = root / "git"
+            git_binary.write_bytes(b"fixture git")
+            link = root / "git-link"
+            link.symlink_to(git_binary)
+            for label, path, digest in (
+                ("relative", Path("git"), sha(git_binary.read_bytes())),
+                ("symlink", link, sha(git_binary.read_bytes())),
+                ("digest", git_binary, "0" * 64),
+            ):
+                with self.subTest(label=label), self.assertRaises(
+                    run_selector.FailClosed
+                ):
+                    run_selector.bind_trusted_rna_git(
+                        {},
+                        git_binary=path,
+                        git_binary_sha256=digest,
+                        canonical_environment=environment,
+                    )
+
+    def test_offline_verifier_rejects_git_binding_mismatch(self) -> None:
+        registered = {
+            "isolation_runtime": {
+                "git_binary_sha256": run_selector.TRUSTED_GIT_BINARY_SHA256,
+            }
+        }
+        host_ref = {
+            "path": str(run_selector.TRUSTED_GIT_BINARY),
+            "bytes": 1,
+            "sha256": run_selector.TRUSTED_GIT_BINARY_SHA256,
+        }
+        manifest = {"isolation": {"git_binary": host_ref}}
+        config = {
+            "git_binary": str(run_selector.TRUSTED_GIT_BINARY),
+            "git_binary_sha256": run_selector.TRUSTED_GIT_BINARY_SHA256,
+            "trusted_rna_env": {
+                "PATH": "/registered/path/without/git",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+            "trusted_rna_read_roots": [
+                str(run_selector.TRUSTED_GIT_BINARY),
+                "/dev/null",
+            ],
+            "trusted_rna_write_roots": ["/dev/null"],
+        }
+        with mock.patch.object(
+            verify_selector,
+            "check_ref",
+            return_value=(run_selector.TRUSTED_GIT_BINARY, b""),
+        ):
+            errors: list[str] = []
+            verify_selector.validate_trusted_git_binding(
+                manifest, registered, config, errors
+            )
+            self.assertEqual(errors, [])
+
+            mismatched = dict(config)
+            mismatched["git_binary_sha256"] = "0" * 64
+            errors = []
+            verify_selector.validate_trusted_git_binding(
+                manifest, registered, mismatched, errors
+            )
+            self.assertIn(
+                "supervisor_git_binary_not_registration_bound", errors
+            )
+
+
 class WrapperFixture:
     def __init__(self, root: Path):
         self.root = root
@@ -277,6 +386,10 @@ else:
         self.launcher.chmod(0o755)
         self.binary = root / "rna-binary"
         self.binary.write_bytes(b"binary")
+        git_binary = shutil.which("git")
+        if git_binary is None:
+            raise RuntimeError("test requires Git")
+        self.git_binary = Path(git_binary).resolve(strict=True)
         self.environment = root / "canonical-environment.json"
         self.environment.write_bytes(canonical({"PATH": "/usr/bin:/bin"}))
         self.cache_archive = root / "cache.tar"
@@ -381,6 +494,8 @@ else:
             "expected_canonical_environment_sha256": sha(
                 self.environment.read_bytes()
             ),
+            "git_binary": str(self.git_binary),
+            "git_binary_sha256": sha(self.git_binary.read_bytes()),
             "expected_query_sha256": sha(b"Bug title"),
             "result_limit": 10,
         }
@@ -919,6 +1034,8 @@ class RunnerAndVerifierTests(unittest.TestCase):
             "sandbox_exec": str(Path(sys.executable).resolve()),
             "trusted_rna_seatbelt_profile": str(profile),
             "gateway_python": str(Path(sys.executable).resolve()),
+            "git_binary": str(Path(sys.executable).resolve()),
+            "git_binary_sha256": sha(Path(sys.executable).read_bytes()),
             "checkout": str(root),
             "trusted_rna_env": {
                 "PATH": "/usr/bin:/bin",
@@ -1191,6 +1308,8 @@ class RunnerAndVerifierTests(unittest.TestCase):
                 "sandbox_exec": str(Path(sys.executable).resolve()),
                 "trusted_rna_seatbelt_profile": str(profile),
                 "gateway_python": str(Path(sys.executable).resolve()),
+                "git_binary": str(Path(sys.executable).resolve()),
+                "git_binary_sha256": sha(Path(sys.executable).read_bytes()),
                 "checkout": str(root),
                 "trusted_rna_env": {
                     "PATH": "/usr/bin:/bin",

@@ -157,16 +157,63 @@ def cache_inventory_sha256(cache: Path) -> str:
     )
 
 
-def git(repo: Path, *args: str) -> str:
+def _verified_git(config: Mapping[str, Any]) -> tuple[Path, str, int]:
+    """Revalidate the configured nonsymlink Git executable before each use."""
+
+    path = _absolute_path(config.get("git_binary"), "git_binary")
+    expected_sha = _require_hex(
+        config.get("git_binary_sha256"), "git_binary_sha256"
+    )
+    try:
+        observed_sha, observed_size = sha_file(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError("git_binary_identity") from exc
+    if observed_sha != expected_sha:
+        raise ValueError("git_binary_digest")
+    return path, observed_sha, observed_size
+
+
+def git_bytes(
+    repo: Path,
+    config: Mapping[str, Any],
+    *args: str,
+) -> bytes:
+    git_binary, _, _ = _verified_git(config)
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [str(git_binary), "-C", str(repo), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
     if result.returncode != 0:
         raise ValueError(f"git_{'_'.join(args)}")
-    return result.stdout.decode("utf-8", errors="strict").strip()
+    return result.stdout
+
+
+def git(repo: Path, config: Mapping[str, Any], *args: str) -> str:
+    return git_bytes(repo, config, *args).decode(
+        "utf-8", errors="strict"
+    ).strip()
+
+
+def checkout_untracked_material(
+    repo: Path,
+    config: Mapping[str, Any],
+    *,
+    ignored: bool,
+) -> tuple[bytes, ...]:
+    args = ["ls-files", "--others"]
+    if ignored:
+        args.append("--ignored")
+    args.extend(["--exclude-standard", "-z"])
+    output = git_bytes(repo, config, *args)
+    if output and not output.endswith(b"\0"):
+        raise ValueError("live_untracked_inventory_not_nul_terminated")
+    return tuple(item for item in output.split(b"\0") if item)
+
+
+def is_cache_material(path: bytes) -> bool:
+    return path.startswith(b".oh/.cache/")
 
 
 def canonical_repository_slug(value: object) -> str:
@@ -380,15 +427,39 @@ class LiveIdentityVerifier:
         ):
             raise ValueError("canonical_environment_tampered")
 
-        observed_head = git(repo, "rev-parse", "HEAD")
+        observed_head = git(repo, self.config, "rev-parse", "HEAD")
         if observed_head != self.config.get("expected_base_commit"):
             raise ValueError("live_HEAD")
-        observed_tree = git(repo, "rev-parse", "HEAD^{tree}")
+        observed_tree = git(repo, self.config, "rev-parse", "HEAD^{tree}")
         if observed_tree != self.config.get("expected_base_tree"):
             raise ValueError("live_tree")
-        if git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
+        if git(
+            repo,
+            self.config,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ):
             raise ValueError("live_checkout_not_pristine")
-        origins = git(repo, "remote", "get-url", "--all", "origin").splitlines()
+        untracked = checkout_untracked_material(
+            repo, self.config, ignored=False
+        )
+        ignored = checkout_untracked_material(
+            repo, self.config, ignored=True
+        )
+        if any(
+            not is_cache_material(path)
+            for path in (*untracked, *ignored)
+        ):
+            raise ValueError("live_checkout_material_outside_cache")
+        origins = git(
+            repo,
+            self.config,
+            "remote",
+            "get-url",
+            "--all",
+            "origin",
+        ).splitlines()
         if len(origins) != 1:
             raise ValueError("live_repository_origin_count")
         live_repository = canonical_github_origin(origins[0])
@@ -400,6 +471,9 @@ class LiveIdentityVerifier:
 
         launcher_sha, launcher_bytes = sha_file(launcher)
         binary_sha, binary_bytes = sha_file(binary)
+        git_binary, git_binary_sha, git_binary_bytes = _verified_git(
+            self.config
+        )
         if launcher_sha != self.config.get("expected_launcher_sha256"):
             raise ValueError("launcher_tampered")
         if binary_sha != self.config.get("expected_binary_sha256"):
@@ -485,6 +559,10 @@ class LiveIdentityVerifier:
             "launcher_bytes": launcher_bytes,
             "binary_sha256": binary_sha,
             "binary_bytes": binary_bytes,
+            "git_binary_path": str(git_binary),
+            "git_binary_sha256": git_binary_sha,
+            "git_binary_bytes": git_binary_bytes,
+            "git_config_global_write_target": "/dev/null",
             "canonical_environment_sha256": identity_environment_sha,
         }
         receipt["live_state_sha256"] = sha(

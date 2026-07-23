@@ -120,6 +120,10 @@ class RegistrationContractTests(unittest.TestCase):
         registration = dict(self.registration)
         registration["isolation_runtime"] = runtime_registration
         fixed = run_selector._fixed_isolation_registration(registration)
+        self.assertEqual(
+            fixed["git_binary_sha256"],
+            run_selector.TRUSTED_GIT_BINARY_SHA256,
+        )
         self.assertIn("/opt", fixed["trace_allowed_path_prefixes"])
         self.assertIn("/var/run", fixed["trace_allowed_path_prefixes"])
         self.assertIn(

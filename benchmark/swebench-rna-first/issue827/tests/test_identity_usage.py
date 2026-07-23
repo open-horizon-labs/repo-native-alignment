@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parents[1]
@@ -84,6 +87,10 @@ class IdentityFixture:
             check=True,
         ).stdout.decode().strip()
         self.inventory = live_identity.cache_inventory_sha256(self.cache)
+        git_binary = shutil.which("git")
+        if git_binary is None:
+            raise RuntimeError("test requires Git")
+        self.git_binary = Path(git_binary).resolve(strict=True)
 
         self.launcher = root / "launcher"
         self.launcher.write_bytes(b"launcher")
@@ -178,6 +185,8 @@ class IdentityFixture:
             "expected_canonical_environment_sha256": sha(
                 self.environment.read_bytes()
             ),
+            "git_binary": str(self.git_binary),
+            "git_binary_sha256": sha(self.git_binary.read_bytes()),
         }
 
     def verifier(self) -> live_identity.LiveIdentityVerifier:
@@ -256,6 +265,84 @@ class LiveIdentityTests(unittest.TestCase):
                 before["readiness_report_digest"], "a" * 64
             )
             self.assertEqual(before["cache_archive_sha256"], sha(b"archive"))
+            self.assertEqual(
+                before["git_binary_sha256"],
+                sha(fixture.git_binary.read_bytes()),
+            )
+
+    def test_absolute_pinned_git_works_when_path_has_no_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = IdentityFixture(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": str(Path(tmp) / "path-without-git")},
+                clear=False,
+            ):
+                receipt = fixture.verifier().verify("query:before")
+            self.assertEqual(
+                receipt["git_binary_path"], str(fixture.git_binary)
+            )
+
+    def test_git_identity_missing_relative_symlink_or_digest_drift_fails_closed(
+        self,
+    ):
+        def missing(fixture: IdentityFixture) -> None:
+            fixture.config.pop("git_binary")
+
+        def relative(fixture: IdentityFixture) -> None:
+            fixture.config["git_binary"] = "git"
+
+        def symlink(fixture: IdentityFixture) -> None:
+            link = fixture.root / "git-link"
+            link.symlink_to(fixture.git_binary)
+            fixture.config["git_binary"] = str(link)
+
+        def digest(fixture: IdentityFixture) -> None:
+            fixture.config["git_binary_sha256"] = "0" * 64
+
+        def replaced(fixture: IdentityFixture) -> None:
+            copied = fixture.root / "git-copy"
+            shutil.copyfile(fixture.git_binary, copied)
+            fixture.config["git_binary"] = str(copied)
+            fixture.config["git_binary_sha256"] = sha(copied.read_bytes())
+            copied.write_bytes(copied.read_bytes() + b"replaced")
+
+        for label, mutate in {
+            "missing": missing,
+            "relative": relative,
+            "symlink": symlink,
+            "digest": digest,
+            "replaced": replaced,
+        }.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                fixture = IdentityFixture(Path(tmp))
+                mutate(fixture)
+                with self.assertRaises(live_identity.LiveIdentityError):
+                    fixture.verifier().verify(f"{label}:before")
+                self.assertTrue(
+                    json.loads(fixture.state.read_bytes())["fatal"]
+                )
+
+    def test_untracked_or_ignored_material_outside_cache_fails_closed(self):
+        def untracked(fixture: IdentityFixture) -> None:
+            (fixture.repo / "outside.tmp").write_bytes(b"outside")
+
+        def ignored(fixture: IdentityFixture) -> None:
+            (fixture.repo / ".git/info/exclude").write_text("outside.tmp\n")
+            (fixture.repo / "outside.tmp").write_bytes(b"outside")
+
+        for label, mutate in {
+            "untracked": untracked,
+            "ignored": ignored,
+        }.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                fixture = IdentityFixture(Path(tmp))
+                mutate(fixture)
+                with self.assertRaisesRegex(
+                    live_identity.LiveIdentityError,
+                    "live_checkout_material_outside_cache",
+                ):
+                    fixture.verifier().verify(f"{label}:before")
 
     def test_cache_drift_is_fatal_even_after_bytes_are_restored(self):
         with tempfile.TemporaryDirectory() as tmp:

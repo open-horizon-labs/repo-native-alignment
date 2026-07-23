@@ -472,6 +472,25 @@ def _run_trusted_rna(
         )
     ):
         raise IsolationViolation("trusted_rna_declared_roots_invalid")
+    git_value = config.get("git_binary")
+    git_sha256 = config.get("git_binary_sha256")
+    if not isinstance(git_value, str) or not Path(git_value).is_absolute():
+        raise IsolationViolation("trusted_rna_git_identity_mismatch")
+    git_binary = Path(git_value)
+    try:
+        git_metadata = os.lstat(git_binary)
+    except OSError as exc:
+        raise IsolationViolation("trusted_rna_git_identity_mismatch") from exc
+    if (
+        not stat.S_ISREG(git_metadata.st_mode)
+        or stat.S_ISLNK(git_metadata.st_mode)
+        or not isinstance(git_sha256, str)
+        or sha256_file(git_binary) != git_sha256
+        or str(git_binary) not in read_roots
+        or "/dev/null" not in read_roots
+        or "/dev/null" not in write_roots
+    ):
+        raise IsolationViolation("trusted_rna_git_identity_mismatch")
     environment_value = config.get("trusted_rna_environment")
     environment_sha256 = config.get("trusted_rna_environment_sha256")
     if not isinstance(environment_value, str):
@@ -486,6 +505,13 @@ def _run_trusted_rna(
         or str(environment) not in read_roots
     ):
         raise IsolationViolation("trusted_rna_environment_identity_mismatch")
+    trusted_environment = _fixed_host_env(config, "trusted_rna_env")
+    if (
+        trusted_environment.get("GIT_CONFIG_GLOBAL") != "/dev/null"
+        or trusted_environment.get("GIT_CONFIG_NOSYSTEM") != "1"
+        or trusted_environment.get("GIT_TERMINAL_PROMPT") != "0"
+    ):
+        raise IsolationViolation("trusted_rna_git_environment_mismatch")
     # The trusted wrappers are pinned Python programs.  Invoke them through the
     # already-bound gateway interpreter instead of relying on /usr/bin/env and
     # the provider parent's PATH.  The exact inner Seatbelt profile removes the
@@ -501,7 +527,7 @@ def _run_trusted_rna(
     result = subprocess.run(
         argv,
         cwd=str(config["checkout"]),
-        env=_fixed_host_env(config, "trusted_rna_env"),
+        env=trusted_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -526,6 +552,12 @@ def _run_trusted_rna(
             "bytes": environment.stat().st_size,
             "sha256": environment_sha256,
         },
+        "git_binary": {
+            "path": str(git_binary),
+            "bytes": git_metadata.st_size,
+            "sha256": git_sha256,
+        },
+        "git_config_global_write_target": "/dev/null",
         "network_inbound": "denied",
         "network_outbound": "denied",
         "read_roots": list(read_roots),

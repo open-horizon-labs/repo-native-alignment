@@ -42,6 +42,58 @@ def load_ref_json(ref: Any, label: str, errors: list[str]) -> tuple[Path | None,
         return path, None
 
 
+def validate_trusted_git_binding(
+    manifest: Mapping[str, Any],
+    registration: Mapping[str, Any],
+    supervisor_config: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    """Verify the registered host Git and its minimal inner write authority."""
+
+    registered = registration.get("isolation_runtime")
+    host = manifest.get("isolation")
+    if not isinstance(registered, dict) or not isinstance(host, dict):
+        errors.append("trusted_git_registration_or_host_invalid")
+        return
+    expected_path = str(runner.TRUSTED_GIT_BINARY)
+    expected_sha = registered.get("git_binary_sha256")
+    if (
+        expected_sha != runner.TRUSTED_GIT_BINARY_SHA256
+    ):
+        errors.append("trusted_git_registration_mismatch")
+    host_ref = host.get("git_binary")
+    check_ref(host_ref, "manifest_git_binary", errors)
+    if (
+        not isinstance(host_ref, dict)
+        or host_ref.get("path") != expected_path
+        or host_ref.get("sha256") != expected_sha
+    ):
+        errors.append("manifest_git_binary_not_registration_bound")
+    if (
+        supervisor_config.get("git_binary") != expected_path
+        or supervisor_config.get("git_binary_sha256") != expected_sha
+    ):
+        errors.append("supervisor_git_binary_not_registration_bound")
+    trusted_environment = supervisor_config.get("trusted_rna_env")
+    if (
+        not isinstance(trusted_environment, dict)
+        or trusted_environment.get("GIT_CONFIG_GLOBAL") != "/dev/null"
+        or trusted_environment.get("GIT_CONFIG_NOSYSTEM") != "1"
+        or trusted_environment.get("GIT_TERMINAL_PROMPT") != "0"
+    ):
+        errors.append("trusted_git_environment_mismatch")
+    read_roots = supervisor_config.get("trusted_rna_read_roots")
+    write_roots = supervisor_config.get("trusted_rna_write_roots")
+    if (
+        not isinstance(read_roots, list)
+        or expected_path not in read_roots
+        or "/dev/null" not in read_roots
+        or not isinstance(write_roots, list)
+        or "/dev/null" not in write_roots
+    ):
+        errors.append("trusted_git_confinement_mismatch")
+
+
 def selected_case(manifest: Mapping[str, Any], case_id: str, rank: int, errors: list[str]) -> Mapping[str, Any] | None:
     matches = [case for case in manifest.get("cases", []) if case.get("instance_id") == case_id and case.get("rank") == rank]
     if len(matches) != 1:
@@ -733,6 +785,13 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                             errors.append("manifest_docker_host_not_config_bound")
                         if host.get("docker_server") != loaded_config.get("docker_server"):
                             errors.append("manifest_docker_server_not_config_bound")
+                    if isinstance(registration, dict):
+                        validate_trusted_git_binding(
+                            manifest,
+                            registration,
+                            loaded_config,
+                            errors,
+                        )
                 if isinstance(case, dict):
                     worker = case.get("isolation_worker")
                     if not isinstance(worker, dict):
@@ -921,6 +980,10 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                         "trusted_rna_environment_sha256"
                     ),
                 ),
+                "git_binary": (
+                    supervisor_config.get("git_binary"),
+                    supervisor_config.get("git_binary_sha256"),
+                ),
             }
             for key, (expected_path, expected_sha) in expected_refs.items():
                 ref = confinement.get(key)
@@ -942,6 +1005,8 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                 != supervisor_config.get("trusted_rna_read_roots")
                 or confinement.get("write_roots")
                 != supervisor_config.get("trusted_rna_write_roots")
+                or confinement.get("git_config_global_write_target")
+                != "/dev/null"
                 or confinement.get("process_environment_sha256")
                 != runner.sha_bytes(
                     runner.canonical(

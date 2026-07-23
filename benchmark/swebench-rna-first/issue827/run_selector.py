@@ -47,6 +47,13 @@ WORKER_PREFLIGHT_SCHEMA = "issue827-worker-preflight-v1"
 WORKER_SELF_TEST_SCHEMA = "issue827-worker-self-test-v1"
 EMPTY_MCP_BYTES = b'{"mcpServers":{}}\n'
 READY_SENTINEL = "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
+TRUSTED_GIT_BINARY = Path(
+    "/Library/Developer/CommandLineTools/usr/bin/git"
+)
+TRUSTED_GIT_BINARY_SHA256 = (
+    "be4afb2b003904725826250de9fb76567bbacf82323457b5a1ec26706b66bcae"
+)
+TRUSTED_GIT_CONFIG_WRITE_TARGET = Path("/dev/null")
 SOURCE = Path(__file__).resolve().parent
 CODE_KINDS = {
     "class", "const", "enum", "function", "interface", "method", "module",
@@ -513,6 +520,7 @@ def _fixed_isolation_registration(registration: Mapping[str, Any]) -> dict[str, 
     required = {
         "schema_version",
         "gateway_python_sha256",
+        "git_binary_sha256",
         "docker_binary_sha256",
         "docker_server",
         "sandbox_exec_sha256",
@@ -538,12 +546,17 @@ def _fixed_isolation_registration(registration: Mapping[str, Any]) -> dict[str, 
     require(value["schema_version"] == ISOLATION_REGISTRATION_SCHEMA, "isolation registration schema mismatch")
     for key in (
         "gateway_python_sha256",
+        "git_binary_sha256",
         "docker_binary_sha256",
         "sandbox_exec_sha256",
         "worker_entrypoint_sha256",
         "strace_artifact_sha256",
     ):
         require(isinstance(value[key], str) and re.fullmatch(r"[0-9a-f]{64}", value[key]) is not None, f"isolation {key} invalid")
+    require(
+        value["git_binary_sha256"] == TRUSTED_GIT_BINARY_SHA256,
+        "trusted RNA Git digest differs from the exact CommandLineTools binary",
+    )
     require(isinstance(value["worker_entrypoint"], str) and value["worker_entrypoint"].startswith("/"), "worker entrypoint invalid")
     require(isinstance(value["strace_path"], str) and value["strace_path"].startswith("/"), "strace path invalid")
     for key in ("worker_landlock_abi_min", "worker_uid", "worker_gid", "worker_pids_limit", "worker_memory_bytes", "gateway_tool_timeout_ms"):
@@ -602,6 +615,7 @@ def verify_isolation_host(
         {
             "schema_version",
             "gateway_python",
+            "git_binary",
             "docker_binary",
             "sandbox_exec",
             "docker_host",
@@ -618,6 +632,7 @@ def verify_isolation_host(
     paths: dict[str, Path] = {}
     for name, expected_key in (
         ("gateway_python", "gateway_python_sha256"),
+        ("git_binary", "git_binary_sha256"),
         ("docker_binary", "docker_binary_sha256"),
         ("sandbox_exec", "sandbox_exec_sha256"),
     ):
@@ -625,6 +640,10 @@ def verify_isolation_host(
         require(path.is_absolute() and path.is_file() and not path.is_symlink(), f"isolation {name} path invalid")
         require(value[name]["sha256"] == fixed[expected_key], f"isolation {name} not registration bound")
         paths[name] = path
+    require(
+        paths["git_binary"] == TRUSTED_GIT_BINARY,
+        "trusted RNA Git path not registration bound",
+    )
     verify_gateway_python_identity(paths["gateway_python"])
     require(
         paths["sandbox_exec"] == Path("/usr/bin/sandbox-exec"),
@@ -664,6 +683,7 @@ def verify_isolation_host(
         "schema_version": ISOLATION_HOST_SCHEMA,
         "fixed": fixed,
         "gateway_python": paths["gateway_python"],
+        "git_binary": paths["git_binary"],
         "docker_binary": paths["docker_binary"],
         "sandbox_exec": paths["sandbox_exec"],
         "docker_host": docker_host,
@@ -1328,6 +1348,42 @@ def validate_trusted_rna_write_scope(
         )
 
 
+def bind_trusted_rna_git(
+    config: dict[str, Any],
+    *,
+    git_binary: Path,
+    git_binary_sha256: str,
+    canonical_environment: Mapping[str, str],
+) -> None:
+    """Bind exact Git identity without changing the registered RNA environment."""
+
+    require(
+        git_binary.is_absolute()
+        and git_binary.is_file()
+        and not git_binary.is_symlink()
+        and sha_file(git_binary) == git_binary_sha256,
+        "trusted RNA Git identity mismatch",
+    )
+    require(
+        canonical_environment.get("GIT_CONFIG_GLOBAL")
+        == str(TRUSTED_GIT_CONFIG_WRITE_TARGET)
+        and canonical_environment.get("GIT_CONFIG_NOSYSTEM") == "1"
+        and canonical_environment.get("GIT_TERMINAL_PROMPT") == "0",
+        "trusted RNA canonical Git environment mismatch",
+    )
+    environment_bytes = canonical(dict(canonical_environment))
+    config["git_binary"] = str(git_binary)
+    config["git_binary_sha256"] = git_binary_sha256
+    config["trusted_rna_env"] = {
+        str(name): str(value)
+        for name, value in canonical_environment.items()
+    }
+    require(
+        canonical(config["trusted_rna_env"]) == environment_bytes,
+        "trusted RNA Git binding changed the canonical environment",
+    )
+
+
 def configure_episode(
     prepared: PreparedRun,
     case: PreparedCase,
@@ -1500,6 +1556,8 @@ def configure_episode(
         directories["trusted_rna_state"],
         identity_path,
         trusted_rna_environment,
+        prepared.isolation_host["git_binary"],
+        TRUSTED_GIT_CONFIG_WRITE_TARGET,
         *canonical_environment_roots,
     ]
     if macos_selector_root.is_dir():
@@ -1510,6 +1568,7 @@ def configure_episode(
         directories["rna_events"],
         directories["query_events"],
         directories["trusted_rna_state"],
+        TRUSTED_GIT_CONFIG_WRITE_TARGET,
     ]
     trusted_rna_read_roots = sorted(
         {path.resolve(strict=True) for path in trusted_rna_read_roots}
@@ -1528,6 +1587,7 @@ def configure_episode(
             treatment_lock_path,
             directories["rna_events"],
             directories["query_events"],
+            TRUSTED_GIT_CONFIG_WRITE_TARGET,
         ],
         unrelated_paths=[
             episode,
@@ -1619,6 +1679,8 @@ def configure_episode(
         "__DECLARED_TOOLCHAIN_ROOT__": str(prepared.isolation_host["declared_toolchain_root"]),
         "__PINNED_GATEWAY_PYTHON__": str(prepared.isolation_host["gateway_python"]),
         "__PINNED_GATEWAY_PYTHON_SHA256__": fixed["gateway_python_sha256"],
+        "__PINNED_GIT_BINARY__": str(prepared.isolation_host["git_binary"]),
+        "__PINNED_GIT_BINARY_SHA256__": fixed["git_binary_sha256"],
         "__PINNED_BASH_GATEWAY__": str(harness_paths["bash_gateway.py"]),
         "__PINNED_BASH_GATEWAY_SHA256__": sha_file(harness_paths["bash_gateway.py"]),
         "__PINNED_TRUSTED_RNA_BROKER__": str(
@@ -1703,10 +1765,12 @@ def configure_episode(
     config["trusted_rna_write_roots"] = [
         str(path) for path in trusted_rna_write_roots
     ]
-    config["trusted_rna_env"] = {
-        str(name): str(value)
-        for name, value in canonical_trusted_environment.items()
-    }
+    bind_trusted_rna_git(
+        config,
+        git_binary=prepared.isolation_host["git_binary"],
+        git_binary_sha256=fixed["git_binary_sha256"],
+        canonical_environment=canonical_trusted_environment,
+    )
     config["worker_entrypoint"] = fixed["worker_entrypoint"]
     config["strace_path"] = fixed["strace_path"]
     for key in (
@@ -1906,6 +1970,10 @@ def acquire_treatment(
             ),
             "canonical_environment": file_ref(
                 Path(str(config["trusted_rna_environment"]))
+            ),
+            "git_binary": file_ref(Path(str(config["git_binary"]))),
+            "git_config_global_write_target": str(
+                TRUSTED_GIT_CONFIG_WRITE_TARGET
             ),
             "process_environment_sha256": sha_bytes(
                 canonical(trusted_environment)
@@ -2704,6 +2772,21 @@ def isolation_compliance(
             if execution.get("canonical_environment") != expected_environment:
                 errors.append(
                     f"trusted_rna_environment_identity:{path.name}"
+                )
+            git_path = Path(str(config["git_binary"]))
+            expected_git = (
+                file_ref(git_path)
+                if git_path.is_file() and not git_path.is_symlink()
+                else None
+            )
+            if execution.get("git_binary") != expected_git:
+                errors.append(f"trusted_rna_git_identity:{path.name}")
+            if (
+                execution.get("git_config_global_write_target")
+                != str(TRUSTED_GIT_CONFIG_WRITE_TARGET)
+            ):
+                errors.append(
+                    f"trusted_rna_git_config_target:{path.name}"
                 )
             if (
                 execution.get("network_inbound") != "denied"

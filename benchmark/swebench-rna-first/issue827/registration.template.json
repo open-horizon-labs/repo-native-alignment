@@ -129,6 +129,7 @@
   "isolation_runtime": {
     "schema_version": "issue827-isolation-registration-v1",
     "gateway_python_sha256": "__GATEWAY_PYTHON_SHA256__",
+    "git_binary_sha256": "be4afb2b003904725826250de9fb76567bbacf82323457b5a1ec26706b66bcae",
     "docker_binary_sha256": "__DOCKER_BINARY_SHA256__",
     "docker_server": "29.1.3|29.1.3-0ubuntu3~24.04.2|linux|arm64",
     "sandbox_exec_sha256": "__SANDBOX_EXEC_SHA256__",

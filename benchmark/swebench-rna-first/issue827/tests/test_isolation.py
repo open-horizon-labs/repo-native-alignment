@@ -777,14 +777,21 @@ class RequestAndSettingsTests(unittest.TestCase):
             profile.write_text("(version 1)\n(allow default)\n")
             profile.chmod(0o444)
             environment = root / "canonical-environment.json"
-            trusted_env = {"PATH": "/usr/bin:/bin"}
-            environment.write_bytes(canonical(trusted_env))
             gateway_python = Path(sys.executable).resolve()
+            trusted_env = {
+                "PATH": "/registered/path/without/git",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            environment.write_bytes(canonical(trusted_env))
             command = f"{wrapper} --node foo.py:target:function --mode neighbors"
             config = {
                 "wrapper": str(wrapper),
                 "gateway_python": str(gateway_python),
                 "gateway_python_sha256": file_sha(gateway_python),
+                "git_binary": str(gateway_python),
+                "git_binary_sha256": file_sha(gateway_python),
                 "checkout": str(root),
                 "trusted_rna_env": trusted_env,
                 "trusted_rna_timeout_seconds": 5,
@@ -794,8 +801,13 @@ class RequestAndSettingsTests(unittest.TestCase):
                 "trusted_rna_seatbelt_profile_sha256": file_sha(profile),
                 "trusted_rna_environment": str(environment),
                 "trusted_rna_environment_sha256": file_sha(environment),
-                "trusted_rna_read_roots": [str(root), str(environment)],
-                "trusted_rna_write_roots": [str(root)],
+                "trusted_rna_read_roots": [
+                    str(root),
+                    str(environment),
+                    str(gateway_python),
+                    "/dev/null",
+                ],
+                "trusted_rna_write_roots": [str(root), "/dev/null"],
             }
             completed = subprocess.CompletedProcess([], 0, b"ok", b"")
             with mock.patch.object(
@@ -828,6 +840,25 @@ class RequestAndSettingsTests(unittest.TestCase):
             self.assertEqual(
                 evidence["canonical_environment"]["sha256"],
                 file_sha(environment),
+            )
+            self.assertEqual(
+                evidence["git_binary"]["sha256"],
+                file_sha(gateway_python),
+            )
+            self.assertEqual(
+                evidence["git_config_global_write_target"], "/dev/null"
+            )
+            missing_git_config_write = {
+                **config,
+                "trusted_rna_write_roots": [str(root)],
+            }
+            with self.assertRaises(IsolationViolation) as raised:
+                bash_gateway._run_trusted_rna(
+                    {"command": command}, missing_git_config_write
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "trusted_rna_git_identity_mismatch",
             )
 
     def test_request_is_single_use_and_canonical(self):

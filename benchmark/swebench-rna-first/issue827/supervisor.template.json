@@ -54,6 +54,8 @@
   ],
   "gateway_python": "__PINNED_GATEWAY_PYTHON__",
   "gateway_python_sha256": "__PINNED_GATEWAY_PYTHON_SHA256__",
+  "git_binary": "__PINNED_GIT_BINARY__",
+  "git_binary_sha256": "__PINNED_GIT_BINARY_SHA256__",
   "bash_gateway": "__PINNED_BASH_GATEWAY__",
   "bash_gateway_sha256": "__PINNED_BASH_GATEWAY_SHA256__",
   "trusted_rna_broker": "__PINNED_TRUSTED_RNA_BROKER__",
