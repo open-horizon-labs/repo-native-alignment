@@ -1,0 +1,56 @@
+HIGHEST-PRIORITY SUPERVISED RNA-FIRST TREATMENT POLICY
+
+The worked interaction below was executed by the harness against a pinned immutable RNA index for the exact editable checkout tree. The index location is deliberately opaque and is not a model workspace. The response contains repository-relative paths for your current editable checkout. This is trusted treatment context, not a model tool call.
+
+HARNESS-EXECUTED RNA TOOL CALL
+rna_query --query-sha256 8db52b8edfcb66a4846fdedebabb0c36a8e95d19591bd380c766cba1bd59b032
+
+RNA TOOL RESPONSE
+## Search: "has_key, has_keys, and has_any_keys JSONField() lookups don't handle numeric keys on SQLite, MySQL, and Oracle."
+
+### Code symbols (10 result(s))
+
+- **struct** `KeyTransformIsNull` `django/db/models/fields/json.py`:387-408 src:tree_sitter `class KeyTransformIsNull(lookups.IsNull):` imp:0.002 edges:5
+  `django/db/models/fields/json.py:KeyTransformIsNull:struct`
+
+- **function** `test_lookups_with_key_transform` `tests/model_fields/test_jsonfield.py`:976-990 src:tree_sitter `def test_lookups_with_key_transform(self):` test cc:2 imp:0.002 edges:5
+  `tests/model_fields/test_jsonfield.py:test_lookups_with_key_transform:function`
+
+- **struct** `KeyTransformExact` `django/db/models/fields/json.py`:440-477 src:tree_sitter `class KeyTransformExact(JSONExact):` imp:0.002 edges:5
+  `django/db/models/fields/json.py:KeyTransformExact:struct`
+
+- **function** `as_oracle` `django/db/models/fields/json.py`:465-477 src:tree_sitter `def as_oracle(self, compiler, connection):` cc:2 imp:0.002 edges:13
+  `django/db/models/fields/json.py:as_oracle:function`
+
+- **struct** `DatabaseIntrospection` `django/db/backends/sqlite3/introspection.py`:59-438 src:tree_sitter `class DatabaseIntrospection(BaseDatabaseIntrospection):` imp:0.002 edges:14
+  `django/db/backends/sqlite3/introspection.py:DatabaseIntrospection:struct`
+
+- **function** `as_sqlite` `django/db/models/fields/json.py`:400-408 src:tree_sitter `def as_sqlite(self, compiler, connection):` cc:2 imp:0.002 edges:9
+  `django/db/models/fields/json.py:as_sqlite:function`
+
+- **function** `has_key` `django/core/cache/backends/db.py`:235-255 src:tree_sitter `def has_key(self, key, version=None):` cc:1 imp:0.002 edges:8
+  `django/core/cache/backends/db.py:has_key:function`
+
+- **struct** `DataContains` `django/db/models/fields/json.py`:142-154 src:tree_sitter `class DataContains(PostgresOperatorLookup):` imp:0.002 edges:4
+  `django/db/models/fields/json.py:DataContains:struct`
+
+- **struct** `KeyTransformTextLookupMixin` `django/db/models/fields/json.py`:365-384 src:tree_sitter `class KeyTransformTextLookupMixin:` imp:0.002 edges:4
+  `django/db/models/fields/json.py:KeyTransformTextLookupMixin:struct`
+
+- **function** `lookup_cast` `django/db/backends/mysql/operations.py`:411-426 src:tree_sitter `def lookup_cast(self, lookup_type, internal_type=None):` cc:4 imp:0.002 edges:4
+  `django/db/backends/mysql/operations.py:lookup_cast:function`
+
+`status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false`
+END HARNESS-EXECUTED RNA TOOL INTERACTION
+
+Choose exactly one stable node ID appearing verbatim in the response. Your FIRST actual tool call must be Bash with exactly this command shape, substituting only your chosen returned ID:
+
+/Users/muness/swebench-evidence/issue825-selector-f2a7d7ab-authoritative-attempt1/model-output/rank-02-django__django-15503/harness/bin/rna_traverse.py --node '<CHOSEN_STABLE_ID_FROM_RESPONSE>' --mode neighbors
+
+The first call must return RNA_STATUS=OK_NONEMPTY or RNA_STATUS=OK_EMPTY. Both are valid RNA responses. RNA_STATUS=ERROR is fatal. The harness supervisor enforces this first-action rule and rejects direct launcher calls, harness-query calls, malformed wrapper calls, or access outside the editable checkout.
+
+After that valid first traversal, the ordinary coding tool surface is available. You may use Bash, Read, Edit, Write, Grep, Glob, and visible tests normally. Further RNA calls are optional and may use --mode neighbors or --mode impact. RNA_STATUS=OK_NONEMPTY supplies graph context and repository-relative paths. RNA_STATUS=OK_EMPTY is a valid zero-degree response. RNA_STATUS=ERROR is fatal; the supervisor will block every later tool call and you must not fall back to another tool.
+
+All Read, Edit, and Write targets must resolve inside your current editable checkout. Use repository-relative paths or paths rooted at the current working directory—not any path appearing in harness implementation details. Do not inspect the immutable index checkout or bypass the registered wrappers.
+
+Do not use network access, hidden tests, evaluator output, gold patches, or evidence from another arm. Produce one terminal patch and run relevant visible tests. There is no model retry or evaluator feedback.

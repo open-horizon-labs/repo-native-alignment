@@ -263,9 +263,13 @@ fn should_abort_zero_edge_pass(
     edge_producing_total: usize,
     edge_attempted: u32,
     emitted_edges: bool,
-    elapsed: Duration,
+    edge_phase_elapsed: Option<Duration>,
 ) -> bool {
+    let Some(elapsed) = edge_phase_elapsed else {
+        return false;
+    };
     edge_producing_total > 0
+        && edge_attempted > 0
         && !emitted_edges
         && ((edge_attempted >= ZERO_EDGE_ABORT_THRESHOLD && elapsed >= ZERO_EDGE_MIN_WARMUP)
             || elapsed > ZERO_EDGE_TIMEOUT)
@@ -1576,6 +1580,7 @@ impl LspEnricher {
         // by phase/file instead of waiting for the outer 30-minute job watchdog.
         let mut attempted = barrier_attempted;
         let mut edge_attempted = 0u32;
+        let mut edge_phase_started_at = None::<std::time::Instant>;
         let mut errors = 0u32;
         let mut aborted = false;
         let mut abort_diagnostic = None;
@@ -1606,7 +1611,10 @@ impl LspEnricher {
                         break;
                     };
                     attempted += 1;
-                    edge_attempted += u32::from(task_result.edge_producing);
+                    if task_result.edge_producing {
+                        edge_phase_started_at.get_or_insert_with(std::time::Instant::now);
+                        edge_attempted += 1;
+                    }
                     if task_result.had_error {
                         errors += 1;
                     }
@@ -1705,14 +1713,15 @@ impl LspEnricher {
                 last_logged_count = done;
             }
 
-            // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
-            // OR spent >= 2 minutes with 0 edges, the language server is likely
-            // misconfigured.
+            // Early abort after edge-producing work starts: if we've processed
+            // >= 1,000 edge requests AND warmed up for >= 30s, OR spent >= 2
+            // minutes in that phase with 0 edges, the server is likely misconfigured.
+            let edge_phase_elapsed = edge_phase_started_at.map(|started| started.elapsed());
             if should_abort_zero_edge_pass(
                 edge_producing_total,
                 edge_attempted,
                 result.added_edges.len() != pass1_edge_baseline,
-                pass1_start.elapsed(),
+                edge_phase_elapsed,
             ) {
                 let snapshot = diagnostics.snapshot().await;
                 let rendered_snapshot = snapshot.render();
@@ -1721,7 +1730,7 @@ impl LspEnricher {
                     self.server_command,
                     edge_attempted,
                     edge_producing_total,
-                    pass1_start.elapsed().as_secs_f64(),
+                    edge_phase_elapsed.unwrap_or_default().as_secs_f64(),
                     rendered_snapshot,
                 );
                 aborted = true;
@@ -3257,24 +3266,31 @@ mod tests {
     }
 
     #[test]
-    fn document_symbol_only_work_never_trips_zero_edge_watchdog() {
+    fn issue825_document_symbol_prep_does_not_age_zero_edge_watchdog() {
         assert!(!should_abort_zero_edge_pass(
             0,
             0,
             false,
-            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+            Some(ZERO_EDGE_TIMEOUT + Duration::from_secs(1)),
+        ));
+        assert!(!should_abort_zero_edge_pass(1, 0, false, None));
+        assert!(!should_abort_zero_edge_pass(
+            1,
+            0,
+            false,
+            Some(ZERO_EDGE_TIMEOUT + Duration::from_secs(1)),
         ));
         assert!(should_abort_zero_edge_pass(
             1,
             ZERO_EDGE_ABORT_THRESHOLD,
             false,
-            ZERO_EDGE_MIN_WARMUP,
+            Some(ZERO_EDGE_MIN_WARMUP),
         ));
         assert!(!should_abort_zero_edge_pass(
             1,
             ZERO_EDGE_ABORT_THRESHOLD,
             true,
-            ZERO_EDGE_TIMEOUT + Duration::from_secs(1),
+            Some(ZERO_EDGE_TIMEOUT + Duration::from_secs(1)),
         ));
     }
 
