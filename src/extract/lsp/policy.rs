@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::graph::{Node, NodeKind};
+use crate::graph::{ExtractionSource, Node, NodeKind};
 
 /// Semantic LSP operation used for both admission and yield accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -410,8 +410,16 @@ impl LspQueryProfile {
 
     pub(crate) fn accepts_declaration(&self, node: &Node) -> bool {
         node.language == self.language
+            && node.source != ExtractionSource::Lsp
             && node.metadata.get("synthetic").map(String::as_str) != Some("true")
-            && !matches!(&node.id.kind, NodeKind::Other(kind) if kind == "crate" || kind == "diagnostic")
+            && node.metadata.get("virtual").map(String::as_str) != Some("true")
+            && !matches!(
+                &node.id.kind,
+                NodeKind::Other(kind)
+                    if kind == "crate"
+                        || kind == "diagnostic"
+                        || kind == "lsp_document_symbol"
+            )
     }
 }
 
