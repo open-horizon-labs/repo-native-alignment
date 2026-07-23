@@ -25,6 +25,7 @@ AMENDED_SELECTION = "794aa76a7d9bcbfb5148ba59e88ff060ef8052514884f46b7cf92dcd36c
 EVALUATION_BATCH = "794996b8023dbe3fb2e0164bebd9d9b7c990bf0307026cdf9427cd6e5be2fc5c"
 SELECTION_RESULT = "350dd532c90c05d8b8d66883576afa4608ece9dca6ebeb58afd38aa7941af127"
 SELECTION_CORRECTION = "970116a6420614edae3416515eda9ae7bb7cc39a51e498da8cb65f02fefdfa4a"
+CHECKSUM_MANIFEST = "cc685c46807ed2893df03af47300575d1a4cd6fc54294265e52d87d31bab6b12"
 RUN_MANIFEST = "9a11ce063ef6f08ff50546a2aa34a14fd77d3bb5b57cc10e946b9a17f26471e1"
 ORIGINAL_RUN_MANIFEST = "5148945367c90e10c7952b84c78d81ee382af424baa03f044e2164f3ca657a93"
 PREPARATION = "71602d955239f0f1749b3c30fad60867a38b0041b09498fe06bc5d9a7ece2005"
@@ -229,6 +230,30 @@ def verify_inventory(root: Path) -> None:
         )
 
 
+def verify_checksum_manifest(root: Path) -> None:
+    manifest_path = root / "SHA256SUMS"
+    manifest = strict_bytes(manifest_path)
+    require(sha_bytes(manifest) == CHECKSUM_MANIFEST, "published checksum manifest drift")
+    try:
+        lines = manifest.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise EvidenceError("published checksum manifest is not UTF-8") from exc
+    expected_paths = EXPECTED_FILES - {"SHA256SUMS"}
+    entries: dict[str, str] = {}
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)", line)
+        require(match is not None, "malformed published checksum entry")
+        expected, relative = match.groups()
+        require(
+            relative in expected_paths and relative not in entries,
+            f"unexpected or duplicated published checksum path: {relative}",
+        )
+        entries[relative] = expected
+    require(set(entries) == expected_paths, "published checksum manifest file set drift")
+    for relative, expected in entries.items():
+        digest(root / relative, expected)
+
+
 def verify_registered_sources(issue_dir: Path, registered_files: Any) -> None:
     require(isinstance(registered_files, dict), "registered source file map missing")
     require(set(registered_files) == set(REGISTERED_SOURCE_FILES), "registered source file set drift")
@@ -410,6 +435,7 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
     root = root.resolve(strict=True)
     issue_dir = issue_dir.resolve(strict=True)
     verify_inventory(root)
+    verify_checksum_manifest(root)
     digest(issue_dir / "registration.json", ORIGINAL_REGISTRATION)
     digest(issue_dir / "selection.json", ORIGINAL_SELECTION)
     amended_registration, amended_registration_bytes = load(
@@ -796,7 +822,7 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
         "retained post-nonadherence xarray T evaluator outcome was not verified",
     )
 
-    return {
+    verified_result = {
         "schema_version": "issue825-published-result-verification-v2",
         "valid": True,
         "protocol_classification": "amended_development_selector",
@@ -837,6 +863,11 @@ def verify(root: Path, issue_dir: Path) -> dict[str, Any]:
             "T": {"resolved": 2, "regressions": 0, "provider_total_tokens": 4_367_033, "combined_wall_seconds": totals["T"]["wall"]},
         },
     }
+    require(
+        strict_bytes(root / "verification-receipt.json") == canonical(verified_result),
+        "published verification receipt does not match recomputed result",
+    )
+    return verified_result
 
 
 def parser() -> argparse.ArgumentParser:

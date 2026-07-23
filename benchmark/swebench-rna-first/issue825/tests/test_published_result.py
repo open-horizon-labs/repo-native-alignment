@@ -105,6 +105,19 @@ def test_tampered_superseding_correction_fails_closed(tmp_path: Path) -> None:
     rejects(root)
 
 
+@pytest.mark.parametrize(
+    "relative",
+    ["README.md", "SHA256SUMS", "verification-receipt.json"],
+)
+def test_published_manifest_and_receipt_tamper_fail_closed(
+    tmp_path: Path, relative: str
+) -> None:
+    root = copied_evidence(tmp_path)
+    with (root / relative).open("ab") as stream:
+        stream.write(b"tamper")
+    rejects(root)
+
+
 def test_verification_level_evaluator_feedback_fails_closed(tmp_path: Path) -> None:
     root = copied_evidence(tmp_path)
     rewrite(root, "final/xarray/A/episode-verification.json", lambda value: value.__setitem__("official_evaluator_invoked", True))
