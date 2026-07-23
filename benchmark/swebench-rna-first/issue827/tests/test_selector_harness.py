@@ -341,6 +341,219 @@ class TrustedRnaCacheReadScopeTests(unittest.TestCase):
             )
 
 
+class TrustedRnaToolchainReadScopeTests(unittest.TestCase):
+    def fixture(
+        self, root: Path
+    ) -> tuple[dict[str, object], Path, tuple[Path, Path], Path]:
+        toolchain = root / "bound-toolchain"
+        python_runtime = toolchain / "runtimes/python"
+        python_environment = toolchain / "servers/python-env"
+        python_runtime.mkdir(parents=True)
+        python_environment.mkdir(parents=True)
+        runtime_marker = python_runtime / "stdlib.marker"
+        environment_marker = python_environment / "esbonio.marker"
+        runtime_marker.write_text("python\n")
+        environment_marker.write_text("esbonio\n")
+        sibling = root / "unbound-toolchain/secret"
+        sibling.parent.mkdir()
+        sibling.write_text("must remain unreadable\n")
+        receipt = root / "runtime-environment-receipt.json"
+        receipt.write_bytes(
+            canonical(
+                {
+                    "preprocessing": {
+                        "identity": {
+                            "inventory_sha256": "1" * 64,
+                            "provision_receipt_digest": "2" * 64,
+                            "provision_receipt_sha256": "3" * 64,
+                            "toolchain_root": str(toolchain),
+                        }
+                    }
+                }
+            )
+        )
+        return ref(receipt), toolchain, (
+            runtime_marker,
+            environment_marker,
+        ), sibling
+
+    def test_root_is_exactly_receipt_bound_and_environment_is_unchanged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipt_ref, toolchain, dependencies, sibling = self.fixture(root)
+            environment = {
+                "PATH": f"{toolchain / 'bin'}:/usr/bin",
+                "PYTHONSAFEPATH": "1",
+            }
+            before = canonical(environment)
+            resolved = run_selector.trusted_rna_toolchain_read_root(
+                receipt_ref
+            )
+            self.assertEqual(resolved, toolchain)
+            self.assertEqual(canonical(environment), before)
+            for dependency in dependencies:
+                self.assertTrue(
+                    run_selector.path_is_covered_by_root(
+                        dependency, (resolved,)
+                    )
+                )
+            self.assertFalse(
+                run_selector.path_is_covered_by_root(sibling, (resolved,))
+            )
+            self.assertNotEqual(resolved, resolved.parent)
+
+            mismatched = dict(receipt_ref)
+            mismatched["sha256"] = "0" * 64
+            with self.assertRaisesRegex(
+                run_selector.FailClosed,
+                "runtime receipt SHA mismatch",
+            ):
+                run_selector.trusted_rna_toolchain_read_root(mismatched)
+
+            alias = root / "toolchain-alias"
+            alias.symlink_to(toolchain, target_is_directory=True)
+            aliased_receipt = root / "aliased-runtime-receipt.json"
+            aliased_receipt.write_bytes(
+                canonical(
+                    {
+                        "preprocessing": {
+                            "identity": {
+                                "inventory_sha256": "1" * 64,
+                                "provision_receipt_digest": "2" * 64,
+                                "provision_receipt_sha256": "3" * 64,
+                                "toolchain_root": str(alias),
+                            }
+                        }
+                    }
+                )
+            )
+            with self.assertRaisesRegex(
+                run_selector.FailClosed,
+                "toolchain root invalid",
+            ):
+                run_selector.trusted_rna_toolchain_read_root(
+                    ref(aliased_receipt)
+                )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "requires macOS Seatbelt",
+    )
+    def test_real_seatbelt_allows_bound_toolchain_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipt_ref, toolchain, dependencies, sibling = self.fixture(root)
+            toolchain_root = (
+                run_selector.trusted_rna_toolchain_read_root(receipt_ref)
+            )
+            state = root / "trusted-state"
+            state.mkdir()
+            null = Path("/dev/null")
+            runtime_roots = [
+                path
+                for path in (
+                    Path("/bin"),
+                    Path("/usr"),
+                    Path("/System"),
+                    Path("/Library"),
+                    Path("/opt/homebrew"),
+                    Path(sys.prefix),
+                    Path("/private/var/select"),
+                )
+                if path.exists()
+            ]
+            profile = root / "trusted-rna-toolchain.sb"
+            profile.write_text(
+                run_selector.isolation.generate_trusted_rna_seatbelt_profile(
+                    read_roots=[
+                        *runtime_roots,
+                        toolchain_root,
+                        state,
+                        null,
+                    ],
+                    write_roots=[state, null],
+                )
+            )
+            profile.chmod(0o444)
+
+            readable = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    "/bin/cat",
+                    *map(str, dependencies),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                readable.returncode,
+                0,
+                readable.stderr.decode(errors="replace"),
+            )
+            self.assertEqual(readable.stdout, b"python\nesbonio\n")
+
+            denied = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    "/bin/cat",
+                    str(sibling),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertEqual(
+                sibling.read_bytes(), b"must remain unreadable\n"
+            )
+
+            for dependency in dependencies:
+                before = dependency.read_bytes()
+                overwrite = subprocess.run(
+                    [
+                        "/usr/bin/sandbox-exec",
+                        "-f",
+                        str(profile),
+                        "/bin/sh",
+                        "-c",
+                        'printf tamper > "$1"',
+                        "sh",
+                        str(dependency),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertNotEqual(overwrite.returncode, 0)
+                self.assertEqual(dependency.read_bytes(), before)
+
+            dev_null_write = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    "/bin/sh",
+                    "-c",
+                    "printf probe > /dev/null",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                dev_null_write.returncode,
+                0,
+                dev_null_write.stderr.decode(errors="replace"),
+            )
+
+
 class TrustedGitBindingTests(unittest.TestCase):
     def test_binding_preserves_canonical_environment_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

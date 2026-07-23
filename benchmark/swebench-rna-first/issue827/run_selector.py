@@ -506,6 +506,7 @@ class PreparedRun:
     launcher_path: Path
     binary_path: Path
     rna_refs: dict[str, dict[str, Any]]
+    trusted_rna_toolchain_root: Path
     mcp_path: Path
     output_root: Path
     cases: tuple[PreparedCase, ...]
@@ -1100,6 +1101,9 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
 
     claude_path, claude_version = verify_runtime(manifest, registration)
     launcher_path, binary_path, rna_refs = verify_rna_artifact(manifest, registration)
+    trusted_rna_toolchain_root = trusted_rna_toolchain_read_root(
+        rna_refs["runtime_receipt"]
+    )
     verify_qualification_closure(manifest, registration)
     mcp_path, mcp_bytes = check_ref(manifest["mcp_config"], "manifest.mcp_config")
     require(mcp_bytes == EMPTY_MCP_BYTES, "MCP config is not canonical strict-empty")
@@ -1214,6 +1218,7 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
         launcher_path=launcher_path,
         binary_path=binary_path,
         rna_refs=rna_refs,
+        trusted_rna_toolchain_root=trusted_rna_toolchain_root,
         mcp_path=mcp_path,
         output_root=output_root,
         cases=tuple(cases),
@@ -1362,6 +1367,71 @@ def trusted_rna_cache_evidence_read_roots(
         f"{case.case_id}.cache evidence paths must be distinct",
     )
     return tuple(roots)
+
+
+def trusted_rna_toolchain_read_root(
+    runtime_receipt_ref: Mapping[str, Any],
+) -> Path:
+    """Resolve the immutable toolchain closure bound by the runtime receipt."""
+
+    require(
+        isinstance(runtime_receipt_ref, Mapping)
+        and set(runtime_receipt_ref) == {"path", "bytes", "sha256"},
+        "trusted RNA runtime receipt reference invalid",
+    )
+    path_value = runtime_receipt_ref["path"]
+    expected_bytes = runtime_receipt_ref["bytes"]
+    expected_sha256 = runtime_receipt_ref["sha256"]
+    receipt_path = Path(path_value) if isinstance(path_value, str) else Path()
+    require(
+        isinstance(path_value, str)
+        and receipt_path.is_absolute()
+        and receipt_path.is_file()
+        and not receipt_path.is_symlink(),
+        "trusted RNA runtime receipt path must be a nonsymlink file",
+    )
+    require(
+        type(expected_bytes) is int
+        and expected_bytes >= 0
+        and receipt_path.stat().st_size == expected_bytes,
+        "trusted RNA runtime receipt bytes mismatch",
+    )
+    require(
+        isinstance(expected_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None
+        and sha_file(receipt_path) == expected_sha256,
+        "trusted RNA runtime receipt SHA mismatch",
+    )
+    receipt = read_json(receipt_path)
+    require(
+        isinstance(receipt, Mapping),
+        "trusted RNA runtime receipt must be an object",
+    )
+    preprocessing = receipt.get("preprocessing")
+    require(
+        isinstance(preprocessing, Mapping),
+        "trusted RNA runtime receipt preprocessing identity missing",
+    )
+    identity = preprocessing.get("identity")
+    require(
+        isinstance(identity, Mapping),
+        "trusted RNA runtime receipt preprocessing identity missing",
+    )
+    for name in (
+        "inventory_sha256",
+        "provision_receipt_digest",
+        "provision_receipt_sha256",
+    ):
+        value = identity.get(name)
+        require(
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None,
+            f"trusted RNA runtime receipt {name} invalid",
+        )
+    return _absolute_real_directory(
+        identity.get("toolchain_root"),
+        "trusted RNA runtime receipt toolchain root",
+    )
 
 
 def path_is_covered_by_root(path: Path, roots: Sequence[Path]) -> bool:
@@ -1592,6 +1662,7 @@ def configure_episode(
         prepared.launcher_path.parent,
         prepared.binary_path.parent,
         prepared.isolation_host["declared_toolchain_root"],
+        prepared.trusted_rna_toolchain_root,
         Path(sys.prefix),
         directories["gateway_home"],
         directories["gateway_tmp"],
