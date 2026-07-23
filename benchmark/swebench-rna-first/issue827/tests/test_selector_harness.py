@@ -188,6 +188,159 @@ class TrustedRnaWriteScopeTests(unittest.TestCase):
                     )
 
 
+class TrustedRnaCacheReadScopeTests(unittest.TestCase):
+    def fixture(
+        self, root: Path
+    ) -> tuple[SimpleNamespace, tuple[Path, ...], Path]:
+        publication = root / "publication"
+        publication.mkdir()
+        cache_refs = {}
+        for name in run_selector.TRUSTED_RNA_CACHE_EVIDENCE_REFS:
+            path = publication / f"{name}.evidence"
+            path.write_bytes(f"{name}\n".encode())
+            cache_refs[name] = ref(path)
+        sibling = publication / "unregistered-sibling.evidence"
+        sibling.write_bytes(b"must remain unreadable\n")
+        case = SimpleNamespace(
+            case_id="repo__repo-1",
+            cache_refs=cache_refs,
+        )
+        roots = run_selector.trusted_rna_cache_evidence_read_roots(case)
+        return case, roots, sibling
+
+    def test_scope_contains_exact_four_files_and_not_their_sibling(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            case, roots, sibling = self.fixture(Path(temporary))
+            expected = tuple(
+                Path(case.cache_refs[name]["path"]).resolve(strict=True)
+                for name in run_selector.TRUSTED_RNA_CACHE_EVIDENCE_REFS
+            )
+            self.assertEqual(roots, expected)
+            self.assertEqual(len(roots), 4)
+            self.assertFalse(
+                run_selector.path_is_covered_by_root(sibling, roots)
+            )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "requires macOS Seatbelt",
+    )
+    def test_real_seatbelt_reads_only_exact_cache_evidence_and_cannot_write_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _case, cache_roots, sibling = self.fixture(root)
+            state = root / "trusted-state"
+            state.mkdir()
+            null = Path("/dev/null")
+            runtime_roots = [
+                path
+                for path in (
+                    Path("/usr"),
+                    Path("/System"),
+                    Path("/Library"),
+                    Path("/opt/homebrew"),
+                    Path(sys.prefix),
+                    Path("/private/var/select"),
+                )
+                if path.exists()
+            ]
+            read_roots = [*runtime_roots, *cache_roots, state, null]
+            write_roots = [state, null]
+            profile = root / "trusted-rna-cache-evidence.sb"
+            profile.write_text(
+                run_selector.isolation.generate_trusted_rna_seatbelt_profile(
+                    read_roots=read_roots,
+                    write_roots=write_roots,
+                )
+            )
+            profile.chmod(0o444)
+
+            read_result = state / "read-result"
+            readable = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    str(Path(sys.executable).resolve()),
+                    "-c",
+                    (
+                        "from pathlib import Path; import sys; "
+                        "[Path(value).read_bytes() for value in sys.argv[2:]]; "
+                        "Path(sys.argv[1]).write_text('read')"
+                    ),
+                    str(read_result),
+                    *map(str, cache_roots),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                readable.returncode,
+                0,
+                readable.stderr.decode(errors="replace"),
+            )
+            self.assertEqual(read_result.read_text(), "read")
+
+            denied = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    "/bin/cat",
+                    str(sibling),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertEqual(sibling.read_bytes(), b"must remain unreadable\n")
+
+            for cache_path in cache_roots:
+                before = cache_path.read_bytes()
+                overwrite = subprocess.run(
+                    [
+                        "/usr/bin/sandbox-exec",
+                        "-f",
+                        str(profile),
+                        "/bin/sh",
+                        "-c",
+                        'printf tamper > "$1"',
+                        "sh",
+                        str(cache_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertNotEqual(overwrite.returncode, 0)
+                self.assertEqual(cache_path.read_bytes(), before)
+
+            dev_null_write = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    "/bin/sh",
+                    "-c",
+                    'printf probe > /dev/null',
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                dev_null_write.returncode,
+                0,
+                dev_null_write.stderr.decode(errors="replace"),
+            )
+
+
 class TrustedGitBindingTests(unittest.TestCase):
     def test_binding_preserves_canonical_environment_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

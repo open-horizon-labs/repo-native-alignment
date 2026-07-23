@@ -54,6 +54,12 @@ TRUSTED_GIT_BINARY_SHA256 = (
     "be4afb2b003904725826250de9fb76567bbacf82323457b5a1ec26706b66bcae"
 )
 TRUSTED_GIT_CONFIG_WRITE_TARGET = Path("/dev/null")
+TRUSTED_RNA_CACHE_EVIDENCE_REFS = (
+    "archive",
+    "manifest",
+    "verification_receipt",
+    "readiness_report",
+)
 SOURCE = Path(__file__).resolve().parent
 CODE_KINDS = {
     "class", "const", "enum", "function", "interface", "method", "module",
@@ -1321,6 +1327,43 @@ def make_identity(prepared: PreparedRun, case: PreparedCase) -> dict[str, Any]:
     }
 
 
+def trusted_rna_cache_evidence_read_roots(
+    case: PreparedCase,
+) -> tuple[Path, ...]:
+    """Return only the exact immutable cache files live identity revalidates."""
+
+    roots: list[Path] = []
+    for name in TRUSTED_RNA_CACHE_EVIDENCE_REFS:
+        ref = case.cache_refs.get(name)
+        require(
+            isinstance(ref, Mapping)
+            and set(ref) == {"path", "bytes", "sha256"},
+            f"{case.case_id}.cache.{name} reference invalid",
+        )
+        path_value = ref["path"]
+        expected_bytes = ref["bytes"]
+        path = Path(path_value) if isinstance(path_value, str) else Path()
+        require(
+            isinstance(path_value, str)
+            and path.is_absolute()
+            and path.is_file()
+            and not path.is_symlink(),
+            f"{case.case_id}.cache.{name} path must be a nonsymlink file",
+        )
+        require(
+            type(expected_bytes) is int
+            and expected_bytes >= 0
+            and path.stat().st_size == expected_bytes,
+            f"{case.case_id}.cache.{name} bytes mismatch",
+        )
+        roots.append(path.resolve(strict=True))
+    require(
+        len(set(roots)) == len(TRUSTED_RNA_CACHE_EVIDENCE_REFS),
+        f"{case.case_id}.cache evidence paths must be distinct",
+    )
+    return tuple(roots)
+
+
 def path_is_covered_by_root(path: Path, roots: Sequence[Path]) -> bool:
     resolved = path.resolve(strict=False)
     return any(root == resolved or root in resolved.parents for root in roots)
@@ -1544,6 +1587,7 @@ def configure_episode(
         *map(Path, prepared.isolation_host["system_read_roots"]),
         case.checkouts[arm],
         case.index_checkout,
+        *trusted_rna_cache_evidence_read_roots(case),
         harness_paths["harness"],
         prepared.launcher_path.parent,
         prepared.binary_path.parent,
