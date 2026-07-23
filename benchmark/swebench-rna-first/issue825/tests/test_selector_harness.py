@@ -38,6 +38,36 @@ def ref(path: Path) -> dict:
     return {"path": str(path), "bytes": len(data), "sha256": sha(data)}
 
 
+def runtime_amendment() -> dict:
+    return {
+        "schema_version": run_selector.RUNTIME_AMENDMENT_SCHEMA,
+        "classification": "post_start_administrative_runtime_amendment",
+        "reason": "both arms reached the original administrative wall limit",
+        "published_before_rerun": True,
+        "official_evaluator_invocations_before_amendment": 0,
+        "original_registration_sha256": run_selector.ORIGINAL_REGISTRATION_SHA256,
+        "original_selection_sha256": run_selector.ORIGINAL_SELECTION_SHA256,
+        "original_wall_seconds": 600,
+        "amended_wall_seconds": 1200,
+        "original_budget_usd": 3.0,
+        "amended_budget_usd": 6.0,
+        "rerun_episodes": [
+            {"case_id": "pydata__xarray-4687", "rank": 1, "arm": arm,
+             "receipt_sha256": character * 64, "verification_sha256": "e" * 64}
+            for arm, character in (("A", "a"), ("T", "b"))
+        ],
+        "retained_episodes": [
+            {"case_id": "django__django-15503", "rank": 2, "arm": arm,
+             "receipt_sha256": character * 64, "verification_sha256": "f" * 64}
+            for arm, character in (("A", "c"), ("T", "d"))
+        ],
+        "fresh_sessions_required": True,
+        "resume_allowed": False,
+        "same_cases_commits_trees_caches_prompts_tools_and_order": True,
+        "result_classification": "amended_development_selector",
+    }
+
+
 class WrapperFixture:
     def __init__(self, root: Path):
         self.root = root
@@ -457,6 +487,38 @@ class RnaWrapperTests(unittest.TestCase):
 
 
 class RunnerAndVerifierTests(unittest.TestCase):
+    def test_runtime_amendment_changes_only_limit_budget_and_execution_pair(self):
+        amendment = runtime_amendment()
+        registration = {"runtime_amendment": amendment}
+        self.assertEqual(run_selector.validate_runtime_amendment(registration), amendment)
+        cases = (
+            SimpleNamespace(case_id="pydata__xarray-4687", rank=1, arm_order=("A", "T")),
+            SimpleNamespace(case_id="django__django-15503", rank=2, arm_order=("T", "A")),
+        )
+        selected = run_selector.execution_cases(
+            SimpleNamespace(registration=registration, cases=cases)
+        )
+        self.assertEqual(selected, cases[:1])
+
+        registration_bytes = canonical(registration)
+        selection = {
+            "authoritative": True,
+            "state": run_selector.AMENDED_SELECTION_STATE,
+            "problem_statements_inspected_by_human_before_selection": False,
+            "gold_or_outcomes_inspected_before_selection": False,
+            "registration_sha256": sha(registration_bytes),
+            "supersedes_selection_sha256": run_selector.ORIGINAL_SELECTION_SHA256,
+            "prior_model_calls_retained": True,
+            "fresh_case_claim": False,
+            "runtime_amendment_sha256": sha(canonical(amendment)),
+        }
+        run_selector.validate_authoritative_selection(selection, registration_bytes)
+
+        tampered = json.loads(json.dumps(registration))
+        tampered["runtime_amendment"]["amended_budget_usd"] = 7.0
+        with self.assertRaisesRegex(run_selector.FailClosed, "budget mismatch"):
+            run_selector.validate_runtime_amendment(tampered)
+
     def test_failed_acquisition_retains_exact_command_and_wrapper_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -797,6 +859,21 @@ class ResultAggregationAuthorityTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "selected_T")
         self.assertEqual(decision["classification"], "efficacy_selection")
         self.assertTrue(decision["selection_authoritative"])
+
+    def test_amended_selector_is_explicitly_classified(self):
+        decision = select_result.decide_for_selection(
+            {
+                "authoritative": True,
+                "state": run_selector.AMENDED_SELECTION_STATE,
+                "problem_statements_inspected_by_human_before_selection": False,
+                "gold_or_outcomes_inspected_before_selection": False,
+                "prior_model_calls_retained": True,
+                "fresh_case_claim": False,
+            },
+            self.winning_treatment_metrics(),
+        )
+        self.assertEqual(decision["decision"], "selected_T")
+        self.assertEqual(decision["protocol_classification"], "amended_development_selector")
 
     def test_missing_or_malformed_authority_fails_closed(self):
         invalid = (

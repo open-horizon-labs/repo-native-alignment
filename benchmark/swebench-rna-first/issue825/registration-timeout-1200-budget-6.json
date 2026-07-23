@@ -1,0 +1,165 @@
+{
+  "schema_version": "issue825-treatment-registration-v3",
+  "state": "authoritative_runtime_amendment_frozen_before_xarray_rerun",
+  "frozen_at_utc": "2026-07-23T00:34:47Z",
+  "issue": 825,
+  "pull_request": 826,
+  "supersedes": {
+    "registration_commit": "f2a7d7abb911f5187b061c8ca80a76618a98c33d",
+    "registration_sha256": "dbfcc2553cd5cda945e53295f11ea21100265aff3c8131e45f6543fc7cf56fbc",
+    "selection_commit": "fc3d25964bc4d654131a8f65602d035c513fda60",
+    "selection_sha256": "2898db4e0a083fd3facd4799534a24b8e1344af47a6142c4ba668f0a08216a66",
+    "reason": "both pydata__xarray-4687 arms were symmetrically censored by the original 600-second administrative wall limit before any official evaluator invocation; retain the completed Django pair and rerun only xarray with the explicitly authorized 1200-second wall and 6-dollar budget"
+  },
+  "issue_body_sha256": "a6da4f886a888fd724746a758604a860c5cb9e3245554d76d5641c2b041f8093",
+  "claim": "A mandatory RNA-first Sonnet treatment improves resolution or regression safety, or preserves both while materially improving tokens or time, relative to the same bare agent.",
+  "dataset": {
+    "name": "SWE-bench_Verified",
+    "configuration": "SWE-bench___swe-bench_verified/default/0.0.0/91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+    "split": "test",
+    "rows": 500,
+    "arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+  },
+  "selector": {
+    "seed": "rna-first-sonnet-selector-v1",
+    "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
+    "algorithm_version": "issue825-selector-v3",
+    "pairs": 2,
+    "schedule": "lower_rank_A_then_T; higher_rank_T_then_A; same_case_serial; maximum_two_cases_concurrent",
+    "case_replacement_after_model_start": false,
+    "exclusions_path": "benchmark/swebench-rna-first/issue825/exclusions.json",
+    "exclusions_file_sha256": "6887390983da7b9d668f66d75569d92ab8bd14b9e3c461f9fe5bb00e7d2bf1b9",
+    "excluded_ids_sha256": "7790aec743b0c12289812fedad1957e97bc5dee0af2e52b5f14409cdc3bb6b8c",
+    "excluded_rows": 79,
+    "eligible_rows": 421,
+    "remaining_eligible_population_ranked_before_this_registration_commit": false
+  },
+  "rna_artifact": {
+    "producer_commit": "f073088635e25a8962199a7784472b45b435cff5",
+    "binary_sha256": "801015e4ffb75d05270c1402388b678222078bf2f109351bb6a5961849e95622",
+    "launcher_sha256": "37d45cb2ed5d89f632a8044235ad8adcbf77b005a4e255b87cce400246ee862d",
+    "bundle_manifest_sha256": "fb32c35f6790e0f4195e9e82562ccc408cd94a1bfcbdd56b4fa58cb908d2b619",
+    "archive_sha256": "afd3bed34d64fbb7175c4c767c52c514a058b3ba45462c839837af7bf6c56a43",
+    "verification_receipt_sha256": "80e70d50251db1f6b821be353f165a6628aacddcce677951d19017ce384e17ee",
+    "local_source_build_allowed": false
+  },
+  "model_runtime": {
+    "cli": "Claude Code",
+    "cli_version": "2.1.216",
+    "cli_sha256": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+    "model": "claude-sonnet-5",
+    "effort": "high",
+    "wall_seconds": 1200,
+    "budget_usd": 6.0,
+    "invocations_per_episode": 1,
+    "resume_allowed": false,
+    "model_retry_allowed": false,
+    "permission_mode": "bypassPermissions",
+    "safe_mode": false,
+    "tools": ["Bash","Edit","Read","Write","Glob","Grep"],
+    "disallowed_tools": ["WebSearch","WebFetch"],
+    "strict_empty_mcp_sha256": "e93fc8db2b1bd77107fe6c758bca9545fa864cf7cce8ab93a7b2b93a1d566a7b"
+  },
+  "runtime_amendment": {
+    "schema_version": "issue825-runtime-amendment-v1",
+    "classification": "post_start_administrative_runtime_amendment",
+    "reason": "both xarray arms reached the original 600-second administrative wall limit; neither was evaluator-authorized and no official evaluator invocation occurred",
+    "published_before_rerun": true,
+    "official_evaluator_invocations_before_amendment": 0,
+    "original_registration_sha256": "dbfcc2553cd5cda945e53295f11ea21100265aff3c8131e45f6543fc7cf56fbc",
+    "original_selection_sha256": "2898db4e0a083fd3facd4799534a24b8e1344af47a6142c4ba668f0a08216a66",
+    "original_wall_seconds": 600,
+    "amended_wall_seconds": 1200,
+    "original_budget_usd": 3.0,
+    "amended_budget_usd": 6.0,
+    "rerun_episodes": [
+      {"case_id":"pydata__xarray-4687","rank":1,"arm":"A","receipt_sha256":"d5e0e7920e1c11c2f4e73ad2868584c0eddaac31f17897cab14277701d4f55bd","verification_sha256":"87ac565f84420f530f215e48f1b9063ff6864da5a8089386ab5a5a2f7c88e87d"},
+      {"case_id":"pydata__xarray-4687","rank":1,"arm":"T","receipt_sha256":"dd24edf2fdb6537ff1c48715b1c8cdd4fe6329d07a7b65e1b5456033da4f0e51","verification_sha256":"0926dba5b9f6a40c1c7e5e701e533450541f039936bce61fc8c3831795702e01"}
+    ],
+    "retained_episodes": [
+      {"case_id":"django__django-15503","rank":2,"arm":"A","receipt_sha256":"8f6e6c2cab175c43abf5ab43a17bbb7083df4a9cddf7212bf4f7303b9acfcfe5","verification_sha256":"4a112d00eeea8d3f7e03fa60a48160e70126bb8feb6742361a30911f07741121"},
+      {"case_id":"django__django-15503","rank":2,"arm":"T","receipt_sha256":"d5d6cb6f381684d026c73c4a221e7c92066ea8c6a907d30cf84bdaf3f640c366","verification_sha256":"78e5a1fa56cfb4f17918743a9e1ee0d9dbec0f4b1aaed4966c9ad5dccdfe2183"}
+    ],
+    "fresh_sessions_required": true,
+    "resume_allowed": false,
+    "same_cases_commits_trees_caches_prompts_tools_and_order": true,
+    "result_classification": "amended_development_selector"
+  },
+  "title_acquisition": {
+    "source": "frozen problem_statement UTF-8 bytes",
+    "transform": "offset zero to first LF; remove only a CR immediately before that LF; if no LF use all bytes",
+    "normalization": false,
+    "query_argv_suffix": ["search","--repo","<immutable-index-checkout>","--root","<bound-root>","--compact","--include-artifacts=false","--limit=10","<exact-title>"],
+    "result_limit": 10,
+    "required_status": "READY",
+    "required_capabilities": ["embeddings=true","retrieval=hybrid","rerank=true","metal=true","fallback=false"],
+    "required_identity_binding": ["repository","repository_commit","repository_tree","root","producer_commit","rna_binary_sha256","rna_launcher_sha256","cache_archive_sha256","cache_manifest_sha256","operational_cache_inventory_sha256"],
+    "minimum_stable_code_node_ids": 1,
+    "raw_cli_bytes_preserved": true,
+    "valid_empty_title_results": false,
+    "manual_or_llm_replacement": false
+  },
+  "arms": {
+    "A": "byte-exact standard user prompt and standard tool-enabled Sonnet agent; no RNA identity, response, directive, or worked interaction",
+    "T": "same user prompt/runtime plus appended-system exact-title RNA interaction and mandatory first live neighbors traversal"
+  },
+  "treatment_policy": {
+    "first_model_tool": "exact unchained traversal wrapper --node <model-selected injected ID> --mode neighbors",
+    "valid_rna_statuses": ["OK_NONEMPTY","OK_EMPTY"],
+    "fatal_rna_status": "ERROR",
+    "tools_after_valid_first_response": "ordinary identical Bash/Edit/Read/Write/Glob/Grep and visible-test surface",
+    "tools_after_error": "none; hook denies and runner terminates",
+    "later_rna_calls": "optional; same status rules",
+    "rna_traversal_validation": "the bound exact-title acquisition must retain the exact strict READY sentinel; each node-mode graph response must carry one valid Index terminal, one Capability readiness section, and one ready benchmark per-file completeness terminal with full nonzero coverage, zero violations, and a digest matching the bound fresh-reopen readiness report",
+    "path_provenance_restriction_after_valid_response": false,
+    "common_checkout_confinement": "identical common_supervisor.py hook for A and T; the same pair-private wrapper path is present for both arms",
+    "manual_or_llm_rna_fallback": false
+  },
+  "registered_files": {
+    "system_prefix_sha256": "a23028ce7d62befac18cf0316f2af8d7e201f55acb40095f32b4a737f0754df1",
+    "system_suffix_sha256": "4e5855ad0dbd582c56a997cba07f3de962427760c97c0e9b980140f5e43b1ffd",
+    "rna_query_sha256": "84725ed5eb69f1d11541b3a3ef7f60bb5e69888386b51b1f5aba27bc5f828370",
+    "rna_traverse_sha256": "5574ff5f4267a2bea9c2c81a810fb3e57198f6c6825bf37f6a25ec9bd5113f5c",
+    "tool_supervisor_sha256": "316bf70b52c817402ad0813a3f665f15782fb08ab10d70f65d571d9bee7533a3",
+    "supervisor_template_sha256": "f3229d0768cc7032bcf6eb000794c662c6253e017b817400bb8e4518cd1c0749",
+    "claude_settings_template_sha256": "04a5b9b0fe65bceb4f4bfff9868f6a97197805dca76c6d0f2faebc30126f3634",
+    "validator_sha256": "ea2421371724d8e9ed659e945578072932c97f9ce4d613a24038c65b02fdd84e",
+    "common_supervisor_sha256": "863642fbab706405571c3b606ed3f13dd67fdf62151201492448f19d01d4692b",
+    "case_selector_sha256": "9ad6ed00d5d372d8fca13c1d6ca668d618f47acd172e15cc58432af59527432d",
+    "runner_sha256": "196d58e051cdc52ff5f19c77f371cda3955c4d4fdfb14c69f0fc5ed15751879e",
+    "verifier_sha256": "610a4247c53107c5f2fe76fd9b4e37a6aea747769e73c25e608b4a1b95f7d41d",
+    "exclusions_sha256": "6887390983da7b9d668f66d75569d92ab8bd14b9e3c461f9fe5bb00e7d2bf1b9",
+    "evaluator_runner_sha256": "987a3aed681fb4feb2771a69ee994b21320e2b9d02a91687c6ccf138d89843a2",
+    "evaluator_plan_template_sha256": "acf42b47270a81f9db17fec37f5c9ff05fb127e047a3390dec229b0077efa970",
+    "result_selector_sha256": "61ce172df58dad3de0af03b36be32e949bacfb6971b9c460d9654da65a156736",
+    "selector_harness_tests_sha256": "ad10e69c03b183687aab6d2976d13b13c38efc2b7c73d3759dc2627759ccf01c",
+    "evaluator_tests_sha256": "fe4a47f09a5978b34c960ade4b532519b13f3243c779f6aac40bf6820e806f13"
+  },
+  "cache_preparation": {
+    "artifact": "exact successful PR 826/f073088635e25a8962199a7784472b45b435cff5 CI semantic bundle only",
+    "local_source_build_allowed": false,
+    "selected_case_mode": "reuse the existing verifier-clean exact-tree cache; no scan, LSP, embedding, rerank encoding, or repair before the amended rerun",
+    "scan_argv": ["--business-context","disabled","scan","--repo","<immutable-index-checkout>","--full","--timings"],
+    "fresh_process_readiness_required": true,
+    "live_checkout_and_operational_cache_inventory_revalidated_before_each_rna_call": true,
+    "strict_hybrid_metal_query_required": true,
+    "model_authorized_before_both_ready": false
+  },
+  "evaluation": {
+    "official_swebench_once_per_policy_compliant_terminal_patch": true,
+    "evaluator_feedback_to_model": false,
+    "compliant_no_patch": "unresolved; no evaluator",
+    "treatment_nonadherence": "unresolved intention-to-treat; no evaluator; no retry",
+    "setup_failure_retry": "a retained harness or environment failure before a valid treatment traversal response may be corrected and rerun only as a new immutable qualification attempt; it is not selection evidence",
+    "runtime_amendment_execution": "the original xarray timeout receipts remain immutable and unevaluated; only fresh never-resumed xarray A/T sessions may supersede them; completed Django A/T receipts are retained exactly",
+    "retain_all_failures": true
+  },
+  "selection": {
+    "prerequisite": "both T episodes policy-compliant and all other resolution/regression outcomes verifier-clean; otherwise no treatment or inconclusive as registered",
+    "reject_if": "T resolves fewer or causes more total PASS_TO_PASS regressions",
+    "select_efficacy_if": "T resolves more without more regressions, or tied resolution with fewer regressions",
+    "select_efficiency_if_exact_efficacy_tie": "whole-invocation provider_total_tokens at least 15 percent lower, or tokens no more than 5 percent higher and RNA_plus_model wall at least 20 percent lower",
+    "token_total": "sum once across every model in the invocation of provider input_tokens plus cache_creation_input_tokens plus cache_read_input_tokens plus output_tokens; reasoning is reported separately and is not added again",
+    "request_accounting": "CLI num_turns, transcript-observed unique provider response messages, and provider requests are separate; provider_requests is null when the pinned CLI does not expose it"
+  }
+}

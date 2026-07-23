@@ -47,6 +47,10 @@ ARM_POLICIES = {"A": "control", "T": "treatment"}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SCRIPT_PATH = Path(__file__).resolve()
+ORIGINAL_REGISTRATION_SHA256 = "dbfcc2553cd5cda945e53295f11ea21100265aff3c8131e45f6543fc7cf56fbc"
+ORIGINAL_SELECTION_SHA256 = "2898db4e0a083fd3facd4799534a24b8e1344af47a6142c4ba668f0a08216a66"
+AMENDED_SELECTION_STATE = "selected_pre_amended_rerun"
+RUNTIME_AMENDMENT_SCHEMA = "issue825-runtime-amendment-v1"
 
 
 class FailClosed(RuntimeError):
@@ -85,7 +89,13 @@ def validate_authoritative_selection(
     selection: Mapping[str, Any], registration_bytes: bytes
 ) -> None:
     require(selection.get("authoritative") is True, "selection is not authoritative")
-    require(selection.get("state") == "selected_pre_model", "selection state is not selected_pre_model")
+    try:
+        registration = json.loads(registration_bytes)
+    except json.JSONDecodeError as exc:
+        raise FailClosed(f"registration is invalid JSON: {exc}") from exc
+    amendment = validate_runtime_amendment(registration)
+    expected_state = AMENDED_SELECTION_STATE if amendment is not None else "selected_pre_model"
+    require(selection.get("state") == expected_state, f"selection state is not {expected_state}")
     require(
         selection.get("problem_statements_inspected_by_human_before_selection") is False,
         "selection permits prior human problem-statement inspection",
@@ -98,6 +108,15 @@ def validate_authoritative_selection(
         selection.get("registration_sha256") == sha256_bytes(registration_bytes),
         "selection binds another registration",
     )
+    if amendment is not None:
+        require(selection.get("supersedes_selection_sha256") == ORIGINAL_SELECTION_SHA256, "amended selection does not preserve original selection")
+        require(selection.get("prior_model_calls_retained") is True, "amended selection hides prior model calls")
+        require(selection.get("fresh_case_claim") is False, "amended selection improperly claims fresh cases")
+        require(
+            selection.get("runtime_amendment_sha256")
+            == sha256_bytes(canonical_json_bytes(amendment)),
+            "selection binds another runtime amendment",
+        )
 
 
 def write_exclusive(path: Path, data: bytes, mode: int = 0o444) -> None:
@@ -210,6 +229,92 @@ def _require_exact_keys(value: Any, expected: set[str], label: str) -> Mapping[s
     return value
 
 
+def validate_runtime_amendment(registration: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    amendment = registration.get("runtime_amendment")
+    if amendment is None:
+        return None
+    amendment = _require_exact_keys(
+        amendment,
+        {
+            "schema_version", "classification", "reason", "published_before_rerun",
+            "official_evaluator_invocations_before_amendment",
+            "original_registration_sha256", "original_selection_sha256",
+            "original_wall_seconds", "amended_wall_seconds",
+            "original_budget_usd", "amended_budget_usd", "rerun_episodes",
+            "retained_episodes", "fresh_sessions_required", "resume_allowed",
+            "same_cases_commits_trees_caches_prompts_tools_and_order", "result_classification",
+        },
+        "registration.runtime_amendment",
+    )
+    require(amendment["schema_version"] == RUNTIME_AMENDMENT_SCHEMA, "runtime amendment schema mismatch")
+    require(amendment["classification"] == "post_start_administrative_runtime_amendment", "runtime amendment classification mismatch")
+    require(amendment["published_before_rerun"] is True, "runtime amendment was not frozen before rerun")
+    require(amendment["official_evaluator_invocations_before_amendment"] == 0, "runtime amendment follows evaluator execution")
+    require(amendment["original_registration_sha256"] == ORIGINAL_REGISTRATION_SHA256, "runtime amendment original registration mismatch")
+    require(amendment["original_selection_sha256"] == ORIGINAL_SELECTION_SHA256, "runtime amendment original selection mismatch")
+    require((amendment["original_wall_seconds"], amendment["amended_wall_seconds"]) == (600, 1200), "runtime amendment wall limit mismatch")
+    require((amendment["original_budget_usd"], amendment["amended_budget_usd"]) == (3.0, 6.0), "runtime amendment budget mismatch")
+    require(amendment["fresh_sessions_required"] is True and amendment["resume_allowed"] is False, "runtime amendment session isolation mismatch")
+    require(amendment["same_cases_commits_trees_caches_prompts_tools_and_order"] is True, "runtime amendment changes non-runtime inputs")
+    require(amendment["result_classification"] == "amended_development_selector", "runtime amendment result classification mismatch")
+    required = {"case_id", "rank", "arm", "receipt_sha256", "verification_sha256"}
+    scopes: dict[str, set[tuple[str, int, str]]] = {}
+    for label in ("rerun", "retained"):
+        episodes = amendment[f"{label}_episodes"]
+        require(isinstance(episodes, list) and len(episodes) == 2, f"runtime amendment {label} scope must contain one pair")
+        keys: set[tuple[str, int, str]] = set()
+        for index, episode in enumerate(episodes):
+            episode = _require_exact_keys(episode, required, f"registration.runtime_amendment.{label}_episodes[{index}]")
+            require(episode["arm"] in ALLOWED_ARMS and type(episode["rank"]) is int, f"runtime amendment {label} identity invalid")
+            require(HEX64.fullmatch(episode["receipt_sha256"]) is not None, f"runtime amendment {label} receipt digest invalid")
+            require(HEX64.fullmatch(episode["verification_sha256"]) is not None, f"runtime amendment {label} verification digest invalid")
+            keys.add((episode["case_id"], episode["rank"], episode["arm"]))
+        require(len(keys) == 2 and {key[2] for key in keys} == ALLOWED_ARMS, f"runtime amendment {label} scope is not A/T")
+        require(len({key[:2] for key in keys}) == 1, f"runtime amendment {label} scope spans cases")
+        scopes[label] = keys
+    require(scopes["rerun"].isdisjoint(scopes["retained"]), "runtime amendment scopes overlap")
+    return amendment
+
+
+def validate_episode_lineage(
+    registration: Mapping[str, Any],
+    registration_bytes: bytes,
+    selection_bytes: bytes,
+    episode: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    receipt_bytes: bytes,
+    verification_bytes: bytes,
+) -> None:
+    amendment = validate_runtime_amendment(registration)
+    if amendment is None:
+        return
+    key = (episode["case_id"], episode["rank"], episode["arm"])
+    rerun = {
+        (item["case_id"], item["rank"], item["arm"]): item
+        for item in amendment["rerun_episodes"]
+    }
+    retained = {
+        (item["case_id"], item["rank"], item["arm"]): item
+        for item in amendment["retained_episodes"]
+    }
+    receipt_registration = receipt.get("registration")
+    receipt_selection = receipt.get("selection")
+    require(isinstance(receipt_registration, dict), "amended episode registration reference missing")
+    require(isinstance(receipt_selection, dict), "amended episode selection reference missing")
+    if key in rerun:
+        require(receipt_registration.get("sha256") == sha256_bytes(registration_bytes), "rerun episode binds another registration")
+        require(receipt_selection.get("sha256") == sha256_bytes(selection_bytes), "rerun episode binds another selection")
+        require(sha256_bytes(receipt_bytes) != rerun[key]["receipt_sha256"], "rerun episode reused superseded receipt")
+        require(sha256_bytes(verification_bytes) != rerun[key]["verification_sha256"], "rerun episode reused superseded verification")
+    elif key in retained:
+        require(sha256_bytes(receipt_bytes) == retained[key]["receipt_sha256"], "retained episode receipt differs from amendment")
+        require(sha256_bytes(verification_bytes) == retained[key]["verification_sha256"], "retained episode verification differs from amendment")
+        require(receipt_registration.get("sha256") == amendment["original_registration_sha256"], "retained episode registration differs from original")
+        require(receipt_selection.get("sha256") == amendment["original_selection_sha256"], "retained episode selection differs from original")
+    else:
+        raise FailClosed(f"episode is outside runtime amendment lineage: {key}")
+
+
 def _normalize_policy(value: Any, arm: str) -> str:
     require(isinstance(value, str), "episode policy must be a string")
     normalized = {"A": "control", "T": "treatment"}.get(value, value)
@@ -222,7 +327,11 @@ def _same_ref(left: Any, right: Any, label: str) -> None:
 
 
 def validate_episode_input(
-    plan: Mapping[str, Any], episode: Mapping[str, Any]
+    plan: Mapping[str, Any],
+    episode: Mapping[str, Any],
+    registration: Mapping[str, Any],
+    registration_bytes: bytes,
+    selection_bytes: bytes,
 ) -> dict[str, Any]:
     model_root = Path(plan["model_output_root"])
     receipt_path, receipt_bytes = validate_file_reference(
@@ -233,6 +342,15 @@ def validate_episode_input(
     )
     receipt = json.loads(receipt_bytes)
     verification = json.loads(verification_bytes)
+    validate_episode_lineage(
+        registration,
+        registration_bytes,
+        selection_bytes,
+        episode,
+        receipt,
+        receipt_bytes,
+        verification_bytes,
+    )
     require(
         receipt.get("schema_version") == "issue825-episode-receipt-v1",
         "episode receipt schema mismatch",
@@ -326,15 +444,49 @@ def validate_episode_input(
 
     token_ledger = receipt.get("token_ledger")
     require(isinstance(token_ledger, dict), "episode token ledger missing")
-    require(
-        token_ledger.get("schema_version") == TOKEN_LEDGER_SCHEMA
-        and token_ledger.get("valid") is True
-        and token_ledger.get("errors") == [],
-        "episode token ledger v3 invalid",
+    require(token_ledger.get("schema_version") == TOKEN_LEDGER_SCHEMA, "episode token ledger schema invalid")
+    token_usage_observed = (
+        token_ledger.get("valid") is True and token_ledger.get("errors") == []
     )
+    if not token_usage_observed:
+        require(
+            disposition in {"incomplete_evidence", "noncompliant"}
+            and evaluator_authorized is False,
+            "invalid token evidence may only produce an unauthorized zero-invocation disposition",
+        )
+        require(token_ledger.get("valid") is False, "invalid token ledger validity flag malformed")
+        require(
+            isinstance(token_ledger.get("errors"), list)
+            and token_ledger["errors"]
+            and all(isinstance(item, str) and item for item in token_ledger["errors"]),
+            "invalid token ledger must retain concrete errors",
+        )
+        require(token_ledger.get("model_invoked") is True, "invalid token ledger must describe an invoked model")
+        require(
+            all(
+                token_ledger.get(key) is None
+                for key in (
+                    "input_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "output_tokens",
+                    "provider_total_tokens", "reasoning_tokens", "cli_turns",
+                    "provider_requests",
+                )
+            ),
+            "invalid token ledger must not invent provider counters",
+        )
+        require(
+            token_ledger.get("provider_responses") is None
+            or (
+                type(token_ledger["provider_responses"]) is int
+                and token_ledger["provider_responses"] >= 0
+            ),
+            "invalid token ledger provider response count malformed",
+        )
     timing = receipt.get("timing_ledger")
     require(isinstance(timing, dict), "episode timing ledger missing")
-    if token_ledger.get("model_invoked") is False:
+    if not token_usage_observed:
+        pass
+    elif token_ledger.get("model_invoked") is False:
         require(
             disposition == "noncompliant"
             and receipt.get("returncode") is None
@@ -613,7 +765,15 @@ def validate_plan(path: Path) -> dict[str, Any]:
             == episode["official_image_config_id"],
             "local Docker image ID differs from registered manifest config ID",
         )
-        validated.append(validate_episode_input(plan, episode))
+        validated.append(
+            validate_episode_input(
+                plan,
+                episode,
+                registration,
+                registration_bytes,
+                selection_bytes,
+            )
+        )
     expected = {(case_id, arm) for case_id in selected for arm in ALLOWED_ARMS}
     require(seen == expected, "plan does not contain both A/T episodes for both cases")
 

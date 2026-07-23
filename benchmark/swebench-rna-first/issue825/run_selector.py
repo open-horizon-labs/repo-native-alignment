@@ -35,6 +35,10 @@ TOKEN_LEDGER_SCHEMA = "issue825-token-ledger-v3"
 QUERY_EVIDENCE_SCHEMA = "issue825-query-evidence-v2"
 EMPTY_MCP_BYTES = b'{"mcpServers":{}}\n'
 READY_SENTINEL = "status=READY embeddings=true retrieval=hybrid rerank=true metal=true fallback=false"
+ORIGINAL_REGISTRATION_SHA256 = "dbfcc2553cd5cda945e53295f11ea21100265aff3c8131e45f6543fc7cf56fbc"
+ORIGINAL_SELECTION_SHA256 = "2898db4e0a083fd3facd4799534a24b8e1344af47a6142c4ba668f0a08216a66"
+AMENDED_SELECTION_STATE = "selected_pre_amended_rerun"
+RUNTIME_AMENDMENT_SCHEMA = "issue825-runtime-amendment-v1"
 SOURCE = Path(__file__).resolve().parent
 CODE_KINDS = {
     "class", "const", "enum", "function", "interface", "method", "module",
@@ -574,11 +578,74 @@ def validate_registered_sources(registration: Mapping[str, Any]) -> None:
         require(registered.get(key) == sha_file(SOURCE / filename), f"registered source hash mismatch: {filename}")
 
 
+def validate_runtime_amendment(registration: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    amendment = registration.get("runtime_amendment")
+    if amendment is None:
+        return None
+    require(isinstance(amendment, dict), "registration runtime amendment must be an object")
+    exact_keys(
+        amendment,
+        {
+            "schema_version", "classification", "reason", "published_before_rerun",
+            "official_evaluator_invocations_before_amendment",
+            "original_registration_sha256", "original_selection_sha256",
+            "original_wall_seconds", "amended_wall_seconds",
+            "original_budget_usd", "amended_budget_usd", "rerun_episodes",
+            "retained_episodes", "fresh_sessions_required", "resume_allowed",
+            "same_cases_commits_trees_caches_prompts_tools_and_order", "result_classification",
+        },
+        "registration.runtime_amendment",
+    )
+    require(amendment["schema_version"] == RUNTIME_AMENDMENT_SCHEMA, "runtime amendment schema mismatch")
+    require(amendment["classification"] == "post_start_administrative_runtime_amendment", "runtime amendment classification mismatch")
+    require(amendment["published_before_rerun"] is True, "runtime amendment was not frozen before rerun")
+    require(amendment["official_evaluator_invocations_before_amendment"] == 0, "runtime amendment follows evaluator execution")
+    require(amendment["original_registration_sha256"] == ORIGINAL_REGISTRATION_SHA256, "runtime amendment original registration mismatch")
+    require(amendment["original_selection_sha256"] == ORIGINAL_SELECTION_SHA256, "runtime amendment original selection mismatch")
+    require(
+        (amendment["original_wall_seconds"], amendment["amended_wall_seconds"]) == (600, 1200),
+        "runtime amendment wall limit mismatch",
+    )
+    require(
+        (amendment["original_budget_usd"], amendment["amended_budget_usd"]) == (3.0, 6.0),
+        "runtime amendment budget mismatch",
+    )
+    require(amendment["fresh_sessions_required"] is True and amendment["resume_allowed"] is False, "runtime amendment session isolation mismatch")
+    require(amendment["same_cases_commits_trees_caches_prompts_tools_and_order"] is True, "runtime amendment changes non-runtime inputs")
+    require(amendment["result_classification"] == "amended_development_selector", "runtime amendment result classification mismatch")
+    rerun = amendment["rerun_episodes"]
+    retained = amendment["retained_episodes"]
+    require(isinstance(rerun, list) and isinstance(retained, list), "runtime amendment episode scopes must be lists")
+    require(len(rerun) == 2 and len(retained) == 2, "runtime amendment must rerun and retain one complete pair")
+    required_episode_keys = {"case_id", "rank", "arm", "receipt_sha256", "verification_sha256"}
+    for label, episodes in (("rerun", rerun), ("retained", retained)):
+        for index, episode in enumerate(episodes):
+            exact_keys(episode, required_episode_keys, f"registration.runtime_amendment.{label}_episodes[{index}]")
+            require(episode["arm"] in {"A", "T"}, f"runtime amendment {label} arm invalid")
+            require(type(episode["rank"]) is int, f"runtime amendment {label} rank invalid")
+            require(re.fullmatch(r"[0-9a-f]{64}", episode["receipt_sha256"]) is not None, f"runtime amendment {label} receipt digest invalid")
+            require(re.fullmatch(r"[0-9a-f]{64}", episode["verification_sha256"]) is not None, f"runtime amendment {label} verification digest invalid")
+    rerun_keys = {(item["case_id"], item["rank"], item["arm"]) for item in rerun}
+    retained_keys = {(item["case_id"], item["rank"], item["arm"]) for item in retained}
+    require(len(rerun_keys) == 2 and {item[2] for item in rerun_keys} == {"A", "T"}, "runtime amendment rerun scope is not one A/T pair")
+    require(len({(item[0], item[1]) for item in rerun_keys}) == 1, "runtime amendment rerun scope spans cases")
+    require(len(retained_keys) == 2 and {item[2] for item in retained_keys} == {"A", "T"}, "runtime amendment retained scope is not one A/T pair")
+    require(len({(item[0], item[1]) for item in retained_keys}) == 1, "runtime amendment retained scope spans cases")
+    require(rerun_keys.isdisjoint(retained_keys), "runtime amendment scopes overlap")
+    return amendment
+
+
 def validate_authoritative_selection(
     selection: Mapping[str, Any], registration_bytes: bytes
 ) -> None:
     require(selection.get("authoritative") is True, "selection is not authoritative")
-    require(selection.get("state") == "selected_pre_model", "selection state is not selected_pre_model")
+    try:
+        registration = json.loads(registration_bytes)
+    except json.JSONDecodeError as exc:
+        raise FailClosed(f"registration is invalid JSON: {exc}") from exc
+    amendment = validate_runtime_amendment(registration)
+    expected_state = AMENDED_SELECTION_STATE if amendment is not None else "selected_pre_model"
+    require(selection.get("state") == expected_state, f"selection state is not {expected_state}")
     require(
         selection.get("problem_statements_inspected_by_human_before_selection") is False,
         "selection permits prior human problem-statement inspection",
@@ -591,18 +658,29 @@ def validate_authoritative_selection(
         selection.get("registration_sha256") == sha_bytes(registration_bytes),
         "selection binds another registration",
     )
+    if amendment is not None:
+        require(selection.get("supersedes_selection_sha256") == ORIGINAL_SELECTION_SHA256, "amended selection does not preserve original selection")
+        require(selection.get("prior_model_calls_retained") is True, "amended selection hides prior model calls")
+        require(selection.get("fresh_case_claim") is False, "amended selection improperly claims fresh cases")
+        require(
+            selection.get("runtime_amendment_sha256") == sha_bytes(canonical(amendment)),
+            "selection binds another runtime amendment",
+        )
 
 
 def verify_runtime(manifest: Mapping[str, Any], registration: Mapping[str, Any]) -> tuple[Path, str]:
     runtime = registration["model_runtime"]
+    amendment = validate_runtime_amendment(registration)
+    wall_seconds = 1200 if amendment is not None else 600
+    budget_usd = 6.0 if amendment is not None else 3.0
     require(runtime == {
         "cli": "Claude Code",
         "cli_version": "2.1.216",
         "cli_sha256": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
         "model": "claude-sonnet-5",
         "effort": "high",
-        "wall_seconds": 600,
-        "budget_usd": 3.0,
+        "wall_seconds": wall_seconds,
+        "budget_usd": budget_usd,
         "invocations_per_episode": 1,
         "resume_allowed": False,
         "model_retry_allowed": False,
@@ -1530,22 +1608,54 @@ def execute_case(prepared: PreparedRun, case: PreparedCase) -> tuple[list[dict[s
     return receipts, errors
 
 
+def execution_cases(prepared: PreparedRun) -> tuple[PreparedCase, ...]:
+    amendment = validate_runtime_amendment(prepared.registration)
+    if amendment is None:
+        return prepared.cases
+    rerun_pairs = {(item["case_id"], item["rank"]) for item in amendment["rerun_episodes"]}
+    selected = tuple(
+        case for case in prepared.cases if (case.case_id, case.rank) in rerun_pairs
+    )
+    require(len(selected) == 1, "amended execution did not select exactly one frozen case")
+    rerun_arms = [
+        item["arm"] for item in amendment["rerun_episodes"]
+        if (item["case_id"], item["rank"]) == (selected[0].case_id, selected[0].rank)
+    ]
+    require(set(rerun_arms) == {"A", "T"}, "amended execution does not contain both arms")
+    require(selected[0].arm_order == ("A", "T"), "amended rerun changed the frozen xarray arm order")
+    return selected
+
+
 def execute(prepared: PreparedRun) -> int:
+    cases = execution_cases(prepared)
+    amendment = validate_runtime_amendment(prepared.registration)
     prepared.output_root.mkdir(parents=True, exist_ok=False)
     start = {
-        "schema_version": "issue825-selector-invocation-v1",
+        "schema_version": (
+            "issue825-selector-amended-invocation-v1"
+            if amendment is not None
+            else "issue825-selector-invocation-v1"
+        ),
         "started_at": utc_now(),
         "run_manifest": prepared.manifest_ref,
-        "parallel_cases": 2,
+        "parallel_cases": len(cases),
         "same_case_serial": True,
-        "models_authorized": 4,
+        "models_authorized": len(cases) * 2,
+        "runtime_amendment_sha256": (
+            sha_bytes(canonical(amendment)) if amendment is not None else None
+        ),
+        "execution_episode_keys": [
+            {"case_id": case.case_id, "rank": case.rank, "arm": arm}
+            for case in cases
+            for arm in case.arm_order
+        ],
         "official_evaluator_invoked": False,
     }
     atomic_write(prepared.output_root / "invocation-start.json", canonical(start))
     receipts: list[dict[str, Any]] = []
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="issue825") as executor:
-        futures = {executor.submit(execute_case, prepared, case): case for case in prepared.cases}
+    with ThreadPoolExecutor(max_workers=len(cases), thread_name_prefix="issue825") as executor:
+        futures = {executor.submit(execute_case, prepared, case): case for case in cases}
         for future in as_completed(futures):
             case = futures[future]
             try:
@@ -1562,15 +1672,18 @@ def execute(prepared: PreparedRun) -> int:
             key=lambda ref: ref["path"],
         ),
         "worker_errors": sorted(errors),
-        "all_four_episodes_recorded": len(receipts) == 4,
+        "all_authorized_episodes_recorded": len(receipts) == len(cases) * 2,
+        "all_four_episodes_recorded": amendment is None and len(receipts) == 4,
         "evaluator_authorizations": sum(receipt.get("evaluator_authorized") is True for receipt in receipts),
         "official_evaluator_invoked": False,
     }
     atomic_write(prepared.output_root / "invocation-result.json", canonical(result))
-    return 0 if not errors and len(receipts) == 4 else 1
+    return 0 if not errors and len(receipts) == len(cases) * 2 else 1
 
 
 def preflight_summary(prepared: PreparedRun) -> dict[str, Any]:
+    cases = execution_cases(prepared)
+    amendment = validate_runtime_amendment(prepared.registration)
     return {
         "status": "READY_TO_EXECUTE_SELECTOR",
         "run_manifest": prepared.manifest_ref,
@@ -1609,7 +1722,23 @@ def preflight_summary(prepared: PreparedRun) -> dict[str, Any]:
             for case in prepared.cases
         ],
         "same_case_serial": True,
-        "maximum_concurrent_cases": 2,
+        "maximum_concurrent_cases": len(cases),
+        "execution_episode_keys": [
+            {"case_id": case.case_id, "rank": case.rank, "arm": arm}
+            for case in cases
+            for arm in case.arm_order
+        ],
+        "retained_episode_keys": (
+            [
+                {"case_id": item["case_id"], "rank": item["rank"], "arm": item["arm"]}
+                for item in amendment["retained_episodes"]
+            ]
+            if amendment is not None
+            else []
+        ),
+        "runtime_amendment_sha256": (
+            sha_bytes(canonical(amendment)) if amendment is not None else None
+        ),
         "models_launched": 0,
         "official_evaluator_invoked": False,
     }

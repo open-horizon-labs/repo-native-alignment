@@ -31,6 +31,40 @@ def write_bytes(path: Path, data: bytes) -> dict[str, object]:
     return {"path": str(path), "bytes": len(data), "sha256": runner.sha256_bytes(data)}
 
 
+def runtime_amendment(
+    *, retained_receipt_sha256: str = "c" * 64,
+    retained_verification_sha256: str = "d" * 64,
+) -> dict[str, object]:
+    return {
+        "schema_version": runner.RUNTIME_AMENDMENT_SCHEMA,
+        "classification": "post_start_administrative_runtime_amendment",
+        "reason": "both arms reached the original administrative wall limit",
+        "published_before_rerun": True,
+        "official_evaluator_invocations_before_amendment": 0,
+        "original_registration_sha256": runner.ORIGINAL_REGISTRATION_SHA256,
+        "original_selection_sha256": runner.ORIGINAL_SELECTION_SHA256,
+        "original_wall_seconds": 600,
+        "amended_wall_seconds": 1200,
+        "original_budget_usd": 3.0,
+        "amended_budget_usd": 6.0,
+        "rerun_episodes": [
+            {"case_id": "pydata__xarray-4687", "rank": 1, "arm": arm,
+             "receipt_sha256": character * 64, "verification_sha256": "e" * 64}
+            for arm, character in (("A", "a"), ("T", "b"))
+        ],
+        "retained_episodes": [
+            {"case_id": "django__django-15503", "rank": 2, "arm": arm,
+             "receipt_sha256": retained_receipt_sha256,
+             "verification_sha256": retained_verification_sha256}
+            for arm in ("A", "T")
+        ],
+        "fresh_sessions_required": True,
+        "resume_allowed": False,
+        "same_cases_commits_trees_caches_prompts_tools_and_order": True,
+        "result_classification": "amended_development_selector",
+    }
+
+
 class Fixture:
     def __init__(
         self,
@@ -40,6 +74,7 @@ class Fixture:
         noncompliant_keys: set[tuple[int, str]] = frozenset(),
         incomplete_keys: set[tuple[int, str]] = frozenset(),
         pre_model_keys: set[tuple[int, str]] = frozenset(),
+        invalid_token_keys: set[tuple[int, str]] = frozenset(),
         arm_tokens: dict[str, int] | None = None,
     ) -> None:
         self.root = root
@@ -130,6 +165,19 @@ class Fixture:
                     "provider_responses": None,
                     "provider_requests": None,
                 })
+                if key in invalid_token_keys:
+                    token_ledger = {
+                        **token_ledger,
+                        "valid": False,
+                        "errors": ["missing_or_invalid_observed_provider_usage"],
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "cache_creation_input_tokens": None,
+                        "cache_read_input_tokens": None,
+                        "provider_total_tokens": None,
+                        "reasoning_tokens": None,
+                        "cli_turns": None,
+                    }
                 timing_ledger = {
                     "model_wall_seconds": 0.0 if pre_model else 100.0,
                     "rna_preprocessing_seconds": 1.0 if pre_model else 0.0,
@@ -257,6 +305,32 @@ class AuthoritativeSelectionInputTests(unittest.TestCase):
             with self.subTest(validator=validator.__module__):
                 validator(dict(self.valid_selection), self.registration_bytes)
 
+    def test_amended_selection_is_accepted_only_with_exact_disclosure(self) -> None:
+        registration_bytes = runner.canonical_json_bytes({
+            "schema_version": "issue825-treatment-registration-v3",
+            "issue": 825,
+            "runtime_amendment": runtime_amendment(),
+        })
+        amendment = json.loads(registration_bytes)["runtime_amendment"]
+        selection = {
+            "authoritative": True,
+            "state": runner.AMENDED_SELECTION_STATE,
+            "problem_statements_inspected_by_human_before_selection": False,
+            "gold_or_outcomes_inspected_before_selection": False,
+            "registration_sha256": runner.sha256_bytes(registration_bytes),
+            "supersedes_selection_sha256": runner.ORIGINAL_SELECTION_SHA256,
+            "prior_model_calls_retained": True,
+            "fresh_case_claim": False,
+            "runtime_amendment_sha256": runner.sha256_bytes(
+                runner.canonical_json_bytes(amendment)
+            ),
+        }
+        for validator, failure in self.validators():
+            with self.subTest(validator=validator.__module__):
+                validator(dict(selection), registration_bytes)
+                with self.assertRaises(failure):
+                    validator({**selection, "fresh_case_claim": True}, registration_bytes)
+
     def test_setup_qualification_and_inspected_inputs_are_rejected(self) -> None:
         invalid_updates = (
             {"authoritative": False},
@@ -306,6 +380,98 @@ class AuthoritativeSelectionInputTests(unittest.TestCase):
 
 
 class EvaluatorToolsTests(unittest.TestCase):
+    def test_invalid_tokens_are_retained_only_as_unauthorized_zero_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys={(1, "A")},
+                incomplete_keys={(1, "A")},
+                invalid_token_keys={(1, "A")},
+            )
+            plan = fixture.validated_plan()
+            episode = next(
+                item for item in plan["_validated_episodes"]
+                if item["episode"]["rank"] == 1 and item["episode"]["arm"] == "A"
+            )
+            self.assertEqual(episode["disposition"], "incomplete_evidence")
+            runner.seal_all(plan)
+            seal_set = runner.validate_seal_set(plan)
+            seal = next(
+                item for item in seal_set["seals"]
+                if item["seal"]["rank"] == 1 and item["seal"]["arm"] == "A"
+            )
+            skip = runner.write_skip_receipt(plan, seal)
+            self.assertFalse(skip["official_evaluator_invocation_authorized"])
+            self.assertFalse(skip["official_evaluator_invocation_confirmed"])
+            self.assertEqual(skip["disposition"], "incomplete_evidence")
+
+    def test_authorized_episode_with_invalid_tokens_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys={(1, "A")},
+                invalid_token_keys={(1, "A")},
+            )
+            with self.assertRaisesRegex(
+                runner.FailClosed,
+                "invalid token evidence may only produce an unauthorized",
+            ):
+                fixture.validated_plan()
+
+    def test_mixed_lineage_accepts_new_xarray_and_exact_retained_django_only(self) -> None:
+        retained_receipt = {
+            "registration": {"sha256": runner.ORIGINAL_REGISTRATION_SHA256},
+            "selection": {"sha256": runner.ORIGINAL_SELECTION_SHA256},
+        }
+        retained_receipt_bytes = runner.canonical_json_bytes(retained_receipt)
+        retained_verification_bytes = runner.canonical_json_bytes({"retained": True})
+        amendment = runtime_amendment(
+            retained_receipt_sha256=runner.sha256_bytes(retained_receipt_bytes),
+            retained_verification_sha256=runner.sha256_bytes(retained_verification_bytes),
+        )
+        registration = {
+            "schema_version": "issue825-treatment-registration-v3",
+            "issue": 825,
+            "runtime_amendment": amendment,
+        }
+        registration_bytes = runner.canonical_json_bytes(registration)
+        selection_bytes = runner.canonical_json_bytes({"amended": True})
+
+        runner.validate_episode_lineage(
+            registration,
+            registration_bytes,
+            selection_bytes,
+            {"case_id": "django__django-15503", "rank": 2, "arm": "A"},
+            retained_receipt,
+            retained_receipt_bytes,
+            retained_verification_bytes,
+        )
+        with self.assertRaisesRegex(runner.FailClosed, "retained episode receipt differs"):
+            runner.validate_episode_lineage(
+                registration,
+                registration_bytes,
+                selection_bytes,
+                {"case_id": "django__django-15503", "rank": 2, "arm": "A"},
+                retained_receipt,
+                retained_receipt_bytes + b"tamper",
+                retained_verification_bytes,
+            )
+
+        rerun_receipt = {
+            "registration": {"sha256": runner.sha256_bytes(registration_bytes)},
+            "selection": {"sha256": runner.sha256_bytes(selection_bytes)},
+        }
+        rerun_receipt_bytes = runner.canonical_json_bytes(rerun_receipt)
+        runner.validate_episode_lineage(
+            registration,
+            registration_bytes,
+            selection_bytes,
+            {"case_id": "pydata__xarray-4687", "rank": 1, "arm": "T"},
+            rerun_receipt,
+            rerun_receipt_bytes,
+            runner.canonical_json_bytes({"rerun": True}),
+        )
+
     def test_plan_accepts_pre_model_t_failures_with_null_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Fixture(

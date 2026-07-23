@@ -526,10 +526,17 @@ def decide_for_selection(
             "selection_authoritative": False,
             "selection_state": selection.get("state"),
         }
+    state = selection.get("state")
     evaluator.require(
-        selection.get("state") == "selected_pre_model",
-        "authoritative selection state is not selected_pre_model",
+        state in {"selected_pre_model", evaluator.AMENDED_SELECTION_STATE},
+        "authoritative selection state is neither original nor amended",
     )
+    if state == evaluator.AMENDED_SELECTION_STATE:
+        evaluator.require(
+            selection.get("prior_model_calls_retained") is True
+            and selection.get("fresh_case_claim") is False,
+            "amended selection does not disclose prior model exposure",
+        )
     evaluator.require(
         selection.get("problem_statements_inspected_by_human_before_selection") is False,
         "authoritative selection permits prior human problem-statement inspection",
@@ -540,7 +547,12 @@ def decide_for_selection(
     )
     return {
         "selection_authoritative": True,
-        "selection_state": selection.get("state"),
+        "selection_state": state,
+        "protocol_classification": (
+            "amended_development_selector"
+            if state == evaluator.AMENDED_SELECTION_STATE
+            else "fresh_preregistered_selector"
+        ),
         **decide_registered(metrics),
     }
 
