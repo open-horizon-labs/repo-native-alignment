@@ -687,7 +687,7 @@ fn new_record(
     }
 }
 
-fn node_input_hash(node: &Node) -> String {
+pub(crate) fn node_input_hash(node: &Node) -> String {
     let mut hasher = blake3::Hasher::new();
     for value in [
         node.stable_id(),

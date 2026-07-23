@@ -3108,7 +3108,11 @@ def classify_path(path: str, prefix: bytes) -> tuple[str, str | None, str]:
         return "excluded_data", "non_language_data", "plain_test_or_dataset_payload"
     if extension in DOC_EXTENSIONS or filename.startswith(DOC_FILENAME_PREFIXES):
         return "docs", None, "project_document"
-    if extension in CONFIG_EXTENSIONS or filename in CONFIG_FILENAMES:
+    if (
+        extension in CONFIG_EXTENSIONS
+        or filename in CONFIG_FILENAMES
+        or filename.startswith("dockerfile.")
+    ):
         return "config", None, "project_configuration"
     if filename.startswith("requirements") or filename == "manifest.in":
         return "config", None, "project_configuration"
@@ -3144,6 +3148,8 @@ def language_for_path(path: str, prefix: bytes, role: str) -> str:
     filename = pure.name.lower()
     components = [component.lower() for component in pure.parts]
 
+    if filename == "dockerfile" or filename.startswith("dockerfile."):
+        return "config"
     if extension == "sample":
         if filename == "code.sample":
             return "python"
@@ -3160,7 +3166,7 @@ def language_for_path(path: str, prefix: bytes, role: str) -> str:
             return "python"
         if any(shell in shebang for shell in (b"sh", b"bash", b"zsh", b"xonsh")):
             return "shell"
-        if filename in {"makefile", "gnumakefile", "dockerfile", "pylintrc", "matplotlibrc"}:
+        if filename in {"makefile", "gnumakefile", "pylintrc", "matplotlibrc"}:
             return "config"
         if filename.startswith(".") or filename in {"codeowners", "procfile"}:
             return "config"

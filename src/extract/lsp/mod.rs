@@ -740,7 +740,9 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let special_language = if filename == "code.sample" {
+    let special_language = if filename == "dockerfile" || filename.starts_with("dockerfile.") {
+        Some("config")
+    } else if filename == "code.sample" {
         Some("python")
     } else if filename == "tox.ini.sample" {
         Some("config")
@@ -781,7 +783,6 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
     }
     let language = if filename == "makefile"
         || filename == "gnumakefile"
-        || filename == "dockerfile"
         || filename == "manifest.in"
         || filename.starts_with("requirements")
         || filename.starts_with('.')
@@ -5293,8 +5294,7 @@ mod tests {
             .find(|node| {
                 node.id.file.as_path() == Path::new("src/app.py")
                     && node.id.name == "generated_target@lsp:49:0-50:1"
-                    && node.metadata.get("lsp_name").map(String::as_str)
-                        == Some("generated_target")
+                    && node.metadata.get("lsp_name").map(String::as_str) == Some("generated_target")
                     && node.source == ExtractionSource::Lsp
             })
             .expect("raw endpoint without an extracted node is materialized")

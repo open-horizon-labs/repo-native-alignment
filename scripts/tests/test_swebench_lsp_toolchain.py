@@ -26,6 +26,37 @@ SPEC.loader.exec_module(TOOLCHAIN)
 
 
 class SwebenchLspToolchainTests(unittest.TestCase):
+    def test_dockerfile_variants_share_config_inventory_partition(self) -> None:
+        for path in (
+            "Dockerfile",
+            "Dockerfile.prod",
+            "doc/Dockerfile.htmldoc",
+        ):
+            with self.subTest(path=path):
+                role, exclusion, _ = TOOLCHAIN.classify_path(
+                    path, b"FROM python:3.13\n"
+                )
+                self.assertEqual(role, "config")
+                self.assertIsNone(exclusion)
+                self.assertEqual(
+                    TOOLCHAIN.language_for_path(
+                        path, b"FROM python:3.13\n", role
+                    ),
+                    "config",
+                )
+        role, _, _ = TOOLCHAIN.classify_path(
+            "doc/NotDockerfile.htmldoc", b"FROM python:3.13\n"
+        )
+        self.assertEqual(role, "source")
+        self.assertEqual(
+            TOOLCHAIN.language_for_path(
+                "doc/NotDockerfile.htmldoc",
+                b"FROM python:3.13\n",
+                role,
+            ),
+            "cohort-text",
+        )
+
     def test_minified_body_provenance_accepts_direct_and_wrapped_structural_ast(
         self,
     ) -> None:
