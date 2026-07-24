@@ -18,10 +18,10 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v15.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v15.json"
+SCHEDULE_FILENAME = "execution-schedule-v16.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v16.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v15.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v16.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
@@ -54,7 +54,7 @@ REGISTERED_SOURCE_DELTA = {
             "63b556e094f0553701118fbea7db9729a327f30496388778fb2ff48b8d28284e"
         ),
         "successor": (
-            "027696d72ccd8855f92b084fb56d74a316edeee2cf38d6b47280c069c3059cb9"
+            "9dea27168d17427e7b6f2fb72298f4b9e597d5cb6b3a4f0725042327b76d4fd4"
         ),
     },
     "runner_sha256": {
@@ -62,18 +62,19 @@ REGISTERED_SOURCE_DELTA = {
             "cc250022e01b5c708d5d4d0c5a9ba8caad97f7a7d08006c231f7eb17cb58d658"
         ),
         "successor": (
-            "f88e2fbedf77e8205a2ef5f971168bc867d4868eb7aec23c7c03d23020223b3a"
+            "eef0074ca3242e098b80a4b9b195465f1d27cffad563606c46755c16d5b74088"
         ),
     },
 }
 SUCCESSOR_REGISTERED_FILES_SHA256 = (
-    "31f803daf41ff1f768bc721e9ccc5b8d0e3d4b83bfb8a8677cfb616ca0508cbb"
+    "72ede139d53507c009f77a539c71c345166c1192f296b5bd058d83065065fe66"
 )
 PROTOCOL_CHANGE = (
     "deterministic_issue_query_preconditioning_and_gateway_recovery_"
     "plus_qualified_registration_source_bridge_"
     "plus_native_tool_parallelism_"
     "plus_trace_namespace_classification_repair_"
+    "plus_internal_tracked_symlink_support_"
     "no_cohort_or_arm_order_change"
 )
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
@@ -315,7 +316,8 @@ def validate_predecessor_activity(
         and document["protocol_change"]
         == (
             "deterministic_issue_query_preconditioning_and_gateway_recovery_"
-            "plus_trace_namespace_classification_repair"
+            "plus_trace_namespace_classification_repair_"
+            "plus_internal_tracked_symlink_support"
         ),
         "predecessor activity semantics drift",
     )
@@ -331,6 +333,7 @@ def validate_predecessor_activity(
             "native_tool_parallelism_restoration",
             "authoritative_model_usage_reporting",
             "trace_namespace_classification_repair",
+            "internal_tracked_symlink_support",
         ]
         and adaptations[0].get("applies_to_arms") == ["T"]
         and all(

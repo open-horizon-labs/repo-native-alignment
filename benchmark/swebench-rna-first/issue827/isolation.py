@@ -432,8 +432,12 @@ def validate_effective_path(
     return result
 
 
-def audit_private_tree(root: Path) -> dict[str, object]:
-    """Reject aliases, links, hardlinks, and special files in an episode tree."""
+def audit_private_tree(
+    root: Path,
+    *,
+    allow_internal_symlinks: bool = False,
+) -> dict[str, object]:
+    """Reject aliases, escaping links, hardlinks, and special files."""
 
     if not root.is_absolute():
         raise IsolationViolation("private_tree_root_not_absolute", path=str(root))
@@ -457,6 +461,7 @@ def audit_private_tree(root: Path) -> dict[str, object]:
 
     regular_files = 0
     directories = 0
+    links = 0
     total_bytes = 0
     digest = hashlib.sha256()
     stack = [root]
@@ -469,9 +474,33 @@ def audit_private_tree(root: Path) -> dict[str, object]:
                 metadata = entry.stat(follow_symlinks=False)
                 relative = path.relative_to(root).as_posix()
                 if entry.is_symlink():
-                    raise IsolationViolation(
-                        "private_tree_contains_symlink", path=relative
+                    if not allow_internal_symlinks:
+                        raise IsolationViolation(
+                            "private_tree_contains_symlink", path=relative
+                        )
+                    target = os.readlink(path)
+                    try:
+                        resolved_target = path.resolve(strict=True)
+                    except OSError as exc:
+                        raise IsolationViolation(
+                            "private_tree_symlink_target_unavailable",
+                            path=relative,
+                            errno=exc.errno,
+                        ) from exc
+                    if (
+                        os.path.isabs(target)
+                        or "\x00" in target
+                        or not resolved_target.is_relative_to(root)
+                    ):
+                        raise IsolationViolation(
+                            "private_tree_symlink_escapes_root",
+                            path=relative,
+                        )
+                    links += 1
+                    digest.update(
+                        canonical(["symlink", relative, target])
                     )
+                    continue
                 if stat.S_ISDIR(metadata.st_mode):
                     stack.append(path)
                     digest.update(canonical(["directory", relative]))
@@ -507,7 +536,7 @@ def audit_private_tree(root: Path) -> dict[str, object]:
         "regular_files": regular_files,
         "bytes": total_bytes,
         "tree_digest": digest.hexdigest(),
-        "links": 0,
+        "links": links,
         "hardlinks": 0,
         "special_files": 0,
     }

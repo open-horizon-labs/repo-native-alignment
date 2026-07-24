@@ -2668,7 +2668,7 @@ class CheckoutHygieneTests(unittest.TestCase):
                     str(checkout), commit, tree, "arm prelaunch"
                 )
 
-    def test_model_checkout_preflight_rejects_tracked_symlink(self):
+    def test_model_checkout_preflight_allows_tracked_internal_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout, _, _ = self.fixture(Path(tmp).resolve())
             (checkout / "tracked-link.py").symlink_to("tracked.py")
@@ -2690,9 +2690,41 @@ class CheckoutHygieneTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 check=True,
             ).stdout.decode().strip()
+            self.assertEqual(
+                run_selector.verify_model_checkout(
+                    str(checkout), commit, tree, "arm"
+                ),
+                checkout,
+            )
+
+    def test_model_checkout_preflight_rejects_tracked_escaping_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp).resolve()
+            checkout, _, _ = self.fixture(parent)
+            outside = parent / "outside.py"
+            outside.write_text("outside")
+            (checkout / "tracked-link.py").symlink_to("../outside.py")
+            subprocess.run(
+                ["git", "-C", str(checkout), "add", "tracked-link.py"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "commit", "-qm", "tracked link"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
+            tree = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD^{tree}"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
             with self.assertRaisesRegex(
                 run_selector.FailClosed,
-                "private-tree audit failed: private_tree_contains_symlink",
+                "private-tree audit failed: private_tree_symlink_escapes_root",
             ):
                 run_selector.verify_model_checkout(
                     str(checkout), commit, tree, "arm"

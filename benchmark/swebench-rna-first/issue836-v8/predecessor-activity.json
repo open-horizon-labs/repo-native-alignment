@@ -66,6 +66,14 @@
         "T"
       ],
       "scope": "classify only the executable path in execve argv, recognize exact missing SELinux statfs probes, and treat the already-authorized editable checkout as the Bash worker's declared host-path alias while retaining sibling, index, evidence, credential, and network denials"
+    },
+    {
+      "type": "internal_tracked_symlink_support",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "allow only relative Git-tracked symlinks whose strict resolved targets remain inside the already-authorized editable checkout; retain rejection of absolute, broken, untracked, special-file, hardlink, and escaping aliases"
     }
   ],
   "cohort_reused_unchanged": true,
@@ -194,5 +202,5 @@
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair"
+  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair_plus_internal_tracked_symlink_support"
 }

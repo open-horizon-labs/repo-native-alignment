@@ -251,11 +251,32 @@ class PrivateTreeAndLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             (root / "target").write_text("x")
-            (root / "link").symlink_to(root / "target")
+            (root / "link").symlink_to("target")
             with self.assertRaises(IsolationViolation) as raised:
                 audit_private_tree(root)
             self.assertEqual(
                 raised.exception.code, "private_tree_contains_symlink"
+            )
+            allowed = audit_private_tree(
+                root,
+                allow_internal_symlinks=True,
+            )
+            self.assertEqual(allowed["links"], 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            root = parent / "root"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.write_text("x")
+            (root / "link").symlink_to("../outside")
+            with self.assertRaises(IsolationViolation) as raised:
+                audit_private_tree(
+                    root,
+                    allow_internal_symlinks=True,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "private_tree_symlink_escapes_root",
             )
 
     def test_ledger_is_monotonic_hash_chained_and_tamper_evident(self):

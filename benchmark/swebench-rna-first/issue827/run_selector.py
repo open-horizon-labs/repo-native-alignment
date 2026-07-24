@@ -343,7 +343,10 @@ def verify_model_checkout(
 
     checkout = verify_checkout(path_text, commit, tree, where)
     try:
-        isolation.audit_private_tree(checkout)
+        isolation.audit_private_tree(
+            checkout,
+            allow_internal_symlinks=True,
+        )
     except isolation.IsolationViolation as exc:
         raise FailClosed(
             f"{where} private-tree audit failed: {exc.code}"
@@ -1609,7 +1612,10 @@ def configure_episode(
     live_self_test_path = isolation_root / "live-worker-self-test.json"
     atomic_write(live_self_test_path, canonical(case.isolation_worker["live_self_test"]))
 
-    checkout_audit = isolation.audit_private_tree(case.checkouts[arm])
+    checkout_audit = isolation.audit_private_tree(
+        case.checkouts[arm],
+        allow_internal_symlinks=True,
+    )
     model_private_audit = isolation.audit_private_tree(model_private)
     harness_audit = isolation.audit_private_tree(harness_paths["harness"])
     private_audits = {
@@ -3481,7 +3487,8 @@ def launch_episode(
     post_private_audit_path = evidence / "isolation/post-private-tree-audit.json"
     try:
         post_private_audit = isolation.audit_private_tree(
-            case.checkouts[arm]
+            case.checkouts[arm],
+            allow_internal_symlinks=True,
         )
         atomic_write(post_private_audit_path, canonical(post_private_audit))
     except isolation.IsolationViolation as exc:
