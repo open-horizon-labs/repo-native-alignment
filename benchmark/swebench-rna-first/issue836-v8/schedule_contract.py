@@ -18,10 +18,10 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v17.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v17.json"
+SCHEDULE_FILENAME = "execution-schedule-v18.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v18.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v17.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v18.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
@@ -78,6 +78,7 @@ PROTOCOL_CHANGE = (
     "plus_noncontaminating_observation_policy_"
     "plus_workspace_alias_mapping_"
     "plus_three_case_parallelism_"
+    "plus_three_case_assembler_support_"
     "no_cohort_or_arm_order_change"
 )
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
@@ -138,7 +139,7 @@ BASE_SELECTION_SHA256 = (
 BASE_SOURCE_COMMIT = "6bb1bf6200cb9f380007d033f717a2825fe75934"
 BASE_SOURCE_TREE = "70af087a30f93ad204af1196fad30a0da04c3e66"
 APPROVED_ASSEMBLER_SHA256 = (
-    "ab0bed124258bfd473a5be3332bccadb428bd5412f598dd5f5d3035002efb05e"
+    "f9c76a1d5ce0a08827f09a1261741f7fac6f26ed1412a9cdf8b01994ff850e88"
 )
 NO_SPEND = {
     "credentials_accessed": False,
