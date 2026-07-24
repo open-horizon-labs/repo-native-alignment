@@ -1926,7 +1926,8 @@ def execute_wave(
     return 0 if result["all_authorized_episodes_recorded"] else 1
 
 
-GATEWAY_SMOKE_COMMAND = "printf host-null-smoke >/dev/null; exit 7"
+HOST_DEV_NULL_SMOKE_COMMAND = "printf host-null-smoke >/dev/null"
+GATEWAY_SMOKE_COMMAND = "exit 7"
 
 
 def _gateway_smoke_process(
@@ -2062,6 +2063,26 @@ def gateway_smoke(
         str(seatbelt_profile),
     ]
     parent_environment = base.provider_parent_env(episode / "private")
+    host_dev_null, host_dev_null_ref = _gateway_smoke_process(
+        label="00-host-dev-null",
+        argv=[
+            *outer_prefix,
+            "/bin/sh",
+            "-c",
+            HOST_DEV_NULL_SMOKE_COMMAND,
+        ],
+        cwd=checkout,
+        environment=parent_environment,
+        evidence=smoke_evidence,
+        input_bytes=None,
+        timeout_seconds=15.0,
+    )
+    base.require(
+        host_dev_null.returncode == 0
+        and not host_dev_null.stdout
+        and not host_dev_null.stderr,
+        "gateway smoke host /dev/null probe failed",
+    )
 
     def hook_argv(role: str) -> list[str]:
         child_name = (
@@ -2282,9 +2303,11 @@ def gateway_smoke(
         "case_id": case.case_id,
         "arm": "A",
         "command": GATEWAY_SMOKE_COMMAND,
+        "host_dev_null_command": HOST_DEV_NULL_SMOKE_COMMAND,
         "outer_seatbelt": base.file_ref(seatbelt_profile),
         "dev_null_exact_write_root": str(dev_null),
         "processes": [
+            host_dev_null_ref,
             common_pre_ref,
             treatment_pre_ref,
             gateway_process_ref,

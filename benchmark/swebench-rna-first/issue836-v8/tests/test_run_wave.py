@@ -72,6 +72,11 @@ class PriorWaveSealTests(unittest.TestCase):
         )
 
     def test_successor_dns_aliases_are_literal_and_gateway_is_reachable(self) -> None:
+        self.assertEqual(
+            run_wave.HOST_DEV_NULL_SMOKE_COMMAND,
+            "printf host-null-smoke >/dev/null",
+        )
+        self.assertEqual(run_wave.GATEWAY_SMOKE_COMMAND, "exit 7")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             read = root / "read"
