@@ -46,7 +46,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             cls.binding_repo
             / select_cases.ISSUE836_V4_REGISTRATION_PATH
         )
-        registration_path.parent.mkdir(parents=True)
+        registration_path.parent.mkdir(parents=True, exist_ok=True)
         registration_path.write_bytes(
             select_cases.canonical(cls.registration)
         )
