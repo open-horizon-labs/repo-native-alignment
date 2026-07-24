@@ -341,6 +341,83 @@ class TrustedRnaCacheReadScopeTests(unittest.TestCase):
             )
 
 
+class ProviderAuthSeatbeltTests(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "requires macOS Seatbelt",
+    )
+    def test_real_keychain_file_is_readable_and_unwritable(self) -> None:
+        keychain = (
+            Path.home()
+            / "Library"
+            / "Keychains"
+            / "login.keychain-db"
+        )
+        if not keychain.is_file() or keychain.is_symlink():
+            self.skipTest("exact login Keychain is unavailable")
+        self.assertEqual(
+            run_selector.provider_auth_read_files(),
+            [keychain],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = root / "state"
+            state.mkdir()
+            runtime_roots = [
+                path
+                for path in (
+                    Path("/usr"),
+                    Path("/System"),
+                    Path("/Library"),
+                    Path("/opt/homebrew"),
+                    Path(sys.prefix),
+                    Path("/private/etc"),
+                    Path("/private/var/db"),
+                    Path("/private/var/select"),
+                )
+                if path.exists()
+            ]
+            profile = root / "provider-auth-keychain.sb"
+            profile.write_text(
+                run_selector.isolation.generate_outer_seatbelt_profile(
+                    read_roots=[*runtime_roots, keychain, state],
+                    write_roots=[state],
+                )
+            )
+            profile.chmod(0o444)
+            proof = state / "proof"
+            probe = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    str(Path(sys.executable).resolve()),
+                    "-c",
+                    (
+                        "import os, sys; from pathlib import Path; "
+                        "target=Path(sys.argv[1]); target.read_bytes()[:1]; "
+                        "\ntry: fd=os.open(target, os.O_WRONLY|os.O_APPEND)"
+                        "\nexcept PermissionError: "
+                        "Path(sys.argv[2]).write_text('readable-unwritable')"
+                        "\nelse: os.close(fd); raise SystemExit(4)"
+                    ),
+                    str(keychain),
+                    str(proof),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                probe.stderr.decode(errors="replace"),
+            )
+            self.assertEqual(probe.stdout, b"")
+            self.assertEqual(proof.read_text(), "readable-unwritable")
+
+
 class TrustedRnaToolchainReadScopeTests(unittest.TestCase):
     def fixture(
         self, root: Path
@@ -1948,6 +2025,7 @@ class RunnerAndVerifierTests(unittest.TestCase):
                     str(claude),
                     "auth",
                     "status",
+                    "--json",
                 ],
             )
 

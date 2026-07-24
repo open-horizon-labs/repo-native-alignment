@@ -2286,6 +2286,7 @@ def verify_provider_auth(
         str(prepared.claude_path),
         "auth",
         "status",
+        "--json",
     ]
     started_at = utc_now()
     started = time.monotonic()
