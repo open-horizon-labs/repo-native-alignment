@@ -82,7 +82,10 @@ class ScheduleContractTests(unittest.TestCase):
     def test_wave_scope_is_explicit_ordered_and_capped(self) -> None:
         self.assertEqual(contract.explicit_wave_ranks([1]), (1,))
         self.assertEqual(contract.explicit_wave_ranks([1, 12]), (1, 12))
-        for invalid in ([1, 1], [1, 2, 3], [12, 1], [0], [21]):
+        self.assertEqual(
+            contract.explicit_wave_ranks([1, 12, 20]), (1, 12, 20)
+        )
+        for invalid in ([1, 1], [1, 2, 3, 4], [12, 1], [0], [21]):
             with self.subTest(invalid=invalid), self.assertRaises(contract.ContractError):
                 contract.explicit_wave_ranks(invalid)
 

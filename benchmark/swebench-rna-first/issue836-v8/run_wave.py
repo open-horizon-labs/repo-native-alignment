@@ -856,8 +856,8 @@ def _prior_wave_receipts(
         and invocation["episode_count"] == 40
         and invocation["per_episode_budget_usd"] == 6.0
         and invocation["maximum_budget_usd"] == 240.0
-        and invocation["max_cases_per_wave"] == 2
-        and invocation["max_episodes_per_wave"] == 4
+        and invocation["max_cases_per_wave"] == 3
+        and invocation["max_episodes_per_wave"] == 6
         and invocation["same_case_serialized"] is True
         and invocation["official_evaluator_invoked"] is False,
         "v8 invocation start drift",
@@ -1000,7 +1000,7 @@ def _prior_wave_receipts(
             == receipt["authorized_episode_keys"]
             and prior_manifest["same_case_serialized"] is True
             and prior_manifest["max_parallel_cases"]
-            == min(2, len(requested))
+            == min(3, len(requested))
             and prior_manifest["per_episode_budget_usd"] == 6.0
             and prior_manifest["wave_maximum_budget_usd"]
             == 12.0 * len(requested)
@@ -1089,7 +1089,7 @@ def _prior_wave_receipts(
             and start["models_authorized"] == 2 * len(requested)
             and start["maximum_budget_usd"] == 12.0 * len(requested)
             and start["same_case_serialized"] is True
-            and start["max_parallel_cases"] == min(2, len(requested))
+            and start["max_parallel_cases"] == min(3, len(requested))
             and start["official_evaluator_invoked"] is False,
             f"prior wave pre-call authorization drift: {wave_root.name}",
         )
@@ -1379,7 +1379,7 @@ def prepare_wave(
     require(
         manifest["execution_episode_keys"] == requested_episode_keys
         and manifest["same_case_serialized"] is True
-        and manifest["max_parallel_cases"] == min(2, len(ranks))
+        and manifest["max_parallel_cases"] == min(3, len(ranks))
         and manifest["per_episode_budget_usd"] == 6.0
         and manifest["wave_maximum_budget_usd"] == 12.0 * len(ranks)
         and manifest["selection_policy"] == "explicit_rank_arguments_only"
@@ -1715,7 +1715,7 @@ def preflight_summary(
         "prior_wave_receipts": prior_refs,
         **cumulative,
         "same_case_serialized": True,
-        "max_parallel_cases": min(2, len(ranks)),
+        "max_parallel_cases": min(3, len(ranks)),
         "models_launched": 0,
         "provider_requests": 0,
         "official_evaluator_invoked": False,
@@ -1814,8 +1814,8 @@ def execute_wave(
                     "episode_count": 40,
                     "per_episode_budget_usd": 6.0,
                     "maximum_budget_usd": 240.0,
-                    "max_cases_per_wave": 2,
-                    "max_episodes_per_wave": 4,
+                    "max_cases_per_wave": 3,
+                    "max_episodes_per_wave": 6,
                     "same_case_serialized": True,
                     "official_evaluator_invoked": False,
                 }
