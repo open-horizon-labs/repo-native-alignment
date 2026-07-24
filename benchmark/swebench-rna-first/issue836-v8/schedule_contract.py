@@ -18,15 +18,16 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v9.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v9.json"
+SCHEDULE_FILENAME = "execution-schedule-v10.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v10.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v9.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v10.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
 PROTOCOL_CHANGE = (
     "deterministic_issue_query_preconditioning_and_gateway_recovery_"
+    "plus_qualified_registration_source_bridge_"
     "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
 )
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
@@ -87,7 +88,7 @@ BASE_SELECTION_SHA256 = (
 BASE_SOURCE_COMMIT = "6bb1bf6200cb9f380007d033f717a2825fe75934"
 BASE_SOURCE_TREE = "70af087a30f93ad204af1196fad30a0da04c3e66"
 APPROVED_ASSEMBLER_SHA256 = (
-    "8c0519934bf6e2ae8a87828eb21c1a515e3799cd5fbaf1a1ffd8e6e4b37e4adf"
+    "ab0bed124258bfd473a5be3332bccadb428bd5412f598dd5f5d3035002efb05e"
 )
 NO_SPEND = {
     "credentials_accessed": False,
@@ -220,6 +221,7 @@ def validate_predecessor_activity(
             "preconditioned_treatment_restoration",
             "trusted_gateway_access_restoration",
             "ordinary_gateway_failure_delivery",
+            "qualified_registration_source_validation_bridge",
             "native_tool_parallelism_restoration",
             "authoritative_model_usage_reporting",
         ]

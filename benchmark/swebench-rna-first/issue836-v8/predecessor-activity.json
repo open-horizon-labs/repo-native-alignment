@@ -36,6 +36,14 @@
       "scope": "allow exact /dev/null stream plumbing and deliver verified clean nonzero Bash results to the model while retaining terminal denial for violations, nonadherence, tamper, or event mismatch"
     },
     {
+      "type": "qualified_registration_source_validation_bridge",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "validate the frozen v4 registration against its byte-qualified source root while binding the current successor runner and common supervisor through the implementation tree and each wave manifest"
+    },
+    {
       "type": "native_tool_parallelism_restoration",
       "applies_to_arms": [
         "A",

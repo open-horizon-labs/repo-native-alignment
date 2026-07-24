@@ -145,6 +145,11 @@ def configure(base: Any, argv: Sequence[str]) -> None:
             == b"",
             "tracked source must be pristine",
         )
+    # Keep the byte-qualified v4 registration check pointed at its original
+    # source root.  The successor implementation tree intentionally contains
+    # a newer runner/common supervisor; those live bytes are bound separately
+    # by the v10 schedule and every assembled wave manifest.
+    qualified_harness = Path(base.HARNESS).resolve(strict=True)
     bridge_root = rolling_root(argv)
     base.ASSEMBLER = ADAPTER
     # The immutable assembler was originally qualified in a different ordinary
@@ -157,6 +162,17 @@ def configure(base: Any, argv: Sequence[str]) -> None:
     base.SELECTION = base.ISSUE836 / "selection.json"
     base.SOURCE_COMMIT = commit
     base.SOURCE_TREE = tree
+    original_validate_frozen_inputs = base.validate_frozen_inputs
+
+    def validate_successor_frozen_inputs() -> tuple[dict, dict]:
+        successor_harness = base.HARNESS
+        base.HARNESS = qualified_harness
+        try:
+            return original_validate_frozen_inputs()
+        finally:
+            base.HARNESS = successor_harness
+
+    base.validate_frozen_inputs = validate_successor_frozen_inputs
     original_validate = base.validate_cache_envelope
 
     def validate_cache_envelope(
