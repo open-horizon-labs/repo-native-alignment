@@ -18,10 +18,10 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v13.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v13.json"
+SCHEDULE_FILENAME = "execution-schedule-v14.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v14.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v13.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v14.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
@@ -33,12 +33,28 @@ QUALIFIED_HARNESS_ROOT = (
 )
 SUCCESSOR_HARNESS_ROOT = Path(__file__).resolve().parent.parent / "issue827"
 REGISTERED_SOURCE_DELTA = {
+    "bash_gateway_sha256": {
+        "qualified": (
+            "42b0484a6d63e2cae59550003ecfa0c494778dc925cd641abe3b21e8a2b4c58c"
+        ),
+        "successor": (
+            "cded193127f4e35f0d72481bdbf56a437f3c9e58c4ec1c0819a2a1b19270fbb9"
+        ),
+    },
     "common_supervisor_sha256": {
         "qualified": (
             "8aea0bc62eb36d5e249cb50a1aebce6c2545d7083cc91b5bcc933de945d9a597"
         ),
         "successor": (
             "0aa3715b5350c2afb3792bf3e11ed615ff772e7b6fe60ba243e0ac95d5bc90f0"
+        ),
+    },
+    "isolation_sha256": {
+        "qualified": (
+            "63b556e094f0553701118fbea7db9729a327f30496388778fb2ff48b8d28284e"
+        ),
+        "successor": (
+            "94a7d5530cb5b47ecfa5b188c2d0bf8ae8e1bddebaabff4349b4dd117f786dfe"
         ),
     },
     "runner_sha256": {
@@ -51,12 +67,14 @@ REGISTERED_SOURCE_DELTA = {
     },
 }
 SUCCESSOR_REGISTERED_FILES_SHA256 = (
-    "922326602892b019d56cd3b0b3cb604885c94b29631d568f0db3a848ef6538d3"
+    "94812e689fde1012e2eafa062c442e4969009a1686ef9e9b2453f7de350c2b9f"
 )
 PROTOCOL_CHANGE = (
     "deterministic_issue_query_preconditioning_and_gateway_recovery_"
     "plus_qualified_registration_source_bridge_"
-    "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
+    "plus_native_tool_parallelism_"
+    "plus_trace_namespace_classification_repair_"
+    "no_cohort_or_arm_order_change"
 )
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
     "benchmark/swebench-rna-first/issue830/registration.json"
@@ -125,15 +143,15 @@ NO_SPEND = {
     "official_evaluator_invocations": 0,
 }
 PREDECESSOR_ACTIVITY = {
-    "infrastructure_invalidated_provider_episodes": 6,
-    "local_cli_process_starts": 8,
-    "model_invoked_receipts": 8,
+    "infrastructure_invalidated_provider_episodes": 8,
+    "local_cli_process_starts": 10,
+    "model_invoked_receipts": 10,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.7132426,
-    "provider_exposed_episodes": 6,
-    "provider_usage_tokens": 494566,
+    "provider_cost_usd": 1.1539282,
+    "provider_exposed_episodes": 8,
+    "provider_usage_tokens": 844211,
     "stale_auth_episode_starts": 2,
-    "terminal_patches": 0,
+    "terminal_patches": 2,
 }
 
 
@@ -295,7 +313,10 @@ def validate_predecessor_activity(
         and document["new_session_ids_required"] is True
         and document["predecessor_superseded"] is True
         and document["protocol_change"]
-        == "deterministic_issue_query_preconditioning_and_gateway_recovery",
+        == (
+            "deterministic_issue_query_preconditioning_and_gateway_recovery_"
+            "plus_trace_namespace_classification_repair"
+        ),
         "predecessor activity semantics drift",
     )
     adaptations = document["adaptations"]
@@ -309,6 +330,7 @@ def validate_predecessor_activity(
             "qualified_registration_source_validation_bridge",
             "native_tool_parallelism_restoration",
             "authoritative_model_usage_reporting",
+            "trace_namespace_classification_repair",
         ]
         and adaptations[0].get("applies_to_arms") == ["T"]
         and all(
@@ -330,6 +352,7 @@ def validate_predecessor_activity(
             "provider_exposed_supervisor_termination",
             "provider_exposed_native_tool_overlap",
             "provider_exposed_outer_seatbelt_dev_null_denial",
+            "provider_exposed_trace_namespace_classification",
         ],
         "predecessor attempt classifications drift",
     )

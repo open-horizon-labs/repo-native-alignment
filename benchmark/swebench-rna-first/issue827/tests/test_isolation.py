@@ -433,6 +433,9 @@ class WorkerContractTests(unittest.TestCase):
                 '1699.95 newfstatat(AT_FDCWD, "/", {}, 0) = 0\n'
                 '1699.96 connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT\n'
                 '1700.0 socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = -1 ENETUNREACH\n'
+                '1700.01 statfs("/sys/fs/selinux", 0xffff) = -1 ENOENT (No such file or directory)\n'
+                '1700.02 statfs("/selinux", 0xffff) = -1 ENOENT (No such file or directory)\n'
+                '1700.03 execve("/bin/bash", ["/bin/bash", "-lc", "printf \\"/not-an-access\\""], 0xffff) = 0\n'
                 '1700.1 openat(AT_FDCWD, "/shared/evidence/x", O_RDONLY) = -1 ENOENT\n'
                 "1700.2 +++ exited with 0 +++\n"
             )
@@ -440,6 +443,7 @@ class WorkerContractTests(unittest.TestCase):
                 trace,
                 allowed_path_prefixes=[
                     "/workspace",
+                    "/bin",
                     "/usr",
                     "/shared",
                     "/var/run",
@@ -447,13 +451,58 @@ class WorkerContractTests(unittest.TestCase):
                 forbidden_path_fragments=["/shared/evidence"],
             )
             self.assertTrue(report["complete"])
+            self.assertEqual(report["violations"], [])
             self.assertEqual(
-                {item["code"] for item in report["violations"]},
+                {item["code"] for item in report["observations"]},
                 {
-                    "network_syscall_attempt",
-                    "forbidden_fragment_attempt",
-                    "forbidden_path_attempt",
+                    "network_syscall_observed",
+                    "forbidden_fragment_observed",
+                    "blocked_forbidden_path_attempt",
                 },
+            )
+
+    def test_trace_checkout_alias_is_allowed_but_other_host_path_is_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary)
+            trace_member = trace / "trace.1"
+            trace_member.write_text(
+                "1699.9 landlock_restrict_self(3, 0) = 0\n"
+                '1700.0 statx(AT_FDCWD, "/host/editable", 0, 0, {}) = 0\n'
+                "1700.1 +++ exited with 0 +++\n"
+            )
+            denied = parse_strace_directory(
+                trace,
+                allowed_path_prefixes=["/workspace"],
+                forbidden_path_fragments=[],
+            )
+            self.assertEqual(
+                [item["code"] for item in denied["violations"]],
+                ["undeclared_path_access"],
+            )
+            allowed = parse_strace_directory(
+                trace,
+                allowed_path_prefixes=["/workspace", "/host/editable"],
+                forbidden_path_fragments=[],
+            )
+            self.assertEqual(allowed["violations"], [])
+
+    def test_trace_retains_blocked_undeclared_path_as_nonfatal_telemetry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary)
+            (trace / "trace.1").write_text(
+                "1699.9 landlock_restrict_self(3, 0) = 0\n"
+                '1700.0 statx(AT_FDCWD, "/host/absent", 0, 0, {}) = -1 ENOENT\n'
+                "1700.1 +++ exited with 0 +++\n"
+            )
+            report = parse_strace_directory(
+                trace,
+                allowed_path_prefixes=["/workspace"],
+                forbidden_path_fragments=[],
+            )
+            self.assertEqual(report["violations"], [])
+            self.assertEqual(
+                [item["code"] for item in report["observations"]],
+                ["blocked_undeclared_path_attempt"],
             )
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary)

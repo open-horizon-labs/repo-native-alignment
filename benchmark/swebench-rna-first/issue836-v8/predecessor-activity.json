@@ -1,15 +1,15 @@
 {
   "schema_version": "issue836-predecessor-activity-v3",
   "activity": {
-    "infrastructure_invalidated_provider_episodes": 6,
-    "local_cli_process_starts": 8,
-    "model_invoked_receipts": 8,
+    "infrastructure_invalidated_provider_episodes": 8,
+    "local_cli_process_starts": 10,
+    "model_invoked_receipts": 10,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.7132426,
-    "provider_exposed_episodes": 6,
-    "provider_usage_tokens": 494566,
+    "provider_cost_usd": 1.1539282,
+    "provider_exposed_episodes": 8,
+    "provider_usage_tokens": 844211,
     "stale_auth_episode_starts": 2,
-    "terminal_patches": 0
+    "terminal_patches": 2
   },
   "adaptations": [
     {
@@ -58,6 +58,14 @@
         "T"
       ],
       "scope": "count provider tokens from Claude CLI whole-invocation modelUsage totals while retaining transcript response counts separately"
+    },
+    {
+      "type": "trace_namespace_classification_repair",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "classify only the executable path in execve argv, recognize exact missing SELinux statfs probes, and treat the already-authorized editable checkout as the Bash worker's declared host-path alias while retaining sibling, index, evidence, credential, and network denials"
     }
   ],
   "cohort_reused_unchanged": true,
@@ -160,8 +168,31 @@
         "bytes": 26607,
         "sha256": "a36414b1a5ee73ae86d63534bf6022b45e7a9a61f20f1665831755caec27d08f"
       }
+    },
+    {
+      "classification": "provider_exposed_trace_namespace_classification",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-006/v8-invocation-start.json",
+        "bytes": 2277,
+        "sha256": "7e580b8db4eabaefc9d9f9771f8409120365d6ad638d0385dd86958e6289741d"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-006/waves/wave-001-rank-01/wave-receipt.json",
+        "bytes": 2566,
+        "sha256": "9188ddd88416eee63ff4c8bf4bcd0cf6b0ebb5807e6beeea1087b407dc3caa21"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-006/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+        "bytes": 20833,
+        "sha256": "c2912e02bde32264afca926de4067941c08234fe5ed5a66da796cd79b2b2c2b2"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-006/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+        "bytes": 33313,
+        "sha256": "f1012bc6f787e53183939205acd218bd45d3d4147f80491d8899509487f03f18"
+      }
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery"
+  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair"
 }

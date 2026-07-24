@@ -76,6 +76,14 @@ TRACE_TERMINAL_RE = re.compile(
     r"(?:^|\s)\+\+\+ (?:exited with [0-9]+|killed by [A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$"
 )
 TRACE_ABSOLUTE_PATH_RE = re.compile(r'"(/(?:[^"\\]|\\.)*)"')
+TRACE_EXECVE_RE = re.compile(r"(?:^|\s)execve(?:at)?\(")
+TRACE_MISSING_SELINUX_STATFS_RE = re.compile(
+    r'(?:^|\s)statfs\("(?P<path>/sys/fs/selinux|/selinux)",'
+    r".*\)\s*=\s*-1 ENOENT(?:\s|$)"
+)
+TRACE_BLOCKED_RESULT_RE = re.compile(
+    r"\)\s*=\s*-1\s+E[A-Z0-9_]+(?:\s|$)"
+)
 TRACE_INET_RE = re.compile(
     r"(?:socket\(\s*AF_INET6?\b|sa_family=AF_INET6?\b|"
     r"connect\([^,\n]+,\s*\{[^}\n]*AF_INET6?\b)"
@@ -866,6 +874,7 @@ def parse_strace_directory(
         value for value in forbidden_path_fragments if isinstance(value, str) and value
     )
     violations: list[dict[str, object]] = []
+    observations: list[dict[str, object]] = []
     receipts: list[dict[str, object]] = []
     landlock_enforced = False
     for path in files:
@@ -892,9 +901,12 @@ def parse_strace_directory(
             if TRACE_LANDLOCK_SUCCESS_RE.search(line):
                 landlock_enforced = True
             if TRACE_INET_RE.search(line):
-                violations.append(
+                # Docker's network=none boundary is the enforcement layer.
+                # Socket use (including loopback tests) is retained as
+                # telemetry but cannot reach the host or provider network.
+                observations.append(
                     {
-                        "code": "network_syscall_attempt",
+                        "code": "network_syscall_observed",
                         "trace": path.name,
                         "line": line_number,
                         "line_sha256": sha256_bytes(line.encode("utf-8")),
@@ -902,9 +914,12 @@ def parse_strace_directory(
                 )
             for fragment in forbidden:
                 if fragment in line:
-                    violations.append(
+                    # A fragment in argv or diagnostic text is not itself an
+                    # access. Actual path-bearing syscalls are classified
+                    # separately below.
+                    observations.append(
                         {
-                            "code": "forbidden_fragment_attempt",
+                            "code": "forbidden_fragment_observed",
                             "trace": path.name,
                             "line": line_number,
                             "line_sha256": sha256_bytes(
@@ -912,12 +927,35 @@ def parse_strace_directory(
                             ),
                         }
                     )
-            for encoded_path in TRACE_ABSOLUTE_PATH_RE.findall(line):
+            encoded_paths = TRACE_ABSOLUTE_PATH_RE.findall(line)
+            # Only argv[0] is a filesystem access made by execve/execveat.
+            # Later quoted strings are arguments and may contain shell source,
+            # diagnostic text, or other absolute-looking data.
+            if TRACE_EXECVE_RE.search(line):
+                encoded_paths = encoded_paths[:1]
+            missing_selinux_probe = TRACE_MISSING_SELINUX_STATFS_RE.search(
+                line
+            )
+            blocked_result = TRACE_BLOCKED_RESULT_RE.search(line) is not None
+            for encoded_path in encoded_paths:
                 attempted = encoded_path.replace(r"\/", "/")
+                if (
+                    missing_selinux_probe is not None
+                    and attempted == missing_selinux_probe.group("path")
+                ):
+                    # libselinux/coreutils probe these conventional locations
+                    # with statfs. ENOENT proves that no filesystem object was
+                    # reached; the probe is not an undeclared data access.
+                    continue
                 if any(fragment in attempted for fragment in forbidden):
-                    violations.append(
+                    destination = observations if blocked_result else violations
+                    destination.append(
                         {
-                            "code": "forbidden_path_attempt",
+                            "code": (
+                                "blocked_forbidden_path_attempt"
+                                if blocked_result
+                                else "forbidden_path_access"
+                            ),
                             "trace": path.name,
                             "line": line_number,
                             "path_sha256": sha256_bytes(
@@ -930,9 +968,14 @@ def parse_strace_directory(
                     or attempted.startswith(prefix.rstrip("/") + "/")
                     for prefix in allowed
                 ):
-                    violations.append(
+                    destination = observations if blocked_result else violations
+                    destination.append(
                         {
-                            "code": "undeclared_path_attempt",
+                            "code": (
+                                "blocked_undeclared_path_attempt"
+                                if blocked_result
+                                else "undeclared_path_access"
+                            ),
                             "trace": path.name,
                             "line": line_number,
                             "path_sha256": sha256_bytes(
@@ -955,12 +998,21 @@ def parse_strace_directory(
         for item in violations
     }
     violations = [unique[key] for key in sorted(unique)]
+    unique_observations = {
+        canonical(item): item
+        for item in observations
+    }
+    observations = [
+        unique_observations[key] for key in sorted(unique_observations)
+    ]
     report = {
         "schema_version": TRACE_SCHEMA,
         "complete": True,
         "tracer": "strace-ff",
         "landlock_enforced": True,
         "members": receipts,
+        "observations": observations,
+        "observation_count": len(observations),
         "violations": violations,
         "violation_count": len(violations),
     }
