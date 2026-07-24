@@ -398,7 +398,10 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
         "v8 invocation registration differs from frozen v4",
     )
     registration = base.read_json(registration_path)
-    base.validate_registered_sources(registration)
+    contract.validate_qualified_registered_sources(
+        base.registration_contract,
+        registration,
+    )
     selection_path, _ = base.check_ref(
         invocation["selection"],
         "v8 invocation.selection",

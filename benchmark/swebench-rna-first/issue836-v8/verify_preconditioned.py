@@ -16,6 +16,7 @@ import isolation
 import provider_usage
 import registration_contract
 import frontier_replay
+import schedule_contract as successor_contract
 
 
 VERIFY_SCHEMA = "issue827-episode-verification-v1"
@@ -514,11 +515,11 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
         errors.append("run_manifest_schema_mismatch")
     if isinstance(registration, dict):
         try:
-            registration_contract.validate_registration(
+            successor_contract.validate_qualified_registered_sources(
+                registration_contract,
                 registration,
-                source_root=runner.SOURCE,
             )
-        except registration_contract.RegistrationContractError as exc:
+        except successor_contract.ContractError as exc:
             errors.append(f"registration_contract:{exc}")
     expected_identities: tuple[tuple[int, str, str], ...] = ()
     if isinstance(registration, dict) and isinstance(selection, dict):
@@ -548,12 +549,19 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             errors.append(f"qualification_closure:{exc}")
         runner_ref = manifest.get("runner")
         _, _ = check_ref(runner_ref, "registered_runner", errors)
-        if isinstance(runner_ref, dict) and runner_ref.get("sha256") != registration.get("registered_files", {}).get("runner_sha256"):
-            errors.append("runner_not_registration_bound")
+        if (
+            isinstance(runner_ref, dict)
+            and runner_ref != runner.file_ref(runner.SOURCE / "run_selector.py")
+        ):
+            errors.append("runner_not_successor_manifest_bound")
         common_ref = manifest.get("common_supervisor")
         _, _ = check_ref(common_ref, "registered_common_supervisor", errors)
-        if isinstance(common_ref, dict) and common_ref.get("sha256") != registration.get("registered_files", {}).get("common_supervisor_sha256"):
-            errors.append("common_supervisor_not_registration_bound")
+        if (
+            isinstance(common_ref, dict)
+            and common_ref
+            != runner.file_ref(runner.SOURCE / "common_supervisor.py")
+        ):
+            errors.append("common_supervisor_not_successor_manifest_bound")
     case = selected_case(manifest, receipt.get("case_id"), receipt.get("rank"), errors) if isinstance(manifest, dict) else None
     problem_bytes: bytes | None = None
     arm = receipt.get("arm")
@@ -1312,9 +1320,9 @@ def registered_run_contract(
     if not isinstance(registration, dict) or not isinstance(selection, dict):
         return None, (), {}
     try:
-        registration_contract.validate_registration(
+        successor_contract.validate_qualified_registered_sources(
+            registration_contract,
             registration,
-            source_root=runner.SOURCE,
         )
         if registration_path is None:
             raise runner.FailClosed(
@@ -1332,7 +1340,7 @@ def registered_run_contract(
     except (
         OSError,
         runner.FailClosed,
-        registration_contract.RegistrationContractError,
+        successor_contract.ContractError,
     ) as exc:
         errors.append(f"aggregate_contract:{exc}")
         return None, (), {}

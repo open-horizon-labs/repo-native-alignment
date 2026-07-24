@@ -218,7 +218,10 @@ def validate_v4_inputs(
     )
     registration = base.read_json(registration_path)
     selection = base.read_json(selection_path)
-    base.validate_registered_sources(registration)
+    contract.validate_qualified_registered_sources(
+        base.registration_contract,
+        registration,
+    )
     base.validate_authoritative_selection(selection, registration_bytes)
     require(
         manifest["registered_runner"] == contract.file_ref(BASE / "run_selector.py")

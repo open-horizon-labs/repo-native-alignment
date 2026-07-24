@@ -18,13 +18,41 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v10.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v10.json"
+SCHEDULE_FILENAME = "execution-schedule-v11.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v11.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v10.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v11.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
+QUALIFIED_SOURCE_ROOT = Path(
+    "/Users/muness/swebench-evidence/issue829-readiness-fix.IYiMyx/source"
+)
+QUALIFIED_HARNESS_ROOT = (
+    QUALIFIED_SOURCE_ROOT / "benchmark/swebench-rna-first/issue827"
+)
+SUCCESSOR_HARNESS_ROOT = Path(__file__).resolve().parent.parent / "issue827"
+REGISTERED_SOURCE_DELTA = {
+    "common_supervisor_sha256": {
+        "qualified": (
+            "8aea0bc62eb36d5e249cb50a1aebce6c2545d7083cc91b5bcc933de945d9a597"
+        ),
+        "successor": (
+            "0aa3715b5350c2afb3792bf3e11ed615ff772e7b6fe60ba243e0ac95d5bc90f0"
+        ),
+    },
+    "runner_sha256": {
+        "qualified": (
+            "cc250022e01b5c708d5d4d0c5a9ba8caad97f7a7d08006c231f7eb17cb58d658"
+        ),
+        "successor": (
+            "f88e2fbedf77e8205a2ef5f971168bc867d4868eb7aec23c7c03d23020223b3a"
+        ),
+    },
+}
+SUCCESSOR_REGISTERED_FILES_SHA256 = (
+    "922326602892b019d56cd3b0b3cb604885c94b29631d568f0db3a848ef6538d3"
+)
 PROTOCOL_CHANGE = (
     "deterministic_issue_query_preconditioning_and_gateway_recovery_"
     "plus_qualified_registration_source_bridge_"
@@ -152,6 +180,63 @@ def file_ref(path: Path) -> dict[str, Any]:
         "bytes": resolved.stat().st_size,
         "sha256": sha_file(resolved),
     }
+
+
+def validate_qualified_registered_sources(
+    registration_contract_module: Any,
+    registration: Mapping[str, Any],
+) -> None:
+    """Validate the frozen registration against its byte-qualified sources."""
+
+    require(
+        QUALIFIED_HARNESS_ROOT.is_dir()
+        and not QUALIFIED_HARNESS_ROOT.is_symlink(),
+        "qualified registration source root unavailable",
+    )
+    try:
+        registration_contract_module.validate_registration(
+            registration,
+            source_root=QUALIFIED_HARNESS_ROOT,
+        )
+    except registration_contract_module.RegistrationContractError as exc:
+        raise ContractError(
+            f"qualified registration source validation failed: {exc}"
+        ) from exc
+    registered = registration.get("registered_files")
+    require(
+        isinstance(registered, Mapping)
+        and sha_canonical(registered) == CURRENT_REGISTERED_FILES_SHA256,
+        "frozen registered source digest drift",
+    )
+    filenames = registration_contract_module.REGISTERED_FILE_NAMES
+    require(
+        SUCCESSOR_HARNESS_ROOT.is_dir()
+        and not SUCCESSOR_HARNESS_ROOT.is_symlink()
+        and isinstance(filenames, Mapping)
+        and set(filenames) == set(registered),
+        "successor registered source root or interface drift",
+    )
+    successor = {
+        key: sha_file(SUCCESSOR_HARNESS_ROOT / str(filename))
+        for key, filename in filenames.items()
+    }
+    changed = sorted(
+        key for key in registered if registered[key] != successor[key]
+    )
+    require(
+        changed == sorted(REGISTERED_SOURCE_DELTA),
+        "successor registered source delta drift",
+    )
+    for key, identity in REGISTERED_SOURCE_DELTA.items():
+        require(
+            registered[key] == identity["qualified"]
+            and successor[key] == identity["successor"],
+            f"successor registered source identity drift: {key}",
+        )
+    require(
+        sha_canonical(successor) == SUCCESSOR_REGISTERED_FILES_SHA256,
+        "successor registered source digest drift",
+    )
 
 
 def check_ref(value: Any, where: str) -> tuple[Path, bytes]:

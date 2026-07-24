@@ -20,6 +20,32 @@ import verify_preconditioned as verifier  # noqa: E402
 
 
 class PriorWaveSealTests(unittest.TestCase):
+    def test_qualified_registration_allows_only_exact_successor_delta(self) -> None:
+        registration = json.loads(
+            (ROOT.parent / "issue836-v4" / "registration.json").read_bytes()
+        )
+        contract = run_wave.contract
+        contract.validate_qualified_registered_sources(
+            run_wave.base.registration_contract,
+            registration,
+        )
+        original_sha = contract.sha_file
+
+        def drift(path: Path) -> str:
+            if (
+                path.parent == contract.SUCCESSOR_HARNESS_ROOT
+                and path.name == "tool_supervisor.py"
+            ):
+                return "0" * 64
+            return original_sha(path)
+
+        with mock.patch.object(contract, "sha_file", side_effect=drift):
+            with self.assertRaises(contract.ContractError):
+                contract.validate_qualified_registered_sources(
+                    run_wave.base.registration_contract,
+                    registration,
+                )
+
     def test_deterministic_query_uses_clean_bounded_issue_context(self) -> None:
         problem = (
             b"Generic title\r\n"
