@@ -14,6 +14,23 @@ import verify_successor  # type: ignore  # noqa: E402
 
 
 class SuccessorRegistrationTests(unittest.TestCase):
+    def test_regular_bytes_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "target.json"
+            target.write_bytes(b"{}\n")
+            link = root / "link.json"
+            link.symlink_to(target)
+
+            with self.assertRaisesRegex(
+                verify_successor.SuccessorVerificationError,
+                "successor registration is a symlink",
+            ):
+                verify_successor.regular_bytes(
+                    link,
+                    "successor registration",
+                )
+
     def test_published_registration_is_verifier_clean(self) -> None:
         receipt = verify_successor.verify_registration(
             HERE / "registration.json",

@@ -50,10 +50,10 @@ def require(condition: bool, message: str) -> None:
 
 
 def regular_bytes(path: Path, label: str) -> bytes:
+    require(not path.is_symlink(), f"{label} is a symlink")
     path = path.resolve(strict=True)
     metadata = path.stat()
     require(stat.S_ISREG(metadata.st_mode), f"{label} is not a regular file")
-    require(not path.is_symlink(), f"{label} is a symlink")
     return path.read_bytes()
 
 
