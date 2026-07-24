@@ -97,6 +97,72 @@ class PriorWaveSealTests(unittest.TestCase):
 
         self.assertIn("(deny network-outbound", loopback_profile)
 
+    def test_gateway_smoke_uses_its_own_existing_output_root(self) -> None:
+        class Configured(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paid_output = root / "paid-output"
+            smoke_output = root / "smoke-output"
+            checkout = root / "checkout"
+            index_checkout = root / "index-checkout"
+            checkout.mkdir()
+            index_checkout.mkdir()
+            prepared = run_wave.base.PreparedRun(
+                manifest_path=root / "manifest.json",
+                manifest_ref={},
+                registration_path=root / "registration.json",
+                registration_ref={},
+                registration={},
+                selection_path=root / "selection.json",
+                selection_ref={},
+                selection={},
+                claude_path=root / "claude",
+                claude_version="test",
+                launcher_path=root / "launcher",
+                binary_path=root / "binary",
+                rna_refs={},
+                trusted_rna_toolchain_root=root,
+                mcp_path=root / "mcp.json",
+                output_root=paid_output,
+                cases=(),
+                isolation_host={},
+            )
+            case = SimpleNamespace(
+                rank=1,
+                case_id="owner__repo-1",
+                checkouts={"A": checkout},
+                index_checkout=index_checkout,
+            )
+            with (
+                mock.patch.object(
+                    run_wave.base,
+                    "materialize_harness",
+                    return_value={},
+                ),
+                mock.patch.object(
+                    run_wave.base,
+                    "configure_episode",
+                    side_effect=Configured,
+                ) as configure,
+                self.assertRaises(Configured),
+            ):
+                run_wave.gateway_smoke(
+                    prepared,
+                    [case],
+                    rank=1,
+                    output_root=smoke_output,
+                )
+
+            self.assertFalse(paid_output.exists())
+            self.assertTrue(smoke_output.is_dir())
+            configured = configure.call_args.args[0]
+            self.assertIsInstance(configured, run_wave.base.PreparedRun)
+            self.assertEqual(configured.output_root, smoke_output)
+            self.assertEqual(prepared.output_root, paid_output)
+            self.assertEqual(configured.manifest_path, prepared.manifest_path)
+
     def test_treatment_is_preconditioned_without_a_first_tool_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

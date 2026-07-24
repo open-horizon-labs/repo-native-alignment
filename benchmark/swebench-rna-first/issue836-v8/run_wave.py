@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 import fcntl
 import json
 import os
@@ -2029,6 +2030,7 @@ def gateway_smoke(
     resolved_output.mkdir(mode=0o700)
     case_root = resolved_output / f"rank-{case.rank:02d}-{case.case_id}"
     harness_paths = base.materialize_harness(case_root, "A")
+    smoke_prepared = replace(prepared, output_root=resolved_output)
     (
         episode,
         evidence,
@@ -2036,7 +2038,7 @@ def gateway_smoke(
         _settings_path,
         config,
     ) = base.configure_episode(
-        prepared,
+        smoke_prepared,
         case,
         "A",
         case_root,
@@ -2147,7 +2149,11 @@ def gateway_smoke(
         "gateway smoke observational PreToolUse hook failed",
     )
 
-    broker_runtime = base.start_trusted_rna_broker(prepared, config, evidence)
+    broker_runtime = base.start_trusted_rna_broker(
+        smoke_prepared,
+        config,
+        evidence,
+    )
     broker_teardown: dict[str, Any] | None = None
     try:
         gateway_command = str(updated_input["command"])
