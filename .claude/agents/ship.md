@@ -287,7 +287,7 @@ gh pr comment <PR> --body "$(cat <<'EOF'
 - [x/blank] Read path: Arrow → Node.metadata during load
 - [x/blank] Render: `search` code results formatting
 - [x/blank] Render: `search` graph traversal (neighbors/impact) formatting
-- [x/blank] End-to-end: value visible in tool output after installing the successful CI artifact + restart + rescan
+- [x/blank] End-to-end: value visible in tool output after installing a successful CI artifact with Rust inputs matching the final commit + restart + rescan
 - [x/blank] MCP server path: verified via `mcp-smoke.mjs` or `@modelcontextprotocol/inspector` (not just CLI)
 EOF
 )"
@@ -301,15 +301,21 @@ If no user-facing changes, skip.
 
 ### 9. Smoke test
 
-`cargo test` must pass. All tests, not just new ones.
+Choose tests from the final diff:
+
+- If Rust source, Rust tests, Cargo/toolchain/build configuration, embedded assets, or release build/package logic changed, `cargo test` must pass. All tests, not just new ones.
+- If no Rust-relevant input changed, the Rust test/build gate is N/A. Run the complete tests for the changed non-Rust surfaces instead; do not run Cargo merely to recreate an unchanged binary.
 
 If there's a `src/smoke.rs`, update it to exercise the new code path.
 
 ### 10. CI green
 
-Verify CI passes on the final commit: `gh pr checks <PR>`.
+Classify both Rust CI inputs and Rust artifact inputs in the diff between the final commit and the source commit of the latest successful Rust artifact, following `.oh/guardrails/ci-artifacts-for-release-builds.md`.
 
-If CI is pending, wait. If CI fails, fix and re-run from step 9.
+- **Rust artifact inputs changed:** require Rust CI and a successful artifact on the exact final commit. If relevant CI is pending, wait. If it fails, fix and re-run from step 9.
+- **Only Rust CI inputs changed:** run the relevant Rust checks, but reuse the existing artifact.
+- **No Rust CI or artifact inputs changed:** reuse the existing successful artifact and record its source commit, digest, and diff evidence. Rust build/test/lint/audit/artifact checks are N/A: **do not dispatch, rerun, or wait for them.** Require exact-head CI only for the changed non-Rust surfaces.
+- If the workflow cannot run those non-Rust checks without also launching Rust jobs, use a selective check path and record the routing gap; do not trigger the full workflow solely to manufacture an exact-head Rust artifact.
 
 ### 10b. Final comment sweep
 
