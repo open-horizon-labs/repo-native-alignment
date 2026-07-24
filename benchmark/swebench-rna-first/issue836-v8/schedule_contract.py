@@ -18,10 +18,10 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v5.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v5.json"
+SCHEDULE_FILENAME = "execution-schedule-v6.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v6.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v5.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v6.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
@@ -83,7 +83,7 @@ BASE_SELECTION_SHA256 = (
 BASE_SOURCE_COMMIT = "6bb1bf6200cb9f380007d033f717a2825fe75934"
 BASE_SOURCE_TREE = "70af087a30f93ad204af1196fad30a0da04c3e66"
 APPROVED_ASSEMBLER_SHA256 = (
-    "a4b99d012c5937a40aebc05be5295eccef30fe56c36259524cca5f41e012ec46"
+    "8c0519934bf6e2ae8a87828eb21c1a515e3799cd5fbaf1a1ffd8e6e4b37e4adf"
 )
 NO_SPEND = {
     "credentials_accessed": False,
@@ -663,6 +663,10 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
             and sha_file(path) == expected,
             f"registered source hash mismatch: {filename}",
         )
+    require(
+        registered["assemble_successor.py"] == APPROVED_ASSEMBLER_SHA256,
+        "approved assembler is not the registered successor assembler",
+    )
 
 
 def validate_selection_binding(
