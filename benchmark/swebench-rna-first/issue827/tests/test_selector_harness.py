@@ -341,6 +341,83 @@ class TrustedRnaCacheReadScopeTests(unittest.TestCase):
             )
 
 
+class ProviderAuthSeatbeltTests(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "requires macOS Seatbelt",
+    )
+    def test_real_keychain_file_is_readable_and_unwritable(self) -> None:
+        keychain = (
+            Path.home()
+            / "Library"
+            / "Keychains"
+            / "login.keychain-db"
+        )
+        if not keychain.is_file() or keychain.is_symlink():
+            self.skipTest("exact login Keychain is unavailable")
+        self.assertEqual(
+            run_selector.provider_auth_read_files(),
+            [keychain],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = root / "state"
+            state.mkdir()
+            runtime_roots = [
+                path
+                for path in (
+                    Path("/usr"),
+                    Path("/System"),
+                    Path("/Library"),
+                    Path("/opt/homebrew"),
+                    Path(sys.prefix),
+                    Path("/private/etc"),
+                    Path("/private/var/db"),
+                    Path("/private/var/select"),
+                )
+                if path.exists()
+            ]
+            profile = root / "provider-auth-keychain.sb"
+            profile.write_text(
+                run_selector.isolation.generate_outer_seatbelt_profile(
+                    read_roots=[*runtime_roots, keychain, state],
+                    write_roots=[state],
+                )
+            )
+            profile.chmod(0o444)
+            proof = state / "proof"
+            probe = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    str(Path(sys.executable).resolve()),
+                    "-c",
+                    (
+                        "import os, sys; from pathlib import Path; "
+                        "target=Path(sys.argv[1]); target.read_bytes()[:1]; "
+                        "\ntry: fd=os.open(target, os.O_WRONLY|os.O_APPEND)"
+                        "\nexcept PermissionError: "
+                        "Path(sys.argv[2]).write_text('readable-unwritable')"
+                        "\nelse: os.close(fd); raise SystemExit(4)"
+                    ),
+                    str(keychain),
+                    str(proof),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                probe.stderr.decode(errors="replace"),
+            )
+            self.assertEqual(probe.stdout, b"")
+            self.assertEqual(proof.read_text(), "readable-unwritable")
+
+
 class TrustedRnaToolchainReadScopeTests(unittest.TestCase):
     def fixture(
         self, root: Path
@@ -1869,6 +1946,133 @@ class RunnerAndVerifierTests(unittest.TestCase):
                 "BUN_TMPDIR",
             ):
                 self.assertEqual(env[name], expected)
+
+    def test_provider_auth_read_files_exposes_only_exact_login_keychain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            keychains = home / "Library" / "Keychains"
+            keychains.mkdir(parents=True)
+            login = keychains / "login.keychain-db"
+            login.write_bytes(b"opaque\n")
+            sibling = keychains / "unrelated.keychain-db"
+            sibling.write_bytes(b"opaque\n")
+
+            with mock.patch.object(run_selector.sys, "platform", "darwin"):
+                files = run_selector.provider_auth_read_files(home)
+
+            self.assertEqual(files, [login])
+            self.assertNotIn(sibling, files)
+
+    def test_provider_auth_status_is_sandboxed_zero_spend_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            claude = root / "claude"
+            claude.write_bytes(b"binary\n")
+            profile = root / "outer.sb"
+            profile.write_bytes(b"(version 1)\n")
+            model_private = root / "private"
+            (model_private / "tmp").mkdir(parents=True)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            prepared = SimpleNamespace(
+                claude_path=claude,
+                isolation_host={"sandbox_exec": Path("/usr/bin/sandbox-exec")},
+            )
+            status = {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "email": "must-not-be-retained@example.invalid",
+                "orgId": "must-not-be-retained",
+                "subscriptionType": "team",
+            }
+            result = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(status).encode(),
+                stderr=b"",
+            )
+
+            with mock.patch.object(
+                run_selector.subprocess,
+                "run",
+                return_value=result,
+            ) as launched:
+                reference = run_selector.verify_provider_auth(
+                    prepared,
+                    {"seatbelt_profile": str(profile)},
+                    model_private,
+                    evidence,
+                )
+
+            receipt = json.loads(
+                (evidence / "provider-auth-status.json").read_bytes()
+            )
+            self.assertEqual(reference["path"], str(evidence / "provider-auth-status.json"))
+            self.assertTrue(receipt["logged_in"])
+            self.assertFalse(receipt["model_invoked"])
+            self.assertEqual(receipt["provider_requests"], 0)
+            self.assertEqual(receipt["cost_usd"], 0.0)
+            self.assertNotIn("email", receipt)
+            self.assertNotIn("orgId", receipt)
+            self.assertNotIn("must-not-be-retained", json.dumps(receipt))
+            command = launched.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    str(claude),
+                    "auth",
+                    "status",
+                    "--json",
+                ],
+            )
+
+    def test_provider_auth_status_fails_before_model_when_logged_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            claude = root / "claude"
+            claude.write_bytes(b"binary\n")
+            profile = root / "outer.sb"
+            profile.write_bytes(b"(version 1)\n")
+            model_private = root / "private"
+            (model_private / "tmp").mkdir(parents=True)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            prepared = SimpleNamespace(
+                claude_path=claude,
+                isolation_host={"sandbox_exec": Path("/usr/bin/sandbox-exec")},
+            )
+            result = SimpleNamespace(
+                returncode=1,
+                stdout=b'{"loggedIn":false,"authMethod":"none"}\n',
+                stderr=b"",
+            )
+
+            with mock.patch.object(
+                run_selector.subprocess,
+                "run",
+                return_value=result,
+            ):
+                with self.assertRaisesRegex(
+                    run_selector.FailClosed,
+                    "Claude is not logged in inside the provider sandbox",
+                ):
+                    run_selector.verify_provider_auth(
+                        prepared,
+                        {"seatbelt_profile": str(profile)},
+                        model_private,
+                        evidence,
+                    )
+
+            receipt = json.loads(
+                (evidence / "provider-auth-status.json").read_bytes()
+            )
+            self.assertFalse(receipt["logged_in"])
+            self.assertFalse(receipt["model_invoked"])
+            self.assertEqual(receipt["provider_requests"], 0)
+            self.assertEqual(receipt["cost_usd"], 0.0)
 
     def test_token_ledger_prefers_whole_invocation_model_usage_without_double_counting(self):
         summary = {

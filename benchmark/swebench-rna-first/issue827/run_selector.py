@@ -40,6 +40,7 @@ SELECTION_SCHEMA = "issue827-fresh-pair-selection-v1"
 IDENTITY_SCHEMA = "issue827-runtime-identity-v1"
 RECEIPT_SCHEMA = "issue827-episode-receipt-v1"
 QUERY_EVIDENCE_SCHEMA = "issue827-query-evidence-v1"
+PROVIDER_AUTH_STATUS_SCHEMA = "issue827-provider-auth-status-v1"
 ISOLATION_REGISTRATION_SCHEMA = "issue827-isolation-registration-v1"
 ISOLATION_HOST_SCHEMA = "issue827-isolation-host-v1"
 WORKER_IMAGE_SCHEMA = "issue827-worker-image-manifest-v1"
@@ -1574,6 +1575,7 @@ def configure_episode(
     read_roots = [
         *map(Path, prepared.isolation_host["system_read_roots"]),
         *map(Path, prepared.isolation_host["provider_read_roots"]),
+        *provider_auth_read_files(),
         case.checkouts[arm],
         episode,
         harness_paths["harness"],
@@ -2241,6 +2243,122 @@ def provider_parent_env(model_private: Path) -> dict[str, str]:
     ):
         env[name] = str(private_tmp)
     return env
+
+
+def provider_auth_read_files(home: Path | None = None) -> list[Path]:
+    """Return the exact host credential file needed by Claude on macOS."""
+
+    if sys.platform != "darwin":
+        return []
+    keychain = (
+        (home if home is not None else Path.home())
+        / "Library"
+        / "Keychains"
+        / "login.keychain-db"
+    )
+    require(
+        keychain.is_absolute()
+        and keychain.is_file()
+        and not keychain.is_symlink()
+        and keychain.resolve(strict=True) == keychain,
+        "Claude login Keychain is not an exact regular file",
+    )
+    return [keychain]
+
+
+def verify_provider_auth(
+    prepared: PreparedRun,
+    config: Mapping[str, Any],
+    model_private: Path,
+    evidence: Path,
+) -> dict[str, Any]:
+    """Prove Claude is logged in inside the exact final provider sandbox."""
+
+    profile = Path(str(config["seatbelt_profile"]))
+    require(
+        profile.is_file() and not profile.is_symlink(),
+        "provider auth Seatbelt profile invalid",
+    )
+    command = [
+        str(prepared.isolation_host["sandbox_exec"]),
+        "-f",
+        str(profile),
+        str(prepared.claude_path),
+        "auth",
+        "status",
+        "--json",
+    ]
+    started_at = utc_now()
+    started = time.monotonic()
+    error: str | None = None
+    returncode: int | None = None
+    stdout = b""
+    stderr = b""
+    status: dict[str, Any] = {}
+    try:
+        result = subprocess.run(
+            command,
+            cwd=model_private,
+            env=provider_parent_env(model_private),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30.0,
+        )
+        returncode = result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+        loaded = json.loads(stdout)
+        if isinstance(loaded, dict):
+            status = loaded
+        else:
+            error = "provider auth status is not an object"
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        error = f"{type(exc).__name__}:{exc}"
+    logged_in = status.get("loggedIn") is True
+    valid = returncode == 0 and logged_in and error is None
+    receipt = {
+        "schema_version": PROVIDER_AUTH_STATUS_SCHEMA,
+        "started_at": started_at,
+        "ended_at": utc_now(),
+        "elapsed_seconds": time.monotonic() - started,
+        "command": command,
+        "claude": file_ref(prepared.claude_path),
+        "seatbelt_profile": file_ref(profile),
+        "returncode": returncode,
+        "logged_in": logged_in,
+        "auth_method": (
+            status.get("authMethod")
+            if isinstance(status.get("authMethod"), str)
+            else None
+        ),
+        "api_provider": (
+            status.get("apiProvider")
+            if isinstance(status.get("apiProvider"), str)
+            else None
+        ),
+        "subscription_type": (
+            status.get("subscriptionType")
+            if isinstance(status.get("subscriptionType"), str)
+            else None
+        ),
+        "stdout_sha256": sha_bytes(stdout),
+        "stderr_sha256": sha_bytes(stderr),
+        "error": error,
+        "model_invoked": False,
+        "provider_requests": 0,
+        "cost_usd": 0.0,
+    }
+    receipt_path = evidence / "provider-auth-status.json"
+    atomic_write(receipt_path, canonical(receipt))
+    require(valid, "Claude is not logged in inside the provider sandbox")
+    return file_ref(receipt_path)
 
 
 def start_trusted_rna_broker(
@@ -3083,6 +3201,11 @@ def failed_pre_model_receipt(
         "runtime_identity": file_ref(identity_path),
         "prompt": None,
         "treatment_system": None,
+        "provider_auth_status": (
+            file_ref(evidence / "provider-auth-status.json")
+            if (evidence / "provider-auth-status.json").is_file()
+            else None
+        ),
         "query_evidence": dict(query_evidence) if query_evidence is not None else None,
         "command": None,
         "started_at": None,
@@ -3141,6 +3264,26 @@ def launch_episode(
 ) -> dict[str, Any]:
     verify_checkout(str(case.checkouts[arm]), case.base_commit, case.base_tree, f"{case.case_id}/{arm} prelaunch")
     episode, evidence, identity_path, settings_path, config = configure_episode(prepared, case, arm, case_root, harness_paths)
+    try:
+        verify_provider_auth(
+            prepared,
+            config,
+            episode / "private",
+            evidence,
+        )
+    except FailClosed as exc:
+        return failed_pre_model_receipt(
+            prepared,
+            case,
+            arm,
+            episode,
+            evidence,
+            identity_path,
+            config,
+            f"provider_auth_preflight_failed:{exc}",
+            0.0,
+            None,
+        )
     treatment_system_path: Path | None = None
     query_evidence: dict[str, Any] | None = None
     rna_seconds = 0.0
@@ -3318,6 +3461,9 @@ def launch_episode(
         "runtime_identity": file_ref(identity_path),
         "prompt": file_ref(prompt_path),
         "treatment_system": file_ref(treatment_system_path) if treatment_system_path else None,
+        "provider_auth_status": file_ref(
+            evidence / "provider-auth-status.json"
+        ),
         "query_evidence": query_evidence,
         "command": command,
         "started_at": started_at,

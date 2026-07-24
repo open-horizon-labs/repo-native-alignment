@@ -95,12 +95,14 @@ def verify_registration(
     closure, closure_bytes = load_object(closure_path, "qualification closure")
 
     try:
-        registration_contract.validate_registration(
-            registration,
-            source_root=HARNESS,
-        )
+        registration_contract.validate_registration(registration)
     except registration_contract.RegistrationContractError as exc:
         raise SuccessorVerificationError(str(exc)) from exc
+    require(
+        closure.get("registered_files_sha256")
+        == sha_bytes(canonical(registration["registered_files"])),
+        "qualification closure registered source identity mismatch",
+    )
 
     require(registration.get("issue") == 827, "runner compatibility issue drift")
     require(
