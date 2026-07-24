@@ -13,7 +13,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Any, Mapping, NamedTuple
 
@@ -28,6 +28,10 @@ EXPECTED_ROWS = 500
 EXPECTED_SEED = "rna-first-sonnet-hermetic-selector-v1"
 EXPECTED_RANKING = "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)"
 REGISTRATION_PATH = "benchmark/swebench-rna-first/issue827/registration.json"
+CURRENT_REGISTRATION_PATH = (
+    "benchmark/swebench-rna-first/issue836/registration.json"
+)
+ALLOWED_REGISTRATION_PATHS = {REGISTRATION_PATH, CURRENT_REGISTRATION_PATH}
 EXCLUSIONS_PATH = "benchmark/swebench-rna-first/issue827/exclusions.json"
 SELECTOR_PATH = "benchmark/swebench-rna-first/issue827/select_cases.py"
 
@@ -159,6 +163,33 @@ def require_hex(value: Any, length: int, label: str) -> str:
     return value
 
 
+def normalized_repo_relative_path(value: str, label: str) -> str:
+    """Return an exact normalized Git tree path beneath the repository root."""
+
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise SelectionError(f"{label} must be a normalized relative POSIX path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise SelectionError(f"{label} must be a normalized relative POSIX path")
+    return value
+
+
+def registered_registration_repo_path(value: str) -> str:
+    """Return one of the versioned registration publication paths."""
+
+    normalized = normalized_repo_relative_path(
+        value,
+        "registration repository path",
+    )
+    if normalized not in ALLOWED_REGISTRATION_PATHS:
+        raise SelectionError("registration repository path is not registered")
+    return normalized
+
+
 def load_arrow(path: Path) -> Any:
     try:
         import pyarrow as pa
@@ -214,9 +245,15 @@ def require_commit_binding(
     commit: str,
     registration_path: Path,
     exclusions_path: Path,
+    registration_repo_path: str = REGISTRATION_PATH,
 ) -> None:
     if repository.is_symlink() or not (repository / ".git").is_dir():
         raise SelectionError("selector repository must be a regular Git checkout")
+    registration_repo_path = registered_registration_repo_path(
+        registration_repo_path
+    )
+    if registration_path.is_symlink() or not registration_path.is_file():
+        raise SelectionError("registration must be a regular file")
     check = subprocess.run(
         ["git", "-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"],
         check=False,
@@ -225,7 +262,7 @@ def require_commit_binding(
     if check.returncode != 0:
         raise SelectionError("registration commit is absent from the repository")
     expected = {
-        REGISTRATION_PATH: registration_path.read_bytes(),
+        registration_repo_path: registration_path.read_bytes(),
         EXCLUSIONS_PATH: exclusions_path.read_bytes(),
         SELECTOR_PATH: Path(__file__).resolve().read_bytes(),
     }
@@ -248,6 +285,14 @@ def main() -> int:
     parser.add_argument("--arrow", type=Path, required=True)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--registration-commit", required=True)
+    parser.add_argument(
+        "--registration-repo-path",
+        default=REGISTRATION_PATH,
+        help=(
+            "normalized repo-relative path containing the exact registration "
+            "bytes at --registration-commit"
+        ),
+    )
     parser.add_argument("--git-cache-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank-only", action="store_true")
@@ -261,8 +306,9 @@ def main() -> int:
     require_commit_binding(
         arguments.repo.resolve(),
         registration_commit,
-        arguments.registration.resolve(),
+        arguments.registration,
         arguments.exclusions.resolve(),
+        arguments.registration_repo_path,
     )
     try:
         registration_contract.validate_registration(

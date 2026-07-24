@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -188,6 +190,110 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                     select_cases.expected_episode_identities(
                         self.registration,
                         selection,
+                    )
+
+    def test_registration_commit_binding_supports_separate_issue_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            registration_path = (
+                repo
+                / "benchmark/swebench-rna-first/issue836/registration.json"
+            )
+            exclusions_path = (
+                repo / "benchmark/swebench-rna-first/issue827/exclusions.json"
+            )
+            selector_path = (
+                repo / "benchmark/swebench-rna-first/issue827/select_cases.py"
+            )
+            registration_path.parent.mkdir(parents=True)
+            exclusions_path.parent.mkdir(parents=True)
+            registration_path.write_bytes(b'{"issue":836}\n')
+            exclusions_path.write_bytes(b'{"excluded":[]}\n')
+            selector_path.write_bytes(
+                Path(select_cases.__file__).resolve().read_bytes()
+            )
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=selector-test",
+                    "-c",
+                    "user.email=selector-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            select_cases.require_commit_binding(
+                repo,
+                commit,
+                registration_path,
+                exclusions_path,
+                "benchmark/swebench-rna-first/issue836/registration.json",
+            )
+
+            registration_path.write_bytes(b'{"issue":827}\n')
+            with self.assertRaises(select_cases.SelectionError):
+                select_cases.require_commit_binding(
+                    repo,
+                    commit,
+                    registration_path,
+                    exclusions_path,
+                    "benchmark/swebench-rna-first/issue836/registration.json",
+                )
+
+            registration_path.unlink()
+            alias_target = repo / "registration-alias-target.json"
+            alias_target.write_bytes(b'{"issue":836}\n')
+            registration_path.symlink_to(alias_target)
+            with self.assertRaises(select_cases.SelectionError):
+                select_cases.require_commit_binding(
+                    repo,
+                    commit,
+                    registration_path,
+                    exclusions_path,
+                    "benchmark/swebench-rna-first/issue836/registration.json",
+                )
+
+    def test_registration_repo_path_rejects_unsafe_or_ambiguous_paths(
+        self,
+    ) -> None:
+        for value in (
+            select_cases.REGISTRATION_PATH,
+            select_cases.CURRENT_REGISTRATION_PATH,
+        ):
+            self.assertEqual(
+                select_cases.registered_registration_repo_path(value),
+                value,
+            )
+        for value in (
+            "/benchmark/registration.json",
+            "../registration.json",
+            "benchmark/../registration.json",
+            "./benchmark/registration.json",
+            "benchmark//registration.json",
+            "benchmark\\registration.json",
+            select_cases.EXCLUSIONS_PATH,
+            select_cases.SELECTOR_PATH,
+            "benchmark/swebench-rna-first/issue999/registration.json",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(select_cases.SelectionError):
+                    select_cases.registered_registration_repo_path(
+                        value
                     )
 
 
