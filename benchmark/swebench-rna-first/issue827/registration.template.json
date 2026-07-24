@@ -1,7 +1,7 @@
 {
-  "schema_version": "issue836-treatment-registration-v2",
+  "schema_version": "issue836-treatment-registration-v3",
   "issue": 836,
-  "classification": "preregistered_hermetic_prefix_extension",
+  "classification": "preregistered_hermetic_pre_model_cohort_replacement",
   "published_before_selection": true,
   "fresh_case_claim": true,
   "prior_model_calls": 0,
@@ -15,7 +15,7 @@
     "local_cache_only": true
   },
   "selector": {
-    "algorithm_version": "issue836-selector-v2",
+    "algorithm_version": "issue836-selector-v3",
     "seed": "rna-first-sonnet-hermetic-selector-v1",
     "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
     "population_rows": 500,
@@ -39,8 +39,42 @@
     },
     "prefix_lineage": {
       "ranks_1_through_2": "pre_model_carry_forward_prefix",
-      "ranks_3_through_20": "deterministic_extension",
+      "ranks_3_through_7_and_9_through_20": "deterministic_extension",
+      "rank_8": "pre_model_replacement_from_s2_rank_21",
       "outcomes_inspected_for_extension": false
+    },
+    "pre_model_v2_supersession": {
+      "schema_version": "issue836-pre-model-cohort-supersession-v1",
+      "superseded_registration_schema": "issue836-treatment-registration-v2",
+      "superseded_registration_sha256": "10345f1ba1b1638f04b6b671a3aa64f5847e17944d955cd08494f91f003275b0",
+      "superseded_registration_commit": "a6c768ba633ab0301df1ea6a94ceb036a401e45e",
+      "superseded_selection_schema": "issue836-fresh-cohort-selection-v2",
+      "superseded_selection_sha256": "8b1c0dbfac7a540668f526a656f1a230af497b963b56793f44039686d147b73b",
+      "superseded_selection_digest": "d9438a49ff01e9e86519c0f9871c319a5c90be368464ec84466f1e899c53ebd5",
+      "dataset_arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e",
+      "exclusions_sha256": "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79",
+      "excluded_ids_sha256": "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b",
+      "superseded_rank": 8,
+      "excluded_instance_id": "sympy__sympy-24661",
+      "replacement_instance_id": "django__django-11163",
+      "replacement_source_rank": 21,
+      "replacement_method": "next_deterministic_s2_ranked_candidate",
+      "preserved_arm_order": [
+        "T",
+        "A"
+      ],
+      "reason_code": "old_shipped_rna_binary_mjs_descriptor_incompatibility",
+      "reason": "the registered old shipped RNA binary cannot prepare the exact selected tree because its JavaScript descriptor routing does not support .mjs",
+      "incompatible_rna_binary_sha256": "d4d264da1a012b38814f0f2e9ee92f77c5aab3ed558a0f23abcd830d4b78ca94",
+      "replacement_repo": "django/django",
+      "replacement_base_commit": "e6588aa4e793b7f56f4cadbfa155b581e0efc59a",
+      "replacement_base_tree": "4c221e3aba9030ab459871106740934193ce1118",
+      "replacement_ranking_sha256": "0bbab2a1aa0c0547bc1fea70b6fa97ae226b9c7c6e178dd1f69b2279900c5beb",
+      "replacement_problem_statement_sha256": "8dbd8cae38c3a82b681a79bdfe8ffaa78aa6f1fad9744a1ca197f90265e5c80b",
+      "detected_during_pre_model_cache_preparation": true,
+      "prior_model_calls": 0,
+      "prior_official_evaluator_invocations": 0,
+      "case_replacement_after_model_start": false
     },
     "case_ids_external_until_authoritative_selection": true,
     "problem_statements_inspected_by_human_before_selection": false,
@@ -48,7 +82,7 @@
     "case_replacement_after_model_start": false
   },
   "episode_design": {
-    "schema_version": "issue836-episode-design-v2",
+    "schema_version": "issue836-episode-design-v3",
     "case_count": 20,
     "episode_count": 40,
     "arms": {
@@ -270,7 +304,7 @@
     "model_output_delivery": "none"
   },
   "selection_rule": {
-    "schema_version": "issue836-selection-rule-v2",
+    "schema_version": "issue836-selection-rule-v3",
     "episode_count": 40,
     "pair_count": 20,
     "arms": [

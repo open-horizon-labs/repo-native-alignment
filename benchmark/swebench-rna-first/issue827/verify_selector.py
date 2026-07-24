@@ -1270,9 +1270,8 @@ def registered_run_contract(
     if invocation.get("models_authorized") != dimensions["episode_count"]:
         errors.append("invocation_episode_count_mismatch")
 
-    if (
+    if registration_contract.is_issue836_registration_schema(
         registration.get("schema_version")
-        == registration_contract.CURRENT_REGISTRATION_SCHEMA
     ):
         if invocation.get("case_count") != dimensions["case_count"]:
             errors.append("invocation_case_count_mismatch")

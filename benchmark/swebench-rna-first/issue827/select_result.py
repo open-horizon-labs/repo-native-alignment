@@ -14,7 +14,8 @@ import evaluator_runner as evaluator
 
 
 LEGACY_RESULT_SCHEMA = "issue827-selector-result-v1"
-CURRENT_RESULT_SCHEMA = "issue836-selector-result-v2"
+ISSUE836_V2_RESULT_SCHEMA = "issue836-selector-result-v2"
+CURRENT_RESULT_SCHEMA = "issue836-selector-result-v3"
 RESULT_SCHEMA = CURRENT_RESULT_SCHEMA
 _REGISTERED_SELECTION_RULE_COMMON = {
     "arms": ["A", "T"],
@@ -61,8 +62,13 @@ def registered_selection_rule(
     schema = registration.get("schema_version")
     if schema == evaluator.registration_contract.LEGACY_REGISTRATION_SCHEMA:
         rule_schema = "issue827-selection-rule-v1"
-    elif schema == evaluator.registration_contract.CURRENT_REGISTRATION_SCHEMA:
+    elif (
+        schema
+        == evaluator.registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA
+    ):
         rule_schema = "issue836-selection-rule-v2"
+    elif schema == evaluator.registration_contract.CURRENT_REGISTRATION_SCHEMA:
+        rule_schema = "issue836-selection-rule-v3"
     else:
         raise evaluator.FailClosed(
             "registration schema has no registered selection rule"
@@ -79,6 +85,11 @@ def result_schema(registration: Mapping[str, Any]) -> str:
     schema = registration.get("schema_version")
     if schema == evaluator.registration_contract.LEGACY_REGISTRATION_SCHEMA:
         return LEGACY_RESULT_SCHEMA
+    if (
+        schema
+        == evaluator.registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA
+    ):
+        return ISSUE836_V2_RESULT_SCHEMA
     if schema == evaluator.registration_contract.CURRENT_REGISTRATION_SCHEMA:
         return CURRENT_RESULT_SCHEMA
     raise evaluator.FailClosed("registration schema has no result schema")

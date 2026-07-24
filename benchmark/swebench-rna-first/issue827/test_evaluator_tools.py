@@ -19,6 +19,7 @@ import evaluator_runner as runner
 import provider_usage
 import registration_contract
 import run_selector as selector_runner
+import select_cases
 import select_result
 
 
@@ -79,6 +80,7 @@ def registration(
         )
         value["issue"] = 827
         value["selector"]["algorithm_version"] = "issue827-selector-v1"
+        value["selector"].pop("pre_model_v2_supersession")
         value["selector"]["selected_case_count"] = 2
         value["selector"]["episode_count"] = 4
         value["episode_design"]["schema_version"] = (
@@ -91,6 +93,25 @@ def registration(
         )
         value["selection_rule"]["episode_count"] = 4
         value["selection_rule"]["pair_count"] = 2
+    else:
+        value["schema_version"] = (
+            registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA
+        )
+        value["selector"]["algorithm_version"] = (
+            select_cases.ISSUE836_V2_ALGORITHM_VERSION
+        )
+        value["selector"].pop("pre_model_v2_supersession")
+        value["selector"]["prefix_lineage"] = {
+            "ranks_1_through_2": "pre_model_carry_forward_prefix",
+            "ranks_3_through_20": "deterministic_extension",
+            "outcomes_inspected_for_extension": False,
+        }
+        value["episode_design"]["schema_version"] = (
+            registration_contract.ISSUE836_V2_EPISODE_DESIGN_SCHEMA
+        )
+        value["selection_rule"]["schema_version"] = (
+            "issue836-selection-rule-v2"
+        )
     value["dataset"]["arrow_sha256"] = DATASET_SHA
     value["evaluator"].update(
         {
@@ -113,7 +134,13 @@ def registration(
         "producer_commit",
         "local_source_build_allowed",
     }:
-        value["rna_artifact"][key] = ZERO
+        value["rna_artifact"][key] = (
+            registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION[
+                "incompatible_rna_binary_sha256"
+            ]
+            if current and key == "binary_sha256"
+            else ZERO
+        )
     value["qualification_closure"]["manifest_sha256"] = ZERO
     value["qualification_closure"]["archive_sha256"] = ZERO
     return value
@@ -183,38 +210,58 @@ class Fixture:
         self.registry = self.evidence / "irrevocable-registry"
         self.evidence.mkdir(parents=True)
         self.arm_tokens = arm_tokens or {"A": 1000, "T": 800}
-        self.cases = [
-            {
-                "rank": rank,
-                "instance_id": f"project__project-{rank:03d}",
-                "base_commit": f"{rank:040x}",
-                "base_tree": f"{rank + 100:040x}",
-                "arm_order": (
-                    ["A", "T"] if rank % 2 == 1 else ["T", "A"]
-                ),
-            }
-            for rank in range(1, case_count + 1)
-        ]
+        frozen_v2_selection = None
+        if case_count == 20:
+            _, frozen_v2_selection = select_cases.load_frozen_v2_artifacts()
+            self.cases = [
+                dict(case) for case in frozen_v2_selection["cases"]
+            ]
+        else:
+            self.cases = [
+                {
+                    "rank": rank,
+                    "instance_id": f"project__project-{rank:03d}",
+                    "base_commit": f"{rank:040x}",
+                    "base_tree": f"{rank + 100:040x}",
+                    "arm_order": (
+                        ["A", "T"] if rank % 2 == 1 else ["T", "A"]
+                    ),
+                }
+                for rank in range(1, case_count + 1)
+            ]
         evaluator = evaluator_config()
         registration_ref = write_json(
             self.evidence / "registration.json",
             registration(evaluator, current=case_count == 20),
         )
-        selection = {
-            "schema_version": (
-                "issue836-fresh-cohort-selection-v2"
-                if case_count == 20
-                else "issue827-fresh-pair-selection-v1"
-            ),
-            "state": "selected_pre_model",
-            "authoritative": True,
-            "registration_sha256": registration_ref["sha256"],
-            "problem_statements_inspected_by_human_before_selection": False,
-            "gold_or_outcomes_inspected_before_selection": False,
-            "fresh_case_claim": True,
-            "prior_model_calls": 0,
-            "cases": self.cases,
-        }
+        if case_count == 20:
+            assert frozen_v2_selection is not None
+            selection = dict(frozen_v2_selection)
+            selection.update(
+                {
+                    "schema_version": select_cases.ISSUE836_V2_SCHEMA,
+                    "registration_commit": "b" * 40,
+                    "registration_sha256": registration_ref["sha256"],
+                    "cases": self.cases,
+                }
+            )
+            selection.pop("digest", None)
+            selection["digest"] = runner.sha256_bytes(
+                runner.canonical_json_bytes(selection)
+            )
+        else:
+            selection = {
+                "schema_version": "issue827-fresh-pair-selection-v1",
+                "state": "selected_pre_model",
+                "authoritative": True,
+                "registration_sha256": registration_ref["sha256"],
+                "problem_statements_inspected_by_human_before_selection": False,
+                "gold_or_outcomes_inspected_before_selection": False,
+                "fresh_case_claim": True,
+                "prior_model_calls": 0,
+                "case_replacement_after_model_start": False,
+                "cases": self.cases,
+            }
         selection_ref = write_json(self.evidence / "selection.json", selection)
 
         episodes: list[dict[str, object]] = []
@@ -503,7 +550,7 @@ class EvaluatorToolsTests(unittest.TestCase):
             )
             self.assertEqual(
                 select_result.result_schema(plan["_registration"]),
-                select_result.CURRENT_RESULT_SCHEMA,
+                select_result.ISSUE836_V2_RESULT_SCHEMA,
             )
 
     def test_current_offline_batch_and_result_are_dimension_complete(
@@ -554,7 +601,7 @@ class EvaluatorToolsTests(unittest.TestCase):
             )
             self.assertEqual(
                 result["schema_version"],
-                select_result.CURRENT_RESULT_SCHEMA,
+                select_result.ISSUE836_V2_RESULT_SCHEMA,
             )
             self.assertEqual(len(result["episodes"]), 40)
             self.assertEqual(

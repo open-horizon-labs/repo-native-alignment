@@ -17,12 +17,14 @@ from typing import Any, Mapping, TypedDict
 
 
 LEGACY_REGISTRATION_SCHEMA = "issue827-treatment-registration-v1"
-CURRENT_REGISTRATION_SCHEMA = "issue836-treatment-registration-v2"
-# New registrations use the current schema. Historical issue #827/#830
-# registrations remain valid through LEGACY_REGISTRATION_SCHEMA.
+ISSUE836_V2_REGISTRATION_SCHEMA = "issue836-treatment-registration-v2"
+CURRENT_REGISTRATION_SCHEMA = "issue836-treatment-registration-v3"
+# New registrations use the current schema. Historical issue #827/#830 and
+# issue #836 v2 registrations remain valid through their versioned schemas.
 REGISTRATION_SCHEMA = CURRENT_REGISTRATION_SCHEMA
 LEGACY_EPISODE_DESIGN_SCHEMA = "issue827-episode-design-v1"
-CURRENT_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v2"
+ISSUE836_V2_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v2"
+CURRENT_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v3"
 QUALIFICATION_REGISTRATION_SCHEMA = (
     "issue827-qualification-closure-registration-v1"
 )
@@ -98,6 +100,68 @@ RNA_ARTIFACT_FIELDS = {
     "local_source_build_allowed",
 }
 
+FROZEN_V3_PREFIX_LINEAGE: dict[str, Any] = {
+    "ranks_1_through_2": "pre_model_carry_forward_prefix",
+    "ranks_3_through_7_and_9_through_20": "deterministic_extension",
+    "rank_8": "pre_model_replacement_from_s2_rank_21",
+    "outcomes_inspected_for_extension": False,
+}
+
+FROZEN_V3_PRE_MODEL_SUPERSESSION: dict[str, Any] = {
+    "schema_version": "issue836-pre-model-cohort-supersession-v1",
+    "superseded_registration_schema": ISSUE836_V2_REGISTRATION_SCHEMA,
+    "superseded_registration_sha256": (
+        "10345f1ba1b1638f04b6b671a3aa64f5847e17944d955cd08494f91f003275b0"
+    ),
+    "superseded_registration_commit": (
+        "a6c768ba633ab0301df1ea6a94ceb036a401e45e"
+    ),
+    "superseded_selection_schema": "issue836-fresh-cohort-selection-v2",
+    "superseded_selection_sha256": (
+        "8b1c0dbfac7a540668f526a656f1a230af497b963b56793f44039686d147b73b"
+    ),
+    "superseded_selection_digest": (
+        "d9438a49ff01e9e86519c0f9871c319a5c90be368464ec84466f1e899c53ebd5"
+    ),
+    "dataset_arrow_sha256": (
+        "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+    ),
+    "exclusions_sha256": (
+        "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79"
+    ),
+    "excluded_ids_sha256": (
+        "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b"
+    ),
+    "superseded_rank": 8,
+    "excluded_instance_id": "sympy__sympy-24661",
+    "replacement_instance_id": "django__django-11163",
+    "replacement_source_rank": 21,
+    "replacement_method": "next_deterministic_s2_ranked_candidate",
+    "preserved_arm_order": ["T", "A"],
+    "reason_code": "old_shipped_rna_binary_mjs_descriptor_incompatibility",
+    "reason": (
+        "the registered old shipped RNA binary cannot prepare the exact "
+        "selected tree because its JavaScript descriptor routing does not "
+        "support .mjs"
+    ),
+    "incompatible_rna_binary_sha256": (
+        "d4d264da1a012b38814f0f2e9ee92f77c5aab3ed558a0f23abcd830d4b78ca94"
+    ),
+    "replacement_repo": "django/django",
+    "replacement_base_commit": "e6588aa4e793b7f56f4cadbfa155b581e0efc59a",
+    "replacement_base_tree": "4c221e3aba9030ab459871106740934193ce1118",
+    "replacement_ranking_sha256": (
+        "0bbab2a1aa0c0547bc1fea70b6fa97ae226b9c7c6e178dd1f69b2279900c5beb"
+    ),
+    "replacement_problem_statement_sha256": (
+        "8dbd8cae38c3a82b681a79bdfe8ffaa78aa6f1fad9744a1ca197f90265e5c80b"
+    ),
+    "detected_during_pre_model_cache_preparation": True,
+    "prior_model_calls": 0,
+    "prior_official_evaluator_invocations": 0,
+    "case_replacement_after_model_start": False,
+}
+
 
 class RegistrationContractError(RuntimeError):
     """A frozen preregistration identity or semantic contract did not hold."""
@@ -166,12 +230,21 @@ def experiment_dimensions(
             "case_count": 2,
             "episode_count": 4,
         }
+    elif schema == ISSUE836_V2_REGISTRATION_SCHEMA:
+        expected = {
+            "issue": 836,
+            "episode_schema": ISSUE836_V2_EPISODE_DESIGN_SCHEMA,
+            "selector_schema": "issue836-selector-v2",
+            "selection_rule_schema": "issue836-selection-rule-v2",
+            "case_count": 20,
+            "episode_count": 40,
+        }
     elif schema == CURRENT_REGISTRATION_SCHEMA:
         expected = {
             "issue": 836,
             "episode_schema": CURRENT_EPISODE_DESIGN_SCHEMA,
-            "selector_schema": "issue836-selector-v2",
-            "selection_rule_schema": "issue836-selection-rule-v2",
+            "selector_schema": "issue836-selector-v3",
+            "selection_rule_schema": "issue836-selection-rule-v3",
             "case_count": 20,
             "episode_count": 40,
         }
@@ -278,6 +351,15 @@ def experiment_dimensions(
     }
 
 
+def is_issue836_registration_schema(value: Any) -> bool:
+    """Return whether a schema is a supported issue #836 registration."""
+
+    return value in {
+        ISSUE836_V2_REGISTRATION_SCHEMA,
+        CURRENT_REGISTRATION_SCHEMA,
+    }
+
+
 def validate_registration(
     registration: Mapping[str, Any],
     *,
@@ -287,6 +369,7 @@ def validate_registration(
     """Validate shared frozen semantics and, optionally, live source bytes."""
 
     dimensions = experiment_dimensions(registration)
+    schema = registration.get("schema_version")
 
     runtime = registration.get("model_runtime")
     require(
@@ -298,8 +381,12 @@ def validate_registration(
     for key, expected in {
         "schema_version": (
             LEGACY_EPISODE_DESIGN_SCHEMA
-            if registration.get("schema_version") == LEGACY_REGISTRATION_SCHEMA
-            else CURRENT_EPISODE_DESIGN_SCHEMA
+            if schema == LEGACY_REGISTRATION_SCHEMA
+            else (
+                ISSUE836_V2_EPISODE_DESIGN_SCHEMA
+                if schema == ISSUE836_V2_REGISTRATION_SCHEMA
+                else CURRENT_EPISODE_DESIGN_SCHEMA
+            )
         ),
         "case_count": dimensions["case_count"],
         "episode_count": dimensions["episode_count"],
@@ -313,6 +400,32 @@ def validate_registration(
         require(
             episode.get(key) == expected,
             f"registration episode design drift: {key}",
+        )
+
+    selector = registration.get("selector")
+    require(isinstance(selector, dict), "registration selector missing")
+    if schema == CURRENT_REGISTRATION_SCHEMA:
+        require(
+            selector.get("pre_model_v2_supersession")
+            == FROZEN_V3_PRE_MODEL_SUPERSESSION,
+            "registration pre-model v2 supersession drift",
+        )
+        require(
+            selector.get("prefix_lineage") == FROZEN_V3_PREFIX_LINEAGE,
+            "registration v3 prefix lineage drift",
+        )
+        if require_resolved_hashes:
+            require(
+                selector["pre_model_v2_supersession"][
+                    "incompatible_rna_binary_sha256"
+                ]
+                == registration.get("rna_artifact", {}).get("binary_sha256"),
+                "superseded binary identity differs from registered RNA binary",
+            )
+    else:
+        require(
+            "pre_model_v2_supersession" not in selector,
+            "historical registration unexpectedly declares v3 supersession",
         )
 
     usage = registration.get("usage")
