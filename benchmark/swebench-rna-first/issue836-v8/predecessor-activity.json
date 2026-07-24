@@ -1,15 +1,15 @@
 {
   "schema_version": "issue836-predecessor-activity-v3",
   "activity": {
-    "infrastructure_invalidated_provider_episodes": 8,
-    "local_cli_process_starts": 10,
-    "model_invoked_receipts": 10,
+    "infrastructure_invalidated_provider_episodes": 10,
+    "local_cli_process_starts": 14,
+    "model_invoked_receipts": 14,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 1.1539282,
-    "provider_exposed_episodes": 8,
-    "provider_usage_tokens": 844211,
+    "provider_cost_usd": 3.3581463,
+    "provider_exposed_episodes": 12,
+    "provider_usage_tokens": 4510145,
     "stale_auth_episode_starts": 2,
-    "terminal_patches": 2
+    "terminal_patches": 5
   },
   "adaptations": [
     {
@@ -74,6 +74,22 @@
         "T"
       ],
       "scope": "allow only relative Git-tracked symlinks whose strict resolved targets remain inside the already-authorized editable checkout; retain rejection of absolute, broken, untracked, special-file, hardlink, and escaping aliases"
+    },
+    {
+      "type": "noncontaminating_observation_policy",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "retain blocked attempts, network syscalls behind Docker network=none, and successful read-only access to immutable container metadata as telemetry; terminate only successful writes outside declared roots, execution outside declared roots, or successful access to explicit sibling, evidence, index, or credential paths"
+    },
+    {
+      "type": "workspace_alias_and_native_hook_telemetry",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "map the model-visible /workspace prefix to the exact episode checkout for native tools and retain structurally valid unresolved native-tool reservations after the exited CLI process as telemetry"
     }
   ],
   "cohort_reused_unchanged": true,
@@ -199,8 +215,54 @@
         "bytes": 33313,
         "sha256": "f1012bc6f787e53183939205acd218bd45d3d4147f80491d8899509487f03f18"
       }
+    },
+    {
+      "classification": "provider_exposed_relaxed_policy_admissible_pair",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/v8-invocation-start.json",
+        "bytes": 2277,
+        "sha256": "64356863cfb4da3fd8545453e91649e8f6e93a1d82f5168e1b78a80917ee5958"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/waves/wave-001-ranks-02-03/wave-receipt.json",
+        "bytes": 3470,
+        "sha256": "7a9d85a7a9e5f84bf7b2fd60f2f48014d26cee24a4022c7c858b40d19af47dd8"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/rank-02-django__django-11179/A/episode-receipt.json",
+        "bytes": 95236,
+        "sha256": "c04adb28834a705273557afbdb2f8c41dba71eab9348ebe37528846bc91179a6"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/rank-02-django__django-11179/T/episode-receipt.json",
+        "bytes": 70440,
+        "sha256": "d51b5ac94d6a83290b3ef90646d6b867b1f49bbd5dd270ad9ba3d20d45e1f586"
+      }
+    },
+    {
+      "classification": "provider_exposed_censored_monitor_false_positive_pair",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/v8-invocation-start.json",
+        "bytes": 2277,
+        "sha256": "64356863cfb4da3fd8545453e91649e8f6e93a1d82f5168e1b78a80917ee5958"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/waves/wave-001-ranks-02-03/wave-receipt.json",
+        "bytes": 3470,
+        "sha256": "7a9d85a7a9e5f84bf7b2fd60f2f48014d26cee24a4022c7c858b40d19af47dd8"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/rank-03-sympy__sympy-13757/A/episode-receipt.json",
+        "bytes": 33381,
+        "sha256": "d0eba56c47cc95cbfb836099d84d5026f70badb127addd88a25ca74a64c7612a"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-gateway-successor-attempt-011/rank-03-sympy__sympy-13757/T/episode-receipt.json",
+        "bytes": 59213,
+        "sha256": "b8e71d1fd35029653eef890aaa1ab767d382babc350d2b5fdcd8998404f38a63"
+      }
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair_plus_internal_tracked_symlink_support"
+  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair_plus_internal_tracked_symlink_support_plus_noncontaminating_observation_policy_plus_workspace_alias_mapping"
 }

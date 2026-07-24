@@ -2907,12 +2907,13 @@ def isolation_compliance(
     )
     try:
         native_tool_state = read_json(native_tool_state_path)
-        if native_tool_state != {
-            "schema_version": "issue827-native-tool-state-v1",
-            "active": {},
-        }:
-            errors.append("native_tool_state_not_quiescent")
-    except (FailClosed, OSError, json.JSONDecodeError) as exc:
+        isolation.validate_native_tool_state(native_tool_state)
+    except (
+        FailClosed,
+        OSError,
+        json.JSONDecodeError,
+        isolation.IsolationViolation,
+    ) as exc:
         errors.append(f"native_tool_state_invalid:{exc}")
     guard_records: list[dict[str, Any]] = []
     if guard_ledger_path.exists():
