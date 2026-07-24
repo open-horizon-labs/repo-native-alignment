@@ -436,6 +436,7 @@ class WorkerContractTests(unittest.TestCase):
                 '1700.01 statfs("/sys/fs/selinux", 0xffff) = -1 ENOENT (No such file or directory)\n'
                 '1700.02 statfs("/selinux", 0xffff) = -1 ENOENT (No such file or directory)\n'
                 '1700.03 execve("/bin/bash", ["/bin/bash", "-lc", "printf \\"/not-an-access\\""], 0xffff) = 0\n'
+                '1700.04 execve("./tool", ["./tool", "/also-not-an-access"], 0xffff) = 0\n'
                 '1700.1 openat(AT_FDCWD, "/shared/evidence/x", O_RDONLY) = -1 ENOENT\n'
                 "1700.2 +++ exited with 0 +++\n"
             )
@@ -503,6 +504,25 @@ class WorkerContractTests(unittest.TestCase):
             self.assertEqual(
                 [item["code"] for item in report["observations"]],
                 ["blocked_undeclared_path_attempt"],
+            )
+
+    def test_trace_classification_cannot_be_spoofed_by_quoted_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary)
+            (trace / "trace.1").write_text(
+                "1699.9 landlock_restrict_self(3, 0) = 0\n"
+                '1700.0 rename("/workspace/ execve(", "/outside") = 0\n'
+                '1700.1 openat(AT_FDCWD, "/shared/evidence/) = -1 ENOENT /x", O_RDONLY) = 3\n'
+                "1700.2 +++ exited with 0 +++\n"
+            )
+            report = parse_strace_directory(
+                trace,
+                allowed_path_prefixes=["/workspace", "/shared"],
+                forbidden_path_fragments=["/shared/evidence"],
+            )
+            self.assertEqual(
+                {item["code"] for item in report["violations"]},
+                {"undeclared_path_access", "forbidden_path_access"},
             )
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary)

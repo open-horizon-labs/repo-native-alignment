@@ -75,14 +75,17 @@ WRITE_TOOLS = {"Edit", "Write"}
 TRACE_TERMINAL_RE = re.compile(
     r"(?:^|\s)\+\+\+ (?:exited with [0-9]+|killed by [A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$"
 )
+TRACE_QUOTED_VALUE_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 TRACE_ABSOLUTE_PATH_RE = re.compile(r'"(/(?:[^"\\]|\\.)*)"')
-TRACE_EXECVE_RE = re.compile(r"(?:^|\s)execve(?:at)?\(")
+TRACE_TIMESTAMP_PREFIX = r"^(?:[0-9]+(?:\.[0-9]+)?\s+)?"
+TRACE_EXECVE_RE = re.compile(TRACE_TIMESTAMP_PREFIX + r"execve(?:at)?\(")
 TRACE_MISSING_SELINUX_STATFS_RE = re.compile(
-    r'(?:^|\s)statfs\("(?P<path>/sys/fs/selinux|/selinux)",'
-    r".*\)\s*=\s*-1 ENOENT(?:\s|$)"
+    TRACE_TIMESTAMP_PREFIX
+    + r'statfs\("(?P<path>/sys/fs/selinux|/selinux)",'
+    + r".*\)\s*=\s*-1 ENOENT(?:\s+\([^\n]*\))?\s*$"
 )
 TRACE_BLOCKED_RESULT_RE = re.compile(
-    r"\)\s*=\s*-1\s+E[A-Z0-9_]+(?:\s|$)"
+    r"\)\s*=\s*-1\s+E[A-Z0-9_]+(?:\s+\([^\n]*\))?\s*$"
 )
 TRACE_INET_RE = re.compile(
     r"(?:socket\(\s*AF_INET6?\b|sa_family=AF_INET6?\b|"
@@ -927,12 +930,19 @@ def parse_strace_directory(
                             ),
                         }
                     )
-            encoded_paths = TRACE_ABSOLUTE_PATH_RE.findall(line)
             # Only argv[0] is a filesystem access made by execve/execveat.
             # Later quoted strings are arguments and may contain shell source,
             # diagnostic text, or other absolute-looking data.
-            if TRACE_EXECVE_RE.search(line):
-                encoded_paths = encoded_paths[:1]
+            if TRACE_EXECVE_RE.match(line):
+                quoted_values = TRACE_QUOTED_VALUE_RE.findall(line)
+                executable = (
+                    quoted_values[0].replace(r"\/", "/")
+                    if quoted_values
+                    else ""
+                )
+                encoded_paths = [executable] if executable.startswith("/") else []
+            else:
+                encoded_paths = TRACE_ABSOLUTE_PATH_RE.findall(line)
             missing_selinux_probe = TRACE_MISSING_SELINUX_STATFS_RE.search(
                 line
             )

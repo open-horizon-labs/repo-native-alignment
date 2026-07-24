@@ -18,10 +18,10 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v14.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v14.json"
+SCHEDULE_FILENAME = "execution-schedule-v15.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v15.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v14.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v15.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
@@ -54,7 +54,7 @@ REGISTERED_SOURCE_DELTA = {
             "63b556e094f0553701118fbea7db9729a327f30496388778fb2ff48b8d28284e"
         ),
         "successor": (
-            "94a7d5530cb5b47ecfa5b188c2d0bf8ae8e1bddebaabff4349b4dd117f786dfe"
+            "027696d72ccd8855f92b084fb56d74a316edeee2cf38d6b47280c069c3059cb9"
         ),
     },
     "runner_sha256": {
@@ -67,7 +67,7 @@ REGISTERED_SOURCE_DELTA = {
     },
 }
 SUCCESSOR_REGISTERED_FILES_SHA256 = (
-    "94812e689fde1012e2eafa062c442e4969009a1686ef9e9b2453f7de350c2b9f"
+    "31f803daf41ff1f768bc721e9ccc5b8d0e3d4b83bfb8a8677cfb616ca0508cbb"
 )
 PROTOCOL_CHANGE = (
     "deterministic_issue_query_preconditioning_and_gateway_recovery_"
