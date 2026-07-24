@@ -80,10 +80,7 @@ def build(schedule_commit: str) -> dict:
     return {
         "schema_version": contract.SELECTION_BINDING_SCHEMA,
         "authoritative": True,
-        "protocol_change": (
-            "preconditioned_treatment_and_gateway_recovery_"
-            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
-        ),
+        "protocol_change": contract.PROTOCOL_CHANGE,
         "schedule_sha256": contract.sha_file(schedule_path),
         "schedule_commit": commit,
         "schedule_tree": tree,

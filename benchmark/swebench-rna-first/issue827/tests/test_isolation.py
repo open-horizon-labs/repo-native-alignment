@@ -975,6 +975,124 @@ class RequestAndSettingsTests(unittest.TestCase):
             denied = json.loads(output.getvalue())["hookSpecificOutput"]
             self.assertEqual(denied["permissionDecision"], "deny")
 
+    def test_common_hook_preserves_adherent_nonzero_bash_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipts = root / "receipts"
+            receipts.mkdir()
+            gateway = root / "bash_gateway.py"
+            gateway.write_text("# gateway\n")
+            python = root / "python"
+            python.write_text("# python\n")
+            supervisor = root / "supervisor.json"
+            supervisor.write_text("{}\n")
+            config = {
+                "policy": "control",
+                "common_hook_ledger": str(root / "common.jsonl"),
+                "common_state": str(root / "state.json"),
+                "gateway_receipt_directory": str(receipts),
+                "gateway_python": str(python),
+                "bash_gateway": str(gateway),
+                "gateway_config": str(supervisor),
+            }
+            request_id = "a" * 32
+            request_sha = "b" * 64
+            command = common_supervisor.gateway_command(
+                config={
+                    **config,
+                    "gateway_config_sha256": file_sha(supervisor),
+                },
+                request_id=request_id,
+                request_sha256=request_sha,
+            )
+            receipt = {
+                "schema_version": "issue827-bash-gateway-receipt-v1",
+                "request_id": request_id,
+                "request_sha256": request_sha,
+                "status": "failed",
+                "returncode": 1,
+                "violations": [],
+            }
+            receipt["receipt_sha256"] = sha256_bytes(canonical(receipt))
+            (receipts / f"{request_id}.json").write_bytes(canonical(receipt))
+            event = {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_use_id": "tool",
+                "tool_input": {"command": command},
+            }
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = common_supervisor.handle(event, config)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "")
+            record = json.loads(Path(config["common_hook_ledger"]).read_text())
+            self.assertEqual(record["decision"], "verified_failure")
+            self.assertEqual(record["payload"]["returncode"], 1)
+            self.assertFalse(Path(config["common_state"]).exists())
+
+    def test_common_hook_rejects_gateway_result_event_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            receipts = root / "receipts"
+            receipts.mkdir()
+            gateway = root / "bash_gateway.py"
+            gateway.write_text("# gateway\n")
+            python = root / "python"
+            python.write_text("# python\n")
+            supervisor = root / "supervisor.json"
+            supervisor.write_text("{}\n")
+            config = {
+                "policy": "control",
+                "common_hook_ledger": str(root / "common.jsonl"),
+                "common_state": str(root / "state.json"),
+                "gateway_receipt_directory": str(receipts),
+                "gateway_python": str(python),
+                "bash_gateway": str(gateway),
+                "gateway_config": str(supervisor),
+            }
+            request_id = "c" * 32
+            request_sha = "d" * 64
+            command = common_supervisor.gateway_command(
+                config={
+                    **config,
+                    "gateway_config_sha256": file_sha(supervisor),
+                },
+                request_id=request_id,
+                request_sha256=request_sha,
+            )
+            receipt = {
+                "schema_version": "issue827-bash-gateway-receipt-v1",
+                "request_id": request_id,
+                "request_sha256": request_sha,
+                "status": "failed",
+                "returncode": 2,
+                "violations": [],
+            }
+            receipt["receipt_sha256"] = sha256_bytes(canonical(receipt))
+            (receipts / f"{request_id}.json").write_bytes(canonical(receipt))
+            event = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "tool",
+                "tool_input": {"command": command},
+            }
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = common_supervisor.handle(event, config)
+
+            self.assertEqual(result, 0)
+            decision = json.loads(output.getvalue())
+            self.assertFalse(decision["continue"])
+            state = json.loads(Path(config["common_state"]).read_text())
+            self.assertEqual(
+                state["fatal_reason"],
+                "gateway_tool_result_mismatch",
+            )
+
 
 class TrustedRnaBrokerTests(unittest.TestCase):
     def fixture(self, root: Path) -> tuple[dict, dict, Path, bytes, bytes]:

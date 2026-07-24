@@ -247,9 +247,37 @@ def _receipt_for_gateway_command(
         or receipt.get("request_sha256") != request_sha
     ):
         raise IsolationViolation("gateway_receipt_binding_mismatch")
-    if receipt.get("status") != "success":
+    observed_hash = receipt.get("receipt_sha256")
+    body = {
+        key: value
+        for key, value in receipt.items()
+        if key != "receipt_sha256"
+    }
+    if (
+        not isinstance(observed_hash, str)
+        or observed_hash != sha256_bytes(canonical(body))
+    ):
+        raise IsolationViolation("gateway_receipt_self_hash_invalid")
+    status = receipt.get("status")
+    returncode = receipt.get("returncode")
+    violations = receipt.get("violations")
+    adherent_success = (
+        status == "success"
+        and type(returncode) is int
+        and returncode == 0
+        and violations == []
+    )
+    adherent_failure = (
+        status == "failed"
+        and type(returncode) is int
+        and returncode != 0
+        and violations == []
+    )
+    if not adherent_success and not adherent_failure:
         raise IsolationViolation(
-            "gateway_receipt_not_success", status=receipt.get("status")
+            "gateway_receipt_not_adherent",
+            status=status,
+            returncode=returncode,
         )
     return receipt
 
@@ -356,16 +384,30 @@ def handle(event: dict, config: dict) -> int:
             if not isinstance(command, str):
                 raise IsolationViolation("gateway_post_command_missing")
             receipt = _receipt_for_gateway_command(command, config)
-            if name == "PostToolUseFailure":
-                raise IsolationViolation("gateway_tool_reported_failure")
+            expected_event = (
+                "PostToolUse"
+                if receipt["status"] == "success"
+                else "PostToolUseFailure"
+            )
+            if name != expected_event:
+                raise IsolationViolation(
+                    "gateway_tool_result_mismatch",
+                    status=receipt["status"],
+                    event=name,
+                )
             _ledger(
                 config,
                 event,
-                decision="verified",
+                decision=(
+                    "verified"
+                    if receipt["status"] == "success"
+                    else "verified_failure"
+                ),
                 reason=None,
                 payload={
                     "request_id": receipt["request_id"],
                     "receipt_sha256": receipt["receipt_sha256"],
+                    "returncode": receipt["returncode"],
                 },
             )
             return 0

@@ -15,8 +15,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
+import subprocess
 import sys
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -32,6 +34,36 @@ import assemble_wave as wave_adapter  # noqa: E402
 import schedule_contract as contract  # noqa: E402
 
 
+QUERY_BODY_CHAR_LIMIT = 512
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_FENCED_CODE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+
+
+def deterministic_rna_query(problem: bytes) -> bytes:
+    """Build one outcome-blind query from the frozen issue text.
+
+    The exact title stays first. A bounded, mechanically cleaned issue-body
+    prefix adds identifiers and failure language without result-dependent
+    rewriting, sentence parsing, or access to evaluator information.
+    """
+
+    normalized = (
+        problem.decode("utf-8", errors="strict")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+    title, separator, body = normalized.partition("\n")
+    base.require(bool(title), "deterministic query title is empty")
+    if not separator:
+        return title.encode("utf-8")
+    prose = _HTML_COMMENT.sub(" ", body)
+    prose = _FENCED_CODE.sub(" ", prose)
+    prose = " ".join(prose.split())
+    body_prefix = prose[:QUERY_BODY_CHAR_LIMIT]
+    query = title if not body_prefix else f"{title}\n\n{body_prefix}"
+    return query.encode("utf-8")
+
+
 def generate_successor_outer_seatbelt_profile(
     *,
     read_roots: Sequence[Path],
@@ -43,7 +75,15 @@ def generate_successor_outer_seatbelt_profile(
     if not read_roots or not write_roots:
         raise base.isolation.IsolationViolation("seatbelt_roots_empty")
     read = sorted({path.resolve(strict=True) for path in read_roots})
-    write = sorted({path.resolve(strict=True) for path in write_roots})
+    # The Claude shell and Docker CLI both use /dev/null for routine stream
+    # plumbing.  Denying that exact device makes an otherwise valid gateway
+    # command fail before the isolated worker can emit its mandatory trace.
+    write = sorted(
+        {
+            *(path.resolve(strict=True) for path in write_roots),
+            Path("/dev/null").resolve(strict=True),
+        }
+    )
     read_literals = set(read)
     for path in read:
         read_literals.update(path.parents)
@@ -224,7 +264,7 @@ def acquire_preconditioned_treatment(
     evidence: Path,
     config: dict[str, Any],
 ) -> tuple[bytes, list[str], float, dict[str, Any]]:
-    """Inject the exact issue title and its already-executed RNA result."""
+    """Inject the deterministic issue query and already-executed RNA result."""
 
     _, ids, elapsed, query_evidence = _ORIGINAL_ACQUIRE_TREATMENT(
         case,
@@ -233,24 +273,32 @@ def acquire_preconditioned_treatment(
         config,
     )
     projection = Path(config["initial_response"]).read_bytes()
-    title = case.title.rstrip(b"\r\n")
-    prefix = (ROOT / "precondition-prefix.txt").read_bytes()
+    query = case.title.rstrip(b"\r\n")
+    query_text = query.decode("utf-8", errors="strict")
+    worked_call = (
+        b"rna_tool_search("
+        + json.dumps(query_text, ensure_ascii=False).encode("utf-8")
+        + b")"
+    )
+    prefix = (ROOT / "precondition-prefix.txt").read_bytes().replace(
+        b"rna_tool_search(__EXACT_ISSUE_TITLE_JSON__)",
+        worked_call,
+    )
     suffix = (ROOT / "precondition-suffix.txt").read_bytes().replace(
         b"__TRAVERSAL_WRAPPER__",
         str(harness_paths["rna_traverse.py"]).encode(),
     )
     system = (
         prefix
-        + b"\n"
-        + title
-        + b"\n\nRNA RESULT FOR THAT EXACT TITLE QUERY\n"
         + projection
         + suffix
     )
     base.require(
-        title
-        and base.sha_bytes(title) == config["expected_query_sha256"]
-        and system.startswith(prefix + b"\n" + title)
+        query
+        and base.sha_bytes(query) == config["expected_query_sha256"]
+        and system.startswith(prefix)
+        and system.count(worked_call) == 1
+        and system.index(worked_call) < system.index(projection)
         and system.count(projection) == 1
         and b"Your FIRST actual tool call" not in system
         and b"supervisor enforces" not in system,
@@ -349,6 +397,8 @@ def build_observational_actor_tool_ledger(
     )
     command_families = {"grep": 0, "rg": 0, "sed": 0}
     for action in ledger["actions"]:
+        if action.get("action") == "rna_exact_title_query":
+            action["action"] = "rna_deterministic_issue_query"
         command = action.get("bash_command")
         if not isinstance(command, str):
             continue
@@ -1547,7 +1597,7 @@ def prepare_wave(
                 base_tree=case["base_tree"],
                 problem=problem,
                 prompt=prompt,
-                title=base.title_bytes(problem),
+                title=deterministic_rna_query(problem),
                 index_checkout=index_checkout,
                 root=cache_root,
                 cache_refs=cache_refs,
@@ -1872,11 +1922,423 @@ def execute_wave(
     return 0 if result["all_authorized_episodes_recorded"] else 1
 
 
+GATEWAY_SMOKE_COMMAND = "printf host-null-smoke >/dev/null; exit 7"
+
+
+def _gateway_smoke_process(
+    *,
+    label: str,
+    argv: Sequence[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    evidence: Path,
+    input_bytes: bytes | None,
+    timeout_seconds: float,
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any]]:
+    """Run and retain one exact process in the production outer Seatbelt."""
+
+    process_argv = [str(item) for item in argv]
+    input_path = evidence / f"{label}.stdin"
+    stdout_path = evidence / f"{label}.stdout"
+    stderr_path = evidence / f"{label}.stderr"
+    try:
+        if input_bytes is not None:
+            base.atomic_write(input_path, input_bytes)
+            result = subprocess.run(
+                process_argv,
+                cwd=cwd,
+                env=dict(environment),
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        else:
+            result = subprocess.run(
+                process_argv,
+                cwd=cwd,
+                env=dict(environment),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout_seconds,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise base.FailClosed(f"gateway smoke process timed out: {label}") from exc
+    base.atomic_write(stdout_path, result.stdout)
+    base.atomic_write(stderr_path, result.stderr)
+    record = {
+        "schema_version": "issue836-gateway-smoke-process-v1",
+        "label": label,
+        "argv": process_argv,
+        "cwd": str(cwd),
+        "input": base.file_ref(input_path) if input_bytes is not None else None,
+        "stdout": base.file_ref(stdout_path),
+        "stderr": base.file_ref(stderr_path),
+        "returncode": result.returncode,
+    }
+    record_path = evidence / f"{label}.process.json"
+    base.atomic_write(record_path, base.canonical(record))
+    return result, {"process": base.file_ref(record_path), **record}
+
+
+def gateway_smoke(
+    prepared: base.PreparedRun,
+    cases: Sequence[base.PreparedCase],
+    *,
+    rank: int,
+    output_root: Path,
+) -> int:
+    """Exercise a clean nonzero Bash result without launching a model.
+
+    This uses the production materializer, common and observational hooks,
+    single-use gateway, offline Docker worker, and outer Seatbelt.  It proves
+    both the exact /dev/null allowance and model-visible delivery of an
+    adherent return code 7 before any paid successor episode is authorized.
+    """
+
+    matches = [case for case in cases if case.rank == rank]
+    base.require(len(matches) == 1, "gateway smoke rank is not in this wave")
+    case = matches[0]
+    raw_output = output_root
+    base.require(raw_output.is_absolute(), "gateway smoke output must be absolute")
+    resolved_output = raw_output.resolve(strict=False)
+    base.require(
+        raw_output == resolved_output
+        and not raw_output.exists()
+        and not raw_output.is_symlink()
+        and raw_output.parent.is_dir()
+        and not raw_output.parent.is_symlink(),
+        "gateway smoke output must be a canonical absent path",
+    )
+    paid_output = prepared.output_root.resolve(strict=False)
+    checkout = case.checkouts["A"].resolve(strict=True)
+    for forbidden in (paid_output, checkout, case.index_checkout.resolve(strict=True)):
+        base.require(
+            resolved_output != forbidden
+            and resolved_output not in forbidden.parents
+            and forbidden not in resolved_output.parents,
+            "gateway smoke output overlaps production or checkout state",
+        )
+
+    resolved_output.mkdir(mode=0o700)
+    case_root = resolved_output / f"rank-{case.rank:02d}-{case.case_id}"
+    harness_paths = base.materialize_harness(case_root, "A")
+    (
+        episode,
+        evidence,
+        _identity_path,
+        _settings_path,
+        config,
+    ) = base.configure_episode(
+        prepared,
+        case,
+        "A",
+        case_root,
+        harness_paths,
+    )
+    smoke_evidence = evidence / "gateway-smoke"
+    smoke_evidence.mkdir(mode=0o700)
+    before_status_path = smoke_evidence / "checkout-before.status"
+    base.atomic_write(before_status_path, base.clean_status(checkout))
+
+    seatbelt_profile = Path(str(config["seatbelt_profile"]))
+    seatbelt_text = seatbelt_profile.read_text(encoding="utf-8")
+    dev_null = Path("/dev/null").resolve(strict=True)
+    base.require(
+        base.isolation._seatbelt_literal(dev_null) in seatbelt_text,
+        "production outer Seatbelt does not include exact /dev/null",
+    )
+    outer_prefix = [
+        str(config["sandbox_exec"]),
+        "-f",
+        str(seatbelt_profile),
+    ]
+    parent_environment = base.provider_parent_env(episode / "private")
+
+    def hook_argv(role: str) -> list[str]:
+        child_name = (
+            "common_supervisor.py"
+            if role == "common"
+            else "tool_supervisor.py"
+        )
+        child = harness_paths[child_name]
+        return [
+            *outer_prefix,
+            str(config["gateway_python"]),
+            str(harness_paths["hook_guard.py"]),
+            "--config",
+            str(harness_paths["config"]),
+            "--evidence-root",
+            str(evidence),
+            "--child",
+            str(child),
+            "--child-sha256",
+            base.sha_file(child),
+            "--role",
+            role,
+            "--timeout-ms",
+            "3500",
+        ]
+
+    session_id = f"gateway-smoke-rank-{case.rank:02d}"
+    tool_use_id = f"gateway-smoke-rank-{case.rank:02d}-bash"
+    pre_event = {
+        "session_id": session_id,
+        "cwd": str(checkout),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": tool_use_id,
+        "tool_input": {
+            "command": GATEWAY_SMOKE_COMMAND,
+            "run_in_background": False,
+        },
+    }
+    pre_bytes = base.canonical(pre_event)
+    common_pre, common_pre_ref = _gateway_smoke_process(
+        label="01-common-pre",
+        argv=hook_argv("common"),
+        cwd=checkout,
+        environment=parent_environment,
+        evidence=smoke_evidence,
+        input_bytes=pre_bytes,
+        timeout_seconds=15.0,
+    )
+    base.require(
+        common_pre.returncode == 0 and not common_pre.stderr,
+        "gateway smoke common PreToolUse hook failed",
+    )
+    try:
+        common_pre_document = json.loads(common_pre.stdout)
+        specific = common_pre_document["hookSpecificOutput"]
+        updated_input = specific["updatedInput"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise base.FailClosed(
+            "gateway smoke common PreToolUse response invalid"
+        ) from exc
+    base.require(
+        isinstance(updated_input, dict)
+        and specific.get("hookEventName") == "PreToolUse"
+        and specific.get("permissionDecision") == "allow"
+        and updated_input.get("run_in_background") is False
+        and type(updated_input.get("timeout")) is int
+        and isinstance(updated_input.get("command"), str),
+        "gateway smoke common PreToolUse did not replace Bash",
+    )
+    effective_pre_event = {**pre_event, "tool_input": updated_input}
+    treatment_pre, treatment_pre_ref = _gateway_smoke_process(
+        label="02-treatment-pre",
+        argv=hook_argv("treatment"),
+        cwd=checkout,
+        environment=parent_environment,
+        evidence=smoke_evidence,
+        input_bytes=base.canonical(effective_pre_event),
+        timeout_seconds=15.0,
+    )
+    base.require(
+        treatment_pre.returncode == 0
+        and not treatment_pre.stdout
+        and not treatment_pre.stderr,
+        "gateway smoke observational PreToolUse hook failed",
+    )
+
+    broker_runtime = base.start_trusted_rna_broker(prepared, config, evidence)
+    broker_teardown: dict[str, Any] | None = None
+    try:
+        gateway_command = str(updated_input["command"])
+        gateway_result, gateway_process_ref = _gateway_smoke_process(
+            label="03-gateway",
+            argv=[*outer_prefix, *shlex.split(gateway_command)],
+            cwd=checkout,
+            environment=parent_environment,
+            evidence=smoke_evidence,
+            input_bytes=None,
+            timeout_seconds=min(
+                180.0,
+                float(config["worker_timeout_seconds"]) + 30.0,
+            ),
+        )
+        base.require(
+            gateway_result.returncode == 7
+            and not gateway_result.stdout
+            and not gateway_result.stderr,
+            "gateway smoke did not preserve the clean return code 7",
+        )
+        post_event = {
+            **effective_pre_event,
+            "hook_event_name": "PostToolUseFailure",
+            "error": "Command failed with exit code 7",
+        }
+        post_bytes = base.canonical(post_event)
+        common_post, common_post_ref = _gateway_smoke_process(
+            label="04-common-post-failure",
+            argv=hook_argv("common"),
+            cwd=checkout,
+            environment=parent_environment,
+            evidence=smoke_evidence,
+            input_bytes=post_bytes,
+            timeout_seconds=15.0,
+        )
+        base.require(
+            common_post.returncode == 0
+            and not common_post.stdout
+            and not common_post.stderr,
+            "gateway smoke common PostToolUseFailure hook denied",
+        )
+        treatment_post, treatment_post_ref = _gateway_smoke_process(
+            label="05-treatment-post-failure",
+            argv=hook_argv("treatment"),
+            cwd=checkout,
+            environment=parent_environment,
+            evidence=smoke_evidence,
+            input_bytes=post_bytes,
+            timeout_seconds=15.0,
+        )
+        base.require(
+            treatment_post.returncode == 0
+            and not treatment_post.stdout
+            and not treatment_post.stderr,
+            "gateway smoke observational PostToolUseFailure hook denied",
+        )
+    finally:
+        broker_teardown = base.stop_trusted_rna_broker(
+            broker_runtime,
+            config,
+        )
+
+    gateway_receipts = sorted(
+        Path(str(config["gateway_receipt_directory"])).glob("*.json")
+    )
+    base.require(
+        len(gateway_receipts) == 1,
+        "gateway smoke receipt cardinality drift",
+    )
+    gateway_receipt = base.read_json(gateway_receipts[0])
+    receipt_body = {
+        key: value
+        for key, value in gateway_receipt.items()
+        if key != "receipt_sha256"
+    }
+    base.require(
+        gateway_receipt.get("status") == "failed"
+        and gateway_receipt.get("returncode") == 7
+        and gateway_receipt.get("violations") == []
+        and gateway_receipt.get("receipt_sha256")
+        == base.sha_bytes(base.canonical(receipt_body)),
+        "gateway smoke clean-failure receipt invalid",
+    )
+    common_hooks = base.load_jsonl(Path(str(config["common_hook_ledger"])))
+    treatment_hooks = base.load_jsonl(Path(str(config["hook_ledger"])))
+    base.require(
+        [item.get("decision") for item in common_hooks]
+        == ["replace_allow", "verified_failure"],
+        "gateway smoke common decision sequence drift",
+    )
+    base.require(
+        [item.get("decision") for item in treatment_hooks]
+        == ["observe_allow", "observed_ordinary_bash_failure"],
+        "gateway smoke observational decision sequence drift",
+    )
+    isolated, isolation_errors = base.isolation_compliance(
+        config,
+        common_hooks,
+        treatment_hooks,
+    )
+    observational, observational_errors = base.treatment_compliance(
+        config,
+        evidence,
+        "A",
+    )
+    base.require(
+        isolated
+        and not isolation_errors
+        and observational
+        and not observational_errors,
+        "gateway smoke production compliance failed: "
+        f"{isolation_errors + observational_errors}",
+    )
+    after_status_path = smoke_evidence / "checkout-after.status"
+    base.atomic_write(after_status_path, base.clean_status(checkout))
+    base.require(
+        before_status_path.read_bytes() == after_status_path.read_bytes(),
+        "gateway smoke changed the editable checkout",
+    )
+
+    receipt = {
+        "schema_version": "issue836-gateway-smoke-receipt-v1",
+        "status": "PASS",
+        "rank": case.rank,
+        "case_id": case.case_id,
+        "arm": "A",
+        "command": GATEWAY_SMOKE_COMMAND,
+        "outer_seatbelt": base.file_ref(seatbelt_profile),
+        "dev_null_exact_write_root": str(dev_null),
+        "processes": [
+            common_pre_ref,
+            treatment_pre_ref,
+            gateway_process_ref,
+            common_post_ref,
+            treatment_post_ref,
+        ],
+        "gateway_receipt": base.file_ref(gateway_receipts[0]),
+        "gateway_status": "failed",
+        "gateway_returncode": 7,
+        "gateway_violations": [],
+        "common_decisions": ["replace_allow", "verified_failure"],
+        "observational_decisions": [
+            "observe_allow",
+            "observed_ordinary_bash_failure",
+        ],
+        "broker": broker_teardown,
+        "isolation_compliant": True,
+        "observational_compliant": True,
+        "checkout_before": base.file_ref(before_status_path),
+        "checkout_after": base.file_ref(after_status_path),
+        "models_launched": 0,
+        "provider_requests": 0,
+        "official_evaluator_invocations": 0,
+    }
+    receipt["receipt_sha256"] = base.sha_bytes(base.canonical(receipt))
+    receipt_path = resolved_output / "gateway-smoke-receipt.json"
+    base.atomic_write(receipt_path, base.canonical(receipt))
+    print(
+        json.dumps(
+            {
+                "status": "GATEWAY_SMOKE_PASS_ZERO_MODEL",
+                "receipt": base.file_ref(receipt_path),
+                **{
+                    key: receipt[key]
+                    for key in (
+                        "gateway_returncode",
+                        "gateway_violations",
+                        "common_decisions",
+                        "models_launched",
+                        "provider_requests",
+                        "official_evaluator_invocations",
+                    )
+                },
+            },
+            sort_keys=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
     preflight = sub.add_parser("preflight", help="read-only wave validation")
     preflight.add_argument("--manifest", type=Path, required=True)
+    smoke = sub.add_parser(
+        "gateway-smoke",
+        help="run the production gateway through return code 7 with no model",
+    )
+    smoke.add_argument("--manifest", type=Path, required=True)
+    smoke.add_argument("--rank", type=int, required=True)
+    smoke.add_argument("--output-root", type=Path, required=True)
     run = sub.add_parser(
         "run",
         help="preflight and optionally execute one registered wave",
@@ -1901,6 +2363,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             episode_keys,
         )
         print(json.dumps(summary, sort_keys=True, indent=2))
+        if args.command == "gateway-smoke":
+            return gateway_smoke(
+                prepared,
+                prepared.cases,
+                rank=args.rank,
+                output_root=args.output_root,
+            )
         if args.command == "preflight" or not args.execute:
             if args.command == "run":
                 print(

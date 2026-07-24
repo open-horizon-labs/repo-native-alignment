@@ -1,13 +1,13 @@
 {
   "schema_version": "issue836-predecessor-activity-v3",
   "activity": {
-    "infrastructure_invalidated_provider_episodes": 4,
-    "local_cli_process_starts": 6,
-    "model_invoked_receipts": 6,
+    "infrastructure_invalidated_provider_episodes": 6,
+    "local_cli_process_starts": 8,
+    "model_invoked_receipts": 8,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.4538073,
-    "provider_exposed_episodes": 4,
-    "provider_usage_tokens": 244712,
+    "provider_cost_usd": 0.7132426,
+    "provider_exposed_episodes": 6,
+    "provider_usage_tokens": 494566,
     "stale_auth_episode_starts": 2,
     "terminal_patches": 0
   },
@@ -17,7 +17,7 @@
       "applies_to_arms": [
         "T"
       ],
-      "scope": "inject the exact issue title and its precomputed RNA exact-title result; observe subsequent tool calls without requiring RNA or a particular first tool"
+      "scope": "inject one outcome-blind query generated from the exact title plus a mechanically cleaned 512-character issue-body prefix and its precomputed RNA result; observe subsequent tool calls without requiring RNA or a particular first tool"
     },
     {
       "type": "trusted_gateway_access_restoration",
@@ -26,6 +26,14 @@
         "T"
       ],
       "scope": "make the pinned Docker client readable and its forwarded Unix socket reachable by the common single-use Bash gateway"
+    },
+    {
+      "type": "ordinary_gateway_failure_delivery",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "allow exact /dev/null stream plumbing and deliver verified clean nonzero Bash results to the model while retaining terminal denial for violations, nonadherence, tamper, or event mismatch"
     },
     {
       "type": "native_tool_parallelism_restoration",
@@ -121,8 +129,31 @@
         "bytes": 26035,
         "sha256": "bf44064ae1ff8c909931f32206a1522e69c4aea879a19b7d1261428b606a8e50"
       }
+    },
+    {
+      "classification": "provider_exposed_outer_seatbelt_dev_null_denial",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-parallel-successor/v8-invocation-start.json",
+        "bytes": 2275,
+        "sha256": "bd6280b34d5e001944d604b899b93a0531c8b673eb3b1cc709696f6f39ec5f90"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-parallel-successor/waves/wave-001-rank-01/wave-receipt.json",
+        "bytes": 2542,
+        "sha256": "c9a0a1372cd523989fe43652c5ebd7e2ebae0e7b536bf3310a903fec31fa1283"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-parallel-successor/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+        "bytes": 14491,
+        "sha256": "c16af14be8b344aaf896f833b35586bafb67435a13087e85a62fd9aa2c887a70"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-parallel-successor/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+        "bytes": 26607,
+        "sha256": "a36414b1a5ee73ae86d63534bf6022b45e7a9a61f20f1665831755caec27d08f"
+      }
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "restore_preconditioning_and_remove_nonexperimental_tool_serialization"
+  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery"
 }

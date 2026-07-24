@@ -18,13 +18,17 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v8.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v8.json"
+SCHEDULE_FILENAME = "execution-schedule-v9.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v9.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v8.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v9.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
+PROTOCOL_CHANGE = (
+    "deterministic_issue_query_preconditioning_and_gateway_recovery_"
+    "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
+)
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
     "benchmark/swebench-rna-first/issue830/registration.json"
 )
@@ -92,13 +96,13 @@ NO_SPEND = {
     "official_evaluator_invocations": 0,
 }
 PREDECESSOR_ACTIVITY = {
-    "infrastructure_invalidated_provider_episodes": 4,
-    "local_cli_process_starts": 6,
-    "model_invoked_receipts": 6,
+    "infrastructure_invalidated_provider_episodes": 6,
+    "local_cli_process_starts": 8,
+    "model_invoked_receipts": 8,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.4538073,
-    "provider_exposed_episodes": 4,
-    "provider_usage_tokens": 244712,
+    "provider_cost_usd": 0.7132426,
+    "provider_exposed_episodes": 6,
+    "provider_usage_tokens": 494566,
     "stale_auth_episode_starts": 2,
     "terminal_patches": 0,
 }
@@ -205,10 +209,7 @@ def validate_predecessor_activity(
         and document["new_session_ids_required"] is True
         and document["predecessor_superseded"] is True
         and document["protocol_change"]
-        == (
-            "restore_preconditioning_and_remove_nonexperimental_tool_"
-            "serialization"
-        ),
+        == "deterministic_issue_query_preconditioning_and_gateway_recovery",
         "predecessor activity semantics drift",
     )
     adaptations = document["adaptations"]
@@ -218,6 +219,7 @@ def validate_predecessor_activity(
         == [
             "preconditioned_treatment_restoration",
             "trusted_gateway_access_restoration",
+            "ordinary_gateway_failure_delivery",
             "native_tool_parallelism_restoration",
             "authoritative_model_usage_reporting",
         ]
@@ -240,6 +242,7 @@ def validate_predecessor_activity(
             "stale_auth_zero_provider",
             "provider_exposed_supervisor_termination",
             "provider_exposed_native_tool_overlap",
+            "provider_exposed_outer_seatbelt_dev_null_denial",
         ],
         "predecessor attempt classifications drift",
     )
@@ -585,11 +588,7 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
     require(
         schedule["schema_version"] == SCHEDULE_SCHEMA
         and schedule["authoritative"] is True
-        and schedule["protocol_change"]
-        == (
-            "restore_title_query_preconditioning_and_trusted_gateway_access_"
-            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
-        )
+        and schedule["protocol_change"] == PROTOCOL_CHANGE
         and schedule["base_source_commit"] == BASE_SOURCE_COMMIT
         and schedule["base_source_tree"] == BASE_SOURCE_TREE
         and isinstance(schedule["implementation_commit"], str)
@@ -714,11 +713,7 @@ def validate_selection_binding(
     require(
         binding["schema_version"] == SELECTION_BINDING_SCHEMA
         and binding["authoritative"] is True
-        and binding["protocol_change"]
-        == (
-            "preconditioned_treatment_and_gateway_recovery_"
-            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
-        )
+        and binding["protocol_change"] == PROTOCOL_CHANGE
         and binding["schedule_sha256"] == schedule_sha256
         and isinstance(binding["schedule_commit"], str)
         and re.fullmatch(r"[0-9a-f]{40}", binding["schedule_commit"])

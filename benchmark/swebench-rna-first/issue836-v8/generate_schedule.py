@@ -102,10 +102,7 @@ def build(implementation_commit: str) -> dict:
     return {
         "schema_version": contract.SCHEDULE_SCHEMA,
         "authoritative": True,
-        "protocol_change": (
-            "restore_title_query_preconditioning_and_trusted_gateway_access_"
-            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
-        ),
+        "protocol_change": contract.PROTOCOL_CHANGE,
         "base_source_commit": contract.BASE_SOURCE_COMMIT,
         "base_source_tree": contract.BASE_SOURCE_TREE,
         "implementation_commit": commit,

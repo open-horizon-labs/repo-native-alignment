@@ -2972,7 +2972,21 @@ def isolation_compliance(
             continue
         if value.get("schema_version") != "issue827-bash-gateway-receipt-v1":
             errors.append(f"gateway_receipt_schema:{path.name}")
-        if value.get("status") != "success" or value.get("violations") != []:
+        status = value.get("status")
+        returncode = value.get("returncode")
+        adherent_success = (
+            status == "success"
+            and type(returncode) is int
+            and returncode == 0
+            and value.get("violations") == []
+        )
+        adherent_failure = (
+            status == "failed"
+            and type(returncode) is int
+            and returncode != 0
+            and value.get("violations") == []
+        )
+        if not adherent_success and not adherent_failure:
             errors.append(f"gateway_receipt_not_clean:{path.name}")
         if value.get("receipt_sha256") != sha_bytes(
             canonical({key: item for key, item in value.items() if key != "receipt_sha256"})

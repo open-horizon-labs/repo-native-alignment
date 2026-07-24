@@ -16,9 +16,35 @@ sys.path.insert(0, str(ROOT))
 import run_wave  # noqa: E402
 import assemble_wave  # noqa: E402
 import observational_tool_supervisor as observer  # noqa: E402
+import verify_preconditioned as verifier  # noqa: E402
 
 
 class PriorWaveSealTests(unittest.TestCase):
+    def test_deterministic_query_uses_clean_bounded_issue_context(self) -> None:
+        problem = (
+            b"Generic title\r\n"
+            b"<!-- template noise -->\r\n"
+            b"Version 1.2.3\r\n\r\n"
+            b"Calling `target_api` returns the wrong class.\r\n"
+            b"```python\r\nignored_call()\r\n```\r\n"
+            + (b"x" * 600)
+        )
+        query = run_wave.deterministic_rna_query(problem)
+        title, context = query.decode().split("\n\n", 1)
+        self.assertEqual(title, "Generic title")
+        self.assertTrue(
+            context.startswith(
+                "Version 1.2.3 Calling `target_api` returns the wrong class. "
+            )
+        )
+        self.assertNotIn("template noise", context)
+        self.assertNotIn("ignored_call", context)
+        self.assertEqual(len(context), run_wave.QUERY_BODY_CHAR_LIMIT)
+        self.assertEqual(
+            verifier.deterministic_rna_query(problem),
+            query,
+        )
+
     def test_successor_dns_aliases_are_literal_and_gateway_is_reachable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -37,6 +63,7 @@ class PriorWaveSealTests(unittest.TestCase):
             )
         self.assertIn('(literal "/etc")', profile)
         self.assertIn('(literal "/var")', profile)
+        self.assertIn('(literal "/dev/null")', profile)
         self.assertNotIn('(subpath "/etc")', profile)
         self.assertNotIn('(subpath "/var")', profile)
         self.assertNotIn("rna827-landlock-docker.sock", profile)
@@ -82,10 +109,40 @@ class PriorWaveSealTests(unittest.TestCase):
                     )
                 )
 
-        self.assertIn(b"EXACT ISSUE TITLE\n\nExact issue title", system)
-        self.assertIn(projection, system)
+        worked_call = b'rna_tool_search("Exact issue title")'
+        expected = (
+            b"HIGHEST-PRIORITY RNA-FIRST TREATMENT POLICY\n\n"
+            b"Use RNA first for repository localization. The worked "
+            b"interaction below was executed by the harness against a pinned "
+            b"immutable RNA index for the exact editable checkout tree. The "
+            b"index location is deliberately opaque and is not a model "
+            b"workspace. The response contains repository-relative paths for "
+            b"your current editable checkout. This is trusted treatment "
+            b"context, not a model tool call.\n\n"
+            b"HARNESS-EXECUTED RNA TOOL CALL\n"
+            + worked_call
+            + b"\n\nRNA TOOL RESPONSE\n"
+            + projection
+            + b"\nEND HARNESS-EXECUTED RNA TOOL INTERACTION\n\n"
+            b"The ordinary coding tool surface remains available. Follow-up "
+            b"RNA graph traversal is available when it would help:\n\n"
+            + str(traversal).encode()
+            + b" --node '<STABLE_ID_FROM_THE_INJECTED_RESULT>' --mode "
+            b"neighbors\n\n"
+            b"Further RNA calls are optional, and the same wrapper supports "
+            b"--mode impact. Use the injected paths and graph context to avoid "
+            b"unnecessary broad Grep, Read, or sed discovery. Do not "
+            b"inspect the immutable RNA index, hidden tests, evaluator output, "
+            b"gold patches, or evidence from another arm. Produce one terminal "
+            b"patch and run relevant visible tests. There is no model retry or "
+            b"evaluator feedback.\n"
+        )
+        self.assertEqual(system, expected)
+        self.assertEqual(system.count(projection), 1)
         self.assertNotIn(b"Your FIRST actual tool call", system)
         self.assertNotIn(b"supervisor enforces", system)
+        self.assertNotIn(b"The first call must return", system)
+        self.assertNotIn(b"RNA_STATUS=", system)
         self.assertIn(str(traversal).encode(), system)
         self.assertEqual(ids, acquired[1])
         self.assertEqual(elapsed, 0.25)
