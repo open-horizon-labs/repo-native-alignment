@@ -1870,6 +1870,132 @@ class RunnerAndVerifierTests(unittest.TestCase):
             ):
                 self.assertEqual(env[name], expected)
 
+    def test_provider_auth_read_files_exposes_only_exact_login_keychain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            keychains = home / "Library" / "Keychains"
+            keychains.mkdir(parents=True)
+            login = keychains / "login.keychain-db"
+            login.write_bytes(b"opaque\n")
+            sibling = keychains / "unrelated.keychain-db"
+            sibling.write_bytes(b"opaque\n")
+
+            with mock.patch.object(run_selector.sys, "platform", "darwin"):
+                files = run_selector.provider_auth_read_files(home)
+
+            self.assertEqual(files, [login])
+            self.assertNotIn(sibling, files)
+
+    def test_provider_auth_status_is_sandboxed_zero_spend_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            claude = root / "claude"
+            claude.write_bytes(b"binary\n")
+            profile = root / "outer.sb"
+            profile.write_bytes(b"(version 1)\n")
+            model_private = root / "private"
+            (model_private / "tmp").mkdir(parents=True)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            prepared = SimpleNamespace(
+                claude_path=claude,
+                isolation_host={"sandbox_exec": Path("/usr/bin/sandbox-exec")},
+            )
+            status = {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "email": "must-not-be-retained@example.invalid",
+                "orgId": "must-not-be-retained",
+                "subscriptionType": "team",
+            }
+            result = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(status).encode(),
+                stderr=b"",
+            )
+
+            with mock.patch.object(
+                run_selector.subprocess,
+                "run",
+                return_value=result,
+            ) as launched:
+                reference = run_selector.verify_provider_auth(
+                    prepared,
+                    {"seatbelt_profile": str(profile)},
+                    model_private,
+                    evidence,
+                )
+
+            receipt = json.loads(
+                (evidence / "provider-auth-status.json").read_bytes()
+            )
+            self.assertEqual(reference["path"], str(evidence / "provider-auth-status.json"))
+            self.assertTrue(receipt["logged_in"])
+            self.assertFalse(receipt["model_invoked"])
+            self.assertEqual(receipt["provider_requests"], 0)
+            self.assertEqual(receipt["cost_usd"], 0.0)
+            self.assertNotIn("email", receipt)
+            self.assertNotIn("orgId", receipt)
+            self.assertNotIn("must-not-be-retained", json.dumps(receipt))
+            command = launched.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    str(claude),
+                    "auth",
+                    "status",
+                ],
+            )
+
+    def test_provider_auth_status_fails_before_model_when_logged_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            claude = root / "claude"
+            claude.write_bytes(b"binary\n")
+            profile = root / "outer.sb"
+            profile.write_bytes(b"(version 1)\n")
+            model_private = root / "private"
+            (model_private / "tmp").mkdir(parents=True)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            prepared = SimpleNamespace(
+                claude_path=claude,
+                isolation_host={"sandbox_exec": Path("/usr/bin/sandbox-exec")},
+            )
+            result = SimpleNamespace(
+                returncode=1,
+                stdout=b'{"loggedIn":false,"authMethod":"none"}\n',
+                stderr=b"",
+            )
+
+            with mock.patch.object(
+                run_selector.subprocess,
+                "run",
+                return_value=result,
+            ):
+                with self.assertRaisesRegex(
+                    run_selector.FailClosed,
+                    "Claude is not logged in inside the provider sandbox",
+                ):
+                    run_selector.verify_provider_auth(
+                        prepared,
+                        {"seatbelt_profile": str(profile)},
+                        model_private,
+                        evidence,
+                    )
+
+            receipt = json.loads(
+                (evidence / "provider-auth-status.json").read_bytes()
+            )
+            self.assertFalse(receipt["logged_in"])
+            self.assertFalse(receipt["model_invoked"])
+            self.assertEqual(receipt["provider_requests"], 0)
+            self.assertEqual(receipt["cost_usd"], 0.0)
+
     def test_token_ledger_prefers_whole_invocation_model_usage_without_double_counting(self):
         summary = {
             "usage": {
