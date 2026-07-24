@@ -15,8 +15,10 @@ all other assembly work to the byte-pinned v4 assembler.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -52,6 +54,23 @@ def sha_file(path: Path) -> str:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def successor_explicit_ranks(values: Sequence[int]) -> tuple[int, ...]:
+    """Return up to three unique ranks in frozen-selection order."""
+
+    require(values, "at least one explicit --rank is required")
+    require(len(values) <= 3, "at most three different cases may be requested")
+    require(
+        all(type(rank) is int and 1 <= rank <= 20 for rank in values),
+        "requested ranks must be integers from 1 through 20",
+    )
+    require(len(set(values)) == len(values), "requested ranks must be unique")
+    require(
+        tuple(values) == tuple(sorted(values)),
+        "requested ranks must be supplied in increasing frozen-selection order",
+    )
+    return tuple(values)
 
 
 def git(*arguments: str) -> str:
@@ -173,6 +192,50 @@ def configure(base: Any, argv: Sequence[str]) -> None:
             base.HARNESS = successor_harness
 
     base.validate_frozen_inputs = validate_successor_frozen_inputs
+    if list(argv) == ["self-test"]:
+        original_synthetic_self_test = base.synthetic_self_test
+
+        def successor_synthetic_self_test() -> int:
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                result = original_synthetic_self_test()
+            require(result == 0, "immutable assembler self-test failed")
+            report = json.loads(captured.getvalue())
+            tests = report.get("tests")
+            require(isinstance(tests, list), "immutable self-test report drift")
+            require(
+                successor_explicit_ranks([1, 12, 20]) == (1, 12, 20),
+                "three-rank successor scope self-test failed",
+            )
+            try:
+                successor_explicit_ranks([1, 2, 3, 4])
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError("four-rank successor scope did not fail closed")
+            report["tests"] = [
+                test
+                for test in tests
+                if test
+                not in {
+                    "explicit_one_or_two_rank_scope",
+                    "three_rank_wave_rejected",
+                }
+            ]
+            report["tests"][:0] = [
+                "explicit_one_to_three_rank_scope",
+                "four_rank_wave_rejected",
+            ]
+            print(json.dumps(report, sort_keys=True, indent=2))
+            return 0
+
+        base.synthetic_self_test = successor_synthetic_self_test
+    else:
+        # The immutable v4 assembler's parser already accepts repeated
+        # --rank arguments. Replace only its two-case validation boundary so
+        # the v17 runner can occupy its registered three independent case
+        # lanes without changing cohort membership or within-case arm order.
+        base.explicit_ranks = successor_explicit_ranks
     original_validate = base.validate_cache_envelope
 
     def validate_cache_envelope(
