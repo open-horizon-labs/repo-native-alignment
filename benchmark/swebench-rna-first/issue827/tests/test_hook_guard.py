@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 
 import common_supervisor
 import hook_guard
+import isolation
 import tool_supervisor
 
 
@@ -33,7 +34,7 @@ def sha256(path: Path) -> str:
 
 
 class GuardFixture:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, python: Path | None = None):
         self.root = root
         self.harness = root / "harness"
         self.bin = self.harness / "bin"
@@ -106,11 +107,18 @@ else:
         )
         self.child.chmod(0o555)
         self.counter = root / "child-count"
+        self.python = (
+            Path(sys.executable).resolve(strict=True)
+            if python is None
+            else python
+        )
         self.config = {
             "schema_version": hook_guard.CONFIG_SCHEMA,
             "policy": "control",
             "harness_root": str(self.harness),
             "episode_evidence_root": str(self.evidence),
+            "gateway_python": str(self.python),
+            "gateway_python_sha256": sha256(self.python),
             "common_state": str(
                 self.evidence / "common-supervisor-state.json"
             ),
@@ -220,6 +228,148 @@ class HookGuardTests(unittest.TestCase):
             self.assertEqual(record["outcome"], "allow")
             self.assertFalse(record["fatal"])
             self.assertEqual(record["child_sha256"], sha256(fixture.child))
+
+    def test_bound_python_must_be_exact_regular_file_with_matching_digest(self):
+        cases = ("symlink", "digest")
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                fixture = GuardFixture(Path(temporary))
+                if case == "symlink":
+                    alias = fixture.root / "python-alias"
+                    alias.symlink_to(fixture.python)
+                    fixture.config["gateway_python"] = str(alias)
+                    expected = b"hook_guard_python_not_regular"
+                else:
+                    fixture.config["gateway_python_sha256"] = "0" * 64
+                    expected = b"hook_guard_python_digest_mismatch"
+                fixture.config_path.write_bytes(canonical(fixture.config))
+                result = fixture.invoke("allow")
+                self.assert_terminal(result)
+                self.assertIn(expected, result.stdout)
+                self.assertFalse(fixture.counter.exists())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and Path("/usr/bin/sandbox-exec").is_file(),
+        "real Seatbelt regression requires macOS",
+    )
+    def test_outer_seatbelt_launches_child_with_bound_canonical_python(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            homebrew_alias = Path(
+                "/opt/homebrew/opt/python@3.14/bin/python3.14"
+            )
+            if homebrew_alias.exists():
+                canonical_python = homebrew_alias.resolve(strict=True)
+            else:
+                canonical_python = Path("/usr/bin/python3")
+            self.assertTrue(
+                canonical_python.is_file()
+                and not canonical_python.is_symlink()
+            )
+            fixture = GuardFixture(
+                Path(temporary).resolve(strict=True),
+                python=canonical_python,
+            )
+            runtime_root = fixture.python.parent.parent
+            read_roots = [
+                fixture.root,
+                HERE,
+                runtime_root,
+                *(
+                    path
+                    for path in (
+                        Path("/Library"),
+                        Path("/System"),
+                        Path("/bin"),
+                        Path("/dev"),
+                        Path("/private/etc"),
+                        Path("/private/var/db"),
+                        Path("/private/var/select"),
+                        Path("/sbin"),
+                        Path("/usr"),
+                    )
+                    if path.exists()
+                ),
+            ]
+            profile = fixture.root / "outer.sb"
+            profile.write_text(
+                isolation.generate_outer_seatbelt_profile(
+                    read_roots=read_roots,
+                    write_roots=[fixture.root],
+                )
+            )
+            profile.chmod(0o444)
+            environment = {
+                "FAKE_CHILD_MODE": "allow",
+                "FAKE_CHILD_COUNTER": str(fixture.counter),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONSAFEPATH": "1",
+            }
+            argv = [
+                "/usr/bin/sandbox-exec",
+                "-f",
+                str(profile),
+                str(fixture.python),
+                str(HERE / "hook_guard.py"),
+                "--config",
+                str(fixture.config_path),
+                "--evidence-root",
+                str(fixture.evidence),
+                "--child",
+                str(fixture.child),
+                "--child-sha256",
+                sha256(fixture.child),
+                "--role",
+                "common",
+                "--timeout-ms",
+                "250",
+            ]
+            if homebrew_alias.exists():
+                alias_probe = subprocess.run(
+                    [
+                        "/usr/bin/sandbox-exec",
+                        "-f",
+                        str(profile),
+                        str(fixture.python),
+                        "-I",
+                        "-c",
+                        (
+                            "from pathlib import Path; import sys; "
+                            "Path(sys.executable).stat()"
+                        ),
+                    ],
+                    cwd=fixture.root,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertNotEqual(alias_probe.returncode, 0)
+            result = subprocess.run(
+                argv,
+                cwd=fixture.root,
+                env=environment,
+                input=canonical(fixture.event),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            self.assertEqual(
+                json.loads(result.stdout)["hookSpecificOutput"][
+                    "permissionDecision"
+                ],
+                "allow",
+                result.stdout,
+            )
+            self.assertEqual(fixture.counter.read_text(), "1")
 
     def test_crash_is_terminal_and_sticky_before_any_later_child_or_provider(self):
         with tempfile.TemporaryDirectory() as temporary:

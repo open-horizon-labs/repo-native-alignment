@@ -135,7 +135,7 @@ def exact_regular_file(path: Path, label: str) -> Path:
 
 def validated_runtime(
     values: argparse.Namespace,
-) -> tuple[dict[str, Any], Path, Path, Path]:
+) -> tuple[dict[str, Any], Path, Path, Path, Path]:
     config_path = exact_regular_file(Path(values.config), "hook_guard_config")
     evidence_root = Path(values.evidence_root)
     try:
@@ -180,7 +180,29 @@ def validated_runtime(
         or config.get(digest_field) != values.child_sha256
     ):
         raise GuardFailure("hook_guard_child_digest_mismatch")
-    return config, config_path, evidence_root, child
+
+    python_value = config.get("gateway_python")
+    python_digest = config.get("gateway_python_sha256")
+    if (
+        not isinstance(python_value, str)
+        or not Path(python_value).is_absolute()
+        or not isinstance(python_digest, str)
+        or len(python_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in python_digest
+        )
+    ):
+        raise GuardFailure("hook_guard_python_binding_invalid")
+    python = exact_regular_file(
+        Path(python_value),
+        "hook_guard_python",
+    )
+    if str(python) != python_value:
+        raise GuardFailure("hook_guard_python_binding_invalid")
+    if sha256_file(python) != python_digest:
+        raise GuardFailure("hook_guard_python_digest_mismatch")
+    return config, config_path, evidence_root, child, python
 
 
 def guard_paths(evidence_root: Path) -> tuple[Path, Path, Path]:
@@ -536,12 +558,12 @@ def validate_event(raw: bytes) -> dict[str, Any]:
 
 
 def run_child(
-    child: Path, raw_event: bytes, timeout_ms: int
+    python: Path, child: Path, raw_event: bytes, timeout_ms: int
 ) -> tuple[int, bytes, bytes, int]:
     started = time.monotonic()
     try:
         process = subprocess.Popen(
-            [sys.executable, str(child)],
+            [str(python), str(child)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -675,7 +697,13 @@ def fail(
 
 def execute(argv: Sequence[str], raw_event: bytes) -> int:
     values = parse_args(argv)
-    config, _config_path, evidence_root, child = validated_runtime(values)
+    (
+        config,
+        _config_path,
+        evidence_root,
+        child,
+        python,
+    ) = validated_runtime(values)
     event = validate_event(raw_event)
     previous = fatal_state(evidence_root)
     if previous is not None:
@@ -708,7 +736,10 @@ def execute(argv: Sequence[str], raw_event: bytes) -> int:
 
     try:
         returncode, stdout, stderr, elapsed_ms = run_child(
-            child, raw_event, values.timeout_ms
+            python,
+            child,
+            raw_event,
+            values.timeout_ms,
         )
         try:
             disposition, document = validate_child_response(
