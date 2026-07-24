@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared, fail-closed registration contract for issue #827.
+"""Shared, fail-closed registration contracts for issues #827 and #836.
 
 The model runner, offline verifier, and official evaluator all import this
 module.  Keeping the immutable contract in one place prevents a permissive
@@ -13,10 +13,16 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, TypedDict
 
 
-REGISTRATION_SCHEMA = "issue827-treatment-registration-v1"
+LEGACY_REGISTRATION_SCHEMA = "issue827-treatment-registration-v1"
+CURRENT_REGISTRATION_SCHEMA = "issue836-treatment-registration-v2"
+# New registrations use the current schema. Historical issue #827/#830
+# registrations remain valid through LEGACY_REGISTRATION_SCHEMA.
+REGISTRATION_SCHEMA = CURRENT_REGISTRATION_SCHEMA
+LEGACY_EPISODE_DESIGN_SCHEMA = "issue827-episode-design-v1"
+CURRENT_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v2"
 QUALIFICATION_REGISTRATION_SCHEMA = (
     "issue827-qualification-closure-registration-v1"
 )
@@ -97,6 +103,16 @@ class RegistrationContractError(RuntimeError):
     """A frozen preregistration identity or semantic contract did not hold."""
 
 
+class ExperimentDimensions(TypedDict):
+    """Authoritative count, concurrency, and budget dimensions."""
+
+    case_count: int
+    episode_count: int
+    max_parallel_cases: int
+    per_episode_budget_usd: float
+    maximum_budget_usd: float
+
+
 def canonical(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
@@ -135,6 +151,133 @@ def require_sha256(value: Any, where: str) -> str:
     return value
 
 
+def experiment_dimensions(
+    registration: Mapping[str, Any],
+) -> ExperimentDimensions:
+    """Return versioned experiment dimensions, rejecting cross-field drift."""
+
+    schema = registration.get("schema_version")
+    if schema == LEGACY_REGISTRATION_SCHEMA:
+        expected = {
+            "issue": 827,
+            "episode_schema": LEGACY_EPISODE_DESIGN_SCHEMA,
+            "selector_schema": "issue827-selector-v1",
+            "selection_rule_schema": "issue827-selection-rule-v1",
+            "case_count": 2,
+            "episode_count": 4,
+        }
+    elif schema == CURRENT_REGISTRATION_SCHEMA:
+        expected = {
+            "issue": 836,
+            "episode_schema": CURRENT_EPISODE_DESIGN_SCHEMA,
+            "selector_schema": "issue836-selector-v2",
+            "selection_rule_schema": "issue836-selection-rule-v2",
+            "case_count": 20,
+            "episode_count": 40,
+        }
+    else:
+        raise RegistrationContractError("registration schema mismatch")
+
+    require(
+        registration.get("issue") == expected["issue"],
+        "registration issue mismatch",
+    )
+    episode = registration.get("episode_design")
+    selector = registration.get("selector")
+    selection_rule = registration.get("selection_rule")
+    evaluator = registration.get("evaluator")
+    runtime = registration.get("model_runtime")
+    require(isinstance(episode, dict), "registration episode design missing")
+    require(isinstance(selector, dict), "registration selector missing")
+    require(
+        isinstance(selection_rule, dict),
+        "registration selection rule missing",
+    )
+    require(isinstance(evaluator, dict), "registration evaluator missing")
+    require(isinstance(runtime, dict), "registration model runtime missing")
+
+    case_count = expected["case_count"]
+    episode_count = expected["episode_count"]
+    max_parallel_cases = 2
+    per_episode_budget_usd = 6.0
+    for actual, frozen, where in (
+        (
+            episode.get("schema_version"),
+            expected["episode_schema"],
+            "registration episode design schema",
+        ),
+        (
+            episode.get("case_count"),
+            case_count,
+            "registration episode case count",
+        ),
+        (
+            episode.get("episode_count"),
+            episode_count,
+            "registration episode count",
+        ),
+        (
+            episode.get("different_cases_max_parallel"),
+            max_parallel_cases,
+            "registration maximum parallel cases",
+        ),
+        (
+            selector.get("algorithm_version"),
+            expected["selector_schema"],
+            "registration selector schema",
+        ),
+        (
+            selector.get("selected_case_count"),
+            case_count,
+            "registration selector case count",
+        ),
+        (
+            selector.get("episode_count"),
+            episode_count,
+            "registration selector episode count",
+        ),
+        (
+            selection_rule.get("schema_version"),
+            expected["selection_rule_schema"],
+            "registration selection rule schema",
+        ),
+        (
+            selection_rule.get("pair_count"),
+            case_count,
+            "registration selection rule pair count",
+        ),
+        (
+            selection_rule.get("episode_count"),
+            episode_count,
+            "registration selection rule episode count",
+        ),
+        (
+            evaluator.get("max_parallel"),
+            max_parallel_cases,
+            "registration evaluator maximum parallel cases",
+        ),
+        (
+            runtime.get("budget_usd"),
+            per_episode_budget_usd,
+            "registration per-episode budget",
+        ),
+        (
+            runtime.get("wall_seconds"),
+            1200,
+            "registration episode wall time",
+        ),
+    ):
+        require(actual == frozen, f"{where} drift")
+
+    return {
+        "case_count": case_count,
+        "episode_count": episode_count,
+        "max_parallel_cases": max_parallel_cases,
+        "per_episode_budget_usd": per_episode_budget_usd,
+        "maximum_budget_usd": episode_count * per_episode_budget_usd,
+    }
+
+
 def validate_registration(
     registration: Mapping[str, Any],
     *,
@@ -143,11 +286,7 @@ def validate_registration(
 ) -> None:
     """Validate shared frozen semantics and, optionally, live source bytes."""
 
-    require(
-        registration.get("schema_version") == REGISTRATION_SCHEMA,
-        "registration schema mismatch",
-    )
-    require(registration.get("issue") == 827, "registration issue mismatch")
+    dimensions = experiment_dimensions(registration)
 
     runtime = registration.get("model_runtime")
     require(
@@ -157,11 +296,15 @@ def validate_registration(
     episode = registration.get("episode_design")
     require(isinstance(episode, dict), "registration episode design missing")
     for key, expected in {
-        "schema_version": "issue827-episode-design-v1",
-        "case_count": 2,
-        "episode_count": 4,
+        "schema_version": (
+            LEGACY_EPISODE_DESIGN_SCHEMA
+            if registration.get("schema_version") == LEGACY_REGISTRATION_SCHEMA
+            else CURRENT_EPISODE_DESIGN_SCHEMA
+        ),
+        "case_count": dimensions["case_count"],
+        "episode_count": dimensions["episode_count"],
         "same_case_serialized": True,
-        "different_cases_max_parallel": 2,
+        "different_cases_max_parallel": dimensions["max_parallel_cases"],
         "fresh_session_per_episode": True,
         "resume_allowed": False,
         "model_retry_allowed": False,

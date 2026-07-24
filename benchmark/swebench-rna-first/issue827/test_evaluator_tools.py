@@ -69,8 +69,28 @@ def evaluator_config() -> dict[str, object]:
     }
 
 
-def registration(evaluator: dict[str, object]) -> dict[str, object]:
+def registration(
+    evaluator: dict[str, object], *, current: bool
+) -> dict[str, object]:
     value = json.loads((HERE / "registration.template.json").read_bytes())
+    if not current:
+        value["schema_version"] = (
+            registration_contract.LEGACY_REGISTRATION_SCHEMA
+        )
+        value["issue"] = 827
+        value["selector"]["algorithm_version"] = "issue827-selector-v1"
+        value["selector"]["selected_case_count"] = 2
+        value["selector"]["episode_count"] = 4
+        value["episode_design"]["schema_version"] = (
+            registration_contract.LEGACY_EPISODE_DESIGN_SCHEMA
+        )
+        value["episode_design"]["case_count"] = 2
+        value["episode_design"]["episode_count"] = 4
+        value["selection_rule"]["schema_version"] = (
+            "issue827-selection-rule-v1"
+        )
+        value["selection_rule"]["episode_count"] = 4
+        value["selection_rule"]["pair_count"] = 2
     value["dataset"]["arrow_sha256"] = DATASET_SHA
     value["evaluator"].update(
         {
@@ -154,6 +174,7 @@ class Fixture:
         pre_model_keys: set[tuple[int, str]] = frozenset(),
         invalid_token_keys: set[tuple[int, str]] = frozenset(),
         arm_tokens: dict[str, int] | None = None,
+        case_count: int = 2,
     ) -> None:
         self.root = root.resolve()
         self.evidence = self.root / "evidence"
@@ -164,26 +185,27 @@ class Fixture:
         self.arm_tokens = arm_tokens or {"A": 1000, "T": 800}
         self.cases = [
             {
-                "rank": 1,
-                "instance_id": "project__project-100",
-                "base_commit": "1" * 40,
-                "base_tree": "a" * 40,
-                "arm_order": ["A", "T"],
-            },
-            {
-                "rank": 2,
-                "instance_id": "project__project-200",
-                "base_commit": "2" * 40,
-                "base_tree": "b" * 40,
-                "arm_order": ["T", "A"],
-            },
+                "rank": rank,
+                "instance_id": f"project__project-{rank:03d}",
+                "base_commit": f"{rank:040x}",
+                "base_tree": f"{rank + 100:040x}",
+                "arm_order": (
+                    ["A", "T"] if rank % 2 == 1 else ["T", "A"]
+                ),
+            }
+            for rank in range(1, case_count + 1)
         ]
         evaluator = evaluator_config()
         registration_ref = write_json(
-            self.evidence / "registration.json", registration(evaluator)
+            self.evidence / "registration.json",
+            registration(evaluator, current=case_count == 20),
         )
         selection = {
-            "schema_version": "issue827-fresh-pair-selection-v1",
+            "schema_version": (
+                "issue836-fresh-cohort-selection-v2"
+                if case_count == 20
+                else "issue827-fresh-pair-selection-v1"
+            ),
             "state": "selected_pre_model",
             "authoritative": True,
             "registration_sha256": registration_ref["sha256"],
@@ -443,6 +465,181 @@ class AuthoritativeSelectionInputTests(unittest.TestCase):
 
 
 class EvaluatorToolsTests(unittest.TestCase):
+    def test_current_dimensions_require_twenty_balanced_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys=set(),
+                case_count=20,
+            )
+            plan = fixture.validated_plan()
+            self.assertEqual(
+                plan["_dimensions"],
+                {
+                    "case_count": 20,
+                    "episode_count": 40,
+                    "max_parallel_cases": 2,
+                    "per_episode_budget_usd": 6.0,
+                    "maximum_budget_usd": 240.0,
+                },
+            )
+            self.assertEqual(len(plan["episodes"]), 40)
+            self.assertEqual(
+                {
+                    (episode["case_id"], episode["arm"])
+                    for episode in plan["episodes"]
+                },
+                {
+                    (case["instance_id"], arm)
+                    for case in fixture.cases
+                    for arm in ("A", "T")
+                },
+            )
+            self.assertEqual(
+                select_result.registered_selection_rule(
+                    plan["_registration"]
+                )["pair_count"],
+                20,
+            )
+            self.assertEqual(
+                select_result.result_schema(plan["_registration"]),
+                select_result.CURRENT_RESULT_SCHEMA,
+            )
+
+    def test_current_offline_batch_and_result_are_dimension_complete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys=set(),
+                case_count=20,
+            )
+            plan = fixture.validated_plan()
+            runner.seal_all(plan)
+            model_isolation = {
+                "checked_session_count": 40,
+                "all_absent": True,
+            }
+            static_environment = {
+                "dataset_arrow_sha256": DATASET_SHA,
+                "official_evaluator_invocations": 0,
+            }
+            with (
+                mock.patch.object(
+                    runner,
+                    "no_live_model_sessions",
+                    return_value=model_isolation,
+                ),
+                mock.patch.object(
+                    runner,
+                    "validate_static_environment",
+                    return_value=static_environment,
+                ),
+            ):
+                self.assertEqual(runner.evaluate_all(plan), 0)
+
+            batch_path = (
+                fixture.output / "evaluation-batch.receipt.json"
+            )
+            batch = runner.read_json(batch_path)
+            self.assertTrue(batch["valid"])
+            self.assertEqual(len(batch["results"]), 40)
+            self.assertEqual(batch["zero_invocation_receipts"], 40)
+            self.assertEqual(batch["max_parallel"], 2)
+            self.assertTrue(batch["same_case_serialized"])
+
+            result = select_result.aggregate(
+                fixture.plan_path, batch_path
+            )
+            self.assertEqual(
+                result["schema_version"],
+                select_result.CURRENT_RESULT_SCHEMA,
+            )
+            self.assertEqual(len(result["episodes"]), 40)
+            self.assertEqual(
+                result["experiment_dimensions"][
+                    "maximum_budget_usd"
+                ],
+                240.0,
+            )
+            self.assertEqual(result["decision"], "selected_T")
+
+    def test_legacy_dimensions_and_result_schema_remain_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = Fixture(
+                Path(temporary), patch_keys=set()
+            ).validated_plan()
+            self.assertEqual(plan["_dimensions"]["case_count"], 2)
+            self.assertEqual(plan["_dimensions"]["episode_count"], 4)
+            self.assertEqual(
+                plan["_dimensions"]["maximum_budget_usd"], 24.0
+            )
+            self.assertEqual(
+                select_result.registered_selection_rule(
+                    plan["_registration"]
+                ),
+                select_result.REGISTERED_SELECTION_RULE,
+            )
+            self.assertEqual(
+                select_result.result_schema(plan["_registration"]),
+                select_result.LEGACY_RESULT_SCHEMA,
+            )
+
+    def test_episode_plan_builder_derives_case_truth_from_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary),
+                patch_keys=set(),
+                case_count=20,
+            )
+            plan = runner.read_json(fixture.plan_path)
+            registration_value = runner.read_json(
+                Path(plan["registration"]["path"])
+            )
+            selection_value = runner.read_json(
+                Path(plan["selection"]["path"])
+            )
+            inputs = [
+                {
+                    key: episode[key]
+                    for key in runner.EPISODE_INPUT_KEYS
+                }
+                for episode in reversed(plan["episodes"])
+            ]
+            built = runner.build_episode_plan(
+                registration_value, selection_value, inputs
+            )
+            self.assertEqual(
+                [
+                    (item["rank"], item["case_id"], item["arm"])
+                    for item in built
+                ],
+                [
+                    tuple(identity)
+                    for identity in runner.expected_episode_identities(
+                        registration_value, selection_value
+                    )
+                ],
+            )
+            self.assertEqual(
+                built[0]["base_commit"],
+                selection_value["cases"][0]["base_commit"],
+            )
+            template = runner.read_json(
+                HERE / "evaluator-plan.template.json"
+            )
+            self.assertEqual(template["episodes"], [])
+
+            inputs[-1] = dict(inputs[0])
+            with self.assertRaisesRegex(
+                runner.FailClosed,
+                "duplicate episode input|exactly match",
+            ):
+                runner.build_episode_plan(
+                    registration_value, selection_value, inputs
+                )
+
     def test_plan_consumes_reproducible_independent_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Fixture(Path(temporary), patch_keys={(1, "A")})
@@ -484,6 +681,7 @@ class EvaluatorToolsTests(unittest.TestCase):
                 Path(temporary),
                 patch_keys={(1, "A")},
                 invalid_token_keys={(1, "A")},
+                case_count=20,
             )
             plan = fixture.validated_plan()
             episode = next(
@@ -501,9 +699,11 @@ class EvaluatorToolsTests(unittest.TestCase):
                 episode["episode"]["evaluator_authorization"]
             )
             runner.seal_all(plan)
+            seal_set = runner.validate_seal_set(plan)
+            self.assertEqual(len(seal_set["seals"]), 40)
             seal = next(
                 item
-                for item in runner.validate_seal_set(plan)["seals"]
+                for item in seal_set["seals"]
                 if item["seal"]["rank"] == 1
                 and item["seal"]["arm"] == "A"
             )
@@ -661,10 +861,11 @@ class EvaluatorToolsTests(unittest.TestCase):
 
     def test_registered_decision_rule_is_unchanged(self) -> None:
         metrics = []
-        for rank in (1, 2):
+        for rank in range(1, 21):
             for arm in ("A", "T"):
                 metrics.append(
                     {
+                        "case_id": f"project__project-{rank:03d}",
                         "rank": rank,
                         "arm": arm,
                         "evidence_complete": True,
@@ -678,7 +879,13 @@ class EvaluatorToolsTests(unittest.TestCase):
                         "combined_pre_evaluator_wall_seconds": 100.0,
                     }
                 )
-        decision = select_result.decide_registered(metrics)
+        dimensions = {
+            "case_count": 20,
+            "episode_count": 40,
+        }
+        decision = select_result.decide_registered(
+            metrics, dimensions
+        )
         self.assertEqual(decision["decision"], "selected_T")
         self.assertEqual(
             decision["classification"], "material_efficiency_selection"
@@ -691,6 +898,15 @@ class EvaluatorToolsTests(unittest.TestCase):
                 "time_reduction_percent": 20,
             },
         )
+        legacy = select_result.decide_registered(metrics[:4])
+        self.assertEqual(legacy["decision"], "selected_T")
+
+        duplicate = [dict(item) for item in metrics]
+        duplicate[-1]["case_id"] = duplicate[1]["case_id"]
+        with self.assertRaisesRegex(
+            runner.FailClosed, "exact A/T pairs"
+        ):
+            select_result.decide_registered(duplicate, dimensions)
 
     def test_registration_contract_drift_fails_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,7 +1,7 @@
 {
-  "schema_version": "issue827-treatment-registration-v1",
-  "issue": 827,
-  "classification": "fresh_preregistered_hermetic_selector",
+  "schema_version": "issue836-treatment-registration-v2",
+  "issue": 836,
+  "classification": "preregistered_hermetic_prefix_extension",
   "published_before_selection": true,
   "fresh_case_claim": true,
   "prior_model_calls": 0,
@@ -15,7 +15,7 @@
     "local_cache_only": true
   },
   "selector": {
-    "algorithm_version": "issue827-selector-v1",
+    "algorithm_version": "issue836-selector-v2",
     "seed": "rna-first-sonnet-hermetic-selector-v1",
     "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
     "population_rows": 500,
@@ -23,17 +23,24 @@
     "eligible_rows": 419,
     "excluded_ids_sha256": "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b",
     "exclusions_file_sha256": "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79",
-    "selected_case_count": 2,
-    "episode_count": 4,
+    "selected_case_count": 20,
+    "episode_count": 40,
     "counterbalance": {
-      "rank_1_arm_order": [
+      "odd_rank_arm_order": [
         "A",
         "T"
       ],
-      "rank_2_arm_order": [
+      "even_rank_arm_order": [
         "T",
         "A"
-      ]
+      ],
+      "a_first_case_count": 10,
+      "t_first_case_count": 10
+    },
+    "prefix_lineage": {
+      "ranks_1_through_2": "pre_model_carry_forward_prefix",
+      "ranks_3_through_20": "deterministic_extension",
+      "outcomes_inspected_for_extension": false
     },
     "case_ids_external_until_authoritative_selection": true,
     "problem_statements_inspected_by_human_before_selection": false,
@@ -41,9 +48,9 @@
     "case_replacement_after_model_start": false
   },
   "episode_design": {
-    "schema_version": "issue827-episode-design-v1",
-    "case_count": 2,
-    "episode_count": 4,
+    "schema_version": "issue836-episode-design-v2",
+    "case_count": 20,
+    "episode_count": 40,
     "arms": {
       "A": "control",
       "T": "rna_first_treatment"
@@ -263,9 +270,9 @@
     "model_output_delivery": "none"
   },
   "selection_rule": {
-    "schema_version": "issue827-selection-rule-v1",
-    "episode_count": 4,
-    "pair_count": 2,
+    "schema_version": "issue836-selection-rule-v2",
+    "episode_count": 40,
+    "pair_count": 20,
     "arms": [
       "A",
       "T"

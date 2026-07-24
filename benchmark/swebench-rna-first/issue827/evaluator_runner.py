@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Seal and evaluate #827 A/T terminal patches exactly once.
+"""Seal and evaluate preregistered A/T terminal patches exactly once.
 
 The adapter has no model integration.  It consumes immutable episode and
-verification receipts only after the model process is terminal, seals all four
-episode outcomes out-of-band, and invokes the official SWE-bench evaluator once
-for each verifier-authorized non-empty patch.  Noncompliant, incomplete, and
-no-patch episodes receive immutable zero-invocation receipts.
+verification receipts only after every model process is terminal, seals the
+complete registered episode set out-of-band, and invokes the official
+SWE-bench evaluator once for each verifier-authorized non-empty patch.
+Noncompliant, incomplete, and no-patch episodes receive immutable
+zero-invocation receipts.
 
 Evaluator stdout, stderr, reports, and receipts are written only beneath the
 registered evaluator output root and are never returned to a model process.
@@ -36,6 +37,7 @@ from typing import Any, Mapping
 import evaluator_authorization
 import provider_usage
 import registration_contract
+import select_cases
 
 
 PLAN_SCHEMA = "issue827-official-evaluator-plan-v1"
@@ -51,6 +53,25 @@ ARM_POLICIES = {"A": "control", "T": "treatment"}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SCRIPT_PATH = Path(__file__).resolve()
+EPISODE_KEYS = {
+    "case_id",
+    "rank",
+    "arm",
+    "base_commit",
+    "base_tree",
+    "episode_receipt",
+    "episode_verification",
+    "evaluator_authorization",
+    "model_name_or_path",
+    "run_id",
+    "official_image",
+    "official_image_source",
+    "official_image_manifest_digest",
+    "official_image_config_id",
+    "official_image_local_id",
+    "official_image_tag",
+}
+EPISODE_INPUT_KEYS = EPISODE_KEYS - {"rank", "base_commit", "base_tree"}
 
 
 class FailClosed(RuntimeError):
@@ -218,6 +239,156 @@ def _require_exact_keys(value: Any, expected: set[str], label: str) -> Mapping[s
     require(isinstance(value, dict), f"{label} must be a JSON object")
     require(set(value) == expected, f"{label} keys differ: {sorted(set(value) ^ expected)}")
     return value
+
+
+def experiment_dimensions(
+    registration: Mapping[str, Any],
+) -> registration_contract.ExperimentDimensions:
+    try:
+        return registration_contract.experiment_dimensions(registration)
+    except registration_contract.RegistrationContractError as exc:
+        raise FailClosed(str(exc)) from exc
+
+
+def expected_episode_identities(
+    registration: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> list[tuple[int, str, str]]:
+    try:
+        identities = select_cases.expected_episode_identities(
+            registration, selection
+        )
+    except (
+        registration_contract.RegistrationContractError,
+        select_cases.SelectionError,
+    ) as exc:
+        raise FailClosed(str(exc)) from exc
+    require(
+        isinstance(identities, (list, tuple))
+        and all(
+            isinstance(identity, tuple)
+            and len(identity) == 3
+            and type(identity[0]) is int
+            and isinstance(identity[1], str)
+            and identity[1]
+            and identity[2] in ALLOWED_ARMS
+            for identity in identities
+        ),
+        "selection-derived episode identities are malformed",
+    )
+    return [
+        (identity[0], identity[1], identity[2])
+        for identity in identities
+    ]
+
+
+def build_episode_plan(
+    registration: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    episode_inputs: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Join external episode artifacts to selection-owned case identities.
+
+    ``episode_inputs`` intentionally omits rank and base identities. Those
+    fields come only from the authoritative selection, preventing a generated
+    plan from becoming a second, hand-maintained source of case truth.
+    """
+
+    require(
+        selection.get("authoritative") is True
+        and selection.get("state") == "selected_pre_model"
+        and selection.get("fresh_case_claim") is True
+        and selection.get("prior_model_calls") == 0
+        and selection.get(
+            "problem_statements_inspected_by_human_before_selection"
+        )
+        is False
+        and selection.get(
+            "gold_or_outcomes_inspected_before_selection"
+        )
+        is False,
+        "episode plan generation requires an authoritative fresh selection",
+    )
+    expected = expected_episode_identities(registration, selection)
+    dimensions = experiment_dimensions(registration)
+    require(
+        len(expected) == dimensions["episode_count"],
+        "selection-derived episode count differs from registration",
+    )
+    selection_cases = selection.get("cases")
+    require(isinstance(selection_cases, list), "selection cases missing")
+    selected: dict[str, Mapping[str, Any]] = {}
+    for index, case in enumerate(selection_cases):
+        require(
+            isinstance(case, dict),
+            f"selection cases[{index}] must be a JSON object",
+        )
+        case_id = case.get("instance_id")
+        require(
+            isinstance(case_id, str) and case_id,
+            f"selection cases[{index}] instance identity missing",
+        )
+        require(case_id not in selected, "selection contains duplicate cases")
+        selected[case_id] = case
+
+    require(
+        isinstance(episode_inputs, list)
+        and len(episode_inputs) == dimensions["episode_count"],
+        "episode inputs do not match the registered episode count",
+    )
+    by_identity: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for index, value in enumerate(episode_inputs):
+        episode_input = _require_exact_keys(
+            value, EPISODE_INPUT_KEYS, f"episode_inputs[{index}]"
+        )
+        identity = (episode_input["case_id"], episode_input["arm"])
+        require(
+            isinstance(identity[0], str)
+            and identity[0]
+            and identity[1] in ALLOWED_ARMS,
+            f"episode_inputs[{index}] identity malformed",
+        )
+        require(identity not in by_identity, f"duplicate episode input: {identity}")
+        by_identity[identity] = episode_input
+
+    expected_keys = {(case_id, arm) for _, case_id, arm in expected}
+    require(
+        set(by_identity) == expected_keys,
+        "episode inputs do not exactly match selection-derived identities",
+    )
+    episodes: list[dict[str, Any]] = []
+    for rank, case_id, arm in expected:
+        case = selected[case_id]
+        episode_input = by_identity[(case_id, arm)]
+        require(case.get("rank") == rank, "selection-derived episode rank mismatch")
+        base_commit = case.get("base_commit")
+        base_tree = case.get("base_tree")
+        require(
+            isinstance(base_commit, str)
+            and HEX40.fullmatch(base_commit) is not None,
+            "selection-derived base commit malformed",
+        )
+        require(
+            isinstance(base_tree, str)
+            and HEX40.fullmatch(base_tree) is not None,
+            "selection-derived base tree malformed",
+        )
+        episodes.append(
+            {
+                "case_id": case_id,
+                "rank": rank,
+                "arm": arm,
+                "base_commit": base_commit,
+                "base_tree": base_tree,
+                **{
+                    key: episode_input[key]
+                    for key in sorted(
+                        EPISODE_INPUT_KEYS - {"case_id", "arm"}
+                    )
+                },
+            }
+        )
+    return episodes
 
 
 def validate_episode_lineage(
@@ -572,15 +743,15 @@ def validate_registration_contracts(
     plan: Mapping[str, Any],
     evaluator: Mapping[str, Any],
 ) -> None:
+    dimensions = experiment_dimensions(registration)
     episode_design = registration.get("episode_design")
     require(
         isinstance(episode_design, dict)
-        and episode_design.get("schema_version")
-        == "issue827-episode-design-v1"
-        and episode_design.get("case_count") == 2
-        and episode_design.get("episode_count") == 4
+        and episode_design.get("case_count") == dimensions["case_count"]
+        and episode_design.get("episode_count") == dimensions["episode_count"]
         and episode_design.get("same_case_serialized") is True
-        and episode_design.get("different_cases_max_parallel") == 2
+        and episode_design.get("different_cases_max_parallel")
+        == dimensions["max_parallel_cases"]
         and episode_design.get("fresh_session_per_episode") is True
         and episode_design.get("resume_allowed") is False
         and episode_design.get("model_retry_allowed") is False
@@ -681,7 +852,6 @@ def validate_plan(path: Path) -> dict[str, Any]:
         "plan",
     )
     require(plan["schema_version"] == PLAN_SCHEMA, "plan schema mismatch")
-    require(plan["max_parallel"] == 2, "outer evaluator parallelism must be 2")
     require(plan["evaluator_wall_seconds"] == 3600, "evaluator wall limit drift")
     validate_output_isolation(plan)
 
@@ -691,11 +861,6 @@ def validate_plan(path: Path) -> dict[str, Any]:
     selection_path, selection_bytes = validate_file_reference(plan["selection"], "selection")
     registration = json.loads(registration_bytes)
     selection = json.loads(selection_bytes)
-    require(registration.get("issue") == 827, "registration issue mismatch")
-    require(
-        registration.get("schema_version") == "issue827-treatment-registration-v1",
-        "registration schema mismatch",
-    )
     try:
         registration_contract.validate_registration(
             registration,
@@ -703,11 +868,13 @@ def validate_plan(path: Path) -> dict[str, Any]:
         )
     except registration_contract.RegistrationContractError as exc:
         raise FailClosed(str(exc)) from exc
+    dimensions = experiment_dimensions(registration)
     require(
-        selection.get("schema_version") == "issue827-fresh-pair-selection-v1",
-        "selection schema mismatch",
+        plan["max_parallel"] == dimensions["max_parallel_cases"],
+        "outer evaluator parallelism differs from registration",
     )
     validate_authoritative_selection(selection, registration_bytes)
+    expected_identities = expected_episode_identities(registration, selection)
 
     evaluator = _require_exact_keys(
         plan["evaluator"],
@@ -753,37 +920,34 @@ def validate_plan(path: Path) -> dict[str, Any]:
     validate_registration_contracts(registration, plan, evaluator)
 
     episodes = plan["episodes"]
-    require(isinstance(episodes, list) and len(episodes) == 4, "exactly four episodes required")
+    require(
+        isinstance(episodes, list)
+        and len(episodes) == dimensions["episode_count"],
+        "plan episode count differs from registration",
+    )
     selection_cases = selection.get("cases")
-    require(isinstance(selection_cases, list) and len(selection_cases) == 2, "selection must contain two cases")
+    require(
+        isinstance(selection_cases, list)
+        and len(selection_cases) == dimensions["case_count"],
+        "selection case count differs from registration",
+    )
     selected = {case["instance_id"]: case for case in selection_cases}
-    require(len(selected) == 2, "selection contains duplicate cases")
+    require(
+        len(selected) == dimensions["case_count"],
+        "selection contains duplicate cases",
+    )
     seen: set[tuple[str, str]] = set()
     run_ids: set[str] = set()
     validated: list[dict[str, Any]] = []
-    episode_keys = {
-        "case_id",
-        "rank",
-        "arm",
-        "base_commit",
-        "base_tree",
-        "episode_receipt",
-        "episode_verification",
-        "evaluator_authorization",
-        "model_name_or_path",
-        "run_id",
-        "official_image",
-        "official_image_source",
-        "official_image_manifest_digest",
-        "official_image_config_id",
-        "official_image_local_id",
-        "official_image_tag",
-    }
     for index, episode in enumerate(episodes):
-        episode = _require_exact_keys(episode, episode_keys, f"episodes[{index}]")
+        episode = _require_exact_keys(episode, EPISODE_KEYS, f"episodes[{index}]")
         arm = episode["arm"]
         require(arm in ALLOWED_ARMS, f"unknown episode arm: {arm}")
-        require(type(episode["rank"]) is int and episode["rank"] in (1, 2), "bad rank")
+        require(
+            type(episode["rank"]) is int
+            and 1 <= episode["rank"] <= dimensions["case_count"],
+            "bad rank",
+        )
         require(HEX40.fullmatch(episode["base_commit"]) is not None, "bad base commit")
         require(HEX40.fullmatch(episode["base_tree"]) is not None, "bad base tree")
         key = (episode["case_id"], arm)
@@ -820,8 +984,11 @@ def validate_plan(path: Path) -> dict[str, Any]:
                 selection_bytes,
             )
         )
-    expected = {(case_id, arm) for case_id in selected for arm in ALLOWED_ARMS}
-    require(seen == expected, "plan does not contain both A/T episodes for both cases")
+    expected = {(case_id, arm) for _, case_id, arm in expected_identities}
+    require(
+        seen == expected,
+        "plan does not exactly match selection-derived A/T identities",
+    )
 
     plan["_path"] = str(path)
     plan["_bytes"] = plan_bytes
@@ -832,6 +999,8 @@ def validate_plan(path: Path) -> dict[str, Any]:
     plan["_selection_path"] = selection_path
     plan["_selection_bytes"] = selection_bytes
     plan["_selection"] = selection
+    plan["_dimensions"] = dimensions
+    plan["_expected_episode_identities"] = expected_identities
     plan["_validated_episodes"] = validated
     return plan
 
@@ -1155,6 +1324,19 @@ def validate_seal_set(plan: Mapping[str, Any]) -> dict[str, Any]:
         ),
         key=lambda item: (item["rank"], item["arm"]),
     )
+    expected_identities = {
+        (case_id, arm)
+        for _, case_id, arm in plan["_expected_episode_identities"]
+    }
+    require(
+        len(refs) == plan["_dimensions"]["episode_count"]
+        and {
+            (item["case_id"], item["arm"])
+            for item in refs
+        }
+        == expected_identities,
+        "seal-set does not contain the exact registered episode identities",
+    )
     require(value.get("seals") == refs, "seal-set member references changed")
     require(
         value.get("official_evaluations_authorized")
@@ -1322,7 +1504,10 @@ def no_live_model_sessions(plan: Mapping[str, Any]) -> dict[str, Any]:
     session_ids = sorted(
         item["receipt"]["session_id"] for item in plan["_validated_episodes"]
     )
-    require(len(set(session_ids)) == 4, "episode session identities are not unique")
+    require(
+        len(set(session_ids)) == plan["_dimensions"]["episode_count"],
+        "episode session identities are not unique or complete",
+    )
     for session_id in session_ids:
         require(session_id not in process_list, "a frozen episode model session is still live")
     return {"checked_session_count": len(session_ids), "all_absent": True}
@@ -2071,7 +2256,11 @@ def evaluate_all(plan: Mapping[str, Any]) -> int:
         "same_case_serialized": True,
         "results": results,
         "failures": failures,
-        "valid": len(results) == 4 and not failures and all(item["valid"] for item in results),
+        "valid": (
+            len(results) == plan["_dimensions"]["episode_count"]
+            and not failures
+            and all(item["valid"] for item in results)
+        ),
         "model_output_delivery": "none; evaluator outputs remain out-of-band",
     }
     write_exclusive(receipt_path, canonical_json_bytes(receipt))

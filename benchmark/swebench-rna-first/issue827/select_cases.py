@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Deterministically select #827 cases without exposing problem text.
+"""Deterministically select the registered case prefix without exposing text.
 
 The selector can first emit a non-authoritative rank receipt so the selected
-repositories can be acquired.  A final receipt additionally requires an exact
-commit-to-tree binding for both selected cases.
+repositories can be acquired. A final receipt additionally requires an exact
+commit-to-tree binding for every selected case. Historical issue #827 pair
+registrations and current issue #836 cohort registrations share this path.
 """
 
 from __future__ import annotations
@@ -14,11 +15,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Any
+from typing import Any, Mapping, NamedTuple
 
 import registration_contract
 
-SCHEMA = "issue827-fresh-pair-selection-v1"
+LEGACY_SCHEMA = "issue827-fresh-pair-selection-v1"
+CURRENT_SCHEMA = "issue836-fresh-cohort-selection-v2"
+SCHEMA = CURRENT_SCHEMA
+LEGACY_ALGORITHM_VERSION = "issue827-selector-v1"
+CURRENT_ALGORITHM_VERSION = "issue836-selector-v2"
 EXPECTED_ROWS = 500
 EXPECTED_SEED = "rna-first-sonnet-hermetic-selector-v1"
 EXPECTED_RANKING = "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)"
@@ -29,6 +34,95 @@ SELECTOR_PATH = "benchmark/swebench-rna-first/issue827/select_cases.py"
 
 class SelectionError(RuntimeError):
     pass
+
+
+class ExpectedEpisodeIdentity(NamedTuple):
+    """An exact one-shot episode required by registration and selection."""
+
+    rank: int
+    instance_id: str
+    arm: str
+
+
+def selection_schema(registration: Mapping[str, Any]) -> str:
+    """Return the only selection schema valid for a registration version."""
+
+    schema = registration.get("schema_version")
+    if schema == registration_contract.LEGACY_REGISTRATION_SCHEMA:
+        return LEGACY_SCHEMA
+    if schema == registration_contract.CURRENT_REGISTRATION_SCHEMA:
+        return CURRENT_SCHEMA
+    raise SelectionError("registration schema has no selection schema")
+
+
+def expected_episode_identities(
+    registration: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> tuple[ExpectedEpisodeIdentity, ...]:
+    """Validate selection count/rank/parity and enumerate exact episodes."""
+
+    try:
+        dimensions = registration_contract.experiment_dimensions(registration)
+    except registration_contract.RegistrationContractError as exc:
+        raise SelectionError(f"registration dimensions invalid: {exc}") from exc
+    if selection.get("schema_version") != selection_schema(registration):
+        raise SelectionError("selection schema does not match registration version")
+    cases = selection.get("cases")
+    if not isinstance(cases, list):
+        raise SelectionError("selection cases must be a list")
+    if len(cases) != dimensions["case_count"]:
+        raise SelectionError("selection case count differs from registration")
+
+    identities: list[ExpectedEpisodeIdentity] = []
+    seen_instance_ids: set[str] = set()
+    for expected_rank, case in enumerate(cases, start=1):
+        if not isinstance(case, dict):
+            raise SelectionError("selection case must be an object")
+        if case.get("rank") != expected_rank:
+            raise SelectionError("selection ranks must be the exact ranked prefix")
+        instance_id = case.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            raise SelectionError("selection case instance ID is invalid")
+        if instance_id in seen_instance_ids:
+            raise SelectionError("selection case instance IDs must be unique")
+        seen_instance_ids.add(instance_id)
+        expected_arm_order = (
+            ["A", "T"] if expected_rank % 2 == 1 else ["T", "A"]
+        )
+        if case.get("arm_order") != expected_arm_order:
+            raise SelectionError("selection arm order does not match rank parity")
+        identities.extend(
+            ExpectedEpisodeIdentity(expected_rank, instance_id, arm)
+            for arm in expected_arm_order
+        )
+    if len(identities) != dimensions["episode_count"]:
+        raise SelectionError("selection episode count differs from registration")
+    return tuple(identities)
+
+
+def deterministic_ranked_prefix(
+    instance_ids: list[str],
+    excluded_instance_ids: set[str],
+    seed: str,
+    case_count: int,
+) -> list[tuple[str, str]]:
+    """Rank eligible IDs without consulting problem text, gold, or outcomes."""
+
+    ranked = sorted(
+        (
+            sha256_bytes(
+                seed.encode("utf-8")
+                + b"\0"
+                + instance_id.encode("utf-8")
+            ),
+            instance_id,
+        )
+        for instance_id in instance_ids
+        if instance_id not in excluded_instance_ids
+    )
+    if len(ranked) < case_count:
+        raise SelectionError("eligible population is smaller than registered cohort")
+    return ranked[:case_count]
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -170,8 +264,6 @@ def main() -> int:
         arguments.registration.resolve(),
         arguments.exclusions.resolve(),
     )
-    if registration.get("schema_version") != "issue827-treatment-registration-v1":
-        raise SelectionError("registration schema is not the frozen issue #827 schema")
     try:
         registration_contract.validate_registration(
             registration,
@@ -191,8 +283,15 @@ def main() -> int:
         raise SelectionError("selector seed differs from the frozen seed")
     if selector.get("ranking") != EXPECTED_RANKING:
         raise SelectionError("selector ranking differs from the frozen algorithm")
-    if selector.get("algorithm_version") != "issue827-selector-v1":
+    expected_algorithm = (
+        LEGACY_ALGORITHM_VERSION
+        if registration.get("schema_version")
+        == registration_contract.LEGACY_REGISTRATION_SCHEMA
+        else CURRENT_ALGORITHM_VERSION
+    )
+    if selector.get("algorithm_version") != expected_algorithm:
         raise SelectionError("selector algorithm version is invalid")
+    dimensions = registration_contract.experiment_dimensions(registration)
 
     if exclusions.get("schema_version") != "issue827-exclusions-v1":
         raise SelectionError("exclusion schema is not frozen for issue #827")
@@ -204,7 +303,7 @@ def main() -> int:
         type(excluded_count) is not int
         or type(eligible_count) is not int
         or excluded_count < 0
-        or eligible_count < 2
+        or eligible_count < dimensions["case_count"]
         or excluded_count + eligible_count != EXPECTED_ROWS
     ):
         raise SelectionError("exclusion population counts are invalid")
@@ -240,17 +339,15 @@ def main() -> int:
     if not set(excluded).issubset(ids):
         raise SelectionError("exclusion set contains an unknown instance ID")
 
-    ranked = sorted(
-        (
-            sha256_bytes(seed.encode("utf-8") + b"\0" + instance_id.encode("utf-8")),
-            instance_id,
-        )
-        for instance_id in ids
-        if instance_id not in set(excluded)
+    eligible_ranked = deterministic_ranked_prefix(
+        ids,
+        set(excluded),
+        seed,
+        exclusions["eligible_count"],
     )
-    if len(ranked) != exclusions.get("eligible_count"):
+    if len(eligible_ranked) != exclusions.get("eligible_count"):
         raise SelectionError("eligible population count mismatch")
-    selected = ranked[:2]
+    selected = eligible_ranked[: dimensions["case_count"]]
     rows_by_id = {ids[index]: index for index in range(table.num_rows)}
     if arguments.rank_only and arguments.git_cache_root is not None:
         raise SelectionError("rank-only mode cannot consume a Git cache")
@@ -275,7 +372,7 @@ def main() -> int:
             "repo": repository,
             "base_commit": commit,
             "problem_statement_sha256": sha256_bytes(problem.encode("utf-8")),
-            "arm_order": ["A", "T"] if rank == 1 else ["T", "A"],
+            "arm_order": ["A", "T"] if rank % 2 == 1 else ["T", "A"],
         }
         if not arguments.rank_only:
             case["base_tree"] = git_tree(
@@ -288,7 +385,7 @@ def main() -> int:
         cases.append(case)
 
     receipt = {
-        "schema_version": SCHEMA,
+        "schema_version": selection_schema(registration),
         "state": "ranked_needs_tree_binding" if arguments.rank_only else "selected_pre_model",
         "authoritative": not arguments.rank_only,
         "registration_commit": registration_commit,
@@ -299,7 +396,7 @@ def main() -> int:
         "seed": seed,
         "population_rows": EXPECTED_ROWS,
         "excluded_rows": len(excluded),
-        "eligible_rows": len(ranked),
+        "eligible_rows": len(eligible_ranked),
         "problem_statements_inspected_by_human_before_selection": False,
         "gold_or_outcomes_inspected_before_selection": False,
         "fresh_case_claim": True,
@@ -308,6 +405,16 @@ def main() -> int:
         "model_calls_authorized_before_cache_readiness": False,
         "case_replacement_after_model_start": False,
     }
+    if (
+        registration.get("schema_version")
+        == registration_contract.CURRENT_REGISTRATION_SCHEMA
+    ):
+        receipt["prefix_lineage"] = {
+            "ranks_1_through_2": "pre_model_carry_forward_prefix",
+            "ranks_3_through_20": "deterministic_extension",
+            "outcomes_inspected_for_extension": False,
+        }
+    expected_episode_identities(registration, receipt)
     receipt["digest"] = sha256_bytes(canonical(receipt))
     publish_exclusive(arguments.output, receipt)
     print(canonical(receipt).decode("utf-8"), end="")

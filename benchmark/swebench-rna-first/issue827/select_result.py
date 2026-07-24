@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, deterministic result aggregation for the registered #827 selector."""
+"""Offline, deterministic result aggregation for registered A/T selectors."""
 
 from __future__ import annotations
 
@@ -13,11 +13,10 @@ from typing import Any, Mapping
 import evaluator_runner as evaluator
 
 
-RESULT_SCHEMA = "issue827-selector-result-v1"
-REGISTERED_SELECTION_RULE = {
-    "schema_version": "issue827-selection-rule-v1",
-    "episode_count": 4,
-    "pair_count": 2,
+LEGACY_RESULT_SCHEMA = "issue827-selector-result-v1"
+CURRENT_RESULT_SCHEMA = "issue836-selector-result-v2"
+RESULT_SCHEMA = CURRENT_RESULT_SCHEMA
+_REGISTERED_SELECTION_RULE_COMMON = {
     "arms": ["A", "T"],
     "aggregate_by_arm": [
         "resolved",
@@ -47,6 +46,42 @@ REGISTERED_SELECTION_RULE = {
     },
     "default_decision": "no_RNA_treatment",
 }
+REGISTERED_SELECTION_RULE = {
+    "schema_version": "issue827-selection-rule-v1",
+    "episode_count": 4,
+    "pair_count": 2,
+    **_REGISTERED_SELECTION_RULE_COMMON,
+}
+
+
+def registered_selection_rule(
+    registration: Mapping[str, Any],
+) -> dict[str, Any]:
+    dimensions = evaluator.experiment_dimensions(registration)
+    schema = registration.get("schema_version")
+    if schema == evaluator.registration_contract.LEGACY_REGISTRATION_SCHEMA:
+        rule_schema = "issue827-selection-rule-v1"
+    elif schema == evaluator.registration_contract.CURRENT_REGISTRATION_SCHEMA:
+        rule_schema = "issue836-selection-rule-v2"
+    else:
+        raise evaluator.FailClosed(
+            "registration schema has no registered selection rule"
+        )
+    return {
+        "schema_version": rule_schema,
+        "episode_count": dimensions["episode_count"],
+        "pair_count": dimensions["case_count"],
+        **_REGISTERED_SELECTION_RULE_COMMON,
+    }
+
+
+def result_schema(registration: Mapping[str, Any]) -> str:
+    schema = registration.get("schema_version")
+    if schema == evaluator.registration_contract.LEGACY_REGISTRATION_SCHEMA:
+        return LEGACY_RESULT_SCHEMA
+    if schema == evaluator.registration_contract.CURRENT_REGISTRATION_SCHEMA:
+        return CURRENT_RESULT_SCHEMA
+    raise evaluator.FailClosed("registration schema has no result schema")
 
 
 def _as_decimal(value: int | float) -> Decimal:
@@ -499,11 +534,66 @@ def episode_metrics(
     }
 
 
-def decide_registered(metrics: list[Mapping[str, Any]]) -> dict[str, Any]:
-    evaluator.require(len(metrics) == 4, "registered decision requires four episodes")
+def decide_registered(
+    metrics: list[Mapping[str, Any]],
+    dimensions: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    pair_keys = [
+        item["case_id"] if "case_id" in item else item.get("rank")
+        for item in metrics
+    ]
+    evaluator.require(
+        all(
+            isinstance(value, (str, int))
+            and not isinstance(value, bool)
+            and value != ""
+            for value in pair_keys
+        ),
+        "registered decision episode pair identity is malformed",
+    )
+    inferred_case_count = len(set(pair_keys))
+    case_count = (
+        dimensions["case_count"]
+        if dimensions is not None
+        else inferred_case_count
+    )
+    episode_count = (
+        dimensions["episode_count"]
+        if dimensions is not None
+        else case_count * len(evaluator.ALLOWED_ARMS)
+    )
+    evaluator.require(
+        type(case_count) is int
+        and case_count > 0
+        and type(episode_count) is int
+        and episode_count == case_count * len(evaluator.ALLOWED_ARMS),
+        "registered decision dimensions are invalid",
+    )
+    evaluator.require(
+        len(metrics) == episode_count,
+        "registered decision episode count differs from registration",
+    )
     treatment = [item for item in metrics if item["arm"] == "T"]
     control = [item for item in metrics if item["arm"] == "A"]
-    evaluator.require(len(treatment) == len(control) == 2, "registered decision requires two A/T pairs")
+    evaluator.require(
+        len(treatment) == len(control) == case_count,
+        "registered decision requires one balanced A/T pair per case",
+    )
+    identities = {
+        (pair_key, item["arm"])
+        for pair_key, item in zip(pair_keys, metrics, strict=True)
+    }
+    expected_identities = {
+        (pair_key, arm)
+        for pair_key in set(pair_keys)
+        for arm in evaluator.ALLOWED_ARMS
+    }
+    evaluator.require(
+        len(set(pair_keys)) == case_count
+        and identities == expected_identities
+        and len(identities) == episode_count,
+        "registered decision metrics do not contain exact A/T pairs",
+    )
     if any(item["policy_compliant"] is not True for item in treatment):
         return {
             "decision": "no_RNA_treatment",
@@ -606,6 +696,7 @@ def decide_registered(metrics: list[Mapping[str, Any]]) -> dict[str, Any]:
 def decide_for_selection(
     selection: Mapping[str, Any],
     metrics: list[Mapping[str, Any]],
+    dimensions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     authoritative = selection.get("authoritative")
     evaluator.require(
@@ -639,15 +730,16 @@ def decide_for_selection(
         "selection_authoritative": True,
         "selection_state": state,
         "protocol_classification": "fresh_preregistered_selector",
-        **decide_registered(metrics),
+        **decide_registered(metrics, dimensions),
     }
 
 
 def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
     plan = evaluator.validate_plan(plan_path.resolve(strict=True))
+    dimensions = plan["_dimensions"]
     evaluator.require(
         plan["_registration"].get("selection_rule")
-        == REGISTERED_SELECTION_RULE,
+        == registered_selection_rule(plan["_registration"]),
         "registration selection rule drift",
     )
     seal_set = evaluator.validate_seal_set(plan)
@@ -674,11 +766,24 @@ def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
     )
     evaluator.require(batch.get("model_output_delivery", "").startswith("none"), "batch reports model feedback")
     results = batch.get("results")
-    evaluator.require(isinstance(results, list) and len(results) == 4, "batch must record four episode dispositions")
-    evaluator.require(all(isinstance(item, dict) for item in results), "batch result shape mismatch")
+    evaluator.require(
+        isinstance(results, list)
+        and len(results) == dimensions["episode_count"],
+        "batch result count differs from registration",
+    )
+    evaluator.require(
+        all(
+            isinstance(item, dict)
+            and isinstance(item.get("case_id"), str)
+            and item["case_id"]
+            and item.get("arm") in evaluator.ALLOWED_ARMS
+            for item in results
+        ),
+        "batch result identity shape mismatch",
+    )
     evaluator.require(batch.get("failures") == [], "batch contains unrecorded worker failures")
     evaluator.require(
-        batch.get("max_parallel") == 2
+        batch.get("max_parallel") == dimensions["max_parallel_cases"]
         and batch.get("same_case_serialized") is True,
         "batch concurrency contract drift",
     )
@@ -690,11 +795,19 @@ def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
         and environment.get("official_evaluator_invocations") == 0
         and environment.get("model_session_isolation", {}).get("all_absent") is True
         and environment.get("model_session_isolation", {}).get("checked_session_count")
-        == 4,
+        == dimensions["episode_count"],
         "batch environment/no-feedback proof mismatch",
     )
     result_map = {(item["case_id"], item["arm"]): item for item in results}
-    evaluator.require(len(result_map) == 4, "batch contains duplicate episode results")
+    expected_identities = {
+        (case_id, arm)
+        for _, case_id, arm in plan["_expected_episode_identities"]
+    }
+    evaluator.require(
+        set(result_map) == expected_identities
+        and len(result_map) == dimensions["episode_count"],
+        "batch does not contain the exact registered episode identities",
+    )
     metrics: list[dict[str, Any]] = []
     for seal_info in seal_set["seals"]:
         key = (seal_info["seal"]["case_id"], seal_info["seal"]["arm"])
@@ -709,10 +822,16 @@ def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
         batch.get("official_evaluations_recorded") == expected_authorized,
         "batch recorded-evaluation count mismatch",
     )
-    evaluator.require(batch.get("zero_invocation_receipts") == 4 - expected_authorized, "batch zero-call count mismatch")
-    decision = decide_for_selection(plan["_selection"], metrics)
+    evaluator.require(
+        batch.get("zero_invocation_receipts")
+        == dimensions["episode_count"] - expected_authorized,
+        "batch zero-call count mismatch",
+    )
+    decision = decide_for_selection(
+        plan["_selection"], metrics, dimensions
+    )
     payload = {
-        "schema_version": RESULT_SCHEMA,
+        "schema_version": result_schema(plan["_registration"]),
         "computed_at": evaluator.utc_now(),
         "plan": {"path": str(plan_path), "bytes": len(plan["_bytes"]), "sha256": plan["_sha256"]},
         "registration_sha256": evaluator.sha256_bytes(plan["_registration_bytes"]),
@@ -726,9 +845,12 @@ def aggregate(plan_path: Path, batch_path: Path) -> dict[str, Any]:
             "sha256": evaluator.sha256_bytes(batch_data),
         },
         "episodes": metrics,
+        "experiment_dimensions": dict(dimensions),
         "official_evaluations_authorized": expected_authorized,
         "official_evaluations_started": expected_started,
-        "zero_invocation_episodes": 4 - expected_authorized,
+        "zero_invocation_episodes": (
+            dimensions["episode_count"] - expected_authorized
+        ),
         "no_model_feedback_verified": True,
         **decision,
     }
