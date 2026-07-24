@@ -9,12 +9,16 @@ import json
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 from typing import Any, Mapping
 
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent / "issue827"
+REPOSITORY = HERE.parents[2]
+REGISTERED_SOURCE_COMMIT = "d40069ad28f8525560ba7af59268b1653a74d481"
+REGISTERED_SOURCE_TREE = "370b08743c7bed38896ce3246ca67c7bd5bee202"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 EXPECTED_ARTIFACT = {
     "producer_commit": "13c74539441adeef1ffd7d68b413ff148203f21c",
@@ -79,6 +83,58 @@ def sha_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_historical_registered_sources(
+    registration: Mapping[str, Any],
+    registered_file_names: Mapping[str, str],
+) -> None:
+    tree = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPOSITORY),
+            "rev-parse",
+            f"{REGISTERED_SOURCE_COMMIT}^{{tree}}",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        tree.returncode == 0
+        and tree.stdout.decode().strip() == REGISTERED_SOURCE_TREE,
+        "historical registered source tree unavailable",
+    )
+    registered = registration.get("registered_files")
+    require(isinstance(registered, dict), "registered source hashes missing")
+    for key, filename in registered_file_names.items():
+        source = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPOSITORY),
+                "show",
+                (
+                    f"{REGISTERED_SOURCE_COMMIT}:"
+                    "benchmark/swebench-rna-first/issue827/"
+                    f"{filename}"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        require(
+            source.returncode == 0,
+            f"historical registered source unavailable: {filename}",
+        )
+        require(
+            registered.get(key) == sha_bytes(source.stdout),
+            f"historical registered source hash mismatch: {filename}",
+        )
+
+
 def verify_registration(
     registration_path: Path,
     lineage_path: Path,
@@ -95,12 +151,13 @@ def verify_registration(
     closure, closure_bytes = load_object(closure_path, "qualification closure")
 
     try:
-        registration_contract.validate_registration(
-            registration,
-            source_root=HARNESS,
-        )
+        registration_contract.validate_registration(registration)
     except registration_contract.RegistrationContractError as exc:
         raise SuccessorVerificationError(str(exc)) from exc
+    verify_historical_registered_sources(
+        registration,
+        registration_contract.REGISTERED_FILE_NAMES,
+    )
 
     require(registration.get("issue") == 827, "runner compatibility issue drift")
     require(
