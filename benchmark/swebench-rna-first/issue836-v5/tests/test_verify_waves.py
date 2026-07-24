@@ -104,6 +104,68 @@ class SealedWaveVerifierTests(unittest.TestCase):
             contract.FINAL_LEDGER_SCHEMA,
         )
 
+    def test_episode_verifier_receives_bridge_and_rejects_other_errors(
+        self,
+    ) -> None:
+        original = base.verify_qualification_closure
+
+        def invoke_qualification(_episode_path: Path) -> dict:
+            base.verify_qualification_closure({}, {})
+            return {
+                "evidence_complete": True,
+                "official_evaluator_invoked": False,
+                "errors": [],
+            }
+
+        with (
+            mock.patch.object(
+                verify_waves.run_wave,
+                "verify_v4_qualification_compatibility",
+            ) as bridge,
+            mock.patch.object(
+                verify_waves.base_verifier,
+                "verify_episode",
+                side_effect=invoke_qualification,
+            ),
+        ):
+            result = (
+                verify_waves.verify_episode_with_qualification_compatibility(
+                    Path("/episode.json"),
+                    compatibility={"compatibility": 1},
+                    registration={"registration": 1},
+                    schedule={"schedule": 1},
+                    where="synthetic episode",
+                )
+            )
+        self.assertTrue(result["evidence_complete"])
+        bridge.assert_called_once()
+        self.assertIs(base.verify_qualification_closure, original)
+
+        with (
+            mock.patch.object(
+                verify_waves.run_wave,
+                "verify_v4_qualification_compatibility",
+            ),
+            mock.patch.object(
+                verify_waves.base_verifier,
+                "verify_episode",
+                return_value={
+                    "evidence_complete": False,
+                    "official_evaluator_invoked": False,
+                    "errors": ["another verifier error"],
+                },
+            ),
+            self.assertRaises(base.FailClosed),
+        ):
+            verify_waves.verify_episode_with_qualification_compatibility(
+                Path("/episode.json"),
+                compatibility={"compatibility": 1},
+                registration={"registration": 1},
+                schedule={"schedule": 1},
+                where="synthetic episode",
+            )
+        self.assertIs(base.verify_qualification_closure, original)
+
     def test_complete_ten_wave_chain_is_accepted(self) -> None:
         verify_waves.validate_sealed_wave_documents(
             sealed_waves(),

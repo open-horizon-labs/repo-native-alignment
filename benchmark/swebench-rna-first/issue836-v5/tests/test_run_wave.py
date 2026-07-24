@@ -82,8 +82,13 @@ class PriorWaveSealTests(unittest.TestCase):
             )
 
     def test_paid_wave_input_must_be_canonical_adapter_output(self) -> None:
-        compatibility_path = Path("/evidence/wave/v5-compatibility-manifest.json")
-        canonical = compatibility_path.parent / "rolling-wave-manifest.json"
+        compatibility_path = (
+            Path("/evidence/wave") / run_wave.contract.COMPATIBILITY_FILENAME
+        )
+        canonical = (
+            compatibility_path.parent
+            / run_wave.contract.WAVE_MANIFEST_FILENAME
+        )
         run_wave.require_canonical_wave_manifest_path(
             canonical,
             compatibility_path,
@@ -92,6 +97,100 @@ class PriorWaveSealTests(unittest.TestCase):
             run_wave.require_canonical_wave_manifest_path(
                 Path("/evidence/copied-wave-manifest.json"),
                 compatibility_path,
+            )
+
+    def test_successor_envelope_binding_coexists_with_preserved_v5(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_root = Path(directory).resolve()
+            old_binding = evidence_root / "v5-envelope-binding.json"
+            old_binding.write_text("{}\n")
+            successor = (
+                evidence_root
+                / run_wave.contract.ENVELOPE_BINDING_FILENAME
+            )
+            assemble_wave.validate_envelope_binding_path(
+                successor,
+                evidence_root,
+            )
+            self.assertTrue(old_binding.is_file())
+            self.assertFalse(successor.exists())
+            with self.assertRaises(run_wave.base.FailClosed):
+                assemble_wave.validate_envelope_binding_path(
+                    old_binding,
+                    evidence_root,
+                )
+
+    def test_qualification_bridge_accepts_only_exact_registered_delta(
+        self,
+    ) -> None:
+        current = json.loads(
+            (ROOT.parent / "issue836-v4" / "registration.json").read_bytes()
+        )
+        qualified = json.loads(
+            (ROOT.parent / "issue830" / "registration.json").read_bytes()
+        )
+        qualification = json.loads(
+            (
+                ROOT.parent
+                / "issue830"
+                / "qualification-closure.manifest.json"
+            ).read_bytes()
+        )
+        run_wave.contract.validate_qualification_compatibility(
+            run_wave.contract.QUALIFICATION_COMPATIBILITY,
+            qualification,
+            current,
+            qualified,
+        )
+        compatibility = {
+            "qualification_closure": {
+                "manifest": run_wave.contract.file_ref(
+                    ROOT.parent
+                    / "issue830"
+                    / "qualification-closure.manifest.json"
+                )
+            }
+        }
+        schedule = {
+            "qualification_compatibility": (
+                run_wave.contract.QUALIFICATION_COMPATIBILITY
+            )
+        }
+
+        def exact_registered_files_mismatch(*_args: object) -> None:
+            raise run_wave.base.FailClosed(
+                "qualification manifest binding mismatch: "
+                "registered_files_sha256"
+            )
+
+        run_wave.verify_v4_qualification_compatibility(
+            compatibility,
+            current,
+            schedule,
+            qualification_verifier=exact_registered_files_mismatch,
+        )
+
+        def another_failure(*_args: object) -> None:
+            raise run_wave.base.FailClosed("another qualification failure")
+
+        with self.assertRaises(run_wave.base.FailClosed):
+            run_wave.verify_v4_qualification_compatibility(
+                compatibility,
+                current,
+                schedule,
+                qualification_verifier=another_failure,
+            )
+
+        tampered = json.loads(json.dumps(current))
+        tampered["registered_files"]["runner_sha256"] = "0" * 64
+        with self.assertRaises(run_wave.contract.ContractError):
+            run_wave.contract.validate_qualification_compatibility(
+                run_wave.contract.QUALIFICATION_COMPATIBILITY,
+                qualification,
+                tampered,
+                qualified,
             )
 
     def test_exact_complete_prior_wave_is_accepted(self) -> None:

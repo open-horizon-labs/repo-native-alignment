@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the absent-path v5 schedule after its implementation commit exists."""
+"""Generate the absent-path successor schedule after its implementation commit."""
 
 from __future__ import annotations
 
@@ -72,11 +72,32 @@ def build(implementation_commit: str) -> dict:
             == hashlib.sha256(committed.stdout).hexdigest(),
             f"working v5 source differs from implementation commit: {filename}",
         )
+    qualified_registration = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPO),
+            "show",
+            (
+                f"{commit}:"
+                f"{contract.QUALIFIED_REGISTRATION_RELATIVE_PATH}"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    contract.require(
+        qualified_registration.returncode == 0
+        and hashlib.sha256(qualified_registration.stdout).hexdigest()
+        == contract.QUALIFIED_REGISTRATION_SHA256,
+        "qualified predecessor registration differs from implementation commit",
+    )
     return {
         "schema_version": contract.SCHEDULE_SCHEMA,
         "authoritative": True,
         "protocol_change": (
-            "execution_schedule_only_staged_one_or_two_case_waves"
+            "staged_execution_plus_exact_v4_qualification_digest_compatibility"
         ),
         "base_source_commit": contract.BASE_SOURCE_COMMIT,
         "base_source_tree": contract.BASE_SOURCE_TREE,
@@ -85,6 +106,7 @@ def build(implementation_commit: str) -> dict:
         "base_registration_sha256": contract.BASE_REGISTRATION_SHA256,
         "base_selection_sha256": contract.BASE_SELECTION_SHA256,
         "approved_assembler_sha256": contract.APPROVED_ASSEMBLER_SHA256,
+        "qualification_compatibility": contract.QUALIFICATION_COMPATIBILITY,
         "registered_files": {
             filename: contract.sha_file(ROOT / filename)
             for filename in REGISTERED_FILES
@@ -112,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "execution-schedule.json",
+        default=ROOT / contract.SCHEDULE_FILENAME,
     )
     return result
 
@@ -122,7 +144,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         output = args.output.resolve(strict=False)
         contract.require(
-            output == (ROOT / "execution-schedule.json").resolve(strict=False),
+            output
+            == (ROOT / contract.SCHEDULE_FILENAME).resolve(strict=False),
             "schedule output path is fixed",
         )
         contract.require(

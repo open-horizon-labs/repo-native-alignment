@@ -21,6 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parents[2]
 BASE = ROOT.parent / "issue827"
 sys.path.insert(0, str(BASE))
 
@@ -94,8 +95,8 @@ COMPATIBILITY_KEYS = {
     "batch_id",
     "explicit_requested_ranks",
 }
-INVOCATION_SCHEMA = "issue836-rolling-invocation-v5"
-WAVE_START_SCHEMA = "issue836-rolling-wave-start-v5"
+INVOCATION_SCHEMA = "issue836-rolling-invocation-v6"
+WAVE_START_SCHEMA = "issue836-rolling-wave-start-v6"
 WAVE_START_KEYS = {
     "schema_version",
     "started_at",
@@ -391,7 +392,7 @@ def _prior_wave_receipts(
         and output_root.resolve(strict=True) == output_root,
         "cumulative output root is invalid",
     )
-    invocation_path = output_root / "v5-invocation-start.json"
+    invocation_path = output_root / contract.INVOCATION_FILENAME
     require(
         invocation_path.is_file() and not invocation_path.is_symlink(),
         "cumulative output root lacks the immutable v5 invocation start",
@@ -701,9 +702,67 @@ def require_canonical_wave_manifest_path(
 ) -> None:
     require(
         manifest_path
-        == compatibility_path.parent / "rolling-wave-manifest.json",
+        == compatibility_path.parent / contract.WAVE_MANIFEST_FILENAME,
         "paid wave input is not the canonical assembled manifest",
     )
+
+
+def verify_v4_qualification_compatibility(
+    compatibility: Mapping[str, Any],
+    registration: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    *,
+    qualification_verifier: Any | None = None,
+) -> None:
+    """Accept only the exact registered-files-only v4 closure mismatch."""
+
+    verifier = (
+        base.verify_qualification_closure
+        if qualification_verifier is None
+        else qualification_verifier
+    )
+    try:
+        verifier(compatibility, registration)
+        return
+    except base.FailClosed as exc:
+        require(
+            str(exc)
+            == (
+                "qualification manifest binding mismatch: "
+                "registered_files_sha256"
+            ),
+            str(exc),
+        )
+    _, qualification_bytes = base.check_ref(
+        compatibility["qualification_closure"]["manifest"],
+        "wave compatibility qualification manifest",
+    )
+    try:
+        qualification_manifest = json.loads(qualification_bytes)
+    except json.JSONDecodeError as exc:
+        raise base.FailClosed(
+            f"qualification compatibility manifest invalid JSON: {exc}"
+        ) from exc
+    qualified_registration_path = (
+        REPO / contract.QUALIFIED_REGISTRATION_RELATIVE_PATH
+    )
+    require(
+        qualified_registration_path.is_file()
+        and not qualified_registration_path.is_symlink()
+        and contract.sha_file(qualified_registration_path)
+        == contract.QUALIFIED_REGISTRATION_SHA256,
+        "qualified predecessor registration drift",
+    )
+    qualified_registration = base.read_json(qualified_registration_path)
+    try:
+        contract.validate_qualification_compatibility(
+            schedule["qualification_compatibility"],
+            qualification_manifest,
+            registration,
+            qualified_registration,
+        )
+    except contract.ContractError as exc:
+        raise base.FailClosed(str(exc)) from exc
 
 
 def prepare_wave(
@@ -745,7 +804,7 @@ def prepare_wave(
         raise base.FailClosed(str(exc)) from exc
     require(
         schedule_path.resolve()
-        == (ROOT / "execution-schedule.json").resolve(),
+        == (ROOT / contract.SCHEDULE_FILENAME).resolve(),
         "wave manifest binds another execution schedule",
     )
     v4_manifest_path, _ = contract.check_ref(
@@ -827,7 +886,7 @@ def prepare_wave(
     )
     require(
         selection_binding_path.resolve()
-        == (ROOT / "selection-binding.json").resolve(),
+        == (ROOT / contract.SELECTION_BINDING_FILENAME).resolve(),
         "wave manifest binds another selection binding",
     )
     try:
@@ -976,7 +1035,11 @@ def prepare_wave(
     trusted_rna_toolchain_root = base.trusted_rna_toolchain_read_root(
         rna_refs["runtime_receipt"]
     )
-    base.verify_qualification_closure(compatibility, registration)
+    verify_v4_qualification_compatibility(
+        compatibility,
+        registration,
+        schedule,
+    )
     mcp_path, mcp_bytes = base.check_ref(
         compatibility["mcp_config"],
         "wave compatibility manifest.mcp_config",
@@ -1205,11 +1268,11 @@ def preflight_summary(
         "wave batch ID must be lexically after every prior wave",
     )
     return {
-        "schema_version": "issue836-rolling-wave-preflight-v5",
+        "schema_version": "issue836-rolling-wave-preflight-v6",
         "status": "READY_TO_EXECUTE_WAVE",
         "wave_manifest": contract.file_ref(
             Path(manifest["compatibility_manifest"]["path"]).parent
-            / "rolling-wave-manifest.json"
+            / contract.WAVE_MANIFEST_FILENAME
         ),
         "compatibility_manifest": prepared.manifest_ref,
         "schedule": manifest["schedule"],
@@ -1306,7 +1369,7 @@ def execute_wave(
     if not output_root.exists():
         output_root.mkdir(parents=True, exist_ok=False)
         base.atomic_write(
-            output_root / "v5-invocation-start.json",
+            output_root / contract.INVOCATION_FILENAME,
             base.canonical(
                 {
                     "schema_version": INVOCATION_SCHEMA,
@@ -1351,7 +1414,7 @@ def execute_wave(
         "batch_id": manifest["batch_id"],
         "wave_manifest": contract.file_ref(
             Path(manifest["compatibility_manifest"]["path"]).parent
-            / "rolling-wave-manifest.json"
+            / contract.WAVE_MANIFEST_FILENAME
         ),
         "compatibility_manifest": prepared.manifest_ref,
         "schedule": manifest["schedule"],

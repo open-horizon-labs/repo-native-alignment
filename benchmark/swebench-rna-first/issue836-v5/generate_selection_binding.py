@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind a committed v5 schedule to the unchanged frozen v4 cohort."""
+"""Bind a committed successor schedule to the unchanged frozen v4 cohort."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def git(*args: str) -> str:
 
 
 def build(schedule_commit: str) -> dict:
-    schedule_path = ROOT / "execution-schedule.json"
+    schedule_path = ROOT / contract.SCHEDULE_FILENAME
     schedule = json.loads(schedule_path.read_bytes())
     contract.validate_schedule(schedule, ROOT)
     commit = git("rev-parse", f"{schedule_commit}^{{commit}}")
@@ -80,7 +80,10 @@ def build(schedule_commit: str) -> dict:
     return {
         "schema_version": contract.SELECTION_BINDING_SCHEMA,
         "authoritative": True,
-        "protocol_change": "execution_schedule_only_no_cohort_or_arm_change",
+        "protocol_change": (
+            "execution_and_qualification_compatibility_only_"
+            "no_cohort_or_arm_change"
+        ),
         "schedule_sha256": contract.sha_file(schedule_path),
         "schedule_commit": commit,
         "schedule_tree": tree,
@@ -113,7 +116,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "selection-binding.json",
+        default=ROOT / contract.SELECTION_BINDING_FILENAME,
     )
     return result
 
@@ -123,7 +126,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         output = args.output.resolve(strict=False)
         contract.require(
-            output == (ROOT / "selection-binding.json").resolve(strict=False),
+            output
+            == (
+                ROOT / contract.SELECTION_BINDING_FILENAME
+            ).resolve(strict=False),
             "selection-binding output path is fixed",
         )
         contract.require(
@@ -135,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         contract.validate_selection_binding(
             binding,
             schedule_sha256=contract.sha_file(
-                ROOT / "execution-schedule.json"
+                ROOT / contract.SCHEDULE_FILENAME
             ),
             selection=selection,
         )

@@ -142,6 +142,21 @@ def validate_execution_episode_keys(
     )
 
 
+def validate_envelope_binding_path(
+    envelope_binding_path: Path,
+    evidence_root: Path,
+) -> None:
+    require(
+        envelope_binding_path.is_absolute()
+        and envelope_binding_path.is_relative_to(evidence_root)
+        and envelope_binding_path.name
+        == contract.ENVELOPE_BINDING_FILENAME
+        and envelope_binding_path.parent.is_dir()
+        and not envelope_binding_path.parent.is_symlink(),
+        "successor envelope-binding path invalid",
+    )
+
+
 def validate_v4_inputs(
     v4_manifest_path: Path,
     v4_receipt_path: Path,
@@ -296,8 +311,8 @@ def assemble(
         and not cumulative_output_root.is_symlink(),
         "cumulative output root must be a canonical child of evidence root",
     )
-    schedule_path = ROOT / "execution-schedule.json"
-    selection_binding_path = ROOT / "selection-binding.json"
+    schedule_path = ROOT / contract.SCHEDULE_FILENAME
+    selection_binding_path = ROOT / contract.SELECTION_BINDING_FILENAME
     schedule = json.loads(schedule_path.read_bytes())
     selection_binding = json.loads(selection_binding_path.read_bytes())
     contract.validate_schedule(schedule, ROOT)
@@ -310,13 +325,9 @@ def assemble(
     selection_binding_ref = contract.file_ref(selection_binding_path)
     envelope_ref = manifest["episode_envelope"]
     envelope_binding_path = envelope_binding_path.resolve(strict=False)
-    require(
-        envelope_binding_path.is_absolute()
-        and envelope_binding_path.is_relative_to(evidence_root)
-        and envelope_binding_path.name == "v5-envelope-binding.json"
-        and envelope_binding_path.parent.is_dir()
-        and not envelope_binding_path.parent.is_symlink(),
-        "v5 envelope-binding path invalid",
+    validate_envelope_binding_path(
+        envelope_binding_path,
+        evidence_root,
     )
     if not envelope_binding_path.exists():
         binding = {
@@ -344,8 +355,8 @@ def assemble(
     )
     envelope_binding_ref = contract.file_ref(envelope_binding_path)
     attempt_root = v4_manifest_path.resolve(strict=True).parent
-    compatibility_path = attempt_root / "v5-compatibility-manifest.json"
-    wave_path = attempt_root / "rolling-wave-manifest.json"
+    compatibility_path = attempt_root / contract.COMPATIBILITY_FILENAME
+    wave_path = attempt_root / contract.WAVE_MANIFEST_FILENAME
     require(
         not compatibility_path.exists()
         and not compatibility_path.is_symlink()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the sealed issue836-v5 wave chain as one frozen 40-episode run."""
+"""Verify the sealed issue836 successor chain as one frozen 40-episode run."""
 
 from __future__ import annotations
 
@@ -41,6 +41,44 @@ def load_ref_json(value: Any, where: str) -> tuple[Path, dict[str, Any]]:
         raise base.FailClosed(f"{where}: {exc}") from exc
     require(isinstance(document, dict), f"{where} must contain an object")
     return path, document
+
+
+def verify_episode_with_qualification_compatibility(
+    episode_path: Path,
+    *,
+    compatibility: Mapping[str, Any],
+    registration: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    where: str,
+) -> dict[str, Any]:
+    """Run the frozen verifier with only the exact successor bridge replaced."""
+
+    original = base_verifier.runner.verify_qualification_closure
+
+    def bridged(
+        manifest: Mapping[str, Any],
+        episode_registration: Mapping[str, Any],
+    ) -> None:
+        run_wave.verify_v4_qualification_compatibility(
+            manifest,
+            episode_registration,
+            schedule,
+            qualification_verifier=original,
+        )
+
+    base_verifier.runner.verify_qualification_closure = bridged
+    try:
+        result = base_verifier.verify_episode(episode_path)
+    finally:
+        base_verifier.runner.verify_qualification_closure = original
+    require(
+        result.get("evidence_complete") is True
+        and result.get("official_evaluator_invoked") is False
+        and result.get("errors") == [],
+        f"{where} is not verifier-clean: "
+        + ",".join(result.get("errors", [])),
+    )
+    return result
 
 
 def validate_sealed_wave_documents(
@@ -220,7 +258,7 @@ def _verify_wave_authorization_lineage(
         and not evidence_root.is_symlink()
         and evidence_root.resolve(strict=True) == evidence_root
         and manifest_path.is_relative_to(evidence_root)
-        and manifest_path.name == "rolling-wave-manifest.json"
+        and manifest_path.name == contract.WAVE_MANIFEST_FILENAME
         and manifest["schedule"] == invocation["schedule"]
         and manifest["schedule_contract"]
         == contract.file_ref(ROOT / "schedule_contract.py")
@@ -324,7 +362,7 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
         output_root.is_dir() and not output_root.is_symlink(),
         "cumulative output root invalid",
     )
-    invocation_path = output_root / "v5-invocation-start.json"
+    invocation_path = output_root / contract.INVOCATION_FILENAME
     invocation = base.read_json(invocation_path)
     require(
         isinstance(invocation, dict)
@@ -337,7 +375,7 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
     )
     require(
         schedule_path.resolve()
-        == (ROOT / "execution-schedule.json").resolve(),
+        == (ROOT / contract.SCHEDULE_FILENAME).resolve(),
         "v5 invocation binds another execution schedule",
     )
     try:
@@ -378,7 +416,7 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
     )
     require(
         selection_binding_path.resolve()
-        == (ROOT / "selection-binding.json").resolve(),
+        == (ROOT / contract.SELECTION_BINDING_FILENAME).resolve(),
         "v5 invocation binds another selection binding",
     )
     try:
@@ -565,12 +603,12 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
                 len(selected) == 1,
                 f"wave {batch_id} episode absent from compatibility manifest",
             )
-            result = base_verifier.verify_episode(episode_path)
-            require(
-                result.get("evidence_complete") is True
-                and result.get("official_evaluator_invoked") is False,
-                f"wave {batch_id} episode is not verifier-clean: "
-                + ",".join(result.get("errors", [])),
+            result = verify_episode_with_qualification_compatibility(
+                episode_path,
+                compatibility=compatibility,
+                registration=registration,
+                schedule=schedule,
+                where=f"wave {batch_id} episode",
             )
             episode_results.append(result)
             identities.append(identity)

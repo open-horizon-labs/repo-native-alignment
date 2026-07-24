@@ -11,13 +11,68 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 
-SCHEDULE_SCHEMA = "issue836-rolling-execution-schedule-v5"
+SCHEDULE_SCHEMA = "issue836-rolling-execution-schedule-v6"
 ENVELOPE_SCHEMA = "issue836-v4-frozen-episode-envelope-v1"
-WAVE_MANIFEST_SCHEMA = "issue836-rolling-wave-manifest-v5"
-WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v5"
-FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v5"
-SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v5"
-ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v5"
+WAVE_MANIFEST_SCHEMA = "issue836-rolling-wave-manifest-v6"
+WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v6"
+FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v6"
+SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v6"
+ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v6"
+SCHEDULE_FILENAME = "execution-schedule-v2.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v2.json"
+COMPATIBILITY_FILENAME = "v6-compatibility-manifest.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v2.json"
+INVOCATION_FILENAME = "v6-invocation-start.json"
+ENVELOPE_BINDING_FILENAME = "v6-envelope-binding.json"
+QUALIFIED_REGISTRATION_RELATIVE_PATH = (
+    "benchmark/swebench-rna-first/issue830/registration.json"
+)
+QUALIFIED_REGISTRATION_SHA256 = (
+    "ee3c602de28696a3dee4a0c9c6107c8d184c22b20763987c2dcf7f2e496cfd1a"
+)
+QUALIFICATION_MANIFEST_SHA256 = (
+    "a9e3d460fb9d0daf2c4e4bc93c08781d327ba729f7082498679a8ac5823a43a9"
+)
+QUALIFICATION_ARCHIVE_SHA256 = (
+    "97fe60aac2107925061fb13a94ea61a07ffdba38460e426633729d942bcad960"
+)
+QUALIFIED_REGISTERED_FILES_SHA256 = (
+    "14b9b57f5b9db2d1d1835a7e861a622317ed25f37505f4540982d217c20a1cc8"
+)
+CURRENT_REGISTERED_FILES_SHA256 = (
+    "d867d3a9da1ffb63b13fdc0a68dd84717043f2203a0e0168f477ca9c65b59fef"
+)
+REGISTERED_FILE_DELTA_KEYS = [
+    "evaluator_plan_template_sha256",
+    "evaluator_runner_sha256",
+    "registration_contract_sha256",
+    "result_selector_sha256",
+    "runner_sha256",
+    "selector_sha256",
+    "verifier_sha256",
+]
+QUALIFICATION_COMPATIBILITY = {
+    "schema_version": "issue836-v4-qualification-compatibility-v1",
+    "reason_code": (
+        "v4_reused_issue830_closure_after_registered_harness_successor"
+    ),
+    "qualified_registration_relative_path": QUALIFIED_REGISTRATION_RELATIVE_PATH,
+    "qualified_registration_sha256": QUALIFIED_REGISTRATION_SHA256,
+    "qualification_manifest_sha256": QUALIFICATION_MANIFEST_SHA256,
+    "qualification_archive_sha256": QUALIFICATION_ARCHIVE_SHA256,
+    "qualified_registered_files_sha256": QUALIFIED_REGISTERED_FILES_SHA256,
+    "current_registered_files_sha256": CURRENT_REGISTERED_FILES_SHA256,
+    "registered_file_delta_keys": REGISTERED_FILE_DELTA_KEYS,
+    "model_runtime_unchanged": True,
+    "isolation_runtime_unchanged": True,
+    "rna_artifact_unchanged": True,
+    "applies_equally_to_arms": ["A", "T"],
+    "cohort_or_arm_change": False,
+    "gold_or_outcomes_inspected": False,
+    "prior_model_calls": 0,
+    "prior_provider_requests": 0,
+    "prior_official_evaluator_invocations": 0,
+}
 BASE_REGISTRATION_SHA256 = (
     "2b070bb61ea2c5de6fe6b1d8cf840d6d4e53732b4e524d3f26aefc3504a6523b"
 )
@@ -66,6 +121,10 @@ def sha_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha_canonical(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def file_ref(path: Path) -> dict[str, Any]:
@@ -288,8 +347,101 @@ def next_cumulative_state(
     }
 
 
+def validate_qualification_compatibility(
+    record: Mapping[str, Any],
+    qualification_manifest: Mapping[str, Any],
+    current_registration: Mapping[str, Any],
+    qualified_registration: Mapping[str, Any],
+) -> None:
+    """Validate the exact no-spend bridge for the frozen v4 registration."""
+
+    require(
+        record == QUALIFICATION_COMPATIBILITY,
+        "qualification compatibility record drift",
+    )
+    exact_keys(
+        qualification_manifest,
+        {
+            "schema_version",
+            "qualified",
+            "no_model_or_provider_calls",
+            "archive_sha256",
+            "registered_files_sha256",
+            "model_runtime_sha256",
+            "isolation_runtime_sha256",
+            "rna_artifact_sha256",
+            "external_inputs_sha256",
+            "runtime_identity_sha256",
+            "evidence_inventory_sha256",
+        },
+        "qualification compatibility manifest",
+    )
+    require(
+        qualification_manifest["schema_version"]
+        == "issue827-qualification-closure-v1"
+        and qualification_manifest["qualified"] is True
+        and qualification_manifest["no_model_or_provider_calls"] is True
+        and qualification_manifest["archive_sha256"]
+        == QUALIFICATION_ARCHIVE_SHA256
+        and qualification_manifest["registered_files_sha256"]
+        == QUALIFIED_REGISTERED_FILES_SHA256,
+        "qualified predecessor closure identity drift",
+    )
+    for key in (
+        "external_inputs_sha256",
+        "runtime_identity_sha256",
+        "evidence_inventory_sha256",
+    ):
+        require(
+            isinstance(qualification_manifest[key], str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                qualification_manifest[key],
+            )
+            is not None,
+            f"qualification compatibility digest invalid: {key}",
+        )
+    require(
+        current_registration["qualification_closure"]["manifest_sha256"]
+        == qualified_registration["qualification_closure"]["manifest_sha256"]
+        == QUALIFICATION_MANIFEST_SHA256
+        and current_registration["qualification_closure"]["archive_sha256"]
+        == qualified_registration["qualification_closure"]["archive_sha256"]
+        == QUALIFICATION_ARCHIVE_SHA256,
+        "qualification closure registration lineage drift",
+    )
+    current_files = current_registration["registered_files"]
+    qualified_files = qualified_registration["registered_files"]
+    require(
+        sha_canonical(current_files) == CURRENT_REGISTERED_FILES_SHA256
+        and sha_canonical(qualified_files)
+        == QUALIFIED_REGISTERED_FILES_SHA256,
+        "qualification registered-file digest drift",
+    )
+    changed = sorted(
+        key
+        for key in set(current_files) | set(qualified_files)
+        if current_files.get(key) != qualified_files.get(key)
+    )
+    require(
+        changed == REGISTERED_FILE_DELTA_KEYS,
+        "qualification registered-file delta drift",
+    )
+    for field, manifest_key in (
+        ("model_runtime", "model_runtime_sha256"),
+        ("isolation_runtime", "isolation_runtime_sha256"),
+        ("rna_artifact", "rna_artifact_sha256"),
+    ):
+        require(
+            current_registration[field] == qualified_registration[field]
+            and sha_canonical(current_registration[field])
+            == qualification_manifest[manifest_key],
+            f"qualification compatibility changed {field}",
+        )
+
+
 def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
-    """Validate the formal v5 schedule and every newly registered source."""
+    """Validate the formal successor schedule and every registered source."""
 
     exact_keys(
         schedule,
@@ -304,6 +456,7 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
             "base_registration_sha256",
             "base_selection_sha256",
             "approved_assembler_sha256",
+            "qualification_compatibility",
             "registered_files",
             "case_count",
             "episode_count",
@@ -326,7 +479,9 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
         schedule["schema_version"] == SCHEDULE_SCHEMA
         and schedule["authoritative"] is True
         and schedule["protocol_change"]
-        == "execution_schedule_only_staged_one_or_two_case_waves"
+        == (
+            "staged_execution_plus_exact_v4_qualification_digest_compatibility"
+        )
         and schedule["base_source_commit"] == BASE_SOURCE_COMMIT
         and schedule["base_source_tree"] == BASE_SOURCE_TREE
         and isinstance(schedule["implementation_commit"], str)
@@ -366,6 +521,21 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
         schedule["approved_assembler_sha256"]
         == APPROVED_ASSEMBLER_SHA256,
         "execution schedule approved assembler drift",
+    )
+    require(
+        schedule["qualification_compatibility"]
+        == QUALIFICATION_COMPATIBILITY,
+        "execution schedule qualification compatibility drift",
+    )
+    qualified_registration_path = (
+        root.parents[2] / QUALIFIED_REGISTRATION_RELATIVE_PATH
+    )
+    require(
+        qualified_registration_path.is_file()
+        and not qualified_registration_path.is_symlink()
+        and sha_file(qualified_registration_path)
+        == QUALIFIED_REGISTRATION_SHA256,
+        "qualified predecessor registration drift",
     )
     registered = schedule["registered_files"]
     exact_keys(
@@ -431,7 +601,10 @@ def validate_selection_binding(
         binding["schema_version"] == SELECTION_BINDING_SCHEMA
         and binding["authoritative"] is True
         and binding["protocol_change"]
-        == "execution_schedule_only_no_cohort_or_arm_change"
+        == (
+            "execution_and_qualification_compatibility_only_"
+            "no_cohort_or_arm_change"
+        )
         and binding["schedule_sha256"] == schedule_sha256
         and isinstance(binding["schedule_commit"], str)
         and re.fullmatch(r"[0-9a-f]{40}", binding["schedule_commit"])
