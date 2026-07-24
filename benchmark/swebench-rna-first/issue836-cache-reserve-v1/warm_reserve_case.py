@@ -388,6 +388,18 @@ def prepare(source_rank: int, attempt: int, output_root: Path) -> None:
                 str(GIT),
                 "-C",
                 str(checkout),
+                "fetch",
+                "--depth=1",
+                "--no-tags",
+                str(bare_repo),
+                case["base_commit"],
+            ]
+        )
+        run_checked(
+            [
+                str(GIT),
+                "-C",
+                str(checkout),
                 "remote",
                 "set-url",
                 "origin",
