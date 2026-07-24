@@ -246,7 +246,7 @@ jobs:
         run: |
           OUTPUT=$(./target/release/repo-native-alignment search "hello" --repo .github/fixtures/smoke --limit 3 2>/dev/null)
           echo "$OUTPUT"
-          echo "$OUTPUT" | grep -q "Code symbols" || { echo "FAIL: search returned no results"; exit 1; }
+          echo "$OUTPUT" | grep -Eq '^- selected_records: [1-9][0-9]*$' || { echo "FAIL: search returned no results"; exit 1; }
 
       - name: CLI graph smoke test
         run: |
