@@ -392,11 +392,19 @@ def validate_episode_input(
                 for key in (
                     "input_tokens", "cache_creation_input_tokens",
                     "cache_read_input_tokens", "output_tokens",
-                    "provider_total_tokens", "reasoning_tokens", "cli_turns",
+                    "provider_total_tokens", "reasoning_tokens",
                     "provider_requests",
                 )
             ),
             "invalid token ledger must not invent provider counters",
+        )
+        require(
+            token_ledger.get("cli_turns") is None
+            or (
+                type(token_ledger["cli_turns"]) is int
+                and token_ledger["cli_turns"] >= 0
+            ),
+            "invalid token ledger CLI turn count malformed",
         )
         require(
             token_ledger.get("provider_responses") is None

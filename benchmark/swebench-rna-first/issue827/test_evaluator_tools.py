@@ -230,7 +230,7 @@ class Fixture:
                         "output_tokens": None,
                         "reasoning_tokens": None,
                         "provider_total_tokens": None,
-                        "cli_turns": None,
+                        "cli_turns": 1,
                     }
                 eligible = (
                     patch_ref is not None
@@ -493,6 +493,10 @@ class EvaluatorToolsTests(unittest.TestCase):
                 and item["episode"]["arm"] == "A"
             )
             self.assertEqual(episode["disposition"], "incomplete_evidence")
+            self.assertEqual(
+                episode["receipt"]["token_ledger"]["cli_turns"],
+                1,
+            )
             self.assertIsNone(
                 episode["episode"]["evaluator_authorization"]
             )
