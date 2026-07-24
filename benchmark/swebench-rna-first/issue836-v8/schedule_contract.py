@@ -77,6 +77,7 @@ PROTOCOL_CHANGE = (
     "plus_internal_tracked_symlink_support_"
     "plus_noncontaminating_observation_policy_"
     "plus_workspace_alias_mapping_"
+    "plus_three_case_parallelism_"
     "no_cohort_or_arm_order_change"
 )
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
@@ -321,7 +322,8 @@ def validate_predecessor_activity(
             "plus_trace_namespace_classification_repair_"
             "plus_internal_tracked_symlink_support_"
             "plus_noncontaminating_observation_policy_"
-            "plus_workspace_alias_mapping"
+            "plus_workspace_alias_mapping_"
+            "plus_three_case_parallelism"
         ),
         "predecessor activity semantics drift",
     )
@@ -340,6 +342,7 @@ def validate_predecessor_activity(
             "internal_tracked_symlink_support",
             "noncontaminating_observation_policy",
             "workspace_alias_and_native_hook_telemetry",
+            "three_case_trial_parallelism",
         ]
         and adaptations[0].get("applies_to_arms") == ["T"]
         and all(
@@ -391,8 +394,8 @@ def validate_predecessor_activity(
 
 def explicit_wave_ranks(value: Any) -> tuple[int, ...]:
     require(
-        isinstance(value, list) and 1 <= len(value) <= 2,
-        "a wave must explicitly select one or two ranks",
+        isinstance(value, list) and 1 <= len(value) <= 3,
+        "a wave must explicitly select one to three ranks",
     )
     require(
         all(type(rank) is int and 1 <= rank <= 20 for rank in value),
@@ -733,10 +736,10 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
         and schedule["episode_count"] == 40
         and schedule["per_episode_budget_usd"] == 6.0
         and schedule["maximum_budget_usd"] == 240.0
-        and schedule["max_cases_per_wave"] == 2
-        and schedule["max_episodes_per_wave"] == 4
+        and schedule["max_cases_per_wave"] == 3
+        and schedule["max_episodes_per_wave"] == 6
         and schedule["same_case_serialized"] is True
-        and schedule["different_cases_max_parallel"] == 2
+        and schedule["different_cases_max_parallel"] == 3
         and schedule["one_shot_per_rank"] is True
         and schedule["append_only_cumulative_ledger"] is True
         and schedule["evaluation_before_full_cohort_allowed"] is False,

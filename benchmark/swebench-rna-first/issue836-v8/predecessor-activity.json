@@ -90,6 +90,14 @@
         "T"
       ],
       "scope": "map the model-visible /workspace prefix to the exact episode checkout for native tools and retain structurally valid unresolved native-tool reservations after the exited CLI process as telemetry"
+    },
+    {
+      "type": "three_case_trial_parallelism",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "run up to three different cases concurrently after cache warming stops while keeping the two arms of every case serialized in their frozen order"
     }
   ],
   "cohort_reused_unchanged": true,
@@ -264,5 +272,5 @@
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair_plus_internal_tracked_symlink_support_plus_noncontaminating_observation_policy_plus_workspace_alias_mapping"
+  "protocol_change": "deterministic_issue_query_preconditioning_and_gateway_recovery_plus_trace_namespace_classification_repair_plus_internal_tracked_symlink_support_plus_noncontaminating_observation_policy_plus_workspace_alias_mapping_plus_three_case_parallelism"
 }

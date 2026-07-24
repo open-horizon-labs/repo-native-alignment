@@ -282,7 +282,7 @@ def _verify_wave_authorization_lineage(
         and manifest["execution_episode_keys"]
         == wave["authorized_episode_keys"]
         and manifest["same_case_serialized"] is True
-        and manifest["max_parallel_cases"] == min(2, len(requested))
+        and manifest["max_parallel_cases"] == min(3, len(requested))
         and manifest["per_episode_budget_usd"] == 6.0
         and manifest["wave_maximum_budget_usd"]
         == 12.0 * len(requested)
@@ -349,7 +349,7 @@ def _verify_wave_authorization_lineage(
         and start["models_authorized"] == 2 * len(requested)
         and start["maximum_budget_usd"] == 12.0 * len(requested)
         and start["same_case_serialized"] is True
-        and start["max_parallel_cases"] == min(2, len(requested))
+        and start["max_parallel_cases"] == min(3, len(requested))
         and start["official_evaluator_invoked"] is False,
         f"wave {batch_id} pre-call authorization start drift",
     )
