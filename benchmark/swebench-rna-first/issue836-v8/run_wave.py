@@ -175,6 +175,7 @@ def acquire_preconditioned_treatment(
     )
     system = (
         prefix
+        + b"\n"
         + title
         + b"\n\nRNA RESULT FOR THAT EXACT TITLE QUERY\n"
         + projection
@@ -183,7 +184,7 @@ def acquire_preconditioned_treatment(
     base.require(
         title
         and base.sha_bytes(title) == config["expected_query_sha256"]
-        and system.startswith(prefix + title)
+        and system.startswith(prefix + b"\n" + title)
         and system.count(projection) == 1
         and b"Your FIRST actual tool call" not in system
         and b"supervisor enforces" not in system,

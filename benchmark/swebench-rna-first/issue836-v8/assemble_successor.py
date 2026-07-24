@@ -147,6 +147,14 @@ def configure(base: Any, argv: Sequence[str]) -> None:
         )
     bridge_root = rolling_root(argv)
     base.ASSEMBLER = ADAPTER
+    # The immutable assembler was originally qualified in a different ordinary
+    # clone. Rebind only its source paths to this byte-identical pristine clone
+    # so Git identity and every registered file reference describe one tree.
+    base.SOURCE_CLONE = REPO
+    base.HARNESS = REPO / "benchmark/swebench-rna-first/issue827"
+    base.ISSUE836 = REPO / "benchmark/swebench-rna-first/issue836-v4"
+    base.REGISTRATION = base.ISSUE836 / "registration.json"
+    base.SELECTION = base.ISSUE836 / "selection.json"
     base.SOURCE_COMMIT = commit
     base.SOURCE_TREE = tree
     original_validate = base.validate_cache_envelope

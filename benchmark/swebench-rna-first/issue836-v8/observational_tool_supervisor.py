@@ -199,7 +199,7 @@ def handle(event: dict, config: dict) -> int:
             successful = (
                 name == "PostToolUse"
                 and receipt.get("status") == "success"
-                and current.get("first_traversal_succeeded") is True
+                and receipt.get("returncode") == 0
             )
             log(
                 config,

@@ -82,7 +82,7 @@ class PriorWaveSealTests(unittest.TestCase):
                     )
                 )
 
-        self.assertIn(b"EXACT ISSUE TITLE\nExact issue title", system)
+        self.assertIn(b"EXACT ISSUE TITLE\n\nExact issue title", system)
         self.assertIn(projection, system)
         self.assertNotIn(b"Your FIRST actual tool call", system)
         self.assertNotIn(b"supervisor enforces", system)

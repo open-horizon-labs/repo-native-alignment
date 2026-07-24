@@ -460,7 +460,7 @@ def assemble(
     )
     write_new(wave_path, wave)
     return {
-        "status": "READY_FOR_ZERO_SPEND_V7_PREFLIGHT",
+        "status": "READY_FOR_ZERO_SPEND_V8_PREFLIGHT",
         "wave_manifest": contract.file_ref(wave_path),
         "compatibility_manifest": contract.file_ref(compatibility_path),
         "envelope_binding": envelope_binding_ref,
