@@ -943,11 +943,10 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             "native_tool_state",
             errors,
         )
-        if native_tool_state != {
-            "schema_version": "issue827-native-tool-state-v1",
-            "active": {},
-        }:
-            errors.append("native_tool_state_not_quiescent")
+        try:
+            isolation.validate_native_tool_state(native_tool_state)
+        except isolation.IsolationViolation as exc:
+            errors.append(f"native_tool_state_invalid:{exc}")
         for index, ref in enumerate(supervisor.get("rna_events", [])):
             _, event = load_ref_json(ref, f"rna_event_{index}", errors)
             if isinstance(event, dict):

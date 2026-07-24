@@ -72,12 +72,16 @@ SECRET_ENV_PARTS = (
 NON_SECRET_ENV_NAMES = frozenset({"RNA_EMBEDDING_TOKENIZER_SHA256"})
 NATIVE_TOOLS = {"Read", "Edit", "Write", "Glob", "Grep"}
 WRITE_TOOLS = {"Edit", "Write"}
+NATIVE_TOOL_STATE_SCHEMA = "issue827-native-tool-state-v1"
 TRACE_TERMINAL_RE = re.compile(
     r"(?:^|\s)\+\+\+ (?:exited with [0-9]+|killed by [A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$"
 )
 TRACE_QUOTED_VALUE_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 TRACE_ABSOLUTE_PATH_RE = re.compile(r'"(/(?:[^"\\]|\\.)*)"')
 TRACE_TIMESTAMP_PREFIX = r"^(?:[0-9]+(?:\.[0-9]+)?\s+)?"
+TRACE_SYSCALL_RE = re.compile(
+    TRACE_TIMESTAMP_PREFIX + r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\("
+)
 TRACE_EXECVE_RE = re.compile(TRACE_TIMESTAMP_PREFIX + r"execve(?:at)?\(")
 TRACE_MISSING_SELINUX_STATFS_RE = re.compile(
     TRACE_TIMESTAMP_PREFIX
@@ -94,6 +98,49 @@ TRACE_INET_RE = re.compile(
 TRACE_LANDLOCK_SUCCESS_RE = re.compile(
     r"\blandlock_restrict_self\([^)]*\)\s*=\s*0(?:\s|$)"
 )
+TRACE_OPEN_WRITE_FLAG_RE = re.compile(
+    r"\b(?:O_WRONLY|O_RDWR|O_CREAT|O_EXCL|O_TRUNC|O_APPEND|O_TMPFILE)\b"
+)
+TRACE_MUTATING_PATH_SYSCALLS = frozenset(
+    {
+        "chmod",
+        "chown",
+        "creat",
+        "fchmodat",
+        "fchmodat2",
+        "fchownat",
+        "lchown",
+        "link",
+        "linkat",
+        "lremovexattr",
+        "lsetxattr",
+        "mkdir",
+        "mkdirat",
+        "mknod",
+        "mknodat",
+        "mount",
+        "move_mount",
+        "open_tree",
+        "pivot_root",
+        "removexattr",
+        "rename",
+        "renameat",
+        "renameat2",
+        "rmdir",
+        "setxattr",
+        "symlink",
+        "symlinkat",
+        "truncate",
+        "umount",
+        "umount2",
+        "unlink",
+        "unlinkat",
+        "utime",
+        "utimensat",
+        "utimes",
+    }
+)
+TRACE_EXECUTION_PATH_SYSCALLS = frozenset({"execve", "execveat"})
 
 
 def canonical(value: object) -> bytes:
@@ -113,6 +160,63 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_native_tool_state(value: object) -> int:
+    """Validate hook bookkeeping and return unresolved reservation count.
+
+    Reservations serialize native tools only while the model process is
+    alive. Once that process exits, valid unresolved entries record omitted
+    completion hooks; they do not represent active work or contamination.
+    """
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "active"}
+        or value.get("schema_version") != NATIVE_TOOL_STATE_SCHEMA
+        or not isinstance(value.get("active"), dict)
+    ):
+        raise IsolationViolation("native_tool_state_schema_mismatch")
+    active = value["active"]
+    for tool_use_id, item in active.items():
+        if (
+            not isinstance(tool_use_id, str)
+            or not tool_use_id
+            or not isinstance(item, dict)
+            or set(item) != {"tool_name", "access", "post_pending"}
+            or item.get("tool_name") not in NATIVE_TOOLS
+            or item.get("access")
+            != (
+                "exclusive"
+                if item.get("tool_name") in WRITE_TOOLS
+                else "read"
+            )
+            or type(item.get("post_pending")) is not bool
+        ):
+            raise IsolationViolation("native_tool_state_entry_invalid")
+    return len(active)
+
+
+def trace_path_effect(line: str) -> str:
+    """Classify a path-bearing syscall as read, write, execute, or unknown."""
+
+    matched = TRACE_SYSCALL_RE.match(line)
+    if matched is None:
+        return "unknown"
+    syscall = matched.group("name")
+    if syscall in {"open", "openat", "openat2"}:
+        first_value = TRACE_QUOTED_VALUE_RE.search(line)
+        flag_region = line[first_value.end() :] if first_value else line
+        return (
+            "write"
+            if TRACE_OPEN_WRITE_FLAG_RE.search(flag_region)
+            else "read"
+        )
+    if syscall in TRACE_MUTATING_PATH_SYSCALLS:
+        return "write"
+    if syscall in TRACE_EXECUTION_PATH_SYSCALLS:
+        return "execute"
+    return "read"
 
 
 def is_secret_env_name(name: object) -> bool:
@@ -882,7 +986,7 @@ def parse_strace_directory(
     allowed_path_prefixes: Sequence[str],
     forbidden_path_fragments: Sequence[str],
 ) -> dict[str, object]:
-    """Parse mandatory ``strace -ff`` outputs and retain denied attempts."""
+    """Parse mandatory ``strace -ff`` outputs and classify path effects."""
 
     if trace_directory.is_symlink() or not trace_directory.is_dir():
         raise IsolationViolation("trace_directory_invalid")
@@ -976,6 +1080,7 @@ def parse_strace_directory(
                 line
             )
             blocked_result = TRACE_BLOCKED_RESULT_RE.search(line) is not None
+            path_effect = trace_path_effect(line)
             for encoded_path in encoded_paths:
                 attempted = encoded_path.replace(r"\/", "/")
                 if (
@@ -1007,13 +1112,26 @@ def parse_strace_directory(
                     or attempted.startswith(prefix.rstrip("/") + "/")
                     for prefix in allowed
                 ):
-                    destination = observations if blocked_result else violations
+                    nonfatal = blocked_result or path_effect == "read"
+                    destination = observations if nonfatal else violations
                     destination.append(
                         {
                             "code": (
                                 "blocked_undeclared_path_attempt"
                                 if blocked_result
-                                else "undeclared_path_access"
+                                else (
+                                    "undeclared_read_observed"
+                                    if path_effect == "read"
+                                    else (
+                                        "undeclared_path_write"
+                                        if path_effect == "write"
+                                        else (
+                                            "undeclared_path_execution"
+                                            if path_effect == "execute"
+                                            else "undeclared_path_access"
+                                        )
+                                    )
+                                )
                             ),
                             "trace": path.name,
                             "line": line_number,

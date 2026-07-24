@@ -45,6 +45,7 @@ from isolation import (
     parse_strace_directory,
     sha256_bytes,
     validate_effective_path,
+    validate_native_tool_state,
     validate_trusted_rna_root_separation,
     verify_event_chain,
 )
@@ -93,6 +94,25 @@ class SecretEnvironmentNameTests(unittest.TestCase):
         for name in allowed:
             with self.subTest(name=name):
                 self.assertFalse(is_secret_env_name(name))
+
+    def test_unresolved_valid_native_tool_state_is_telemetry(self):
+        state = {
+            "schema_version": "issue827-native-tool-state-v1",
+            "active": {
+                "tool-use": {
+                    "tool_name": "Edit",
+                    "access": "exclusive",
+                    "post_pending": False,
+                }
+            },
+        }
+        self.assertEqual(validate_native_tool_state(state), 1)
+        state["active"]["tool-use"]["access"] = "read"
+        with self.assertRaises(IsolationViolation) as raised:
+            validate_native_tool_state(state)
+        self.assertEqual(
+            raised.exception.code, "native_tool_state_entry_invalid"
+        )
 
     def test_canonical_trusted_environment_accepts_tokenizer_digest(self):
         trusted_env = {
@@ -483,7 +503,7 @@ class WorkerContractTests(unittest.TestCase):
                 },
             )
 
-    def test_trace_checkout_alias_is_allowed_but_other_host_path_is_not(self):
+    def test_trace_checkout_alias_suppresses_read_observation(self):
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary)
             trace_member = trace / "trace.1"
@@ -492,14 +512,15 @@ class WorkerContractTests(unittest.TestCase):
                 '1700.0 statx(AT_FDCWD, "/host/editable", 0, 0, {}) = 0\n'
                 "1700.1 +++ exited with 0 +++\n"
             )
-            denied = parse_strace_directory(
+            observed = parse_strace_directory(
                 trace,
                 allowed_path_prefixes=["/workspace"],
                 forbidden_path_fragments=[],
             )
+            self.assertEqual(observed["violations"], [])
             self.assertEqual(
-                [item["code"] for item in denied["violations"]],
-                ["undeclared_path_access"],
+                [item["code"] for item in observed["observations"]],
+                ["undeclared_read_observed"],
             )
             allowed = parse_strace_directory(
                 trace,
@@ -507,6 +528,33 @@ class WorkerContractTests(unittest.TestCase):
                 forbidden_path_fragments=[],
             )
             self.assertEqual(allowed["violations"], [])
+            self.assertEqual(allowed["observations"], [])
+
+    def test_trace_immutable_metadata_reads_are_nonfatal_but_writes_are_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary)
+            (trace / "trace.1").write_text(
+                "1699.9 landlock_restrict_self(3, 0) = 0\n"
+                '1700.0 newfstatat(AT_FDCWD, "/var/lib/dpkg/status", {}, 0) = 0\n'
+                '1700.1 openat(AT_FDCWD, "/var/lib/dpkg/status", O_RDONLY) = 3\n'
+                '1700.2 openat(AT_FDCWD, "/outside/O_WRONLY-name", O_RDONLY) = 4\n'
+                '1700.3 openat(AT_FDCWD, "/outside/write", O_WRONLY|O_CREAT, 0600) = 5\n'
+                '1700.4 rename("/workspace/source", "/outside/moved") = 0\n'
+                "1700.5 +++ exited with 0 +++\n"
+            )
+            report = parse_strace_directory(
+                trace,
+                allowed_path_prefixes=["/workspace"],
+                forbidden_path_fragments=[],
+            )
+            self.assertEqual(
+                {item["code"] for item in report["observations"]},
+                {"undeclared_read_observed"},
+            )
+            self.assertEqual(
+                {item["code"] for item in report["violations"]},
+                {"undeclared_path_write"},
+            )
 
     def test_trace_retains_blocked_undeclared_path_as_nonfatal_telemetry(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -543,7 +591,7 @@ class WorkerContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 {item["code"] for item in report["violations"]},
-                {"undeclared_path_access", "forbidden_path_access"},
+                {"undeclared_path_write", "forbidden_path_access"},
             )
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary)
@@ -1057,8 +1105,35 @@ class RequestAndSettingsTests(unittest.TestCase):
             self.assertEqual(decision["permissionDecision"], "allow")
             self.assertIn(str(gateway), decision["updatedInput"]["command"])
             self.assertNotIn("printf ok", decision["updatedInput"]["command"])
-            event["tool_input"]["run_in_background"] = True
-            event["tool_use_id"] = "tool2"
+            (checkout / "target.py").write_text("pass\n")
+            event.update(
+                {
+                    "tool_use_id": "native-tool",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/workspace/target.py"},
+                }
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                common_supervisor.handle(event, config)
+            native_decision = json.loads(
+                output.getvalue()
+            )["hookSpecificOutput"]
+            self.assertEqual(
+                native_decision["updatedInput"]["file_path"],
+                str(checkout / "target.py"),
+            )
+            event.update(
+                {
+                    "tool_use_id": "tool2",
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "printf ok",
+                        "timeout": 20,
+                        "run_in_background": True,
+                    },
+                }
+            )
             output = io.StringIO()
             with redirect_stdout(output):
                 common_supervisor.handle(event, config)
