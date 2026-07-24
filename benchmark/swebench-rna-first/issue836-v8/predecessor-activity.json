@@ -1,0 +1,89 @@
+{
+  "schema_version": "issue836-predecessor-activity-v2",
+  "activity": {
+    "infrastructure_terminated_provider_episodes": 2,
+    "local_cli_process_starts": 4,
+    "model_invoked_receipts": 4,
+    "official_evaluator_invocations": 0,
+    "provider_cost_usd": 0.228589,
+    "provider_exposed_episodes": 2,
+    "provider_usage_tokens": 38478,
+    "stale_auth_episode_starts": 2,
+    "terminal_patches": 0
+  },
+  "adaptations": [
+    {
+      "type": "preconditioned_treatment_restoration",
+      "applies_to_arms": [
+        "T"
+      ],
+      "scope": "inject the exact issue title and its precomputed RNA exact-title result; observe subsequent tool calls without requiring RNA or a particular first tool"
+    },
+    {
+      "type": "trusted_gateway_access_restoration",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "make the pinned Docker client readable and its forwarded Unix socket reachable by the common single-use Bash gateway"
+    }
+  ],
+  "cohort_reused_unchanged": true,
+  "earlier_predecessor_ledger": {
+    "path": "/Users/muness/swebench-evidence/issue829-readiness-fix.IYiMyx/source/benchmark/swebench-rna-first/issue836-v7/predecessor-activity.json",
+    "bytes": 2400,
+    "sha256": "5bd3ed6ecec466fa126184e14b0d873bb80a49286f5e96b0ed287cedae1f9882"
+  },
+  "evaluator_or_outcomes_inspected": false,
+  "new_session_ids_required": true,
+  "predecessor_attempts": [
+    {
+      "classification": "stale_auth_zero_provider",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-successor/v7-invocation-start.json",
+        "bytes": 2257,
+        "sha256": "cac12b7917c14f1e42a3c15d55a37bbf344f29b85ee124d5763560fbf651149a"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-successor/waves/wave-001-rank-01/wave-receipt.json",
+        "bytes": 2481,
+        "sha256": "1f98fb1cd7e9646de894e222ad8fa9d7bd8b7c3666d956f7216d5d849e16a03b"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-successor/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+        "bytes": 10854,
+        "sha256": "86013c05eae4e6064c1ee07667649c403ec3ae3a51845198b07a94e36c901b59"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-successor/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+        "bytes": 22764,
+        "sha256": "59ffc8b9e751c9bb2a7c3593f28df3ef411eb11f82ed499ff22f0dc3fa5c9131"
+      }
+    },
+    {
+      "classification": "provider_exposed_supervisor_termination",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-auth-successor/v7-invocation-start.json",
+        "bytes": 2267,
+        "sha256": "d24027b4cb9635b5bec82a552faaa7e6dfce980f885af887208dab7f95c2fbf1"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-auth-successor/waves/wave-001-rank-01/wave-receipt.json",
+        "bytes": 2506,
+        "sha256": "4c5f4ae5184517af6f7fa45cdb93f492afef32c8173295b0f7596d8954bb7192"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-auth-successor/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+        "bytes": 14464,
+        "sha256": "64ea7d8c4b7c2a4ddfc485f26abac85d8869226430aedc0c7056152a5c664f29"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v7-auth-successor/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+        "bytes": 25485,
+        "sha256": "fa794fbd0dfc14f7564fdfb560a5c7ca2083de0af866363df2bfa8eb81c2ec43"
+      }
+    }
+  ],
+  "predecessor_superseded": true,
+  "protocol_change": "restore_title_query_preconditioning_without_behavioral_gate"
+}
