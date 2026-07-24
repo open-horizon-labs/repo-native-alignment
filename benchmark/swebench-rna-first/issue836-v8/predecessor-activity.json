@@ -1,13 +1,13 @@
 {
-  "schema_version": "issue836-predecessor-activity-v2",
+  "schema_version": "issue836-predecessor-activity-v3",
   "activity": {
-    "infrastructure_terminated_provider_episodes": 2,
-    "local_cli_process_starts": 4,
-    "model_invoked_receipts": 4,
+    "infrastructure_invalidated_provider_episodes": 4,
+    "local_cli_process_starts": 6,
+    "model_invoked_receipts": 6,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.228589,
-    "provider_exposed_episodes": 2,
-    "provider_usage_tokens": 38478,
+    "provider_cost_usd": 0.4538073,
+    "provider_exposed_episodes": 4,
+    "provider_usage_tokens": 244712,
     "stale_auth_episode_starts": 2,
     "terminal_patches": 0
   },
@@ -26,6 +26,22 @@
         "T"
       ],
       "scope": "make the pinned Docker client readable and its forwarded Unix socket reachable by the common single-use Bash gateway"
+    },
+    {
+      "type": "native_tool_parallelism_restoration",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "allow Sonnet native tool calls from one assistant turn to overlap after each path is independently validated"
+    },
+    {
+      "type": "authoritative_model_usage_reporting",
+      "applies_to_arms": [
+        "A",
+        "T"
+      ],
+      "scope": "count provider tokens from Claude CLI whole-invocation modelUsage totals while retaining transcript response counts separately"
     }
   ],
   "cohort_reused_unchanged": true,
@@ -82,8 +98,31 @@
         "bytes": 25485,
         "sha256": "fa794fbd0dfc14f7564fdfb560a5c7ca2083de0af866363df2bfa8eb81c2ec43"
       }
+    },
+    {
+      "classification": "provider_exposed_native_tool_overlap",
+      "invocation_start": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-preconditioned-successor/v8-invocation-start.json",
+        "bytes": 2275,
+        "sha256": "1254bcaf57de9c6c671e8bdd51140a3b5864d4d9f3ea500b0508ac86f2c64fc2"
+      },
+      "wave_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-preconditioned-successor/waves/wave-001-rank-01/wave-receipt.json",
+        "bytes": 2554,
+        "sha256": "8698cbf6d329b55a2b3ec3f8d3bfbf6472fbd3bd492d3b1c9fd9e867b7b12509"
+      },
+      "a_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-preconditioned-successor/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+        "bytes": 13727,
+        "sha256": "4223a37c3a55b492ce056836fdb52931e3d63de089ae410f69801f2f029393d3"
+      },
+      "t_episode_receipt": {
+        "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/paid-run-v8-preconditioned-successor/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+        "bytes": 26035,
+        "sha256": "bf44064ae1ff8c909931f32206a1522e69c4aea879a19b7d1261428b606a8e50"
+      }
     }
   ],
   "predecessor_superseded": true,
-  "protocol_change": "restore_title_query_preconditioning_without_behavioral_gate"
+  "protocol_change": "restore_preconditioning_and_remove_nonexperimental_tool_serialization"
 }

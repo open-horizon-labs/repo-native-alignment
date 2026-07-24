@@ -82,7 +82,7 @@ def build(schedule_commit: str) -> dict:
         "authoritative": True,
         "protocol_change": (
             "preconditioned_treatment_and_gateway_recovery_"
-            "no_cohort_or_arm_order_change"
+            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
         ),
         "schedule_sha256": contract.sha_file(schedule_path),
         "schedule_commit": commit,

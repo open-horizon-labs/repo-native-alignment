@@ -95,6 +95,52 @@ _ORIGINAL_MATERIALIZE_HARNESS = base.materialize_harness
 _ORIGINAL_ACQUIRE_TREATMENT = base.acquire_treatment
 _ORIGINAL_TREATMENT_COMPLIANCE = base.treatment_compliance
 _ORIGINAL_BUILD_ACTOR_TOOL_LEDGER = base.build_actor_tool_ledger
+_ORIGINAL_TOKEN_LEDGER = base.token_ledger
+
+_NATIVE_TOOL_SERIALIZATION_BLOCK = b"""            if any(
+                isinstance(item, dict) and item.get("post_pending") is True
+                for item in active.values()
+            ):
+                raise GuardFailure("native_tool_post_unresolved")
+            access = (
+                "read" if tool_name in NATIVE_READ_TOOLS else "exclusive"
+            )
+            if active and (
+                access == "exclusive"
+                or any(
+                    isinstance(item, dict)
+                    and item.get("access") == "exclusive"
+                    for item in active.values()
+                )
+            ):
+                raise GuardFailure("native_tool_rw_overlap")
+"""
+_NATIVE_TOOL_CONCURRENCY_BLOCK = b"""            # Sonnet may issue independent native tools in one assistant turn.
+            # Each path remains validated by the common child hook; overlapping
+            # lifecycle events are telemetry, not an experimental intervention.
+            access = (
+                "read" if tool_name in NATIVE_READ_TOOLS else "exclusive"
+            )
+"""
+
+
+def allow_parallel_native_tools(source: bytes) -> bytes:
+    """Remove only the non-experimental native-tool serialization gate."""
+
+    base.require(
+        source.count(_NATIVE_TOOL_SERIALIZATION_BLOCK) == 1,
+        "native tool guard transformation source drift",
+    )
+    transformed = source.replace(
+        _NATIVE_TOOL_SERIALIZATION_BLOCK,
+        _NATIVE_TOOL_CONCURRENCY_BLOCK,
+    )
+    base.require(
+        b'native_tool_rw_overlap' not in transformed
+        and b'native_tool_post_unresolved' not in transformed,
+        "native tool guard transformation incomplete",
+    )
+    return transformed
 
 
 def verify_isolation_host_with_gateway_read_access(
@@ -139,11 +185,31 @@ def materialize_observational_harness(
         "observational supervisor materialization failed",
     )
 
+    guard_source = BASE / "hook_guard.py"
+    guard_destination = paths["hook_guard.py"]
+    patched_guard = allow_parallel_native_tools(
+        guard_destination.read_bytes()
+    )
+    guard_destination.chmod(0o755)
+    guard_destination.write_bytes(patched_guard)
+    guard_destination.chmod(0o555)
+    base.require(
+        guard_destination.stat().st_nlink == 1
+        and guard_destination.read_bytes() == patched_guard,
+        "parallel native tool guard materialization failed",
+    )
+
     manifest_path = paths["materialization"]
     manifest = base.read_json(manifest_path)
     manifest["files"]["tool_supervisor.py"] = {
         "source_sha256": base.sha_file(source),
         "destination": base.file_ref(destination),
+        "mode": "0555",
+        "link_count": 1,
+    }
+    manifest["files"]["hook_guard.py"] = {
+        "source_sha256": base.sha_file(guard_source),
+        "destination": base.file_ref(guard_destination),
         "mode": "0555",
         "link_count": 1,
     }
@@ -305,11 +371,32 @@ def build_observational_actor_tool_ledger(
     return ledger
 
 
+def authoritative_token_ledger(
+    raw_result: Mapping[str, Any],
+    *,
+    model_invoked: bool = True,
+    model_events: Sequence[Mapping[str, Any]] | None = None,
+    provider_responses: int | None = None,
+    provider_requests: int | None = None,
+) -> dict[str, Any]:
+    """Use Claude's whole-invocation modelUsage totals for token accounting."""
+
+    del model_events
+    return _ORIGINAL_TOKEN_LEDGER(
+        raw_result,
+        model_invoked=model_invoked,
+        model_events=None,
+        provider_responses=provider_responses,
+        provider_requests=provider_requests,
+    )
+
+
 base.verify_isolation_host = verify_isolation_host_with_gateway_read_access
 base.materialize_harness = materialize_observational_harness
 base.acquire_treatment = acquire_preconditioned_treatment
 base.treatment_compliance = preconditioned_treatment_compliance
 base.build_actor_tool_ledger = build_observational_actor_tool_ledger
+base.token_ledger = authoritative_token_ledger
 
 
 MANIFEST_KEYS = {

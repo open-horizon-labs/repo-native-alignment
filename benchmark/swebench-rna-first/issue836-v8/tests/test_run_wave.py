@@ -220,6 +220,67 @@ class PriorWaveSealTests(unittest.TestCase):
             ["/existing", str(docker.parent)],
         )
 
+    def test_native_tool_guard_allows_parallel_tools_but_still_compiles(
+        self,
+    ) -> None:
+        source = (
+            ROOT.parent / "issue827" / "hook_guard.py"
+        ).read_bytes()
+        transformed = run_wave.allow_parallel_native_tools(source)
+
+        self.assertNotIn(b"native_tool_rw_overlap", transformed)
+        self.assertNotIn(b"native_tool_post_unresolved", transformed)
+        self.assertIn(b"native_tool_duplicate_pre", transformed)
+        self.assertIn(b"native_tool_post_without_matching_pre", transformed)
+        compile(transformed, "patched-hook-guard.py", "exec")
+
+    def test_materialized_harness_contains_observer_and_parallel_guard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case_root = Path(directory).resolve()
+            paths = run_wave.materialize_observational_harness(
+                case_root,
+                "T",
+            )
+            manifest = json.loads(paths["materialization"].read_bytes())
+            observer_bytes = paths["tool_supervisor.py"].read_bytes()
+            guard_bytes = paths["hook_guard.py"].read_bytes()
+
+        self.assertEqual(
+            observer_bytes,
+            (ROOT / "observational_tool_supervisor.py").read_bytes(),
+        )
+        self.assertNotIn(b"native_tool_rw_overlap", guard_bytes)
+        self.assertNotIn(b"native_tool_post_unresolved", guard_bytes)
+        self.assertEqual(
+            manifest["files"]["hook_guard.py"]["destination"]["sha256"],
+            run_wave.base.sha_bytes(guard_bytes),
+        )
+
+    def test_token_reporting_uses_whole_invocation_model_usage(self) -> None:
+        sentinel = {"valid": True}
+        with mock.patch.object(
+            run_wave,
+            "_ORIGINAL_TOKEN_LEDGER",
+            return_value=sentinel,
+        ) as original:
+            result = run_wave.authoritative_token_ledger(
+                {"modelUsage": {}},
+                model_events=[{"message_id": "observational"}],
+                provider_responses=3,
+                provider_requests=None,
+            )
+
+        self.assertIs(result, sentinel)
+        original.assert_called_once_with(
+            {"modelUsage": {}},
+            model_invoked=True,
+            model_events=None,
+            provider_responses=3,
+            provider_requests=None,
+        )
+
     def test_adapter_and_runner_manifest_interfaces_are_exact(self) -> None:
         self.assertEqual(
             assemble_wave.WAVE_MANIFEST_KEYS,

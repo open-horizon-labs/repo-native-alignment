@@ -104,7 +104,7 @@ def build(implementation_commit: str) -> dict:
         "authoritative": True,
         "protocol_change": (
             "restore_title_query_preconditioning_and_trusted_gateway_access_"
-            "no_cohort_or_arm_order_change"
+            "plus_native_tool_parallelism_no_cohort_or_arm_order_change"
         ),
         "base_source_commit": contract.BASE_SOURCE_COMMIT,
         "base_source_tree": contract.BASE_SOURCE_TREE,
