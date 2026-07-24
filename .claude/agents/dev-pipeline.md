@@ -70,5 +70,6 @@ Ship posts each step's findings as PR comments — that's the auditable quality 
 ## Rules
 
 - **No waiting** between phases — gate passes, next phase starts.
+- **No redundant Rust CI** — if the diff since the last successful artifact changes neither Rust CI nor Rust artifact inputs, reuse that artifact and do not dispatch or wait for Rust build/test/lint/audit/artifact jobs. Run exact-head checks only for the changed non-Rust surfaces. Follow `.oh/guardrails/ci-artifacts-for-release-builds.md`.
 - **Stop and ask** only for: unclear acceptance criteria, SALVAGE verdict, CI fails after 2 fix attempts.
 - **RNA tools for code nav**, not Grep/Read. Log friction when you fall back.

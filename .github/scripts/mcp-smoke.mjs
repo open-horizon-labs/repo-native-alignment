@@ -370,12 +370,6 @@ try {
     assertContains("search returns code symbol entry", searchSymText, "main");
     pass("search('main') returned results");
   }
-  assertContains(
-    "MCP search delivers per-file LSP completeness readiness",
-    searchSymText,
-    "benchmark per-file LSP completeness",
-  );
-
   // ── 4a. projected search contract ───────────────────────────────────────
   console.log("\n── search (agent/evidence projections) ──");
   const agentProjectionText = await callSearchWithRetry({
@@ -698,6 +692,7 @@ try {
     mode: "neighbors",
     depth: 2,
     compact: true,
+    verbose: true,
     include_artifacts: false,
     include_markdown: false,
     top_k: 1,
@@ -711,6 +706,11 @@ try {
     // The fixture may have no neighbors for "main", which produces a "No neighbors" message.
     pass("search depth=2 parameter honored through MCP protocol");
   }
+  assertContains(
+    "MCP search delivers per-file LSP completeness readiness",
+    depthSearchText,
+    "benchmark per-file LSP completeness",
+  );
 
   // ── 8. negative test: unknown tool ──────────────────────────────────────
   console.log("\n── unknown tool (negative test) ──");

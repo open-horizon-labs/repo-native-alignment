@@ -1,0 +1,103 @@
+{
+  "cases": [
+    {
+      "arm_order": [
+        "A",
+        "T"
+      ],
+      "base_commit": "832c24fec1046eaa544a4cab4c69e3af3e651759",
+      "base_tree": "1ff23de82d74c15a3809c4b9caa40549135113c3",
+      "instance_id": "sympy__sympy-23534"
+    },
+    {
+      "arm_order": [
+        "T",
+        "A"
+      ],
+      "base_commit": "19fc6376ce67d01ca37a91ef2f55ef769f50513a",
+      "base_tree": "a40bb59e08bec7f9c6358d078a7e3157760b7993",
+      "instance_id": "django__django-11179"
+    }
+  ],
+  "cases_carried_forward_without_rerandomization": true,
+  "classification": "post_selection_pre_outcome_artifact_successor",
+  "issue": 830,
+  "original_registration": {
+    "commit": "23f48b8f418af5894ad759db7066d857ea980b5b",
+    "issue": 827,
+    "sha256": "b7e8f0b9e7e02ca24b187dbff5ec35b0c0788892e4949e2884efb214e4c7c803"
+  },
+  "original_selection": {
+    "commit": "ab3fc2c5c1ad048adcc97c508df43cd3634de522",
+    "digest": "991fda825b69d7dc023df3c8605c7b5064abb7146b486ca57a7a0f35dc8769b2",
+    "fresh_case_claim_scope": "original_issue827_selection_event_only",
+    "issue": 827,
+    "sha256": "9d2b75d9af8787882fadabb792cd3018686caade7af004f6aae80aa4dee82fbd"
+  },
+  "prior_activity": {
+    "credentials_accessed": false,
+    "model_calls": 0,
+    "official_evaluator_invocations": 0,
+    "provider_requests": 0
+  },
+  "producer_correction": {
+    "artifact_identity_change_reason": "The registered issue #827 artifact could not satisfy fail-closed readiness on the already-selected SymPy tree; issue #829 corrected the general Markdown capability, recovery attribution, and Dockerfile routing defects.",
+    "exact_ci_producer_commit": "13c74539441adeef1ffd7d68b413ff148203f21c",
+    "merge_commit": "bd9e922642b2d95d6ecd71e9fda4ecaf6a79b626",
+    "owning_issue": 829,
+    "pull_request": 831
+  },
+  "published_before_evaluator": true,
+  "published_before_model": true,
+  "retained_no_spend_failure": {
+    "completeness_report_sha256": "76f632d71dfec55a904137c23ea506f1614eac2164f89966a279a50be946e07a",
+    "credentials_accessed": false,
+    "failure_summary_sha256": "e770ad2a3481425b035c12883996515e645e567b7b731edf8823719db288a668",
+    "model_calls": 0,
+    "official_evaluator_invocations": 0,
+    "provider_requests": 0
+  },
+  "retained_pre_model_attempts": [
+    {
+      "authorization_requests": 0,
+      "credential_worker_invocations": 0,
+      "episode_receipts": 0,
+      "failure_codes": [
+        "trusted RNA canonical environment contract invalid",
+        "private_tree_contains_symlink"
+      ],
+      "invocation_result_sha256": "811418802aa634d361ccc74c9af26f2e008a87904914f05c75c553e771bae7c0",
+      "invocation_start_sha256": "24a908fa91ebac510ef84129bfc5b9ccd9232a904d150bc797fef99d375b4d5e",
+      "model_processes_started": 0,
+      "official_evaluator_invocations": 0,
+      "provider_requests": 0,
+      "run_manifest_sha256": "6753cc3f0b2c1b153df80955d517fe0801bbc8a3d5cc71e572b40dfaa2404fac"
+    },
+    {
+      "authorization_requests": 0,
+      "credential_worker_invocations": 0,
+      "episode_receipt_sha256": "e8a2bbf3767d84c6dbf58fb7851aa86cfb91372425d4528783e388f305186f33",
+      "episode_receipts": 1,
+      "failure_codes": [
+        "trusted RNA broker exited before ready: 1",
+        "ModuleNotFoundError: No module named 'live_identity'"
+      ],
+      "invocation_result_sha256": "66dea20ee76ed72cf6462afb9bd055465fef1b928e4d28d4030fd159f6a6589c",
+      "invocation_start_sha256": "c60de68cfe6039627e1afedc8b84c99227aa6489bb4a2e74e43c41dc3cda2d9a",
+      "model_processes_started": 0,
+      "official_evaluator_invocations": 0,
+      "provider_requests": 0,
+      "run_manifest_sha256": "30bcfda77be360fb3fcbc7a77cf6e40dd42e0cb3852f90bb09fd5af6cee875cf"
+    }
+  ],
+  "runtime_authorization": {
+    "episode_budget_usd": 6.0,
+    "episode_count": 4,
+    "maximum_budget_usd": 24.0,
+    "model_retry_allowed": false,
+    "resume_allowed": false,
+    "wall_seconds": 1200
+  },
+  "schema_version": "issue830-successor-lineage-v3",
+  "supersedes_issue": 827
+}

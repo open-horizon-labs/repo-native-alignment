@@ -1,0 +1,160 @@
+{
+  "schema_version": "issue827-official-evaluator-plan-v1",
+  "registration": {
+    "path": "__ABSOLUTE_REGISTRATION_JSON__",
+    "bytes": 0,
+    "sha256": "__REGISTRATION_SHA256__"
+  },
+  "selection": {
+    "path": "__ABSOLUTE_SELECTION_JSON__",
+    "bytes": 0,
+    "sha256": "__SELECTION_SHA256__"
+  },
+  "evidence_root": "__ABSOLUTE_ISSUE827_EVIDENCE_ROOT__",
+  "model_output_root": "__ABSOLUTE_EPISODE_OUTPUT_ROOT__",
+  "output_root": "__ABSOLUTE_TERMINAL_EVALUATION_ROOT__",
+  "registry_root": "__ABSOLUTE_IRREVOCABLE_REGISTRY_ROOT__",
+  "max_parallel": 2,
+  "evaluator_wall_seconds": 3600,
+  "evaluator": {
+    "python": "__ABSOLUTE_EVALUATOR_PYTHON__",
+    "python_realpath": "__ABSOLUTE_EVALUATOR_PYTHON_REALPATH__",
+    "python_sha256": "__EVALUATOR_PYTHON_SHA256__",
+    "swebench_version": "4.1.0",
+    "swebench_record": "__ABSOLUTE_SWEBENCH_RECORD__",
+    "swebench_record_sha256": "__SWEBENCH_RECORD_SHA256__",
+    "run_evaluation": "__ABSOLUTE_OFFICIAL_RUN_EVALUATION_PY__",
+    "run_evaluation_sha256": "__OFFICIAL_RUN_EVALUATION_SHA256__",
+    "distribution_lock_sha256": "__EVALUATOR_DISTRIBUTION_LOCK_SHA256__",
+    "dataset_name": "princeton-nlp/SWE-bench_Verified",
+    "dataset_split": "test",
+    "dataset_cache_root": "__ABSOLUTE_FROZEN_DATASET_CACHE_ROOT__",
+    "dataset_arrow": "__ABSOLUTE_FROZEN_TEST_ARROW__",
+    "dataset_arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e",
+    "dataset_info": "__ABSOLUTE_FROZEN_DATASET_INFO__",
+    "dataset_info_sha256": "__FROZEN_DATASET_INFO_SHA256__",
+    "docker_server": "__DOCKER_SERVER_VERSION_GITCOMMIT_OS_ARCH__"
+  },
+  "episodes": [
+    {
+      "case_id": "__RANK_1_INSTANCE_ID__",
+      "rank": 1,
+      "arm": "A",
+      "base_commit": "__RANK_1_BASE_COMMIT__",
+      "base_tree": "__RANK_1_BASE_TREE__",
+      "episode_receipt": {
+        "path": "__ABSOLUTE_RANK_1_A_EPISODE_RECEIPT__",
+        "bytes": 0,
+        "sha256": "__RANK_1_A_EPISODE_RECEIPT_SHA256__"
+      },
+      "episode_verification": {
+        "path": "__ABSOLUTE_RANK_1_A_EPISODE_VERIFICATION__",
+        "bytes": 0,
+        "sha256": "__RANK_1_A_EPISODE_VERIFICATION_SHA256__"
+      },
+      "evaluator_authorization": {
+        "path": "__ABSOLUTE_RANK_1_A_EVALUATOR_AUTHORIZATION__",
+        "bytes": 0,
+        "sha256": "__RANK_1_A_EVALUATOR_AUTHORIZATION_SHA256__"
+      },
+      "model_name_or_path": "claude-sonnet-5-A",
+      "run_id": "issue827-rank1-A",
+      "official_image": "swebench/sweb.eval.x86_64.__RANK_1_IMAGE_KEY__:__RANK_1_IMAGE_TAG__",
+      "official_image_source": "docker.io/swebench/sweb.eval.x86_64.__RANK_1_IMAGE_KEY__:latest",
+      "official_image_manifest_digest": "sha256:__RANK_1_IMAGE_MANIFEST_SHA256__",
+      "official_image_config_id": "sha256:__RANK_1_IMAGE_CONFIG_SHA256__",
+      "official_image_local_id": "sha256:__RANK_1_IMAGE_CONFIG_SHA256__",
+      "official_image_tag": "__RANK_1_IMAGE_TAG__"
+    },
+    {
+      "case_id": "__RANK_1_INSTANCE_ID__",
+      "rank": 1,
+      "arm": "T",
+      "base_commit": "__RANK_1_BASE_COMMIT__",
+      "base_tree": "__RANK_1_BASE_TREE__",
+      "episode_receipt": {
+        "path": "__ABSOLUTE_RANK_1_T_EPISODE_RECEIPT__",
+        "bytes": 0,
+        "sha256": "__RANK_1_T_EPISODE_RECEIPT_SHA256__"
+      },
+      "episode_verification": {
+        "path": "__ABSOLUTE_RANK_1_T_EPISODE_VERIFICATION__",
+        "bytes": 0,
+        "sha256": "__RANK_1_T_EPISODE_VERIFICATION_SHA256__"
+      },
+      "evaluator_authorization": {
+        "path": "__ABSOLUTE_RANK_1_T_EVALUATOR_AUTHORIZATION__",
+        "bytes": 0,
+        "sha256": "__RANK_1_T_EVALUATOR_AUTHORIZATION_SHA256__"
+      },
+      "model_name_or_path": "claude-sonnet-5-T",
+      "run_id": "issue827-rank1-T",
+      "official_image": "swebench/sweb.eval.x86_64.__RANK_1_IMAGE_KEY__:__RANK_1_IMAGE_TAG__",
+      "official_image_source": "docker.io/swebench/sweb.eval.x86_64.__RANK_1_IMAGE_KEY__:latest",
+      "official_image_manifest_digest": "sha256:__RANK_1_IMAGE_MANIFEST_SHA256__",
+      "official_image_config_id": "sha256:__RANK_1_IMAGE_CONFIG_SHA256__",
+      "official_image_local_id": "sha256:__RANK_1_IMAGE_CONFIG_SHA256__",
+      "official_image_tag": "__RANK_1_IMAGE_TAG__"
+    },
+    {
+      "case_id": "__RANK_2_INSTANCE_ID__",
+      "rank": 2,
+      "arm": "A",
+      "base_commit": "__RANK_2_BASE_COMMIT__",
+      "base_tree": "__RANK_2_BASE_TREE__",
+      "episode_receipt": {
+        "path": "__ABSOLUTE_RANK_2_A_EPISODE_RECEIPT__",
+        "bytes": 0,
+        "sha256": "__RANK_2_A_EPISODE_RECEIPT_SHA256__"
+      },
+      "episode_verification": {
+        "path": "__ABSOLUTE_RANK_2_A_EPISODE_VERIFICATION__",
+        "bytes": 0,
+        "sha256": "__RANK_2_A_EPISODE_VERIFICATION_SHA256__"
+      },
+      "evaluator_authorization": {
+        "path": "__ABSOLUTE_RANK_2_A_EVALUATOR_AUTHORIZATION__",
+        "bytes": 0,
+        "sha256": "__RANK_2_A_EVALUATOR_AUTHORIZATION_SHA256__"
+      },
+      "model_name_or_path": "claude-sonnet-5-A",
+      "run_id": "issue827-rank2-A",
+      "official_image": "swebench/sweb.eval.x86_64.__RANK_2_IMAGE_KEY__:__RANK_2_IMAGE_TAG__",
+      "official_image_source": "docker.io/swebench/sweb.eval.x86_64.__RANK_2_IMAGE_KEY__:latest",
+      "official_image_manifest_digest": "sha256:__RANK_2_IMAGE_MANIFEST_SHA256__",
+      "official_image_config_id": "sha256:__RANK_2_IMAGE_CONFIG_SHA256__",
+      "official_image_local_id": "sha256:__RANK_2_IMAGE_CONFIG_SHA256__",
+      "official_image_tag": "__RANK_2_IMAGE_TAG__"
+    },
+    {
+      "case_id": "__RANK_2_INSTANCE_ID__",
+      "rank": 2,
+      "arm": "T",
+      "base_commit": "__RANK_2_BASE_COMMIT__",
+      "base_tree": "__RANK_2_BASE_TREE__",
+      "episode_receipt": {
+        "path": "__ABSOLUTE_RANK_2_T_EPISODE_RECEIPT__",
+        "bytes": 0,
+        "sha256": "__RANK_2_T_EPISODE_RECEIPT_SHA256__"
+      },
+      "episode_verification": {
+        "path": "__ABSOLUTE_RANK_2_T_EPISODE_VERIFICATION__",
+        "bytes": 0,
+        "sha256": "__RANK_2_T_EPISODE_VERIFICATION_SHA256__"
+      },
+      "evaluator_authorization": {
+        "path": "__ABSOLUTE_RANK_2_T_EVALUATOR_AUTHORIZATION__",
+        "bytes": 0,
+        "sha256": "__RANK_2_T_EVALUATOR_AUTHORIZATION_SHA256__"
+      },
+      "model_name_or_path": "claude-sonnet-5-T",
+      "run_id": "issue827-rank2-T",
+      "official_image": "swebench/sweb.eval.x86_64.__RANK_2_IMAGE_KEY__:__RANK_2_IMAGE_TAG__",
+      "official_image_source": "docker.io/swebench/sweb.eval.x86_64.__RANK_2_IMAGE_KEY__:latest",
+      "official_image_manifest_digest": "sha256:__RANK_2_IMAGE_MANIFEST_SHA256__",
+      "official_image_config_id": "sha256:__RANK_2_IMAGE_CONFIG_SHA256__",
+      "official_image_local_id": "sha256:__RANK_2_IMAGE_CONFIG_SHA256__",
+      "official_image_tag": "__RANK_2_IMAGE_TAG__"
+    }
+  ]
+}

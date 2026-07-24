@@ -1,0 +1,42 @@
+name: SWE-bench RNA-first harness
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "benchmark/swebench-rna-first/issue827/**"
+      - "benchmark/swebench-rna-first/issue830/**"
+      - ".github/workflows/swebench-rna-first-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmark/swebench-rna-first/issue827/**"
+      - "benchmark/swebench-rna-first/issue830/**"
+      - ".github/workflows/swebench-rna-first-harness.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Run hermetic selector tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover \
+            -s benchmark/swebench-rna-first/issue827/tests \
+            -p 'test_*.py' \
+            -v
+          python3 benchmark/swebench-rna-first/issue827/test_evaluator_tools.py
+          python3 -m unittest discover \
+            -s benchmark/swebench-rna-first/issue830/tests \
+            -p 'test_*.py' \
+            -v

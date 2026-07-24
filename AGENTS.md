@@ -116,7 +116,7 @@ RNA compiles the fractal, repo-local knowledge absent from model training dataâ€
 - **no-parallel-cargo-agents**: One cargo build per target directory; use worktrees for parallel builds. [Details](.oh/guardrails/no-parallel-cargo-agents.md)
 - **computed-but-not-delivered**: New metadata must wire through 3 layers â€” extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
 - **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
-- **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use the successful GitHub Actions artifact for the target commit, not a local cargo install from source. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
+- **ci-artifacts-for-release-builds**: Release builds and user-facing verification must use a successful GitHub Actions artifact with Rust artifact inputs matching the target commit. When neither Rust CI nor artifact inputs changed, reuse it and do not dispatch or wait for Rust CI. [Details](.oh/guardrails/ci-artifacts-for-release-builds.md)
 - **independent-final-review-for-prs**: Every PR must receive explicit approval from a fresh, separate repo-local `/review` sub-agent on the final diff before merge. [Details](.oh/guardrails/independent-final-review-for-prs.md)
 
 ### Soft guardrails
@@ -138,7 +138,7 @@ RNA compiles the fractal, repo-local knowledge absent from model training dataâ€
 - YAML frontmatter + markdown body for all `.oh/` artifacts
 - Scanner excludes configurable via `.oh/config.toml`
 - Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
-- **Release installs use CI artifacts only**: download/install the successful GitHub Actions release artifact for the target commit before `/mcp` reconnect (or restart Claude Code). Do not use `cargo install --path .` for anything representing a shipped/user build.
+- **Release installs use CI artifacts only**: download/install a successful GitHub Actions release artifact whose Rust artifact inputs match the target commit before `/mcp` reconnect (or restart Claude Code). When neither Rust CI nor artifact inputs changed, reuse the existing artifact and do not dispatch or wait for redundant Rust CI. Do not use `cargo install --path .` for anything representing a shipped/user build.
 - Parallel worktree builds: `scripts/prep-worktree.sh <path> <branch>` creates a worktree with warm build cache (hardlinks `target/`). Set `CARGO_TARGET_DIR=$WORKTREE/target` before cargo commands. Enables genuinely parallel builds on M4 Max without cache thrashing.
 - **Cargo: use `cargo check --lib` for fast error checking** (seconds, not minutes). Only run `cargo test` once code compiles. Never `cargo run` for testing â€” use the installed binary. Save output to file, then grep/tail. **Use `run_in_background: true` for long cargo commands** â€” never `sleep` then poll.
 
