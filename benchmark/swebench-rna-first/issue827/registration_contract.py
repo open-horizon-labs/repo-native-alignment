@@ -18,13 +18,15 @@ from typing import Any, Mapping, TypedDict
 
 LEGACY_REGISTRATION_SCHEMA = "issue827-treatment-registration-v1"
 ISSUE836_V2_REGISTRATION_SCHEMA = "issue836-treatment-registration-v2"
-CURRENT_REGISTRATION_SCHEMA = "issue836-treatment-registration-v3"
+ISSUE836_V3_REGISTRATION_SCHEMA = "issue836-treatment-registration-v3"
+CURRENT_REGISTRATION_SCHEMA = "issue836-treatment-registration-v4"
 # New registrations use the current schema. Historical issue #827/#830 and
-# issue #836 v2 registrations remain valid through their versioned schemas.
+# issue #836 v2/v3 registrations remain valid through versioned schemas.
 REGISTRATION_SCHEMA = CURRENT_REGISTRATION_SCHEMA
 LEGACY_EPISODE_DESIGN_SCHEMA = "issue827-episode-design-v1"
 ISSUE836_V2_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v2"
-CURRENT_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v3"
+ISSUE836_V3_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v3"
+CURRENT_EPISODE_DESIGN_SCHEMA = "issue836-episode-design-v4"
 QUALIFICATION_REGISTRATION_SCHEMA = (
     "issue827-qualification-closure-registration-v1"
 )
@@ -162,6 +164,99 @@ FROZEN_V3_PRE_MODEL_SUPERSESSION: dict[str, Any] = {
     "case_replacement_after_model_start": False,
 }
 
+FROZEN_V4_PREFIX_LINEAGE: dict[str, Any] = {
+    "ranks_1_through_7_9_through_11_and_13_through_20": (
+        "exact_v3_carry_forward"
+    ),
+    "rank_8": "exact_v3_pre_model_rank_21_replacement_carry_forward",
+    "rank_12": "pre_model_replacement_from_s2_rank_22",
+    "outcomes_inspected_for_replacement": False,
+}
+
+FROZEN_V4_PRE_MODEL_SUPERSESSION: dict[str, Any] = {
+    "schema_version": "issue836-pre-model-cohort-supersession-v2",
+    "superseded_registration_schema": ISSUE836_V3_REGISTRATION_SCHEMA,
+    "superseded_registration_path": (
+        "benchmark/swebench-rna-first/issue836-v3/registration.json"
+    ),
+    "superseded_registration_sha256": (
+        "6f319f138336aef194cd91962edb75f3db172816cab7e19344d20d39217c5e92"
+    ),
+    "superseded_registration_commit": (
+        "a82f0b67e251f2cec6ae968e3b78f74e902ee16d"
+    ),
+    "superseded_selection_schema": "issue836-fresh-cohort-selection-v3",
+    "superseded_selection_path": (
+        "benchmark/swebench-rna-first/issue836-v3/selection.json"
+    ),
+    "superseded_selection_sha256": (
+        "dfd7ce6f4fcdd6e9b7baf81eb3faca76f32cde86485f3876d6d139154cedac80"
+    ),
+    "superseded_selection_commit": (
+        "654890f249ebf7fcdc08a1f79bc1f507a65a5e07"
+    ),
+    "superseded_selection_digest": (
+        "6df1b24382d28624bcda6e4fe07d39126ba4f7f6064af5ef89bc9cde9f5549f4"
+    ),
+    "dataset_arrow_sha256": (
+        "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e"
+    ),
+    "exclusions_sha256": (
+        "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79"
+    ),
+    "excluded_ids_sha256": (
+        "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b"
+    ),
+    "superseded_rank": 12,
+    "excluded_instance_id": "sympy__sympy-24539",
+    "excluded_repo": "sympy/sympy",
+    "excluded_base_commit": "193e3825645d93c73e31cdceb6d742cc6919624d",
+    "excluded_base_tree": "8ffa903a7635c0fc04fae14e0a22cb4104cb4682",
+    "excluded_ranking_sha256": (
+        "048fbc0780ad22b1233b61da02326ea68265cb2fb914a76fa6b2cad0964aef7a"
+    ),
+    "excluded_problem_statement_sha256": (
+        "c45c55bcffb2b526d21ed6b0c8d19976455280d6ce9343f7f2d62d96c3d3e037"
+    ),
+    "replacement_instance_id": "psf__requests-1724",
+    "replacement_source_rank": 22,
+    "replacement_method": "next_deterministic_eligible_source_rank",
+    "preserved_arm_order": ["T", "A"],
+    "reason_code": "old_shipped_rna_binary_exact_rank12_mjs_incompatibility",
+    "reason": (
+        "the registered old shipped RNA binary rejects the exact v3 rank-12 "
+        "tree solely because bin/test_pyodide.mjs is unsupported; all other "
+        "19 v3 trees were audited mjs-free"
+    ),
+    "incompatible_rna_binary_sha256": (
+        "d4d264da1a012b38814f0f2e9ee92f77c5aab3ed558a0f23abcd830d4b78ca94"
+    ),
+    "rejected_tree_mjs_paths": ["bin/test_pyodide.mjs"],
+    "other_v3_tree_count": 19,
+    "other_v3_tree_mjs_path_count": 0,
+    "replacement_repo": "psf/requests",
+    "replacement_base_commit": "1ba83c47ce7b177efe90d5f51f7760680f72eda0",
+    "replacement_base_tree": "c8e845adc2051eac27d5998697d3e83e920ef2c8",
+    "replacement_ranking_sha256": (
+        "0bf45a8589083de3e3dea6a230493a8279e01e379418593d1bfee686469d4761"
+    ),
+    "replacement_problem_statement_sha256": (
+        "eacde5d201658474274cce4558b5d2b8ae74d9fcc2ad6ddc76aaf003b2160b8a"
+    ),
+    "replacement_source_verification_manifest_path": (
+        "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/"
+        "replacement-v4-rank12/cache-setup/source-cache-verification.json"
+    ),
+    "replacement_source_verification_manifest_sha256": (
+        "3c85713bf402204ffccc6e55f0b4edbf8a3aee8e2b1b93a3b177f0ed0c755207"
+    ),
+    "detected_during_pre_model_cache_preparation": True,
+    "prior_model_calls": 0,
+    "prior_provider_requests": 0,
+    "prior_official_evaluator_invocations": 0,
+    "case_replacement_after_model_start": False,
+}
+
 
 class RegistrationContractError(RuntimeError):
     """A frozen preregistration identity or semantic contract did not hold."""
@@ -239,12 +334,21 @@ def experiment_dimensions(
             "case_count": 20,
             "episode_count": 40,
         }
+    elif schema == ISSUE836_V3_REGISTRATION_SCHEMA:
+        expected = {
+            "issue": 836,
+            "episode_schema": ISSUE836_V3_EPISODE_DESIGN_SCHEMA,
+            "selector_schema": "issue836-selector-v3",
+            "selection_rule_schema": "issue836-selection-rule-v3",
+            "case_count": 20,
+            "episode_count": 40,
+        }
     elif schema == CURRENT_REGISTRATION_SCHEMA:
         expected = {
             "issue": 836,
             "episode_schema": CURRENT_EPISODE_DESIGN_SCHEMA,
-            "selector_schema": "issue836-selector-v3",
-            "selection_rule_schema": "issue836-selection-rule-v3",
+            "selector_schema": "issue836-selector-v4",
+            "selection_rule_schema": "issue836-selection-rule-v4",
             "case_count": 20,
             "episode_count": 40,
         }
@@ -356,6 +460,7 @@ def is_issue836_registration_schema(value: Any) -> bool:
 
     return value in {
         ISSUE836_V2_REGISTRATION_SCHEMA,
+        ISSUE836_V3_REGISTRATION_SCHEMA,
         CURRENT_REGISTRATION_SCHEMA,
     }
 
@@ -385,7 +490,11 @@ def validate_registration(
             else (
                 ISSUE836_V2_EPISODE_DESIGN_SCHEMA
                 if schema == ISSUE836_V2_REGISTRATION_SCHEMA
-                else CURRENT_EPISODE_DESIGN_SCHEMA
+                else (
+                    ISSUE836_V3_EPISODE_DESIGN_SCHEMA
+                    if schema == ISSUE836_V3_REGISTRATION_SCHEMA
+                    else CURRENT_EPISODE_DESIGN_SCHEMA
+                )
             )
         ),
         "case_count": dimensions["case_count"],
@@ -404,7 +513,7 @@ def validate_registration(
 
     selector = registration.get("selector")
     require(isinstance(selector, dict), "registration selector missing")
-    if schema == CURRENT_REGISTRATION_SCHEMA:
+    if schema == ISSUE836_V3_REGISTRATION_SCHEMA:
         require(
             selector.get("pre_model_v2_supersession")
             == FROZEN_V3_PRE_MODEL_SUPERSESSION,
@@ -422,10 +531,58 @@ def validate_registration(
                 == registration.get("rna_artifact", {}).get("binary_sha256"),
                 "superseded binary identity differs from registered RNA binary",
             )
+        require(
+            "pre_model_v3_supersession" not in selector,
+            "v3 registration unexpectedly declares v4 supersession",
+        )
+    elif schema == CURRENT_REGISTRATION_SCHEMA:
+        require(
+            selector.get("pre_model_v3_supersession")
+            == FROZEN_V4_PRE_MODEL_SUPERSESSION,
+            "registration pre-model v3 supersession drift",
+        )
+        require(
+            selector.get("prefix_lineage") == FROZEN_V4_PREFIX_LINEAGE,
+            "registration v4 prefix lineage drift",
+        )
+        require(
+            "pre_model_v2_supersession" not in selector,
+            "v4 registration unexpectedly embeds v2 supersession",
+        )
+        require(
+            registration.get("prior_model_calls") == 0
+            and registration.get("prior_official_evaluator_invocations") == 0
+            and FROZEN_V4_PRE_MODEL_SUPERSESSION["prior_model_calls"] == 0
+            and FROZEN_V4_PRE_MODEL_SUPERSESSION[
+                "prior_official_evaluator_invocations"
+            ]
+            == 0,
+            "v4 registration is not a zero-call pre-model successor",
+        )
+        require(
+            selector.get("problem_statements_inspected_by_human_before_selection")
+            is False
+            and selector.get("gold_or_outcomes_inspected_before_selection")
+            is False
+            and selector.get("case_replacement_after_model_start") is False,
+            "v4 registration pre-model inspection/replacement contract drift",
+        )
+        if require_resolved_hashes:
+            require(
+                selector["pre_model_v3_supersession"][
+                    "incompatible_rna_binary_sha256"
+                ]
+                == registration.get("rna_artifact", {}).get("binary_sha256"),
+                "superseded binary identity differs from registered RNA binary",
+            )
     else:
         require(
             "pre_model_v2_supersession" not in selector,
             "historical registration unexpectedly declares v3 supersession",
+        )
+        require(
+            "pre_model_v3_supersession" not in selector,
+            "historical registration unexpectedly declares v4 supersession",
         )
 
     usage = registration.get("usage")

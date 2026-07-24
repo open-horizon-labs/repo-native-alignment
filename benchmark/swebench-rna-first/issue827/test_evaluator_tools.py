@@ -80,7 +80,7 @@ def registration(
         )
         value["issue"] = 827
         value["selector"]["algorithm_version"] = "issue827-selector-v1"
-        value["selector"].pop("pre_model_v2_supersession")
+        value["selector"].pop("pre_model_v3_supersession")
         value["selector"]["selected_case_count"] = 2
         value["selector"]["episode_count"] = 4
         value["episode_design"]["schema_version"] = (
@@ -100,7 +100,7 @@ def registration(
         value["selector"]["algorithm_version"] = (
             select_cases.ISSUE836_V2_ALGORITHM_VERSION
         )
-        value["selector"].pop("pre_model_v2_supersession")
+        value["selector"].pop("pre_model_v3_supersession")
         value["selector"]["prefix_lineage"] = {
             "ranks_1_through_2": "pre_model_carry_forward_prefix",
             "ranks_3_through_20": "deterministic_extension",

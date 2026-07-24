@@ -41,7 +41,7 @@ class RegistrationContractTests(unittest.TestCase):
             "local_source_build_allowed",
         }:
             value["rna_artifact"][key] = (
-                registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION[
+                registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION[
                     "incompatible_rna_binary_sha256"
                 ]
                 if key == "binary_sha256"
@@ -79,25 +79,18 @@ class RegistrationContractTests(unittest.TestCase):
         )
         self.assertEqual(
             value["selector"]["prefix_lineage"],
-            {
-                "ranks_1_through_2": "pre_model_carry_forward_prefix",
-                "ranks_3_through_7_and_9_through_20": (
-                    "deterministic_extension"
-                ),
-                "rank_8": "pre_model_replacement_from_s2_rank_21",
-                "outcomes_inspected_for_extension": False,
-            },
+            registration_contract.FROZEN_V4_PREFIX_LINEAGE,
         )
         self.assertEqual(
-            value["selector"]["pre_model_v2_supersession"],
-            registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION,
+            value["selector"]["pre_model_v3_supersession"],
+            registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION,
         )
 
     def test_selector_population_and_exclusions_are_exact(self) -> None:
         selector = self.registration["selector"]
         exclusions_path = HERE / "exclusions.json"
         exclusions = json.loads(exclusions_path.read_bytes())
-        self.assertEqual(selector["algorithm_version"], "issue836-selector-v3")
+        self.assertEqual(selector["algorithm_version"], "issue836-selector-v4")
         self.assertEqual(selector["seed"], select_cases.EXPECTED_SEED)
         self.assertEqual(
             (selector["population_rows"], selector["excluded_rows"], selector["eligible_rows"]),
@@ -166,6 +159,30 @@ class RegistrationContractTests(unittest.TestCase):
             select_result.result_schema(issue836_v2),
             select_result.ISSUE836_V2_RESULT_SCHEMA,
         )
+        issue836_v3 = json.loads(
+            (HERE.parent / "issue836-v3" / "registration.json").read_bytes()
+        )
+        registration_contract.validate_registration(issue836_v3)
+        self.assertEqual(
+            registration_contract.experiment_dimensions(issue836_v3),
+            {
+                "case_count": 20,
+                "episode_count": 40,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 240.0,
+            },
+        )
+        self.assertEqual(
+            select_result.registered_selection_rule(issue836_v3)[
+                "schema_version"
+            ],
+            "issue836-selection-rule-v3",
+        )
+        self.assertEqual(
+            select_result.result_schema(issue836_v3),
+            select_result.ISSUE836_V3_RESULT_SCHEMA,
+        )
 
     def test_runtime_and_selection_rule_are_exact(self) -> None:
         runtime = self.registration["model_runtime"]
@@ -184,7 +201,7 @@ class RegistrationContractTests(unittest.TestCase):
         )
         expected_rule.update(
             {
-                "schema_version": "issue836-selection-rule-v3",
+                "schema_version": "issue836-selection-rule-v4",
                 "episode_count": 40,
                 "pair_count": 20,
             }
@@ -297,22 +314,58 @@ class RegistrationContractTests(unittest.TestCase):
                         require_resolved_hashes=False,
                     )
 
-    def test_v3_supersession_and_old_binary_identity_fail_closed(self) -> None:
+    def test_v4_supersession_calls_and_old_binary_identity_fail_closed(
+        self,
+    ) -> None:
         registration = self.resolved_registration()
         registration_contract.validate_registration(registration)
         for label, mutate in (
             (
                 "rank",
                 lambda value: value["selector"][
-                    "pre_model_v2_supersession"
-                ].update({"superseded_rank": 9}),
+                    "pre_model_v3_supersession"
+                ].update({"superseded_rank": 11}),
             ),
             (
                 "replacement",
                 lambda value: value["selector"][
-                    "pre_model_v2_supersession"
+                    "pre_model_v3_supersession"
                 ].update(
-                    {"replacement_instance_id": "django__django-11179"}
+                    {"replacement_instance_id": "psf__requests-9999"}
+                ),
+            ),
+            (
+                "source-rank",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_source_rank": 21}),
+            ),
+            (
+                "tree",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_base_tree": "f" * 40}),
+            ),
+            (
+                "problem",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_problem_statement_sha256": "f" * 64}),
+            ),
+            (
+                "ranking",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_ranking_sha256": "f" * 64}),
+            ),
+            (
+                "model-call",
+                lambda value: value.update({"prior_model_calls": 1}),
+            ),
+            (
+                "evaluator-call",
+                lambda value: value.update(
+                    {"prior_official_evaluator_invocations": 1}
                 ),
             ),
             (

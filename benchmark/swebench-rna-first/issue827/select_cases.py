@@ -21,11 +21,13 @@ import registration_contract
 
 LEGACY_SCHEMA = "issue827-fresh-pair-selection-v1"
 ISSUE836_V2_SCHEMA = "issue836-fresh-cohort-selection-v2"
-CURRENT_SCHEMA = "issue836-fresh-cohort-selection-v3"
+ISSUE836_V3_SCHEMA = "issue836-fresh-cohort-selection-v3"
+CURRENT_SCHEMA = "issue836-fresh-cohort-selection-v4"
 SCHEMA = CURRENT_SCHEMA
 LEGACY_ALGORITHM_VERSION = "issue827-selector-v1"
 ISSUE836_V2_ALGORITHM_VERSION = "issue836-selector-v2"
-CURRENT_ALGORITHM_VERSION = "issue836-selector-v3"
+ISSUE836_V3_ALGORITHM_VERSION = "issue836-selector-v3"
+CURRENT_ALGORITHM_VERSION = "issue836-selector-v4"
 EXPECTED_ROWS = 500
 EXPECTED_SEED = "rna-first-sonnet-hermetic-selector-v1"
 EXPECTED_RANKING = "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)"
@@ -36,19 +38,49 @@ ISSUE836_V2_REGISTRATION_PATH = (
 ISSUE836_V3_REGISTRATION_PATH = (
     "benchmark/swebench-rna-first/issue836-v3/registration.json"
 )
-CURRENT_REGISTRATION_PATH = ISSUE836_V3_REGISTRATION_PATH
+ISSUE836_V4_REGISTRATION_PATH = (
+    "benchmark/swebench-rna-first/issue836-v4/registration.json"
+)
+CURRENT_REGISTRATION_PATH = ISSUE836_V4_REGISTRATION_PATH
 ALLOWED_REGISTRATION_PATHS = {
     REGISTRATION_PATH,
     ISSUE836_V2_REGISTRATION_PATH,
     ISSUE836_V3_REGISTRATION_PATH,
+    ISSUE836_V4_REGISTRATION_PATH,
 }
 REGISTRATION_PATH_BY_SCHEMA = {
     registration_contract.LEGACY_REGISTRATION_SCHEMA: REGISTRATION_PATH,
     registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA: (
         ISSUE836_V2_REGISTRATION_PATH
     ),
-    registration_contract.CURRENT_REGISTRATION_SCHEMA: (
+    registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA: (
         ISSUE836_V3_REGISTRATION_PATH
+    ),
+    registration_contract.CURRENT_REGISTRATION_SCHEMA: (
+        ISSUE836_V4_REGISTRATION_PATH
+    ),
+}
+SELECTION_PATH = "benchmark/swebench-rna-first/issue827/selection.json"
+ISSUE836_V2_SELECTION_PATH = (
+    "benchmark/swebench-rna-first/issue836/selection.json"
+)
+ISSUE836_V3_SELECTION_PATH = (
+    "benchmark/swebench-rna-first/issue836-v3/selection.json"
+)
+ISSUE836_V4_SELECTION_PATH = (
+    "benchmark/swebench-rna-first/issue836-v4/selection.json"
+)
+CURRENT_SELECTION_PATH = ISSUE836_V4_SELECTION_PATH
+SELECTION_PATH_BY_SCHEMA = {
+    registration_contract.LEGACY_REGISTRATION_SCHEMA: SELECTION_PATH,
+    registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA: (
+        ISSUE836_V2_SELECTION_PATH
+    ),
+    registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA: (
+        ISSUE836_V3_SELECTION_PATH
+    ),
+    registration_contract.CURRENT_REGISTRATION_SCHEMA: (
+        ISSUE836_V4_SELECTION_PATH
     ),
 }
 EXCLUSIONS_PATH = "benchmark/swebench-rna-first/issue827/exclusions.json"
@@ -62,6 +94,15 @@ FROZEN_V2_SELECTION_SHA256 = (
 FROZEN_V2_ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "issue836"
 FROZEN_V2_REGISTRATION_FILE = FROZEN_V2_ARTIFACT_ROOT / "registration.json"
 FROZEN_V2_SELECTION_FILE = FROZEN_V2_ARTIFACT_ROOT / "selection.json"
+FROZEN_V3_REGISTRATION_SHA256 = (
+    "6f319f138336aef194cd91962edb75f3db172816cab7e19344d20d39217c5e92"
+)
+FROZEN_V3_SELECTION_SHA256 = (
+    "dfd7ce6f4fcdd6e9b7baf81eb3faca76f32cde86485f3876d6d139154cedac80"
+)
+FROZEN_V3_ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "issue836-v3"
+FROZEN_V3_REGISTRATION_FILE = FROZEN_V3_ARTIFACT_ROOT / "registration.json"
+FROZEN_V3_SELECTION_FILE = FROZEN_V3_ARTIFACT_ROOT / "selection.json"
 
 V3_SELECTION_KEYS = {
     "authoritative",
@@ -87,6 +128,14 @@ V3_SELECTION_KEYS = {
     "seed",
     "state",
 }
+V4_SELECTION_KEYS = (
+    V3_SELECTION_KEYS
+    - {"pre_model_v2_supersession"}
+    | {
+        "pre_model_v3_supersession",
+        "prior_official_evaluator_invocations",
+    }
+)
 
 
 class SelectionError(RuntimeError):
@@ -109,9 +158,20 @@ def selection_schema(registration: Mapping[str, Any]) -> str:
         return LEGACY_SCHEMA
     if schema == registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA:
         return ISSUE836_V2_SCHEMA
+    if schema == registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA:
+        return ISSUE836_V3_SCHEMA
     if schema == registration_contract.CURRENT_REGISTRATION_SCHEMA:
         return CURRENT_SCHEMA
     raise SelectionError("registration schema has no selection schema")
+
+
+def selection_publication_path(registration: Mapping[str, Any]) -> str:
+    """Return the only selection publication path for a registration."""
+
+    path = SELECTION_PATH_BY_SCHEMA.get(registration.get("schema_version"))
+    if path is None:
+        raise SelectionError("registration schema has no selection path")
+    return path
 
 
 def require_selection_registration_binding(
@@ -359,12 +419,292 @@ def validate_v3_selection(
     return expected_v3_cases(v2_selection, authoritative=authoritative)
 
 
+def require_committed_artifact(
+    repository: Path,
+    commit: Any,
+    repo_path: str,
+    artifact_bytes: bytes,
+    label: str,
+) -> None:
+    """Require exact artifact bytes at an exact ordinary-clone commit/path."""
+
+    checkout = Path(repository)
+    if checkout.is_symlink() or not (checkout / ".git").is_dir():
+        raise SelectionError(
+            f"{label} repository must be a regular Git checkout"
+        )
+    commit_id = require_hex(commit, 40, f"{label} commit")
+    normalized = normalized_repo_relative_path(repo_path, f"{label} path")
+    result = subprocess.run(
+        ["git", "-C", str(checkout), "show", f"{commit_id}:{normalized}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 or result.stdout != artifact_bytes:
+        raise SelectionError(
+            f"{label} bytes are absent or changed at exact Git commit/path"
+        )
+
+
+def load_frozen_v3_artifacts(
+    registration_path: Path | None = None,
+    selection_path: Path | None = None,
+    *,
+    repository: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load and independently prove the committed v3 base cohort."""
+
+    paths = (
+        (
+            Path(registration_path or FROZEN_V3_REGISTRATION_FILE),
+            FROZEN_V3_REGISTRATION_SHA256,
+            "v3 registration",
+        ),
+        (
+            Path(selection_path or FROZEN_V3_SELECTION_FILE),
+            FROZEN_V3_SELECTION_SHA256,
+            "v3 selection",
+        ),
+    )
+    documents: list[dict[str, Any]] = []
+    payloads: list[bytes] = []
+    for path, expected_sha256, label in paths:
+        if path.is_symlink() or not path.is_file():
+            raise SelectionError(f"frozen {label} artifact is absent or symlinked")
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise SelectionError(
+                f"cannot read frozen {label} artifact: {error}"
+            ) from error
+        if sha256_bytes(data) != expected_sha256:
+            raise SelectionError(f"frozen {label} artifact bytes changed")
+        try:
+            value = json.loads(data)
+        except json.JSONDecodeError as error:
+            raise SelectionError(
+                f"frozen {label} artifact is invalid: {error}"
+            ) from error
+        if not isinstance(value, dict):
+            raise SelectionError(f"frozen {label} artifact must be an object")
+        payloads.append(data)
+        documents.append(value)
+
+    v3_registration, v3_selection = documents
+    try:
+        registration_contract.validate_registration(v3_registration)
+    except registration_contract.RegistrationContractError as error:
+        raise SelectionError(f"frozen v3 registration is invalid: {error}") from error
+
+    supersession = registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+    expected_provenance = {
+        "schema_version": supersession["superseded_selection_schema"],
+        "registration_sha256": supersession["superseded_registration_sha256"],
+        "registration_commit": supersession["superseded_registration_commit"],
+        "digest": supersession["superseded_selection_digest"],
+        "dataset_arrow_sha256": supersession["dataset_arrow_sha256"],
+        "exclusions_sha256": supersession["exclusions_sha256"],
+        "excluded_ids_sha256": supersession["excluded_ids_sha256"],
+        "prior_model_calls": 0,
+        "case_replacement_after_model_start": False,
+    }
+    for key, expected in expected_provenance.items():
+        if v3_selection.get(key) != expected:
+            raise SelectionError(f"frozen v3 selection provenance drift: {key}")
+    if (
+        v3_registration.get("schema_version")
+        != supersession["superseded_registration_schema"]
+        or v3_registration.get("dataset", {}).get("arrow_sha256")
+        != supersession["dataset_arrow_sha256"]
+        or v3_registration.get("selector", {}).get("exclusions_file_sha256")
+        != supersession["exclusions_sha256"]
+        or v3_registration.get("selector", {}).get("excluded_ids_sha256")
+        != supersession["excluded_ids_sha256"]
+    ):
+        raise SelectionError("frozen v3 registration provenance drift")
+
+    checkout = Path(repository or Path(__file__).resolve().parents[3])
+    require_committed_artifact(
+        checkout,
+        supersession["superseded_registration_commit"],
+        supersession["superseded_registration_path"],
+        payloads[0],
+        "frozen v3 registration",
+    )
+    require_committed_artifact(
+        checkout,
+        supersession["superseded_selection_commit"],
+        supersession["superseded_selection_path"],
+        payloads[1],
+        "frozen v3 selection",
+    )
+    require_selection_registration_binding(
+        v3_registration,
+        v3_selection,
+        repository=checkout,
+        registration_repo_path=ISSUE836_V3_REGISTRATION_PATH,
+    )
+    _, v2_selection = load_frozen_v2_artifacts()
+    expected_cases = validate_v3_selection(
+        v3_registration,
+        v3_selection,
+        v2_selection,
+    )
+    if v3_selection.get("cases") != expected_cases:
+        raise SelectionError(
+            "frozen v3 cases differ from frozen v2 plus rank-8 replacement"
+        )
+    return v3_registration, v3_selection
+
+
+def expected_v4_cases(
+    v3_selection: Mapping[str, Any],
+    *,
+    authoritative: bool,
+) -> list[dict[str, Any]]:
+    """Derive v4 by preserving v3 except the registered rank-12 successor."""
+
+    v3_cases = v3_selection.get("cases")
+    if not isinstance(v3_cases, list) or any(
+        not isinstance(case, dict) for case in v3_cases
+    ):
+        raise SelectionError("frozen v3 selection cases are malformed")
+    expected = [dict(case) for case in v3_cases]
+    supersession = registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+    replacement_index = supersession["superseded_rank"] - 1
+    excluded = expected[replacement_index]
+    excluded_identity = {
+        "instance_id": supersession["excluded_instance_id"],
+        "repo": supersession["excluded_repo"],
+        "base_commit": supersession["excluded_base_commit"],
+        "base_tree": supersession["excluded_base_tree"],
+        "ranking_sha256": supersession["excluded_ranking_sha256"],
+        "problem_statement_sha256": supersession[
+            "excluded_problem_statement_sha256"
+        ],
+        "arm_order": supersession["preserved_arm_order"],
+    }
+    for key, value in excluded_identity.items():
+        if excluded.get(key) != value:
+            raise SelectionError(f"frozen v3 rank-12 identity drift: {key}")
+    replacement = dict(excluded)
+    replacement.update(
+        {
+            "instance_id": supersession["replacement_instance_id"],
+            "repo": supersession["replacement_repo"],
+            "base_commit": supersession["replacement_base_commit"],
+            "base_tree": supersession["replacement_base_tree"],
+            "ranking_sha256": supersession["replacement_ranking_sha256"],
+            "problem_statement_sha256": supersession[
+                "replacement_problem_statement_sha256"
+            ],
+            "arm_order": supersession["preserved_arm_order"],
+        }
+    )
+    expected[replacement_index] = replacement
+    if not authoritative:
+        expected = [
+            {
+                key: value
+                for key, value in case.items()
+                if key not in {"base_tree", "cache_preparation"}
+            }
+            for case in expected
+        ]
+    return expected
+
+
+def validate_v4_selection(
+    registration: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    v3_selection: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Fail closed unless v4 is the exact zero-call successor of frozen v3."""
+
+    if not isinstance(selection, dict) or set(selection) != V4_SELECTION_KEYS:
+        raise SelectionError("v4 selection keys differ from the frozen contract")
+    state = selection.get("state")
+    authoritative = selection.get("authoritative")
+    if (state, authoritative) not in {
+        ("ranked_needs_tree_binding", False),
+        ("selected_pre_model", True),
+    }:
+        raise SelectionError("v4 selection state/authority mismatch")
+
+    supersession = registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+    selector = registration.get("selector")
+    if (
+        not isinstance(selector, dict)
+        or selector.get("pre_model_v3_supersession") != supersession
+        or selection.get("pre_model_v3_supersession") != supersession
+    ):
+        raise SelectionError("selection does not bind the registered v3 supersession")
+    if selection.get("prefix_lineage") != registration_contract.FROZEN_V4_PREFIX_LINEAGE:
+        raise SelectionError("selection v4 prefix lineage drift")
+
+    inherited_fields = {
+        "dataset_arrow_sha256",
+        "eligible_rows",
+        "excluded_ids_sha256",
+        "excluded_rows",
+        "exclusions_sha256",
+        "fresh_case_claim",
+        "gold_or_outcomes_inspected_before_selection",
+        "model_calls_authorized_before_cache_readiness",
+        "population_rows",
+        "problem_statements_inspected_by_human_before_selection",
+        "seed",
+    }
+    for key in inherited_fields:
+        if selection.get(key) != v3_selection.get(key):
+            raise SelectionError(f"v4 selection provenance drift: {key}")
+    if (
+        selection.get("prior_model_calls") != 0
+        or selection.get("prior_official_evaluator_invocations") != 0
+        or supersession["prior_model_calls"] != 0
+        or supersession["prior_official_evaluator_invocations"] != 0
+    ):
+        raise SelectionError("v4 selection is not a zero-call pre-model successor")
+    if selection.get("case_replacement_after_model_start") is not False:
+        raise SelectionError("v4 cohort replacement was not completed before model start")
+    if (
+        selection.get("dataset_arrow_sha256")
+        != registration.get("dataset", {}).get("arrow_sha256")
+        or selection.get("exclusions_sha256")
+        != selector.get("exclusions_file_sha256")
+        or selection.get("excluded_ids_sha256")
+        != selector.get("excluded_ids_sha256")
+    ):
+        raise SelectionError("v4 selection differs from registered dataset/exclusions")
+
+    registration_commit = require_hex(
+        selection.get("registration_commit"), 40, "v4 registration commit"
+    )
+    registration_sha256 = require_hex(
+        selection.get("registration_sha256"), 64, "v4 registration SHA-256"
+    )
+    if registration_commit == supersession["superseded_registration_commit"]:
+        raise SelectionError("v4 selection reuses the superseded registration commit")
+    if registration_sha256 == supersession["superseded_registration_sha256"]:
+        raise SelectionError("v4 selection reuses the superseded registration bytes")
+
+    digest = require_hex(selection.get("digest"), 64, "v4 selection digest")
+    digest_payload = dict(selection)
+    digest_payload.pop("digest")
+    if digest != sha256_bytes(canonical(digest_payload)):
+        raise SelectionError("v4 selection digest mismatch")
+    return expected_v4_cases(v3_selection, authoritative=authoritative)
+
+
 def expected_episode_identities(
     registration: Mapping[str, Any],
     selection: Mapping[str, Any],
     *,
     frozen_v2_registration_path: Path | None = None,
     frozen_v2_selection_path: Path | None = None,
+    frozen_v3_registration_path: Path | None = None,
+    frozen_v3_selection_path: Path | None = None,
     registration_repository: Path | None = None,
     registration_repo_path: str | None = None,
 ) -> tuple[ExpectedEpisodeIdentity, ...]:
@@ -377,7 +717,8 @@ def expected_episode_identities(
     if selection.get("schema_version") != selection_schema(registration):
         raise SelectionError("selection schema does not match registration version")
     expected_cases: list[dict[str, Any]] | None = None
-    if registration.get("schema_version") == registration_contract.CURRENT_REGISTRATION_SCHEMA:
+    schema = registration.get("schema_version")
+    if schema == registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA:
         require_selection_registration_binding(
             registration,
             selection,
@@ -392,6 +733,23 @@ def expected_episode_identities(
             registration,
             selection,
             v2_selection,
+        )
+    elif schema == registration_contract.CURRENT_REGISTRATION_SCHEMA:
+        require_selection_registration_binding(
+            registration,
+            selection,
+            repository=registration_repository,
+            registration_repo_path=registration_repo_path,
+        )
+        _, v3_selection = load_frozen_v3_artifacts(
+            frozen_v3_registration_path,
+            frozen_v3_selection_path,
+            repository=registration_repository,
+        )
+        expected_cases = validate_v4_selection(
+            registration,
+            selection,
+            v3_selection,
         )
     cases = selection.get("cases")
     if not isinstance(cases, list):
@@ -422,7 +780,8 @@ def expected_episode_identities(
             for arm in expected_arm_order
         )
     if expected_cases is not None and cases != expected_cases:
-        raise SelectionError("v3 cases differ from frozen v2 plus rank-8 replacement")
+        version = "v4" if schema == registration_contract.CURRENT_REGISTRATION_SCHEMA else "v3"
+        raise SelectionError(f"{version} cases differ from frozen successor contract")
     if len(identities) != dimensions["episode_count"]:
         raise SelectionError("selection episode count differs from registration")
     return tuple(identities)
@@ -467,34 +826,61 @@ def registered_ranked_cohort(
     if len(eligible_ranked) < case_count:
         raise SelectionError("eligible ranking is smaller than registered cohort")
     selected = list(eligible_ranked[:case_count])
-    if (
-        registration.get("schema_version")
-        != registration_contract.CURRENT_REGISTRATION_SCHEMA
-    ):
+    schema = registration.get("schema_version")
+    if schema not in {
+        registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA,
+        registration_contract.CURRENT_REGISTRATION_SCHEMA,
+    }:
         return selected
 
-    supersession = registration.get("selector", {}).get(
-        "pre_model_v2_supersession"
-    )
-    if supersession != registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION:
-        raise SelectionError("registration v2 supersession identity drift")
-    superseded_index = supersession["superseded_rank"] - 1
-    replacement_index = supersession["replacement_source_rank"] - 1
-    if replacement_index >= len(eligible_ranked):
-        raise SelectionError("registered replacement source rank is unavailable")
-    if selected[superseded_index][1] != supersession["excluded_instance_id"]:
-        raise SelectionError("registered superseded rank identity drift")
-    replacement = eligible_ranked[replacement_index]
-    if replacement != (
-        supersession["replacement_ranking_sha256"],
-        supersession["replacement_instance_id"],
-    ):
-        raise SelectionError("registered replacement ranking identity drift")
-    if replacement in selected:
-        raise SelectionError("registered replacement duplicates v2 cohort")
-    selected[superseded_index] = replacement
+    def apply_replacement(
+        supersession: Mapping[str, Any],
+        label: str,
+    ) -> None:
+        superseded_index = supersession["superseded_rank"] - 1
+        replacement_index = supersession["replacement_source_rank"] - 1
+        if replacement_index >= len(eligible_ranked):
+            raise SelectionError(
+                f"registered {label} replacement source rank is unavailable"
+            )
+        if (
+            selected[superseded_index][1]
+            != supersession["excluded_instance_id"]
+        ):
+            raise SelectionError(f"registered {label} superseded identity drift")
+        replacement = eligible_ranked[replacement_index]
+        if replacement != (
+            supersession["replacement_ranking_sha256"],
+            supersession["replacement_instance_id"],
+        ):
+            raise SelectionError(f"registered {label} ranking identity drift")
+        if replacement in selected:
+            raise SelectionError(f"registered {label} replacement is duplicate")
+        selected[superseded_index] = replacement
+
+    selector = registration.get("selector", {})
+    if schema == registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA:
+        v3_supersession = selector.get("pre_model_v2_supersession")
+        if (
+            v3_supersession
+            != registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION
+        ):
+            raise SelectionError("registration v2 supersession identity drift")
+        apply_replacement(v3_supersession, "v3")
+    else:
+        v4_supersession = selector.get("pre_model_v3_supersession")
+        if (
+            v4_supersession
+            != registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+        ):
+            raise SelectionError("registration v3 supersession identity drift")
+        apply_replacement(
+            registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION,
+            "v3 carry-forward",
+        )
+        apply_replacement(v4_supersession, "v4")
     if len({instance_id for _, instance_id in selected}) != case_count:
-        raise SelectionError("registered replacement produces duplicate cases")
+        raise SelectionError("registered replacements produce duplicate cases")
     return selected
 
 
@@ -725,6 +1111,9 @@ def main() -> int:
         registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA: (
             ISSUE836_V2_ALGORITHM_VERSION
         ),
+        registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA: (
+            ISSUE836_V3_ALGORITHM_VERSION
+        ),
         registration_contract.CURRENT_REGISTRATION_SCHEMA: (
             CURRENT_ALGORITHM_VERSION
         ),
@@ -856,7 +1245,7 @@ def main() -> int:
         }
     if (
         registration.get("schema_version")
-        == registration_contract.CURRENT_REGISTRATION_SCHEMA
+        == registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA
     ):
         receipt["pre_model_v2_supersession"] = (
             registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION
@@ -864,6 +1253,17 @@ def main() -> int:
         receipt["prefix_lineage"] = (
             registration_contract.FROZEN_V3_PREFIX_LINEAGE
         )
+    if (
+        registration.get("schema_version")
+        == registration_contract.CURRENT_REGISTRATION_SCHEMA
+    ):
+        receipt["pre_model_v3_supersession"] = (
+            registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+        )
+        receipt["prefix_lineage"] = (
+            registration_contract.FROZEN_V4_PREFIX_LINEAGE
+        )
+        receipt["prior_official_evaluator_invocations"] = 0
     receipt["digest"] = sha256_bytes(canonical(receipt))
     expected_episode_identities(
         registration,

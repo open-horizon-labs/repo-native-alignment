@@ -10,6 +10,7 @@ import unittest
 
 
 HERE = Path(__file__).resolve().parents[1]
+SOURCE_REPO = HERE.parents[2]
 sys.path.insert(0, str(HERE))
 
 import registration_contract
@@ -22,19 +23,32 @@ class Issue836CaseSelectionTests(unittest.TestCase):
         cls.registration = json.loads(
             (HERE / "registration.template.json").read_bytes()
         )
+        cls.v3_registration = json.loads(
+            (HERE.parent / "issue836-v3" / "registration.json").read_bytes()
+        )
+        cls.v3_selection = json.loads(
+            (HERE.parent / "issue836-v3" / "selection.json").read_bytes()
+        )
         cls.binding_directory = tempfile.TemporaryDirectory()
-        cls.binding_repo = Path(cls.binding_directory.name)
+        cls.binding_repo = Path(cls.binding_directory.name) / "source"
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "-q",
+                "--shared",
+                str(SOURCE_REPO),
+                str(cls.binding_repo),
+            ],
+            check=True,
+        )
         registration_path = (
             cls.binding_repo
-            / select_cases.ISSUE836_V3_REGISTRATION_PATH
+            / select_cases.ISSUE836_V4_REGISTRATION_PATH
         )
         registration_path.parent.mkdir(parents=True)
         registration_path.write_bytes(
             select_cases.canonical(cls.registration)
-        )
-        subprocess.run(
-            ["git", "init", "-q", str(cls.binding_repo)],
-            check=True,
         )
         subprocess.run(
             ["git", "-C", str(cls.binding_repo), "add", "."],
@@ -51,7 +65,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 "user.email=selector-test@example.invalid",
                 "commit",
                 "-qm",
-                "v3 registration",
+                "v4 registration",
             ],
             check=True,
         )
@@ -71,24 +85,26 @@ class Issue836CaseSelectionTests(unittest.TestCase):
 
     def current_selection(self) -> dict:
         selection = json.loads(
-            (HERE.parent / "issue836" / "selection.json").read_bytes()
+            json.dumps(self.v3_selection)
         )
         supersession = json.loads(
             json.dumps(
-                registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION
+                registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
             )
         )
+        selection.pop("pre_model_v2_supersession")
         selection.update(
             {
                 "schema_version": select_cases.CURRENT_SCHEMA,
                 "registration_commit": self.binding_commit,
                 "registration_sha256": self.binding_sha256,
                 "prior_model_calls": 0,
+                "prior_official_evaluator_invocations": 0,
                 "case_replacement_after_model_start": False,
-                "pre_model_v2_supersession": supersession,
+                "pre_model_v3_supersession": supersession,
                 "prefix_lineage": json.loads(
                     json.dumps(
-                        registration_contract.FROZEN_V3_PREFIX_LINEAGE
+                        registration_contract.FROZEN_V4_PREFIX_LINEAGE
                     )
                 ),
             }
@@ -124,6 +140,18 @@ class Issue836CaseSelectionTests(unittest.TestCase):
         return select_cases.expected_episode_identities(
             self.registration,
             selection,
+            registration_repository=self.binding_repo,
+            **kwargs,
+        )
+
+    def v3_identities(
+        self,
+        selection: dict | None = None,
+        **kwargs: object,
+    ) -> tuple[select_cases.ExpectedEpisodeIdentity, ...]:
+        return select_cases.expected_episode_identities(
+            self.v3_registration,
+            selection or self.v3_selection,
             registration_repository=self.binding_repo,
             **kwargs,
         )
@@ -177,7 +205,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             supersession["replacement_instance_id"],
         )
         selected = select_cases.registered_ranked_cohort(
-            self.registration,
+            self.v3_registration,
             eligible,
         )
         self.assertEqual(len(selected), 20)
@@ -185,7 +213,43 @@ class Issue836CaseSelectionTests(unittest.TestCase):
         self.assertEqual(selected[:7], eligible[:7])
         self.assertEqual(selected[8:], eligible[8:20])
 
-    def test_current_selection_has_exact_ranks_parity_and_forty_episodes(
+    def test_v4_replaces_only_rank_twelve_after_v3_rank_eight(
+        self,
+    ) -> None:
+        v3 = registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION
+        v4 = registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION
+        eligible = [
+            (f"{rank:064x}", f"case-{rank:02d}")
+            for rank in range(1, 23)
+        ]
+        eligible[7] = (
+            "02e8357bad6c501dec2de83e0a5d769241abb835a7c484fdba3301a415489515",
+            v3["excluded_instance_id"],
+        )
+        eligible[11] = (
+            v4["excluded_ranking_sha256"],
+            v4["excluded_instance_id"],
+        )
+        eligible[20] = (
+            v3["replacement_ranking_sha256"],
+            v3["replacement_instance_id"],
+        )
+        eligible[21] = (
+            v4["replacement_ranking_sha256"],
+            v4["replacement_instance_id"],
+        )
+        selected = select_cases.registered_ranked_cohort(
+            self.registration,
+            eligible,
+        )
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected[7], eligible[20])
+        self.assertEqual(selected[11], eligible[21])
+        self.assertEqual(selected[:7], eligible[:7])
+        self.assertEqual(selected[8:11], eligible[8:11])
+        self.assertEqual(selected[12:], eligible[12:20])
+
+    def test_v4_selection_has_exact_ranks_parity_and_forty_episodes(
         self,
     ) -> None:
         selection = self.current_selection()
@@ -214,19 +278,25 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 for case in selection["cases"]
             )
         )
+        for index, (v3_case, v4_case) in enumerate(
+            zip(self.v3_selection["cases"], selection["cases"], strict=True),
+            start=1,
+        ):
+            if index == 12:
+                self.assertEqual(v4_case["arm_order"], ["T", "A"])
+                self.assertEqual(v4_case["instance_id"], "psf__requests-1724")
+            else:
+                self.assertEqual(v4_case, v3_case)
+        self.assertEqual(
+            selection["cases"][7],
+            self.v3_selection["cases"][7],
+        )
 
-    def test_current_registration_records_truthful_prefix_lineage(self) -> None:
+    def test_v4_registration_records_truthful_successor_lineage(self) -> None:
         selector = self.registration["selector"]
         self.assertEqual(
             selector["prefix_lineage"],
-            {
-                "ranks_1_through_2": "pre_model_carry_forward_prefix",
-                "ranks_3_through_7_and_9_through_20": (
-                    "deterministic_extension"
-                ),
-                "rank_8": "pre_model_replacement_from_s2_rank_21",
-                "outcomes_inspected_for_extension": False,
-            },
+            registration_contract.FROZEN_V4_PREFIX_LINEAGE,
         )
         self.assertFalse(
             selector["gold_or_outcomes_inspected_before_selection"]
@@ -235,36 +305,43 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             selector["problem_statements_inspected_by_human_before_selection"]
         )
         self.assertEqual(
-            selector["pre_model_v2_supersession"],
-            registration_contract.FROZEN_V3_PRE_MODEL_SUPERSESSION,
+            selector["pre_model_v3_supersession"],
+            registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION,
         )
-        supersession = selector["pre_model_v2_supersession"]
-        self.assertEqual(supersession["superseded_rank"], 8)
+        supersession = selector["pre_model_v3_supersession"]
+        self.assertEqual(supersession["superseded_rank"], 12)
         self.assertEqual(
             supersession["excluded_instance_id"],
-            "sympy__sympy-24661",
+            "sympy__sympy-24539",
         )
         self.assertEqual(
             supersession["replacement_instance_id"],
-            "django__django-11163",
+            "psf__requests-1724",
         )
-        self.assertEqual(supersession["replacement_source_rank"], 21)
+        self.assertEqual(supersession["replacement_source_rank"], 22)
         self.assertEqual(supersession["preserved_arm_order"], ["T", "A"])
         self.assertEqual(
             supersession["replacement_base_commit"],
-            "e6588aa4e793b7f56f4cadbfa155b581e0efc59a",
+            "1ba83c47ce7b177efe90d5f51f7760680f72eda0",
         )
         self.assertEqual(
             supersession["replacement_base_tree"],
-            "4c221e3aba9030ab459871106740934193ce1118",
+            "c8e845adc2051eac27d5998697d3e83e920ef2c8",
         )
         self.assertEqual(
             supersession["replacement_problem_statement_sha256"],
-            "8dbd8cae38c3a82b681a79bdfe8ffaa78aa6f1fad9744a1ca197f90265e5c80b",
+            "eacde5d201658474274cce4558b5d2b8ae74d9fcc2ad6ddc76aaf003b2160b8a",
         )
         self.assertEqual(
-            supersession["reason_code"],
-            "old_shipped_rna_binary_mjs_descriptor_incompatibility",
+            supersession["rejected_tree_mjs_paths"],
+            ["bin/test_pyodide.mjs"],
+        )
+        self.assertEqual(supersession["other_v3_tree_count"], 19)
+        self.assertEqual(supersession["other_v3_tree_mjs_path_count"], 0)
+        self.assertEqual(supersession["prior_model_calls"], 0)
+        self.assertEqual(
+            supersession["prior_official_evaluator_invocations"],
+            0,
         )
 
     def test_historical_issue830_pair_remains_a_valid_verifier_path(
@@ -346,7 +423,52 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             ),
         )
 
-    def test_selection_schema_rank_and_parity_drift_fail_closed(self) -> None:
+    def test_historical_issue836_v3_cohort_remains_a_valid_verifier_path(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.v3_registration["schema_version"],
+            registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA,
+        )
+        self.assertEqual(
+            self.v3_selection["schema_version"],
+            select_cases.ISSUE836_V3_SCHEMA,
+        )
+        registration_contract.validate_registration(self.v3_registration)
+        identities = self.v3_identities()
+        self.assertEqual(len(identities), 40)
+        self.assertEqual(
+            identities[14:16],
+            (
+                select_cases.ExpectedEpisodeIdentity(
+                    8,
+                    "django__django-11163",
+                    "T",
+                ),
+                select_cases.ExpectedEpisodeIdentity(
+                    8,
+                    "django__django-11163",
+                    "A",
+                ),
+            ),
+        )
+        self.assertEqual(
+            identities[22:24],
+            (
+                select_cases.ExpectedEpisodeIdentity(
+                    12,
+                    "sympy__sympy-24539",
+                    "T",
+                ),
+                select_cases.ExpectedEpisodeIdentity(
+                    12,
+                    "sympy__sympy-24539",
+                    "A",
+                ),
+            ),
+        )
+
+    def test_v4_replacement_and_zero_call_drift_fail_closed(self) -> None:
         for label, mutate in (
             (
                 "schema",
@@ -360,32 +482,60 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             ),
             (
                 "parity",
-                lambda selection: selection["cases"][9].update(
+                lambda selection: selection["cases"][11].update(
                     {"arm_order": ["A", "T"]}
                 ),
             ),
             (
-                "supersession",
+                "wrong-source-rank",
                 lambda selection: selection[
-                    "pre_model_v2_supersession"
-                ].update({"replacement_source_rank": 22}),
+                    "pre_model_v3_supersession"
+                ].update({"replacement_source_rank": 21}),
+            ),
+            (
+                "wrong-tree",
+                lambda selection: selection["cases"][11].update(
+                    {"base_tree": "f" * 40}
+                ),
+            ),
+            (
+                "wrong-problem-hash",
+                lambda selection: selection["cases"][11].update(
+                    {"problem_statement_sha256": "f" * 64}
+                ),
+            ),
+            (
+                "wrong-ranking-hash",
+                lambda selection: selection["cases"][11].update(
+                    {"ranking_sha256": "f" * 64}
+                ),
             ),
             (
                 "lineage",
                 lambda selection: selection["prefix_lineage"].update(
-                    {"rank_8": "deterministic_extension"}
+                    {"rank_12": "exact_v3_carry_forward"}
                 ),
             ),
             (
-                "replacement",
-                lambda selection: selection["cases"][7].update(
-                    {"instance_id": "django__django-11179"}
+                "different-replacement",
+                lambda selection: selection["cases"][11].update(
+                    {"instance_id": "psf__requests-9999"}
                 ),
             ),
             (
-                "non-rank-8-instance",
+                "extra-replacement",
                 lambda selection: selection["cases"][0].update(
                     {"instance_id": "fabricated__case-00001"}
+                ),
+            ),
+            (
+                "nonzero-model-call",
+                lambda selection: selection.update({"prior_model_calls": 1}),
+            ),
+            (
+                "nonzero-evaluator-call",
+                lambda selection: selection.update(
+                    {"prior_official_evaluator_invocations": 1}
                 ),
             ),
         ):
@@ -423,8 +573,8 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 selection_path.write_bytes(selection_bytes)
                 mutate(registration_path, selection_path)
                 with self.assertRaises(select_cases.SelectionError):
-                    self.current_identities(
-                        self.current_selection(),
+                    self.v3_identities(
+                        json.loads(json.dumps(self.v3_selection)),
                         frozen_v2_registration_path=registration_path,
                         frozen_v2_selection_path=selection_path,
                     )
@@ -435,6 +585,122 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 "forty-zero-registration-commit",
                 lambda selection: selection.update(
                     {"registration_commit": "0" * 40}
+                ),
+                True,
+            ),
+            (
+                "dataset",
+                lambda selection: selection.update(
+                    {"dataset_arrow_sha256": "f" * 64}
+                ),
+                True,
+            ),
+            (
+                "exclusions-file",
+                lambda selection: selection.update(
+                    {"exclusions_sha256": "f" * 64}
+                ),
+                True,
+            ),
+            (
+                "excluded-ids",
+                lambda selection: selection.update(
+                    {"excluded_ids_sha256": "f" * 64}
+                ),
+                True,
+            ),
+            (
+                "digest",
+                lambda selection: selection.update({"digest": "f" * 64}),
+                False,
+            ),
+        ):
+            with self.subTest(label=label):
+                selection = json.loads(json.dumps(self.v3_selection))
+                mutate(selection)
+                if reseal:
+                    self.reseal(selection)
+                with self.assertRaises(select_cases.SelectionError):
+                    self.v3_identities(selection)
+
+    def test_v4_rejects_absent_changed_or_reprovenanced_v3_artifacts(
+        self,
+    ) -> None:
+        registration_bytes = select_cases.FROZEN_V3_REGISTRATION_FILE.read_bytes()
+        selection_bytes = select_cases.FROZEN_V3_SELECTION_FILE.read_bytes()
+        for label, mutate in (
+            (
+                "absent-registration",
+                lambda registration, selection: registration.unlink(),
+            ),
+            (
+                "absent-selection",
+                lambda registration, selection: selection.unlink(),
+            ),
+            (
+                "changed-registration-bytes",
+                lambda registration, selection: registration.write_bytes(
+                    registration.read_bytes() + b" "
+                ),
+            ),
+            (
+                "changed-selection-bytes",
+                lambda registration, selection: selection.write_bytes(
+                    selection.read_bytes() + b" "
+                ),
+            ),
+            (
+                "changed-selection-provenance",
+                lambda registration, selection: selection.write_bytes(
+                    select_cases.canonical(
+                        {
+                            **json.loads(selection.read_bytes()),
+                            "dataset_arrow_sha256": "f" * 64,
+                        }
+                    )
+                ),
+            ),
+            (
+                "changed-registration-provenance",
+                lambda registration, selection: registration.write_bytes(
+                    select_cases.canonical(
+                        {
+                            **json.loads(registration.read_bytes()),
+                            "prior_model_calls": 1,
+                        }
+                    )
+                ),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registration_path = root / "registration.json"
+                selection_path = root / "selection.json"
+                registration_path.write_bytes(registration_bytes)
+                selection_path.write_bytes(selection_bytes)
+                mutate(registration_path, selection_path)
+                with self.assertRaises(select_cases.SelectionError):
+                    self.current_identities(
+                        self.current_selection(),
+                        frozen_v3_registration_path=registration_path,
+                        frozen_v3_selection_path=selection_path,
+                    )
+
+    def test_v4_selection_provenance_digest_and_commit_fail_closed(
+        self,
+    ) -> None:
+        for label, mutate, reseal in (
+            (
+                "missing-registration-commit-bytes",
+                lambda selection: selection.update(
+                    {"registration_commit": "0" * 40}
+                ),
+                True,
+            ),
+            (
+                "registration-bytes",
+                lambda selection: selection.update(
+                    {"registration_sha256": "f" * 64}
                 ),
                 True,
             ),
@@ -480,7 +746,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
             repo = Path(temporary)
             registration_path = (
                 repo
-                / select_cases.ISSUE836_V3_REGISTRATION_PATH
+                / select_cases.ISSUE836_V4_REGISTRATION_PATH
             )
             exclusions_path = (
                 repo / "benchmark/swebench-rna-first/issue827/exclusions.json"
@@ -499,6 +765,11 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 }
             )
             registration_path.write_bytes(registration_bytes)
+            v3_registration_path = (
+                repo / select_cases.ISSUE836_V3_REGISTRATION_PATH
+            )
+            v3_registration_path.parent.mkdir(parents=True)
+            v3_registration_path.write_bytes(registration_bytes)
             v2_registration_path = (
                 repo / select_cases.ISSUE836_V2_REGISTRATION_PATH
             )
@@ -536,7 +807,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                 commit,
                 registration_path,
                 exclusions_path,
-                select_cases.ISSUE836_V3_REGISTRATION_PATH,
+                select_cases.ISSUE836_V4_REGISTRATION_PATH,
             )
             with self.assertRaises(select_cases.SelectionError):
                 select_cases.require_commit_binding(
@@ -545,6 +816,14 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                     registration_path,
                     exclusions_path,
                     select_cases.ISSUE836_V2_REGISTRATION_PATH,
+                )
+            with self.assertRaises(select_cases.SelectionError):
+                select_cases.require_commit_binding(
+                    repo,
+                    commit,
+                    v3_registration_path,
+                    exclusions_path,
+                    select_cases.ISSUE836_V3_REGISTRATION_PATH,
                 )
 
             registration_path.write_bytes(
@@ -563,7 +842,7 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                     commit,
                     registration_path,
                     exclusions_path,
-                    select_cases.ISSUE836_V3_REGISTRATION_PATH,
+                    select_cases.ISSUE836_V4_REGISTRATION_PATH,
                 )
 
             registration_path.unlink()
@@ -576,33 +855,61 @@ class Issue836CaseSelectionTests(unittest.TestCase):
                     commit,
                     registration_path,
                     exclusions_path,
-                    select_cases.ISSUE836_V3_REGISTRATION_PATH,
+                    select_cases.ISSUE836_V4_REGISTRATION_PATH,
                 )
 
     def test_registration_repo_path_rejects_unsafe_or_ambiguous_paths(
         self,
     ) -> None:
-        for schema, value in (
+        versioned_paths = (
             (
                 registration_contract.LEGACY_REGISTRATION_SCHEMA,
                 select_cases.REGISTRATION_PATH,
+                select_cases.SELECTION_PATH,
             ),
             (
                 registration_contract.ISSUE836_V2_REGISTRATION_SCHEMA,
                 select_cases.ISSUE836_V2_REGISTRATION_PATH,
+                select_cases.ISSUE836_V2_SELECTION_PATH,
+            ),
+            (
+                registration_contract.ISSUE836_V3_REGISTRATION_SCHEMA,
+                select_cases.ISSUE836_V3_REGISTRATION_PATH,
+                select_cases.ISSUE836_V3_SELECTION_PATH,
             ),
             (
                 registration_contract.CURRENT_REGISTRATION_SCHEMA,
                 select_cases.CURRENT_REGISTRATION_PATH,
+                select_cases.CURRENT_SELECTION_PATH,
             ),
-        ):
+        )
+        for schema, value, selection_path in versioned_paths:
             self.assertEqual(
                 select_cases.registered_registration_repo_path(value, schema),
                 value,
             )
+            self.assertEqual(
+                select_cases.selection_publication_path(
+                    {"schema_version": schema}
+                ),
+                selection_path,
+            )
+        self.assertEqual(
+            len({registration for _, registration, _ in versioned_paths}),
+            len(versioned_paths),
+        )
+        self.assertEqual(
+            len({selection for _, _, selection in versioned_paths}),
+            len(versioned_paths),
+        )
         with self.assertRaises(select_cases.SelectionError):
             select_cases.registered_registration_repo_path(
                 select_cases.ISSUE836_V2_REGISTRATION_PATH,
+                registration_contract.CURRENT_REGISTRATION_SCHEMA,
+            )
+        with self.assertRaises(select_cases.SelectionError):
+            select_cases.registered_registration_repo_path(
+                select_cases.ISSUE836_V3_REGISTRATION_PATH,
                 registration_contract.CURRENT_REGISTRATION_SCHEMA,
             )
         for value in (
