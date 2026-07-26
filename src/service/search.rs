@@ -55,8 +55,9 @@ use model::{
 };
 use task_context::{
     ContextRole as TaskRole, EvidenceCandidate as TaskEvidenceCandidate, ExactCandidate,
-    ExactResolution, RetrievalLane as TaskLane, SelectionPolicy as TaskSelectionPolicy,
-    SelectionReason as TaskSelectionReason, SourceAnchor, TaskFacet,
+    ExactReferenceKind, ExactResolution, RetrievalLane as TaskLane,
+    SelectionPolicy as TaskSelectionPolicy, SelectionReason as TaskSelectionReason, SourceAnchor,
+    TaskFacet,
 };
 
 /// When impact results exceed this node-count threshold, render a
@@ -5311,6 +5312,17 @@ async fn projected_fused_candidates(
         final_scores = result.score_evidence;
         product_score_audit = result.product_score_audit;
         final_orders = result.order_evidence;
+        let exact_references = ordinary_qualified_reference_order(query, params, ctx);
+        if !exact_references.is_empty() {
+            let lexical = final_orders
+                .entry(EvidenceChannel::ExactLexical)
+                .or_default();
+            let mut merged = exact_references;
+            merged.append(lexical);
+            let mut seen = BTreeSet::new();
+            merged.retain(|id| seen.insert(id.clone()));
+            *lexical = merged;
+        }
         let mut matches = result.matches;
         // Fuse the union of bounded per-channel observations. The legacy flat
         // list is still retained for legacy rendering, but it must not evict a
@@ -5432,6 +5444,49 @@ async fn projected_fused_candidates(
     fuse_ranked_channels(policy, &channels)
         .map(|fused| (fused, capabilities, product_score_audit))
         .map_err(|error| error.to_string())
+}
+
+fn ordinary_qualified_reference_order(
+    query: &str,
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Vec<String> {
+    let Ok(task) = task_context::parse_task(query) else {
+        return Vec::new();
+    };
+    let references = task
+        .exact_references
+        .into_iter()
+        .filter(|reference| reference.kind == ExactReferenceKind::QualifiedName)
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return Vec::new();
+    }
+    let candidates = ctx
+        .graph_state
+        .nodes
+        .iter()
+        .filter(|node| projected_node_passes(node, params, ctx))
+        .map(|node| ExactCandidate {
+            evidence_id: node.stable_id(),
+            display: node.id.name.clone(),
+            match_keys: BTreeSet::from([
+                node.id.name.clone(),
+                node.signature.clone(),
+                node.stable_id(),
+            ]),
+            source_file: node.id.file.to_string_lossy().replace('\\', "/"),
+            source_line: u32::try_from(node.line_start).ok(),
+        })
+        .collect::<Vec<_>>();
+
+    task_context::resolve_exact_references(&references, &candidates)
+        .into_iter()
+        .filter_map(|resolution| match resolution.resolution {
+            ExactResolution::Hit(candidate) => Some(candidate.evidence_id),
+            ExactResolution::Ambiguous(_) | ExactResolution::Miss => None,
+        })
+        .collect()
 }
 
 fn resolve_projected_entry_nodes<'a>(
@@ -12978,6 +13033,67 @@ mod tests {
             capability.capability == "task_exact_reference_resolution"
                 && capability.state == CapabilityState::Ready
         }));
+    }
+
+    #[tokio::test]
+    async fn ordinary_search_pins_unique_dotted_reference_before_candidate_truncation() {
+        let repository = tempfile::tempdir().unwrap();
+        let source_path = repository.path().join("django/contrib/admin/checks.py");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            "def _check_list_display(self, obj):\n    pass\n",
+        )
+        .unwrap();
+
+        let mut nodes = (0..30)
+            .map(|index| {
+                let mut node = make_node(
+                    &format!("decoy_{index}"),
+                    NodeKind::Function,
+                    "django/contrib/admin/checks.py",
+                );
+                node.signature = format!(
+                    "fn decoy_{index}(django admin contrib checks _check_list_display behavior regression test)"
+                );
+                node.line_start = 1;
+                node.line_end = 1;
+                node
+            })
+            .collect::<Vec<_>>();
+        let mut target = make_node(
+            "_check_list_display",
+            NodeKind::Function,
+            "django/contrib/admin/checks.py",
+        );
+        target.signature = "def _check_list_display(self, obj):".into();
+        target.line_start = 1;
+        target.line_end = 2;
+        let target_id = target.stable_id();
+        nodes.push(target);
+
+        let graph = make_graph_state(nodes);
+        let ctx = make_search_context(&graph, repository.path());
+        let output = projected_search(
+            &SearchParams {
+                query: Some(
+                    "Fix behavior in django.admin.contrib.checks._check_list_display and add a regression test"
+                        .into(),
+                ),
+                limit: Some(10),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(output.contains(&target_id), "output was:\n{output}");
+        assert!(
+            output.contains("selected_records: 10"),
+            "output was:\n{output}"
+        );
     }
 
     #[tokio::test]

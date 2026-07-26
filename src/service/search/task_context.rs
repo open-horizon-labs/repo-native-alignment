@@ -483,10 +483,12 @@ fn is_identifier(token: &str) -> bool {
 }
 
 fn is_qualified_name(token: &str) -> bool {
-    token.contains("::")
-        && token
-            .split("::")
-            .all(|component| !component.is_empty() && is_identifier(component))
+    ["::", "."].into_iter().any(|separator| {
+        token.contains(separator)
+            && token
+                .split(separator)
+                .all(|component| !component.is_empty() && is_identifier(component))
+    })
 }
 
 fn is_test_name(token: &str) -> bool {
@@ -601,11 +603,22 @@ pub(crate) fn resolve_exact_references(
         .cloned()
         .map(|reference| {
             let key = normalize_match_key(&reference.normalized);
-            let matches = canonical_candidates
+            let mut matches = canonical_candidates
                 .iter()
                 .filter(|candidate| candidate.canonical_match_keys().contains(&key))
                 .cloned()
                 .collect::<Vec<_>>();
+            if matches.is_empty()
+                && reference.kind == ExactReferenceKind::QualifiedName
+                && let Some(terminal) = qualified_name_terminal(&reference.normalized)
+            {
+                let terminal = normalize_match_key(terminal);
+                matches = canonical_candidates
+                    .iter()
+                    .filter(|candidate| candidate.canonical_match_keys().contains(&terminal))
+                    .cloned()
+                    .collect();
+            }
             let resolution = match matches.as_slice() {
                 [] => ExactResolution::Miss,
                 [candidate] => ExactResolution::Hit(candidate.clone()),
@@ -617,6 +630,16 @@ pub(crate) fn resolve_exact_references(
             }
         })
         .collect()
+}
+
+fn qualified_name_terminal(name: &str) -> Option<&str> {
+    if name.contains("::") {
+        name.rsplit("::").next()
+    } else if name.contains('.') {
+        name.rsplit('.').next()
+    } else {
+        None
+    }
 }
 
 fn normalize_match_key(key: &str) -> String {
@@ -1407,6 +1430,63 @@ mod tests {
             ExactResolution::Ambiguous(ref matches) if matches.len() == 2
         ));
         assert_eq!(resolved[2].resolution, ExactResolution::Miss);
+    }
+
+    #[test]
+    fn dotted_qualified_reference_resolves_by_unique_terminal_name() {
+        let parsed = parse_task(
+            "Fix django.admin.contrib.checks._check_list_display and add a regression test.",
+        )
+        .unwrap();
+        let reference = parsed
+            .exact_references
+            .iter()
+            .find(|reference| {
+                reference.normalized == "django.admin.contrib.checks._check_list_display"
+            })
+            .expect("dotted Python reference is parsed");
+        assert_eq!(reference.kind, ExactReferenceKind::QualifiedName);
+
+        let candidates = vec![ExactCandidate {
+            evidence_id: "target".into(),
+            display: "_check_list_display".into(),
+            match_keys: BTreeSet::new(),
+            source_file: "django/contrib/admin/checks.py".into(),
+            source_line: Some(706),
+        }];
+        let resolved = resolve_exact_references(&[reference.clone()], &candidates);
+        assert!(matches!(
+            &resolved[0].resolution,
+            ExactResolution::Hit(candidate) if candidate.evidence_id == "target"
+        ));
+    }
+
+    #[test]
+    fn qualified_terminal_fallback_does_not_choose_an_ambiguous_candidate() {
+        let reference = ExactReference {
+            raw: "package.module.shared_name".into(),
+            normalized: "package.module.shared_name".into(),
+            kind: ExactReferenceKind::QualifiedName,
+            origin: ReferenceOrigin::Prose,
+            byte_start: 0,
+            byte_end: 26,
+        };
+        let candidates = ["first", "second"]
+            .into_iter()
+            .map(|id| ExactCandidate {
+                evidence_id: id.into(),
+                display: "shared_name".into(),
+                match_keys: BTreeSet::new(),
+                source_file: format!("src/{id}.py"),
+                source_line: Some(1),
+            })
+            .collect::<Vec<_>>();
+
+        let resolved = resolve_exact_references(&[reference], &candidates);
+        assert!(matches!(
+            &resolved[0].resolution,
+            ExactResolution::Ambiguous(matches) if matches.len() == 2
+        ));
     }
 
     #[test]
