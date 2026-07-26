@@ -8213,6 +8213,31 @@ async fn search_traversal(
     // Remove empty groups after filtering
     merged_groups.retain(|_, ids| !ids.is_empty());
 
+    // An explicit traversal limit applies to rendered, displayable neighbors,
+    // not only to entry-node resolution. Preserve the established edge-kind
+    // and traversal ordering while taking at most `limit` visible nodes across
+    // all groups. Hidden structural nodes do not consume the caller's budget.
+    if let Some(limit) = params.limit {
+        let mut remaining = limit;
+        for ids in merged_groups.values_mut() {
+            ids.retain(|id| {
+                let displayable = gs
+                    .node_by_stable_id(id, node_index_map)
+                    .map(|node| !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind))
+                    .unwrap_or(true);
+                if !displayable {
+                    return true;
+                }
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                true
+            });
+        }
+        merged_groups.retain(|_, ids| !ids.is_empty());
+    }
+
     // Count total displayable results
     let total_count: usize = merged_groups
         .values()
@@ -9430,6 +9455,45 @@ mod tests {
         assert!(result.contains("## Graph neighbors"));
         assert!(result.contains("callee"));
         assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn explicit_limit_bounds_displayable_traversal_results() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let third = make_node("third", NodeKind::Function, "src/third.rs");
+        let graph = make_graph_state_with_edges(
+            vec![caller.clone(), first.clone(), second.clone(), third.clone()],
+            vec![
+                make_edge(&caller, &first, crate::graph::EdgeKind::Calls),
+                make_edge(&caller, &second, crate::graph::EdgeKind::Calls),
+                make_edge(&caller, &third, crate::graph::EdgeKind::Calls),
+            ],
+        );
+        let repository = PathBuf::from("/tmp/limited-traversal-fixture");
+        let ctx = make_search_context(&graph, &repository);
+        let unrestricted = SearchParams {
+            node: Some(caller.stable_id()),
+            mode: Some("neighbors".into()),
+            edge_types: Some(vec!["calls".into()]),
+            compact: true,
+            ..Default::default()
+        };
+        let params = SearchParams {
+            limit: Some(2),
+            ..unrestricted.clone()
+        };
+
+        let result = search(&params, &ctx).await;
+        let unrestricted_result = search(&unrestricted, &ctx).await;
+
+        assert!(result.contains("2 result(s)"), "{result}");
+        assert_eq!(result.matches("- **function**").count(), 2, "{result}");
+        assert!(
+            unrestricted_result.contains("3 result(s)"),
+            "{unrestricted_result}"
+        );
     }
 
     #[tokio::test]
