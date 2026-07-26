@@ -18,13 +18,69 @@ WAVE_RECEIPT_SCHEMA = "issue836-rolling-wave-receipt-v8"
 FINAL_LEDGER_SCHEMA = "issue836-rolling-final-ledger-v8"
 SELECTION_BINDING_SCHEMA = "issue836-rolling-selection-binding-v8"
 ENVELOPE_BINDING_SCHEMA = "issue836-rolling-envelope-binding-v8"
-SCHEDULE_FILENAME = "execution-schedule-v6.json"
-SELECTION_BINDING_FILENAME = "selection-binding-v6.json"
+SCHEDULE_FILENAME = "execution-schedule-v18.json"
+SELECTION_BINDING_FILENAME = "selection-binding-v18.json"
 COMPATIBILITY_FILENAME = "v8-compatibility-manifest.json"
-WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v6.json"
+WAVE_MANIFEST_FILENAME = "rolling-wave-manifest-v18.json"
 INVOCATION_FILENAME = "v8-invocation-start.json"
 ENVELOPE_BINDING_FILENAME = "v8-envelope-binding.json"
 PREDECESSOR_ACTIVITY_FILENAME = "predecessor-activity.json"
+QUALIFIED_SOURCE_ROOT = Path(
+    "/Users/muness/swebench-evidence/issue829-readiness-fix.IYiMyx/source"
+)
+QUALIFIED_HARNESS_ROOT = (
+    QUALIFIED_SOURCE_ROOT / "benchmark/swebench-rna-first/issue827"
+)
+SUCCESSOR_HARNESS_ROOT = Path(__file__).resolve().parent.parent / "issue827"
+REGISTERED_SOURCE_DELTA = {
+    "bash_gateway_sha256": {
+        "qualified": (
+            "42b0484a6d63e2cae59550003ecfa0c494778dc925cd641abe3b21e8a2b4c58c"
+        ),
+        "successor": (
+            "cded193127f4e35f0d72481bdbf56a437f3c9e58c4ec1c0819a2a1b19270fbb9"
+        ),
+    },
+    "common_supervisor_sha256": {
+        "qualified": (
+            "8aea0bc62eb36d5e249cb50a1aebce6c2545d7083cc91b5bcc933de945d9a597"
+        ),
+        "successor": (
+            "d1730dbea66c80cf17b94a8a1df28a623958d9b67784148cddbd004e4a44ccbe"
+        ),
+    },
+    "isolation_sha256": {
+        "qualified": (
+            "63b556e094f0553701118fbea7db9729a327f30496388778fb2ff48b8d28284e"
+        ),
+        "successor": (
+            "8473f135eefddc87723ffcfd016d85196637f6573d9ba16b052cdd7949a98754"
+        ),
+    },
+    "runner_sha256": {
+        "qualified": (
+            "cc250022e01b5c708d5d4d0c5a9ba8caad97f7a7d08006c231f7eb17cb58d658"
+        ),
+        "successor": (
+            "83b963bb65b8af3162159be5043577acbd5908093ecdb61f999bc350a18e3a7a"
+        ),
+    },
+}
+SUCCESSOR_REGISTERED_FILES_SHA256 = (
+    "6e6adf4e78d42a54385a3f8c900d73adac790374a394fc5619cf784bef00c45b"
+)
+PROTOCOL_CHANGE = (
+    "deterministic_issue_query_preconditioning_and_gateway_recovery_"
+    "plus_qualified_registration_source_bridge_"
+    "plus_native_tool_parallelism_"
+    "plus_trace_namespace_classification_repair_"
+    "plus_internal_tracked_symlink_support_"
+    "plus_noncontaminating_observation_policy_"
+    "plus_workspace_alias_mapping_"
+    "plus_three_case_parallelism_"
+    "plus_three_case_assembler_support_"
+    "no_cohort_or_arm_order_change"
+)
 QUALIFIED_REGISTRATION_RELATIVE_PATH = (
     "benchmark/swebench-rna-first/issue830/registration.json"
 )
@@ -83,7 +139,7 @@ BASE_SELECTION_SHA256 = (
 BASE_SOURCE_COMMIT = "6bb1bf6200cb9f380007d033f717a2825fe75934"
 BASE_SOURCE_TREE = "70af087a30f93ad204af1196fad30a0da04c3e66"
 APPROVED_ASSEMBLER_SHA256 = (
-    "8c0519934bf6e2ae8a87828eb21c1a515e3799cd5fbaf1a1ffd8e6e4b37e4adf"
+    "f9c76a1d5ce0a08827f09a1261741f7fac6f26ed1412a9cdf8b01994ff850e88"
 )
 NO_SPEND = {
     "credentials_accessed": False,
@@ -92,15 +148,15 @@ NO_SPEND = {
     "official_evaluator_invocations": 0,
 }
 PREDECESSOR_ACTIVITY = {
-    "infrastructure_terminated_provider_episodes": 2,
-    "local_cli_process_starts": 4,
-    "model_invoked_receipts": 4,
+    "infrastructure_invalidated_provider_episodes": 10,
+    "local_cli_process_starts": 14,
+    "model_invoked_receipts": 14,
     "official_evaluator_invocations": 0,
-    "provider_cost_usd": 0.228589,
-    "provider_exposed_episodes": 2,
-    "provider_usage_tokens": 38478,
+    "provider_cost_usd": 3.3581463,
+    "provider_exposed_episodes": 12,
+    "provider_usage_tokens": 4510145,
     "stale_auth_episode_starts": 2,
-    "terminal_patches": 0,
+    "terminal_patches": 5,
 }
 
 
@@ -147,6 +203,63 @@ def file_ref(path: Path) -> dict[str, Any]:
         "bytes": resolved.stat().st_size,
         "sha256": sha_file(resolved),
     }
+
+
+def validate_qualified_registered_sources(
+    registration_contract_module: Any,
+    registration: Mapping[str, Any],
+) -> None:
+    """Validate the frozen registration against its byte-qualified sources."""
+
+    require(
+        QUALIFIED_HARNESS_ROOT.is_dir()
+        and not QUALIFIED_HARNESS_ROOT.is_symlink(),
+        "qualified registration source root unavailable",
+    )
+    try:
+        registration_contract_module.validate_registration(
+            registration,
+            source_root=QUALIFIED_HARNESS_ROOT,
+        )
+    except registration_contract_module.RegistrationContractError as exc:
+        raise ContractError(
+            f"qualified registration source validation failed: {exc}"
+        ) from exc
+    registered = registration.get("registered_files")
+    require(
+        isinstance(registered, Mapping)
+        and sha_canonical(registered) == CURRENT_REGISTERED_FILES_SHA256,
+        "frozen registered source digest drift",
+    )
+    filenames = registration_contract_module.REGISTERED_FILE_NAMES
+    require(
+        SUCCESSOR_HARNESS_ROOT.is_dir()
+        and not SUCCESSOR_HARNESS_ROOT.is_symlink()
+        and isinstance(filenames, Mapping)
+        and set(filenames) == set(registered),
+        "successor registered source root or interface drift",
+    )
+    successor = {
+        key: sha_file(SUCCESSOR_HARNESS_ROOT / str(filename))
+        for key, filename in filenames.items()
+    }
+    changed = sorted(
+        key for key in registered if registered[key] != successor[key]
+    )
+    require(
+        changed == sorted(REGISTERED_SOURCE_DELTA),
+        "successor registered source delta drift",
+    )
+    for key, identity in REGISTERED_SOURCE_DELTA.items():
+        require(
+            registered[key] == identity["qualified"]
+            and successor[key] == identity["successor"],
+            f"successor registered source identity drift: {key}",
+        )
+    require(
+        sha_canonical(successor) == SUCCESSOR_REGISTERED_FILES_SHA256,
+        "successor registered source digest drift",
+    )
 
 
 def check_ref(value: Any, where: str) -> tuple[Path, bytes]:
@@ -198,14 +311,21 @@ def validate_predecessor_activity(
         "predecessor activity",
     )
     require(
-        document["schema_version"] == "issue836-predecessor-activity-v2"
+        document["schema_version"] == "issue836-predecessor-activity-v3"
         and document["activity"] == PREDECESSOR_ACTIVITY
         and document["cohort_reused_unchanged"] is True
         and document["evaluator_or_outcomes_inspected"] is False
         and document["new_session_ids_required"] is True
         and document["predecessor_superseded"] is True
         and document["protocol_change"]
-        == "restore_title_query_preconditioning_without_behavioral_gate",
+        == (
+            "deterministic_issue_query_preconditioning_and_gateway_recovery_"
+            "plus_trace_namespace_classification_repair_"
+            "plus_internal_tracked_symlink_support_"
+            "plus_noncontaminating_observation_policy_"
+            "plus_workspace_alias_mapping_"
+            "plus_three_case_parallelism"
+        ),
         "predecessor activity semantics drift",
     )
     adaptations = document["adaptations"]
@@ -215,9 +335,21 @@ def validate_predecessor_activity(
         == [
             "preconditioned_treatment_restoration",
             "trusted_gateway_access_restoration",
+            "ordinary_gateway_failure_delivery",
+            "qualified_registration_source_validation_bridge",
+            "native_tool_parallelism_restoration",
+            "authoritative_model_usage_reporting",
+            "trace_namespace_classification_repair",
+            "internal_tracked_symlink_support",
+            "noncontaminating_observation_policy",
+            "workspace_alias_and_native_hook_telemetry",
+            "three_case_trial_parallelism",
         ]
         and adaptations[0].get("applies_to_arms") == ["T"]
-        and adaptations[1].get("applies_to_arms") == ["A", "T"],
+        and all(
+            item.get("applies_to_arms") == ["A", "T"]
+            for item in adaptations[1:]
+        ),
         "successor adaptations drift",
     )
     check_ref(
@@ -228,7 +360,15 @@ def validate_predecessor_activity(
     require(
         isinstance(attempts, list)
         and [attempt.get("classification") for attempt in attempts]
-        == ["stale_auth_zero_provider", "provider_exposed_supervisor_termination"],
+        == [
+            "stale_auth_zero_provider",
+            "provider_exposed_supervisor_termination",
+            "provider_exposed_native_tool_overlap",
+            "provider_exposed_outer_seatbelt_dev_null_denial",
+            "provider_exposed_trace_namespace_classification",
+            "provider_exposed_relaxed_policy_admissible_pair",
+            "provider_exposed_censored_monitor_false_positive_pair",
+        ],
         "predecessor attempt classifications drift",
     )
     for index, attempt in enumerate(attempts):
@@ -255,8 +395,8 @@ def validate_predecessor_activity(
 
 def explicit_wave_ranks(value: Any) -> tuple[int, ...]:
     require(
-        isinstance(value, list) and 1 <= len(value) <= 2,
-        "a wave must explicitly select one or two ranks",
+        isinstance(value, list) and 1 <= len(value) <= 3,
+        "a wave must explicitly select one to three ranks",
     )
     require(
         all(type(rank) is int and 1 <= rank <= 20 for rank in value),
@@ -573,11 +713,7 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
     require(
         schedule["schema_version"] == SCHEDULE_SCHEMA
         and schedule["authoritative"] is True
-        and schedule["protocol_change"]
-        == (
-            "restore_title_query_preconditioning_and_trusted_gateway_access_"
-            "no_cohort_or_arm_order_change"
-        )
+        and schedule["protocol_change"] == PROTOCOL_CHANGE
         and schedule["base_source_commit"] == BASE_SOURCE_COMMIT
         and schedule["base_source_tree"] == BASE_SOURCE_TREE
         and isinstance(schedule["implementation_commit"], str)
@@ -601,10 +737,10 @@ def validate_schedule(schedule: Mapping[str, Any], root: Path) -> None:
         and schedule["episode_count"] == 40
         and schedule["per_episode_budget_usd"] == 6.0
         and schedule["maximum_budget_usd"] == 240.0
-        and schedule["max_cases_per_wave"] == 2
-        and schedule["max_episodes_per_wave"] == 4
+        and schedule["max_cases_per_wave"] == 3
+        and schedule["max_episodes_per_wave"] == 6
         and schedule["same_case_serialized"] is True
-        and schedule["different_cases_max_parallel"] == 2
+        and schedule["different_cases_max_parallel"] == 3
         and schedule["one_shot_per_rank"] is True
         and schedule["append_only_cumulative_ledger"] is True
         and schedule["evaluation_before_full_cohort_allowed"] is False,
@@ -702,11 +838,7 @@ def validate_selection_binding(
     require(
         binding["schema_version"] == SELECTION_BINDING_SCHEMA
         and binding["authoritative"] is True
-        and binding["protocol_change"]
-        == (
-            "preconditioned_treatment_and_gateway_recovery_"
-            "no_cohort_or_arm_order_change"
-        )
+        and binding["protocol_change"] == PROTOCOL_CHANGE
         and binding["schedule_sha256"] == schedule_sha256
         and isinstance(binding["schedule_commit"], str)
         and re.fullmatch(r"[0-9a-f]{40}", binding["schedule_commit"])

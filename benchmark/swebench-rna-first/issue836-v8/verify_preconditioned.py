@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -15,9 +16,32 @@ import isolation
 import provider_usage
 import registration_contract
 import frontier_replay
+import schedule_contract as successor_contract
 
 
 VERIFY_SCHEMA = "issue827-episode-verification-v1"
+QUERY_BODY_CHAR_LIMIT = 512
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_FENCED_CODE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+
+
+def deterministic_rna_query(problem: bytes) -> bytes:
+    normalized = (
+        problem.decode("utf-8", errors="strict")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+    title, separator, body = normalized.partition("\n")
+    if not title:
+        raise ValueError("empty issue title")
+    if not separator:
+        return title.encode("utf-8")
+    prose = _HTML_COMMENT.sub(" ", body)
+    prose = _FENCED_CODE.sub(" ", prose)
+    prose = " ".join(prose.split())
+    body_prefix = prose[:QUERY_BODY_CHAR_LIMIT]
+    query = title if not body_prefix else f"{title}\n\n{body_prefix}"
+    return query.encode("utf-8")
 
 
 def check_ref(ref: Any, label: str, errors: list[str]) -> tuple[Path | None, bytes | None]:
@@ -106,10 +130,11 @@ def exact_preconditioned_treatment_context(
     config: Mapping[str, Any],
     system: bytes,
     projection: bytes,
+    problem: bytes | None,
     errors: list[str],
 ) -> None:
     del actor
-    marker = b"RNA PRECONDITIONING CONTEXT"
+    marker = b"HARNESS-EXECUTED RNA TOOL CALL"
     if marker not in system:
         errors.append("treatment_system_missing_precondition_marker")
     expected_wrapper = config.get("wrapper")
@@ -126,21 +151,60 @@ def exact_preconditioned_treatment_context(
     ):
         errors.append("treatment_system_contains_behavioral_gate")
     try:
-        title = (
+        query = (
             Path(str(config["harness_root"]))
             .joinpath("title-query.txt")
             .read_bytes()
             .rstrip(b"\r\n")
         )
     except OSError:
-        title = b""
-        errors.append("title_query_unreadable")
+        query = b""
+        errors.append("deterministic_query_unreadable")
     if (
-        not title
-        or runner.sha_bytes(title) != config.get("expected_query_sha256")
-        or title not in system
+        not query
+        or runner.sha_bytes(query) != config.get("expected_query_sha256")
     ):
-        errors.append("exact_title_not_injected")
+        errors.append("deterministic_query_identity_mismatch")
+    elif problem is None:
+        errors.append("deterministic_query_problem_unavailable")
+    else:
+        try:
+            expected_query = deterministic_rna_query(problem)
+            worked_call = (
+                b"rna_tool_search("
+                + json.dumps(
+                    query.decode("utf-8", errors="strict"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b")"
+            )
+        except (UnicodeError, ValueError):
+            errors.append("deterministic_query_not_utf8")
+        else:
+            ordered_parts = (
+                marker,
+                worked_call,
+                b"RNA TOOL RESPONSE",
+                projection,
+                b"END HARNESS-EXECUTED RNA TOOL INTERACTION",
+                b"The ordinary coding tool surface remains available.",
+                b"Further RNA calls are optional",
+            )
+            if (
+                query != expected_query
+                or not projection
+                or system.count(projection) != 1
+                or system.count(worked_call) != 1
+                or any(part not in system for part in ordered_parts)
+                or [
+                    system.index(part)
+                    for part in ordered_parts
+                ]
+                != sorted(system.index(part) for part in ordered_parts)
+            ):
+                errors.append(
+                    "deterministic_query_interaction_not_injected"
+                )
     try:
         projected_ids = runner.stable_code_ids(projection.decode("utf-8", errors="strict"))
     except UnicodeError:
@@ -451,11 +515,11 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
         errors.append("run_manifest_schema_mismatch")
     if isinstance(registration, dict):
         try:
-            registration_contract.validate_registration(
+            successor_contract.validate_qualified_registered_sources(
+                registration_contract,
                 registration,
-                source_root=runner.SOURCE,
             )
-        except registration_contract.RegistrationContractError as exc:
+        except successor_contract.ContractError as exc:
             errors.append(f"registration_contract:{exc}")
     expected_identities: tuple[tuple[int, str, str], ...] = ()
     if isinstance(registration, dict) and isinstance(selection, dict):
@@ -485,13 +549,21 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             errors.append(f"qualification_closure:{exc}")
         runner_ref = manifest.get("runner")
         _, _ = check_ref(runner_ref, "registered_runner", errors)
-        if isinstance(runner_ref, dict) and runner_ref.get("sha256") != registration.get("registered_files", {}).get("runner_sha256"):
-            errors.append("runner_not_registration_bound")
+        if (
+            isinstance(runner_ref, dict)
+            and runner_ref != runner.file_ref(runner.SOURCE / "run_selector.py")
+        ):
+            errors.append("runner_not_successor_manifest_bound")
         common_ref = manifest.get("common_supervisor")
         _, _ = check_ref(common_ref, "registered_common_supervisor", errors)
-        if isinstance(common_ref, dict) and common_ref.get("sha256") != registration.get("registered_files", {}).get("common_supervisor_sha256"):
-            errors.append("common_supervisor_not_registration_bound")
+        if (
+            isinstance(common_ref, dict)
+            and common_ref
+            != runner.file_ref(runner.SOURCE / "common_supervisor.py")
+        ):
+            errors.append("common_supervisor_not_successor_manifest_bound")
     case = selected_case(manifest, receipt.get("case_id"), receipt.get("rank"), errors) if isinstance(manifest, dict) else None
+    problem_bytes: bytes | None = None
     arm = receipt.get("arm")
     if arm not in {"A", "T"}:
         errors.append("arm_invalid")
@@ -499,6 +571,11 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
     if receipt.get("policy") != expected_policy:
         errors.append("policy_arm_mismatch")
     if case is not None:
+        _, problem_bytes = check_ref(
+            case.get("problem_statement"),
+            "manifest_problem_statement",
+            errors,
+        )
         if receipt.get("base_commit") != case.get("base_commit") or receipt.get("base_tree") != case.get("base_tree"):
             errors.append("base_identity_mismatch")
         if (
@@ -866,11 +943,10 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             "native_tool_state",
             errors,
         )
-        if native_tool_state != {
-            "schema_version": "issue827-native-tool-state-v1",
-            "active": {},
-        }:
-            errors.append("native_tool_state_not_quiescent")
+        try:
+            isolation.validate_native_tool_state(native_tool_state)
+        except isolation.IsolationViolation as exc:
+            errors.append(f"native_tool_state_invalid:{exc}")
         for index, ref in enumerate(supervisor.get("rna_events", [])):
             _, event = load_ref_json(ref, f"rna_event_{index}", errors)
             if isinstance(event, dict):
@@ -1094,6 +1170,7 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
                 supervisor_config,
                 system,
                 query_projection,
+                problem_bytes,
                 errors,
             )
         if state.get("fatal") is True:
@@ -1242,9 +1319,9 @@ def registered_run_contract(
     if not isinstance(registration, dict) or not isinstance(selection, dict):
         return None, (), {}
     try:
-        registration_contract.validate_registration(
+        successor_contract.validate_qualified_registered_sources(
+            registration_contract,
             registration,
-            source_root=runner.SOURCE,
         )
         if registration_path is None:
             raise runner.FailClosed(
@@ -1262,7 +1339,7 @@ def registered_run_contract(
     except (
         OSError,
         runner.FailClosed,
-        registration_contract.RegistrationContractError,
+        successor_contract.ContractError,
     ) as exc:
         errors.append(f"aggregate_contract:{exc}")
         return None, (), {}

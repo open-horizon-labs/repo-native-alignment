@@ -282,7 +282,7 @@ def _verify_wave_authorization_lineage(
         and manifest["execution_episode_keys"]
         == wave["authorized_episode_keys"]
         and manifest["same_case_serialized"] is True
-        and manifest["max_parallel_cases"] == min(2, len(requested))
+        and manifest["max_parallel_cases"] == min(3, len(requested))
         and manifest["per_episode_budget_usd"] == 6.0
         and manifest["wave_maximum_budget_usd"]
         == 12.0 * len(requested)
@@ -349,7 +349,7 @@ def _verify_wave_authorization_lineage(
         and start["models_authorized"] == 2 * len(requested)
         and start["maximum_budget_usd"] == 12.0 * len(requested)
         and start["same_case_serialized"] is True
-        and start["max_parallel_cases"] == min(2, len(requested))
+        and start["max_parallel_cases"] == min(3, len(requested))
         and start["official_evaluator_invoked"] is False,
         f"wave {batch_id} pre-call authorization start drift",
     )
@@ -398,7 +398,10 @@ def verify_complete_run(output_root: Path) -> dict[str, Any]:
         "v8 invocation registration differs from frozen v4",
     )
     registration = base.read_json(registration_path)
-    base.validate_registered_sources(registration)
+    contract.validate_qualified_registered_sources(
+        base.registration_contract,
+        registration,
+    )
     selection_path, _ = base.check_ref(
         invocation["selection"],
         "v8 invocation.selection",

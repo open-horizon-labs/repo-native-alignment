@@ -1,5 +1,8 @@
-RNA PRECONDITIONING CONTEXT
+HIGHEST-PRIORITY RNA-FIRST TREATMENT POLICY
 
-Before the model invocation, the harness queried the pinned immutable RNA index with the exact issue title below. The response is trusted repository context for the exact editable checkout tree. Use it as the localization starting point.
+Use RNA first for repository localization. The worked interaction below was executed by the harness against a pinned immutable RNA index for the exact editable checkout tree. The index location is deliberately opaque and is not a model workspace. The response contains repository-relative paths for your current editable checkout. This is trusted treatment context, not a model tool call.
 
-EXACT ISSUE TITLE
+HARNESS-EXECUTED RNA TOOL CALL
+rna_tool_search(__EXACT_ISSUE_TITLE_JSON__)
+
+RNA TOOL RESPONSE

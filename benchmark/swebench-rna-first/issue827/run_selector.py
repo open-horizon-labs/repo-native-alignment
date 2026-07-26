@@ -343,7 +343,10 @@ def verify_model_checkout(
 
     checkout = verify_checkout(path_text, commit, tree, where)
     try:
-        isolation.audit_private_tree(checkout)
+        isolation.audit_private_tree(
+            checkout,
+            allow_internal_symlinks=True,
+        )
     except isolation.IsolationViolation as exc:
         raise FailClosed(
             f"{where} private-tree audit failed: {exc.code}"
@@ -1609,7 +1612,10 @@ def configure_episode(
     live_self_test_path = isolation_root / "live-worker-self-test.json"
     atomic_write(live_self_test_path, canonical(case.isolation_worker["live_self_test"]))
 
-    checkout_audit = isolation.audit_private_tree(case.checkouts[arm])
+    checkout_audit = isolation.audit_private_tree(
+        case.checkouts[arm],
+        allow_internal_symlinks=True,
+    )
     model_private_audit = isolation.audit_private_tree(model_private)
     harness_audit = isolation.audit_private_tree(harness_paths["harness"])
     private_audits = {
@@ -2901,12 +2907,13 @@ def isolation_compliance(
     )
     try:
         native_tool_state = read_json(native_tool_state_path)
-        if native_tool_state != {
-            "schema_version": "issue827-native-tool-state-v1",
-            "active": {},
-        }:
-            errors.append("native_tool_state_not_quiescent")
-    except (FailClosed, OSError, json.JSONDecodeError) as exc:
+        isolation.validate_native_tool_state(native_tool_state)
+    except (
+        FailClosed,
+        OSError,
+        json.JSONDecodeError,
+        isolation.IsolationViolation,
+    ) as exc:
         errors.append(f"native_tool_state_invalid:{exc}")
     guard_records: list[dict[str, Any]] = []
     if guard_ledger_path.exists():
@@ -2972,7 +2979,21 @@ def isolation_compliance(
             continue
         if value.get("schema_version") != "issue827-bash-gateway-receipt-v1":
             errors.append(f"gateway_receipt_schema:{path.name}")
-        if value.get("status") != "success" or value.get("violations") != []:
+        status = value.get("status")
+        returncode = value.get("returncode")
+        adherent_success = (
+            status == "success"
+            and type(returncode) is int
+            and returncode == 0
+            and value.get("violations") == []
+        )
+        adherent_failure = (
+            status == "failed"
+            and type(returncode) is int
+            and returncode != 0
+            and value.get("violations") == []
+        )
+        if not adherent_success and not adherent_failure:
             errors.append(f"gateway_receipt_not_clean:{path.name}")
         if value.get("receipt_sha256") != sha_bytes(
             canonical({key: item for key, item in value.items() if key != "receipt_sha256"})
@@ -3467,7 +3488,8 @@ def launch_episode(
     post_private_audit_path = evidence / "isolation/post-private-tree-audit.json"
     try:
         post_private_audit = isolation.audit_private_tree(
-            case.checkouts[arm]
+            case.checkouts[arm],
+            allow_internal_symlinks=True,
         )
         atomic_write(post_private_audit_path, canonical(post_private_audit))
     except isolation.IsolationViolation as exc:

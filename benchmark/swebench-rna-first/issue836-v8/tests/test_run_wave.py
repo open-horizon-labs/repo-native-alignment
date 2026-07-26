@@ -16,10 +16,67 @@ sys.path.insert(0, str(ROOT))
 import run_wave  # noqa: E402
 import assemble_wave  # noqa: E402
 import observational_tool_supervisor as observer  # noqa: E402
+import verify_preconditioned as verifier  # noqa: E402
 
 
 class PriorWaveSealTests(unittest.TestCase):
+    def test_qualified_registration_allows_only_exact_successor_delta(self) -> None:
+        registration = json.loads(
+            (ROOT.parent / "issue836-v4" / "registration.json").read_bytes()
+        )
+        contract = run_wave.contract
+        contract.validate_qualified_registered_sources(
+            run_wave.base.registration_contract,
+            registration,
+        )
+        original_sha = contract.sha_file
+
+        def drift(path: Path) -> str:
+            if (
+                path.parent == contract.SUCCESSOR_HARNESS_ROOT
+                and path.name == "tool_supervisor.py"
+            ):
+                return "0" * 64
+            return original_sha(path)
+
+        with mock.patch.object(contract, "sha_file", side_effect=drift):
+            with self.assertRaises(contract.ContractError):
+                contract.validate_qualified_registered_sources(
+                    run_wave.base.registration_contract,
+                    registration,
+                )
+
+    def test_deterministic_query_uses_clean_bounded_issue_context(self) -> None:
+        problem = (
+            b"Generic title\r\n"
+            b"<!-- template noise -->\r\n"
+            b"Version 1.2.3\r\n\r\n"
+            b"Calling `target_api` returns the wrong class.\r\n"
+            b"```python\r\nignored_call()\r\n```\r\n"
+            + (b"x" * 600)
+        )
+        query = run_wave.deterministic_rna_query(problem)
+        title, context = query.decode().split("\n\n", 1)
+        self.assertEqual(title, "Generic title")
+        self.assertTrue(
+            context.startswith(
+                "Version 1.2.3 Calling `target_api` returns the wrong class. "
+            )
+        )
+        self.assertNotIn("template noise", context)
+        self.assertNotIn("ignored_call", context)
+        self.assertEqual(len(context), run_wave.QUERY_BODY_CHAR_LIMIT)
+        self.assertEqual(
+            verifier.deterministic_rna_query(problem),
+            query,
+        )
+
     def test_successor_dns_aliases_are_literal_and_gateway_is_reachable(self) -> None:
+        self.assertEqual(
+            run_wave.HOST_DEV_NULL_SMOKE_COMMAND,
+            "printf host-null-smoke >/dev/null",
+        )
+        self.assertEqual(run_wave.GATEWAY_SMOKE_COMMAND, "exit 7")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             read = root / "read"
@@ -37,12 +94,79 @@ class PriorWaveSealTests(unittest.TestCase):
             )
         self.assertIn('(literal "/etc")', profile)
         self.assertIn('(literal "/var")', profile)
+        self.assertIn('(literal "/dev/null")', profile)
         self.assertNotIn('(subpath "/etc")', profile)
         self.assertNotIn('(subpath "/var")', profile)
         self.assertNotIn("rna827-landlock-docker.sock", profile)
         self.assertNotIn("(deny network-outbound", profile)
 
         self.assertIn("(deny network-outbound", loopback_profile)
+
+    def test_gateway_smoke_uses_its_own_existing_output_root(self) -> None:
+        class Configured(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paid_output = root / "paid-output"
+            smoke_output = root / "smoke-output"
+            checkout = root / "checkout"
+            index_checkout = root / "index-checkout"
+            checkout.mkdir()
+            index_checkout.mkdir()
+            prepared = run_wave.base.PreparedRun(
+                manifest_path=root / "manifest.json",
+                manifest_ref={},
+                registration_path=root / "registration.json",
+                registration_ref={},
+                registration={},
+                selection_path=root / "selection.json",
+                selection_ref={},
+                selection={},
+                claude_path=root / "claude",
+                claude_version="test",
+                launcher_path=root / "launcher",
+                binary_path=root / "binary",
+                rna_refs={},
+                trusted_rna_toolchain_root=root,
+                mcp_path=root / "mcp.json",
+                output_root=paid_output,
+                cases=(),
+                isolation_host={},
+            )
+            case = SimpleNamespace(
+                rank=1,
+                case_id="owner__repo-1",
+                checkouts={"A": checkout},
+                index_checkout=index_checkout,
+            )
+            with (
+                mock.patch.object(
+                    run_wave.base,
+                    "materialize_harness",
+                    return_value={},
+                ),
+                mock.patch.object(
+                    run_wave.base,
+                    "configure_episode",
+                    side_effect=Configured,
+                ) as configure,
+                self.assertRaises(Configured),
+            ):
+                run_wave.gateway_smoke(
+                    prepared,
+                    [case],
+                    rank=1,
+                    output_root=smoke_output,
+                )
+
+            self.assertFalse(paid_output.exists())
+            self.assertTrue(smoke_output.is_dir())
+            configured = configure.call_args.args[0]
+            self.assertIsInstance(configured, run_wave.base.PreparedRun)
+            self.assertEqual(configured.output_root, smoke_output)
+            self.assertEqual(prepared.output_root, paid_output)
+            self.assertEqual(configured.manifest_path, prepared.manifest_path)
 
     def test_treatment_is_preconditioned_without_a_first_tool_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,10 +206,40 @@ class PriorWaveSealTests(unittest.TestCase):
                     )
                 )
 
-        self.assertIn(b"EXACT ISSUE TITLE\n\nExact issue title", system)
-        self.assertIn(projection, system)
+        worked_call = b'rna_tool_search("Exact issue title")'
+        expected = (
+            b"HIGHEST-PRIORITY RNA-FIRST TREATMENT POLICY\n\n"
+            b"Use RNA first for repository localization. The worked "
+            b"interaction below was executed by the harness against a pinned "
+            b"immutable RNA index for the exact editable checkout tree. The "
+            b"index location is deliberately opaque and is not a model "
+            b"workspace. The response contains repository-relative paths for "
+            b"your current editable checkout. This is trusted treatment "
+            b"context, not a model tool call.\n\n"
+            b"HARNESS-EXECUTED RNA TOOL CALL\n"
+            + worked_call
+            + b"\n\nRNA TOOL RESPONSE\n"
+            + projection
+            + b"\nEND HARNESS-EXECUTED RNA TOOL INTERACTION\n\n"
+            b"The ordinary coding tool surface remains available. Follow-up "
+            b"RNA graph traversal is available when it would help:\n\n"
+            + str(traversal).encode()
+            + b" --node '<STABLE_ID_FROM_THE_INJECTED_RESULT>' --mode "
+            b"neighbors\n\n"
+            b"Further RNA calls are optional, and the same wrapper supports "
+            b"--mode impact. Use the injected paths and graph context to avoid "
+            b"unnecessary broad Grep, Read, or sed discovery. Do not "
+            b"inspect the immutable RNA index, hidden tests, evaluator output, "
+            b"gold patches, or evidence from another arm. Produce one terminal "
+            b"patch and run relevant visible tests. There is no model retry or "
+            b"evaluator feedback.\n"
+        )
+        self.assertEqual(system, expected)
+        self.assertEqual(system.count(projection), 1)
         self.assertNotIn(b"Your FIRST actual tool call", system)
         self.assertNotIn(b"supervisor enforces", system)
+        self.assertNotIn(b"The first call must return", system)
+        self.assertNotIn(b"RNA_STATUS=", system)
         self.assertIn(str(traversal).encode(), system)
         self.assertEqual(ids, acquired[1])
         self.assertEqual(elapsed, 0.25)
@@ -218,6 +372,67 @@ class PriorWaveSealTests(unittest.TestCase):
         self.assertEqual(
             result["system_read_roots"],
             ["/existing", str(docker.parent)],
+        )
+
+    def test_native_tool_guard_allows_parallel_tools_but_still_compiles(
+        self,
+    ) -> None:
+        source = (
+            ROOT.parent / "issue827" / "hook_guard.py"
+        ).read_bytes()
+        transformed = run_wave.allow_parallel_native_tools(source)
+
+        self.assertNotIn(b"native_tool_rw_overlap", transformed)
+        self.assertNotIn(b"native_tool_post_unresolved", transformed)
+        self.assertIn(b"native_tool_duplicate_pre", transformed)
+        self.assertIn(b"native_tool_post_without_matching_pre", transformed)
+        compile(transformed, "patched-hook-guard.py", "exec")
+
+    def test_materialized_harness_contains_observer_and_parallel_guard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case_root = Path(directory).resolve()
+            paths = run_wave.materialize_observational_harness(
+                case_root,
+                "T",
+            )
+            manifest = json.loads(paths["materialization"].read_bytes())
+            observer_bytes = paths["tool_supervisor.py"].read_bytes()
+            guard_bytes = paths["hook_guard.py"].read_bytes()
+
+        self.assertEqual(
+            observer_bytes,
+            (ROOT / "observational_tool_supervisor.py").read_bytes(),
+        )
+        self.assertNotIn(b"native_tool_rw_overlap", guard_bytes)
+        self.assertNotIn(b"native_tool_post_unresolved", guard_bytes)
+        self.assertEqual(
+            manifest["files"]["hook_guard.py"]["destination"]["sha256"],
+            run_wave.base.sha_bytes(guard_bytes),
+        )
+
+    def test_token_reporting_uses_whole_invocation_model_usage(self) -> None:
+        sentinel = {"valid": True}
+        with mock.patch.object(
+            run_wave,
+            "_ORIGINAL_TOKEN_LEDGER",
+            return_value=sentinel,
+        ) as original:
+            result = run_wave.authoritative_token_ledger(
+                {"modelUsage": {}},
+                model_events=[{"message_id": "observational"}],
+                provider_responses=3,
+                provider_requests=None,
+            )
+
+        self.assertIs(result, sentinel)
+        original.assert_called_once_with(
+            {"modelUsage": {}},
+            model_invoked=True,
+            model_events=None,
+            provider_responses=3,
+            provider_requests=None,
         )
 
     def test_adapter_and_runner_manifest_interfaces_are_exact(self) -> None:

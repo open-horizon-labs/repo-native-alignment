@@ -89,6 +89,27 @@ def common_fatal(config: Mapping[str, object]) -> bool:
     return value.get("fatal") is True
 
 
+def map_workspace_alias(
+    *,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+    checkout: str,
+) -> tuple[dict[str, object], bool]:
+    """Map the worker-visible /workspace alias to the host checkout."""
+
+    key = "file_path" if tool_name in {"Read", "Edit", "Write"} else "path"
+    raw = tool_input.get(key)
+    if (
+        not isinstance(raw, str)
+        or not (raw == "/workspace" or raw.startswith("/workspace/"))
+    ):
+        return dict(tool_input), False
+    suffix = raw[len("/workspace") :].lstrip("/")
+    updated = dict(tool_input)
+    updated[key] = str(Path(checkout) / suffix)
+    return updated, True
+
+
 def hook_output(
     *,
     event_name: str,
@@ -247,9 +268,37 @@ def _receipt_for_gateway_command(
         or receipt.get("request_sha256") != request_sha
     ):
         raise IsolationViolation("gateway_receipt_binding_mismatch")
-    if receipt.get("status") != "success":
+    observed_hash = receipt.get("receipt_sha256")
+    body = {
+        key: value
+        for key, value in receipt.items()
+        if key != "receipt_sha256"
+    }
+    if (
+        not isinstance(observed_hash, str)
+        or observed_hash != sha256_bytes(canonical(body))
+    ):
+        raise IsolationViolation("gateway_receipt_self_hash_invalid")
+    status = receipt.get("status")
+    returncode = receipt.get("returncode")
+    violations = receipt.get("violations")
+    adherent_success = (
+        status == "success"
+        and type(returncode) is int
+        and returncode == 0
+        and violations == []
+    )
+    adherent_failure = (
+        status == "failed"
+        and type(returncode) is int
+        and returncode != 0
+        and violations == []
+    )
+    if not adherent_success and not adherent_failure:
         raise IsolationViolation(
-            "gateway_receipt_not_success", status=receipt.get("status")
+            "gateway_receipt_not_adherent",
+            status=status,
+            returncode=returncode,
         )
     return receipt
 
@@ -305,20 +354,44 @@ def handle(event: dict, config: dict) -> int:
             if not isinstance(tool_input, dict):
                 raise IsolationViolation("tool_input_not_object", tool=tool)
             if tool in {"Read", "Edit", "Write", "Glob", "Grep"}:
-                validated = validate_effective_path(
+                effective_input, workspace_alias = map_workspace_alias(
                     tool_name=str(tool),
                     tool_input=tool_input,
+                    checkout=str(config["checkout"]),
+                )
+                validated = validate_effective_path(
+                    tool_name=str(tool),
+                    tool_input=effective_input,
                     cwd=event.get("cwd"),
                     read_roots=list(config["native_read_roots"]),
                     write_roots=list(config["native_write_roots"]),
                 )
+                if workspace_alias:
+                    key = (
+                        "file_path"
+                        if tool in {"Read", "Edit", "Write"}
+                        else "path"
+                    )
+                    validated["workspace_alias_rewritten"] = True
+                    validated["original_path_sha256"] = sha256_bytes(
+                        str(tool_input.get(key)).encode("utf-8")
+                    )
                 _ledger(
                     config,
                     event,
-                    decision="allow",
+                    decision=(
+                        "replace_allow" if workspace_alias else "allow"
+                    ),
                     reason=None,
                     payload=validated,
                 )
+                if workspace_alias:
+                    hook_output(
+                        event_name="PreToolUse",
+                        decision="allow",
+                        reason="/workspace mapped to the episode checkout",
+                        updated_input=effective_input,
+                    )
                 return 0
             command = tool_input.get("command")
             if not isinstance(command, str) or not command or "\x00" in command:
@@ -356,16 +429,30 @@ def handle(event: dict, config: dict) -> int:
             if not isinstance(command, str):
                 raise IsolationViolation("gateway_post_command_missing")
             receipt = _receipt_for_gateway_command(command, config)
-            if name == "PostToolUseFailure":
-                raise IsolationViolation("gateway_tool_reported_failure")
+            expected_event = (
+                "PostToolUse"
+                if receipt["status"] == "success"
+                else "PostToolUseFailure"
+            )
+            if name != expected_event:
+                raise IsolationViolation(
+                    "gateway_tool_result_mismatch",
+                    status=receipt["status"],
+                    event=name,
+                )
             _ledger(
                 config,
                 event,
-                decision="verified",
+                decision=(
+                    "verified"
+                    if receipt["status"] == "success"
+                    else "verified_failure"
+                ),
                 reason=None,
                 payload={
                     "request_id": receipt["request_id"],
                     "receipt_sha256": receipt["receipt_sha256"],
+                    "returncode": receipt["returncode"],
                 },
             )
             return 0

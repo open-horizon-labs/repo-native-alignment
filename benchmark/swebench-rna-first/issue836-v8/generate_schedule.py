@@ -102,10 +102,7 @@ def build(implementation_commit: str) -> dict:
     return {
         "schema_version": contract.SCHEDULE_SCHEMA,
         "authoritative": True,
-        "protocol_change": (
-            "restore_title_query_preconditioning_and_trusted_gateway_access_"
-            "no_cohort_or_arm_order_change"
-        ),
+        "protocol_change": contract.PROTOCOL_CHANGE,
         "base_source_commit": contract.BASE_SOURCE_COMMIT,
         "base_source_tree": contract.BASE_SOURCE_TREE,
         "implementation_commit": commit,
@@ -122,10 +119,10 @@ def build(implementation_commit: str) -> dict:
         "episode_count": 40,
         "per_episode_budget_usd": 6.0,
         "maximum_budget_usd": 240.0,
-        "max_cases_per_wave": 2,
-        "max_episodes_per_wave": 4,
+        "max_cases_per_wave": 3,
+        "max_episodes_per_wave": 6,
         "same_case_serialized": True,
-        "different_cases_max_parallel": 2,
+        "different_cases_max_parallel": 3,
         "one_shot_per_rank": True,
         "append_only_cumulative_ledger": True,
         "evaluation_before_full_cohort_allowed": False,
