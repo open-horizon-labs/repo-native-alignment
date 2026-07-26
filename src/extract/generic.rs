@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Result;
 
 use super::query::{CaptureSet, QueryExtractor, RouteQueryConfig};
-use super::string_literals::harvest_string_literals;
+use super::string_literals::{StringLiteralConfig, harvest_string_literals};
 use super::{ExtractionResult, Extractor};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use crate::scanner::PatternConfig;
@@ -362,10 +362,12 @@ impl GenericExtractor {
                 tree.root_node(),
                 path,
                 source,
-                self.config.language_name,
-                outer_kind,
-                *content_child,
-                self.config.docstring_in_body,
+                StringLiteralConfig {
+                    language: self.config.language_name,
+                    node_kind: outer_kind,
+                    content_child: *content_child,
+                    skip_body_docstrings: self.config.docstring_in_body,
+                },
                 &mut nodes,
             );
         }

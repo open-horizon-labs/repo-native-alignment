@@ -11,6 +11,14 @@ use std::path::Path;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
+#[derive(Clone, Copy)]
+pub struct StringLiteralConfig<'a> {
+    pub language: &'a str,
+    pub node_kind: &'a str,
+    pub content_child: Option<&'a str>,
+    pub skip_body_docstrings: bool,
+}
+
 /// Harvest single-token string literals from a tree-sitter AST as synthetic Const nodes.
 ///
 /// Walks the entire AST looking for nodes whose kind matches `string_node_kind`.
@@ -29,57 +37,36 @@ use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 /// * `root` — root node of the parsed AST
 /// * `path` — file path (used for Node identity)
 /// * `source` — raw source bytes
-/// * `language` — language name for Node metadata
-/// * `string_node_kind` — tree-sitter node kind string for string literals (e.g. `"string_literal"`)
-/// * `content_child` — optional child node kind that holds the actual string content (e.g. `"string_content"`);
-///   if `None`, surrounding quotes are stripped from the raw node text
-/// * `skip_body_docstrings` — skip first-statement module/function/class strings that the
-///   language config already treats as documentation
+/// * `config` — language metadata, tree-sitter string node shape, and whether body
+///   docstrings should be excluded from synthetic constants
 /// * `nodes` — output vector to push harvested Const nodes into
 pub fn harvest_string_literals(
     root: tree_sitter::Node,
     path: &Path,
     source: &[u8],
-    language: &str,
-    string_node_kind: &str,
-    content_child: Option<&str>,
-    skip_body_docstrings: bool,
+    config: StringLiteralConfig<'_>,
     nodes: &mut Vec<Node>,
 ) {
     let mut seen: HashSet<String> = HashSet::new();
-    harvest_rec(
-        root,
-        path,
-        source,
-        language,
-        string_node_kind,
-        content_child,
-        skip_body_docstrings,
-        nodes,
-        &mut seen,
-    );
+    harvest_rec(root, path, source, config, nodes, &mut seen);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn harvest_rec(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
-    language: &str,
-    string_node_kind: &str,
-    content_child: Option<&str>,
-    skip_body_docstrings: bool,
+    config: StringLiteralConfig<'_>,
     nodes: &mut Vec<Node>,
     seen: &mut HashSet<String>,
 ) {
-    if node.kind() == string_node_kind {
-        if skip_body_docstrings && is_body_docstring(node) {
+    if node.kind() == config.node_kind {
+        if config.skip_body_docstrings && is_body_docstring(node) {
             return;
         }
         let raw = node.utf8_text(source).unwrap_or("").trim().to_string();
 
         // Extract value: use named content child if specified, otherwise strip quotes
-        let value = if let Some(child_kind) = content_child {
+        let value = if let Some(child_kind) = config.content_child {
             let mut found = String::new();
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
@@ -114,7 +101,7 @@ fn harvest_rec(
                         name: value.clone(),
                         kind: NodeKind::Const,
                     },
-                    language: language.to_string(),
+                    language: config.language.to_string(),
                     line_start,
                     line_end: node.end_position().row + 1,
                     signature: format!("\"{}\"", value),
@@ -131,17 +118,7 @@ fn harvest_rec(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            harvest_rec(
-                child,
-                path,
-                source,
-                language,
-                string_node_kind,
-                content_child,
-                skip_body_docstrings,
-                nodes,
-                seen,
-            );
+            harvest_rec(child, path, source, config, nodes, seen);
         }
     }
 }
