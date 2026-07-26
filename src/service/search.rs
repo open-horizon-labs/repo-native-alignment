@@ -7627,6 +7627,11 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // For path/name queries use only the name part for ranking.
         let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
         sort_symbol_text_matches(&mut matches, sort_key, &text_terms, &graph_state.index);
+        // Match the bounded semantic over-fetch contract before cross-encoder
+        // inference. Without this truncation, a missing embedding generation
+        // sends every lexical match through the reranker even when the caller
+        // requested only a handful of results.
+        matches.truncate(rerank_over_fetch);
     }
 
     // Cross-encoder reranking: re-score the top candidates using a cross-encoder
