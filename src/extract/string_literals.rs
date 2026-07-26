@@ -33,6 +33,8 @@ use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 /// * `string_node_kind` — tree-sitter node kind string for string literals (e.g. `"string_literal"`)
 /// * `content_child` — optional child node kind that holds the actual string content (e.g. `"string_content"`);
 ///   if `None`, surrounding quotes are stripped from the raw node text
+/// * `skip_body_docstrings` — skip first-statement module/function/class strings that the
+///   language config already treats as documentation
 /// * `nodes` — output vector to push harvested Const nodes into
 pub fn harvest_string_literals(
     root: tree_sitter::Node,
@@ -41,6 +43,7 @@ pub fn harvest_string_literals(
     language: &str,
     string_node_kind: &str,
     content_child: Option<&str>,
+    skip_body_docstrings: bool,
     nodes: &mut Vec<Node>,
 ) {
     let mut seen: HashSet<String> = HashSet::new();
@@ -51,6 +54,7 @@ pub fn harvest_string_literals(
         language,
         string_node_kind,
         content_child,
+        skip_body_docstrings,
         nodes,
         &mut seen,
     );
@@ -64,10 +68,14 @@ fn harvest_rec(
     language: &str,
     string_node_kind: &str,
     content_child: Option<&str>,
+    skip_body_docstrings: bool,
     nodes: &mut Vec<Node>,
     seen: &mut HashSet<String>,
 ) {
     if node.kind() == string_node_kind {
+        if skip_body_docstrings && is_body_docstring(node) {
+            return;
+        }
         let raw = node.utf8_text(source).unwrap_or("").trim().to_string();
 
         // Extract value: use named content child if specified, otherwise strip quotes
@@ -130,11 +138,42 @@ fn harvest_rec(
                 language,
                 string_node_kind,
                 content_child,
+                skip_body_docstrings,
                 nodes,
                 seen,
             );
         }
     }
+}
+
+/// Return true for a string that is the first statement in a module, function, or class body.
+/// The caller enables this only for language configurations whose documentation syntax uses
+/// body string literals (currently Python), so generic extraction has no language-name branch.
+fn is_body_docstring(node: tree_sitter::Node) -> bool {
+    let Some(statement) = node.parent() else {
+        return false;
+    };
+    if statement.kind() != "expression_statement" {
+        return false;
+    }
+    let Some(container) = statement.parent() else {
+        return false;
+    };
+    let Some(first_statement) = container.named_child(0) else {
+        return false;
+    };
+    if first_statement.id() != statement.id() {
+        return false;
+    }
+    if container.kind() == "module" {
+        return true;
+    }
+    if container.kind() != "block" {
+        return false;
+    }
+    container
+        .parent()
+        .is_some_and(|owner| matches!(owner.kind(), "function_definition" | "class_definition"))
 }
 
 /// Strip surrounding quote characters from a raw string literal text.
