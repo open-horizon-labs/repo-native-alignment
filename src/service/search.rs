@@ -7196,6 +7196,14 @@ async fn flat_code_symbol_search<'a>(
     .matches
 }
 
+fn dedupe_nodes_preserving_order(nodes: Vec<&Node>) -> Vec<&Node> {
+    let mut seen = BTreeSet::new();
+    nodes
+        .into_iter()
+        .filter(|node| seen.insert(node.stable_id()))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn flat_code_symbol_search_with_diagnostics<'a>(
     query_str: &str,
@@ -7429,7 +7437,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                     }
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
                     // node_passes_filters already handles the path/name split check.
-                    let found: Vec<_> = results
+                    let found = results
                         .iter()
                         .filter(|r| r.kind.starts_with("code:"))
                         .filter_map(|result| {
@@ -7438,6 +7446,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                         .filter(|node| node_passes_filters(node))
                         .take(rerank_over_fetch)
                         .collect();
+                    let found = dedupe_nodes_preserving_order(found);
                     order_evidence
                         .insert(channel, found.iter().map(|node| node.stable_id()).collect());
                     found
@@ -9032,6 +9041,20 @@ mod tests {
             enrichment_jobs: Vec::new(),
             business_context: &BUSINESS_CONTEXT,
         }
+    }
+
+    #[test]
+    fn embedding_candidates_are_deduplicated_before_reranking() {
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let deduplicated =
+            dedupe_nodes_preserving_order(vec![&first, &first, &second, &first, &second]);
+        let ids: Vec<_> = deduplicated
+            .iter()
+            .map(|node| node.stable_id())
+            .collect();
+
+        assert_eq!(ids, vec![first.stable_id(), second.stable_id()]);
     }
 
     #[test]
