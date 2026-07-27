@@ -23,6 +23,13 @@ treatment on each backend for every case. The original 80 cells remain intact;
 T2 is reported as a distinct condition in the unified report and is not
 substituted for the original T arm.
 
+An additional post-hoc ceiling-effect sensitivity execution contributes 120
+more cells: A, original T, and T2 on Claude Haiku 4.5 and GPT-5.3 Codex Spark
+for every frozen case. It tests the concern that Sonnet and Luna solve too many
+cases for treatment differences to be visible. It does not replace or alter
+the original 120 Sonnet/Luna cells and is not part of the preregistered
+selector.
+
 The original issue preregistration described 40 Sonnet episodes under a
 mandatory first-traversal harness. Operational testing exposed material
 harness defects and model/runtime incompatibilities. The final 20×4 analysis
@@ -186,10 +193,33 @@ deterministic title-only fallback; the other 19 ranks use the primary
 title-plus-normalized-512-character query. T2 prompt, base, and directive bytes
 are identical between Sonnet and Luna for every rank.
 
+### Weaker-model sensitivity execution
+
+The Haiku/Spark execution reuses the checked-in A, original T, and T2
+user-prompt bytes exactly; it does not rebuild RNA context. For every case and
+condition, Haiku and Spark receive matching user-prompt SHA-256 values, and
+those values match the corresponding frozen Sonnet/Luna condition. All prompts
+remain at or below 32,768 bytes, below Spark's 121,600-token effective context
+window and Haiku's 200,000-token context window.
+
+Conditions are serialized within each case so one checkout is never shared by
+simultaneous arms. The deterministic rotating order is A→T→T2, T→T2→A, or
+T2→A→T by rank; different cases may run concurrently. The analysis retains
+every completed cell, including empty patches and unresolved verdicts. One
+rank-6 Haiku T setup attempt failed before provider invocation because the
+launcher supplied the wrong checkout path; its zero-spend setup record is
+provenance only, and the first provider-invoked T episode is canonical. No
+paid weaker-model cell was replaced or rerun.
+
 ## Model runtimes
 
 - **Sonnet:** Claude Sonnet 5 through the logged-in Claude CLI.
 - **Luna:** GPT-5.6 Luna through Codex App Server.
+- **Haiku:** Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) through the
+  logged-in Claude CLI, using the same audited Claude runner as Sonnet.
+- **Spark:** GPT-5.3 Codex Spark (`gpt-5.3-codex-spark`, high effort) through
+  Codex App Server, with a 128,000-token nominal and 121,600-token effective
+  context window.
 
 Each backend uses its provider-native tool scaffolding, so Sonnet/Luna totals
 must not be treated as a randomized cross-model comparison. Within a backend,
@@ -210,7 +240,12 @@ outcomes:
 - unbounded graph projections, extracted docstring constants, duplicate
   prompt/task material, and unparsed top-level producer record bullets; and
 - a stale RNA launcher/binary that could hang after the model requested a
-  traversal.
+  traversal; and
+- Claude terminal-patch extraction relative to `HEAD`, which loses valid work
+  when Haiku commits its fix. Haiku patches are instead reconstructed
+  deterministically as the frozen base commit versus the final worktree, with
+  untracked files included via intent-to-add; the original head-relative
+  receipts and patches remain retained provenance.
 
 Affected attempts are not canonical evidence. Prompt construction was frozen
 and byte-audited before replacement episodes. Luna used a predeclared
@@ -234,7 +269,7 @@ Every terminal patch was evaluated with the stock SWE-bench 4.1.0 exact-patch
 evaluator. Evaluations are bound to instance ID and terminal-patch SHA-256.
 Evaluator results were never provided to a model. All 80 original canonical
 cells and all 40 additive T2 cells have a completed `RESOLVED` or `UNRESOLVED`
-verdict.
+verdict. The same contract applies to all 120 weaker-model cells.
 
 ## Metrics
 
@@ -250,7 +285,11 @@ The report includes, per cell and by condition:
 
 For Sonnet, cost is the sum of provider-receipt model entries. For Luna, cost
 is an API-equivalent estimate using the published standard prices captured by
-the evidence manifest; it is not a claim about App Server billing.
+the evidence manifest; it is not a claim about App Server billing. Haiku cost
+is the provider-receipt total and is cross-checked against its per-model usage
+entry. Spark cost is reported as unavailable: App Server exposes no episode
+cost for these runs and Spark has no published API rate, so the report does not
+invent one.
 
 Uncached Sonnet input is ordinary input plus cache-creation input across the
 main Sonnet model and the CLI's auxiliary Haiku model. Both the inclusive and
@@ -264,6 +303,10 @@ All 80 original transcripts passed structural parsing and independent tool
 recounting. All 40 additive T2 transcripts passed the same checks plus exact
 prompt and patch hashing, model/context validation, item reconciliation, and
 foreign-rank/checkout-reference checks.
+All 120 weaker-model transcripts pass exact prompt hashing, execution and
+terminal-patch validation, independent tool recounting, and foreign-rank
+contamination checks. Spark additionally passes App Server item reconciliation
+and exact context-window validation.
 Two Luna `imageView` calls omitted from provider receipts were restored from
 the transcript. One null Luna command output was retained and disclosed; no
 started item lacked a completion record. Web searches and direct-solution
@@ -284,3 +327,9 @@ evidence. Efficiency distributions are heterogeneous and contain large
 positive and negative trajectory outliers. Cross-model comparisons are
 descriptive, and outcome-normalized ratios are post-hoc diagnostics rather
 than preregistered decision metrics.
+
+The weaker-model execution is explicitly a post-hoc sensitivity analysis. It
+can reveal differential performance hidden by a ceiling, but it does not turn
+the repaired study into a preregistered experiment. Haiku and Spark also differ
+in context window, model capability, provider scaffolding, and native tools;
+only A/T/T2 comparisons within one model are treated as paired effects.

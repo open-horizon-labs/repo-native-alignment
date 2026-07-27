@@ -20,8 +20,8 @@ REPORT = ROOT / "REPORT.md"
 METHOD = ROOT / "METHOD.md"
 MANIFEST = ROOT / "t2-evidence-manifest.json"
 EXPECTED_T2_RESULTS_SHA = "26e9ad318e2d3a03f355499326dd644968bbd3770807d69d272c617ca7e62daf"
-EXPECTED_REPORT_SHA = "8281e45857f58d2b5ca85d2de8f3649024e8f077b95b2aad672e2701476af47d"
-EXPECTED_METHOD_SHA = "eefcb2f7b4b6420cbfe3da2ed5e2c2335e37af3fb8d092075e8e939bc2045049"
+EXPECTED_REPORT_SHA = "b2a4b238fac4114077947735ec1ff9de5a21091a2337106f726f00415ae32219"
+EXPECTED_METHOD_SHA = "2acdce0175fd75ab41a0bc8ac3b95eb4425daa9276f1eaad4a4f65655276cafb"
 EXPECTED_MANIFEST_SHA = "518dc273c59fc548008c66f84ded5dcf1c377696aef0befb6824e3a2151b28cc"
 BASE_SHA = "da68ef814351f2953d9954f4cc309bf755605ac4e672c3d5096106cc664e3d49"
 DIRECTIVE_SHA = "f91a19798b6fbee94e3e1ae17848991154d31ad2d60317f2f0436abfe327143b"
@@ -266,7 +266,10 @@ def main() -> int:
     )
     require("no edge-type filter" in report, "report faithful graph statement")
     require("original 80-cell A/T evidence" in report, "report preserves original evidence")
-    require("42 paid T2 provider episodes" in report, "report superseded episode accounting")
+    require(
+        "Sonnet/Luna T2 extension executed 42 paid provider episodes" in report,
+        "report superseded episode accounting",
+    )
     require(manifest["schema_version"] == "issue836-t2-unfiltered-evidence-manifest-v2", "T2 manifest schema")
     require(manifest["paid_model_calls_to_build_review_package"] == 0, "T2 review package model calls")
     require(manifest["paid_t2_episode_count"] == 42, "paid T2 episode count")
