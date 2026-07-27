@@ -68,9 +68,8 @@ The T user prompt begins with a worked, verbatim RNA interaction:
    title-only fallback defined below) and its compact search result, where the
    exact byte-level construction of `title` and `normalized_body` is specified
    below;
-2. `rna_tool_search(node="<stable ID of the first admissible traversal-root
-   candidate under the deterministic title-overlap, production-first, and
-   RNA-rerank ordering whose graph yields a valid bounded prompt>",
+2. `rna_tool_search(node="<first admissible stable node ID under the
+   deterministic title-overlap, production-first, and RNA-rerank ordering>",
    mode="neighbors", hops=2, direction="both", edge_types="calls",
    include_body=true, minify_body=true, limit=<selected whole-record
    limit>)` and its graph result; then
