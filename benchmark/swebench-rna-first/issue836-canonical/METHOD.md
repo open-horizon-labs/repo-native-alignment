@@ -16,8 +16,11 @@ reported separately from model tool calls.
 
 The case population is the deterministic 20-case issue #836 cohort. Case
 identity, commit, tree, and order come from the published issue836-v4
-registration and selection. The canonical analysis has 80 cells: two arms on
-each of two model backends for every case.
+registration and selection. The original canonical analysis has 80 cells: two
+arms on each of two model backends for every case. An additive post-hoc T2
+execution contributes 40 more cells, one faithful unfiltered typed-graph
+treatment on each backend for every case. The original 80 cells remain intact;
+T2 is reported separately and is not substituted for the original T arm.
 
 The original issue preregistration described 40 Sonnet episodes under a
 mandatory first-traversal harness. Operational testing exposed material
@@ -52,7 +55,7 @@ fix and run the relevant tests.
 A receives the normalized SWE-bench problem statement and no RNA directive or
 RNA results.
 
-### Treatment T
+### Original treatment T (calls-only graph)
 
 T receives the same standard task plus this 189-byte developer directive
 (SHA-256
@@ -120,6 +123,68 @@ Prompt bytes, base instructions, and treatment directives are byte-identical
 between Sonnet and Luna within each arm. The only intended A/T differences are
 the directive and the prepended RNA interaction.
 
+### Additive treatment T2 (unfiltered typed graph)
+
+T2 executes the faithful graph specification requested after the original T
+evidence was frozen. It is an additive, post-hoc condition, not a relabeling of
+T and not a retroactive preregistered arm. T2 uses the same standard task,
+166-byte base instruction, and 189-byte RNA directive as T.
+
+For each rank, T2 reuses the audited T text query and compact text-search result
+byte-for-byte. The primary model-visible text-search call is exactly:
+
+`rna_tool_search(title + "\n\n" + normalized_body[:512])`
+
+Here, `title` is the problem statement's first line after trimming the whole
+statement and then trimming that line at both ends. `normalized_body` is every
+remaining line joined as the body, with each run of Unicode whitespace replaced
+by one ASCII space. The slice is the first 512 Unicode characters. No label,
+quoting, or other text is added. If and only if that primary query cannot yield
+a valid compact result, an eligible traversal root, and a bounded valid graph
+projection, the producer tries the single deterministic fallback call
+`rna_tool_search(title)`. Only the selected query and result are model-visible;
+both calls use the cached strict hybrid reranker.
+
+The original calls-only graph result is not reused. Instead, the graph is
+freshly projected from the warm exact-tree cache with this model-visible call:
+
+`rna_tool_search(node="<first admissible stable node ID under the
+deterministic title-overlap, production-first, and RNA-rerank ordering>",
+mode="neighbors", hops=2,
+direction="both", include_body=true, minify_body=true,
+limit=<selected whole-record limit>)`
+
+“Traversal root” is the selected graph node, not a random seed. Eligible
+records and their ordering are exactly those defined for T above: descending
+unique title-token overlap, then production before test, then original
+RNA-reranked order. The producer tries candidates in that order and, for each
+candidate, tries whole-record limits `20`, `10`, `5`, `2`, and `1`. It selects
+the first candidate-and-limit pair that returns a valid graph projection and
+keeps the complete prompt at or below 32,768 bytes. Consequently, a later
+candidate is selected when every limit for an earlier candidate is invalid or
+still too large.
+
+There is deliberately no `edge_types` argument. RNA therefore traverses the
+unfiltered typed graph in both directions for exactly two hops. The projected
+records retain their typed edge labels (for example, `Calls`, `Defines`, or
+another producer-reported type) so the model can distinguish relationships.
+Deterministic whole-record projection and the limit ladder `20`, `10`, `5`,
+`2`, `1` are applied only after that traversal. The selected combination is the
+first admissible traversal root and limit whose complete projected records keep
+the entire user prompt at or below 32,768 bytes. A later root may be selected
+when an earlier root cannot yield a valid bounded projection.
+
+All 20 selected T2 prompts passed global byte audit before their canonical
+provider episodes. Ranks 1–19 passed before the original run. A later whole-record
+audit found that rank 20's original projection contained an unparsed top-level
+record bullet; its parser was repaired and its replacement prompt passed the
+same gate before the two replacement episodes. The selected prompts range from
+2,514 to 25,075 bytes (mean 18,085.8); their typed graph projections range from
+496 to 11,723 bytes (mean 4,671.65). Rank 12 uses the already-audited
+deterministic title-only fallback; the other 19 ranks use the primary
+title-plus-normalized-512-character query. T2 prompt, base, and directive bytes
+are identical between Sonnet and Luna for every rank.
+
 ## Model runtimes
 
 - **Sonnet:** Claude Sonnet 5 through the logged-in Claude CLI.
@@ -141,8 +206,8 @@ outcomes:
   standard task;
 - foreign-checkout and `PYTHONPATH` contamination;
 - mismatched A prompts across backends or mismatched T prompt construction;
-- unbounded graph projections, extracted docstring constants, and duplicate
-  prompt/task material; and
+- unbounded graph projections, extracted docstring constants, duplicate
+  prompt/task material, and unparsed top-level producer record bullets; and
 - a stale RNA launcher/binary that could hang after the model requested a
   traversal.
 
@@ -166,8 +231,9 @@ The RNA product fixes discovered during this work are included on PR #837:
 
 Every terminal patch was evaluated with the stock SWE-bench 4.1.0 exact-patch
 evaluator. Evaluations are bound to instance ID and terminal-patch SHA-256.
-Evaluator results were never provided to a model. All 80 canonical cells have
-a completed `RESOLVED` or `UNRESOLVED` verdict.
+Evaluator results were never provided to a model. All 80 original canonical
+cells and all 40 additive T2 cells have a completed `RESOLVED` or `UNRESOLVED`
+verdict.
 
 ## Metrics
 
@@ -193,7 +259,10 @@ uncached input directly. Luna reasoning output is a subset of output tokens.
 
 ## Transcript and evidence audit
 
-All 80 transcripts passed structural parsing and independent tool recounting.
+All 80 original transcripts passed structural parsing and independent tool
+recounting. All 40 additive T2 transcripts passed the same checks plus exact
+prompt and patch hashing, model/context validation, item reconciliation, and
+foreign-rank/checkout-reference checks.
 Two Luna `imageView` calls omitted from provider receipts were restored from
 the transcript. One null Luna command output was retained and disclosed; no
 started item lacked a completion record. Web searches and direct-solution

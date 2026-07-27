@@ -2,6 +2,16 @@
 
 Status: **COMPLETE**. Ready episodes: **80/80**; officially evaluated: **80/80**.
 
+**Additive T2 update:** the separately preserved faithful unfiltered typed-graph
+conditions are also complete (40/40 canonical cells and 40/40 stock evaluations).
+The program executed 42 paid T2 episodes: two original rank-20 cells were
+superseded after a whole-record projection parser defect was found, and their two
+audited replacements are canonical. T2 resolved 17/20 cases on both Sonnet and
+Luna. See the full six-condition matrix, input/output decomposition, costs,
+timing, tool mix, prompt audit, and transcript disclosures in
+[T2_REPORT.md](T2_REPORT.md). The original calls-only T evidence and analysis
+below remain unchanged.
+
 Every available cell passed exact prompt/base/directive hashes, checkout identity, transcript parsing, independent tool recounting, token extraction, and cost cross-checking. Missing or invalid cells are not replaced by historical attempts.
 
 Read [METHOD.md](METHOD.md) for the treatment construction, canonicalization
