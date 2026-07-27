@@ -43,3 +43,7 @@ jobs:
             -s benchmark/swebench-rna-first/issue830/tests \
             -p 'test_*.py' \
             -v
+          python3 -m unittest discover \
+            -s benchmark/swebench-rna-first/issue836-canonical/tests \
+            -p 'test_*.py' \
+            -v
