@@ -64,19 +64,26 @@ T receives the same standard task plus this 189-byte developer directive
 
 The T user prompt begins with a worked, verbatim RNA interaction:
 
-1. `rna_tool_search("<title>\n\n<body-prefix>")` (or the title-only
-   fallback defined below) and its compact search result;
-2. `rna_tool_search(node="<selected traversal-root stable ID>",
+1. `rna_tool_search(title + "\n\n" + normalized_body[:512])` (or the
+   title-only fallback defined below) and its compact search result, where the
+   exact byte-level construction of `title` and `normalized_body` is specified
+   below;
+2. `rna_tool_search(node="<stable ID of the first admissible traversal-root
+   candidate under the deterministic title-overlap, production-first, and
+   RNA-rerank ordering whose graph yields a valid bounded prompt>",
    mode="neighbors", hops=2, direction="both", edge_types="calls",
    include_body=true, minify_body=true, limit=<selected whole-record
    limit>)` and its graph result; then
 3. the byte-identical standard task used by A.
 
 The query is constructed byte-deterministically. After trimming the problem
-statement, the first line (trimmed at both ends) is `title`. All remaining
-lines form the body; every run of Unicode whitespace in that body is replaced
-by one ASCII space, and `body-prefix` is its first 512 Unicode characters.
-The primary query is exactly `title + "\n\n" + body-prefix`. If that query
+statement, the first line (trimmed at both ends) is the issue title. All
+remaining lines form the body; every run of Unicode whitespace in that body is
+replaced by one ASCII space, and the result is truncated to its first 512
+Unicode characters. The deterministic primary query is exactly the issue
+title, two ASCII line-feed bytes, and that normalized 512-character body
+prefix: `title + "\n\n" + normalized_body[:512]`. No label, quoting, or other
+text is added to the query. If that query
 cannot produce a valid compact result, an eligible traversal root, and a
 bounded valid graph projection, the producer tries exactly one fallback:
 `title`. Only the selected query and result are model-visible; rejected
