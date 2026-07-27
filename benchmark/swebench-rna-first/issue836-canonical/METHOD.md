@@ -64,25 +64,51 @@ T receives the same standard task plus this 189-byte developer directive
 
 The T user prompt begins with a worked, verbatim RNA interaction:
 
-1. `rna_tool_search(<deterministic query>)` and its compact search result;
-2. `rna_tool_search(node=<deterministic seed>, mode="neighbors", hops=2,
-   direction="both", edge_types="calls", include_body=true,
-   minify_body=true, limit=<bounded limit>)` and its graph result; then
+1. `rna_tool_search("<title>\n\n<body-prefix>")` (or the title-only
+   fallback defined below) and its compact search result;
+2. `rna_tool_search(node="<selected traversal-root stable ID>",
+   mode="neighbors", hops=2, direction="both", edge_types="calls",
+   include_body=true, minify_body=true, limit=<selected whole-record
+   limit>)` and its graph result; then
 3. the byte-identical standard task used by A.
 
-The primary query is the issue title plus at most the first 512 characters of
-the problem statement. A deterministic title-only candidate is permitted
-when the primary query cannot produce an admissible result. Rejected
-candidates remain non-model-visible provenance. Search uses the cached strict
-hybrid reranker. A preferred definition record deterministically supplies the
-graph seed.
+The query is constructed byte-deterministically. After trimming the problem
+statement, the first line (trimmed at both ends) is `title`. All remaining
+lines form the body; every run of Unicode whitespace in that body is replaced
+by one ASCII space, and `body-prefix` is its first 512 Unicode characters.
+The primary query is exactly `title + "\n\n" + body-prefix`. If that query
+cannot produce a valid compact result, an eligible traversal root, and a
+bounded valid graph projection, the producer tries exactly one fallback:
+`title`. Only the selected query and result are model-visible; rejected
+candidates remain non-model-visible provenance. Both searches use the cached
+strict hybrid reranker.
 
-The graph is exactly two hops, call edges in both directions, with minified
-bodies. The producer tries a maximum whole-record limit of 20 and reduces the
-limit only as required to fit the 32 KiB user-prompt cap. Python docstrings
-are removed only through AST-identified docstring handling; records and graph
-projections are bounded as whole records. The final injections range from
-3,076 to 30,957 bytes (mean 21,273 bytes).
+The traversal root is selected deterministically from the selected compact
+search result. Eligible records have kind `function`, `method`, `struct`,
+`enum`, `trait`, or `module`. The producer case-folds the title, extracts
+`[a-z0-9_]+` tokens longer than two characters, and removes this fixed
+stop-word set: `bug`, `when`, `with`, `from`, `into`, `this`, `that`, `the`,
+`and`, `for`, `passing`, `error`, `issue`, `fails`, and `failure`. For each
+record, the case-folded concatenation of its name, one space, and its stable ID
+is tokenized with the same expression. Eligible records are ordered by: (1)
+descending size of the unique-token intersection between the title and record;
+(2) production records before test records; and (3) their original
+RNA-reranked order. A record is classified as a test when its stable-ID path
+starts with `test`, contains `/test` or `tests/`, or its name starts with
+`test_`.
+
+The producer tries traversal roots in that order. For each root it tries the
+whole-record limits `20`, `10`, `5`, `2`, and `1`, in that order. The selected
+root and limit are the first combination that returns a valid graph projection
+and keeps the complete T user prompt at or below 32 KiB (32,768 bytes). Thus
+the traversal root can be a later RNA result when earlier roots cannot produce
+a valid bounded prompt; it is not a random seed.
+
+The selected graph projection is exactly two hops, call edges in both
+directions, with minified bodies. Python docstrings are removed only through
+AST-identified docstring handling; records and graph projections are bounded
+as whole records. The final injections range from 3,076 to 30,957 bytes (mean
+21,273 bytes).
 
 Prompt bytes, base instructions, and treatment directives are byte-identical
 between Sonnet and Luna within each arm. The only intended A/T differences are
