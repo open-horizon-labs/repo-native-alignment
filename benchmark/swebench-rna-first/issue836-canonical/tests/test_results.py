@@ -42,6 +42,14 @@ class CanonicalResultsTests(unittest.TestCase):
                 report.write_text(text.replace(old, new, 1))
                 self.assert_package_fails(results, report, manifest)
 
+    def test_method_claim_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            destination = Path(raw)
+            results, report, manifest = self.copied_package(destination)
+            method = destination / "METHOD.md"
+            method.write_text(method.read_text() + "\nAll population effects are conclusive.\n")
+            self.assert_package_fails(results, report, manifest)
+
     def test_manifest_digest_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             results, report, manifest = self.copied_package(Path(raw))
