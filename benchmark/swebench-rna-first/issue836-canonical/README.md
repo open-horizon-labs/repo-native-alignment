@@ -1,4 +1,4 @@
-# Issue #836 canonical benchmark and faithful T2 addendum
+# Issue #836 canonical benchmark
 
 This directory publishes the reviewable method and results for the completed
 RNA-context benchmark associated with issue #836 and PR #837.
@@ -18,12 +18,13 @@ without replacing any original evidence:
   `neighbors`, two-hop, bidirectional typed-graph projection; and
 - `T2_luna`: the byte-identical T2 prompt with Luna.
 
-Read [METHOD.md](METHOD.md) before interpreting the original [REPORT.md](REPORT.md)
-or additive [T2_REPORT.md](T2_REPORT.md). `results.json` and `t2-results.json`
-are the path-free machine-readable ledgers used by `verify_results.py` and
-`verify_t2_results.py`. Their separate evidence manifests bind the review
-artifacts to retained external evidence without committing provider
-transcripts, checkouts, caches, or credentials.
+Read [METHOD.md](METHOD.md) before interpreting the unified
+[REPORT.md](REPORT.md), which reports all six conditions and includes per-case
+metrics and tool-type details. `results.json` and `t2-results.json` are the
+path-free machine-readable ledgers used by `verify_results.py` and
+`verify_t2_results.py`. Their evidence manifests bind the review artifacts to
+retained external evidence without committing provider transcripts, checkouts,
+caches, or credentials.
 
 This is the canonical repaired analysis, not a claim that every abandoned
 predecessor harness attempt was valid. Attempts affected by prompt mismatch,

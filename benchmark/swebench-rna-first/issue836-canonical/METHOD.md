@@ -20,7 +20,8 @@ registration and selection. The original canonical analysis has 80 cells: two
 arms on each of two model backends for every case. An additive post-hoc T2
 execution contributes 40 more cells, one faithful unfiltered typed-graph
 treatment on each backend for every case. The original 80 cells remain intact;
-T2 is reported separately and is not substituted for the original T arm.
+T2 is reported as a distinct condition in the unified report and is not
+substituted for the original T arm.
 
 The original issue preregistration described 40 Sonnet episodes under a
 mandatory first-traversal harness. Operational testing exposed material

@@ -1,23 +1,26 @@
-# Canonical 20-case × 4-condition report
+# Canonical 20-case × 6-condition report
 
-Status: **COMPLETE**. Ready episodes: **80/80**; officially evaluated: **80/80**.
+Status: **COMPLETE**. Canonical cells: **120/120**; officially evaluated: **120/120**.
 
-**Additive T2 update:** the separately preserved faithful unfiltered typed-graph
-conditions are also complete (40/40 canonical cells and 40/40 stock evaluations).
-The program executed 42 paid T2 episodes: two original rank-20 cells were
-superseded after a whole-record projection parser defect was found, and their two
-audited replacements are canonical. T2 resolved 17/20 cases on both Sonnet and
-Luna. See the full six-condition matrix, input/output decomposition, costs,
-timing, tool mix, prompt audit, and transcript disclosures in
-[T2_REPORT.md](T2_REPORT.md). The original calls-only T evidence and analysis
-below remain unchanged.
+This is the single reader-facing report for all six conditions: control A,
+original calls-only treatment T, and faithful unfiltered typed-graph treatment
+T2 on both Claude Sonnet 5 and GPT-5.6 Luna. The original 80-cell A/T evidence
+remains intact; the additive T2 execution contributes 40 canonical cells.
 
-Every available cell passed exact prompt/base/directive hashes, checkout identity, transcript parsing, independent tool recounting, token extraction, and cost cross-checking. Missing or invalid cells are not replaced by historical attempts.
+The program executed 42 paid T2 provider episodes: two original rank-20 cells
+were superseded after a whole-record projection parser defect was found, and
+their two audited replacements are canonical. T2 resolved 17/20 cases on both
+Sonnet and Luna.
 
-Read [METHOD.md](METHOD.md) for the treatment construction, canonicalization
-rules, runtime contracts, and limitations. The most important result is not a
-raw token reduction. T resolved one additional case on each model and used
-fewer tools, while processing slightly more total input context.
+Every canonical cell passed exact prompt/base/directive hashes, checkout
+identity, transcript parsing, independent tool recounting, token extraction,
+and cost cross-checking. Missing or invalid cells are not replaced by
+historical attempts.
+
+Read [METHOD.md](METHOD.md) for treatment construction, canonicalization rules,
+runtime contracts, and limitations. The original T treatment resolved one
+additional case on each model and used fewer tools while processing slightly
+more total input context. T2 did not improve aggregate efficacy.
 
 ## Executive result
 
@@ -152,32 +155,43 @@ contained some template/filter material but missed
 graph. This is classified as an RNA retrieval/seed/context failure, not a
 runtime failure.
 
-## Full A–A–T–T matrix
 
-| Rank | Case | A-Sonnet | A-Luna | T-Sonnet | T-Luna |
-|---:|---|---|---|---|---|
-| 1 | `sympy__sympy-23534` | success yes · 199.6s · in 179,511 · out 2,705 · $0.195187 | success yes · 74.5s · in 201,307 · out 2,769 · $0.082907 | success yes · 61.4s · in 234,761 · out 1,938 · $0.259946 | success yes · 53.5s · in 205,312 · out 2,087 · $0.062084 |
-| 2 | `django__django-11179` | success yes · 233.9s · in 527,787 · out 7,214 · $0.379073 | success yes · 66.0s · in 203,084 · out 2,250 · $0.055304 | success yes · 215.4s · in 662,547 · out 4,879 · $0.423247 | success yes · 70.5s · in 292,042 · out 2,221 · $0.072203 |
-| 3 | `sympy__sympy-13757` | success yes · 256.0s · in 363,595 · out 5,589 · $0.293556 | success yes · 205.7s · in 1,359,660 · out 7,706 · $0.248827 | success yes · 318.0s · in 1,488,908 · out 12,258 · $0.897869 | success yes · 133.7s · in 654,825 · out 5,419 · $0.154654 |
-| 4 | `django__django-13033` | success yes · 154.2s · in 850,393 · out 10,768 · $0.594492 | success yes · 79.0s · in 562,223 · out 2,537 · $0.146184 | success yes · 111.4s · in 657,060 · out 7,989 · $0.489729 | success yes · 198.5s · in 649,447 · out 8,693 · $0.162930 |
-| 5 | `pydata__xarray-4075` | success yes · 275.1s · in 840,923 · out 11,149 · $0.598495 | success yes · 175.5s · in 543,974 · out 7,692 · $0.201489 | success yes · 279.7s · in 1,154,953 · out 9,480 · $0.722487 | success yes · 188.3s · in 1,384,232 · out 7,627 · $0.330621 |
-| 6 | `django__django-13794` | success yes · 236.7s · in 1,116,311 · out 15,847 · $0.784036 | success yes · 112.7s · in 831,481 · out 3,749 · $0.213005 | success no · 417.9s · in 1,249,797 · out 16,085 · $0.846995 | success no · 163.9s · in 557,501 · out 7,150 · $0.173979 |
-| 7 | `matplotlib__matplotlib-24026` | success yes · 747.5s · in 3,591,313 · out 24,186 · $1.921416 | success yes · 283.5s · in 2,215,343 · out 9,401 · $0.401640 | success yes · 308.6s · in 951,062 · out 10,986 · $0.684515 | success yes · 258.5s · in 3,061,976 · out 9,132 · $0.513850 |
-| 8 | `django__django-11163` | success yes · 106.9s · in 351,726 · out 5,049 · $0.249018 | success yes · 47.0s · in 109,306 · out 1,521 · $0.037792 | success yes · 44.0s · in 262,041 · out 2,412 · $0.213630 | success yes · 33.5s · in 108,679 · out 965 · $0.034751 |
-| 9 | `django__django-16612` | success yes · 71.8s · in 221,086 · out 3,049 · $0.171232 | success yes · 59.3s · in 154,699 · out 2,017 · $0.051140 | success yes · 50.8s · in 262,866 · out 2,653 · $0.243282 | success yes · 67.0s · in 258,851 · out 2,427 · $0.066744 |
-| 10 | `django__django-11551` | success yes · 101.1s · in 403,685 · out 5,746 · $0.314144 | success yes · 104.8s · in 425,444 · out 4,010 · $0.156944 | success yes · 33.8s · in 168,235 · out 2,127 · $0.185380 | success yes · 145.1s · in 420,972 · out 4,934 · $0.108202 |
-| 11 | `django__django-13658` | success yes · 89.6s · in 125,332 · out 1,797 · $0.095596 | success yes · 161.2s · in 586,597 · out 4,419 · $0.117981 | success yes · 228.9s · in 299,931 · out 2,777 · $0.252531 | success yes · 194.1s · in 640,999 · out 3,970 · $0.125222 |
-| 12 | `psf__requests-1724` | success yes · 275.1s · in 841,053 · out 9,463 · $0.560140 | success no · 154.9s · in 878,616 · out 6,527 · $0.221650 | success yes · 152.1s · in 846,192 · out 7,758 · $0.572233 | success yes · 145.7s · in 1,383,586 · out 5,700 · $0.346800 |
-| 13 | `sympy__sympy-18763` | success no · 241.4s · in 311,170 · out 5,642 · $0.251346 | success no · 88.7s · in 294,302 · out 3,391 · $0.087243 | success no · 98.0s · in 586,478 · out 6,034 · $0.411436 | success yes · 87.6s · in 308,651 · out 3,025 · $0.087508 |
-| 14 | `pytest-dev__pytest-7982` | success yes · 170.2s · in 202,688 · out 2,844 · $0.149304 | success yes · 69.4s · in 272,988 · out 2,992 · $0.077359 | success yes · 90.2s · in 395,815 · out 6,667 · $0.321930 | success yes · 77.5s · in 222,917 · out 2,994 · $0.083057 |
-| 15 | `pytest-dev__pytest-7432` | success yes · 48.4s · in 140,987 · out 3,522 · $0.150536 | success yes · 136.8s · in 487,020 · out 5,384 · $0.111516 | success yes · 228.3s · in 655,393 · out 6,797 · $0.465514 | success yes · 194.6s · in 823,804 · out 8,655 · $0.187068 |
-| 16 | `django__django-12193` | success no · 213.4s · in 1,084,975 · out 10,922 · $0.678113 | success yes · 121.9s · in 513,432 · out 3,979 · $0.146365 | success yes · 45.0s · in 295,480 · out 3,017 · $0.247851 | success yes · 81.6s · in 217,568 · out 3,390 · $0.064417 |
-| 17 | `django__django-16485` | success yes · 65.6s · in 261,382 · out 3,955 · $0.203777 | success yes · 81.0s · in 208,372 · out 2,721 · $0.062036 | success yes · 148.7s · in 871,648 · out 9,620 · $0.583199 | success yes · 81.6s · in 499,631 · out 2,881 · $0.161227 |
-| 18 | `django__django-16877` | success no · 238.2s · in 561,884 · out 7,109 · $0.385894 | success yes · 194.9s · in 2,066,959 · out 7,687 · $0.457526 | success yes · 239.7s · in 812,224 · out 7,310 · $0.521952 | success yes · 193.2s · in 639,666 · out 8,357 · $0.155741 |
-| 19 | `django__django-11451` | success yes · 70.5s · in 236,756 · out 2,905 · $0.191766 | success yes · 83.9s · in 245,732 · out 3,356 · $0.072102 | success yes · 61.5s · in 422,912 · out 2,666 · $0.308905 | success yes · 53.4s · in 148,932 · out 1,848 · $0.046433 |
-| 20 | `pytest-dev__pytest-7205` | success yes · 230.1s · in 524,459 · out 6,610 · $0.376218 | success yes · 163.1s · in 765,767 · out 6,957 · $0.202527 | success yes · 241.1s · in 840,833 · out 8,196 · $0.550277 | success yes · 149.6s · in 760,024 · out 6,478 · $0.167596 |
+## Per-case details
 
-## Tool calls by type
+Each metrics cell reports official efficacy, elapsed wall time, input tokens,
+output tokens, and cost. Tool use is independently recounted from each
+transcript and broken down by provider-native tool type. The deterministic
+pre-injected RNA exposure is treatment context, not a model-initiated tool
+call, and is disclosed separately from these counts.
+
+### Metrics by case and condition
+
+| Rank | Case | A-Sonnet | A-Luna | Original T-Sonnet | Original T-Luna | T2-Sonnet | T2-Luna |
+|---:|---|---|---|---|---|---|---|
+| 1 | `sympy__sympy-23534` | success yes · 199.6s · in 179,511 · out 2,705 · $0.195187 | success yes · 74.5s · in 201,307 · out 2,769 · $0.082907 | success yes · 61.4s · in 234,761 · out 1,938 · $0.259946 | success yes · 53.5s · in 205,312 · out 2,087 · $0.062084 | success yes · 105.2s · in 301,525 · out 2,895 · $0.283434 | success yes · 89.8s · in 441,078 · out 2,761 · $0.102137 |
+| 2 | `django__django-11179` | success yes · 233.9s · in 527,787 · out 7,214 · $0.379073 | success yes · 66.0s · in 203,084 · out 2,250 · $0.055304 | success yes · 215.4s · in 662,547 · out 4,879 · $0.423247 | success yes · 70.5s · in 292,042 · out 2,221 · $0.072203 | success yes · 119.3s · in 305,797 · out 2,564 · $0.278292 | success yes · 50.6s · in 211,782 · out 1,845 · $0.080004 |
+| 3 | `sympy__sympy-13757` | success yes · 256.0s · in 363,595 · out 5,589 · $0.293556 | success yes · 205.7s · in 1,359,660 · out 7,706 · $0.248827 | success yes · 318.0s · in 1,488,908 · out 12,258 · $0.897869 | success yes · 133.7s · in 654,825 · out 5,419 · $0.154654 | success yes · 149.6s · in 727,844 · out 5,759 · $0.485625 | success yes · 137.7s · in 760,091 · out 5,689 · $0.156247 |
+| 4 | `django__django-13033` | success yes · 154.2s · in 850,393 · out 10,768 · $0.594492 | success yes · 79.0s · in 562,223 · out 2,537 · $0.146184 | success yes · 111.4s · in 657,060 · out 7,989 · $0.489729 | success yes · 198.5s · in 649,447 · out 8,693 · $0.162930 | success yes · 195.1s · in 1,571,240 · out 11,394 · $0.911260 | success yes · 107.8s · in 787,744 · out 4,249 · $0.211436 |
+| 5 | `pydata__xarray-4075` | success yes · 275.1s · in 840,923 · out 11,149 · $0.598495 | success yes · 175.5s · in 543,974 · out 7,692 · $0.201489 | success yes · 279.7s · in 1,154,953 · out 9,480 · $0.722487 | success yes · 188.3s · in 1,384,232 · out 7,627 · $0.330621 | success yes · 264.3s · in 1,413,844 · out 10,683 · $0.876066 | success yes · 180.5s · in 666,727 · out 7,996 · $0.189852 |
+| 6 | `django__django-13794` | success yes · 236.7s · in 1,116,311 · out 15,847 · $0.784036 | success yes · 112.7s · in 831,481 · out 3,749 · $0.213005 | success no · 417.9s · in 1,249,797 · out 16,085 · $0.846995 | success no · 163.9s · in 557,501 · out 7,150 · $0.173979 | success no · 291.0s · in 816,533 · out 10,796 · $0.582291 | success yes · 98.5s · in 566,925 · out 3,770 · $0.162431 |
+| 7 | `matplotlib__matplotlib-24026` | success yes · 747.5s · in 3,591,313 · out 24,186 · $1.921416 | success yes · 283.5s · in 2,215,343 · out 9,401 · $0.401640 | success yes · 308.6s · in 951,062 · out 10,986 · $0.684515 | success yes · 258.5s · in 3,061,976 · out 9,132 · $0.513850 | success yes · 223.5s · in 1,627,570 · out 15,371 · $1.010474 | success yes · 286.1s · in 2,881,143 · out 9,621 · $0.590687 |
+| 8 | `django__django-11163` | success yes · 106.9s · in 351,726 · out 5,049 · $0.249018 | success yes · 47.0s · in 109,306 · out 1,521 · $0.037792 | success yes · 44.0s · in 262,041 · out 2,412 · $0.213630 | success yes · 33.5s · in 108,679 · out 965 · $0.034751 | success yes · 121.4s · in 472,446 · out 4,449 · $0.332135 | success yes · 29.7s · in 98,599 · out 871 · $0.036087 |
+| 9 | `django__django-16612` | success yes · 71.8s · in 221,086 · out 3,049 · $0.171232 | success yes · 59.3s · in 154,699 · out 2,017 · $0.051140 | success yes · 50.8s · in 262,866 · out 2,653 · $0.243282 | success yes · 67.0s · in 258,851 · out 2,427 · $0.066744 | success yes · 257.6s · in 828,797 · out 5,375 · $0.516622 | success yes · 107.3s · in 540,335 · out 3,584 · $0.139055 |
+| 10 | `django__django-11551` | success yes · 101.1s · in 403,685 · out 5,746 · $0.314144 | success yes · 104.8s · in 425,444 · out 4,010 · $0.156944 | success yes · 33.8s · in 168,235 · out 2,127 · $0.185380 | success yes · 145.1s · in 420,972 · out 4,934 · $0.108202 | success yes · 157.3s · in 666,958 · out 9,051 · $0.520922 | success yes · 130.4s · in 654,383 · out 5,706 · $0.143953 |
+| 11 | `django__django-13658` | success yes · 89.6s · in 125,332 · out 1,797 · $0.095596 | success yes · 161.2s · in 586,597 · out 4,419 · $0.117981 | success yes · 228.9s · in 299,931 · out 2,777 · $0.252531 | success yes · 194.1s · in 640,999 · out 3,970 · $0.125222 | success yes · 93.7s · in 182,750 · out 2,024 · $0.176311 | success yes · 136.6s · in 499,553 · out 3,699 · $0.122925 |
+| 12 | `psf__requests-1724` | success yes · 275.1s · in 841,053 · out 9,463 · $0.560140 | success no · 154.9s · in 878,616 · out 6,527 · $0.221650 | success yes · 152.1s · in 846,192 · out 7,758 · $0.572233 | success yes · 145.7s · in 1,383,586 · out 5,700 · $0.346800 | success no · 488.1s · in 2,248,397 · out 14,113 · $1.156271 | success no · 183.6s · in 985,062 · out 7,813 · $0.284388 |
+| 13 | `sympy__sympy-18763` | success no · 241.4s · in 311,170 · out 5,642 · $0.251346 | success no · 88.7s · in 294,302 · out 3,391 · $0.087243 | success no · 98.0s · in 586,478 · out 6,034 · $0.411436 | success yes · 87.6s · in 308,651 · out 3,025 · $0.087508 | success no · 70.8s · in 304,390 · out 3,546 · $0.228276 | success no · 87.7s · in 358,485 · out 2,975 · $0.101237 |
+| 14 | `pytest-dev__pytest-7982` | success yes · 170.2s · in 202,688 · out 2,844 · $0.149304 | success yes · 69.4s · in 272,988 · out 2,992 · $0.077359 | success yes · 90.2s · in 395,815 · out 6,667 · $0.321930 | success yes · 77.5s · in 222,917 · out 2,994 · $0.083057 | success yes · 44.7s · in 136,451 · out 3,068 · $0.129168 | success yes · 84.2s · in 247,944 · out 3,354 · $0.066929 |
+| 15 | `pytest-dev__pytest-7432` | success yes · 48.4s · in 140,987 · out 3,522 · $0.150536 | success yes · 136.8s · in 487,020 · out 5,384 · $0.111516 | success yes · 228.3s · in 655,393 · out 6,797 · $0.465514 | success yes · 194.6s · in 823,804 · out 8,655 · $0.187068 | success yes · 162.8s · in 416,304 · out 5,001 · $0.326295 | success yes · 126.4s · in 422,743 · out 5,035 · $0.105740 |
+| 16 | `django__django-12193` | success no · 213.4s · in 1,084,975 · out 10,922 · $0.678113 | success yes · 121.9s · in 513,432 · out 3,979 · $0.146365 | success yes · 45.0s · in 295,480 · out 3,017 · $0.247851 | success yes · 81.6s · in 217,568 · out 3,390 · $0.064417 | success yes · 154.1s · in 870,761 · out 5,759 · $0.544209 | success yes · 95.3s · in 395,437 · out 3,565 · $0.147768 |
+| 17 | `django__django-16485` | success yes · 65.6s · in 261,382 · out 3,955 · $0.203777 | success yes · 81.0s · in 208,372 · out 2,721 · $0.062036 | success yes · 148.7s · in 871,648 · out 9,620 · $0.583199 | success yes · 81.6s · in 499,631 · out 2,881 · $0.161227 | success yes · 121.7s · in 473,098 · out 6,105 · $0.364905 | success yes · 51.0s · in 113,056 · out 1,942 · $0.037156 |
+| 18 | `django__django-16877` | success no · 238.2s · in 561,884 · out 7,109 · $0.385894 | success yes · 194.9s · in 2,066,959 · out 7,687 · $0.457526 | success yes · 239.7s · in 812,224 · out 7,310 · $0.521952 | success yes · 193.2s · in 639,666 · out 8,357 · $0.155741 | success yes · 227.5s · in 599,657 · out 5,978 · $0.413625 | success no · 150.2s · in 807,754 · out 6,028 · $0.210463 |
+| 19 | `django__django-11451` | success yes · 70.5s · in 236,756 · out 2,905 · $0.191766 | success yes · 83.9s · in 245,732 · out 3,356 · $0.072102 | success yes · 61.5s · in 422,912 · out 2,666 · $0.308905 | success yes · 53.4s · in 148,932 · out 1,848 · $0.046433 | success yes · 71.3s · in 408,430 · out 3,620 · $0.312528 | success yes · 75.8s · in 272,514 · out 2,957 · $0.069302 |
+| 20 | `pytest-dev__pytest-7205` | success yes · 230.1s · in 524,459 · out 6,610 · $0.376218 | success yes · 163.1s · in 765,767 · out 6,957 · $0.202527 | success yes · 241.1s · in 840,833 · out 8,196 · $0.550277 | success yes · 149.6s · in 760,024 · out 6,478 · $0.167596 | success yes · 393.9s · in 927,658 · out 9,823 · $0.624548 | success yes · 179.9s · in 1,167,093 · out 7,495 · $0.247839 |
+
+### Tool use by case and condition
+
+#### A and original T
 
 | Rank | A-Sonnet | A-Luna | T-Sonnet | T-Luna |
 |---:|---|---|---|---|
@@ -201,6 +215,31 @@ runtime failure.
 | 18 | 30 (Bash=18, Edit=5, Grep=1, Read=4, Write=2) | 31 (commandExecution=18, fileChange=2, webSearch=11) | 29 (Bash=14, Edit=4, Grep=1, Read=9, Write=1) | 17 (commandExecution=14, fileChange=3) |
 | 19 | 14 (Bash=8, Edit=2, Grep=1, Read=3) | 11 (commandExecution=10, fileChange=1) | 15 (Bash=10, Edit=2, Read=3) | 6 (commandExecution=5, fileChange=1) |
 | 20 | 26 (Bash=13, Edit=6, Grep=1, Read=4, Write=2) | 24 (commandExecution=17, fileChange=4, webSearch=3) | 29 (Bash=15, Edit=7, Read=6, Write=1) | 21 (commandExecution=16, fileChange=5) |
+
+#### T2
+
+| Rank | T2-Sonnet | T2-Luna |
+|---:|---|---|
+| 1 | 13 (Bash=10, Edit=1, Read=2) | 8 (commandExecution=6, fileChange=2) |
+| 2 | 11 (Bash=8, Edit=1, Read=2) | 6 (commandExecution=5, fileChange=1) |
+| 3 | 25 (Bash=16, Edit=1, Grep=3, Read=5) | 19 (commandExecution=16, fileChange=3) |
+| 4 | 41 (Bash=26, Edit=4, Grep=2, Read=9) | 18 (commandExecution=12, fileChange=1, webSearch=5) |
+| 5 | 37 (Bash=20, Edit=10, Read=7) | 18 (commandExecution=16, fileChange=2) |
+| 6 | 30 (Bash=16, Edit=5, Glob=1, Grep=4, Read=4) | 16 (commandExecution=11, fileChange=2, webSearch=3) |
+| 7 | 43 (Bash=33, Edit=5, Read=5) | 38 (commandExecution=21, fileChange=4, webSearch=13) |
+| 8 | 19 (Bash=10, Edit=3, Grep=2, Read=4) | 6 (commandExecution=5, fileChange=1) |
+| 9 | 29 (Bash=21, Edit=3, Read=5) | 13 (commandExecution=11, fileChange=2) |
+| 10 | 23 (Bash=11, Edit=7, Read=5) | 16 (commandExecution=15, fileChange=1) |
+| 11 | 8 (Bash=5, Edit=1, Read=2) | 10 (commandExecution=9, fileChange=1) |
+| 12 | 68 (Bash=56, Edit=4, Grep=4, Read=4) | 23 (commandExecution=15, fileChange=2, webSearch=6) |
+| 13 | 16 (Bash=11, Edit=2, Read=3) | 11 (commandExecution=9, fileChange=2) |
+| 14 | 12 (Bash=4, Edit=2, Grep=3, Read=2, Write=1) | 13 (commandExecution=12, fileChange=1) |
+| 15 | 16 (Bash=11, Edit=1, Read=2, Write=2) | 12 (commandExecution=9, fileChange=3) |
+| 16 | 28 (Bash=25, Edit=1, Read=2) | 13 (commandExecution=9, fileChange=1, webSearch=3) |
+| 17 | 21 (Bash=15, Edit=3, Read=3) | 5 (commandExecution=4, fileChange=1) |
+| 18 | 24 (Bash=12, Edit=4, Grep=3, Read=4, Write=1) | 23 (commandExecution=17, fileChange=2, webSearch=4) |
+| 19 | 16 (Bash=10, Edit=3, Read=3) | 12 (commandExecution=10, fileChange=2) |
+| 20 | 30 (Bash=17, Edit=7, Read=5, Write=1) | 24 (commandExecution=19, fileChange=5) |
 
 ## Within-model A → T effects
 
@@ -273,3 +312,140 @@ The canonical matrix and audit sections were generated by
 `build_canonical_report.py` with zero model calls. The explanatory
 decomposition above is recomputed by `verify_results.py` from the checked-in
 path-free ledger.
+
+## Faithful unfiltered T2 result
+
+| Backend | A resolved | Original T resolved | T2 resolved | Tokens A→T2 | Time A→T2 | Cost A→T2 | Tools A→T2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Sonnet | 17/20 | 18/20 | **17/20** | +19.8% | -7.8% | +17.9% | -5.4% |
+| Luna | 18/20 | 19/20 | **17/20** | -0.4% | -3.0% | +1.7% | -9.8% |
+
+T2 is additive, post-hoc evidence, not a rewrite of the original T condition or
+a retroactive preregistered result. Within-model A→T2 comparisons reuse the frozen
+completed A episodes and compare them to newly executed T2 episodes.
+
+T2 resolved 17/20 cases on each backend. On Sonnet that equals A but trades two
+case-level wins for two losses, and is one resolution below original T. On Luna it
+is one resolution below A and two below original T. The faithful unfiltered graph
+therefore did not improve aggregate efficacy in this single-run additive cohort,
+despite modest aggregate time/tool savings relative to A.
+
+### T2 input and output decomposition
+
+| Backend | Condition | Cached input | Uncached input | Output | Reasoning subset | Non-reasoning output |
+|---|---|---:|---:|---:|---:|---:|
+| Sonnet | A | 12,273,988 | 463,028 | 146,071 | 0 | 146,071 |
+| Sonnet | Original T | 12,391,901 | 727,235 | 131,649 | 0 | 131,649 |
+| Sonnet | T2 | 14,577,901 | 722,549 | 137,374 | 0 | 137,374 |
+| Luna | A | 11,890,176 | 1,036,130 | 91,065 | 44,568 | 46,497 |
+| Luna | Original T | 12,202,496 | 1,037,119 | 97,953 | 53,086 | 44,867 |
+| Luna | T2 | 11,731,712 | 1,146,736 | 90,955 | 44,732 | 46,223 |
+
+Sonnet T2's +19.8% total-token change versus A is primarily repeated cached
+context processing: cached input rises by 2.30M tokens, while inclusive uncached
+input rises by 259.5K and output falls by 8.7K. Relative to original T, T2's
++16.5% total-token change is likewise trajectory-driven cached replay: cached input
+rises by 2.19M while inclusive uncached input is 4.7K lower. T2 made 65 more
+Sonnet tool calls than original T, so the smaller average T2 injection was replayed
+over more turns. Luna T2, by contrast, processed 2.8% fewer total tokens than
+original T and 0.4% fewer than A; its non-reasoning output is essentially unchanged
+from A.
+
+T2 changes only the graph traversal: `mode=neighbors`, `hops=2`,
+`direction=both`, with **no edge-type filter**. Typed edge labels are retained,
+and deterministic whole-record and 32 KiB prompt bounds are applied after
+traversal.
+
+### Within-model T2 comparisons
+
+| Backend | Baseline | Metric | Baseline total | T2 total | Aggregate change | Median paired change | T2 lower |
+|---|---|---|---:|---:|---:|---:|---:|
+| Sonnet | A | Total tokens | 1.28831e+07 | 1.54378e+07 | +19.8% | +66.1% | 6/20 |
+| Sonnet | A | Input tokens | 1.2737e+07 | 1.53004e+07 | +20.1% | +66.6% | 6/20 |
+| Sonnet | A | Output tokens | 146071 | 137374 | -6.0% | +6.4% | 8/20 |
+| Sonnet | A | Elapsed seconds | 4025.18 | 3712.96 | -7.8% | +2.9% | 9/20 |
+| Sonnet | A | Cost USD | 8.54334 | 10.0733 | +17.9% | +49.8% | 6/20 |
+| Sonnet | A | Tool calls | 539 | 510 | -5.4% | +4.4% | 9/20 |
+| Sonnet | Original T | Total tokens | 1.32508e+07 | 1.54378e+07 | +16.5% | +3.6% | 10/20 |
+| Sonnet | Original T | Input tokens | 1.31191e+07 | 1.53004e+07 | +16.6% | +3.5% | 10/20 |
+| Sonnet | Original T | Output tokens | 131649 | 137374 | +4.3% | +16.3% | 9/20 |
+| Sonnet | Original T | Elapsed seconds | 3374.4 | 3712.96 | +10.0% | -5.3% | 11/20 |
+| Sonnet | Original T | Cost USD | 9.20291 | 10.0733 | +9.5% | +5.1% | 9/20 |
+| Sonnet | Original T | Tool calls | 445 | 510 | +14.6% | +5.1% | 9/20 |
+| Luna | A | Total tokens | 1.30174e+07 | 1.29694e+07 | -0.4% | +7.3% | 9/20 |
+| Luna | A | Input tokens | 1.29263e+07 | 1.28784e+07 | -0.4% | +7.6% | 9/20 |
+| Luna | A | Output tokens | 91065 | 90955 | -0.1% | -3.4% | 11/20 |
+| Luna | A | Elapsed seconds | 2463.71 | 2388.91 | -3.0% | -4.4% | 11/20 |
+| Luna | A | Cost USD | 3.15154 | 3.20564 | +1.7% | -1.5% | 10/20 |
+| Luna | A | Tool calls | 337 | 304 | -9.8% | -4.2% | 10/20 |
+| Luna | Original T | Total tokens | 1.33376e+07 | 1.29694e+07 | -2.8% | +13.6% | 8/20 |
+| Luna | Original T | Input tokens | 1.32396e+07 | 1.28784e+07 | -2.7% | +13.7% | 8/20 |
+| Luna | Original T | Output tokens | 97953 | 90955 | -7.1% | +4.9% | 9/20 |
+| Luna | Original T | Elapsed seconds | 2571.48 | 2388.91 | -7.1% | -2.1% | 10/20 |
+| Luna | Original T | Cost USD | 3.10509 | 3.20564 | +3.2% | +12.9% | 7/20 |
+| Luna | Original T | Tool calls | 303 | 304 | +0.3% | +9.2% | 7/20 |
+
+### T2 prompt and graph audit
+
+| Rank | Query | Traversal root | Whole-record limit | Prompt bytes | Graph bytes |
+|---:|---|---|---:|---:|---:|
+| 1 | `title-plus-512` | `sympy/core/symbol.py:symbols:function` | 10 | 14,833 | 3,341 |
+| 2 | `title-plus-512` | `django/db/models/deletion.py:delete:function` | 20 | 24,120 | 11,723 |
+| 3 | `title-plus-512` | `sympy/polys/polytools.py:poly:function` | 10 | 20,271 | 8,962 |
+| 4 | `title-plus-512` | `django/contrib/contenttypes/fields.py:GenericRelation:struct` | 10 | 25,015 | 7,843 |
+| 5 | `title-plus-512` | `xarray/core/weighted.py:_weighted_mean:function` | 2 | 20,020 | 1,389 |
+| 6 | `title-plus-512` | `django/db/models/sql/query.py:add_filter:function` | 5 | 18,192 | 4,641 |
+| 7 | `title-plus-512` | `lib/matplotlib/stackplot.py:stackplot:function` | 5 | 17,501 | 2,218 |
+| 8 | `title-plus-512` | `django/forms/models.py:model_to_dict:function` | 5 | 17,277 | 4,721 |
+| 9 | `title-plus-512` | `django/contrib/admin/sites.py:catch_all_view:function` | 10 | 24,685 | 8,115 |
+| 10 | `title-plus-512` | `django/contrib/admin/checks.py:_check_list_display_links:function` | 2 | 19,824 | 1,386 |
+| 11 | `title-plus-512` | `django/core/management/__init__.py:ManagementUtility:struct` | 5 | 21,887 | 8,406 |
+| 12 | `title-only` | `psf-requests-1724:requests/models.py:prepare_url:function` | 10 | 25,075 | 6,158 |
+| 13 | `title-plus-512` | `sympy/physics/vector/dyadic.py:subs:function` | 1 | 11,748 | 496 |
+| 14 | `title-plus-512` | `pytest-dev-pytest-7982:testing/test_collection.py:test_collect_symlink_file_arg:function` | 1 | 2,514 | 724 |
+| 15 | `title-plus-512` | `src/_pytest/skipping.py:pytest_runtest_setup:function` | 5 | 17,243 | 3,817 |
+| 16 | `title-plus-512` | `django/forms/fields.py:BooleanField:struct` | 2 | 14,877 | 1,397 |
+| 17 | `title-plus-512` | `django-django-16485:django/template/defaultfilters.py:floatformat:function` | 10 | 5,682 | 4,054 |
+| 18 | `title-plus-512` | `django/template/defaultfilters.py:safeseq:function` | 5 | 18,273 | 3,309 |
+| 19 | `title-plus-512` | `django/contrib/auth/backends.py:ModelBackend:struct` | 10 | 20,597 | 5,766 |
+| 20 | `title-plus-512` | `src/_pytest/runner.py:from_call:function` | 10 | 22,082 | 4,967 |
+
+All 20 selected T2 prompts passed global review before their canonical provider
+episodes. Rank 20 was regenerated and re-reviewed before its replacement episodes
+after the original projection exposed a harness parser defect. The title
+query and compact result are byte-identical to the audited original T exposure;
+the original calls-only graph was not reused. Each T2 graph was freshly projected
+from the warm exact-tree cache without `edge_types`, retained per-record typed edge
+labels, used one of the whole-record limits 20/10/5/2/1, and kept the complete user
+prompt at or below 32,768 bytes. Rank 12 alone used the deterministic title-only
+fallback; all other ranks used title plus the normalized 512-character body prefix.
+
+### T2 transcript disclosures
+
+- 40/40 T2 transcripts passed structural parsing, prompt and patch hashing, exact
+  model/context checks, item reconciliation, independent tool recounting, and
+  foreign-rank/checkout reference checks.
+- Luna recorded 6 null command outputs across 5 cells; all remain in the data.
+- No Luna item was started without a corresponding completion record.
+- Every T2 cell had one deterministic pre-injected RNA exposure (40 total).
+  The selected canonical cells made 0 model-initiated follow-up RNA calls.
+  Follow-up was not required by the context-efficacy hypothesis; injected exposure
+  is reported separately from ordinary model tool calls.
+- Luna rank 6 emitted a 416,382-character command result because the model ran
+  `git show --stat --oneline HEAD` on a root/shallow commit. This was a model-chosen
+  command, not harness-injected duplication, so it remains in efficiency metrics.
+- Network and web-search behavior remained unrestricted and is retained rather than
+  filtered post hoc. Direct-solution exposure counts are present in `t2-results.json`.
+- Manual rank-20 transcript review found no foreign checkout or direct-solution
+  exposure. Sonnet corrected an initial `/repo` guess, its `pip` lookup failed, and
+  a model-chosen root-wide `find` moved to Claude's background handling. Luna's local
+  `git log -S` search returned no matching solution commit. All resulting elapsed
+  time, tokens, and tool calls remain in the canonical metrics.
+
+### T2 evaluation and accounting
+
+Every T2 terminal patch was evaluated by stock SWE-bench 4.1.0, bound to the exact
+instance ID and terminal-patch SHA-256. Sonnet cost is the provider-receipt sum.
+Luna cost is the same published API-equivalent estimate used by the original report:
+$1.00/M uncached input, $0.10/M cached input, $1.25/M cache write, $6.00/M
+output, and $0.01 per web search; it is not a claim about App Server billing.

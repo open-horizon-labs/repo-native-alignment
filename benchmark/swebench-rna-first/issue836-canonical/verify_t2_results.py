@@ -16,12 +16,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 T2_RESULTS = ROOT / "t2-results.json"
 OLD_RESULTS = ROOT / "results.json"
-T2_REPORT = ROOT / "T2_REPORT.md"
+REPORT = ROOT / "REPORT.md"
 METHOD = ROOT / "METHOD.md"
 MANIFEST = ROOT / "t2-evidence-manifest.json"
 EXPECTED_T2_RESULTS_SHA = "26e9ad318e2d3a03f355499326dd644968bbd3770807d69d272c617ca7e62daf"
-EXPECTED_T2_REPORT_SHA = "6d79a3eabc1818ef620a42c8330b5600d1711486a70b8cf31f2c5d2871944243"
-EXPECTED_METHOD_SHA = "88e520661c53a607cd8a19d0aa641bf968b1ce61ae3357f353bd7be0197a6342"
+EXPECTED_REPORT_SHA = "8281e45857f58d2b5ca85d2de8f3649024e8f077b95b2aad672e2701476af47d"
+EXPECTED_METHOD_SHA = "eefcb2f7b4b6420cbfe3da2ed5e2c2335e37af3fb8d092075e8e939bc2045049"
 EXPECTED_MANIFEST_SHA = "518dc273c59fc548008c66f84ded5dcf1c377696aef0befb6824e3a2151b28cc"
 BASE_SHA = "da68ef814351f2953d9954f4cc309bf755605ac4e672c3d5096106cc664e3d49"
 DIRECTIVE_SHA = "f91a19798b6fbee94e3e1ae17848991154d31ad2d60317f2f0436abfe327143b"
@@ -151,13 +151,19 @@ def report_cell(cell: dict[str, Any]) -> str:
     return f"success {success} · {metrics['elapsed_seconds']:.1f}s · in {metrics['input_tokens']:,} · out {metrics['output_tokens']:,} · ${metrics['cost_usd']:.6f}"
 
 
+def report_tools(cell: dict[str, Any]) -> str:
+    tools = cell["metrics"]["tool_calls"]
+    parts = ", ".join(f"{name}={count}" for name, count in sorted(tools["by_type"].items()))
+    return f"{tools['total']} ({parts})"
+
+
 def main() -> int:
     data = load(T2_RESULTS)
     old = load(OLD_RESULTS)
     manifest = load(MANIFEST)
-    report = T2_REPORT.read_text()
+    report = REPORT.read_text()
     require(digest(T2_RESULTS) == EXPECTED_T2_RESULTS_SHA, "T2 results digest drift")
-    require(digest(T2_REPORT) == EXPECTED_T2_REPORT_SHA, "T2 report digest drift")
+    require(digest(REPORT) == EXPECTED_REPORT_SHA, "unified report digest drift")
     require(digest(METHOD) == EXPECTED_METHOD_SHA, "method digest drift")
     require(digest(MANIFEST) == EXPECTED_MANIFEST_SHA, "manifest digest drift")
     require(data["schema_version"] == "issue836-t2-unfiltered-results-v1", "T2 schema")
@@ -218,6 +224,10 @@ def main() -> int:
         require(matrix_fragment in report, f"rank {expected_rank}: report matrix")
         for condition in CONDITIONS:
             require(report_cell(row["conditions"][condition]) in report, f"rank {expected_rank} {condition}: report cell")
+        tool_row = f"| {expected_rank} | " + " | ".join(
+            report_tools(row["conditions"][condition]) for condition in CONDITIONS
+        ) + " |"
+        require(tool_row in report, f"rank {expected_rank}: report tool row")
 
     observed = {}
     for condition in CONDITIONS:
