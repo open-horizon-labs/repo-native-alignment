@@ -1,3 +1,9 @@
+---
+id: 836-experiment
+issue: 836
+outcome: context-assembly
+---
+
 # Friction log: issue #836 RNA-first SWE-bench experiment
 
 | Phase | Tool path | Severity | Friction | Bounded fallback / response |
