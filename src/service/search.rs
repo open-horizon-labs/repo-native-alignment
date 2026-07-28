@@ -13174,19 +13174,14 @@ mod tests {
         let graph = make_graph_state(vec![module, function, extension_symbol]);
         let ctx = make_search_context(&graph, repository.path());
         let edge_index = ProjectedEdgeIndex::new(&graph);
-        let output = task_records(
-            &SearchParams {
-                query: Some("Fix app.py behavior and add a regression test".into()),
-                context_mode: Some("task".into()),
-                include_artifacts: false,
-                include_markdown: false,
-                ..Default::default()
-            },
-            &ctx,
-            &edge_index,
-        )
-        .await
-        .unwrap();
+        let params = SearchParams {
+            query: Some("Fix app.py behavior and add a regression test".into()),
+            context_mode: Some("task".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+        let output = task_records(&params, &ctx, &edge_index).await.unwrap();
 
         assert!(
             output
@@ -13198,6 +13193,13 @@ mod tests {
             capability.capability == "task_exact_reference_resolution"
                 && capability.state == CapabilityState::Ready
         }));
+
+        let rendered = projected_search(&params, &ctx).await;
+        assert!(rendered.contains(&module_id), "output was:\n{rendered}");
+        assert!(
+            rendered.contains("task_exact_reference_resolution: ready"),
+            "output was:\n{rendered}"
+        );
     }
 
     #[tokio::test]
