@@ -344,6 +344,58 @@ Primary sources: [HumanLayer benchmark article](https://github.com/humanlayer/ad
 [SlopCodeBench paper](https://arxiv.org/html/2603.24755v1), and
 [SlopCodeBench repository](https://github.com/SprocketLab/slop-code-bench/tree/13de1a7a6b8b3dc5cc532a0c322a0997afa5bec7).
 
+### Post-hoc T5 causal-working-set gate
+
+T5 is a bounded implementation diagnostic prompted by the observation that
+treatment token growth was predominantly cumulative cached-input replay, while
+output and sometimes time/tool counts fell. It is outside the 720 canonical
+cells. Its estimand is narrower: can a deterministic, causally relevant RNA
+working set reduce an unhelpful interaction trajectory without materially
+increasing unique input?
+
+The T5 rule was frozen before its paid calls. It begins with the case's already
+frozen 50-record strict hybrid/reranked title-plus-normalized-512-character
+search result. Test, documentation, example, migration, and benchmark roots are
+discarded; only callable and type definitions are eligible. Explicit
+underscore-bearing callable/type identifiers use an exact lexical lane, with
+leading-underscore identifiers in original task order preferred. Generic
+prose words, constants, and CamelCase domain nouns receive no exact-match
+bonus. Otherwise candidates are scored by task-token overlap in symbol name
+and path, with original RNA rerank position as the tie-break.
+
+When the task includes an explicit diagnostic identifier such as
+`admin.E108`, it must occur literally in the proposed root body. The selected
+production root body is injected exactly once. RNA then traverses all edge
+types two hops in both directions; complete minified records are retained in
+structural traversal order under an 8 KiB injection cap. T5 does not re-filter
+traversed records by lexical overlap. It abstains before provider spend if the
+root body is absent, fewer than three complete graph records fit, no
+callable/type neighbor survives, or the complete prompt exceeds 16 KiB.
+
+Ranks 10 and 13 were predeclared offline preflights. Rank 10 selected
+`django/contrib/admin/checks.py:_check_list_display_item:function` only after
+two earlier candidates abstained for lacking `admin.E108`; four graph records
+fit, producing a 4,819-byte injection and 10,326-byte prompt. Rank 13 selected
+`sympy/printing/latex.py:_print_Subs:function`; nine of 13 traversed records
+fit, producing an 8,037-byte injection and 8,696-byte prompt. Both passed the
+offline prompt audit. Only rank 10 was authorized for paid execution, on
+Sonnet and Spark, and its existing anti-slop A controls were reused. Exactly
+two paid T5 cells were run; no population execution was authorized.
+
+Two earlier rank-10 setup attempts are provenance only and consumed no model
+tokens. Spark's first launcher inherited an obsolete 32,768-byte manifest cap
+that conflicted with the new 16 KiB contract. Sonnet's first launcher inherited
+a `sandbox-exec` profile that denied the logged-in CLI's ordinary
+`fstat(stderr)` call. The final runners removed those obsolete constraints,
+preserved the audited prompt bytes exactly, and passed transcript audit.
+
+The inherited 999-byte treatment-plus-anti-slop directive remained unchanged
+for this gate. It says both to use the already-injected context and to use an
+"available" `rna_tool_search` command for further navigation. That second
+claim was false in the Spark App Server environment and is treated as a
+residual treatment/runner design defect. The report therefore stops T5 after
+one case and specifies a directive-only follow-up gate rather than scaling.
+
 ## Model runtimes
 
 - **Sonnet:** Claude Sonnet 5 through the logged-in Claude CLI.

@@ -132,6 +132,77 @@ The path-free diagnostic ledger is
 with retained artifacts bound by
 [`working-set-diagnostic-evidence-manifest.json`](working-set-diagnostic-evidence-manifest.json).
 
+## Follow-up causal-working-set gate: split result on one case
+
+The replayed-input diagnosis was not disproved by T4; work on it stopped when
+T4 exposed a flawed lexical projection. A corrected T5 producer was therefore
+frozen and tested only through the small gate requested: two offline preflight
+cases (ranks 10 and 13), followed by exactly two paid T5 cells on rank 10
+(`django__django-11551`), one each on Sonnet and Spark. The existing rank-10
+anti-slop A controls were reused. No full sweep was launched.
+
+T5 starts from the frozen 50-record strict hybrid/reranked title-plus-512
+result, admits only production callable/type roots, and uses exact matching
+only for explicit underscore-bearing identifiers. Otherwise it scores symbol
+and path overlap with the frozen rerank order as the tie-break. An explicit
+diagnostic such as `admin.E108` must occur in the selected root body. T5 then
+injects that root body once and complete all-edge, bidirectional, two-hop graph
+records in structural order under an 8 KiB injection and 16 KiB full-prompt
+cap. It never lexically re-filters the traversed graph and abstains when the
+bounded projection lacks a root body, three complete records, or a
+callable/type neighbor.
+
+For rank 10 the deterministic traversal root was
+`django/contrib/admin/checks.py:_check_list_display_item:function`; the two
+earlier candidates abstained because their bodies did not contain
+`admin.E108`. Four complete graph records fit. The 4,819-byte injection
+produced a 10,326-byte prompt, byte-identical across Sonnet and Spark. Rank 13
+also passed offline preflight with `_print_Subs`, an 8,037-byte injection, and a
+8,696-byte prompt, but received no provider call.
+
+Both paid T5 patches passed transcript audit and the stock SWE-bench evaluator.
+
+| Backend | Cell | Resolved | Prompt bytes | Input tokens | Uncached input | Cache read | Output tokens | Total tokens | Time | Cost | Tools |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Sonnet | A-AS | yes | 5,507 | 334,857 | 21,758 | 313,099 | 6,799 | 341,656 | 117.1s | $0.315745 | 17 (Bash=7, Edit=3, Grep=3, Read=4) |
+| Sonnet | T5-AS | yes | 10,326 | 102,892 | 20,784 | 82,108 | 1,685 | 104,577 | 21.5s | $0.156994 | 6 (Bash=3, Edit=1, Glob=1, Read=1) |
+| Spark | A-AS | yes | 5,507 | 967,970 | 42,914 | 925,056 | 10,797 | 978,767 | 96.6s | n/a | 44 (commandExecution=40, fileChange=4) |
+| Spark | T5-AS | yes | 10,326 | 1,815,758 | 46,286 | 1,769,472 | 15,964 | 1,831,722 | 137.1s | n/a | 60 (commandExecution=56, fileChange=4) |
+
+Relative to the matching A, Sonnet T5 reduced input/output/total tokens by
+69.3%/75.2%/69.4%, time by 81.6%, tools by 64.7%, cache-read input by 73.8%,
+and reported cost by 50.3%. Spark T5 instead increased those token fields by
+87.6%/47.9%/87.1%, time by 41.9%, tools by 36.4%, and cache-read input by
+91.3%. Uncached input moved only −4.5% for Sonnet and +7.9% for Spark. That is
+the key causal diagnostic: the treatment prefix itself is not large enough to
+explain either result; the model's ensuing trajectory determines how many
+times the conversation is replayed.
+
+The transcripts explain the split. Sonnet used the injected
+`_check_list_display_item` context immediately, completed in six tool calls,
+and passed 54 relevant tests. Spark also began at the exact injected location,
+so it did not ignore the context. It then spent three calls probing a missing
+`rna_tool_search` executable because the inherited directive inaccurately says
+that command is available, and most of its remaining 56 command calls fought
+the old Django checkout's Python 3.12 `distutils` incompatibility. It still
+produced a resolved patch. These are model/runner interaction effects, not
+evidence that 4.8 KiB of RNA context directly cost 853,111 extra tokens.
+
+The decision is **DO NOT SCALE T5 YET**. This one case shows that the
+treatment-design bug was real and that the corrected working set eliminated
+the replay explosion on Sonnet's observed trajectory; it does not establish a
+population effect or
+cross-model robustness. The next minimal gate should change only the directive
+to state that the injected RNA interaction has already executed and no
+follow-up RNA command is required, then test one different preflight case on
+Sonnet and Spark under an aligned deterministic test runtime. A scale decision
+comes only after that transcript audit.
+
+The path-free T5 ledger is
+[`causal-working-set-diagnostic-results.json`](causal-working-set-diagnostic-results.json),
+with retained artifacts bound by
+[`causal-working-set-diagnostic-evidence-manifest.json`](causal-working-set-diagnostic-evidence-manifest.json).
+
 For continuity with the preregistered two-model A/T analysis, its original
 executive rows are retained verbatim:
 

@@ -39,6 +39,13 @@ canonical cells and ended in a `DO_NOT_SCALE` decision for T4. Their path-free
 ledger and evidence bindings are `working-set-diagnostic-results.json` and
 `working-set-diagnostic-evidence-manifest.json`.
 
+An additional one-case T5 causal-working-set diagnostic follows that failed
+T4 gate without changing the 720 canonical cells. It preflighted ranks 10 and
+13 offline, ran only rank 10 on Sonnet and Spark while reusing the matching A
+controls, and stopped before scale because the two models split. Its path-free
+ledger and evidence bindings are `causal-working-set-diagnostic-results.json`
+and `causal-working-set-diagnostic-evidence-manifest.json`.
+
 Read [METHOD.md](METHOD.md) before interpreting the unified
 [REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
 metrics, quality measurements, and tool-type details. `results.json`,
@@ -71,6 +78,9 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_working_set_diagnostic.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_causal_working_set_diagnostic.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
@@ -99,4 +109,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_working_set_diagnostic.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_causal_working_set_diagnostic.py
 ```
