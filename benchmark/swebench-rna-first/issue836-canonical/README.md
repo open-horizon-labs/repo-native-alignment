@@ -26,14 +26,20 @@ conditions per case without replacing the Sonnet/Luna evidence:
 - `A_spark`, `T_spark`, and `T2_spark`: the byte-identical A/T/T2 user
   prompts on GPT-5.3 Codex Spark through Codex App Server.
 
+The HumanLayer/SlopCodeBench comparison adds 24 more conditions per case by
+crossing the published `anti_slop` and `plan_first` prompt strategies with
+A/T/T2 on all four models. These 480 cells are additive; the original 240 cells
+remain unchanged. The final package therefore reports 36 conditions and 720
+cells in one analysis.
+
 Read [METHOD.md](METHOD.md) before interpreting the unified
-[REPORT.md](REPORT.md), which reports all 12 conditions and includes per-case
-metrics and tool-type details. `results.json`, `t2-results.json`, and
-`weaker-model-results.json` are the path-free machine-readable ledgers used by
-`verify_results.py`, `verify_t2_results.py`, and
-`verify_weaker_results.py`. Their evidence manifests bind the review artifacts
-to retained external evidence without committing provider transcripts,
-checkouts, caches, or credentials.
+[REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
+metrics, quality measurements, and tool-type details. `results.json`,
+`t2-results.json`, `weaker-model-results.json`, and
+`humanlayer-strategy-results.json` are the path-free machine-readable ledgers
+used by their corresponding verifier scripts. Their evidence manifests bind
+the review artifacts to retained external evidence without committing provider
+transcripts, checkouts, caches, or credentials.
 
 This is the canonical repaired analysis, not a claim that every abandoned
 predecessor harness attempt was valid. Attempts affected by prompt mismatch,
@@ -52,12 +58,15 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_weaker_results.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_humanlayer_strategy_results.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
 order and budget, and fail-closed package digests. Where the retained evidence
-root is available, the three commands also verify the bound original, T2, and
-weaker-model external artifacts by content:
+root is available, the four commands also verify the bound original, T2,
+weaker-model, and prompt-strategy external artifacts by content:
 
 ```bash
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
@@ -71,4 +80,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_weaker_results.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_humanlayer_strategy_results.py
 ```

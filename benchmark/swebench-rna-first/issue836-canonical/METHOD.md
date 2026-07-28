@@ -16,19 +16,23 @@ reported separately from model tool calls.
 
 The case population is the deterministic 20-case issue #836 cohort. Case
 identity, commit, tree, and order come from the published issue836-v4
-registration and selection. The original canonical analysis has 80 cells: two
-arms on each of two model backends for every case. An additive post-hoc T2
-execution contributes 40 more cells, one faithful unfiltered typed-graph
-treatment on each backend for every case. The original 80 cells remain intact;
-T2 is reported as a distinct condition in the unified report and is not
-substituted for the original T arm.
+registration and selection. The previously published canonical package has
+240 cells: A, original T, and additive T2 on Sonnet, Luna, Haiku, and Spark for
+every case. T2 is a distinct faithful unfiltered typed-graph condition; it does
+not substitute for the original calls-only T arm.
 
-An additional post-hoc ceiling-effect sensitivity execution contributes 120
-more cells: A, original T, and T2 on Claude Haiku 4.5 and GPT-5.3 Codex Spark
-for every frozen case. It tests the concern that Sonnet and Luna solve too many
-cases for treatment differences to be visible. It does not replace or alter
-the original 120 Sonnet/Luna cells and is not part of the preregistered
-selector.
+The Haiku/Spark cells are a post-hoc ceiling-effect sensitivity execution. They
+test the concern that Sonnet and Luna solve too many selected cases for a
+context-treatment difference to be visible. They do not replace or alter the
+Sonnet/Luna evidence and are not part of the preregistered selector.
+
+The HumanLayer/SlopCodeBench comparison adds a second, orthogonal factor. Two
+published prompt strategies—anti-slop and plan-first—are crossed with A, T, and
+T2 on all four models and all 20 cases. Those 480 additive cells do not replace
+the 240 no-strategy cells. The unified analysis therefore contains 36
+conditions and 720 cells. This factorial extension was frozen before its first
+provider call, but it remains a post-hoc extension of the issue836 study rather
+than a retroactive preregistration.
 
 The original issue preregistration described 40 Sonnet episodes under a
 mandatory first-traversal harness. Operational testing exposed material
@@ -211,6 +215,114 @@ launcher supplied the wrong checkout path; its zero-spend setup record is
 provenance only, and the first provider-invoked T episode is canonical. No
 paid weaker-model cell was replaced or rerun.
 
+### HumanLayer/SlopCodeBench prompt-strategy extension
+
+The comparison pins the HumanLayer article at commit
+`a2da7968c7d5cbc8a58e9c559f4d9eea6d460d6c` and SlopCodeBench at commit
+`13de1a7a6b8b3dc5cc532a0c322a0997afa5bec7`. The exact upstream
+`anti_slop` and `plan_first` Jinja templates have SHA-256 values
+`e334962c38a1ca83f9de87b2120821b07aabd7159f665dfde843f04fe5ed74a5`
+and
+`0fcf89c6f841d9d2d02b3ec50b61ebcf4c4d7fcab812ec4e5d5e66efbec2cf8b`,
+respectively.
+
+The two sources answer related but different questions. HumanLayer's reported
+Opus/Sonnet execution uses SlopCodeBench's `just-solve` baseline over
+longitudinal greenfield checkpoints: model context is fresh at each checkpoint,
+prior code but not prior conversation carries forward, and strict black-box
+evaluation includes earlier regression tests. The article proposes review,
+metric-backpressure, and frontier-to-weaker-model handoff ideas, but does not
+report those proposals as executed prompt arms. The associated SlopCodeBench
+study executes exactly two prompt interventions, `anti_slop` and `plan_first`.
+
+Issue #836 is instead a single-shot existing-repository repair benchmark. It
+cannot import longitudinal checkpoint carry-over without changing the task
+population and estimand. The extension therefore transfers the two executed
+prompt interventions as developer/system-instruction deltas while retaining
+the exact frozen SWE-bench task bytes, checkouts, official evaluator,
+provider-native scaffolding, and A/T/T2 RNA-context factor. Every episode still
+starts in an isolated context and clean frozen-base checkout.
+
+The semantic port removes only SlopCodeBench-specific scaffolding that is false
+for this task: Jinja branching, virtual-environment and `requirements.txt`
+setup, the instruction to create a new Python script, and the `{{ spec }}`
+insertion. The published planning sequence and anti-slop/style rules remain.
+The resulting anti-slop bytes are 808 bytes with SHA-256
+`8d47fd170081caee967ae54bb0921f520d1b466c37959e9cfd59e2745c5964aa`;
+the plan-first bytes are 727 bytes with SHA-256
+`3d93456b81f521c34d97312e9745adfecce74333668c42aa2d90d31b4b21e430`.
+This is a frozen semantic port, not a claim that a SWE-bench episode is
+byte-identical to a SlopCodeBench episode.
+
+For A, the selected strategy is the entire added developer instruction. For T
+and T2, the existing 189-byte RNA directive is followed by exactly two LF bytes
+and then the selected strategy bytes. The canonical A/T/T2 user prompts remain
+unchanged. Strategy bytes are identical across models and ranks. For every
+model and case the additive cells are:
+
+- `A_AS`, `T_AS`, and `T2_AS`: anti-slop crossed with A/T/T2; and
+- `A_PF`, `T_PF`, and `T2_PF`: plan-first crossed with A/T/T2.
+
+Before provider spend, all 480 prompt compositions passed exact source-hash,
+cross-model parity, instruction-composition, and prompt-size checks. Condition
+submission order rotates deterministically; no official outcome was consulted
+during prompt generation. The scale launcher uses six workers and can execute
+the six strategy/context cells for one model/case concurrently. Every cell has
+its own frozen-base checkout and fresh provider thread, so no code or
+conversation state is shared. Elapsed-time comparisons therefore include
+co-scheduled machine/provider contention; the report treats them as paired
+operational measurements rather than uncontended runtime benchmarks.
+
+The first scale audit exposed host-level Python state that was not isolated by
+separate checkouts: concurrent editable installs registered sibling episode
+paths globally, and a later global `.pth` startup hook printed a stale checkout
+path before `sitecustomize` could filter it. Package-manager metadata also
+reported an older editable checkout even though the filesystem boundary denied
+the attempted read. Exact affected cells are superseded, not analyzed. Queued
+and replacement cells use a per-cell virtual environment and pip target;
+shared dependency directories are appended without executing host `.pth`
+files; pip observes only per-cell distribution metadata; and the provider
+process is denied only sibling and prior benchmark episode roots. The final
+runtime additionally denies reads of host shared-site `.pth` and `.egg-link`
+metadata, preventing a model that bypasses the per-cell Python wrapper from
+recovering stale checkout paths through global Python startup or package
+metadata. Network, ordinary host access, prompts, model settings, and time
+ceilings are unchanged. Transcript admission fails on any model-visible foreign
+checkout input or output, then retries only that exact frozen slot.
+
+An efficiency-outlier review then found a distinct same-cell leak in four
+otherwise completed App Server episodes. A model-issued recursive search rooted
+at `..` could match the live `app-server.out.jsonl` beside its checkout, feeding
+part of its own prompt and tool history back into model-visible command output.
+The audit was extended to fail closed on this pattern and identified exactly
+four cells: rank 5 `A_AS_spark`, rank 5 `A_PF_spark`, rank 6 `T_AS_luna`, and
+rank 17 `A_PF_spark`. The runtime now makes the adjacent harness control files
+unreadable to the provider while leaving the checkout, network, host tools, and
+ordinary host paths available. Only those four frozen slots were rerun; the old
+episodes are superseded because their efficiency measurements are inflated,
+not because their model-generated patches were post-hoc classified by outcome.
+The strengthened final audit passes all 480 strategy cells.
+
+Provider accounting is explicit: 480 canonical strategy cells plus one
+wrapper-timeout attempt, 14 cross-cell/host-path isolation attempts, and four
+same-cell transcript-exposure attempts equal 499 paid provider episodes. Stock
+SWE-bench evaluation and deterministic quality scoring add zero model calls.
+
+| Design element | HumanLayer / SlopCodeBench | Issue #836 extension |
+|---|---|---|
+| Task unit | Longitudinal greenfield checkpoint | Single SWE-bench repair |
+| Context | Fresh conversation per checkpoint | Fresh conversation per cell |
+| State carried | Code from earlier checkpoints | None across cells; frozen base per cell |
+| Baseline prompt | `just-solve` | Existing A/T/T2 prompt bytes |
+| Added prompt arms | SCBench `anti_slop`, `plan_first` | Semantic ports crossed with A/T/T2 |
+| Correctness | Strict black-box checkpoint suite | Stock SWE-bench 4.1 exact-patch evaluator |
+| Quality | SlopCodeBench verbosity and erosion | Same pinned metrics on changed Python files, before/after |
+| Runtime ceiling | Two hours per checkpoint | Two hours for Claude; no Codex model/tool timeout |
+
+Primary sources: [HumanLayer benchmark article](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents/blob/a2da7968c7d5cbc8a58e9c559f4d9eea6d460d6c/benchmarking-opus-5-on-slop-code-bench.md),
+[SlopCodeBench paper](https://arxiv.org/html/2603.24755v1), and
+[SlopCodeBench repository](https://github.com/SprocketLab/slop-code-bench/tree/13de1a7a6b8b3dc5cc532a0c322a0997afa5bec7).
+
 ## Model runtimes
 
 - **Sonnet:** Claude Sonnet 5 through the logged-in Claude CLI.
@@ -253,6 +365,15 @@ and byte-audited before replacement episodes. Luna used a predeclared
 retained only after strict runtime/transcript audit. Selection of replacements
 preceded exact-patch efficacy evaluation.
 
+The prompt-strategy scale run inherited a separate 1,200-second Claude wrapper
+ceiling even though its declared comparison window was two hours. It censored
+one rank-3 `T_PF_sonnet` episode while the model's chosen regression suite was
+still running. The censored receipt is provenance only. The exact same frozen
+cell was rerun under the corrected 7,200-second window and passed transcript
+audit and official evaluation. Every earlier completed Claude strategy cell
+finished below 1,200 seconds, so the inherited ceiling did not bind them.
+Codex App Server strategy cells retain no model or tool timeout.
+
 The RNA product fixes discovered during this work are included on PR #837:
 
 - recognize `.mjs` through the JavaScript/TypeScript descriptor path;
@@ -271,6 +392,26 @@ Evaluator results were never provided to a model. All 80 original canonical
 cells and all 40 additive T2 cells have a completed `RESOLVED` or `UNRESOLVED`
 verdict. The same contract applies to all 120 weaker-model cells.
 
+The 480 prompt-strategy cells use the same evaluator module, dataset revision,
+instance images, 1,800-second per-instance timeout, patch bytes, and verdict
+rules. They set the stock evaluator's official `--cache_level instance` option
+so concurrent rank lanes retain their own instance images. That setting changes
+image cleanup/reuse only; it does not change tests or container execution. A
+zero-model batch attempted while Docker Desktop was stopped and a later
+two-lane batch affected by the stock harness's cross-process image-cleanup race
+are retained as noncanonical derived provenance. Three later evaluations also
+collided with stopped containers left by an interrupted attempt because the
+stock harness deterministically reused their container names; those zero-model
+errors were quarantined, the exact stopped containers were removed, and only
+the three missing patch hashes were retried. A separate completed rank-18 test
+run was censored while the stock harness assembled its JSON report: one process
+listed containers while another process removed one of those containers, and
+the resulting Docker 404 aborted report generation. Its patch verdict was not
+reconstructed from logs; that exact patch hash was evaluated again in the
+serial reconciliation. None of these evaluator failures produced or changed a
+provider episode. Canonical efficacy uses only completed race-free evaluator
+receipts bound to the exact terminal-patch SHA-256.
+
 ## Metrics
 
 The report includes, per cell and by condition:
@@ -282,6 +423,18 @@ The report includes, per cell and by condition:
 - output reasoning-token subsets when exposed by the provider;
 - model cost; and
 - tool-call totals and types, independently recounted from transcripts.
+
+For the prompt-strategy comparison, the report also applies SlopCodeBench's
+pinned deterministic verbosity and erosion metrics to changed Python files in
+each terminal patch. Metrics are computed before and after the patch for
+`all`, `production`, and `test` scopes; production-only effects are emphasized
+so added tests do not masquerade as production-code quality. The wrapper
+selects the snapshot entry file with the most Python callable definitions,
+then breaks ties by non-`__init__.py`, bytes, and path, and records the selected
+entry. Ast-grep must execute its pinned rules and the dependency graph must be
+successfully returned. A zero-node graph is retained as a valid metric value,
+as defined by the upstream implementation; it is not converted into a missing
+or failed observation.
 
 For Sonnet, cost is the sum of provider-receipt model entries. For Luna, cost
 is an API-equivalent estimate using the published standard prices captured by
