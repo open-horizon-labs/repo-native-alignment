@@ -41,10 +41,21 @@ ledger and evidence bindings are `working-set-diagnostic-results.json` and
 
 An additional one-case T5 causal-working-set diagnostic follows that failed
 T4 gate without changing the 720 canonical cells. It preflighted ranks 10 and
-13 offline, ran only rank 10 on Sonnet and Spark while reusing the matching A
-controls, and stopped before scale because the two models split. Its path-free
-ledger and evidence bindings are `causal-working-set-diagnostic-results.json`
-and `causal-working-set-diagnostic-evidence-manifest.json`.
+13 offline and ran only rank 10 on Sonnet and Spark. A later audit found that
+its reused A controls were runtime-mismatched, so T5 efficacy is retained but
+its efficiency comparison is explicitly runtime-confounded. Its path-free
+provenance ledger and evidence bindings are
+`causal-working-set-diagnostic-results.json` and
+`causal-working-set-diagnostic-evidence-manifest.json`.
+
+The final bounded follow-up is the four-cell matched A6/T6 micro-gate on rank
+10: fresh A and compact-treatment cells on Sonnet and Spark under the same
+runtime within each model. All four are officially resolved, and T6 reduces
+input, output, time, and tools on both models despite paying positive static
+prefix-replay overhead. The path-free canonical replay decomposition, matched
+cell details, and evidence bindings are `prompt-replay-analysis.json` and
+`prompt-replay-analysis-evidence-manifest.json`. This is a mechanism check,
+not a population or scale claim.
 
 Read [METHOD.md](METHOD.md) before interpreting the unified
 [REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
@@ -81,12 +92,14 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_causal_working_set_diagnostic.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_prompt_replay_analysis.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
 order and budget, and fail-closed package digests. Where the retained evidence
-root is available, the five commands also verify the bound original, T2,
-weaker-model, prompt-strategy, and working-set diagnostic external artifacts by
+root is available, the commands also verify their bound external artifacts by
 content:
 
 ```bash
@@ -113,4 +126,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_causal_working_set_diagnostic.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_prompt_replay_analysis.py
 ```

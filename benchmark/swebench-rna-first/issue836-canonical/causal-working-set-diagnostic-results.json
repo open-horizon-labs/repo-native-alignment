@@ -146,14 +146,21 @@
       "successful_model_followup_rna_tool_call_count": 0
     }
   },
-  "design_diagnosis": {
-    "next_gate": "Change only the directive to say the injected RNA interaction has already executed and no follow-up RNA command is required, then test one different preflight case on Sonnet and Spark before any scale decision.",
-    "root_cause_fixed": "T5 replaces T4's test-rooted lexical projection with a production callable/type root, includes that root body once, preserves complete all-edge two-hop records in structural order, and abstains when the bounded projection is not useful.",
-    "scale_decision": "DO_NOT_SCALE_T5_YET",
-    "spark_residual": "Spark used the injected location immediately, then followed the inaccurate directive that an rna_tool_search command was available and spent most of its remaining trajectory repairing the old Django checkout's Python 3.12 distutils test environment.",
-    "treatment_status": "one-case implementation diagnostic, not population evidence"
+  "comparison_validity": {
+    "efficacy": "Each T5 patch independently received an official RESOLVED verdict.",
+    "efficiency_comparison": "RUNTIME_CONFOUNDED",
+    "sonnet": "The reused A control used the strategy runner's per-cell isolated runtime and sandbox, while T5 used the direct Claude runner and global runtime.",
+    "spark": "The reused A control and T5 used different isolation revisions; T5 suppressed the setuptools distutils .pth hook, then spent 35 command calls after the resulting test-runtime failure.",
+    "use": "Retain raw T5 cells and efficacy verdicts as provenance; do not interpret A-to-T5 efficiency deltas as treatment effects."
   },
-  "effects_percent_vs_A": {
+  "design_diagnosis": {
+    "next_gate": "Completed as the fresh same-runtime A6/T6 four-cell micro-gate recorded in prompt-replay-analysis.json.",
+    "root_cause_fixed": "T5 replaces T4's test-rooted lexical projection with a production callable/type root, includes that root body once, preserves complete all-edge two-hop records in structural order, and abstains when the bounded projection is not useful.",
+    "scale_decision": "DO_NOT_SCALE_FROM_RUNTIME_CONFOUNDED_T5",
+    "spark_residual": "Spark used the injected location immediately, then followed the inaccurate directive that an rna_tool_search command was available. Its dominant remaining trajectory occurred under a treatment-only broken distutils runtime and is harness contamination, not treatment evidence.",
+    "treatment_status": "one-case implementation provenance with independently valid efficacy and runtime-confounded efficiency"
+  },
+  "descriptive_effects_percent_vs_unmatched_A": {
     "sonnet": {
       "cache_read_input_tokens": -73.8,
       "cost_usd": -50.3,

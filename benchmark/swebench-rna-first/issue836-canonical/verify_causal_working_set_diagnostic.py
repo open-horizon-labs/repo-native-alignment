@@ -127,7 +127,7 @@ def verify_effects(data: dict[str, Any]) -> None:
     for model in ("sonnet", "spark"):
         control = data["conditions"][f"A_AS_{model}"]
         treatment = data["conditions"][f"T5_AS_{model}"]
-        observed = data["effects_percent_vs_A"][model]
+        observed = data["descriptive_effects_percent_vs_unmatched_A"][model]
         for name in fields:
             require(observed[name] == pct(metric(control, name), metric(treatment, name)), f"{model}: {name} effect")
         if model == "sonnet":
@@ -215,9 +215,10 @@ def main() -> int:
     require(data["paid_diagnostic_cell_count"] == 2, "paid diagnostic count")
     require(data["case"] == {"instance_id": "django__django-11551", "rank": 10}, "case identity")
     require(set(data["conditions"]) == CONDITIONS, "condition inventory")
-    require(data["design_diagnosis"]["scale_decision"] == "DO_NOT_SCALE_T5_YET", "scale decision")
-    require("## Follow-up causal-working-set gate: split result on one case" in report, "report section")
-    require("**DO NOT SCALE T5 YET**" in report, "report decision")
+    require(data["comparison_validity"]["efficiency_comparison"] == "RUNTIME_CONFOUNDED", "comparison validity")
+    require(data["design_diagnosis"]["scale_decision"] == "DO_NOT_SCALE_FROM_RUNTIME_CONFOUNDED_T5", "scale decision")
+    require("## T5 correction: the apparent split was runtime-confounded" in report, "report section")
+    require("**RUNTIME-CONFOUNDED**" in report, "report correction")
     for key, cell in data["conditions"].items():
         verify_cell(key, cell)
     require(data["conditions"]["T5_AS_sonnet"]["prompt"] == data["conditions"]["T5_AS_spark"]["prompt"], "T5: prompt parity")

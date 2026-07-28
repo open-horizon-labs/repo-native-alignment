@@ -61,6 +61,49 @@ while total tokens rise 13.6%/3.2%. These are descriptive single-run paired
 results over 20 deliberately selected cases; no pooled population effect or
 prompt-strategy causality is claimed.
 
+## Why helpful context still increased billed input
+
+The transcript ledger resolves the apparent contradiction. Provider input
+tokens are not the one-time prompt size: every inference request processes the
+current conversation prefix again. For each same-case pair, cumulative main-
+model input has the exact decomposition
+
+`actual delta = static treatment-prefix replay + interaction-trajectory delta`,
+
+where static replay is
+`(T first-request context − A first-request context) × T request count`.
+The trajectory term is everything else: changed request count and the growth
+of tool results, assistant messages, and subsequent context.
+
+Across the 12 exact Sonnet/Luna/Spark strategy comparisons (AS/PF × T/T2),
+the treatment trajectories collectively saved 8,513,756 input tokens, or 4.6%
+of A input. But replaying the unconditional treatment prefix added 45,399,615
+tokens, or 24.3%; net input therefore rose 36,885,859 tokens (+19.8%). Haiku's
+four decompositions show the same accounting identity over transcript-visible
+main requests, but are labeled approximate because its provider total also
+contains same-model auxiliary calls.
+
+The quoted Sonnet plan-first result is especially clear:
+
+| Cell | Actual main-input delta | Static prefix replay | Interaction trajectory | Requests A→T | Tools A→T | Tool-result chars |
+|---|---:|---:|---:|---:|---:|---:|
+| T | +2,245,735 (+13.0%) | +5,488,662 | **−3,242,927 (−18.8%)** | 652→562 | 632→542 | −5.8% |
+| T2 | +477,700 (+2.8%) | +4,448,564 | **−3,970,864 (−23.1%)** | 652→587 | 632→568 | −14.9% |
+
+Thus useful treatment behavior was already present: fewer requests, tools,
+tool-result characters, and output tokens. The design bug was injecting a
+large text result plus graph unconditionally into the persistent prefix, so
+its replay charge overwhelmed those savings. This also explains why ordinary
+day-to-day RNA use can feel cheaper: a compact or on-demand result replaces
+Grep/Read loops instead of being prepended wholesale to every request.
+
+Structural validity is not the same as causal relevance. The canonical T/T2
+graphs were valid RNA traversals, but deterministic title-overlap selection
+could still choose the wrong task root (for example, rank 10's earlier
+`_check_list_display_links` root rather than `_check_list_display_item`). The
+matched gate below tests a compact working set whose root actually contains
+the reported `admin.E108` diagnostic.
+
 ## Post-hoc working-set gate: stopped after one case
 
 After the 720 canonical cells were complete, two bounded RNA working-set
@@ -132,76 +175,88 @@ The path-free diagnostic ledger is
 with retained artifacts bound by
 [`working-set-diagnostic-evidence-manifest.json`](working-set-diagnostic-evidence-manifest.json).
 
-## Follow-up causal-working-set gate: split result on one case
+## T5 correction: the apparent split was runtime-confounded
 
-The replayed-input diagnosis was not disproved by T4; work on it stopped when
-T4 exposed a flawed lexical projection. A corrected T5 producer was therefore
-frozen and tested only through the small gate requested: two offline preflight
-cases (ranks 10 and 13), followed by exactly two paid T5 cells on rank 10
-(`django__django-11551`), one each on Sonnet and Spark. The existing rank-10
-anti-slop A controls were reused. No full sweep was launched.
+T5 corrected T4's root selection and produced a genuinely compact rank-10
+working set. It selected
+`django/contrib/admin/checks.py:_check_list_display_item:function` only after
+two earlier roots abstained for lacking `admin.E108`; four complete graph
+records fit. The resulting injection was 4,819 bytes and the full prompt was
+10,326 bytes, byte-identical across models. Both T5 patches independently
+passed transcript audit and the stock SWE-bench evaluator.
 
-T5 starts from the frozen 50-record strict hybrid/reranked title-plus-512
-result, admits only production callable/type roots, and uses exact matching
-only for explicit underscore-bearing identifiers. Otherwise it scores symbol
-and path overlap with the frozen rerank order as the tie-break. An explicit
-diagnostic such as `admin.E108` must occur in the selected root body. T5 then
-injects that root body once and complete all-edge, bidirectional, two-hop graph
-records in structural order under an 8 KiB injection and 16 KiB full-prompt
-cap. It never lexically re-filters the traversed graph and abstains when the
-bounded projection lacks a root body, three complete records, or a
-callable/type neighbor.
+The previously reported A→T5 efficiency split is **RUNTIME-CONFOUNDED**,
+however. Those T5 cells reused older A controls instead of fresh controls from
+the same final runner:
 
-For rank 10 the deterministic traversal root was
-`django/contrib/admin/checks.py:_check_list_display_item:function`; the two
-earlier candidates abstained because their bodies did not contain
-`admin.E108`. Four complete graph records fit. The 4,819-byte injection
-produced a 10,326-byte prompt, byte-identical across Sonnet and Spark. Rank 13
-also passed offline preflight with `_print_Subs`, an 8,037-byte injection, and a
-8,696-byte prompt, but received no provider call.
+- Sonnet A used the strategy runner's per-cell isolated runtime and sandbox;
+  T5 used a direct Claude runner and global runtime.
+- Spark T5 used a later isolation layer that suppressed setuptools' `.pth`
+  hook without supplying its Python 3.12 `distutils` compatibility shim. Its
+  first test failed before exercising the patch, and 35 of 56 command calls
+  occurred afterward while the model diagnosed and repaired that treatment-
+  only runtime failure. Spark A did not encounter it.
+- The inherited T5 directive also falsely advertised an available
+  `rna_tool_search` command, prompting three unnecessary Spark probes.
 
-Both paid T5 patches passed transcript audit and the stock SWE-bench evaluator.
-
-| Backend | Cell | Resolved | Prompt bytes | Input tokens | Uncached input | Cache read | Output tokens | Total tokens | Time | Cost | Tools |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Sonnet | A-AS | yes | 5,507 | 334,857 | 21,758 | 313,099 | 6,799 | 341,656 | 117.1s | $0.315745 | 17 (Bash=7, Edit=3, Grep=3, Read=4) |
-| Sonnet | T5-AS | yes | 10,326 | 102,892 | 20,784 | 82,108 | 1,685 | 104,577 | 21.5s | $0.156994 | 6 (Bash=3, Edit=1, Glob=1, Read=1) |
-| Spark | A-AS | yes | 5,507 | 967,970 | 42,914 | 925,056 | 10,797 | 978,767 | 96.6s | n/a | 44 (commandExecution=40, fileChange=4) |
-| Spark | T5-AS | yes | 10,326 | 1,815,758 | 46,286 | 1,769,472 | 15,964 | 1,831,722 | 137.1s | n/a | 60 (commandExecution=56, fileChange=4) |
-
-Relative to the matching A, Sonnet T5 reduced input/output/total tokens by
-69.3%/75.2%/69.4%, time by 81.6%, tools by 64.7%, cache-read input by 73.8%,
-and reported cost by 50.3%. Spark T5 instead increased those token fields by
-87.6%/47.9%/87.1%, time by 41.9%, tools by 36.4%, and cache-read input by
-91.3%. Uncached input moved only −4.5% for Sonnet and +7.9% for Spark. That is
-the key causal diagnostic: the treatment prefix itself is not large enough to
-explain either result; the model's ensuing trajectory determines how many
-times the conversation is replayed.
-
-The transcripts explain the split. Sonnet used the injected
-`_check_list_display_item` context immediately, completed in six tool calls,
-and passed 54 relevant tests. Spark also began at the exact injected location,
-so it did not ignore the context. It then spent three calls probing a missing
-`rna_tool_search` executable because the inherited directive inaccurately says
-that command is available, and most of its remaining 56 command calls fought
-the old Django checkout's Python 3.12 `distutils` incompatibility. It still
-produced a resolved patch. These are model/runner interaction effects, not
-evidence that 4.8 KiB of RNA context directly cost 853,111 extra tokens.
-
-The decision is **DO NOT SCALE T5 YET**. This one case shows that the
-treatment-design bug was real and that the corrected working set eliminated
-the replay explosion on Sonnet's observed trajectory; it does not establish a
-population effect or
-cross-model robustness. The next minimal gate should change only the directive
-to state that the injected RNA interaction has already executed and no
-follow-up RNA command is required, then test one different preflight case on
-Sonnet and Spark under an aligned deterministic test runtime. A scale decision
-comes only after that transcript audit.
-
-The path-free T5 ledger is
+Therefore T5 efficacy is usable—both treatment patches are RESOLVED—but its
+raw A/T5 token, time, tool, and cost deltas are descriptive provenance, not a
+causal treatment comparison. They cannot support either “Sonnet benefits” or
+“Spark is harmed.” The path-free T5 provenance ledger is
 [`causal-working-set-diagnostic-results.json`](causal-working-set-diagnostic-results.json),
 with retained artifacts bound by
 [`causal-working-set-diagnostic-evidence-manifest.json`](causal-working-set-diagnostic-evidence-manifest.json).
+
+## Matched A6/T6 micro-gate
+
+The requested cheap follow-up ran exactly four fresh paid cells on rank 10—A6
+and T6 on Sonnet and Spark—and no scale run. Within each model both arms used
+the same runner, source checkout, tool surface, Python policy, base
+instructions, anti-slop strategy, and official evaluator. Spark's isolated
+runtime installed and preflighted the missing `distutils` compatibility shim
+before provider spend. T6 changed only two model-visible inputs:
+
+1. prepend the frozen 4,819-byte compact RNA interaction to the byte-identical
+   standard task; and
+2. state that the displayed RNA interaction already executed and must not be
+   invoked again during the episode.
+
+All four transcripts passed audit, none made a follow-up RNA call, and all four
+patches were officially RESOLVED.
+
+| Backend | Cell | Resolved | Prompt bytes | Input tokens | Uncached input | Cache read | Output tokens | Total tokens | Time | Cost | Tools |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Sonnet | A6-AS | yes | 5,507 | 1,221,066 | 39,112 | 1,181,954 | 14,175 | 1,235,241 | 382.3s | $0.803795 | 44 (Bash=25, Edit=4, Grep=4, Read=11) |
+| Sonnet | T6-AS | yes | 10,326 | 894,611 | 33,829 | 860,782 | 8,724 | 903,335 | 171.7s | $0.595440 | 33 (Bash=15, Edit=5, Grep=6, Read=7) |
+| Spark | A6-AS | yes | 5,507 | 1,081,989 | 53,125 | 1,028,864 | 16,241 | 1,098,230 | 103.1s | n/a | 43 (commandExecution=38, fileChange=5) |
+| Spark | T6-AS | yes | 10,326 | 749,751 | 39,735 | 710,016 | 9,790 | 759,541 | 69.8s | n/a | 33 (commandExecution=30, fileChange=2, webSearch=1) |
+
+Relative to A6, Sonnet T6 reduced input/output/total tokens by
+26.7%/38.5%/26.9%, time by 55.1%, tools by 25.0%, uncached input by 13.5%,
+cache-read input by 27.2%, and reported cost by 25.9%. Spark T6 reduced the
+same fields by 30.7%/39.7%/30.8%, 32.3%, 23.3%, 25.2%, and 31.0%; Spark cost
+remains unavailable.
+
+The replay decomposition shows exactly how a larger first request still
+produced lower cumulative input:
+
+| Backend | Requests A6→T6 | First context A6→T6 | Static prefix replay | Interaction-trajectory delta | Net input delta |
+|---|---:|---:|---:|---:|---:|
+| Sonnet | 45→34 | 10,411→12,207 | +61,064 | **−387,519** | **−326,455** |
+| Spark | 45→33 | 6,106→7,246 | +37,620 | **−369,858** | **−332,238** |
+
+This is the principles-level answer: correct compact context is not free, and
+its static prefix is charged again at every request. But here it shortened the
+actual work enough to save far more trajectory tokens than it added. The
+canonical token increase came from an oversized unconditional prefix and, in
+some cases, a weakly relevant root—not from a rule that graph context makes
+reasoning intrinsically more expensive.
+
+This remains a one-case mechanism check, not a population-effect estimate, so
+**NO SCALE CLAIM** follows from it. The path-free replay ledger is
+[`prompt-replay-analysis.json`](prompt-replay-analysis.json), with retained
+artifacts bound by
+[`prompt-replay-analysis-evidence-manifest.json`](prompt-replay-analysis-evidence-manifest.json).
 
 For continuity with the preregistered two-model A/T analysis, its original
 executive rows are retained verbatim:

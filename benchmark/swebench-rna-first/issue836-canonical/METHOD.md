@@ -344,6 +344,33 @@ Primary sources: [HumanLayer benchmark article](https://github.com/humanlayer/ad
 [SlopCodeBench paper](https://arxiv.org/html/2603.24755v1), and
 [SlopCodeBench repository](https://github.com/SprocketLab/slop-code-bench/tree/13de1a7a6b8b3dc5cc532a0c322a0997afa5bec7).
 
+### Cumulative-input replay decomposition
+
+The provider token ledgers report cumulative input processed across inference
+requests, not unique prompt bytes. The 480 strategy transcripts were therefore
+audited request by request. For Claude, assistant events are deduplicated by
+provider message ID and request context is ordinary input plus cache creation
+plus cache read. For Codex App Server, each distinct cumulative
+`thread/tokenUsage/updated` notification contributes its `last.inputTokens`;
+byte-for-byte repeated cumulative notifications are not counted as new
+requests.
+
+For every same-case A/T or A/T2 pair, main-model input is decomposed as:
+
+`actual delta = static treatment-prefix replay + interaction-trajectory delta`
+
+with static replay equal to
+`(T first context − A first context) × T request count`. The trajectory
+residual captures changed request count and later conversation growth. The
+identity is exact for all 240 Sonnet/Luna/Spark treatment cells. Haiku's
+transcript-visible main sequence excludes same-model auxiliary classification
+calls included in the provider total, so its four aggregate decompositions are
+explicitly labeled approximate.
+
+This accounting is descriptive and deterministic; it does not assume the
+treatment is relevant. Root relevance is analyzed separately from graph
+structural validity.
+
 ### Post-hoc T5 causal-working-set gate
 
 T5 is a bounded implementation diagnostic prompted by the observation that
@@ -395,6 +422,46 @@ for this gate. It says both to use the already-injected context and to use an
 claim was false in the Spark App Server environment and is treated as a
 residual treatment/runner design defect. The report therefore stops T5 after
 one case and specifies a directive-only follow-up gate rather than scaling.
+
+A later receipt/runtime audit found that T5's reused A controls were not
+runtime-matched. Sonnet's control and T5 cell used different runner/isolation
+policies. Spark T5 alone used an isolation revision that skipped setuptools'
+`distutils` `.pth` hook; its first test failed and 35 command calls followed
+that runtime failure. T5's two independent RESOLVED verdicts remain valid, but
+its A/T5 efficiency deltas are designated `RUNTIME_CONFOUNDED` and are not
+interpreted as treatment effects.
+
+### Matched A6/T6 causal-replay micro-gate
+
+T6 is the directive-only, same-runtime follow-up. It is outside the 720
+canonical cells and was frozen to exactly one case (rank 10), two models
+(Sonnet and Spark), and four fresh paid cells. No population run was
+authorized. To balance temporal order, Sonnet ran A6 then T6 and Spark ran T6
+then A6; every episode used a fresh checkout.
+
+A6 used the 5,507-byte standard SWE-bench task and the 808-byte anti-slop
+strategy. T6 used the exact 10,326-byte T5 prompt—4,819 bytes of compact RNA
+interaction followed by the byte-identical task—and a 1,070-byte developer
+instruction. The T6-only directive states that the RNA interaction at the
+start of the prompt already executed, treats its search and two-hop result as
+context, and prohibits invoking RNA or `rna_tool_search` during the episode.
+The anti-slop suffix is otherwise byte-identical.
+
+Within a model, both arms used the same runner, model/effort, checkout and base
+tree, tool surface, network policy, base instructions, strategy, Python policy,
+and evaluator. Spark used a per-cell virtual environment with shared
+site-packages on `PYTHONPATH`; because that isolation intentionally does not
+execute host `.pth` hooks, its `sitecustomize` installs setuptools'
+`_distutils_hack` shim explicitly. A zero-spend preflight required
+`import distutils.version` through the exact isolated interpreter before a
+provider could start. The same check passed in A6 and T6. Sonnet used the same
+direct logged-in CLI runner and global Python policy for both arms.
+
+Admission required exact prompt/developer hashes, A/T case/commit/tree parity,
+runtime preflight, complete provider transcript, zero follow-up RNA calls, a
+terminal patch, and stock SWE-bench evaluation. All four cells passed. The
+same request-level replay formula above was then applied to the matched pair;
+no post-hoc cell filtering or scale execution followed.
 
 ## Model runtimes
 
