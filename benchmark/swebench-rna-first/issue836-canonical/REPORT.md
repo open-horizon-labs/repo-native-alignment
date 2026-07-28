@@ -310,6 +310,14 @@ Each cell reports official SWE-bench efficacy, elapsed wall time, cumulative inp
 
 This additive post-hoc execution crosses the frozen A/T/T2 context arms with semantic ports of SlopCodeBench's published `anti_slop` (AS) and `plan_first` (PF) strategies on all four models. The original 240 cells remain the strategy-free baseline; no cell is relabeled or replaced.
 
+Scope boundary: HumanLayer's reported run used SlopCodeBench's `just-solve`
+condition. `anti_slop` and `plan_first` are the two executed prompt variants in
+the linked SlopCodeBench study and are the transferable additions evaluated
+here. The article's adversarial-review, deterministic-backpressure, and
+frontier-to-weaker-handoff ideas are future proposals, not reported treatment
+arms; they are not silently counted among these 720 cells. METHOD.md contains
+the complete executed-versus-proposed transfer audit.
+
 All 720 final transcripts pass their applicable independent audit. T/T2 contribute 480 deterministic pre-injected RNA exposures. The 480-cell strategy extension records 25 ordinary follow-up RNA calls; the older ledgers did not expose one uniform follow-up-count field. The injected exposure is context, not a model tool call, and is excluded from tool counts. Preconditioning was necessary because earlier harness/model behavior did not reliably act on RNA system guidance alone; follow-up traversal is not required by the context-efficacy hypothesis. Four superseded strategy attempts that ingested their own live harness transcript were replaced before analysis, as documented in METHOD.md.
 
 ### Complete 36-condition summary

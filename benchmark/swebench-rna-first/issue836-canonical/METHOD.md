@@ -308,16 +308,37 @@ wrapper-timeout attempt, 14 cross-cell/host-path isolation attempts, and four
 same-cell transcript-exposure attempts equal 499 paid provider episodes. Stock
 SWE-bench evaluation and deterministic quality scoring add zero model calls.
 
-| Design element | HumanLayer / SlopCodeBench | Issue #836 extension |
-|---|---|---|
-| Task unit | Longitudinal greenfield checkpoint | Single SWE-bench repair |
-| Context | Fresh conversation per checkpoint | Fresh conversation per cell |
-| State carried | Code from earlier checkpoints | None across cells; frozen base per cell |
-| Baseline prompt | `just-solve` | Existing A/T/T2 prompt bytes |
-| Added prompt arms | SCBench `anti_slop`, `plan_first` | Semantic ports crossed with A/T/T2 |
-| Correctness | Strict black-box checkpoint suite | Stock SWE-bench 4.1 exact-patch evaluator |
-| Quality | SlopCodeBench verbosity and erosion | Same pinned metrics on changed Python files, before/after |
-| Runtime ceiling | Two hours per checkpoint | Two hours for Claude; no Codex model/tool timeout |
+#### Transfer-status audit
+
+This table separates what HumanLayer actually executed from ideas it explicitly
+lists under “what's next / things I'd do differently.” Only executed prompt
+conditions are treatment arms. Operational choices and unexecuted proposals are
+reported for comparison, but are not relabeled as replicated experiments.
+
+| Design element | Source status | HumanLayer / SlopCodeBench | Issue #836 disposition |
+|---|---|---|---|
+| Task unit | Executed method | Three longitudinal greenfield challenges, 17 checkpoints | Twenty single-shot SWE-bench repairs; longitudinal carry-over is not transferred because it would change the task population and estimand |
+| Context | Executed method | Fresh conversation per checkpoint | Fresh provider thread per cell |
+| State carried | Executed method | Code, but not conversation, carries across checkpoints | No state across cells; every cell starts from its frozen base |
+| Prompt parity | Executed method | Same prompt for every compared model | Exact per-rank/context user-prompt bytes are identical across strategy and model cells |
+| Provider harness | Executed method | Claude Code | Provider-native Claude CLI or Codex App Server, held fixed within each model comparison |
+| Baseline prompt | Executed condition | SlopCodeBench `just-solve` | Existing strategy-free A/T/T2 cells |
+| Added prompt arms | Executed in linked SlopCodeBench study, not HumanLayer's reported run | SlopCodeBench `anti_slop` and `plan_first` | Frozen semantic ports crossed with A/T/T2 on all four models |
+| Correctness | Executed method | Held-out black-box tests against the produced entrypoint, including prior-checkpoint regressions | Stock SWE-bench 4.1 evaluator; no prior checkpoints exist in this single-shot task |
+| Quality | Executed measurement | Forty-one deterministic checkpoint metrics; treated as directional rather than a standalone maintainability oracle | Same pinned SlopCodeBench metric families on changed Python files, before and after each patch |
+| Cost, time, and tokens | Executed measurement / proposed emphasis | Cost observed; article proposes greater future emphasis on time and token efficiency | Cost, elapsed time, input/cache/output tokens, and tool calls by type are reported per cell |
+| Nine-way challenge parallelism | Future operational suggestion | Proposed to shorten wall-clock execution | Not a treatment; cell isolation and deterministic ordering are retained, and co-scheduling is disclosed |
+| TypeScript rule port | Future tooling suggestion | Proposed because the published detectors are Python-only | Not applicable to this Python cohort and not a model treatment |
+| Adversarial model-review loop | Future treatment proposal | Explicitly proposed but not executed | Not claimed as replicated; it would add a second model interaction and change the estimand |
+| Deterministic quality backpressure | Future treatment proposal | Explicitly proposed but not executed | Metrics are measured after the patch, not fed back into the solver; an iterative feedback arm would be a new experiment |
+| Frontier-to-weaker handoff | Future benchmark proposal | Proposed for a later longitudinal checkpoint | Not transferable to independent single-shot repairs without constructing a different longitudinal benchmark |
+| Larger dataset | Future scale proposal | Proposed | Not a treatment; the frozen 20-case cohort is retained |
+
+The completed transferable treatment set is therefore the strategy-free
+baseline plus `anti_slop` and `plan_first`, crossed with A/T/T2. Review,
+backpressure, and handoff remain clearly labeled candidate follow-up studies;
+adding them here would not make this experiment a closer replication of the
+reported HumanLayer run.
 
 Primary sources: [HumanLayer benchmark article](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents/blob/a2da7968c7d5cbc8a58e9c559f4d9eea6d460d6c/benchmarking-opus-5-on-slop-code-bench.md),
 [SlopCodeBench paper](https://arxiv.org/html/2603.24755v1), and

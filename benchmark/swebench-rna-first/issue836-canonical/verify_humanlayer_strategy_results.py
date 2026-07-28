@@ -32,8 +32,8 @@ EXPECTED_BASELINE_SHAS = (
     "26e9ad318e2d3a03f355499326dd644968bbd3770807d69d272c617ca7e62daf",
     "c09fdba9e3eaf058e5c7137a08376bcdf2cce35c9c92d9ef3eceaebb92e2b3a5",
 )
-EXPECTED_REPORT_SHA = "3149d5722baf46a2af618d99e7a15331c14f20fe9131810dccbe2338438fc843"
-EXPECTED_METHOD_SHA = "291908cfff17b812014c553e9a07b1379c38ccfaac2e363c4b0ccc98c29d9a19"
+EXPECTED_REPORT_SHA = "c2622237dc429d2c87395a6b81990ebb6654330c4951ae0cb798025c32af1d19"
+EXPECTED_METHOD_SHA = "73f80e16cc0a9dc95011ea2c21526a85fd55dabac9ec8259b56309bfd5ce2c77"
 EXPECTED_README_SHA = "387b35848723bfc85be84d4308e4759a99f69012cb4397f81f01f624c585c2d4"
 EXPECTED_MANIFEST_SHA = "0c9636d997e434ce02022a49aa26627600a62048b0a64d17392d9b27d1386550"
 
@@ -59,6 +59,54 @@ LUNA_RATES = {
     "cache_write_per_mtok": 1.25,
     "output_per_mtok": 6.0,
     "web_search_per_call": 0.01,
+}
+EXPECTED_UPSTREAM = {
+    "anti_slop_template": {
+        "bytes": 1413,
+        "sha256": "e334962c38a1ca83f9de87b2120821b07aabd7159f665dfde843f04fe5ed74a5",
+    },
+    "humanlayer_commit": "a2da7968c7d5cbc8a58e9c559f4d9eea6d460d6c",
+    "plan_first_template": {
+        "bytes": 1233,
+        "sha256": "0fcf89c6f841d9d2d02b3ec50b61ebcf4c4d7fcab812ec4e5d5e66efbec2cf8b",
+    },
+    "slop_code_bench_commit": "13de1a7a6b8b3dc5cc532a0c322a0997afa5bec7",
+}
+EXPECTED_PROMPT_PORT = {
+    "spec": {
+        "bytes": 2814,
+        "sha256": "6fb8ab25479a4025751dd039ee242bbb984238050ff78f291fd9598618b4fb82",
+    },
+    "strategy_instructions": {
+        "AS": {
+            "bytes": 808,
+            "sha256": "8d47fd170081caee967ae54bb0921f520d1b466c37959e9cfd59e2745c5964aa",
+        },
+        "PF": {
+            "bytes": 727,
+            "sha256": "3d93456b81f521c34d97312e9745adfecce74333668c42aa2d90d31b4b21e430",
+        },
+    },
+}
+EXPECTED_DEVELOPER_INSTRUCTIONS = {
+    ("A", "AS"): EXPECTED_PROMPT_PORT["strategy_instructions"]["AS"],
+    ("A", "PF"): EXPECTED_PROMPT_PORT["strategy_instructions"]["PF"],
+    ("T", "AS"): {
+        "bytes": 999,
+        "sha256": "075b02b7d2abefb3a894dd5c8deb838d5faea55b0d10e535623e9fb0cf924706",
+    },
+    ("T2", "AS"): {
+        "bytes": 999,
+        "sha256": "075b02b7d2abefb3a894dd5c8deb838d5faea55b0d10e535623e9fb0cf924706",
+    },
+    ("T", "PF"): {
+        "bytes": 918,
+        "sha256": "ff6dcada51bec5e9228bfb693d5d9e20565fa35fea44c95d6feb9195114ef62a",
+    },
+    ("T2", "PF"): {
+        "bytes": 918,
+        "sha256": "ff6dcada51bec5e9228bfb693d5d9e20565fa35fea44c95d6feb9195114ef62a",
+    },
 }
 
 
@@ -435,6 +483,28 @@ def main() -> int:
         "cell accounting",
     )
     require(data["pricing"]["luna"]["rates"] == LUNA_RATES, "Luna rates")
+    require(data["upstream"] == EXPECTED_UPSTREAM, "pinned upstream sources")
+    require(data["prompt_port"] == EXPECTED_PROMPT_PORT, "frozen prompt port")
+    manifest_prompt_refs = {
+        "spec": manifest["external_artifacts"]["prompt_port"],
+        "AS": manifest["external_artifacts"]["anti_slop_strategy"],
+        "PF": manifest["external_artifacts"]["plan_first_strategy"],
+        "upstream_AS": manifest["external_artifacts"]["upstream_anti_slop"],
+        "upstream_PF": manifest["external_artifacts"]["upstream_plan_first"],
+    }
+    expected_prompt_refs = {
+        "spec": EXPECTED_PROMPT_PORT["spec"],
+        "AS": EXPECTED_PROMPT_PORT["strategy_instructions"]["AS"],
+        "PF": EXPECTED_PROMPT_PORT["strategy_instructions"]["PF"],
+        "upstream_AS": EXPECTED_UPSTREAM["anti_slop_template"],
+        "upstream_PF": EXPECTED_UPSTREAM["plan_first_template"],
+    }
+    for name, expected in expected_prompt_refs.items():
+        actual = {
+            field: manifest_prompt_refs[name][field]
+            for field in ("bytes", "sha256")
+        }
+        require(actual == expected, f"manifest prompt source: {name}")
 
     baseline_quality = {
         (row["rank"], row["key"]): row for row in data["baseline_quality_rows"]
@@ -483,6 +553,16 @@ def main() -> int:
             require(cell["status"] == "READY", f"rank {expected_rank} {key}: ready")
             for name in ("prompt", "developer_instructions", "episode_receipt", "patch"):
                 validate_ref(cell[name], f"rank {expected_rank} {key} {name}")
+            baseline_key = f"{cell['context']}_{cell['backend']}"
+            require(
+                cell["prompt"] == baseline[(expected_rank, baseline_key)]["prompt"],
+                f"rank {expected_rank} {key}: unchanged user prompt",
+            )
+            require(
+                cell["developer_instructions"]
+                == EXPECTED_DEVELOPER_INSTRUCTIONS[(cell["context"], cell["strategy"])],
+                f"rank {expected_rank} {key}: instruction composition",
+            )
             validate_ref(cell["official"]["evaluation_receipt"], f"rank {expected_rank} {key} evaluation")
             require(cell["official"]["verdict"] in {"RESOLVED", "UNRESOLVED"}, f"rank {expected_rank} {key}: verdict")
             metrics = cell["metrics"]
@@ -619,6 +699,17 @@ def main() -> int:
     require("all 36 conditions" in report, "unified report condition prose")
     require("240/240" not in report and "all 12 conditions" not in report, "stale report accounting")
     require("HumanLayer/SlopCodeBench prompt-strategy factorial" in report, "unified report strategy section")
+    require(
+        "Scope boundary: HumanLayer's reported run used SlopCodeBench's `just-solve`"
+        in report,
+        "report transfer boundary",
+    )
+    require("#### Transfer-status audit" in METHOD.read_text(), "method transfer audit")
+    require(
+        "Adversarial model-review loop | Future treatment proposal"
+        in METHOD.read_text(),
+        "method future-treatment boundary",
+    )
     require("Complete 36-condition summary" in report, "unified report condition summary")
     require("All 720 cells: per-case efficacy" in report, "unified report detail section")
     require(
