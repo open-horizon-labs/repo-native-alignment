@@ -16,6 +16,10 @@ RESULTS = ROOT / "prompt-replay-analysis.json"
 MANIFEST = ROOT / "prompt-replay-analysis-evidence-manifest.json"
 REPORT = ROOT / "REPORT.md"
 METHOD = ROOT / "METHOD.md"
+EXPECTED_RESULTS_SHA = "9402e0cc1b0c0f61f69a6aefb2f86b72db38c7d0f478a64a44ed7256228be191"
+EXPECTED_MANIFEST_SHA = "4b95b119490c46d7fe155d2e91e1d74040a7598063cd2950615c6359429947d0"
+EXPECTED_REPORT_SHA = "d6e4eda65545f32c6d4ae2d2795188feb64bbd8c7ea750ce288739c50bf9e4db"
+EXPECTED_METHOD_SHA = "89ce84aab737cc3516e0af4715e2e86642c0bdef350a018d2fc2654832e9a4ee"
 MATCHED_CONDITIONS = {
     "A6_AS_sonnet", "T6_AS_sonnet", "A6_AS_spark", "T6_AS_spark",
 }
@@ -43,6 +47,16 @@ def load(path: Path) -> dict[str, Any]:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_package_digests() -> None:
+    for path, expected in (
+        (RESULTS, EXPECTED_RESULTS_SHA),
+        (MANIFEST, EXPECTED_MANIFEST_SHA),
+        (REPORT, EXPECTED_REPORT_SHA),
+        (METHOD, EXPECTED_METHOD_SHA),
+    ):
+        require(digest(path.read_bytes()) == expected, f"{path.name}: package digest drift")
 
 
 def pct(before: float, after: float) -> float:
@@ -226,6 +240,7 @@ def verify_external(data: dict[str, Any], manifest: dict[str, Any], evidence_roo
 
 
 def main() -> int:
+    verify_package_digests()
     data = load(RESULTS)
     manifest = load(MANIFEST)
     report = REPORT.read_text()

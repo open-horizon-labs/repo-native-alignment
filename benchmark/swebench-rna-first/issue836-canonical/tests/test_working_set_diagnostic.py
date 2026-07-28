@@ -11,6 +11,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import verify_causal_working_set_diagnostic  # noqa: E402
+import verify_prompt_replay_analysis  # noqa: E402
 import verify_working_set_diagnostic  # noqa: E402
 
 
@@ -28,6 +30,36 @@ class WorkingSetDiagnosticVerificationTests(unittest.TestCase):
             with mock.patch.object(verify_working_set_diagnostic, "RESULTS", path):
                 with self.assertRaises(verify_working_set_diagnostic.VerificationFailure):
                     verify_working_set_diagnostic.main()
+
+    def test_offline_package_digest_mutations_fail_closed(self) -> None:
+        protected = (
+            (
+                verify_working_set_diagnostic,
+                ("RESULTS", "MANIFEST", "CANONICAL", "REPORT", "METHOD"),
+            ),
+            (
+                verify_causal_working_set_diagnostic,
+                ("RESULTS", "MANIFEST", "CANONICAL", "REPORT", "METHOD"),
+            ),
+            (
+                verify_prompt_replay_analysis,
+                ("RESULTS", "MANIFEST", "REPORT", "METHOD"),
+            ),
+        )
+        for verifier, names in protected:
+            for name in names:
+                with self.subTest(verifier=verifier.__name__, artifact=name):
+                    original = getattr(verifier, name)
+                    with tempfile.TemporaryDirectory() as raw:
+                        mutated = Path(raw) / original.name
+                        mutated.write_bytes(original.read_bytes() + b"\n")
+                        with mock.patch.object(verifier, name, mutated):
+                            with mock.patch.dict("os.environ", {}, clear=True):
+                                with self.assertRaisesRegex(
+                                    verifier.VerificationFailure,
+                                    "package digest drift",
+                                ):
+                                    verifier.main()
 
 
 if __name__ == "__main__":

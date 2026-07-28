@@ -16,6 +16,12 @@ RESULTS = ROOT / "causal-working-set-diagnostic-results.json"
 MANIFEST = ROOT / "causal-working-set-diagnostic-evidence-manifest.json"
 CANONICAL = ROOT / "humanlayer-strategy-results.json"
 REPORT = ROOT / "REPORT.md"
+METHOD = ROOT / "METHOD.md"
+EXPECTED_RESULTS_SHA = "1c9e1baaab08bab797501d254b6ec1756e9566fcb0a46ff4a0a987cbee51a831"
+EXPECTED_MANIFEST_SHA = "f55906c43c40a9401d155002627ba0ec87fac990ad978d81e6ab6c2a0bcf94eb"
+EXPECTED_CANONICAL_SHA = "b3c617ea3d23e0865adad6c78b28fbfe8e4bd5af97c96d69fabe6d0ad13685a5"
+EXPECTED_REPORT_SHA = "d6e4eda65545f32c6d4ae2d2795188feb64bbd8c7ea750ce288739c50bf9e4db"
+EXPECTED_METHOD_SHA = "89ce84aab737cc3516e0af4715e2e86642c0bdef350a018d2fc2654832e9a4ee"
 CONDITIONS = {"A_AS_sonnet", "A_AS_spark", "T5_AS_sonnet", "T5_AS_spark"}
 
 
@@ -41,6 +47,17 @@ def load(path: Path) -> dict[str, Any]:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_package_digests() -> None:
+    for path, expected in (
+        (RESULTS, EXPECTED_RESULTS_SHA),
+        (MANIFEST, EXPECTED_MANIFEST_SHA),
+        (CANONICAL, EXPECTED_CANONICAL_SHA),
+        (REPORT, EXPECTED_REPORT_SHA),
+        (METHOD, EXPECTED_METHOD_SHA),
+    ):
+        require(digest(path.read_bytes()) == expected, f"{path.name}: package digest drift")
 
 
 def close(left: float, right: float) -> bool:
@@ -206,6 +223,7 @@ def verify_external(data: dict[str, Any], manifest: dict[str, Any], evidence_roo
 
 
 def main() -> int:
+    verify_package_digests()
     data = load(RESULTS)
     manifest = load(MANIFEST)
     canonical = load(CANONICAL)
