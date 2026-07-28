@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 pub(crate) const MAX_TASK_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TASK_LINES: usize = 1_024;
@@ -608,16 +609,30 @@ pub(crate) fn resolve_exact_references(
                 .filter(|candidate| candidate.canonical_match_keys().contains(&key))
                 .cloned()
                 .collect::<Vec<_>>();
-            if matches.is_empty()
-                && reference.kind == ExactReferenceKind::QualifiedName
-                && let Some(terminal) = qualified_name_terminal(&reference.normalized)
-            {
-                let terminal = normalize_match_key(terminal);
-                matches = canonical_candidates
+            if matches.is_empty() && reference.kind == ExactReferenceKind::QualifiedName {
+                let source_file_matches = canonical_candidates
                     .iter()
-                    .filter(|candidate| candidate.canonical_match_keys().contains(&terminal))
+                    .filter(|candidate| {
+                        source_file_basename(&candidate.source_file)
+                            .is_some_and(|basename| basename == key)
+                    })
                     .cloned()
-                    .collect();
+                    .collect::<Vec<_>>();
+                if !source_file_matches.is_empty() {
+                    // A bare dotted filename (for example `app.py`) is
+                    // lexically indistinguishable from a qualified name.
+                    // Prefer actual repository-file evidence when it exists;
+                    // otherwise terminal fallback could resolve the extension
+                    // (`py`) as an unrelated symbol.
+                    matches = source_file_matches;
+                } else if let Some(terminal) = qualified_name_terminal(&reference.normalized) {
+                    let terminal = normalize_match_key(terminal);
+                    matches = canonical_candidates
+                        .iter()
+                        .filter(|candidate| candidate.canonical_match_keys().contains(&terminal))
+                        .cloned()
+                        .collect();
+                }
             }
             let resolution = match matches.as_slice() {
                 [] => ExactResolution::Miss,
@@ -630,6 +645,13 @@ pub(crate) fn resolve_exact_references(
             }
         })
         .collect()
+}
+
+fn source_file_basename(source_file: &str) -> Option<String> {
+    Path::new(source_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(normalize_match_key)
 }
 
 fn qualified_name_terminal(name: &str) -> Option<&str> {
@@ -1486,6 +1508,41 @@ mod tests {
         assert!(matches!(
             &resolved[0].resolution,
             ExactResolution::Ambiguous(matches) if matches.len() == 2
+        ));
+    }
+
+    #[test]
+    fn bare_dotted_filename_prefers_repository_file_over_symbol_terminal() {
+        let parsed = parse_task("Fix app.py without changing package.py.").unwrap();
+        let reference = parsed
+            .exact_references
+            .iter()
+            .find(|reference| reference.normalized == "app.py")
+            .expect("bare dotted filename is parsed");
+        assert_eq!(reference.kind, ExactReferenceKind::QualifiedName);
+
+        let candidates = vec![
+            ExactCandidate {
+                evidence_id: "repository-file-evidence".into(),
+                display: "render_app".into(),
+                match_keys: BTreeSet::new(),
+                source_file: "src/app.py".into(),
+                source_line: Some(1),
+            },
+            ExactCandidate {
+                evidence_id: "unrelated-extension-symbol".into(),
+                display: "py".into(),
+                match_keys: BTreeSet::new(),
+                source_file: "src/languages.rs".into(),
+                source_line: Some(8),
+            },
+        ];
+
+        let resolved = resolve_exact_references(&[reference.clone()], &candidates);
+        assert!(matches!(
+            &resolved[0].resolution,
+            ExactResolution::Hit(candidate)
+                if candidate.evidence_id == "repository-file-evidence"
         ));
     }
 

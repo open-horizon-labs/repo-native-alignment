@@ -97,7 +97,9 @@ replaced by one ASCII space, and the result is truncated to its first 512
 Unicode characters. The deterministic primary query is exactly the issue
 title, two ASCII line-feed bytes, and that normalized 512-character body
 prefix: `title + "\n\n" + normalized_body[:512]`. No label, quoting, or other
-text is added to the query. If that query
+text is added to the query. The constructed query is encoded as UTF-8 without
+a byte-order mark; the two separators are the literal bytes `0x0A 0x0A`, and
+no newline normalization is applied after construction. If that query
 cannot produce a valid compact result, an eligible traversal root, and a
 bounded valid graph projection, the producer tries exactly one fallback:
 `title`. Only the selected query and result are model-visible; rejected
