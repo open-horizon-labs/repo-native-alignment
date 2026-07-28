@@ -5,6 +5,7 @@
 //! spans and projecting it for CLI or MCP rendering.
 
 use std::cmp::Ordering;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -609,6 +610,9 @@ pub(crate) fn resolve_exact_references(
                 .filter(|candidate| candidate.canonical_match_keys().contains(&key))
                 .cloned()
                 .collect::<Vec<_>>();
+            if matches.len() > 1 && reference.kind == ExactReferenceKind::RepositoryPath {
+                matches = source_file_representatives(matches);
+            }
             if matches.is_empty() && reference.kind == ExactReferenceKind::QualifiedName {
                 let source_file_matches = canonical_candidates
                     .iter()
@@ -621,10 +625,10 @@ pub(crate) fn resolve_exact_references(
                 if !source_file_matches.is_empty() {
                     // A bare dotted filename (for example `app.py`) is
                     // lexically indistinguishable from a qualified name.
-                    // Prefer actual repository-file evidence when it exists;
-                    // otherwise terminal fallback could resolve the extension
-                    // (`py`) as an unrelated symbol.
-                    matches = source_file_matches;
+                    // Prefer one deterministic representative per actual
+                    // repository file; otherwise terminal fallback could
+                    // resolve the extension (`py`) as an unrelated symbol.
+                    matches = source_file_representatives(source_file_matches);
                 } else if let Some(terminal) = qualified_name_terminal(&reference.normalized) {
                     let terminal = normalize_match_key(terminal);
                     matches = canonical_candidates
@@ -645,6 +649,31 @@ pub(crate) fn resolve_exact_references(
             }
         })
         .collect()
+}
+
+fn source_file_representatives(matches: Vec<ExactCandidate>) -> Vec<ExactCandidate> {
+    let mut representatives = BTreeMap::<String, ExactCandidate>::new();
+    for candidate in matches {
+        let path = normalize_match_key(&candidate.source_file);
+        match representatives.entry(path) {
+            Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            Entry::Occupied(mut entry)
+                if (
+                    candidate.source_line.unwrap_or(u32::MAX),
+                    candidate.evidence_id.as_str(),
+                ) < (
+                    entry.get().source_line.unwrap_or(u32::MAX),
+                    entry.get().evidence_id.as_str(),
+                ) =>
+            {
+                entry.insert(candidate);
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+    representatives.into_values().collect()
 }
 
 fn source_file_basename(source_file: &str) -> Option<String> {
@@ -1512,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_dotted_filename_prefers_repository_file_over_symbol_terminal() {
+    fn bare_dotted_filename_pins_one_representative_for_the_repository_file() {
         let parsed = parse_task("Fix app.py without changing package.py.").unwrap();
         let reference = parsed
             .exact_references
@@ -1523,11 +1552,18 @@ mod tests {
 
         let candidates = vec![
             ExactCandidate {
-                evidence_id: "repository-file-evidence".into(),
-                display: "render_app".into(),
+                evidence_id: "app-module".into(),
+                display: "app".into(),
                 match_keys: BTreeSet::new(),
                 source_file: "src/app.py".into(),
                 source_line: Some(1),
+            },
+            ExactCandidate {
+                evidence_id: "app-function".into(),
+                display: "render_app".into(),
+                match_keys: BTreeSet::new(),
+                source_file: "src/app.py".into(),
+                source_line: Some(8),
             },
             ExactCandidate {
                 evidence_id: "unrelated-extension-symbol".into(),
@@ -1542,7 +1578,40 @@ mod tests {
         assert!(matches!(
             &resolved[0].resolution,
             ExactResolution::Hit(candidate)
-                if candidate.evidence_id == "repository-file-evidence"
+                if candidate.evidence_id == "app-module"
+        ));
+    }
+
+    #[test]
+    fn bare_dotted_filename_remains_ambiguous_across_distinct_repository_files() {
+        let reference = ExactReference {
+            raw: "app.py".into(),
+            normalized: "app.py".into(),
+            kind: ExactReferenceKind::QualifiedName,
+            origin: ReferenceOrigin::Prose,
+            byte_start: 0,
+            byte_end: 6,
+        };
+        let candidates = ["first/app.py", "second/app.py"]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(file_index, source_file)| {
+                (0..2).map(move |node_index| ExactCandidate {
+                    evidence_id: format!("file-{file_index}-node-{node_index}"),
+                    display: format!("node_{node_index}"),
+                    match_keys: BTreeSet::new(),
+                    source_file: source_file.into(),
+                    source_line: Some(node_index + 1),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let resolved = resolve_exact_references(&[reference], &candidates);
+        assert!(matches!(
+            &resolved[0].resolution,
+            ExactResolution::Ambiguous(matches)
+                if matches.len() == 2
+                    && matches[0].source_file != matches[1].source_file
         ));
     }
 

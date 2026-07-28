@@ -7196,11 +7196,15 @@ async fn flat_code_symbol_search<'a>(
     .matches
 }
 
-fn dedupe_nodes_preserving_order(nodes: Vec<&Node>) -> Vec<&Node> {
+fn dedupe_nodes_preserving_order<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+    limit: usize,
+) -> Vec<&'a Node> {
     let mut seen = BTreeSet::new();
     nodes
         .into_iter()
         .filter(|node| seen.insert(node.stable_id()))
+        .take(limit)
         .collect()
 }
 
@@ -7437,16 +7441,16 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                     }
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
                     // node_passes_filters already handles the path/name split check.
-                    let found = results
-                        .iter()
-                        .filter(|r| r.kind.starts_with("code:"))
-                        .filter_map(|result| {
-                            graph_state.node_by_stable_id(&result.id, node_index_map)
-                        })
-                        .filter(|node| node_passes_filters(node))
-                        .take(rerank_over_fetch)
-                        .collect();
-                    let found = dedupe_nodes_preserving_order(found);
+                    let found = dedupe_nodes_preserving_order(
+                        results
+                            .iter()
+                            .filter(|r| r.kind.starts_with("code:"))
+                            .filter_map(|result| {
+                                graph_state.node_by_stable_id(&result.id, node_index_map)
+                            })
+                            .filter(|node| node_passes_filters(node)),
+                        rerank_over_fetch,
+                    );
                     order_evidence
                         .insert(channel, found.iter().map(|node| node.stable_id()).collect());
                     found
@@ -9077,14 +9081,28 @@ mod tests {
     fn embedding_candidates_are_deduplicated_before_reranking() {
         let first = make_node("first", NodeKind::Function, "src/first.rs");
         let second = make_node("second", NodeKind::Function, "src/second.rs");
-        let deduplicated =
-            dedupe_nodes_preserving_order(vec![&first, &first, &second, &first, &second]);
-        let ids: Vec<_> = deduplicated
-            .iter()
-            .map(|node| node.stable_id())
-            .collect();
+        let deduplicated = dedupe_nodes_preserving_order(
+            vec![&first, &first, &second, &first, &second],
+            usize::MAX,
+        );
+        let ids: Vec<_> = deduplicated.iter().map(|node| node.stable_id()).collect();
 
         assert_eq!(ids, vec![first.stable_id(), second.stable_id()]);
+    }
+
+    #[test]
+    fn embedding_candidate_limit_counts_unique_nodes_not_duplicate_rows() {
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let third = make_node("third", NodeKind::Function, "src/third.rs");
+        let limited =
+            dedupe_nodes_preserving_order(vec![&first, &first, &first, &second, &third], 3);
+        let ids: Vec<_> = limited.iter().map(|node| node.stable_id()).collect();
+
+        assert_eq!(
+            ids,
+            vec![first.stable_id(), second.stable_id(), third.stable_id()]
+        );
     }
 
     #[test]
@@ -13120,6 +13138,61 @@ mod tests {
                 .records
                 .iter()
                 .any(|record| record.identity.node_id == target_id)
+        );
+        assert!(output.capabilities.iter().any(|capability| {
+            capability.capability == "task_exact_reference_resolution"
+                && capability.state == CapabilityState::Ready
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_bare_filename_pins_a_file_representative_with_multiple_graph_records() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        std::fs::write(
+            repository.path().join("src/app.py"),
+            "def render_app():\n    return True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.path().join("src/languages.rs"),
+            "const py: bool = true;\n",
+        )
+        .unwrap();
+
+        let mut module = make_node("app", NodeKind::Module, "src/app.py");
+        module.line_start = 1;
+        module.line_end = 2;
+        let module_id = module.stable_id();
+        let mut function = make_node("render_app", NodeKind::Function, "src/app.py");
+        function.line_start = 2;
+        function.line_end = 2;
+        let mut extension_symbol = make_node("py", NodeKind::Const, "src/languages.rs");
+        extension_symbol.line_start = 1;
+        extension_symbol.line_end = 1;
+
+        let graph = make_graph_state(vec![module, function, extension_symbol]);
+        let ctx = make_search_context(&graph, repository.path());
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let output = task_records(
+            &SearchParams {
+                query: Some("Fix app.py behavior and add a regression test".into()),
+                context_mode: Some("task".into()),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+            &edge_index,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == module_id)
         );
         assert!(output.capabilities.iter().any(|capability| {
             capability.capability == "task_exact_reference_resolution"
