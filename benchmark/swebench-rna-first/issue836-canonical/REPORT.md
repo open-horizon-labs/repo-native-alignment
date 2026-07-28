@@ -61,6 +61,77 @@ while total tokens rise 13.6%/3.2%. These are descriptive single-run paired
 results over 20 deliberately selected cases; no pooled population effect or
 prompt-strategy causality is claimed.
 
+## Post-hoc working-set gate: stopped after one case
+
+After the 720 canonical cells were complete, two bounded RNA working-set
+prototypes were tested on rank 3 (`sympy__sympy-13757`) under anti-slop using
+the already-complete A controls. This is an implementation diagnostic outside
+the canonical 720-cell analysis, not another population estimate. Only four
+new paid cells were run: T3 and T4 on Sonnet and Spark. The requested T4 gate
+stopped after exactly those two model cells; no scale run followed.
+
+All six A/T3/T4 cells were transcript-audited and officially RESOLVED. T3 used
+a 10,839-byte compact working-set prompt. T4 reduced that to 2,610 bytes by
+querying `Poly multiplication`, selecting `test_Poly_mul`, and exposing only
+the lexically matching `mul` and `mul_ground` graph records. T4 materially
+improved on T3 for Sonnet, but it still used 40.8% more total tokens and 21.4%
+more tools than A. Spark regressed sharply.
+
+| Backend | Cell | Resolved | Prompt bytes | Input tokens | Output tokens | Total tokens | Time | Cost | Tools |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Sonnet | A-AS | yes | 513 | 566,804 | 10,825 | 577,629 | 187.7s | $0.480654 | 28 (Bash=17, Edit=3, Read=8) |
+| Sonnet | T3-AS | yes | 10,839 | 1,422,546 | 10,815 | 1,433,361 | 205.5s | $0.875044 | 42 (Bash=35, Edit=2, Read=5) |
+| Sonnet | T4-AS | yes | 2,610 | 805,618 | 7,409 | 813,027 | 150.4s | $0.552445 | 34 (Bash=22, Edit=2, Grep=6, Read=4) |
+| Spark | A-AS | yes | 513 | 849,590 | 15,621 | 865,211 | 81.6s | n/a | 44 (commandExecution=40, fileChange=4) |
+| Spark | T3-AS | yes | 10,839 | 1,280,754 | 12,636 | 1,293,390 | 77.5s | n/a | 42 (commandExecution=40, fileChange=2) |
+| Spark | T4-AS | yes | 2,610 | 3,242,977 | 21,930 | 3,264,907 | 171.6s | n/a | 79 (commandExecution=74, fileChange=2, webSearch=3) |
+
+Input is cumulative context processed across turns. Its decomposition makes
+the failure mode explicit:
+
+| Backend | Cell | Ordinary input | Cache write | Cache read | Uncached input | Tool-result characters |
+|---|---|---:|---:|---:|---:|---:|
+| Sonnet | A-AS | 785 | 25,918 | 540,101 | 26,703 | 33,874 |
+| Sonnet | T3-AS | 4,410 | 49,645 | 1,368,491 | 54,055 | 51,949 |
+| Sonnet | T4-AS | 1,589 | 34,832 | 769,197 | 36,421 | 64,052 |
+| Spark | A-AS | 36,534 | 0 | 813,056 | 36,534 | 46,825 |
+| Spark | T3-AS | 46,578 | 0 | 1,234,176 | 46,578 | 78,709 |
+| Spark | T4-AS | 79,841 | 0 | 3,163,136 | 79,841 | 100,182 |
+
+Relative to the matching A, T4 changed Sonnet input/output/time/tools by
++42.1%/−31.6%/−19.9%/+21.4%; Spark changed them by
++281.7%/+40.4%/+110.4%/+79.5%. Spark's 2.1-KiB injected context was therefore
+not the direct token burden. It induced 35 additional tool calls and more than
+doubled tool-result output; the growing conversation was then replayed as
+3.16M cached-input tokens.
+
+The transcript review identifies a treatment-design bug. T4's lexical
+projection selected a test root and discarded structurally relevant nodes
+whose names did not repeat the task words. Both models ultimately fixed the
+operator-dispatch layer (`_op_priority`), not the injected `mul`/`mul_ground`
+implementation path. Spark spent most of its excess trajectory rediscovering
+that dispatch mechanism and repairing its local Python test environment. One
+late `rm -rf distutils` cleanup command was rejected by App Server policy and
+replaced with a Python cleanup; that event is real runner friction, but it
+occurred after the dominant exploratory expansion and cannot explain the
+35-call difference by itself.
+
+The decision is **DO NOT SCALE T4**. The next candidate must include the
+selected root body, prefer a confident production protocol root, retain
+structurally relevant control-flow records rather than applying lexical
+overlap again after traversal, and abstain instead of injecting a low-confidence
+graph. Offline rank-3 probes show why: the deterministic operator-aware query
+`Poly __mul__ __rmul__` ranks the production `polytools.__rmul__` first, while
+a two-hop traversal from `Expr.__mul__` exposes `call_highest_priority` and
+`binary_op_wrapper`. Because those probes were derived after inspecting rank
+3, they are design evidence only; any next paid gate must freeze the rule and
+use different predeclared cases.
+
+The path-free diagnostic ledger is
+[`working-set-diagnostic-results.json`](working-set-diagnostic-results.json),
+with retained artifacts bound by
+[`working-set-diagnostic-evidence-manifest.json`](working-set-diagnostic-evidence-manifest.json).
+
 For continuity with the preregistered two-model A/T analysis, its original
 executive rows are retained verbatim:
 

@@ -1,0 +1,78 @@
+{
+  "artifacts": [
+    {
+      "bytes": 2570,
+      "path": "compact-working-set-attempt-001/transcript-audit-rank03-as-sonnet.json",
+      "role": "T3_AS_sonnet transcript audit",
+      "sha256": "e7f9d3b2007734621df2399eb3ff2d5b1c574f987c70aee8e72eb26860effe5b"
+    },
+    {
+      "bytes": 2600,
+      "path": "compact-working-set-attempt-001/transcript-audit-rank03-as-spark.json",
+      "role": "T3_AS_spark transcript audit",
+      "sha256": "797c34922871d0c7b46ea941025cc97c84fec18c2665badb1ca7ebc882fb1a11"
+    },
+    {
+      "bytes": 2872,
+      "path": "compact-working-set-attempt-001/evaluation-rank03-as-sonnet-status.json",
+      "role": "T3_AS_sonnet official evaluation status",
+      "sha256": "ba6d45b2dfa70dfe83b6c94fcf857daf7c1eaf53f032f494f3007b462563c935"
+    },
+    {
+      "bytes": 2873,
+      "path": "compact-working-set-attempt-001/evaluation-rank03-as-spark-status.json",
+      "role": "T3_AS_spark official evaluation status",
+      "sha256": "225aa7df989eac84e4519526200d4ce673047d6f5280af2bd42cb9f2fbd9f1a5"
+    },
+    {
+      "bytes": 6499,
+      "path": "compact-working-set-attempt-001/prompt-audit.json",
+      "role": "T3 prompt audit",
+      "sha256": "8da40984e1321dcf6be946783b19b467a02e9b094ed817f20f263a1c9866a7e9"
+    },
+    {
+      "bytes": 302200,
+      "path": "compact-working-set-attempt-001/run-manifest.json",
+      "role": "T3 run manifest",
+      "sha256": "90097cf84f8603037b1e0b617c4754ce4b47f9c1e67220a6eb3f013172e38962"
+    },
+    {
+      "bytes": 2558,
+      "path": "selective-working-set-attempt-001/transcript-audit-rank03-as-sonnet.json",
+      "role": "T4_AS_sonnet transcript audit",
+      "sha256": "435a375acc322f5f2c22a37c8dcb36c3be7998af3537ef7e3102e9cc2761e959"
+    },
+    {
+      "bytes": 2623,
+      "path": "selective-working-set-attempt-001/transcript-audit-rank03-as-spark.json",
+      "role": "T4_AS_spark transcript audit",
+      "sha256": "c1553d45ad1576c68535af7add9ce5232e680757c24746044a05ccef47ff931d"
+    },
+    {
+      "bytes": 2880,
+      "path": "selective-working-set-attempt-001/evaluation/official-swebench-4.1.0-verified/evaluation-rank03-as-sonnet-status.json",
+      "role": "T4_AS_sonnet official evaluation status",
+      "sha256": "69d84bdc960937564386cde02265dccb2c4337105280447b509427bc1b8c764c"
+    },
+    {
+      "bytes": 2888,
+      "path": "selective-working-set-attempt-001/evaluation/official-swebench-4.1.0-verified/evaluation-rank03-as-spark-status.json",
+      "role": "T4_AS_spark official evaluation status",
+      "sha256": "aba3583003b5f3713af9af541459bfab138f09a9b47ca4661102ce56a99326ca"
+    },
+    {
+      "bytes": 463,
+      "path": "selective-working-set-attempt-001/prompt-audit.json",
+      "role": "T4 prompt audit",
+      "sha256": "791418760ae8456441b8692c8877942e8e02a1fd9e1c000a77c426796c70e9f2"
+    },
+    {
+      "bytes": 5060,
+      "path": "selective-working-set-attempt-001/run-manifest.json",
+      "role": "T4 run manifest",
+      "sha256": "8a5f8812c7ed054e156c119b6cfa1d8416a3f6c23761aebcd792c80baba35d6c"
+    }
+  ],
+  "evidence_root_environment": "ISSUE836_EVIDENCE_ROOT",
+  "schema_version": "issue836-working-set-diagnostic-evidence-manifest-v1"
+}

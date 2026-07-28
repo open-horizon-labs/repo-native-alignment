@@ -32,6 +32,13 @@ A/T/T2 on all four models. These 480 cells are additive; the original 240 cells
 remain unchanged. The final package therefore reports 36 conditions and 720
 cells in one analysis.
 
+The same report also contains a clearly separated post-hoc working-set
+implementation diagnostic: rank 3 only, T3 and T4 on Sonnet and Spark, reusing
+the canonical anti-slop A controls. Those four paid cells are outside the 720
+canonical cells and ended in a `DO_NOT_SCALE` decision for T4. Their path-free
+ledger and evidence bindings are `working-set-diagnostic-results.json` and
+`working-set-diagnostic-evidence-manifest.json`.
+
 Read [METHOD.md](METHOD.md) before interpreting the unified
 [REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
 metrics, quality measurements, and tool-type details. `results.json`,
@@ -61,12 +68,16 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_humanlayer_strategy_results.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_working_set_diagnostic.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
 order and budget, and fail-closed package digests. Where the retained evidence
-root is available, the four commands also verify the bound original, T2,
-weaker-model, and prompt-strategy external artifacts by content:
+root is available, the five commands also verify the bound original, T2,
+weaker-model, prompt-strategy, and working-set diagnostic external artifacts by
+content:
 
 ```bash
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
@@ -84,4 +95,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_humanlayer_strategy_results.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_working_set_diagnostic.py
 ```
