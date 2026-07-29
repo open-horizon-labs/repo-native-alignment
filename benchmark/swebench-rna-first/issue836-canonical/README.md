@@ -30,8 +30,8 @@ The HumanLayer/SlopCodeBench comparison adds 24 more conditions per case by
 crossing the published `anti_slop` and `plan_first` prompt strategies with
 A/T/T2 on all four models. These 480 cells are additive; the original 240 cells
 remain unchanged. The final package therefore reports 36 conditions and 720
-factorial cells, plus the later 20-cell Sonnet T_PD population follow-up, in
-one reader-facing analysis.
+factorial cells, plus the later 20-cell Sonnet T_PD population follow-up and
+its 20-cell native-default control repair, in one reader-facing analysis.
 
 The same report also contains a clearly separated post-hoc working-set
 implementation diagnostic: rank 3 only, T3 and T4 on Sonnet and Spark, reusing
@@ -67,13 +67,17 @@ ledger and evidence bindings are
 `compact-progressive-disclosure-results.json` and
 `compact-progressive-disclosure-evidence-manifest.json`.
 
-The Sonnet bounded progressive-disclosure population follow-up reuses all 20
-canonical A controls and adds one 8 KiB complete-record RNA treatment episode
-per case. All 20 pairs have stock SWE-bench verdicts and per-arm split input,
-output, time, cost, and tool-type accounting in the unified report. Its
-path-free ledger and external evidence bindings are
-`bounded-progressive-disclosure-results.json` and
-`bounded-progressive-disclosure-evidence-manifest.json`.
+The Sonnet bounded progressive-disclosure population follow-up adds one 8 KiB
+complete-record RNA treatment episode per case. A prompt-channel audit found
+that its initially reused A controls had a different system-prompt contract,
+so 20 fresh `A_prime` controls were run under the exact T_PD command contract
+minus the RNA append. The corrected A_prime/T_PD comparison has stock
+SWE-bench verdicts and per-arm split input, output, time, cost, and tool-type
+accounting in the unified report. Its path-free repair ledger and external
+evidence bindings are `native-default-control-repair-results.json` and
+`native-default-control-repair-evidence-manifest.json`. The original
+`bounded-progressive-disclosure-results.json` is retained as historical
+provenance, but its legacy A/T_PD efficiency contrast is superseded.
 
 Read [METHOD.md](METHOD.md) before interpreting the unified
 [REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
@@ -119,6 +123,9 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_bounded_progressive_disclosure.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_native_default_control_repair.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
@@ -162,4 +169,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_bounded_progressive_disclosure.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_native_default_control_repair.py
 ```

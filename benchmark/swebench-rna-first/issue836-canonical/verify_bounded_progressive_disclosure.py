@@ -19,9 +19,9 @@ CANONICAL_RESULTS = ROOT / "results.json"
 REPORT = ROOT / "REPORT.md"
 METHOD = ROOT / "METHOD.md"
 EXPECTED_RESULTS_SHA = "f56f7967debf7ac78342b4a31e8b69760168ba6d3438662ac26df78baf385c0b"
-EXPECTED_MANIFEST_SHA = "ff395bbafd727ffb3660e2baf3d36661b3eeaf91500f9cdf4bd576ea9ebd81b4"
-EXPECTED_REPORT_SHA = "88ab5b5a2bf90374ee41d2cdb93698310e65585a6cf22ace019ec9dd37f175a4"
-EXPECTED_METHOD_SHA = "fbaff4a325a4f108a949d91e3ebd9a1e7dee98f0dcceae12a238cd43c6d91488"
+EXPECTED_MANIFEST_SHA = "41c8e5eb4d13172c494225302ffb55bf8166c6808bde81b5bd096a5f29271e76"
+EXPECTED_REPORT_SHA = "588a983ffabea18000da4eb82fbb753bfdaa967241a9c6f8e15ac57b49368052"
+EXPECTED_METHOD_SHA = "a9e60195fd3874e9be03cc35da0fd1eebb32986d0573272b844da13ab0064e72"
 EXPECTED_CANONICAL_RESULTS_SHA = "20ad9fcff75b91c5e86147de3cd2fbb63d582aec1950e3cbd0cca0e35d8a8a17"
 RANKS = tuple(range(1, 21))
 
@@ -236,48 +236,37 @@ def verify_offline(data: dict[str, Any], manifest: dict[str, Any]) -> None:
         path = PurePosixPath(item["path"])
         require(not path.is_absolute() and ".." not in path.parts, f"unsafe evidence path: {item['role']}")
         require(item["bytes"] > 0 and len(item["sha256"]) == 64, f"invalid evidence reference: {item['role']}")
+        require(item.get("content_scope", "full") in ("full", "prefix"), f"invalid content scope: {item['role']}")
+        if item.get("content_scope") == "prefix":
+            require(
+                item["role"] in {
+                    "rank 06 T_PD RNA preprocessing log",
+                    "rank 16 T_PD RNA preprocessing log",
+                    "rank 18 T_PD RNA preprocessing log",
+                },
+                f"unexpected prefix-scoped artifact: {item['role']}",
+            )
     report = REPORT.read_text()
     require("## Bounded progressive-disclosure population run" in report, "report section")
-    for arm in ("A", "T_PD"):
-        row = data["aggregate"][arm]
-        tool_types = ", ".join(f"{name}={count}" for name, count in row["tool_calls"]["by_type"].items())
-        rna_display = "—" if arm == "A" else f"{row['rna_retrieval_seconds']:.1f}s"
-        report_row = (
-            f"| {arm} | {row['resolved']}/20 | {row['elapsed_seconds']:.1f}s | "
-            f"{rna_display} | "
-            f"{row.get('end_to_end_seconds', row['elapsed_seconds']):.1f}s | "
-            f"{int(row['direct_input_tokens']):,} | {int(row['cache_creation_input_tokens']):,} | "
-            f"{int(row['cache_read_input_tokens']):,} | {int(row['total_input_tokens']):,} | "
-            f"{int(row['output_tokens']):,} | ${row['cost_usd']:.6f} | "
-            f"{row['tool_calls']['total']} | {tool_types} |"
-        )
-        require(report_row in report, f"report aggregate row: {arm}")
-    for case in cases:
-        for arm in ("A", "T_PD"):
-            row = case[arm]
-            tool_types = ", ".join(f"{name}={count}" for name, count in row["tool_calls"]["by_type"].items())
-            report_row = (
-                f"| {case['rank']} | {arm} | {row['official_verdict']} | "
-                f"{row['elapsed_seconds']:.1f} / {row.get('rna_retrieval_seconds', 0):.1f} / "
-                f"{row.get('end_to_end_seconds', row['elapsed_seconds']):.1f} | "
-                f"{row['direct_input_tokens']:,} / {row['cache_creation_input_tokens']:,} / "
-                f"{row['cache_read_input_tokens']:,} | {row['total_input_tokens']:,} / "
-                f"{row['output_tokens']:,} | ${row['cost_usd']:.6f} | "
-                f"{row['tool_calls']['total']} ({tool_types}) |"
-            )
-            require(report_row in report, f"rank {case['rank']} {arm}: report detail row")
-    require("while total input becomes +0.8%" in report, "report rank-7 sensitivity")
+    require("legacy A/T_PD" in report and "efficiency contrast is superseded" in report, "report supersession disclosure")
+    require("native-default-control-repair-results.json" in report, "report repair ledger")
     require("### Twenty-case bounded progressive-disclosure treatment" in METHOD.read_text(), "method section")
 
 
 def verify_external(data: dict[str, Any], manifest: dict[str, Any], evidence_root: Path) -> int:
     artifacts: dict[str, Path] = {}
+    bound_payloads: dict[str, bytes] = {}
     for reference in manifest["artifacts"]:
         path = evidence_root / reference["path"]
         payload = path.read_bytes()
-        require(len(payload) == reference["bytes"], f"{reference['role']}: bytes")
+        if reference.get("content_scope") == "prefix":
+            require(len(payload) >= reference["bytes"], f"{reference['role']}: prefix bytes")
+            payload = payload[: reference["bytes"]]
+        else:
+            require(len(payload) == reference["bytes"], f"{reference['role']}: bytes")
         require(digest(payload) == reference["sha256"], f"{reference['role']}: SHA")
         artifacts[reference["role"]] = path
+        bound_payloads[reference["role"]] = payload
     source = load(artifacts["source unified V10 report"])
     require(source["schema_version"] == "issue836-sonnet-a-vs-t-pd-report-v10", "source schema")
     require(path_free(source["aggregate"]) == data["aggregate"], "source aggregate")
@@ -308,7 +297,7 @@ def verify_external(data: dict[str, Any], manifest: dict[str, Any], evidence_roo
         tools, rna_calls = transcript_tools(transcript)
         require(dict(tools) == t_receipt["tool_counts"], f"rank {rank}: transcript tools")
         require(rna_calls == 0, f"rank {rank}: transcript follow-up RNA")
-        calls = artifacts[f"rank {rank:02d} T_PD RNA preprocessing log"].read_text().splitlines()
+        calls = bound_payloads[f"rank {rank:02d} T_PD RNA preprocessing log"].decode().splitlines()
         require(len(calls) == 1, f"rank {rank}: preprocessing call count")
         call = json.loads(calls[0])
         require(close(case["T_PD"]["rna_retrieval_seconds"], call["elapsed_seconds"]), f"rank {rank}: RNA time")

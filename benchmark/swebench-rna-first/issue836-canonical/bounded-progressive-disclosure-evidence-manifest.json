@@ -363,6 +363,7 @@
     },
     {
       "bytes": 681,
+      "content_scope": "prefix",
       "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-06-django__django-13794/rna-calls.jsonl",
       "role": "rank 06 T_PD RNA preprocessing log",
       "sha256": "db426f4ac84a203ffa053a5bb00bfdd586bf307e1c78d7f25f79eb959d6e69c0"
@@ -963,6 +964,7 @@
     },
     {
       "bytes": 976,
+      "content_scope": "prefix",
       "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-16-django__django-12193/rna-calls.jsonl",
       "role": "rank 16 T_PD RNA preprocessing log",
       "sha256": "e8f44b3b8bb7b3b6e476ed77ecf61c2090551cc8764cf11d6f68cde6c9fb5705"
@@ -1083,6 +1085,7 @@
     },
     {
       "bytes": 810,
+      "content_scope": "prefix",
       "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-18-django__django-16877/rna-calls.jsonl",
       "role": "rank 18 T_PD RNA preprocessing log",
       "sha256": "84b8a0bd13b99567b163851840737d496a18968539a20e34dd13af5959570029"

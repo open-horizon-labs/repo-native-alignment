@@ -1,0 +1,739 @@
+{
+  "artifact_count": 122,
+  "artifacts": [
+    {
+      "bytes": 37137,
+      "path": "native-default-a-prime-sonnet-attempt-001/admitted-cohort.json",
+      "role": "admitted-cohort.json",
+      "sha256": "ed576503c994f3051c910e9e05ee9aadced49075a5327d7ac7e4cbf9af29b6fa"
+    },
+    {
+      "bytes": 25350,
+      "path": "native-default-a-prime-sonnet-attempt-001/full-input-index.json",
+      "role": "full-input-index.json",
+      "sha256": "814ca8a5532dc04f4a6752bc51bc065cce80783a6e0bd48206049a42c0ba0cfb"
+    },
+    {
+      "bytes": 11992,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/summary.json",
+      "role": "summary.json",
+      "sha256": "bfba8e33bb87851d71e14ba69c8e594f0ac7025708964ad8e7c0fd637b16915e"
+    },
+    {
+      "bytes": 6093,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-gate-rank01-attempt-001/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+      "role": "provider failure invocation 01 receipt",
+      "sha256": "60d5f4bd5ba949a3f189ce350db83ada4c01c8a71376ce31176ea30b471d195a"
+    },
+    {
+      "bytes": 6221,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-05-pydata__xarray-4075/A/episode-receipt.json",
+      "role": "provider failure invocation 02 receipt",
+      "sha256": "077328b0fbae090aafb6f3c60265ab1efdb73f4114dc6a2e2c78072423f0c59b"
+    },
+    {
+      "bytes": 6230,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-10-django__django-11551/A/episode-receipt.json",
+      "role": "provider failure invocation 03 receipt",
+      "sha256": "4824ae0d1fc3bdeb79d2eac0960ea3a7178510bd924e1565dd97e9011c978623"
+    },
+    {
+      "bytes": 6209,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-03-sympy__sympy-13757/A/episode-receipt.json",
+      "role": "provider failure invocation 04 receipt",
+      "sha256": "35df70f6ebae4bdf1e4b8fc0aaa0852e1a1e9a3edba53b1f1f660be0a1d3ada3"
+    },
+    {
+      "bytes": 6220,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-05-pydata__xarray-4075/A/episode-receipt.json",
+      "role": "provider failure invocation 05 receipt",
+      "sha256": "21f89ea439c0a71ce509928c735e9d294fb474639a94a58d3e400a9a282d2fbf"
+    },
+    {
+      "bytes": 6230,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-10-django__django-11551/A/episode-receipt.json",
+      "role": "provider failure invocation 06 receipt",
+      "sha256": "5f02dd8240b66268015c748effca68519132b55338e5330c22bfef040d346da7"
+    },
+    {
+      "bytes": 6228,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-11-django__django-13658/A/episode-receipt.json",
+      "role": "provider failure invocation 07 receipt",
+      "sha256": "0ddb6039c940929e94463eb162b89feb890f6c1ea68ca26f01cab1c11aa11a7f"
+    },
+    {
+      "bytes": 8305,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-14-pytest-dev__pytest-7982/A/episode-receipt.json",
+      "role": "provider failure invocation 08 receipt",
+      "sha256": "9cf14baab4c3cea7ab2e9687f1aeb90feea4d83c51d4f0a308d62e18b9dfa2dd"
+    },
+    {
+      "bytes": 6154,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-02-django__django-11179/A/episode-receipt.json",
+      "role": "provider failure invocation 09 receipt",
+      "sha256": "7f3c2b21543df02708db0ae1816d9e1a660851ec10e204997d0667a425d0fc36"
+    },
+    {
+      "bytes": 6136,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-03-sympy__sympy-13757/A/episode-receipt.json",
+      "role": "provider failure invocation 10 receipt",
+      "sha256": "5d7abd53e9c7d0bc662ab6747d0bbae3c8e817905334939d4d5d1aeb286e088a"
+    },
+    {
+      "bytes": 6157,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-04-django__django-13033/A/episode-receipt.json",
+      "role": "provider failure invocation 11 receipt",
+      "sha256": "4c48b373abd9546560089cd23e14593e375391d8802d6ae1cad0820d61e55c19"
+    },
+    {
+      "bytes": 6148,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-05-pydata__xarray-4075/A/episode-receipt.json",
+      "role": "provider failure invocation 12 receipt",
+      "sha256": "35898e7088988facbdf8634b15c56f7cb3d3b630d6daf74c5ad762ce9c823ee8"
+    },
+    {
+      "bytes": 6230,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-07-matplotlib__matplotlib-24026/A/episode-receipt.json",
+      "role": "provider failure invocation 13 receipt",
+      "sha256": "08fd9740b77a7cbd4736cba421db5f375611f43f6e7ecc578f504606526519fa"
+    },
+    {
+      "bytes": 6153,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-08-django__django-11163/A/episode-receipt.json",
+      "role": "provider failure invocation 14 receipt",
+      "sha256": "0e47c9a0e3be5e9794833eb67dc91c357d36fe2f3bda2d5091c0038fbb46895f"
+    },
+    {
+      "bytes": 6156,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-10-django__django-11551/A/episode-receipt.json",
+      "role": "provider failure invocation 15 receipt",
+      "sha256": "7fc785a1de34b68b04823f1ff8509702089ae4aeb0d5ba093296886c441087d9"
+    },
+    {
+      "bytes": 6156,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-11-django__django-13658/A/episode-receipt.json",
+      "role": "provider failure invocation 16 receipt",
+      "sha256": "b693eeb6325fda7aeaf70f594d98bfe8c3e46d8039139d619aff757f4c590c2c"
+    },
+    {
+      "bytes": 8183,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-14-pytest-dev__pytest-7982/A/episode-receipt.json",
+      "role": "provider failure invocation 17 receipt",
+      "sha256": "dab6d7c7f4e8763a9e48f6cf92d842aa99dbd255f5c17e62b30e4083c1f673b2"
+    },
+    {
+      "bytes": 6180,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-17-django__django-16485/A/episode-receipt.json",
+      "role": "provider failure invocation 18 receipt",
+      "sha256": "8bc174a4d30795ee36c879a18cffbc54abc6f491b4c79edd8feb4342ee75d2a5"
+    },
+    {
+      "bytes": 6156,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-19-django__django-11451/A/episode-receipt.json",
+      "role": "provider failure invocation 19 receipt",
+      "sha256": "93e8d427eb9c3807d9bc335e691d5eeb42353963a6a0b06c6f894316fa414076"
+    },
+    {
+      "bytes": 6640,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-gate-rank01-attempt-002/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+      "role": "rank 01 A_prime episode receipt",
+      "sha256": "74234c6dac0b12ea20420512b80085663d572a790f48608d55eb49cd07c0b1aa"
+    },
+    {
+      "bytes": 79693,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-gate-rank01-attempt-002/rank-01-sympy__sympy-23534/A/claude.stream.jsonl",
+      "role": "rank 01 A_prime provider transcript",
+      "sha256": "7a43c3490478e284b56d7844acff6de8c05b5e11c3e00356e0737435f308b735"
+    },
+    {
+      "bytes": 819,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-gate-rank01-attempt-002/rank-01-sympy__sympy-23534/A/user-prompt.bin",
+      "role": "rank 01 A_prime user prompt",
+      "sha256": "8fe6dd7a102ee88d8ae872033129b92a5ebb1ec4268fe8004d18af8215df55b3"
+    },
+    {
+      "bytes": 395,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-gate-rank01-attempt-002/rank-01-sympy__sympy-23534/A/terminal.patch",
+      "role": "rank 01 A_prime terminal patch",
+      "sha256": "c06255eaef8ca89770b80a6cf94cd001ea198badb7a923ba2ddce55abf5217a3"
+    },
+    {
+      "bytes": 3705,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-01-sympy__sympy-23534/c06255eaef8ca89770b80a6cf94cd001ea198badb7a923ba2ddce55abf5217a3/evaluation-receipt.json",
+      "role": "rank 01 A_prime official evaluation receipt",
+      "sha256": "e544488eb639c720e1999a206c11e8fac3c52a03f2190cbd69c90a217308b6b4"
+    },
+    {
+      "bytes": 6784,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-02-django__django-11179/A/episode-receipt.json",
+      "role": "rank 02 A_prime episode receipt",
+      "sha256": "8484aac3138b86a04b9aaed93b39d5262f5f74e31251d3cfbf1ebe1ee36ecc07"
+    },
+    {
+      "bytes": 239197,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-02-django__django-11179/A/claude.stream.jsonl",
+      "role": "rank 02 A_prime provider transcript",
+      "sha256": "eac980afb78c2bb3e5eb547a6d683fa9a6c435bbc89aa20427954d130e300695"
+    },
+    {
+      "bytes": 375,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-02-django__django-11179/A/user-prompt.bin",
+      "role": "rank 02 A_prime user prompt",
+      "sha256": "c433d55819e6459333eebca9c2d560d1f2380154deaa67ef77868a16afb85907"
+    },
+    {
+      "bytes": 1203,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-02-django__django-11179/A/terminal.patch",
+      "role": "rank 02 A_prime terminal patch",
+      "sha256": "e73a22ff734b68283a6b5a2dd81d53ecdd4ae453457e125dd82574f08ac12d2e"
+    },
+    {
+      "bytes": 3740,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-02-django__django-11179/e73a22ff734b68283a6b5a2dd81d53ecdd4ae453457e125dd82574f08ac12d2e/evaluation-receipt.json",
+      "role": "rank 02 A_prime official evaluation receipt",
+      "sha256": "096dc5c7807adadabf27ff192f87f11a8f959bdf27e787ecde89dff11d7b838c"
+    },
+    {
+      "bytes": 6754,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-03-sympy__sympy-13757/A/episode-receipt.json",
+      "role": "rank 03 A_prime episode receipt",
+      "sha256": "270083c60e276d669ee9c998f4860e4cb77665a42e02fb121a3e160f0053b4f8"
+    },
+    {
+      "bytes": 274696,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-03-sympy__sympy-13757/A/claude.stream.jsonl",
+      "role": "rank 03 A_prime provider transcript",
+      "sha256": "03708e206e71742bd4a325df098647e18a22159969851d159bb4a4b77353848f"
+    },
+    {
+      "bytes": 513,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-03-sympy__sympy-13757/A/user-prompt.bin",
+      "role": "rank 03 A_prime user prompt",
+      "sha256": "cf34a5b38413a476860577d2200e121a2a7ce7a6fc47f8c12574fe896b519645"
+    },
+    {
+      "bytes": 390,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-03-sympy__sympy-13757/A/terminal.patch",
+      "role": "rank 03 A_prime terminal patch",
+      "sha256": "f0d350012820e3e092fccbc0ecdf1d564fd2efcc9e53693889d4c9db0bedcc21"
+    },
+    {
+      "bytes": 3673,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-03-sympy__sympy-13757/f0d350012820e3e092fccbc0ecdf1d564fd2efcc9e53693889d4c9db0bedcc21/evaluation-receipt.json",
+      "role": "rank 03 A_prime official evaluation receipt",
+      "sha256": "a797a876b25ff6ca5482f5bd4b42b41637bb6aa31e2ebb7d8561cb96e96d9932"
+    },
+    {
+      "bytes": 6785,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-04-django__django-13033/A/episode-receipt.json",
+      "role": "rank 04 A_prime episode receipt",
+      "sha256": "f87e3e8c66d964a2bcb8e2a3308c3c59d34f0ec06e71ab9a64e92caccb3e4a02"
+    },
+    {
+      "bytes": 283084,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-04-django__django-13033/A/claude.stream.jsonl",
+      "role": "rank 04 A_prime provider transcript",
+      "sha256": "d674073625b9279788c5a84fcfee73f79250ed3b8957720e0bc87be50881232e"
+    },
+    {
+      "bytes": 3824,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-04-django__django-13033/A/user-prompt.bin",
+      "role": "rank 04 A_prime user prompt",
+      "sha256": "d0016ea808ae2830b443275e6b3bedca95c54745645fb4bf0db6f4587f6a79f7"
+    },
+    {
+      "bytes": 3070,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-04-django__django-13033/A/terminal.patch",
+      "role": "rank 04 A_prime terminal patch",
+      "sha256": "dcbffb00026726f2342063e43139ae20a88fd175b373f6ee184ce3276ad53ffc"
+    },
+    {
+      "bytes": 3697,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-04-django__django-13033/dcbffb00026726f2342063e43139ae20a88fd175b373f6ee184ce3276ad53ffc/evaluation-receipt.json",
+      "role": "rank 04 A_prime official evaluation receipt",
+      "sha256": "f6cc8cf92cdcc36246c3f5566c9bfbd084b4ab136e7779e0adabb4c2a485de8e"
+    },
+    {
+      "bytes": 6783,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-05-pydata__xarray-4075/A/episode-receipt.json",
+      "role": "rank 05 A_prime episode receipt",
+      "sha256": "7af50a35f8f8e73f8dbff05de15a0c81ec1b2c509abae5043d9708616209f0e0"
+    },
+    {
+      "bytes": 714750,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-05-pydata__xarray-4075/A/claude.stream.jsonl",
+      "role": "rank 05 A_prime provider transcript",
+      "sha256": "2ee8f1fb2c8ddbc9ba5b56e0c13c1123eb029c6ab1cc578e83dd3b058de255bf"
+    },
+    {
+      "bytes": 2365,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-05-pydata__xarray-4075/A/user-prompt.bin",
+      "role": "rank 05 A_prime user prompt",
+      "sha256": "618591db0269588c0ad00f280868ba7c29da289fb8084c3f1e3cf8b9fd4ebd8f"
+    },
+    {
+      "bytes": 2713,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-05-pydata__xarray-4075/A/terminal.patch",
+      "role": "rank 05 A_prime terminal patch",
+      "sha256": "4ddad8a5f31b2e0c38d2c5a6c14aeae972590d712cafcacc53578f2cd0fc998d"
+    },
+    {
+      "bytes": 3686,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-05-pydata__xarray-4075/4ddad8a5f31b2e0c38d2c5a6c14aeae972590d712cafcacc53578f2cd0fc998d/evaluation-receipt.json",
+      "role": "rank 05 A_prime official evaluation receipt",
+      "sha256": "f645d4d211a858cda277d0eb73337f2af70b1a23ae3c81fd3dd60dba895ec600"
+    },
+    {
+      "bytes": 6719,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-06-django__django-13794/A/episode-receipt.json",
+      "role": "rank 06 A_prime episode receipt",
+      "sha256": "5818993e8e489a6758815f7eb7b46e23e13546fccf8f568b5989af101f1bcec8"
+    },
+    {
+      "bytes": 191757,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-06-django__django-13794/A/claude.stream.jsonl",
+      "role": "rank 06 A_prime provider transcript",
+      "sha256": "17a2bc337f8b8259e5b8805eaf6bdd05ec925d10dfa00cb72178cfd2403a0bf2"
+    },
+    {
+      "bytes": 399,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-06-django__django-13794/A/user-prompt.bin",
+      "role": "rank 06 A_prime user prompt",
+      "sha256": "307cc8358a368921484fb1f2b583a2e3e3f0028365b28e131fe811bb61473f5b"
+    },
+    {
+      "bytes": 1789,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-06-django__django-13794/A/terminal.patch",
+      "role": "rank 06 A_prime terminal patch",
+      "sha256": "c226655dd1bbe25874b95193ba67e9ec17db29ea6bb008269cfae84972d79f4f"
+    },
+    {
+      "bytes": 3690,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-06-django__django-13794/c226655dd1bbe25874b95193ba67e9ec17db29ea6bb008269cfae84972d79f4f/evaluation-receipt.json",
+      "role": "rank 06 A_prime official evaluation receipt",
+      "sha256": "0475a794a408733e1b94f59a819c1e09e50ec16c734c23f0e0b4bd77e2df0403"
+    },
+    {
+      "bytes": 6863,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-07-matplotlib__matplotlib-24026/A/episode-receipt.json",
+      "role": "rank 07 A_prime episode receipt",
+      "sha256": "ee46df1bda1534b8bdd10fd994af21947f15c2fb7142100bed79eca384713603"
+    },
+    {
+      "bytes": 240412,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-07-matplotlib__matplotlib-24026/A/claude.stream.jsonl",
+      "role": "rank 07 A_prime provider transcript",
+      "sha256": "c1048272d515979c21202d37be8431c42f0951d3c7fd5b396c7148f9e37cc300"
+    },
+    {
+      "bytes": 2225,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-07-matplotlib__matplotlib-24026/A/user-prompt.bin",
+      "role": "rank 07 A_prime user prompt",
+      "sha256": "ee404d3466eb492ed998a4a92d2b36a7565dcf991ef391dd47c1c464fe51b788"
+    },
+    {
+      "bytes": 1536,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-07-matplotlib__matplotlib-24026/A/terminal.patch",
+      "role": "rank 07 A_prime terminal patch",
+      "sha256": "938871ce5d11c4dc70513150628be2364974d2c4b1111d5f3af993c195e286a7"
+    },
+    {
+      "bytes": 3776,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-07-matplotlib__matplotlib-24026/938871ce5d11c4dc70513150628be2364974d2c4b1111d5f3af993c195e286a7/evaluation-receipt.json",
+      "role": "rank 07 A_prime official evaluation receipt",
+      "sha256": "67ef840ed1140a88fcbcef437eb14064078d15c38e8668e57d940a459b00ddbb"
+    },
+    {
+      "bytes": 6790,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-08-django__django-11163/A/episode-receipt.json",
+      "role": "rank 08 A_prime episode receipt",
+      "sha256": "5f6f4ebc79e5df40847c512ab55954aa6ed991684ef0895ccb73c0afcfecfdf3"
+    },
+    {
+      "bytes": 379541,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-08-django__django-11163/A/claude.stream.jsonl",
+      "role": "rank 08 A_prime provider transcript",
+      "sha256": "90d29a9afed5b26142c939b7c31e2f1ddd2db0ef4733a1aec969a2f15d1ac9c8"
+    },
+    {
+      "bytes": 502,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-08-django__django-11163/A/user-prompt.bin",
+      "role": "rank 08 A_prime user prompt",
+      "sha256": "31de96d4ac9c936228513682dae720bdd719dd05554fc2dbf2ec12f900c712f5"
+    },
+    {
+      "bytes": 1130,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-08-django__django-11163/A/terminal.patch",
+      "role": "rank 08 A_prime terminal patch",
+      "sha256": "adafdb3a2cbc47ae0ad8c89cd9b7799bcfed9a6fc68d5a11a171afb4f37cbb1f"
+    },
+    {
+      "bytes": 3695,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-08-django__django-11163/adafdb3a2cbc47ae0ad8c89cd9b7799bcfed9a6fc68d5a11a171afb4f37cbb1f/evaluation-receipt.json",
+      "role": "rank 08 A_prime official evaluation receipt",
+      "sha256": "fb9f66d36a4beb68e7519d07f6ca425b67a7bfeef90fc59149b0a483d164ad1e"
+    },
+    {
+      "bytes": 6720,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-09-django__django-16612/A/episode-receipt.json",
+      "role": "rank 09 A_prime episode receipt",
+      "sha256": "c44684172028eda7db2fead74c93b9f495f13ce532e7f78bb351f1a34d6460de"
+    },
+    {
+      "bytes": 472064,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-09-django__django-16612/A/claude.stream.jsonl",
+      "role": "rank 09 A_prime provider transcript",
+      "sha256": "11b61e5be5d8a2565e9370cdb9b17f039bb00a845781083dd20f0933c02b9ca8"
+    },
+    {
+      "bytes": 823,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-09-django__django-16612/A/user-prompt.bin",
+      "role": "rank 09 A_prime user prompt",
+      "sha256": "d2aed43df902228d26bf1ba45987585cb3415ecab4c80cfdd1b12100ee74e5da"
+    },
+    {
+      "bytes": 2075,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-09-django__django-16612/A/terminal.patch",
+      "role": "rank 09 A_prime terminal patch",
+      "sha256": "38ed0d8e957d66047081f2434dcfd537440056120eaeca02038fcf6174a66e03"
+    },
+    {
+      "bytes": 3688,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-09-django__django-16612/38ed0d8e957d66047081f2434dcfd537440056120eaeca02038fcf6174a66e03/evaluation-receipt.json",
+      "role": "rank 09 A_prime official evaluation receipt",
+      "sha256": "da514e3878ac441052895aee71e8207fff1705e392c499fabf1f16a3d3541191"
+    },
+    {
+      "bytes": 6793,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-10-django__django-11551/A/episode-receipt.json",
+      "role": "rank 10 A_prime episode receipt",
+      "sha256": "0275c7770903eeab747d2a67b38581a84d8f7a7137e89c290d33ffa16d426cf4"
+    },
+    {
+      "bytes": 283036,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-10-django__django-11551/A/claude.stream.jsonl",
+      "role": "rank 10 A_prime provider transcript",
+      "sha256": "0b6d588d63aec1804556d8a8af28763574240b5a86a78574e0e8ca8b8928de6e"
+    },
+    {
+      "bytes": 5507,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-10-django__django-11551/A/user-prompt.bin",
+      "role": "rank 10 A_prime user prompt",
+      "sha256": "bcbed14edfa150d4cfea7caab214cdec5a2da0ea40e342420c8e9b3b80b965a0"
+    },
+    {
+      "bytes": 4587,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing02-attempt-001/rank-10-django__django-11551/A/terminal.patch",
+      "role": "rank 10 A_prime terminal patch",
+      "sha256": "bd863eab251018435a220355ad3e9cb471194aaa3f7803136a2b0a49bf0ecc19"
+    },
+    {
+      "bytes": 3698,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-10-django__django-11551/bd863eab251018435a220355ad3e9cb471194aaa3f7803136a2b0a49bf0ecc19/evaluation-receipt.json",
+      "role": "rank 10 A_prime official evaluation receipt",
+      "sha256": "2bfb1c6c68e5d3398ce9096e4c9ce0a58498b6dbef507d637176437777668260"
+    },
+    {
+      "bytes": 6770,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-11-django__django-13658/A/episode-receipt.json",
+      "role": "rank 11 A_prime episode receipt",
+      "sha256": "1f614448246710da3332811588cf3d4ada6e8fda319eb01169a09d7f637a0611"
+    },
+    {
+      "bytes": 85145,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-11-django__django-13658/A/claude.stream.jsonl",
+      "role": "rank 11 A_prime provider transcript",
+      "sha256": "e3d85791fc2b6b083460a3dd281aa7510e2b233be169a9da30963235e490fc8a"
+    },
+    {
+      "bytes": 1337,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-11-django__django-13658/A/user-prompt.bin",
+      "role": "rank 11 A_prime user prompt",
+      "sha256": "bb774b321d24f182c5d70e6e644e0327baf6790143ad08b0ce5fe258cea03418"
+    },
+    {
+      "bytes": 890,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-11-django__django-13658/A/terminal.patch",
+      "role": "rank 11 A_prime terminal patch",
+      "sha256": "cef615bcfaa29896765deaced9d2704751d3d2d2737bf514216bc228db4db1dd"
+    },
+    {
+      "bytes": 3695,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-11-django__django-13658/cef615bcfaa29896765deaced9d2704751d3d2d2737bf514216bc228db4db1dd/evaluation-receipt.json",
+      "role": "rank 11 A_prime official evaluation receipt",
+      "sha256": "8a30f4418350c1d807d5d6d03da9ab1eb9b938120fca0c508998d781f06ba800"
+    },
+    {
+      "bytes": 6685,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-12-psf__requests-1724/A/episode-receipt.json",
+      "role": "rank 12 A_prime episode receipt",
+      "sha256": "b324c2901545c619afae089daaffa907679e9b23508c2864cb64fff4cd972623"
+    },
+    {
+      "bytes": 203511,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-12-psf__requests-1724/A/claude.stream.jsonl",
+      "role": "rank 12 A_prime provider transcript",
+      "sha256": "83f594287e5cb68dcf8c155c061931c3a4a4ed378e424b1512e3301c0563f211"
+    },
+    {
+      "bytes": 2584,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-12-psf__requests-1724/A/user-prompt.bin",
+      "role": "rank 12 A_prime user prompt",
+      "sha256": "d45f70e7eadc9665ae43ce922da9890c7e27bb09e3bf084e2d093f7eb7011cd9"
+    },
+    {
+      "bytes": 534,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-12-psf__requests-1724/A/terminal.patch",
+      "role": "rank 12 A_prime terminal patch",
+      "sha256": "d5786001eef828628a28f2bba6428ddbfb67b635c6a11a79dc12d3ddf92f2e3b"
+    },
+    {
+      "bytes": 3666,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-12-psf__requests-1724/d5786001eef828628a28f2bba6428ddbfb67b635c6a11a79dc12d3ddf92f2e3b/evaluation-receipt.json",
+      "role": "rank 12 A_prime official evaluation receipt",
+      "sha256": "ec38e1f100c74eb726bb42b9e0b6b6e9c8bd148004bc61c41f1a55fb1ed0cdf5"
+    },
+    {
+      "bytes": 6674,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-13-sympy__sympy-18763/A/episode-receipt.json",
+      "role": "rank 13 A_prime episode receipt",
+      "sha256": "17a92d0b7a04d39956ce52e494640bf08fc4e7e4c001d47cbc4d4eb7e3b42332"
+    },
+    {
+      "bytes": 278273,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-13-sympy__sympy-18763/A/claude.stream.jsonl",
+      "role": "rank 13 A_prime provider transcript",
+      "sha256": "c7fd78e563a15be97478ba8719ecd44bc60806ffd62a6232a1bca3e49c2fcbc8"
+    },
+    {
+      "bytes": 659,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-13-sympy__sympy-18763/A/user-prompt.bin",
+      "role": "rank 13 A_prime user prompt",
+      "sha256": "63a45f447e5f425349c9fa2e133f96031670d0246e1ce4be8b47c2237e08983e"
+    },
+    {
+      "bytes": 891,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-13-sympy__sympy-18763/A/terminal.patch",
+      "role": "rank 13 A_prime terminal patch",
+      "sha256": "5424bd99fa3c07b19dc367ad12f0ef9cdf363b80e091477044e85720c4badd77"
+    },
+    {
+      "bytes": 3669,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-13-sympy__sympy-18763/5424bd99fa3c07b19dc367ad12f0ef9cdf363b80e091477044e85720c4badd77/evaluation-receipt.json",
+      "role": "rank 13 A_prime official evaluation receipt",
+      "sha256": "39d11d4a03c231ff533254b22719b3c3b805889856c45c9f5b6e232fb8905a56"
+    },
+    {
+      "bytes": 8872,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-14-pytest-dev__pytest-7982/A/episode-receipt.json",
+      "role": "rank 14 A_prime episode receipt",
+      "sha256": "92a61766a037b680fb2e4b3b924c56da30e88e417ebc62f30fd387fbbcd495cb"
+    },
+    {
+      "bytes": 128694,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-14-pytest-dev__pytest-7982/A/claude.stream.jsonl",
+      "role": "rank 14 A_prime provider transcript",
+      "sha256": "7cc481561cf2367eeeacb660bffa40874881e29834828f1ad6a20a2e16b4340b"
+    },
+    {
+      "bytes": 543,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-14-pytest-dev__pytest-7982/A/user-prompt.bin",
+      "role": "rank 14 A_prime user prompt",
+      "sha256": "37d0af4557c6b0f34313f071fb0d20d3a53fa6dc7e377865ae9924e0a43cd559"
+    },
+    {
+      "bytes": 1185,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing05-attempt-001/rank-14-pytest-dev__pytest-7982/A/terminal.patch",
+      "role": "rank 14 A_prime terminal patch",
+      "sha256": "2dea55e2bd9dd56f7ae27e765f9f3079fb14c914b59afcd6edc0ab15d3ea089c"
+    },
+    {
+      "bytes": 3728,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-14-pytest-dev__pytest-7982/2dea55e2bd9dd56f7ae27e765f9f3079fb14c914b59afcd6edc0ab15d3ea089c/evaluation-receipt.json",
+      "role": "rank 14 A_prime official evaluation receipt",
+      "sha256": "6e0227d9783d93e50dd101cde1d0504e3c4bf7bca551e0796f709739683c3d2a"
+    },
+    {
+      "bytes": 8722,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-15-pytest-dev__pytest-7432/A/episode-receipt.json",
+      "role": "rank 15 A_prime episode receipt",
+      "sha256": "adb00380352ace4d202a7125f169c15f5bf992d82afc3765fd08f0a298f0d8ca"
+    },
+    {
+      "bytes": 81416,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-15-pytest-dev__pytest-7432/A/claude.stream.jsonl",
+      "role": "rank 15 A_prime provider transcript",
+      "sha256": "833582954c7f4f3b8b0932fa8b4ef6cef5b7461cb644cdb154b38b84e051f67a"
+    },
+    {
+      "bytes": 865,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-15-pytest-dev__pytest-7432/A/user-prompt.bin",
+      "role": "rank 15 A_prime user prompt",
+      "sha256": "14366c56784cedfcd38b44c136e16b9799acdf47a5cdfa510fb7b3f6146435c6"
+    },
+    {
+      "bytes": 486,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-15-pytest-dev__pytest-7432/A/terminal.patch",
+      "role": "rank 15 A_prime terminal patch",
+      "sha256": "5f8ddf0bce098551f88042427e00b557b6e4003307613f6f612c92cb214d08a7"
+    },
+    {
+      "bytes": 3714,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-15-pytest-dev__pytest-7432/5f8ddf0bce098551f88042427e00b557b6e4003307613f6f612c92cb214d08a7/evaluation-receipt.json",
+      "role": "rank 15 A_prime official evaluation receipt",
+      "sha256": "dfb90c2f820937403e293052fbd502aa38f730631fde5ac66f7b62ae42476bbd"
+    },
+    {
+      "bytes": 6731,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-16-django__django-12193/A/episode-receipt.json",
+      "role": "rank 16 A_prime episode receipt",
+      "sha256": "b435caee5e45018678abd1b235b7d0b2c3f68837d89241305b71643a17056acc"
+    },
+    {
+      "bytes": 268969,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-16-django__django-12193/A/claude.stream.jsonl",
+      "role": "rank 16 A_prime provider transcript",
+      "sha256": "afa0b3def31682f3cd68f06ad7562a09decd67c9b823472deeeca2c5437b2c2f"
+    },
+    {
+      "bytes": 867,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-16-django__django-12193/A/user-prompt.bin",
+      "role": "rank 16 A_prime user prompt",
+      "sha256": "eb985893b87f67da9157a71cd67dcc08a0343873d45d91a49023de772001789b"
+    },
+    {
+      "bytes": 1670,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-16-django__django-12193/A/terminal.patch",
+      "role": "rank 16 A_prime terminal patch",
+      "sha256": "1eeb8672eeecdc6b8ce9b13db9244d3e86093b91d9dc4bd743b5e9045199f580"
+    },
+    {
+      "bytes": 3691,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-16-django__django-12193/1eeb8672eeecdc6b8ce9b13db9244d3e86093b91d9dc4bd743b5e9045199f580/evaluation-receipt.json",
+      "role": "rank 16 A_prime official evaluation receipt",
+      "sha256": "81562be54fb38384298e3f0992c74f5a2985f76e01350e19d2457aafe0924d9f"
+    },
+    {
+      "bytes": 6783,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-17-django__django-16485/A/episode-receipt.json",
+      "role": "rank 17 A_prime episode receipt",
+      "sha256": "6803d97144ecdb3aacca9089cf83b19a94bcedd6f36f2bf7bfdf57ba2bdfa444"
+    },
+    {
+      "bytes": 191952,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-17-django__django-16485/A/claude.stream.jsonl",
+      "role": "rank 17 A_prime provider transcript",
+      "sha256": "bdd85b19283fb1f0073db8265549760ea6cf8db89d2901ef714e70af6b5f6f6a"
+    },
+    {
+      "bytes": 338,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-17-django__django-16485/A/user-prompt.bin",
+      "role": "rank 17 A_prime user prompt",
+      "sha256": "aaa093cbd0e7657f047c5b8f1882fbaebde1c0ed12d12bf776e2709005824e22"
+    },
+    {
+      "bytes": 1172,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-17-django__django-16485/A/terminal.patch",
+      "role": "rank 17 A_prime terminal patch",
+      "sha256": "83192b871c8c2afe68cd5e95f4fa4bc91150b08b2fa56dd927a57c0f83ae0fdd"
+    },
+    {
+      "bytes": 3697,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-17-django__django-16485/83192b871c8c2afe68cd5e95f4fa4bc91150b08b2fa56dd927a57c0f83ae0fdd/evaluation-receipt.json",
+      "role": "rank 17 A_prime official evaluation receipt",
+      "sha256": "c8733dabf03a4a88ea2a64209f3838f32b19f6539525a3b379e4d61b07626d5c"
+    },
+    {
+      "bytes": 6722,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-18-django__django-16877/A/episode-receipt.json",
+      "role": "rank 18 A_prime episode receipt",
+      "sha256": "117bf6d5b4c5e8c74afe4e80011d3c5c975bede21ba20d393095283a86e5fc25"
+    },
+    {
+      "bytes": 389592,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-18-django__django-16877/A/claude.stream.jsonl",
+      "role": "rank 18 A_prime provider transcript",
+      "sha256": "9808e4ec0053cdda997931d2cf4fd6faa2dcd49acd446f34a2ff10ae9c832857"
+    },
+    {
+      "bytes": 527,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-18-django__django-16877/A/user-prompt.bin",
+      "role": "rank 18 A_prime user prompt",
+      "sha256": "46c5ee410c9c9752515ee499af872a25f1b2fdab80e175fed2a8ac5636ad444b"
+    },
+    {
+      "bytes": 2071,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-18-django__django-16877/A/terminal.patch",
+      "role": "rank 18 A_prime terminal patch",
+      "sha256": "e034eb4996f4c65b961604c8e06017ae06f972bc026d5e0e9728f63ae2501cb3"
+    },
+    {
+      "bytes": 3691,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-18-django__django-16877/e034eb4996f4c65b961604c8e06017ae06f972bc026d5e0e9728f63ae2501cb3/evaluation-receipt.json",
+      "role": "rank 18 A_prime official evaluation receipt",
+      "sha256": "6cf1344f3dbaabdbd805e3914880d9e3e23c64655ef299ff349656e78a9cc8dd"
+    },
+    {
+      "bytes": 6773,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-19-django__django-11451/A/episode-receipt.json",
+      "role": "rank 19 A_prime episode receipt",
+      "sha256": "077b6318f5129c3e0f654dbd498198c0402ffe37dbf4e5e99bf71328b5c6f3bd"
+    },
+    {
+      "bytes": 33738,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-19-django__django-11451/A/claude.stream.jsonl",
+      "role": "rank 19 A_prime provider transcript",
+      "sha256": "dbb3b9aeebe211bfb6205621af3608ac0c529ca8b6f94a0b3bc066c6fd6c0fb3"
+    },
+    {
+      "bytes": 2159,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-19-django__django-11451/A/user-prompt.bin",
+      "role": "rank 19 A_prime user prompt",
+      "sha256": "fa8b91bf1122fc318cdd39b862fd0a0edce3b01766f849c8c5f58c12aa878361"
+    },
+    {
+      "bytes": 605,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-provider-retry-missing11-attempt-001/rank-19-django__django-11451/A/terminal.patch",
+      "role": "rank 19 A_prime terminal patch",
+      "sha256": "3c0e1ca544a6677dc63d37839c21b6df4128f29fdb18f652ae15593e203fcd15"
+    },
+    {
+      "bytes": 3694,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-19-django__django-11451/3c0e1ca544a6677dc63d37839c21b6df4128f29fdb18f652ae15593e203fcd15/evaluation-receipt.json",
+      "role": "rank 19 A_prime official evaluation receipt",
+      "sha256": "0383099a6521eef78c7271b1b3f7ddbc471becdff45391380298b2ef1badcfe1"
+    },
+    {
+      "bytes": 8757,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-20-pytest-dev__pytest-7205/A/episode-receipt.json",
+      "role": "rank 20 A_prime episode receipt",
+      "sha256": "a44ffde130797ab5dad2cc50fc057b2d4eb76fb911a2e6e5391207da3889d4ab"
+    },
+    {
+      "bytes": 157437,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-20-pytest-dev__pytest-7205/A/claude.stream.jsonl",
+      "role": "rank 20 A_prime provider transcript",
+      "sha256": "10c80155f2d078d655e38cb5fa26818a339af37199a6fb3e704eddb63bc5a584"
+    },
+    {
+      "bytes": 4359,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-20-pytest-dev__pytest-7205/A/user-prompt.bin",
+      "role": "rank 20 A_prime user prompt",
+      "sha256": "b737ace12e9ff1138faba268b7f3d6a16685bdbedc2e8c0eb70e802e171b41c4"
+    },
+    {
+      "bytes": 2340,
+      "path": "native-default-a-prime-sonnet-attempt-001/model-scale-ranks02-20-attempt-001/rank-20-pytest-dev__pytest-7205/A/terminal.patch",
+      "role": "rank 20 A_prime terminal patch",
+      "sha256": "58e7c3cdef7f90efa4a26c842723586279ac1672b30a273d61c3faa45aea92b4"
+    },
+    {
+      "bytes": 3720,
+      "path": "native-default-a-prime-sonnet-attempt-001/official-evaluation-attempt-001/rank-20-pytest-dev__pytest-7205/58e7c3cdef7f90efa4a26c842723586279ac1672b30a273d61c3faa45aea92b4/evaluation-receipt.json",
+      "role": "rank 20 A_prime official evaluation receipt",
+      "sha256": "a0ab45b72375505d4c56cdf2bf59fb3d14fb6b165894555955f84e33bf1ccdfc"
+    }
+  ],
+  "evidence_root_environment": "ISSUE836_EVIDENCE_ROOT",
+  "schema_version": "issue836-native-default-control-repair-evidence-manifest-v1"
+}
