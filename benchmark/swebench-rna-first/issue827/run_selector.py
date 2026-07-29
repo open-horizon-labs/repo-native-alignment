@@ -31,12 +31,13 @@ from typing import Any, Mapping, Sequence
 import provider_usage
 import isolation
 import registration_contract
+import select_cases
 import frontier_replay
 
 
 RUN_SCHEMA = "issue827-hermetic-selector-run-v1"
 REGISTRATION_SCHEMA = registration_contract.REGISTRATION_SCHEMA
-SELECTION_SCHEMA = "issue827-fresh-pair-selection-v1"
+SELECTION_SCHEMA = select_cases.SCHEMA
 IDENTITY_SCHEMA = "issue827-runtime-identity-v1"
 RECEIPT_SCHEMA = "issue827-episode-receipt-v1"
 QUERY_EVIDENCE_SCHEMA = "issue827-query-evidence-v1"
@@ -342,7 +343,10 @@ def verify_model_checkout(
 
     checkout = verify_checkout(path_text, commit, tree, where)
     try:
-        isolation.audit_private_tree(checkout)
+        isolation.audit_private_tree(
+            checkout,
+            allow_internal_symlinks=True,
+        )
     except isolation.IsolationViolation as exc:
         raise FailClosed(
             f"{where} private-tree audit failed: {exc.code}"
@@ -843,6 +847,31 @@ def validate_registered_sources(registration: Mapping[str, Any]) -> None:
         raise FailClosed(str(exc)) from exc
 
 
+def experiment_dimensions(
+    registration: Mapping[str, Any],
+) -> registration_contract.ExperimentDimensions:
+    try:
+        return registration_contract.experiment_dimensions(registration)
+    except registration_contract.RegistrationContractError as exc:
+        raise FailClosed(str(exc)) from exc
+
+
+def expected_episode_identities(
+    registration: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> tuple[tuple[int, str, str], ...]:
+    try:
+        return select_cases.expected_episode_identities(
+            registration,
+            selection,
+        )
+    except (
+        registration_contract.RegistrationContractError,
+        select_cases.SelectionError,
+    ) as exc:
+        raise FailClosed(str(exc)) from exc
+
+
 def validate_authoritative_selection(
     selection: Mapping[str, Any], registration_bytes: bytes
 ) -> None:
@@ -1089,16 +1118,23 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
 
     registration_path, registration_bytes = check_ref(manifest["registration"], "manifest.registration")
     registration = read_json(registration_path)
-    require(registration.get("schema_version") == REGISTRATION_SCHEMA, "registration schema mismatch")
     validate_registered_sources(registration)
+    dimensions = experiment_dimensions(registration)
     registration_ref = dict(manifest["registration"])
 
     selection_path, _ = check_ref(manifest["selection"], "manifest.selection")
     selection = read_json(selection_path)
-    require(selection.get("schema_version") == SELECTION_SCHEMA, "selection schema mismatch")
     validate_authoritative_selection(selection, registration_bytes)
+    expected_identities = expected_episode_identities(
+        registration,
+        selection,
+    )
     selected = selection.get("cases")
-    require(isinstance(selected, list) and len(selected) == 2, "selection must contain exactly two cases")
+    require(
+        isinstance(selected, list)
+        and len(selected) == dimensions["case_count"],
+        "selection case count differs from registration",
+    )
 
     claude_path, claude_version = verify_runtime(manifest, registration)
     launcher_path, binary_path, rna_refs = verify_rna_artifact(manifest, registration)
@@ -1119,7 +1155,11 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
         require(not output_root.exists(), "output_root already exists")
 
     case_values = manifest["cases"]
-    require(isinstance(case_values, list) and len(case_values) == 2, "manifest must contain exactly two cases")
+    require(
+        isinstance(case_values, list)
+        and len(case_values) == dimensions["case_count"],
+        "manifest case count differs from registration",
+    )
     cases: list[PreparedCase] = []
     sessions: set[str] = set()
     checkouts: set[Path] = set()
@@ -1204,7 +1244,20 @@ def prepare(manifest_path: Path, *, permit_output: bool = False, permit_sessions
                 isolation_worker=isolation_worker,
             )
         )
-    require({case.rank for case in cases} == {1, 2}, "selected ranks must be 1 and 2")
+    require(
+        {case.rank for case in cases}
+        == set(range(1, dimensions["case_count"] + 1)),
+        "selected ranks differ from the registered contiguous range",
+    )
+    require(
+        tuple(
+            (case.rank, case.case_id, arm)
+            for case in cases
+            for arm in case.arm_order
+        )
+        == expected_identities,
+        "manifest episode identities differ from authoritative selection",
+    )
     return PreparedRun(
         manifest_path=manifest_path,
         manifest_ref=file_ref(manifest_path),
@@ -1559,7 +1612,10 @@ def configure_episode(
     live_self_test_path = isolation_root / "live-worker-self-test.json"
     atomic_write(live_self_test_path, canonical(case.isolation_worker["live_self_test"]))
 
-    checkout_audit = isolation.audit_private_tree(case.checkouts[arm])
+    checkout_audit = isolation.audit_private_tree(
+        case.checkouts[arm],
+        allow_internal_symlinks=True,
+    )
     model_private_audit = isolation.audit_private_tree(model_private)
     harness_audit = isolation.audit_private_tree(harness_paths["harness"])
     private_audits = {
@@ -2851,12 +2907,13 @@ def isolation_compliance(
     )
     try:
         native_tool_state = read_json(native_tool_state_path)
-        if native_tool_state != {
-            "schema_version": "issue827-native-tool-state-v1",
-            "active": {},
-        }:
-            errors.append("native_tool_state_not_quiescent")
-    except (FailClosed, OSError, json.JSONDecodeError) as exc:
+        isolation.validate_native_tool_state(native_tool_state)
+    except (
+        FailClosed,
+        OSError,
+        json.JSONDecodeError,
+        isolation.IsolationViolation,
+    ) as exc:
         errors.append(f"native_tool_state_invalid:{exc}")
     guard_records: list[dict[str, Any]] = []
     if guard_ledger_path.exists():
@@ -2922,7 +2979,21 @@ def isolation_compliance(
             continue
         if value.get("schema_version") != "issue827-bash-gateway-receipt-v1":
             errors.append(f"gateway_receipt_schema:{path.name}")
-        if value.get("status") != "success" or value.get("violations") != []:
+        status = value.get("status")
+        returncode = value.get("returncode")
+        adherent_success = (
+            status == "success"
+            and type(returncode) is int
+            and returncode == 0
+            and value.get("violations") == []
+        )
+        adherent_failure = (
+            status == "failed"
+            and type(returncode) is int
+            and returncode != 0
+            and value.get("violations") == []
+        )
+        if not adherent_success and not adherent_failure:
             errors.append(f"gateway_receipt_not_clean:{path.name}")
         if value.get("receipt_sha256") != sha_bytes(
             canonical({key: item for key, item in value.items() if key != "receipt_sha256"})
@@ -3417,7 +3488,8 @@ def launch_episode(
     post_private_audit_path = evidence / "isolation/post-private-tree-audit.json"
     try:
         post_private_audit = isolation.audit_private_tree(
-            case.checkouts[arm]
+            case.checkouts[arm],
+            allow_internal_symlinks=True,
         )
         atomic_write(post_private_audit_path, canonical(post_private_audit))
     except isolation.IsolationViolation as exc:
@@ -3535,31 +3607,55 @@ def execute_case(prepared: PreparedRun, case: PreparedCase) -> tuple[list[dict[s
 
 
 def execution_cases(prepared: PreparedRun) -> tuple[PreparedCase, ...]:
-    require(len(prepared.cases) == 2, "fresh selector requires exactly two cases")
+    dimensions = experiment_dimensions(prepared.registration)
+    require(
+        len(prepared.cases) == dimensions["case_count"],
+        "prepared case count differs from registration",
+    )
+    require(
+        tuple(
+            (case.rank, case.case_id, arm)
+            for case in prepared.cases
+            for arm in case.arm_order
+        )
+        == expected_episode_identities(
+            prepared.registration,
+            prepared.selection,
+        ),
+        "prepared episode identities differ from authoritative selection",
+    )
     return prepared.cases
 
 
 def execute(prepared: PreparedRun) -> int:
     cases = execution_cases(prepared)
+    dimensions = experiment_dimensions(prepared.registration)
+    episode_keys = [
+        {"case_id": case_id, "rank": rank, "arm": arm}
+        for rank, case_id, arm in expected_episode_identities(
+            prepared.registration,
+            prepared.selection,
+        )
+    ]
     prepared.output_root.mkdir(parents=True, exist_ok=False)
     start = {
         "schema_version": "issue827-selector-invocation-v1",
         "started_at": utc_now(),
         "run_manifest": prepared.manifest_ref,
-        "parallel_cases": len(cases),
+        "case_count": dimensions["case_count"],
+        "max_parallel_cases": dimensions["max_parallel_cases"],
         "same_case_serial": True,
-        "models_authorized": len(cases) * 2,
-        "execution_episode_keys": [
-            {"case_id": case.case_id, "rank": case.rank, "arm": arm}
-            for case in cases
-            for arm in case.arm_order
-        ],
+        "models_authorized": dimensions["episode_count"],
+        "execution_episode_keys": episode_keys,
         "official_evaluator_invoked": False,
     }
     atomic_write(prepared.output_root / "invocation-start.json", canonical(start))
     receipts: list[dict[str, Any]] = []
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="issue827") as executor:
+    with ThreadPoolExecutor(
+        max_workers=dimensions["max_parallel_cases"],
+        thread_name_prefix="issue827",
+    ) as executor:
         futures = {executor.submit(execute_case, prepared, case): case for case in cases}
         for future in as_completed(futures):
             case = futures[future]
@@ -3577,8 +3673,9 @@ def execute(prepared: PreparedRun) -> int:
             key=lambda ref: ref["path"],
         ),
         "worker_errors": sorted(errors),
-        "all_authorized_episodes_recorded": len(receipts) == 4,
-        "all_four_episodes_recorded": len(receipts) == 4,
+        "all_authorized_episodes_recorded": (
+            len(receipts) == dimensions["episode_count"]
+        ),
         "evaluator_authorizations": 0,
         "authorization_requests": sum(
             receipt.get("authorization_requested") is True for receipt in receipts
@@ -3586,11 +3683,16 @@ def execute(prepared: PreparedRun) -> int:
         "official_evaluator_invoked": False,
     }
     atomic_write(prepared.output_root / "invocation-result.json", canonical(result))
-    return 0 if not errors and len(receipts) == len(cases) * 2 else 1
+    return (
+        0
+        if not errors and len(receipts) == dimensions["episode_count"]
+        else 1
+    )
 
 
 def preflight_summary(prepared: PreparedRun) -> dict[str, Any]:
     cases = execution_cases(prepared)
+    dimensions = experiment_dimensions(prepared.registration)
     return {
         "status": "READY_TO_EXECUTE_SELECTOR",
         "run_manifest": prepared.manifest_ref,
@@ -3630,11 +3732,14 @@ def preflight_summary(prepared: PreparedRun) -> dict[str, Any]:
             for case in prepared.cases
         ],
         "same_case_serial": True,
-        "maximum_concurrent_cases": 2,
+        "case_count": dimensions["case_count"],
+        "max_parallel_cases": dimensions["max_parallel_cases"],
         "execution_episode_keys": [
-            {"case_id": case.case_id, "rank": case.rank, "arm": arm}
-            for case in cases
-            for arm in case.arm_order
+            {"case_id": case_id, "rank": rank, "arm": arm}
+            for rank, case_id, arm in expected_episode_identities(
+                prepared.registration,
+                prepared.selection,
+            )
         ],
         "models_launched": 0,
         "official_evaluator_invoked": False,
@@ -3646,9 +3751,16 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     preflight = sub.add_parser("preflight", help="read-only frozen-identity preflight")
     preflight.add_argument("--manifest", type=Path, required=True)
-    run = sub.add_parser("run", help="preflight and optionally execute the four episodes")
+    run = sub.add_parser(
+        "run",
+        help="preflight and optionally execute all registered episodes",
+    )
     run.add_argument("--manifest", type=Path, required=True)
-    run.add_argument("--execute", action="store_true", help="launch the four paid Claude episodes")
+    run.add_argument(
+        "--execute",
+        action="store_true",
+        help="launch all registered paid Claude episodes",
+    )
     return result
 
 

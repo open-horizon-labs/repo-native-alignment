@@ -734,6 +734,18 @@ fn collect_references(
     {
         let text = node.utf8_text(source).unwrap_or("");
         if let Some(short) = locals.get(text) {
+            // Import paths are qualified names, not reads of same-named local
+            // bindings.  Their identifier can be nested below dotted-name or
+            // alias nodes, so checking only the immediate parent corrupts
+            // imports such as `from sympy.polys.rings import PolyRing` when a
+            // local named `polys` is also eligible for shortening.
+            let mut ancestor = node.parent();
+            while let Some(parent) = ancestor {
+                if parent.kind().contains("import") {
+                    return;
+                }
+                ancestor = parent.parent();
+            }
             if let Some(parent) = node.parent() {
                 // Don't rename property access targets
                 if parent.kind() == config.member_expr {
@@ -765,10 +777,6 @@ fn collect_references(
                         })
                     && key.id() == node.id()
                 {
-                    return;
-                }
-                // Don't rename imports
-                if parent.kind().contains("import") {
                     return;
                 }
             }
@@ -1609,6 +1617,20 @@ mod tests {
         let result = minified(input, "typescript");
         // Function names should be preserved
         assert!(result.contains("fetchUserById"));
+    }
+
+    #[test]
+    fn test_python_preserves_dotted_import_paths_when_local_name_matches() {
+        let input = r#"def build(polys):
+    from sympy.polys.rings import PolyRing
+    normalized_polys = [poly for poly in polys]
+    return PolyRing(normalized_polys)
+"#;
+        let result = minified(input, "python");
+        assert!(
+            result.contains("from sympy.polys.rings import PolyRing"),
+            "dotted import path was corrupted: {result}"
+        );
     }
 
     #[test]

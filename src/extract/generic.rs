@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Result;
 
 use super::query::{CaptureSet, QueryExtractor, RouteQueryConfig};
-use super::string_literals::harvest_string_literals;
+use super::string_literals::{StringLiteralConfig, harvest_string_literals};
 use super::{ExtractionResult, Extractor};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use crate::scanner::PatternConfig;
@@ -362,9 +362,12 @@ impl GenericExtractor {
                 tree.root_node(),
                 path,
                 source,
-                self.config.language_name,
-                outer_kind,
-                *content_child,
+                StringLiteralConfig {
+                    language: self.config.language_name,
+                    node_kind: outer_kind,
+                    content_child: *content_child,
+                    skip_body_docstrings: self.config.docstring_in_body,
+                },
                 &mut nodes,
             );
         }
@@ -5203,6 +5206,64 @@ def process_input(value):
         }
         // If not captured (graceful degradation), that's acceptable —
         // Python # comments (preceding sibling path) still work.
+        assert!(
+            !result.nodes.iter().any(|node| {
+                node.id.kind == NodeKind::Const && node.id.name.contains("Charges the card")
+            }),
+            "docstrings belong in documentation metadata, not synthetic Const identities"
+        );
+    }
+
+    #[test]
+    fn test_python_docstrings_are_not_synthetic_consts() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r####"r"""Module documentation that must not become a stable ID."""
+
+class PaymentProcessor:
+    r"""Class documentation that must not become a stable ID."""
+
+    def process(self):
+        r"""Method documentation that must not become a stable ID."""
+        content_type = "application/json"
+        return content_type
+"####;
+        let result = ext.extract(Path::new("payments.py"), code).unwrap();
+        let synthetic_consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.id.kind == NodeKind::Const
+                    && node.metadata.get("synthetic").map(String::as_str) == Some("true")
+            })
+            .collect();
+
+        assert!(
+            synthetic_consts
+                .iter()
+                .all(|node| !node.id.name.contains("documentation that must not")),
+            "module, class, and method docstrings must not become Const identities"
+        );
+        assert!(
+            synthetic_consts
+                .iter()
+                .any(|node| node.id.name == "application/json"),
+            "ordinary Python literals must remain searchable synthetic Const nodes"
+        );
+        for symbol_name in ["PaymentProcessor", "process"] {
+            let symbol = result
+                .nodes
+                .iter()
+                .find(|node| node.id.name == symbol_name)
+                .unwrap_or_else(|| panic!("missing {symbol_name}"));
+            assert!(
+                symbol
+                    .metadata
+                    .get("doc_comment")
+                    .is_some_and(|doc| doc.contains("documentation that must not")),
+                "{symbol_name} should retain its docstring as documentation metadata"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

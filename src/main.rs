@@ -252,7 +252,14 @@ struct SearchArgs {
         default_missing_value = "true"
     )]
     include_artifacts: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     include_markdown: bool,
     #[arg(long)]
     artifact_types: Option<String>,
@@ -1817,9 +1824,13 @@ mod tests {
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
 
     #[test]
-    fn search_cli_preserves_default_and_accepts_explicit_artifact_exclusion() {
-        for (arguments, expected) in [
-            (vec!["repo-native-alignment", "search", "query"], true),
+    fn search_cli_preserves_defaults_and_accepts_explicit_content_exclusion() {
+        for (arguments, expected_artifacts, expected_markdown) in [
+            (
+                vec!["repo-native-alignment", "search", "query"],
+                true,
+                true,
+            ),
             (
                 vec![
                     "repo-native-alignment",
@@ -1827,6 +1838,7 @@ mod tests {
                     "query",
                     "--include-artifacts",
                 ],
+                true,
                 true,
             ),
             (
@@ -1837,13 +1849,35 @@ mod tests {
                     "--include-artifacts=false",
                 ],
                 false,
+                true,
+            ),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-markdown",
+                ],
+                true,
+                true,
+            ),
+            (
+                vec![
+                    "repo-native-alignment",
+                    "search",
+                    "query",
+                    "--include-markdown=false",
+                ],
+                true,
+                false,
             ),
         ] {
             let cli = Cli::try_parse_from(arguments).expect("search CLI should parse");
             let Some(Commands::Search(args)) = cli.command else {
                 panic!("expected search command");
             };
-            assert_eq!(args.include_artifacts, expected);
+            assert_eq!(args.include_artifacts, expected_artifacts);
+            assert_eq!(args.include_markdown, expected_markdown);
         }
     }
 

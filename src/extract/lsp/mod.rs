@@ -346,7 +346,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             "typescript",
             "typescript-language-server",
             &["--stdio"],
-            &["ts", "tsx", "js", "jsx", "js_t"]
+            &["ts", "tsx", "js", "jsx", "mjs", "js_t"]
         )
     },
     BuiltinLspDescriptor {
@@ -1152,7 +1152,7 @@ fn lsp_language_id(inventory_language: &str, path: &Path) -> String {
         }
         "typescript" | "deno" => match path.extension().and_then(|extension| extension.to_str()) {
             Some("tsx") => "typescriptreact".to_string(),
-            Some("js" | "js_t") => "javascript".to_string(),
+            Some("js" | "mjs" | "js_t") => "javascript".to_string(),
             Some("jsx") => "javascriptreact".to_string(),
             _ => "typescript".to_string(),
         },
@@ -4621,6 +4621,18 @@ mod tests {
                 .language(),
             "typescript"
         );
+    }
+
+    #[test]
+    fn mjs_has_typescript_lsp_descriptor_and_javascript_language_id() {
+        let path = Path::new("bin/test_pyodide.mjs");
+        assert_eq!(
+            builtin_lsp_descriptor_for_path(path)
+                .expect("tracked ECMAScript modules require a locked descriptor")
+                .language(),
+            "typescript"
+        );
+        assert_eq!(lsp_language_id("typescript", path), "javascript");
     }
 
     #[test]

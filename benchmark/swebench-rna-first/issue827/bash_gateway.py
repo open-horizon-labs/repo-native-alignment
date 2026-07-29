@@ -755,7 +755,15 @@ def _run_offline(
     try:
         trace = parse_strace_directory(
             trace_directory,
-            allowed_path_prefixes=list(config["trace_allowed_path_prefixes"]),
+            allowed_path_prefixes=[
+                *list(config["trace_allowed_path_prefixes"]),
+                # Claude's native tools operate on this exact host checkout,
+                # while Bash sees the same tree at /workspace. Treat the
+                # already-authorized editable checkout as a declared alias;
+                # sibling, index, evidence, and credential paths remain
+                # forbidden by the fragment policy below.
+                str(config["checkout"]),
+            ],
             forbidden_path_fragments=list(
                 config["trace_forbidden_path_fragments"]
             ),

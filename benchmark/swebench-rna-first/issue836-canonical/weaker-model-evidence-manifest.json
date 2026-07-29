@@ -1,0 +1,167 @@
+{
+  "canonical_cell_count": 120,
+  "evidence_root_environment_variable": "ISSUE836_EVIDENCE_ROOT",
+  "external_artifacts": {
+    "condition_launcher": {
+      "bytes": 7605,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/launch.py",
+      "sha256": "eb7966b3a2b49954eabb755a23a73821ea7ca23cda7443f30ced6a932ee7cd48"
+    },
+    "evaluation_launcher": {
+      "bytes": 4068,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/launch_evaluator_snapshot.py",
+      "sha256": "b8ddf8e9d23efcf5c1f49773c544ec06aa66783b34595d7101e7de737e06b127"
+    },
+    "evaluation_launcher_index": {
+      "bytes": 5035,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/snapshot-020/launcher-index.json",
+      "sha256": "607dd804f84336401ac2dd67ea748f410ca7b80c03a9b33669ca78da78f10a6a"
+    },
+    "evaluator_snapshot_builder": {
+      "bytes": 5752,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/prepare_evaluator_snapshot.py",
+      "sha256": "c84717e32d0b92794954dce9027850ec08d34b9667eaf00bed1265e4d067b2ef"
+    },
+    "evaluator_snapshot_manifest": {
+      "bytes": 104831,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluator-snapshots/snapshot-020/evaluator-manifest.json",
+      "sha256": "819af9677557a5606e2e8d2f005dafb19ff85f435d2cdce263521d4927c8441e"
+    },
+    "evidence_manifest_builder": {
+      "bytes": 5187,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/build_evidence_manifest.py",
+      "sha256": "ab1d357be7dbfc00b901b1579ee118da3a7299cd9ac9aaa315c3f0491b97e982"
+    },
+    "haiku_committed_patch_repair": {
+      "bytes": 76897,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/haiku-committed-patch-repair.json",
+      "sha256": "ae7baa2d393bb6b003dd04e2bd38f15f8cb4aa3429a5a094f43da74725ab92c7"
+    },
+    "haiku_committed_patch_repair_script": {
+      "bytes": 6996,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/repair_haiku_committed_patches.py",
+      "sha256": "a23a871788807a535b6b018330801679641f197221e62125e6494e95ec2d9226"
+    },
+    "haiku_pilot_cohort_index": {
+      "bytes": 7049,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/pilot-haiku-rank06-attempt-001/cohort-index.json",
+      "sha256": "58026663954b75f34f9ac2ad356e187c6b7fc46b8d7c2c5fdbba9dae6a948751"
+    },
+    "haiku_rank6_setup_retry_index": {
+      "bytes": 3163,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/pilot-haiku-rank06-T-attempt-002/cohort-index.json",
+      "sha256": "375504a8df085f2b6716061cb634f9ca19a698ca10dc5d690fef23fee1b5a33a"
+    },
+    "haiku_remaining_cohort_index": {
+      "bytes": 133147,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/haiku-remaining-attempt-001/cohort-index.json",
+      "sha256": "1268b9ade3c209ccf4e00042256fef80824810c57769636c5437b887132a4c1b"
+    },
+    "haiku_runner_adapter": {
+      "bytes": 2356,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/haiku_runner.py",
+      "sha256": "701323409e1a6973dce7a734ce8cdadc851725757397c957a39781e5fb5078b9"
+    },
+    "official_evaluation_status_lane_1": {
+      "bytes": 58593,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/snapshot-020/lane-1/evaluation-status.json",
+      "sha256": "b8c5825f0e78a95a870249a21d215f1f67d4f836a4571188c04232f7613fd8c1"
+    },
+    "official_evaluation_status_lane_2": {
+      "bytes": 58942,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/snapshot-020/lane-2/evaluation-status.json",
+      "sha256": "40d322e9f5160cf789ef05579562571f0b8f7150f794bbef5ffd97163c5b7549"
+    },
+    "official_evaluation_status_lane_3": {
+      "bytes": 59089,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/snapshot-020/lane-3/evaluation-status.json",
+      "sha256": "010918922ef8e3c0eae489191518aeb2d77dab0289fa3e950e15b10e7bf41ba7"
+    },
+    "official_evaluation_status_lane_4": {
+      "bytes": 59440,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/snapshot-020/lane-4/evaluation-status.json",
+      "sha256": "0da5738fe48ce00b145b9706f6d804b31f41bdfdda83ef7cc33ecbc2a9cb870d"
+    },
+    "prompt_input_builder": {
+      "bytes": 7805,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/prepare_inputs.py",
+      "sha256": "634bf635d110017b7288914cbe799576fa61357ddce19a5d399fd1108b0e650b"
+    },
+    "rank15_evaluator_cleanup_race_receipt": {
+      "bytes": 7217,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/superseded-evaluator-cleanup-race/rank-15-A-spark-5494cfa6587f/evaluation-receipt.json",
+      "sha256": "09e78ba61c8a50527c1cb49863c724e7941e4a77a367c051a842bb5c5fc6f075"
+    },
+    "rank15_serial_evaluator_retry_status": {
+      "bytes": 7534,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/evaluation/official-swebench-4.1.0-verified/rank15-serial-retry-attempt-001/evaluation-status.json",
+      "sha256": "44dce8abef8067dac25bec5f4cac9e45057b861a2d813d3de831735e0ee0c72d"
+    },
+    "results_builder": {
+      "bytes": 28447,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/build_weaker_results.py",
+      "sha256": "93bc0274cab18b41efa3271e32d9c0e65661933fa7121edf20fcb26cdc4ba1dc"
+    },
+    "run_manifest": {
+      "bytes": 60203,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/run-manifest.json",
+      "sha256": "47417d0d2e187dd422b1b0f3dc974e909b35e3ad3a1cd518ad28c9cb2f925599"
+    },
+    "spark_pilot_cohort_index": {
+      "bytes": 5926,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/pilot-spark-rank06-attempt-001/cohort-index.json",
+      "sha256": "abe5ed6ebfc7b0e8603784b55308e22f11177cbc227c566e60821226bc494466"
+    },
+    "spark_provider_model_entry": {
+      "bytes": 30196,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/spark-provider-model-entry.json",
+      "sha256": "16b6106e02600f817a5ddad0f5df9a8554c058613a32dabbf99dbc98e0dbf08a"
+    },
+    "spark_provider_native_base_instructions": {
+      "bytes": 11987,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/spark-provider-native-base-instructions.bin",
+      "sha256": "8e789aee2e8bb52735f236a7501cd8dd88dea60fc121cc6431433fc53c41d46e"
+    },
+    "spark_remaining_cohort_index": {
+      "bytes": 105318,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/spark-remaining-attempt-001/cohort-index.json",
+      "sha256": "b756fbe80747a9b14bb136782a610e7993a935c6069448dc77e4e7b6dff56d7a"
+    },
+    "spark_runner_adapter": {
+      "bytes": 641,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/spark_runner.py",
+      "sha256": "2d4646be1289c90625bea982195f1416a7c6b7d1b9c444fb866185804bf21d69"
+    },
+    "transcript_audit": {
+      "bytes": 300371,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/transcript-audit.json",
+      "sha256": "3ff92742d8abaff03a8182789fb4dacf0410c0209ca93f93326fa3687cf415b2"
+    },
+    "transcript_auditor": {
+      "bytes": 16652,
+      "path_relative_to_evidence_root": "weaker-models-haiku-spark-attempt-001/audit_transcripts.py",
+      "sha256": "92a235292030bba4561e46a679021f1e709fa69efc8bf09f00329f2e383a4e03"
+    }
+  },
+  "models": {
+    "haiku": {
+      "context_window": 200000,
+      "cost_basis": "provider receipt",
+      "model": "claude-haiku-4-5-20251001",
+      "surface": "logged-in Claude CLI"
+    },
+    "spark": {
+      "cost_basis": "unavailable: App Server exposes no episode cost and Spark has no published API rate",
+      "effective_context_window": 121600,
+      "model": "gpt-5.3-codex-spark",
+      "nominal_context_window": 128000,
+      "surface": "Codex App Server"
+    }
+  },
+  "paid_provider_episode_count": 120,
+  "schema_version": "issue836-weaker-model-evidence-manifest-v1",
+  "stock_evaluator_model_calls": 0,
+  "superseded_canonical_cells": 0,
+  "superseded_evaluator_cleanup_race_attempts": 1,
+  "zero_spend_setup_failures": 1
+}

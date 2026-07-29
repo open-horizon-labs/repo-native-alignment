@@ -55,8 +55,9 @@ use model::{
 };
 use task_context::{
     ContextRole as TaskRole, EvidenceCandidate as TaskEvidenceCandidate, ExactCandidate,
-    ExactResolution, RetrievalLane as TaskLane, SelectionPolicy as TaskSelectionPolicy,
-    SelectionReason as TaskSelectionReason, SourceAnchor, TaskFacet,
+    ExactReferenceKind, ExactResolution, RetrievalLane as TaskLane,
+    SelectionPolicy as TaskSelectionPolicy, SelectionReason as TaskSelectionReason, SourceAnchor,
+    TaskFacet,
 };
 
 /// When impact results exceed this node-count threshold, render a
@@ -5311,6 +5312,17 @@ async fn projected_fused_candidates(
         final_scores = result.score_evidence;
         product_score_audit = result.product_score_audit;
         final_orders = result.order_evidence;
+        let exact_references = ordinary_qualified_reference_order(query, params, ctx);
+        if !exact_references.is_empty() {
+            let lexical = final_orders
+                .entry(EvidenceChannel::ExactLexical)
+                .or_default();
+            let mut merged = exact_references;
+            merged.append(lexical);
+            let mut seen = BTreeSet::new();
+            merged.retain(|id| seen.insert(id.clone()));
+            *lexical = merged;
+        }
         let mut matches = result.matches;
         // Fuse the union of bounded per-channel observations. The legacy flat
         // list is still retained for legacy rendering, but it must not evict a
@@ -5432,6 +5444,49 @@ async fn projected_fused_candidates(
     fuse_ranked_channels(policy, &channels)
         .map(|fused| (fused, capabilities, product_score_audit))
         .map_err(|error| error.to_string())
+}
+
+fn ordinary_qualified_reference_order(
+    query: &str,
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Vec<String> {
+    let Ok(task) = task_context::parse_task(query) else {
+        return Vec::new();
+    };
+    let references = task
+        .exact_references
+        .into_iter()
+        .filter(|reference| reference.kind == ExactReferenceKind::QualifiedName)
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return Vec::new();
+    }
+    let candidates = ctx
+        .graph_state
+        .nodes
+        .iter()
+        .filter(|node| projected_node_passes(node, params, ctx))
+        .map(|node| ExactCandidate {
+            evidence_id: node.stable_id(),
+            display: node.id.name.clone(),
+            match_keys: BTreeSet::from([
+                node.id.name.clone(),
+                node.signature.clone(),
+                node.stable_id(),
+            ]),
+            source_file: node.id.file.to_string_lossy().replace('\\', "/"),
+            source_line: u32::try_from(node.line_start).ok(),
+        })
+        .collect::<Vec<_>>();
+
+    task_context::resolve_exact_references(&references, &candidates)
+        .into_iter()
+        .filter_map(|resolution| match resolution.resolution {
+            ExactResolution::Hit(candidate) => Some(candidate.evidence_id),
+            ExactResolution::Ambiguous(_) | ExactResolution::Miss => None,
+        })
+        .collect()
 }
 
 fn resolve_projected_entry_nodes<'a>(
@@ -7141,6 +7196,18 @@ async fn flat_code_symbol_search<'a>(
     .matches
 }
 
+fn dedupe_nodes_preserving_order<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+    limit: usize,
+) -> Vec<&'a Node> {
+    let mut seen = BTreeSet::new();
+    nodes
+        .into_iter()
+        .filter(|node| seen.insert(node.stable_id()))
+        .take(limit)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn flat_code_symbol_search_with_diagnostics<'a>(
     query_str: &str,
@@ -7374,15 +7441,16 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
                     }
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
                     // node_passes_filters already handles the path/name split check.
-                    let found: Vec<_> = results
-                        .iter()
-                        .filter(|r| r.kind.starts_with("code:"))
-                        .filter_map(|result| {
-                            graph_state.node_by_stable_id(&result.id, node_index_map)
-                        })
-                        .filter(|node| node_passes_filters(node))
-                        .take(rerank_over_fetch)
-                        .collect();
+                    let found = dedupe_nodes_preserving_order(
+                        results
+                            .iter()
+                            .filter(|r| r.kind.starts_with("code:"))
+                            .filter_map(|result| {
+                                graph_state.node_by_stable_id(&result.id, node_index_map)
+                            })
+                            .filter(|node| node_passes_filters(node)),
+                        rerank_over_fetch,
+                    );
                     order_evidence
                         .insert(channel, found.iter().map(|node| node.stable_id()).collect());
                     found
@@ -7563,6 +7631,11 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // For path/name queries use only the name part for ranking.
         let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
         sort_symbol_text_matches(&mut matches, sort_key, &text_terms, &graph_state.index);
+        // Match the bounded semantic over-fetch contract before cross-encoder
+        // inference. Without this truncation, a missing embedding generation
+        // sends every lexical match through the reranker even when the caller
+        // requested only a handful of results.
+        matches.truncate(rerank_over_fetch);
     }
 
     // Cross-encoder reranking: re-score the top candidates using a cross-encoder
@@ -8143,6 +8216,31 @@ async fn search_traversal(
     }
     // Remove empty groups after filtering
     merged_groups.retain(|_, ids| !ids.is_empty());
+
+    // An explicit traversal limit applies to rendered, displayable neighbors,
+    // not only to entry-node resolution. Preserve the established edge-kind
+    // and traversal ordering while taking at most `limit` visible nodes across
+    // all groups. Hidden structural nodes do not consume the caller's budget.
+    if let Some(limit) = params.limit {
+        let mut remaining = limit;
+        for ids in merged_groups.values_mut() {
+            ids.retain(|id| {
+                let displayable = gs
+                    .node_by_stable_id(id, node_index_map)
+                    .map(|node| !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind))
+                    .unwrap_or(true);
+                if !displayable {
+                    return true;
+                }
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                true
+            });
+        }
+        merged_groups.retain(|_, ids| !ids.is_empty());
+    }
 
     // Count total displayable results
     let total_count: usize = merged_groups
@@ -8980,6 +9078,34 @@ mod tests {
     }
 
     #[test]
+    fn embedding_candidates_are_deduplicated_before_reranking() {
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let deduplicated = dedupe_nodes_preserving_order(
+            vec![&first, &first, &second, &first, &second],
+            usize::MAX,
+        );
+        let ids: Vec<_> = deduplicated.iter().map(|node| node.stable_id()).collect();
+
+        assert_eq!(ids, vec![first.stable_id(), second.stable_id()]);
+    }
+
+    #[test]
+    fn embedding_candidate_limit_counts_unique_nodes_not_duplicate_rows() {
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let third = make_node("third", NodeKind::Function, "src/third.rs");
+        let limited =
+            dedupe_nodes_preserving_order(vec![&first, &first, &first, &second, &third], 3);
+        let ids: Vec<_> = limited.iter().map(|node| node.stable_id()).collect();
+
+        assert_eq!(
+            ids,
+            vec![first.stable_id(), second.stable_id(), third.stable_id()]
+        );
+    }
+
+    #[test]
     fn test_search_params_default() {
         let p = SearchParams::default();
         assert!(p.query.is_none());
@@ -9347,6 +9473,45 @@ mod tests {
         assert!(result.contains("## Graph neighbors"));
         assert!(result.contains("callee"));
         assert!(!result.contains("Unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn explicit_limit_bounds_displayable_traversal_results() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let first = make_node("first", NodeKind::Function, "src/first.rs");
+        let second = make_node("second", NodeKind::Function, "src/second.rs");
+        let third = make_node("third", NodeKind::Function, "src/third.rs");
+        let graph = make_graph_state_with_edges(
+            vec![caller.clone(), first.clone(), second.clone(), third.clone()],
+            vec![
+                make_edge(&caller, &first, crate::graph::EdgeKind::Calls),
+                make_edge(&caller, &second, crate::graph::EdgeKind::Calls),
+                make_edge(&caller, &third, crate::graph::EdgeKind::Calls),
+            ],
+        );
+        let repository = PathBuf::from("/tmp/limited-traversal-fixture");
+        let ctx = make_search_context(&graph, &repository);
+        let unrestricted = SearchParams {
+            node: Some(caller.stable_id()),
+            mode: Some("neighbors".into()),
+            edge_types: Some(vec!["calls".into()]),
+            compact: true,
+            ..Default::default()
+        };
+        let params = SearchParams {
+            limit: Some(2),
+            ..unrestricted.clone()
+        };
+
+        let result = search(&params, &ctx).await;
+        let unrestricted_result = search(&unrestricted, &ctx).await;
+
+        assert!(result.contains("2 result(s)"), "{result}");
+        assert_eq!(result.matches("- **function**").count(), 2, "{result}");
+        assert!(
+            unrestricted_result.contains("3 result(s)"),
+            "{unrestricted_result}"
+        );
     }
 
     #[tokio::test]
@@ -12978,6 +13143,124 @@ mod tests {
             capability.capability == "task_exact_reference_resolution"
                 && capability.state == CapabilityState::Ready
         }));
+    }
+
+    #[tokio::test]
+    async fn task_bare_filename_pins_a_file_representative_with_multiple_graph_records() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        std::fs::write(
+            repository.path().join("src/app.py"),
+            "def render_app():\n    return True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.path().join("src/languages.rs"),
+            "const py: bool = true;\n",
+        )
+        .unwrap();
+
+        let mut module = make_node("app", NodeKind::Module, "src/app.py");
+        module.line_start = 1;
+        module.line_end = 2;
+        let module_id = module.stable_id();
+        let mut function = make_node("render_app", NodeKind::Function, "src/app.py");
+        function.line_start = 2;
+        function.line_end = 2;
+        let mut extension_symbol = make_node("py", NodeKind::Const, "src/languages.rs");
+        extension_symbol.line_start = 1;
+        extension_symbol.line_end = 1;
+
+        let graph = make_graph_state(vec![module, function, extension_symbol]);
+        let ctx = make_search_context(&graph, repository.path());
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let params = SearchParams {
+            query: Some("Fix app.py behavior and add a regression test".into()),
+            context_mode: Some("task".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+        let output = task_records(&params, &ctx, &edge_index).await.unwrap();
+
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == module_id)
+        );
+        assert!(output.capabilities.iter().any(|capability| {
+            capability.capability == "task_exact_reference_resolution"
+                && capability.state == CapabilityState::Ready
+        }));
+
+        let rendered = projected_search(&params, &ctx).await;
+        assert!(rendered.contains(&module_id), "output was:\n{rendered}");
+        assert!(
+            rendered.contains("task_exact_reference_resolution: ready"),
+            "output was:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_search_pins_unique_dotted_reference_before_candidate_truncation() {
+        let repository = tempfile::tempdir().unwrap();
+        let source_path = repository.path().join("django/contrib/admin/checks.py");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            "def _check_list_display(self, obj):\n    pass\n",
+        )
+        .unwrap();
+
+        let mut nodes = (0..30)
+            .map(|index| {
+                let mut node = make_node(
+                    &format!("decoy_{index}"),
+                    NodeKind::Function,
+                    "django/contrib/admin/checks.py",
+                );
+                node.signature = format!(
+                    "fn decoy_{index}(django admin contrib checks _check_list_display behavior regression test)"
+                );
+                node.line_start = 1;
+                node.line_end = 1;
+                node
+            })
+            .collect::<Vec<_>>();
+        let mut target = make_node(
+            "_check_list_display",
+            NodeKind::Function,
+            "django/contrib/admin/checks.py",
+        );
+        target.signature = "def _check_list_display(self, obj):".into();
+        target.line_start = 1;
+        target.line_end = 2;
+        let target_id = target.stable_id();
+        nodes.push(target);
+
+        let graph = make_graph_state(nodes);
+        let ctx = make_search_context(&graph, repository.path());
+        let output = projected_search(
+            &SearchParams {
+                query: Some(
+                    "Fix behavior in django.admin.contrib.checks._check_list_display and add a regression test"
+                        .into(),
+                ),
+                limit: Some(10),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(output.contains(&target_id), "output was:\n{output}");
+        assert!(
+            output.contains("selected_records: 10"),
+            "output was:\n{output}"
+        );
     }
 
     #[tokio::test]

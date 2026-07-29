@@ -1472,6 +1472,100 @@ class RnaWrapperTests(unittest.TestCase):
 
 
 class RunnerAndVerifierTests(unittest.TestCase):
+    @staticmethod
+    def episode_identities(
+        case_count: int,
+    ) -> tuple[select_cases.ExpectedEpisodeIdentity, ...]:
+        return tuple(
+            select_cases.ExpectedEpisodeIdentity(rank, f"repo__repo-{rank}", arm)
+            for rank in range(1, case_count + 1)
+            for arm in (
+                ("A", "T") if rank % 2 == 1 else ("T", "A")
+            )
+        )
+
+    def aggregate_fixture(
+        self,
+        root: Path,
+        *,
+        case_count: int,
+        legacy: bool,
+    ) -> tuple[
+        dict[str, int | float],
+        tuple[select_cases.ExpectedEpisodeIdentity, ...],
+        dict[Path, dict[str, object]],
+    ]:
+        dimensions: dict[str, int | float] = {
+            "case_count": case_count,
+            "episode_count": case_count * 2,
+            "max_parallel_cases": 2,
+            "per_episode_budget_usd": 6.0,
+            "maximum_budget_usd": case_count * 12.0,
+        }
+        registration = root / "registration.json"
+        registration.write_bytes(canonical({
+            "schema_version": (
+                verify_selector.registration_contract
+                .LEGACY_REGISTRATION_SCHEMA
+                if legacy
+                else verify_selector.registration_contract
+                .CURRENT_REGISTRATION_SCHEMA
+            ),
+        }))
+        selection = root / "selection.json"
+        selection.write_text("{}\n")
+        manifest = root / "run-manifest.json"
+        manifest.write_bytes(canonical({
+            "schema_version": run_selector.RUN_SCHEMA,
+            "registration": ref(registration),
+            "selection": ref(selection),
+        }))
+        identities = self.episode_identities(case_count)
+        invocation = {
+            "schema_version": "issue827-selector-invocation-v1",
+            "run_manifest": ref(manifest),
+            "models_authorized": case_count * 2,
+            "execution_episode_keys": [
+                {"case_id": case_id, "rank": rank, "arm": arm}
+                for rank, case_id, arm in identities
+            ],
+        }
+        if legacy:
+            invocation["parallel_cases"] = case_count
+        else:
+            invocation["case_count"] = case_count
+            invocation["max_parallel_cases"] = 2
+        (root / "invocation-start.json").write_bytes(canonical(invocation))
+
+        receipt_results: dict[Path, dict[str, object]] = {}
+        contract_refs = {
+            "run_manifest": ref(manifest),
+            "registration": ref(registration),
+            "selection": ref(selection),
+        }
+        for rank, case_id, arm in identities:
+            path = (
+                root
+                / f"rank-{rank:02d}-{case_id}"
+                / arm
+                / "episode-receipt.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_bytes(canonical(contract_refs))
+            receipt_results[path] = {
+                "rank": rank,
+                "case_id": case_id,
+                "arm": arm,
+                "evidence_complete": True,
+                "policy_compliant": True,
+                "evaluator_authorized": True,
+                "token_ledger": {"provider_total_tokens": 10},
+                "timing_ledger": {
+                    "combined_pre_evaluator_wall_seconds": 1.5
+                },
+            }
+        return dimensions, identities, receipt_results
+
     def test_registered_gateway_python_must_match_invoking_interpreter(self):
         with tempfile.TemporaryDirectory() as tmp:
             wrong_python = Path(tmp) / "python"
@@ -2219,6 +2313,106 @@ class RunnerAndVerifierTests(unittest.TestCase):
         self.assertEqual(code, 0)
         execute.assert_not_called()
 
+    def test_runner_records_case_count_separately_from_parallel_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identities = self.episode_identities(20)
+            dimensions = {
+                "case_count": 20,
+                "episode_count": 40,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 240.0,
+            }
+            cases = tuple(
+                SimpleNamespace(
+                    rank=rank,
+                    case_id=f"repo__repo-{rank}",
+                    arm_order=(
+                        ("A", "T") if rank % 2 == 1 else ("T", "A")
+                    ),
+                )
+                for rank in range(1, 21)
+            )
+            prepared = SimpleNamespace(
+                output_root=root / "output",
+                manifest_ref={"path": "/registered/run-manifest.json"},
+                registration={"schema_version": "current"},
+                selection={"schema_version": "current"},
+                cases=cases,
+            )
+            observed_workers: list[int] = []
+            real_executor = run_selector.ThreadPoolExecutor
+
+            class RecordingExecutor(real_executor):
+                def __init__(self, max_workers, *args, **kwargs):
+                    observed_workers.append(max_workers)
+                    super().__init__(max_workers, *args, **kwargs)
+
+            def execute_case(_prepared, case):
+                return (
+                    [
+                        {
+                            "episode_receipt": {
+                                "path": (
+                                    f"/evidence/rank-{case.rank:02d}/"
+                                    f"{arm}/episode-receipt.json"
+                                )
+                            },
+                            "authorization_requested": False,
+                        }
+                        for arm in case.arm_order
+                    ],
+                    [],
+                )
+
+            with (
+                mock.patch.object(
+                    run_selector,
+                    "experiment_dimensions",
+                    return_value=dimensions,
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "expected_episode_identities",
+                    return_value=identities,
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "ThreadPoolExecutor",
+                    RecordingExecutor,
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "execute_case",
+                    side_effect=execute_case,
+                ),
+            ):
+                code = run_selector.execute(prepared)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(observed_workers, [2])
+            invocation = json.loads(
+                (prepared.output_root / "invocation-start.json").read_bytes()
+            )
+            result = json.loads(
+                (prepared.output_root / "invocation-result.json").read_bytes()
+            )
+            self.assertEqual(invocation["case_count"], 20)
+            self.assertEqual(invocation["max_parallel_cases"], 2)
+            self.assertEqual(invocation["models_authorized"], 40)
+            self.assertNotIn("parallel_cases", invocation)
+            self.assertTrue(result["all_authorized_episodes_recorded"])
+            self.assertNotIn("all_four_episodes_recorded", result)
+
+    def test_runner_cli_help_is_count_neutral(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit):
+            run_selector.parser().parse_args(["run", "--help"])
+        help_text = stdout.getvalue()
+        self.assertIn("all registered paid Claude episodes", help_text)
+        self.assertNotIn("four", help_text.lower())
+
     def test_tampered_ref_and_missing_run_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2229,7 +2423,10 @@ class RunnerAndVerifierTests(unittest.TestCase):
             with self.assertRaises(run_selector.FailClosed):
                 run_selector.check_ref(frozen, "tampered")
             aggregate = verify_selector.verify_run(root)
-            self.assertIn("expected_four_episode_receipts_found_0", aggregate["errors"])
+            self.assertIn(
+                "expected_episode_receipts_unknown_found_0",
+                aggregate["errors"],
+            )
 
     def test_reordered_actor_actions_are_detected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2264,30 +2461,129 @@ class RunnerAndVerifierTests(unittest.TestCase):
             result = verify_selector.verify_episode(receipt)
             self.assertIn("actor_sequence_not_contiguous", result["errors"])
 
-    def test_evidence_aggregator_sums_registered_efficiency_fields(self):
+    def test_aggregate_accepts_exact_current_and_legacy_identity_sets(self):
+        for case_count, legacy in ((20, False), (2, True)):
+            with self.subTest(case_count=case_count, legacy=legacy), \
+                 tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                dimensions, identities, results = self.aggregate_fixture(
+                    root,
+                    case_count=case_count,
+                    legacy=legacy,
+                )
+
+                def verify(path):
+                    return results[path]
+
+                with (
+                    mock.patch.object(
+                        verify_selector.registration_contract,
+                        "validate_registration",
+                    ),
+                    mock.patch.object(
+                        run_selector,
+                        "validate_authoritative_selection",
+                    ),
+                    mock.patch.object(
+                        run_selector,
+                        "experiment_dimensions",
+                        return_value=dimensions,
+                    ),
+                    mock.patch.object(
+                        run_selector,
+                        "expected_episode_identities",
+                        return_value=identities,
+                    ),
+                    mock.patch.object(
+                        verify_selector,
+                        "verify_episode",
+                        side_effect=verify,
+                    ),
+                ):
+                    aggregate = verify_selector.verify_run(root)
+
+                self.assertEqual(aggregate["errors"], [])
+                self.assertTrue(
+                    aggregate["all_expected_episodes_verifier_clean"]
+                )
+                self.assertNotIn("all_four_verifier_clean", aggregate)
+                self.assertEqual(
+                    aggregate["expected_case_count"],
+                    case_count,
+                )
+                self.assertEqual(
+                    aggregate["expected_episode_count"],
+                    case_count * 2,
+                )
+                self.assertEqual(aggregate["max_parallel_cases"], 2)
+                self.assertEqual(
+                    aggregate["by_arm"]["A"]["episodes"],
+                    case_count,
+                )
+                self.assertEqual(
+                    aggregate["by_arm"]["T"][
+                        "combined_pre_evaluator_wall_seconds"
+                    ],
+                    case_count * 1.5,
+                )
+
+    def test_aggregate_rejects_wrong_identity_with_complete_unique_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paths = []
-            for case in (1, 2):
-                for arm in ("A", "T"):
-                    path = root / f"rank-{case:02d}-repo__repo-{case}" / arm / "episode-receipt.json"
-                    path.parent.mkdir(parents=True)
-                    path.write_text("{}")
-                    paths.append(path)
-            results = []
-            for index, path in enumerate(paths):
-                arm = path.parent.name
-                results.append({
-                    "case_id": path.parents[1].name, "arm": arm, "evidence_complete": True,
-                    "policy_compliant": True, "evaluator_authorized": True,
-                    "token_ledger": {"provider_total_tokens": 10 + index},
-                    "timing_ledger": {"combined_pre_evaluator_wall_seconds": 1.5},
-                })
-            with mock.patch.object(verify_selector, "verify_episode", side_effect=results):
+            dimensions, identities, results = self.aggregate_fixture(
+                root,
+                case_count=20,
+                legacy=False,
+            )
+            last_path = sorted(results)[-1]
+            results[last_path] = {
+                **results[last_path],
+                "rank": 21,
+                "case_id": "repo__repo-21",
+            }
+
+            def verify(path):
+                return results[path]
+
+            with (
+                mock.patch.object(
+                    verify_selector.registration_contract,
+                    "validate_registration",
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "validate_authoritative_selection",
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "experiment_dimensions",
+                    return_value=dimensions,
+                ),
+                mock.patch.object(
+                    run_selector,
+                    "expected_episode_identities",
+                    return_value=identities,
+                ),
+                mock.patch.object(
+                    verify_selector,
+                    "verify_episode",
+                    side_effect=verify,
+                ),
+            ):
                 aggregate = verify_selector.verify_run(root)
-            self.assertTrue(aggregate["all_four_verifier_clean"])
-            self.assertEqual(aggregate["by_arm"]["A"]["episodes"], 2)
-            self.assertEqual(aggregate["by_arm"]["T"]["combined_pre_evaluator_wall_seconds"], 3.0)
+
+            self.assertEqual(len(aggregate["episodes"]), 40)
+            self.assertNotIn(
+                "duplicate_registered_episode_identity",
+                aggregate["errors"],
+            )
+            self.assertIn(
+                "registered_episode_identity_set_mismatch",
+                aggregate["errors"],
+            )
+            self.assertFalse(
+                aggregate["all_expected_episodes_verifier_clean"]
+            )
 
 
 class CheckoutHygieneTests(unittest.TestCase):
@@ -2372,7 +2668,7 @@ class CheckoutHygieneTests(unittest.TestCase):
                     str(checkout), commit, tree, "arm prelaunch"
                 )
 
-    def test_model_checkout_preflight_rejects_tracked_symlink(self):
+    def test_model_checkout_preflight_allows_tracked_internal_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout, _, _ = self.fixture(Path(tmp).resolve())
             (checkout / "tracked-link.py").symlink_to("tracked.py")
@@ -2394,9 +2690,41 @@ class CheckoutHygieneTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 check=True,
             ).stdout.decode().strip()
+            self.assertEqual(
+                run_selector.verify_model_checkout(
+                    str(checkout), commit, tree, "arm"
+                ),
+                checkout,
+            )
+
+    def test_model_checkout_preflight_rejects_tracked_escaping_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp).resolve()
+            checkout, _, _ = self.fixture(parent)
+            outside = parent / "outside.py"
+            outside.write_text("outside")
+            (checkout / "tracked-link.py").symlink_to("../outside.py")
+            subprocess.run(
+                ["git", "-C", str(checkout), "add", "tracked-link.py"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "commit", "-qm", "tracked link"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
+            tree = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD^{tree}"],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.decode().strip()
             with self.assertRaisesRegex(
                 run_selector.FailClosed,
-                "private-tree audit failed: private_tree_contains_symlink",
+                "private-tree audit failed: private_tree_symlink_escapes_root",
             ):
                 run_selector.verify_model_checkout(
                     str(checkout), commit, tree, "arm"

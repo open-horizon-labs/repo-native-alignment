@@ -1,0 +1,154 @@
+{
+  "canonical_t2_cell_count": 40,
+  "evidence_root_environment_variable": "ISSUE836_EVIDENCE_ROOT",
+  "external_artifacts": {
+    "canonical_official_evaluation_status": {
+      "bytes": 84257,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/canonical-selection-attempt-003/evaluation-status.json",
+      "sha256": "e5e05457d4fbc5d924fe7e7b011827c9caa92640744b8a3ce3503912b74333af"
+    },
+    "canonical_prompt_review": {
+      "bytes": 181157,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/canonical-selection-attempt-003/prompt-review.json",
+      "sha256": "2149bbb6c4e9597ad547960febcb2750573bfbb0740a91d5cbf1b5b38a952c8a"
+    },
+    "canonical_selection_builder": {
+      "bytes": 11031,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/build_t2_canonical_selection.py",
+      "sha256": "89c5c5e58b7e3fc592e29c9ebb0cec41d764aa49b4132d06684d7a475d061e4c"
+    },
+    "canonical_selection_manifest": {
+      "bytes": 3350,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/canonical-selection-attempt-003/selection-manifest.json",
+      "sha256": "fb350390cdcecfc5a6881d15cd74057f734dab08452f587ff836161539c07ab1"
+    },
+    "canonical_transcript_audit": {
+      "bytes": 100757,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/canonical-selection-attempt-003/transcript-audit.json",
+      "sha256": "67f5db61abfe0c1760ae77028ea923736c4fff08ffde12f13b440bc3b325b221"
+    },
+    "global_prompt_reviewer": {
+      "bytes": 19629,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/review_all_t2_inputs.py",
+      "sha256": "dc8f11973830d42f640f07a504aa270830d8a4cf6ccb66e2d8b848039046699a"
+    },
+    "graph_projection_wrapper": {
+      "bytes": 16996,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/rna_tool_projection.py",
+      "sha256": "c510b97d81a91ca094e2ad8b0e31618b26db4262f7793d98e00ea9479cdc8f53"
+    },
+    "original_evaluation_launcher_index": {
+      "bytes": 4596,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/evaluation/official-swebench-4.1.0-verified/launcher-index.json",
+      "sha256": "cb712e04aa5a4d6e9d2ed70291363022e06a2b7300ad7ad64e909e762fc3d624"
+    },
+    "original_evaluator_manifest": {
+      "bytes": 13471,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/evaluator-manifest.json",
+      "sha256": "baad899c1ee8d535ea207ab66b2c3f1fa4e3281d38f697a852e173b7d0553ed7"
+    },
+    "original_luna_cohort_index": {
+      "bytes": 44887,
+      "path_relative_to_evidence_root": "t2-luna-cohort-attempt-003/cohort-index.json",
+      "sha256": "2b4fc901f11de4a5cad61fc1bf0f196e8adfef1b32d9b98dbc617759974069e8"
+    },
+    "original_official_evaluation_status": {
+      "bytes": 85302,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/evaluation/official-swebench-4.1.0-verified/evaluation-status.json",
+      "sha256": "98606af350d1827f23372f5b399b2886fed4389072aacc0964fde2eec5152c76"
+    },
+    "original_prompt_build_index": {
+      "bytes": 90447,
+      "path_relative_to_evidence_root": "t2-unfiltered-inputs-attempt-002/build-index.json",
+      "sha256": "48d3464e0ad9a9dcd7a2b242cc15b54eee46eda4c0cca11016183764327841d0"
+    },
+    "original_prompt_review": {
+      "bytes": 129160,
+      "path_relative_to_evidence_root": "t2-unfiltered-prompt-review-attempt-001/prompt-review.json",
+      "sha256": "ac379c4133b776446376c576797d0425a96ac9809a1f13d50b81715159189e0d"
+    },
+    "original_sonnet_cohort_index": {
+      "bytes": 58775,
+      "path_relative_to_evidence_root": "t2-sonnet-cohort-attempt-001/cohort-index.json",
+      "sha256": "383a2af2d846969a1b4e6aede21ed924e0d5518dfa54feb90a554fef9753c2c3"
+    },
+    "original_transcript_audit": {
+      "bytes": 99272,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/transcript-audit.json",
+      "sha256": "82f5d5ee9480e861142698a982b7b1c2af4a8c90d0925c3b65b5e523b9a0ad9b"
+    },
+    "prompt_builder": {
+      "bytes": 40861,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/build_inputs.py",
+      "sha256": "d30e4640cbcbbe6aa8064bf19eba3f5d37c29659eb8e38b3a6ff8fb6f633189a"
+    },
+    "prompt_contract": {
+      "bytes": 362,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/prompt-contract-v2.json",
+      "sha256": "c8083a3eebb2a9e4abd1163b87bd46cb6f395e9509bfbe79afa35e12bdfd186c"
+    },
+    "rank20_replacement_evaluator_manifest": {
+      "bytes": 1710,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/evaluation/rank20-replacement-attempt-001/evaluator-manifest.json",
+      "sha256": "68651133bfa91334e26321b418d7546919a154c8088b0f121b6d63abfbef70a5"
+    },
+    "rank20_replacement_inputs_manifest": {
+      "bytes": 20055,
+      "path_relative_to_evidence_root": "t2-unfiltered-inputs-rank20-replacement-attempt-001/inputs/inputs-manifest.json",
+      "sha256": "0df0d54ea7ee5a5ea7a11d1aee7f995f340799707ed3e190d7224d16e4277008"
+    },
+    "rank20_replacement_luna_receipt": {
+      "bytes": 24933,
+      "path_relative_to_evidence_root": "t2-luna-rank20-replacement-attempt-001/rank-20-pytest-dev__pytest-7205/case/T/episode-receipt.json",
+      "sha256": "5f7d68ae398c3ab626b20d3227a77468eb2c930ce845421a4bbfa7bbb72250a6"
+    },
+    "rank20_replacement_official_evaluation_status": {
+      "bytes": 4830,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/evaluation/rank20-replacement-attempt-001/official-swebench-4.1.0-verified/evaluation-status.json",
+      "sha256": "df70aba4c5c334b61a1a74c8e60ebc82cab8536770a2573f0f111c03c8e5e4c7"
+    },
+    "rank20_replacement_prompt_review": {
+      "bytes": 8339,
+      "path_relative_to_evidence_root": "t2-unfiltered-inputs-rank20-replacement-attempt-001/rank20-prompt-review.json/prompt-review.json",
+      "sha256": "e9d399b4b98fa70d0f0b20d28838bdcdd0ae2e3b25bb7de18ef94663c0cdba97"
+    },
+    "rank20_replacement_sonnet_receipt": {
+      "bytes": 9220,
+      "path_relative_to_evidence_root": "t2-sonnet-rank20-replacement-attempt-001/rank-20-pytest-dev__pytest-7205/T/episode-receipt.json",
+      "sha256": "19834d944de2f70190488adc3b335445ed0485df56d58879db531c837cc747f6"
+    },
+    "repaired_global_prompt_review": {
+      "bytes": 128931,
+      "path_relative_to_evidence_root": "t2-canonical-prompt-review-attempt-002/prompt-review.json",
+      "sha256": "0e8b26d5a946384794ec0a9947e0f429f72ccfbced90d7c1582637d04c036039"
+    },
+    "report_builder": {
+      "bytes": 31947,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/build_t2_results.py",
+      "sha256": "9bcefda9b1bec76bad9b0e813dbe56ae3d180a0794d1ca5f3bc8aa346bdc5759"
+    },
+    "transcript_auditor": {
+      "bytes": 12765,
+      "path_relative_to_evidence_root": "t2-unfiltered-harness-attempt-001/audit_t2_cohorts.py",
+      "sha256": "b75ab92ba6eac497eae345b935610b5dcd16c48690841e77ea17e42b84deba00"
+    }
+  },
+  "paid_model_calls_to_build_review_package": 0,
+  "paid_t2_episode_count": 42,
+  "pricing": {
+    "long_context_input_threshold_tokens": 272000,
+    "luna_basis": "published standard API-equivalent estimate, not App Server billing",
+    "model_url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "pricing_url": "https://developers.openai.com/api/docs/pricing",
+    "rates_usd_per_million_tokens": {
+      "cache_write": 1.25,
+      "cached_input": 0.1,
+      "output": 6.0,
+      "uncached_input": 1.0
+    },
+    "web_search_usd_per_call": 0.01
+  },
+  "schema_version": "issue836-t2-unfiltered-evidence-manifest-v2",
+  "stock_evaluator_model_calls": 0,
+  "superseded_harness_bug_episode_count": 2
+}

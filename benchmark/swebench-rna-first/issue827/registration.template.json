@@ -1,7 +1,7 @@
 {
-  "schema_version": "issue827-treatment-registration-v1",
-  "issue": 827,
-  "classification": "fresh_preregistered_hermetic_selector",
+  "schema_version": "issue836-treatment-registration-v4",
+  "issue": 836,
+  "classification": "preregistered_hermetic_pre_model_v3_cohort_successor",
   "published_before_selection": true,
   "fresh_case_claim": true,
   "prior_model_calls": 0,
@@ -15,7 +15,7 @@
     "local_cache_only": true
   },
   "selector": {
-    "algorithm_version": "issue827-selector-v1",
+    "algorithm_version": "issue836-selector-v4",
     "seed": "rna-first-sonnet-hermetic-selector-v1",
     "ranking": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
     "population_rows": 500,
@@ -23,17 +23,74 @@
     "eligible_rows": 419,
     "excluded_ids_sha256": "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b",
     "exclusions_file_sha256": "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79",
-    "selected_case_count": 2,
-    "episode_count": 4,
+    "selected_case_count": 20,
+    "episode_count": 40,
     "counterbalance": {
-      "rank_1_arm_order": [
+      "odd_rank_arm_order": [
         "A",
         "T"
       ],
-      "rank_2_arm_order": [
+      "even_rank_arm_order": [
         "T",
         "A"
-      ]
+      ],
+      "a_first_case_count": 10,
+      "t_first_case_count": 10
+    },
+    "prefix_lineage": {
+      "ranks_1_through_7_9_through_11_and_13_through_20": "exact_v3_carry_forward",
+      "rank_8": "exact_v3_pre_model_rank_21_replacement_carry_forward",
+      "rank_12": "pre_model_replacement_from_s2_rank_22",
+      "outcomes_inspected_for_replacement": false
+    },
+    "pre_model_v3_supersession": {
+      "schema_version": "issue836-pre-model-cohort-supersession-v2",
+      "superseded_registration_schema": "issue836-treatment-registration-v3",
+      "superseded_registration_path": "benchmark/swebench-rna-first/issue836-v3/registration.json",
+      "superseded_registration_sha256": "6f319f138336aef194cd91962edb75f3db172816cab7e19344d20d39217c5e92",
+      "superseded_registration_commit": "a82f0b67e251f2cec6ae968e3b78f74e902ee16d",
+      "superseded_selection_schema": "issue836-fresh-cohort-selection-v3",
+      "superseded_selection_path": "benchmark/swebench-rna-first/issue836-v3/selection.json",
+      "superseded_selection_sha256": "dfd7ce6f4fcdd6e9b7baf81eb3faca76f32cde86485f3876d6d139154cedac80",
+      "superseded_selection_commit": "654890f249ebf7fcdc08a1f79bc1f507a65a5e07",
+      "superseded_selection_digest": "6df1b24382d28624bcda6e4fe07d39126ba4f7f6064af5ef89bc9cde9f5549f4",
+      "dataset_arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e",
+      "exclusions_sha256": "0f9e9fb4e46303624670c79a3cd4b127188c6a166e674a5759248e308a9c9c79",
+      "excluded_ids_sha256": "6823c44cc1d7f4f1485690f12de9e8d08060a2e66b394ce2c28469893791886b",
+      "superseded_rank": 12,
+      "excluded_instance_id": "sympy__sympy-24539",
+      "excluded_repo": "sympy/sympy",
+      "excluded_base_commit": "193e3825645d93c73e31cdceb6d742cc6919624d",
+      "excluded_base_tree": "8ffa903a7635c0fc04fae14e0a22cb4104cb4682",
+      "excluded_ranking_sha256": "048fbc0780ad22b1233b61da02326ea68265cb2fb914a76fa6b2cad0964aef7a",
+      "excluded_problem_statement_sha256": "c45c55bcffb2b526d21ed6b0c8d19976455280d6ce9343f7f2d62d96c3d3e037",
+      "replacement_instance_id": "psf__requests-1724",
+      "replacement_source_rank": 22,
+      "replacement_method": "next_deterministic_eligible_source_rank",
+      "preserved_arm_order": [
+        "T",
+        "A"
+      ],
+      "reason_code": "old_shipped_rna_binary_exact_rank12_mjs_incompatibility",
+      "reason": "the registered old shipped RNA binary rejects the exact v3 rank-12 tree solely because bin/test_pyodide.mjs is unsupported; all other 19 v3 trees were audited mjs-free",
+      "incompatible_rna_binary_sha256": "d4d264da1a012b38814f0f2e9ee92f77c5aab3ed558a0f23abcd830d4b78ca94",
+      "rejected_tree_mjs_paths": [
+        "bin/test_pyodide.mjs"
+      ],
+      "other_v3_tree_count": 19,
+      "other_v3_tree_mjs_path_count": 0,
+      "replacement_repo": "psf/requests",
+      "replacement_base_commit": "1ba83c47ce7b177efe90d5f51f7760680f72eda0",
+      "replacement_base_tree": "c8e845adc2051eac27d5998697d3e83e920ef2c8",
+      "replacement_ranking_sha256": "0bf45a8589083de3e3dea6a230493a8279e01e379418593d1bfee686469d4761",
+      "replacement_problem_statement_sha256": "eacde5d201658474274cce4558b5d2b8ae74d9fcc2ad6ddc76aaf003b2160b8a",
+      "replacement_source_verification_manifest_path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/replacement-v4-rank12/cache-setup/source-cache-verification.json",
+      "replacement_source_verification_manifest_sha256": "3c85713bf402204ffccc6e55f0b4edbf8a3aee8e2b1b93a3b177f0ed0c755207",
+      "detected_during_pre_model_cache_preparation": true,
+      "prior_model_calls": 0,
+      "prior_provider_requests": 0,
+      "prior_official_evaluator_invocations": 0,
+      "case_replacement_after_model_start": false
     },
     "case_ids_external_until_authoritative_selection": true,
     "problem_statements_inspected_by_human_before_selection": false,
@@ -41,9 +98,9 @@
     "case_replacement_after_model_start": false
   },
   "episode_design": {
-    "schema_version": "issue827-episode-design-v1",
-    "case_count": 2,
-    "episode_count": 4,
+    "schema_version": "issue836-episode-design-v4",
+    "case_count": 20,
+    "episode_count": 40,
     "arms": {
       "A": "control",
       "T": "rna_first_treatment"
@@ -263,9 +320,9 @@
     "model_output_delivery": "none"
   },
   "selection_rule": {
-    "schema_version": "issue827-selection-rule-v1",
-    "episode_count": 4,
-    "pair_count": 2,
+    "schema_version": "issue836-selection-rule-v4",
+    "episode_count": 40,
+    "pair_count": 20,
     "arms": [
       "A",
       "T"

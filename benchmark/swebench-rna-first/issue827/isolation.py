@@ -72,10 +72,25 @@ SECRET_ENV_PARTS = (
 NON_SECRET_ENV_NAMES = frozenset({"RNA_EMBEDDING_TOKENIZER_SHA256"})
 NATIVE_TOOLS = {"Read", "Edit", "Write", "Glob", "Grep"}
 WRITE_TOOLS = {"Edit", "Write"}
+NATIVE_TOOL_STATE_SCHEMA = "issue827-native-tool-state-v1"
 TRACE_TERMINAL_RE = re.compile(
     r"(?:^|\s)\+\+\+ (?:exited with [0-9]+|killed by [A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$"
 )
+TRACE_QUOTED_VALUE_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 TRACE_ABSOLUTE_PATH_RE = re.compile(r'"(/(?:[^"\\]|\\.)*)"')
+TRACE_TIMESTAMP_PREFIX = r"^(?:[0-9]+(?:\.[0-9]+)?\s+)?"
+TRACE_SYSCALL_RE = re.compile(
+    TRACE_TIMESTAMP_PREFIX + r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\("
+)
+TRACE_EXECVE_RE = re.compile(TRACE_TIMESTAMP_PREFIX + r"execve(?:at)?\(")
+TRACE_MISSING_SELINUX_STATFS_RE = re.compile(
+    TRACE_TIMESTAMP_PREFIX
+    + r'statfs\("(?P<path>/sys/fs/selinux|/selinux)",'
+    + r".*\)\s*=\s*-1 ENOENT(?:\s+\([^\n]*\))?\s*$"
+)
+TRACE_BLOCKED_RESULT_RE = re.compile(
+    r"\)\s*=\s*-1\s+E[A-Z0-9_]+(?:\s+\([^\n]*\))?\s*$"
+)
 TRACE_INET_RE = re.compile(
     r"(?:socket\(\s*AF_INET6?\b|sa_family=AF_INET6?\b|"
     r"connect\([^,\n]+,\s*\{[^}\n]*AF_INET6?\b)"
@@ -83,6 +98,49 @@ TRACE_INET_RE = re.compile(
 TRACE_LANDLOCK_SUCCESS_RE = re.compile(
     r"\blandlock_restrict_self\([^)]*\)\s*=\s*0(?:\s|$)"
 )
+TRACE_OPEN_WRITE_FLAG_RE = re.compile(
+    r"\b(?:O_WRONLY|O_RDWR|O_CREAT|O_EXCL|O_TRUNC|O_APPEND|O_TMPFILE)\b"
+)
+TRACE_MUTATING_PATH_SYSCALLS = frozenset(
+    {
+        "chmod",
+        "chown",
+        "creat",
+        "fchmodat",
+        "fchmodat2",
+        "fchownat",
+        "lchown",
+        "link",
+        "linkat",
+        "lremovexattr",
+        "lsetxattr",
+        "mkdir",
+        "mkdirat",
+        "mknod",
+        "mknodat",
+        "mount",
+        "move_mount",
+        "open_tree",
+        "pivot_root",
+        "removexattr",
+        "rename",
+        "renameat",
+        "renameat2",
+        "rmdir",
+        "setxattr",
+        "symlink",
+        "symlinkat",
+        "truncate",
+        "umount",
+        "umount2",
+        "unlink",
+        "unlinkat",
+        "utime",
+        "utimensat",
+        "utimes",
+    }
+)
+TRACE_EXECUTION_PATH_SYSCALLS = frozenset({"execve", "execveat"})
 
 
 def canonical(value: object) -> bytes:
@@ -102,6 +160,63 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_native_tool_state(value: object) -> int:
+    """Validate hook bookkeeping and return unresolved reservation count.
+
+    Reservations serialize native tools only while the model process is
+    alive. Once that process exits, valid unresolved entries record omitted
+    completion hooks; they do not represent active work or contamination.
+    """
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "active"}
+        or value.get("schema_version") != NATIVE_TOOL_STATE_SCHEMA
+        or not isinstance(value.get("active"), dict)
+    ):
+        raise IsolationViolation("native_tool_state_schema_mismatch")
+    active = value["active"]
+    for tool_use_id, item in active.items():
+        if (
+            not isinstance(tool_use_id, str)
+            or not tool_use_id
+            or not isinstance(item, dict)
+            or set(item) != {"tool_name", "access", "post_pending"}
+            or item.get("tool_name") not in NATIVE_TOOLS
+            or item.get("access")
+            != (
+                "exclusive"
+                if item.get("tool_name") in WRITE_TOOLS
+                else "read"
+            )
+            or type(item.get("post_pending")) is not bool
+        ):
+            raise IsolationViolation("native_tool_state_entry_invalid")
+    return len(active)
+
+
+def trace_path_effect(line: str) -> str:
+    """Classify a path-bearing syscall as read, write, execute, or unknown."""
+
+    matched = TRACE_SYSCALL_RE.match(line)
+    if matched is None:
+        return "unknown"
+    syscall = matched.group("name")
+    if syscall in {"open", "openat", "openat2"}:
+        first_value = TRACE_QUOTED_VALUE_RE.search(line)
+        flag_region = line[first_value.end() :] if first_value else line
+        return (
+            "write"
+            if TRACE_OPEN_WRITE_FLAG_RE.search(flag_region)
+            else "read"
+        )
+    if syscall in TRACE_MUTATING_PATH_SYSCALLS:
+        return "write"
+    if syscall in TRACE_EXECUTION_PATH_SYSCALLS:
+        return "execute"
+    return "read"
 
 
 def is_secret_env_name(name: object) -> bool:
@@ -421,8 +536,12 @@ def validate_effective_path(
     return result
 
 
-def audit_private_tree(root: Path) -> dict[str, object]:
-    """Reject aliases, links, hardlinks, and special files in an episode tree."""
+def audit_private_tree(
+    root: Path,
+    *,
+    allow_internal_symlinks: bool = False,
+) -> dict[str, object]:
+    """Reject aliases, escaping links, hardlinks, and special files."""
 
     if not root.is_absolute():
         raise IsolationViolation("private_tree_root_not_absolute", path=str(root))
@@ -446,6 +565,7 @@ def audit_private_tree(root: Path) -> dict[str, object]:
 
     regular_files = 0
     directories = 0
+    links = 0
     total_bytes = 0
     digest = hashlib.sha256()
     stack = [root]
@@ -458,9 +578,33 @@ def audit_private_tree(root: Path) -> dict[str, object]:
                 metadata = entry.stat(follow_symlinks=False)
                 relative = path.relative_to(root).as_posix()
                 if entry.is_symlink():
-                    raise IsolationViolation(
-                        "private_tree_contains_symlink", path=relative
+                    if not allow_internal_symlinks:
+                        raise IsolationViolation(
+                            "private_tree_contains_symlink", path=relative
+                        )
+                    target = os.readlink(path)
+                    try:
+                        resolved_target = path.resolve(strict=True)
+                    except OSError as exc:
+                        raise IsolationViolation(
+                            "private_tree_symlink_target_unavailable",
+                            path=relative,
+                            errno=exc.errno,
+                        ) from exc
+                    if (
+                        os.path.isabs(target)
+                        or "\x00" in target
+                        or not resolved_target.is_relative_to(root)
+                    ):
+                        raise IsolationViolation(
+                            "private_tree_symlink_escapes_root",
+                            path=relative,
+                        )
+                    links += 1
+                    digest.update(
+                        canonical(["symlink", relative, target])
                     )
+                    continue
                 if stat.S_ISDIR(metadata.st_mode):
                     stack.append(path)
                     digest.update(canonical(["directory", relative]))
@@ -496,7 +640,7 @@ def audit_private_tree(root: Path) -> dict[str, object]:
         "regular_files": regular_files,
         "bytes": total_bytes,
         "tree_digest": digest.hexdigest(),
-        "links": 0,
+        "links": links,
         "hardlinks": 0,
         "special_files": 0,
     }
@@ -842,7 +986,7 @@ def parse_strace_directory(
     allowed_path_prefixes: Sequence[str],
     forbidden_path_fragments: Sequence[str],
 ) -> dict[str, object]:
-    """Parse mandatory ``strace -ff`` outputs and retain denied attempts."""
+    """Parse mandatory ``strace -ff`` outputs and classify path effects."""
 
     if trace_directory.is_symlink() or not trace_directory.is_dir():
         raise IsolationViolation("trace_directory_invalid")
@@ -866,6 +1010,7 @@ def parse_strace_directory(
         value for value in forbidden_path_fragments if isinstance(value, str) and value
     )
     violations: list[dict[str, object]] = []
+    observations: list[dict[str, object]] = []
     receipts: list[dict[str, object]] = []
     landlock_enforced = False
     for path in files:
@@ -892,9 +1037,12 @@ def parse_strace_directory(
             if TRACE_LANDLOCK_SUCCESS_RE.search(line):
                 landlock_enforced = True
             if TRACE_INET_RE.search(line):
-                violations.append(
+                # Docker's network=none boundary is the enforcement layer.
+                # Socket use (including loopback tests) is retained as
+                # telemetry but cannot reach the host or provider network.
+                observations.append(
                     {
-                        "code": "network_syscall_attempt",
+                        "code": "network_syscall_observed",
                         "trace": path.name,
                         "line": line_number,
                         "line_sha256": sha256_bytes(line.encode("utf-8")),
@@ -902,9 +1050,12 @@ def parse_strace_directory(
                 )
             for fragment in forbidden:
                 if fragment in line:
-                    violations.append(
+                    # A fragment in argv or diagnostic text is not itself an
+                    # access. Actual path-bearing syscalls are classified
+                    # separately below.
+                    observations.append(
                         {
-                            "code": "forbidden_fragment_attempt",
+                            "code": "forbidden_fragment_observed",
                             "trace": path.name,
                             "line": line_number,
                             "line_sha256": sha256_bytes(
@@ -912,12 +1063,43 @@ def parse_strace_directory(
                             ),
                         }
                     )
-            for encoded_path in TRACE_ABSOLUTE_PATH_RE.findall(line):
+            # Only argv[0] is a filesystem access made by execve/execveat.
+            # Later quoted strings are arguments and may contain shell source,
+            # diagnostic text, or other absolute-looking data.
+            if TRACE_EXECVE_RE.match(line):
+                quoted_values = TRACE_QUOTED_VALUE_RE.findall(line)
+                executable = (
+                    quoted_values[0].replace(r"\/", "/")
+                    if quoted_values
+                    else ""
+                )
+                encoded_paths = [executable] if executable.startswith("/") else []
+            else:
+                encoded_paths = TRACE_ABSOLUTE_PATH_RE.findall(line)
+            missing_selinux_probe = TRACE_MISSING_SELINUX_STATFS_RE.search(
+                line
+            )
+            blocked_result = TRACE_BLOCKED_RESULT_RE.search(line) is not None
+            path_effect = trace_path_effect(line)
+            for encoded_path in encoded_paths:
                 attempted = encoded_path.replace(r"\/", "/")
+                if (
+                    missing_selinux_probe is not None
+                    and attempted == missing_selinux_probe.group("path")
+                ):
+                    # libselinux/coreutils probe these conventional locations
+                    # with statfs. ENOENT proves that no filesystem object was
+                    # reached; the probe is not an undeclared data access.
+                    continue
                 if any(fragment in attempted for fragment in forbidden):
-                    violations.append(
+                    destination = observations if blocked_result else violations
+                    destination.append(
                         {
-                            "code": "forbidden_path_attempt",
+                            "code": (
+                                "blocked_forbidden_path_attempt"
+                                if blocked_result
+                                else "forbidden_path_access"
+                            ),
                             "trace": path.name,
                             "line": line_number,
                             "path_sha256": sha256_bytes(
@@ -930,9 +1112,27 @@ def parse_strace_directory(
                     or attempted.startswith(prefix.rstrip("/") + "/")
                     for prefix in allowed
                 ):
-                    violations.append(
+                    nonfatal = blocked_result or path_effect == "read"
+                    destination = observations if nonfatal else violations
+                    destination.append(
                         {
-                            "code": "undeclared_path_attempt",
+                            "code": (
+                                "blocked_undeclared_path_attempt"
+                                if blocked_result
+                                else (
+                                    "undeclared_read_observed"
+                                    if path_effect == "read"
+                                    else (
+                                        "undeclared_path_write"
+                                        if path_effect == "write"
+                                        else (
+                                            "undeclared_path_execution"
+                                            if path_effect == "execute"
+                                            else "undeclared_path_access"
+                                        )
+                                    )
+                                )
+                            ),
                             "trace": path.name,
                             "line": line_number,
                             "path_sha256": sha256_bytes(
@@ -955,12 +1155,21 @@ def parse_strace_directory(
         for item in violations
     }
     violations = [unique[key] for key in sorted(unique)]
+    unique_observations = {
+        canonical(item): item
+        for item in observations
+    }
+    observations = [
+        unique_observations[key] for key in sorted(unique_observations)
+    ]
     report = {
         "schema_version": TRACE_SCHEMA,
         "complete": True,
         "tracer": "strace-ff",
         "landlock_enforced": True,
         "members": receipts,
+        "observations": observations,
+        "observation_count": len(observations),
         "violations": violations,
         "violation_count": len(violations),
     }

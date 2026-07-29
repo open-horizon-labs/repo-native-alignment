@@ -1,0 +1,8 @@
+
+END HARNESS-EXECUTED RNA TOOL INTERACTION
+
+The ordinary coding tool surface remains available. Follow-up RNA graph traversal is available when it would help:
+
+__TRAVERSAL_WRAPPER__ --node '<STABLE_ID_FROM_THE_INJECTED_RESULT>' --mode neighbors
+
+Further RNA calls are optional, and the same wrapper supports --mode impact. Use the injected paths and graph context to avoid unnecessary broad Grep, Read, or sed discovery. Do not inspect the immutable RNA index, hidden tests, evaluator output, gold patches, or evidence from another arm. Produce one terminal patch and run relevant visible tests. There is no model retry or evaluator feedback.

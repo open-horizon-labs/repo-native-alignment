@@ -40,39 +40,63 @@ class RegistrationContractTests(unittest.TestCase):
             "producer_commit",
             "local_source_build_allowed",
         }:
-            value["rna_artifact"][key] = "0" * 64
+            value["rna_artifact"][key] = (
+                registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION[
+                    "incompatible_rna_binary_sha256"
+                ]
+                if key == "binary_sha256"
+                else "0" * 64
+            )
         value["qualification_closure"]["manifest_sha256"] = "0" * 64
         value["qualification_closure"]["archive_sha256"] = "0" * 64
         return value
 
-    def test_fresh_two_case_four_episode_design_is_frozen(self) -> None:
+    def test_issue836_twenty_case_forty_episode_design_is_frozen(self) -> None:
         value = self.registration
         self.assertEqual(value["schema_version"], run_selector.REGISTRATION_SCHEMA)
-        self.assertEqual(value["issue"], 827)
+        self.assertEqual(
+            value["schema_version"],
+            registration_contract.CURRENT_REGISTRATION_SCHEMA,
+        )
+        self.assertEqual(value["issue"], 836)
         self.assertTrue(value["published_before_selection"])
         self.assertTrue(value["fresh_case_claim"])
         self.assertEqual(value["prior_model_calls"], 0)
         self.assertEqual(value["prior_official_evaluator_invocations"], 0)
-        self.assertEqual(value["episode_design"]["case_count"], 2)
-        self.assertEqual(value["episode_design"]["episode_count"], 4)
+        self.assertEqual(value["episode_design"]["case_count"], 20)
+        self.assertEqual(value["episode_design"]["episode_count"], 40)
         self.assertTrue(value["episode_design"]["fresh_session_per_episode"])
         self.assertFalse(value["episode_design"]["resume_allowed"])
         self.assertFalse(value["episode_design"]["model_retry_allowed"])
         self.assertEqual(
             value["selector"]["counterbalance"],
-            {"rank_1_arm_order": ["A", "T"], "rank_2_arm_order": ["T", "A"]},
+            {
+                "odd_rank_arm_order": ["A", "T"],
+                "even_rank_arm_order": ["T", "A"],
+                "a_first_case_count": 10,
+                "t_first_case_count": 10,
+            },
+        )
+        self.assertEqual(
+            value["selector"]["prefix_lineage"],
+            registration_contract.FROZEN_V4_PREFIX_LINEAGE,
+        )
+        self.assertEqual(
+            value["selector"]["pre_model_v3_supersession"],
+            registration_contract.FROZEN_V4_PRE_MODEL_SUPERSESSION,
         )
 
     def test_selector_population_and_exclusions_are_exact(self) -> None:
         selector = self.registration["selector"]
         exclusions_path = HERE / "exclusions.json"
         exclusions = json.loads(exclusions_path.read_bytes())
-        self.assertEqual(selector["algorithm_version"], "issue827-selector-v1")
+        self.assertEqual(selector["algorithm_version"], "issue836-selector-v4")
         self.assertEqual(selector["seed"], select_cases.EXPECTED_SEED)
         self.assertEqual(
             (selector["population_rows"], selector["excluded_rows"], selector["eligible_rows"]),
             (500, 81, 419),
         )
+        self.assertGreaterEqual(selector["eligible_rows"], 20)
         self.assertEqual(
             selector["excluded_ids_sha256"],
             hashlib.sha256(
@@ -82,6 +106,82 @@ class RegistrationContractTests(unittest.TestCase):
         self.assertEqual(
             selector["exclusions_file_sha256"],
             hashlib.sha256(exclusions_path.read_bytes()).hexdigest(),
+        )
+
+    def test_current_and_historical_experiment_dimensions_are_authoritative(
+        self,
+    ) -> None:
+        self.assertEqual(
+            registration_contract.experiment_dimensions(self.registration),
+            {
+                "case_count": 20,
+                "episode_count": 40,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 240.0,
+            },
+        )
+        historical = json.loads(
+            (HERE.parent / "issue830" / "registration.json").read_bytes()
+        )
+        registration_contract.validate_registration(historical)
+        self.assertEqual(
+            registration_contract.experiment_dimensions(historical),
+            {
+                "case_count": 2,
+                "episode_count": 4,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 24.0,
+            },
+        )
+        issue836_v2 = json.loads(
+            (HERE.parent / "issue836" / "registration.json").read_bytes()
+        )
+        registration_contract.validate_registration(issue836_v2)
+        self.assertEqual(
+            registration_contract.experiment_dimensions(issue836_v2),
+            {
+                "case_count": 20,
+                "episode_count": 40,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 240.0,
+            },
+        )
+        self.assertEqual(
+            select_result.registered_selection_rule(issue836_v2)[
+                "schema_version"
+            ],
+            "issue836-selection-rule-v2",
+        )
+        self.assertEqual(
+            select_result.result_schema(issue836_v2),
+            select_result.ISSUE836_V2_RESULT_SCHEMA,
+        )
+        issue836_v3 = json.loads(
+            (HERE.parent / "issue836-v3" / "registration.json").read_bytes()
+        )
+        registration_contract.validate_registration(issue836_v3)
+        self.assertEqual(
+            registration_contract.experiment_dimensions(issue836_v3),
+            {
+                "case_count": 20,
+                "episode_count": 40,
+                "max_parallel_cases": 2,
+                "per_episode_budget_usd": 6.0,
+                "maximum_budget_usd": 240.0,
+            },
+        )
+        self.assertEqual(
+            select_result.registered_selection_rule(issue836_v3)[
+                "schema_version"
+            ],
+            "issue836-selection-rule-v3",
+        )
+        self.assertEqual(
+            select_result.result_schema(issue836_v3),
+            select_result.ISSUE836_V3_RESULT_SCHEMA,
         )
 
     def test_runtime_and_selection_rule_are_exact(self) -> None:
@@ -96,10 +196,17 @@ class RegistrationContractTests(unittest.TestCase):
         self.assertFalse(runtime["resume_allowed"])
         self.assertFalse(runtime["model_retry_allowed"])
         self.assertEqual(runtime["permission_mode"], "dontAsk")
-        self.assertEqual(
-            self.registration["selection_rule"],
-            select_result.REGISTERED_SELECTION_RULE,
+        expected_rule = json.loads(
+            json.dumps(select_result.REGISTERED_SELECTION_RULE)
         )
+        expected_rule.update(
+            {
+                "schema_version": "issue836-selection-rule-v4",
+                "episode_count": 40,
+                "pair_count": 20,
+            }
+        )
+        self.assertEqual(self.registration["selection_rule"], expected_rule)
 
     def test_isolation_identity_usage_and_evaluator_contracts_are_bound(self) -> None:
         isolation = self.registration["isolation"]
@@ -206,6 +313,75 @@ class RegistrationContractTests(unittest.TestCase):
                         changed,
                         require_resolved_hashes=False,
                     )
+
+    def test_v4_supersession_calls_and_old_binary_identity_fail_closed(
+        self,
+    ) -> None:
+        registration = self.resolved_registration()
+        registration_contract.validate_registration(registration)
+        for label, mutate in (
+            (
+                "rank",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"superseded_rank": 11}),
+            ),
+            (
+                "replacement",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update(
+                    {"replacement_instance_id": "psf__requests-9999"}
+                ),
+            ),
+            (
+                "source-rank",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_source_rank": 21}),
+            ),
+            (
+                "tree",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_base_tree": "f" * 40}),
+            ),
+            (
+                "problem",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_problem_statement_sha256": "f" * 64}),
+            ),
+            (
+                "ranking",
+                lambda value: value["selector"][
+                    "pre_model_v3_supersession"
+                ].update({"replacement_ranking_sha256": "f" * 64}),
+            ),
+            (
+                "model-call",
+                lambda value: value.update({"prior_model_calls": 1}),
+            ),
+            (
+                "evaluator-call",
+                lambda value: value.update(
+                    {"prior_official_evaluator_invocations": 1}
+                ),
+            ),
+            (
+                "binary",
+                lambda value: value["rna_artifact"].update(
+                    {"binary_sha256": "f" * 64}
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(registration))
+                mutate(changed)
+                with self.assertRaises(
+                    registration_contract.RegistrationContractError
+                ):
+                    registration_contract.validate_registration(changed)
 
     def test_resolved_registration_binds_every_live_source_byte(self) -> None:
         registration_contract.validate_registration(

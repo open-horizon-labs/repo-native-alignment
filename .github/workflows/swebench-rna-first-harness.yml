@@ -7,12 +7,14 @@ on:
     paths:
       - "benchmark/swebench-rna-first/issue827/**"
       - "benchmark/swebench-rna-first/issue830/**"
+      - "benchmark/swebench-rna-first/issue836*/**"
       - ".github/workflows/swebench-rna-first-harness.yml"
   push:
     branches: [main]
     paths:
       - "benchmark/swebench-rna-first/issue827/**"
       - "benchmark/swebench-rna-first/issue830/**"
+      - "benchmark/swebench-rna-first/issue836*/**"
       - ".github/workflows/swebench-rna-first-harness.yml"
   workflow_dispatch:
 
@@ -26,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Run hermetic selector tests
         env:
@@ -38,5 +41,9 @@ jobs:
           python3 benchmark/swebench-rna-first/issue827/test_evaluator_tools.py
           python3 -m unittest discover \
             -s benchmark/swebench-rna-first/issue830/tests \
+            -p 'test_*.py' \
+            -v
+          python3 -m unittest discover \
+            -s benchmark/swebench-rna-first/issue836-canonical/tests \
             -p 'test_*.py' \
             -v

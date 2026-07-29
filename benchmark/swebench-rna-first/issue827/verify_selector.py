@@ -441,14 +441,14 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
         errors.append("episode_receipt_schema_mismatch")
 
     _, manifest = load_ref_json(receipt.get("run_manifest"), "run_manifest", errors)
-    _, registration = load_ref_json(receipt.get("registration"), "registration", errors)
+    registration_path, registration = load_ref_json(
+        receipt.get("registration"),
+        "registration",
+        errors,
+    )
     _, selection = load_ref_json(receipt.get("selection"), "selection", errors)
     if isinstance(manifest, dict) and manifest.get("schema_version") != runner.RUN_SCHEMA:
         errors.append("run_manifest_schema_mismatch")
-    if isinstance(registration, dict) and registration.get("schema_version") != runner.REGISTRATION_SCHEMA:
-        errors.append("registration_schema_mismatch")
-    if isinstance(selection, dict) and selection.get("schema_version") != runner.SELECTION_SCHEMA:
-        errors.append("selection_schema_mismatch")
     if isinstance(registration, dict):
         try:
             registration_contract.validate_registration(
@@ -457,6 +457,23 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
             )
         except registration_contract.RegistrationContractError as exc:
             errors.append(f"registration_contract:{exc}")
+    expected_identities: tuple[tuple[int, str, str], ...] = ()
+    if isinstance(registration, dict) and isinstance(selection, dict):
+        try:
+            if registration_path is None:
+                raise runner.FailClosed(
+                    "registration path unavailable for selection binding"
+                )
+            runner.validate_authoritative_selection(
+                selection,
+                registration_path.read_bytes(),
+            )
+            expected_identities = runner.expected_episode_identities(
+                registration,
+                selection,
+            )
+        except (runner.FailClosed, OSError) as exc:
+            errors.append(f"selection_contract:{exc}")
     if isinstance(manifest, dict) and isinstance(registration, dict):
         try:
             runner.verify_rna_artifact(manifest, registration)
@@ -484,8 +501,11 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
     if case is not None:
         if receipt.get("base_commit") != case.get("base_commit") or receipt.get("base_tree") != case.get("base_tree"):
             errors.append("base_identity_mismatch")
-        selected_match = [item for item in (selection or {}).get("cases", []) if item.get("instance_id") == receipt.get("case_id")]
-        if len(selected_match) != 1 or arm not in selected_match[0].get("arm_order", []):
+        if (
+            receipt.get("rank"),
+            receipt.get("case_id"),
+            arm,
+        ) not in expected_identities:
             errors.append("selection_arm_mismatch")
 
     _, identity = load_ref_json(receipt.get("runtime_identity"), "runtime_identity", errors)
@@ -1170,15 +1190,171 @@ def verify_episode(receipt_path: Path) -> dict[str, Any]:
     return result
 
 
+def registered_run_contract(
+    output_root: Path,
+    errors: list[str],
+) -> tuple[
+    registration_contract.ExperimentDimensions | None,
+    tuple[tuple[int, str, str], ...],
+    dict[str, Any],
+]:
+    invocation_path = output_root / "invocation-start.json"
+    if not invocation_path.is_file() or invocation_path.is_symlink():
+        errors.append("invocation_start_missing_or_invalid")
+        return None, (), {}
+    try:
+        invocation = json.loads(invocation_path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"invocation_start_invalid_json:{exc}")
+        return None, (), {}
+    if not isinstance(invocation, dict):
+        errors.append("invocation_start_not_object")
+        return None, (), {}
+    if invocation.get("schema_version") != "issue827-selector-invocation-v1":
+        errors.append("invocation_start_schema_mismatch")
+
+    _, manifest = load_ref_json(
+        invocation.get("run_manifest"),
+        "aggregate_run_manifest",
+        errors,
+    )
+    if not isinstance(manifest, dict):
+        return None, (), {}
+    if manifest.get("schema_version") != runner.RUN_SCHEMA:
+        errors.append("aggregate_run_manifest_schema_mismatch")
+
+    registration_path, registration = load_ref_json(
+        manifest.get("registration"),
+        "aggregate_registration",
+        errors,
+    )
+    _, selection = load_ref_json(
+        manifest.get("selection"),
+        "aggregate_selection",
+        errors,
+    )
+    if not isinstance(registration, dict) or not isinstance(selection, dict):
+        return None, (), {}
+    try:
+        registration_contract.validate_registration(
+            registration,
+            source_root=runner.SOURCE,
+        )
+        if registration_path is None:
+            raise runner.FailClosed(
+                "aggregate registration path unavailable"
+            )
+        runner.validate_authoritative_selection(
+            selection,
+            registration_path.read_bytes(),
+        )
+        dimensions = runner.experiment_dimensions(registration)
+        expected_identities = runner.expected_episode_identities(
+            registration,
+            selection,
+        )
+    except (
+        OSError,
+        runner.FailClosed,
+        registration_contract.RegistrationContractError,
+    ) as exc:
+        errors.append(f"aggregate_contract:{exc}")
+        return None, (), {}
+
+    expected_keys = [
+        {"case_id": case_id, "rank": rank, "arm": arm}
+        for rank, case_id, arm in expected_identities
+    ]
+    if invocation.get("execution_episode_keys") != expected_keys:
+        errors.append("invocation_episode_identities_mismatch")
+    if invocation.get("models_authorized") != dimensions["episode_count"]:
+        errors.append("invocation_episode_count_mismatch")
+
+    if registration_contract.is_issue836_registration_schema(
+        registration.get("schema_version")
+    ):
+        if invocation.get("case_count") != dimensions["case_count"]:
+            errors.append("invocation_case_count_mismatch")
+        if (
+            invocation.get("max_parallel_cases")
+            != dimensions["max_parallel_cases"]
+        ):
+            errors.append("invocation_max_parallel_cases_mismatch")
+    else:
+        if (
+            "case_count" in invocation
+            and invocation.get("case_count") != dimensions["case_count"]
+        ):
+            errors.append("invocation_case_count_mismatch")
+        if (
+            "max_parallel_cases" in invocation
+            and invocation.get("max_parallel_cases")
+            != dimensions["max_parallel_cases"]
+        ):
+            errors.append("invocation_max_parallel_cases_mismatch")
+        if (
+            "parallel_cases" in invocation
+            and invocation.get("parallel_cases") != dimensions["case_count"]
+        ):
+            errors.append("legacy_invocation_case_count_mismatch")
+
+    return dimensions, expected_identities, {
+        "run_manifest": invocation.get("run_manifest"),
+        "registration": manifest.get("registration"),
+        "selection": manifest.get("selection"),
+    }
+
+
 def verify_run(output_root: Path) -> dict[str, Any]:
     receipt_paths = sorted(output_root.glob("rank-*/*/episode-receipt.json"))
     results = [verify_episode(path) for path in receipt_paths]
     errors: list[str] = []
-    if len(results) != 4:
-        errors.append(f"expected_four_episode_receipts_found_{len(results)}")
-    identities = [(item.get("case_id"), item.get("arm")) for item in results]
+    dimensions, expected_identities, contract_refs = registered_run_contract(
+        output_root,
+        errors,
+    )
+    expected_episode_count = (
+        dimensions["episode_count"] if dimensions is not None else None
+    )
+    if len(results) != expected_episode_count:
+        errors.append(
+            "expected_episode_receipts_"
+            f"{expected_episode_count if expected_episode_count is not None else 'unknown'}"
+            f"_found_{len(results)}"
+        )
+    identities: list[tuple[int, str, str]] = []
+    for item in results:
+        identity = (
+            item.get("rank"),
+            item.get("case_id"),
+            item.get("arm"),
+        )
+        if (
+            type(identity[0]) is not int
+            or not isinstance(identity[1], str)
+            or not isinstance(identity[2], str)
+        ):
+            errors.append("invalid_registered_episode_identity")
+            continue
+        identities.append(identity)
+    if len(identities) != len(results):
+        errors.append("registered_episode_identity_count_mismatch")
     if len(set(identities)) != len(identities):
-        errors.append("duplicate_case_arm_receipt")
+        errors.append("duplicate_registered_episode_identity")
+    if set(identities) != set(expected_identities):
+        errors.append("registered_episode_identity_set_mismatch")
+    for index, path in enumerate(receipt_paths):
+        try:
+            receipt = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        if any(
+            receipt.get(key) != value
+            for key, value in contract_refs.items()
+        ):
+            errors.append(f"episode_{index}_run_contract_ref_mismatch")
     by_arm: dict[str, dict[str, Any]] = {}
     for arm in ("A", "T"):
         selected = [item for item in results if item.get("arm") == arm]
@@ -1198,12 +1374,32 @@ def verify_run(output_root: Path) -> dict[str, Any]:
             ),
             "combined_pre_evaluator_wall_seconds": sum((item.get("timing_ledger") or {}).get("combined_pre_evaluator_wall_seconds", 0) for item in selected),
         }
+    all_expected_clean = (
+        dimensions is not None
+        and len(results) == dimensions["episode_count"]
+        and set(identities) == set(expected_identities)
+        and len(identities) == len(set(identities))
+        and all(
+            item.get("evidence_complete") is True
+            for item in results
+        )
+        and not errors
+    )
     return {
         "schema_version": "issue827-selector-evidence-aggregate-v1",
         "output_root": str(output_root.resolve()),
+        "expected_case_count": (
+            dimensions["case_count"] if dimensions is not None else None
+        ),
+        "expected_episode_count": expected_episode_count,
+        "max_parallel_cases": (
+            dimensions["max_parallel_cases"]
+            if dimensions is not None
+            else None
+        ),
         "episodes": results,
         "by_arm": by_arm,
-        "all_four_verifier_clean": len(results) == 4 and all(item.get("evidence_complete") is True for item in results),
+        "all_expected_episodes_verifier_clean": all_expected_clean,
         "official_evaluator_invoked": False,
         "errors": errors,
     }
@@ -1257,7 +1453,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         runner.atomic_write(target, runner.canonical(result))
     print(json.dumps(result, sort_keys=True, indent=2))
-    return 0 if result["all_four_verifier_clean"] and not result["errors"] else 2
+    return (
+        0
+        if result["all_expected_episodes_verifier_clean"]
+        and not result["errors"]
+        else 2
+    )
 
 
 if __name__ == "__main__":

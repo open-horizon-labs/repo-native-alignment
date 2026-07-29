@@ -1,0 +1,59 @@
+{
+  "schema_version": "issue836-cache-reserve-plan-v1",
+  "issue": 836,
+  "purpose": "Precompute reusable RNA caches for deterministic next-ranked cases without changing the frozen 20-case, 40-episode analysis population.",
+  "analysis_population_changed": false,
+  "eligible_for_frozen_v4_analysis": false,
+  "promotion_requires_separate_preregistration": true,
+  "ranking": {
+    "algorithm": "ascending SHA256(seed_utf8 || 0x00 || instance_id_utf8)",
+    "seed": "rna-first-sonnet-hermetic-selector-v1",
+    "source": {
+      "path": "/Users/muness/swebench-evidence/issue836-selector-20case-20260724/replacement-proposal/ranking-candidates.json",
+      "bytes": 6685,
+      "sha256": "9c0ad81f5aec7a9efbecca214a54cdc71df3d0e0342918a985ad69f92b816be2"
+    },
+    "source_assertions": {
+      "problem_statements_exposed": false,
+      "gold_or_outcomes_inspected": false,
+      "model_provider_evaluator_calls": 0
+    }
+  },
+  "reserved_source_ranks": {
+    "first": 23,
+    "last": 40,
+    "count": 18
+  },
+  "initial_cache_lanes": [
+    {
+      "source_rank": 23,
+      "instance_id": "sympy__sympy-13647",
+      "repo": "sympy/sympy",
+      "base_commit": "67e3c956083d0128a621f65ee86a7dacd4f9f19f",
+      "ranking_sha256": "0bf5b17d19978094dc49eb3011ccf9b760c76e9b6345b12ce577194c5cd112f1"
+    },
+    {
+      "source_rank": 24,
+      "instance_id": "django__django-12262",
+      "repo": "django/django",
+      "base_commit": "69331bb851c34f05bc77e9fc24020fe6908b9cd5",
+      "ranking_sha256": "0c1af3907a361370055e4e3731ffcf5b49b4ab3e282079bd18d40b52edee5a98"
+    },
+    {
+      "source_rank": 25,
+      "instance_id": "sympy__sympy-12481",
+      "repo": "sympy/sympy",
+      "base_commit": "c807dfe7569692cad24f02a08477b70c1679a4dd",
+      "ranking_sha256": "0c50056f6cd30fd87e50a1f87f6a4bb99c085c1758cf071b3f95ba9884db325b"
+    }
+  ],
+  "execution_policy": {
+    "model_provider_evaluator_calls": 0,
+    "credentials_accessed": false,
+    "preserve_every_attempt": true,
+    "reuse_requires_exact_commit_tree_binary_and_cache_receipts": true,
+    "memory_aware_max_concurrent_scans": 2,
+    "total_active_lanes": 3,
+    "trial_or_successor_preparation_preempts_cache_work": true
+  }
+}
