@@ -1,3 +1,12 @@
+---
+session: issue-839
+artifact_type: session
+updated: 2026-07-29
+status: in-progress
+outcomes:
+  - context-assembly
+---
+
 # Issue #839 — bounded warm graph traversal
 
 ## Reproduction

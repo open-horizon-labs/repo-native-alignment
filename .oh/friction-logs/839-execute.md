@@ -1,3 +1,10 @@
+---
+title: Issue #839 bounded warm graph traversal friction
+date: 2026-07-29
+issue: 839
+outcome: context-assembly
+---
+
 # Friction Log: #839 Bounded Warm Graph Traversal
 
 | Phase/Step | Tool | What happened | Workaround | Severity |

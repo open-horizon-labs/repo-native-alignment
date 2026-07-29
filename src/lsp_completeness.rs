@@ -1739,6 +1739,9 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
+                for temp_path in [&temp, &summary_temp, &summary_commit_temp] {
+                    let _ = fs::remove_file(temp_path);
+                }
                 return Err(error).with_context(|| {
                     format!(
                         "failed to invalidate LSP completeness sidecar {}",
@@ -5014,6 +5017,34 @@ mod tests {
 
         let error = load_summary(repo.path()).unwrap_err().to_string();
         assert!(error.contains("commit is missing"), "got: {error}");
+    }
+
+    #[test]
+    fn persist_report_cleans_temps_when_sidecar_invalidation_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let summary = summary_path(repo.path());
+        std::fs::create_dir_all(&summary).unwrap();
+        let report = report(vec![included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+
+        let error = persist_report(repo.path(), &report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to invalidate"), "got: {error}");
+
+        let parent = report_path(repo.path()).parent().unwrap().to_path_buf();
+        for name in [
+            format!(".lsp_completeness.json.tmp-{}", std::process::id()),
+            format!(".lsp_completeness_summary.json.tmp-{}", std::process::id()),
+            format!(
+                ".lsp_completeness_summary.commit.json.tmp-{}",
+                std::process::id()
+            ),
+        ] {
+            assert!(!parent.join(name).exists());
+        }
     }
 
     #[test]
