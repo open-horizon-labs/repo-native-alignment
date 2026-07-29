@@ -1,0 +1,1847 @@
+{
+  "aggregate": {
+    "A": {
+      "cache_creation_input_tokens": 441703.0,
+      "cache_read_input_tokens": 12273988.0,
+      "cases": 20,
+      "cost_usd": 8.5433404,
+      "direct_input_tokens": 21325.0,
+      "elapsed_seconds": 4025.1808847112115,
+      "output_tokens": 146071.0,
+      "resolved": 17,
+      "tool_calls": {
+        "by_type": {
+          "Bash": 333,
+          "Edit": 81,
+          "Grep": 47,
+          "Read": 71,
+          "Write": 7
+        },
+        "total": 539
+      },
+      "total_input_tokens": 12737016.0,
+      "unresolved": 3
+    },
+    "T_PD": {
+      "cache_creation_input_tokens": 438590.0,
+      "cache_read_input_tokens": 9981777.0,
+      "cases": 20,
+      "cost_usd": 7.3594781,
+      "direct_input_tokens": 83054.0,
+      "elapsed_seconds": 2330.37789021153,
+      "end_to_end_seconds": 2867.9024980841205,
+      "output_tokens": 110173.0,
+      "resolved": 17,
+      "rna_retrieval_seconds": 537.5246078725904,
+      "tool_calls": {
+        "by_type": {
+          "Bash": 223,
+          "Edit": 64,
+          "Glob": 1,
+          "Grep": 19,
+          "Read": 53,
+          "Write": 4
+        },
+        "total": 364
+      },
+      "total_input_tokens": 10503421.0,
+      "unresolved": 3
+    },
+    "T_PD_vs_A_total_delta_percent": {
+      "cache_creation_input_tokens": -0.7047722111916831,
+      "cache_read_input_tokens": -18.67535637153955,
+      "cost_usd": -13.857136021409149,
+      "direct_input_tokens": 289.4677608440797,
+      "elapsed_seconds": -42.10501448362304,
+      "end_to_end_seconds": -28.75096597578423,
+      "output_tokens": -24.575720026562426,
+      "tool_calls": -32.467532467532465,
+      "total_input_tokens": -17.5362502488809
+    },
+    "cases_with_lower_metric": {
+      "cache_creation_input_tokens": 11,
+      "cache_read_input_tokens": 12,
+      "cost_usd": 13,
+      "direct_input_tokens": 0,
+      "elapsed_seconds": 17,
+      "end_to_end_seconds": 13,
+      "output_tokens": 16,
+      "tool_calls": 17,
+      "total_input_tokens": 13
+    },
+    "efficacy_matches": 20,
+    "manifest_guided_first_action": 18,
+    "paired_case_median_delta_percent": {
+      "cache_creation_input_tokens": -3.7870357332211695,
+      "cache_read_input_tokens": -8.76891980539553,
+      "cost_usd": -10.825964797874644,
+      "direct_input_tokens": 391.55067155067155,
+      "elapsed_seconds": -47.15616627407378,
+      "end_to_end_seconds": -23.147369383263992,
+      "output_tokens": -25.81091375534993,
+      "tool_calls": -35.424710424710426,
+      "total_input_tokens": -7.7688821540316955
+    }
+  },
+  "cases": [
+    {
+      "A": {
+        "cache_creation_input_tokens": 17603,
+        "cache_read_input_tokens": 161128,
+        "cost_usd": 0.19518739999999998,
+        "direct_input_tokens": 780,
+        "elapsed_seconds": 199.56930591585115,
+        "episode_receipt": {
+          "bytes": 6918,
+          "sha256": "3c603a7d3cbb3a3fbe10b896d41d15762adf995265e781e00c1de39453f84e1d"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 2705,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 1,
+            "Grep": 2,
+            "Read": 2
+          },
+          "total": 13
+        },
+        "total_input_tokens": 179511
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 12815,
+        "cache_read_input_tokens": 162165,
+        "cost_usd": 0.15278550000000002,
+        "direct_input_tokens": 4184,
+        "elapsed_seconds": 35.296475750161335,
+        "end_to_end_seconds": 76.831227542134,
+        "episode_receipt": {
+          "bytes": 7291,
+          "sha256": "7330f7b01d85004172093be27789cf8fcbc579ea7eb801317e34d9e8d6c2af29"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "sympy/core/symbol.py",
+            "limit": 211,
+            "offset": 586
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 18063,
+          "sha256": "b9c69d558e2e0aebddcaba5c583189bcef235cde754262727dbd0d29bb29ad33"
+        },
+        "manifest_guidance_note": "RNA returned sympy/core/symbol.py:symbols; first action read that function.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3857,
+          "sha256": "3dd028cf82e47b27ea7bf62afb3d15cada146253e9f7702c3185d024ee316661"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 1548,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 154402,
+        "rna_retrieval_seconds": 41.53475179197267,
+        "rna_visible_bytes": 8056,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 5,
+            "Edit": 1,
+            "Read": 1
+          },
+          "total": 7
+        },
+        "total_input_tokens": 179164
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -27.199909106402316,
+        "cache_read_input_tokens": 0.6435877066679907,
+        "cost_usd": -21.723687082260415,
+        "direct_input_tokens": 436.4102564102564,
+        "elapsed_seconds": -82.31367514749779,
+        "end_to_end_seconds": -61.501480806607574,
+        "output_tokens": -42.77264325323475,
+        "tool_calls": -46.15384615384615,
+        "total_input_tokens": -0.1933029173699662
+      },
+      "instance_id": "sympy__sympy-23534",
+      "rank": 1
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 19666,
+        "cache_read_input_tokens": 507449,
+        "cost_usd": 0.37907270000000004,
+        "direct_input_tokens": 672,
+        "elapsed_seconds": 233.90979458298534,
+        "episode_receipt": {
+          "bytes": 6925,
+          "sha256": "7865926ceceef232461dd48330f2286c49fe4c90959f283998f44e7adb4a722e"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 7214,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 17,
+            "Edit": 6,
+            "Read": 6
+          },
+          "total": 29
+        },
+        "total_input_tokens": 527787
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 13457,
+        "cache_read_input_tokens": 201007,
+        "cost_usd": 0.1782611,
+        "direct_input_tokens": 3647,
+        "elapsed_seconds": 36.38029266707599,
+        "end_to_end_seconds": 70.48533962504007,
+        "episode_receipt": {
+          "bytes": 7278,
+          "sha256": "6c725b6b93d27fa36ac0d0cb309acdfd500b275adb8a986df1e3447b803932ed"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/db/models/deletion.py",
+            "limit": 70,
+            "offset": 260
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 17410,
+          "sha256": "d48814c81a8640142940b7ccbd60eee34dfc36d5e2b0433137a314dd55c6aea5"
+        },
+        "manifest_guidance_note": "RNA returned django/db/models/deletion.py:delete; first action read that function.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3889,
+          "sha256": "30b1b852c82db3a31b98774a8c4a61e930b834671c16a181d456b0a5679ec641"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 2248,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 367963,
+        "rna_retrieval_seconds": 34.10504695796408,
+        "rna_visible_bytes": 7888,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 5,
+            "Edit": 1,
+            "Grep": 2,
+            "Read": 1
+          },
+          "total": 9
+        },
+        "total_input_tokens": 218111
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -31.572256686667345,
+        "cache_read_input_tokens": -60.388728719536346,
+        "cost_usd": -52.97442944321762,
+        "direct_input_tokens": 442.7083333333333,
+        "elapsed_seconds": -84.44687075548298,
+        "end_to_end_seconds": -69.86644370719857,
+        "output_tokens": -68.83836983642917,
+        "tool_calls": -68.96551724137932,
+        "total_input_tokens": -58.674427373163795
+      },
+      "instance_id": "django__django-11179",
+      "rank": 2
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 17579,
+        "cache_read_input_tokens": 345247,
+        "cost_usd": 0.2935561,
+        "direct_input_tokens": 769,
+        "elapsed_seconds": 255.96687579201534,
+        "episode_receipt": {
+          "bytes": 6900,
+          "sha256": "ebbdf76661ac13be24672108969e14c53fb1db6a4d119d3765a72b250e201faa"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5589,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 15,
+            "Edit": 1,
+            "Grep": 2,
+            "Read": 2
+          },
+          "total": 20
+        },
+        "total_input_tokens": 363595
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 32522,
+        "cache_read_input_tokens": 1300151,
+        "cost_usd": 0.7592333,
+        "direct_input_tokens": 4522,
+        "elapsed_seconds": 651.4575696249958,
+        "end_to_end_seconds": 681.0187414579559,
+        "episode_receipt": {
+          "bytes": 7264,
+          "sha256": "14191c1646699bc4ac2a57df454968daf828ee16cbb9b0e2185bd48d5cb7efb7"
+        },
+        "first_tool": {
+          "input": {
+            "command": "grep -n \"__mul__\\|__rmul__\\|__add__\\|__radd__\\|_op_priority\\|class Poly\" sympy/polys/polytools.py | head -60"
+          },
+          "name": "Bash"
+        },
+        "input_manifest": {
+          "bytes": 17628,
+          "sha256": "37593eca7fc2b2f9f81e3a1065afe6fc6511949d1da32edfd652f7e619bfbe29"
+        },
+        "manifest_guidance_note": "RNA returned relevant Poly operations in polytools.py; first action searched that file. The model later chased pre-existing failures, edited an unrelated test, ran broad suites, and spent minutes polling a background test, producing the largest negative efficiency outlier.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3907,
+          "sha256": "393fc6d4b4b994b64cf8f4cb442e44b30f9dc4e72ea8b39c3da0d9071052a2bb"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 11304,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 120481,
+        "rna_retrieval_seconds": 29.5611718329601,
+        "rna_visible_bytes": 8114,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 34,
+            "Edit": 2,
+            "Read": 4
+          },
+          "total": 40
+        },
+        "total_input_tokens": 1337195
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 85.00483531486432,
+        "cache_read_input_tokens": 276.58574875379077,
+        "cost_usd": 158.63311987044386,
+        "direct_input_tokens": 488.036410923277,
+        "elapsed_seconds": 154.50854436115966,
+        "end_to_end_seconds": 166.05737142774458,
+        "output_tokens": 102.25442834138487,
+        "tool_calls": 100.0,
+        "total_input_tokens": 267.7704588896987
+      },
+      "instance_id": "sympy__sympy-13757",
+      "rank": 3
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 30982,
+        "cache_read_input_tokens": 817530,
+        "cost_usd": 0.594492,
+        "direct_input_tokens": 1881,
+        "elapsed_seconds": 154.17597504216246,
+        "episode_receipt": {
+          "bytes": 6927,
+          "sha256": "3199dee78957eb2e7bb8a4ace80ebbaf9601456b28a21c9f24ac2bbd704bfbcc"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 10768,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 14,
+            "Edit": 7,
+            "Grep": 4,
+            "Read": 9
+          },
+          "total": 34
+        },
+        "total_input_tokens": 850393
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 29251,
+        "cache_read_input_tokens": 768498,
+        "cost_usd": 0.5480293999999999,
+        "direct_input_tokens": 4881,
+        "elapsed_seconds": 124.07873791712336,
+        "end_to_end_seconds": 155.4732075841166,
+        "episode_receipt": {
+          "bytes": 7230,
+          "sha256": "8c34a3b28b26151a202c12196149b6319555e1c1a1f54d963cbee71b79ecb27a"
+        },
+        "first_tool": {
+          "input": {
+            "-n": true,
+            "output_mode": "content",
+            "pattern": "def find_ordering_name"
+          },
+          "name": "Grep"
+        },
+        "input_manifest": {
+          "bytes": 72849,
+          "sha256": "c574a526e8794443cd9a93957d2406ad2bc72194a723073e47c988e4ff76c19e"
+        },
+        "manifest_guidance_note": "Initial RNA manifest was mostly unrelated migration/test noise; first action independently searched compiler code.",
+        "manifest_guided_first_action": false,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3757,
+          "sha256": "60037b3bcb0b6d581dcae008d7bd0c2c1b2d38a50a1bdeaa791239b0b1b38986"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 9145,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 381578,
+        "rna_retrieval_seconds": 31.394469666993245,
+        "rna_visible_bytes": 8084,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 10,
+            "Edit": 5,
+            "Grep": 3,
+            "Read": 8
+          },
+          "total": 26
+        },
+        "total_input_tokens": 802630
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -5.587115099089794,
+        "cache_read_input_tokens": -5.997578070529522,
+        "cost_usd": -7.815513076710895,
+        "direct_input_tokens": 159.4896331738437,
+        "elapsed_seconds": -19.52135351620667,
+        "end_to_end_seconds": 0.8413973328849653,
+        "output_tokens": -15.072436849925706,
+        "tool_calls": -23.529411764705884,
+        "total_input_tokens": -5.616579628477657
+      },
+      "instance_id": "django__django-13033",
+      "rank": 4
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 31226,
+        "cache_read_input_tokens": 808276,
+        "cost_usd": 0.5984947999999999,
+        "direct_input_tokens": 1421,
+        "elapsed_seconds": 275.083339124918,
+        "episode_receipt": {
+          "bytes": 6932,
+          "sha256": "da5a4a160e3fcc84d2dcbf0358eda0dc1ae35d97bbc6cfa005279786124442af"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 11149,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 14,
+            "Edit": 14,
+            "Grep": 1,
+            "Read": 5
+          },
+          "total": 34
+        },
+        "total_input_tokens": 840923
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 30186,
+        "cache_read_input_tokens": 790255,
+        "cost_usd": 0.5421784999999998,
+        "direct_input_tokens": 4388,
+        "elapsed_seconds": 167.15831333282404,
+        "end_to_end_seconds": 177.47739237477072,
+        "episode_receipt": {
+          "bytes": 7295,
+          "sha256": "26e6533bcb83670e239f0f9b42d337d4725a39019b264264cf9ab46628684a03"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "xarray/core/weighted.py"
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 17990,
+          "sha256": "b4103171fd6674a4c003ff263c9002be4ffaccae3257024a74c08ce77ca3312f"
+        },
+        "manifest_guidance_note": "RNA's first record was xarray/core/weighted.py:_weighted_mean; first action read weighted.py.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3838,
+          "sha256": "e00649e1d8394ad65ff374e2081c97cb628d32c3e3dcc91d2585d84eafb08009"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 7976,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 35636,
+        "rna_retrieval_seconds": 10.31907904194668,
+        "rna_visible_bytes": 7872,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 16,
+            "Edit": 7,
+            "Read": 3
+          },
+          "total": 26
+        },
+        "total_input_tokens": 824829
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -3.330557868442964,
+        "cache_read_input_tokens": -2.229560199733754,
+        "cost_usd": -9.409655689573261,
+        "direct_input_tokens": 208.79662209711472,
+        "elapsed_seconds": -39.23357413626717,
+        "end_to_end_seconds": -35.482318580487885,
+        "output_tokens": -28.459951565162793,
+        "tool_calls": -23.529411764705884,
+        "total_input_tokens": -1.9138494249770788
+      },
+      "instance_id": "pydata__xarray-4075",
+      "rank": 5
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 37008,
+        "cache_read_input_tokens": 1078609,
+        "cost_usd": 0.7840357000000001,
+        "direct_input_tokens": 694,
+        "elapsed_seconds": 236.74767437507398,
+        "episode_receipt": {
+          "bytes": 6940,
+          "sha256": "9cae318e5a7c46103b7907d7af60d5690e4e3b41cac782f900f1aa5333d1e4a6"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 15847,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 24,
+            "Edit": 8,
+            "Grep": 5,
+            "Read": 6
+          },
+          "total": 43
+        },
+        "total_input_tokens": 1116311
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 32865,
+        "cache_read_input_tokens": 893165,
+        "cost_usd": 0.6281264999999998,
+        "direct_input_tokens": 3683,
+        "elapsed_seconds": 180.56420825002715,
+        "end_to_end_seconds": 211.149521040963,
+        "episode_receipt": {
+          "bytes": 7305,
+          "sha256": "1e347421cd15180b72c2b2e58b71ffd25868d4399709ac553aa09cba489a9c98"
+        },
+        "first_tool": {
+          "input": {
+            "-A": 15,
+            "output_mode": "content",
+            "pattern": "def add\\("
+          },
+          "name": "Grep"
+        },
+        "input_manifest": {
+          "bytes": 17534,
+          "sha256": "a6d4fc762d2dbef2ca613c5bde566721235d17b4793e5953bdf71fdaef1d47b1"
+        },
+        "manifest_guidance_note": "RNA returned django/template/defaultfilters.py; first action searched its add filter.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3933,
+          "sha256": "139e121bf9c4f20c318edea8fa49dcda3ad8de5d8ed2466865e8c5d9f6d53e58"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 10622,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 389926,
+        "rna_retrieval_seconds": 30.58531279093586,
+        "rna_visible_bytes": 8126,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 18,
+            "Edit": 5,
+            "Grep": 3,
+            "Read": 4
+          },
+          "total": 30
+        },
+        "total_input_tokens": 929713
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -11.194876783398184,
+        "cache_read_input_tokens": -17.192884539253797,
+        "cost_usd": -19.885472051846655,
+        "direct_input_tokens": 430.69164265129683,
+        "elapsed_seconds": -23.731369811065868,
+        "end_to_end_seconds": -10.812420186040097,
+        "output_tokens": -32.971540354641256,
+        "tool_calls": -30.232558139534884,
+        "total_input_tokens": -16.715592697733875
+      },
+      "instance_id": "django__django-13794",
+      "rank": 6
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 84227,
+        "cache_read_input_tokens": 3505674,
+        "cost_usd": 1.9214162,
+        "direct_input_tokens": 1412,
+        "elapsed_seconds": 747.5000508751255,
+        "episode_receipt": {
+          "bytes": 7022,
+          "sha256": "216e3557e3ddc689ef58666c0d0a47a7bc1e0de8eadf55a85d9f775b8cc87c07"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 24186,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 62,
+            "Edit": 6,
+            "Grep": 1,
+            "Read": 5
+          },
+          "total": 74
+        },
+        "total_input_tokens": 3591313
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 53294,
+        "cache_read_input_tokens": 1226928,
+        "cost_usd": 0.8937574000000001,
+        "direct_input_tokens": 4466,
+        "elapsed_seconds": 221.45606291713193,
+        "end_to_end_seconds": 238.5692552921828,
+        "episode_receipt": {
+          "bytes": 7315,
+          "sha256": "540e7091c95e886aba60a564a79816111a37a70beaff6936380f79f88801b5fe"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "lib/matplotlib/stackplot.py"
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 18320,
+          "sha256": "4a399387763b015400c67bc329c46a76713f3c225c69afaa798dbbc0ae7763e5"
+        },
+        "manifest_guidance_note": "RNA returned lib/matplotlib/stackplot.py:stackplot; first action read stackplot.py.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3836,
+          "sha256": "51ffff8300b90c511202e37ba5e9bdeabf2a0949ff63d67dd08d4d3fcc39dd14"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 13431,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 135015,
+        "rna_retrieval_seconds": 17.113192375050858,
+        "rna_visible_bytes": 8160,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 26,
+            "Edit": 6,
+            "Read": 3
+          },
+          "total": 35
+        },
+        "total_input_tokens": 1284688
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -36.72575302456457,
+        "cache_read_input_tokens": -65.00165160822141,
+        "cost_usd": -53.48444548349285,
+        "direct_input_tokens": 216.28895184135976,
+        "elapsed_seconds": -70.37377286357837,
+        "end_to_end_seconds": -68.08438273510737,
+        "output_tokens": -44.46787397668072,
+        "tool_calls": -52.7027027027027,
+        "total_input_tokens": -64.2279021628023
+      },
+      "instance_id": "matplotlib__matplotlib-24026",
+      "rank": 7
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 11815,
+        "cache_read_input_tokens": 339211,
+        "cost_usd": 0.24901829999999997,
+        "direct_input_tokens": 700,
+        "elapsed_seconds": 106.94023120799102,
+        "episode_receipt": {
+          "bytes": 6935,
+          "sha256": "0b2dd08ee604075368cad696dbf8c11022a2f69f685a9eb3a6a23181f4b645bb"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5049,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 15,
+            "Edit": 3,
+            "Grep": 3,
+            "Read": 3
+          },
+          "total": 24
+        },
+        "total_input_tokens": 351726
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 19107,
+        "cache_read_input_tokens": 492537,
+        "cost_usd": 0.3420521,
+        "direct_input_tokens": 3780,
+        "elapsed_seconds": 85.51805316703394,
+        "end_to_end_seconds": 127.53615670814179,
+        "episode_receipt": {
+          "bytes": 7281,
+          "sha256": "0bb6209e5545a6bf6b9f196542255a23ef20e92b8c51a9e6f602e362f12c3132"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/forms/models.py",
+            "limit": 23,
+            "offset": 69
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 19588,
+          "sha256": "482ca15e9a34ab8ba3dc9c0ca9da34d7f85ee2a5ac297ea18fd7edfb0610c0eb"
+        },
+        "manifest_guidance_note": "RNA's first record was django/forms/models.py:model_to_dict; first action read it.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3932,
+          "sha256": "221c732c1223eb9b8efb5b3170e867a46f835835357716261dca9d0a7618cf9f"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5065,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 539779,
+        "rna_retrieval_seconds": 42.01810354110785,
+        "rna_visible_bytes": 8097,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 9,
+            "Edit": 5,
+            "Grep": 4,
+            "Read": 2
+          },
+          "total": 20
+        },
+        "total_input_tokens": 515424
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 61.718154887854425,
+        "cache_read_input_tokens": 45.20077473902674,
+        "cost_usd": 37.360226135990835,
+        "direct_input_tokens": 440.0,
+        "elapsed_seconds": -20.031916706157563,
+        "end_to_end_seconds": 19.259286488817462,
+        "output_tokens": 0.31689443454149335,
+        "tool_calls": -16.666666666666668,
+        "total_input_tokens": 46.54134183995497
+      },
+      "instance_id": "django__django-11163",
+      "rank": 8
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 10300,
+        "cache_read_input_tokens": 209967,
+        "cost_usd": 0.17123209999999997,
+        "direct_input_tokens": 819,
+        "elapsed_seconds": 71.81149066681974,
+        "episode_receipt": {
+          "bytes": 6939,
+          "sha256": "88132b175d8311ea899c8453a8ff6692dab60618678a49a5384ea7a7bc287179"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 3049,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 7,
+            "Edit": 2,
+            "Grep": 3,
+            "Read": 4
+          },
+          "total": 16
+        },
+        "total_input_tokens": 221086
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 13878,
+        "cache_read_input_tokens": 126618,
+        "cost_usd": 0.1510534,
+        "direct_input_tokens": 3902,
+        "elapsed_seconds": 28.0945798328612,
+        "end_to_end_seconds": 64.30660254089162,
+        "episode_receipt": {
+          "bytes": 7281,
+          "sha256": "485e6a98ac8f2ebed449474e542ded92cc98ebb3be59db4ed4b78986748cc70b"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/contrib/admin/sites.py",
+            "limit": 20,
+            "offset": 440
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 20456,
+          "sha256": "ec5d539434ebf502297b89f8ef00ecfcc4fe18e4e23019bd0d43decac70fcdd8"
+        },
+        "manifest_guidance_note": "RNA returned django/contrib/admin/sites.py:catch_all_view; first action read it.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3931,
+          "sha256": "7ee20bdc8f5a2c8b27eefa61e8bb36c2f61085d7d578d43342d220775f98c852"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 1740,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 409878,
+        "rna_retrieval_seconds": 36.21202270803042,
+        "rna_visible_bytes": 7939,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 2,
+            "Edit": 2,
+            "Read": 2
+          },
+          "total": 6
+        },
+        "total_input_tokens": 144398
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 34.737864077669904,
+        "cache_read_input_tokens": -39.69623798025404,
+        "cost_usd": -11.784414254103039,
+        "direct_input_tokens": 376.4346764346764,
+        "elapsed_seconds": -60.877319810543625,
+        "end_to_end_seconds": -10.45081790705081,
+        "output_tokens": -42.93210888816005,
+        "tool_calls": -62.5,
+        "total_input_tokens": -34.68695439783614
+      },
+      "instance_id": "django__django-16612",
+      "rank": 9
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 18504,
+        "cache_read_input_tokens": 383055,
+        "cost_usd": 0.3141445,
+        "direct_input_tokens": 2126,
+        "elapsed_seconds": 101.06358991703019,
+        "episode_receipt": {
+          "bytes": 6908,
+          "sha256": "b9fb6e8b90a5b39b5e3cd3e298e7bb8bd8cab40ea693d3e876bb5dd88c6ab72a"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5746,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 15,
+            "Edit": 3,
+            "Grep": 3
+          },
+          "total": 21
+        },
+        "total_input_tokens": 403685
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 22851,
+        "cache_read_input_tokens": 443346,
+        "cost_usd": 0.3459248,
+        "direct_input_tokens": 5237,
+        "elapsed_seconds": 77.15024075005203,
+        "end_to_end_seconds": 110.0150084591005,
+        "episode_receipt": {
+          "bytes": 7307,
+          "sha256": "57a2e303d2f5f4e8bc104a829c76191ddd8247c45debbc80f429be9d771c040b"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/contrib/admin/checks.py",
+            "limit": 32,
+            "offset": 718
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 18160,
+          "sha256": "9314df3718003e2f1f3610294ac2253d7b9b0a21dd4b48c675e6c6533452afe5"
+        },
+        "manifest_guidance_note": "RNA returned django/contrib/admin/checks.py:_check_list_display_item; first action read it.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3838,
+          "sha256": "043150f789245ce48c391b61b44009cd1cc2c537d4f3e5545f73af5ea1fd7365"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 4714,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 371609,
+        "rna_retrieval_seconds": 32.864767709048465,
+        "rna_visible_bytes": 8005,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 5,
+            "Read": 3
+          },
+          "total": 16
+        },
+        "total_input_tokens": 471434
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 23.492217898832685,
+        "cache_read_input_tokens": 15.739515213220034,
+        "cost_usd": 10.116459145393277,
+        "direct_input_tokens": 146.33113828786455,
+        "elapsed_seconds": -23.66168586195108,
+        "end_to_end_seconds": 8.85721410591008,
+        "output_tokens": -17.960320222763663,
+        "tool_calls": -23.80952380952381,
+        "total_input_tokens": 16.782639929648116
+      },
+      "instance_id": "django__django-11551",
+      "rank": 10
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 5356,
+        "cache_read_input_tokens": 119041,
+        "cost_usd": 0.09559630000000001,
+        "direct_input_tokens": 935,
+        "elapsed_seconds": 89.58976604207419,
+        "episode_receipt": {
+          "bytes": 6916,
+          "sha256": "1c94a7caedfb0e3f101175cb762f4190c86c7f51f22c71f00233be21a8414521"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 1797,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 6,
+            "Edit": 1,
+            "Grep": 4
+          },
+          "total": 11
+        },
+        "total_input_tokens": 125332
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 11697,
+        "cache_read_input_tokens": 148666,
+        "cost_usd": 0.14489580000000002,
+        "direct_input_tokens": 3912,
+        "elapsed_seconds": 80.59503475017846,
+        "end_to_end_seconds": 117.56182366609573,
+        "episode_receipt": {
+          "bytes": 7297,
+          "sha256": "9d842aefbfce63bc5c2d145a752fcb553a508386a6cc7298ee2a86111f791c7f"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/core/management/__init__.py",
+            "limit": 30,
+            "offset": 330
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 26977,
+          "sha256": "9ed3b76ba9a673c6df0209a0872b37e2b9eb17e932a913190f58c850e9e93f75"
+        },
+        "manifest_guidance_note": "RNA returned ManagementUtility.execute; first action read that exact region.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3931,
+          "sha256": "112620c95c4fcaba452cd9e2fcf4d3d6c71d437cd772182f3397d6572f5079bd"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 1758,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 388314,
+        "rna_retrieval_seconds": 36.96678891591728,
+        "rna_visible_bytes": 8129,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 4,
+            "Edit": 1,
+            "Grep": 1,
+            "Read": 1
+          },
+          "total": 7
+        },
+        "total_input_tokens": 164275
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 118.39058999253174,
+        "cache_read_input_tokens": 24.88638368293277,
+        "cost_usd": 51.57051057415402,
+        "direct_input_tokens": 318.39572192513367,
+        "elapsed_seconds": -10.039909343743036,
+        "end_to_end_seconds": 31.222380479133054,
+        "output_tokens": -2.1702838063439067,
+        "tool_calls": -36.36363636363637,
+        "total_input_tokens": 31.07187310503303
+      },
+      "instance_id": "django__django-13658",
+      "rank": 11
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 28939,
+        "cache_read_input_tokens": 810664,
+        "cost_usd": 0.5601402,
+        "direct_input_tokens": 1450,
+        "elapsed_seconds": 275.13316220906563,
+        "episode_receipt": {
+          "bytes": 6895,
+          "sha256": "7ca82691231dca378acd69a040a6cb41b4e1e9b8beeadcbb7bbbd898ce247ba3"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 9463,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 23,
+            "Edit": 3,
+            "Grep": 6,
+            "Read": 5
+          },
+          "total": 37
+        },
+        "total_input_tokens": 841053
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 31276,
+        "cache_read_input_tokens": 587095,
+        "cost_usd": 0.45479149999999996,
+        "direct_input_tokens": 3917,
+        "elapsed_seconds": 99.13418841687962,
+        "end_to_end_seconds": 102.04429337475449,
+        "episode_receipt": {
+          "bytes": 7194,
+          "sha256": "390ac7e9cd37d82c706f860ed3fac1b37104edb87183853678f6215ab271ff37"
+        },
+        "first_tool": {
+          "input": {
+            "-A": 5,
+            "-n": true,
+            "output_mode": "content",
+            "pattern": "def prepare_method"
+          },
+          "name": "Grep"
+        },
+        "input_manifest": {
+          "bytes": 22442,
+          "sha256": "bb03b6cd2849e72b24ca7c27be8349a3ed079a81cf38675f462aeaf1a4dea745"
+        },
+        "manifest_guidance_note": "RNA put prepare_url and the Unicode multipart tests first; the first action inspected the adjacent prepare_method path and the final patch used the repository's native-string helper.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3742,
+          "sha256": "b30fc580d3d5ff66a4589cb00f43496359c38c06a8d13482fc4496675998cb1f"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5816,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 185904,
+        "rna_retrieval_seconds": 2.9101049578748643,
+        "rna_visible_bytes": 8188,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 18,
+            "Edit": 2,
+            "Grep": 2,
+            "Read": 2
+          },
+          "total": 24
+        },
+        "total_input_tokens": 622288
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 8.075607311931995,
+        "cache_read_input_tokens": -27.578503547709037,
+        "cost_usd": -18.807559250344827,
+        "direct_input_tokens": 170.13793103448276,
+        "elapsed_seconds": -63.968651535524295,
+        "end_to_end_seconds": -62.91094372069405,
+        "output_tokens": -38.53957518757265,
+        "tool_calls": -35.13513513513514,
+        "total_input_tokens": -26.010845927664487
+      },
+      "instance_id": "psf__requests-1724",
+      "rank": 12
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 12796,
+        "cache_read_input_tokens": 297545,
+        "cost_usd": 0.2513465,
+        "direct_input_tokens": 829,
+        "elapsed_seconds": 241.36280804197304,
+        "episode_receipt": {
+          "bytes": 6901,
+          "sha256": "13b7c5a380609b5ded23c6a6adeb024c9e97d2b1c843c2b8afc05285260a6ad6"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 5642,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 10,
+            "Edit": 4,
+            "Grep": 4,
+            "Read": 3
+          },
+          "total": 21
+        },
+        "total_input_tokens": 311170
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 12253,
+        "cache_read_input_tokens": 193075,
+        "cost_usd": 0.17389949999999998,
+        "direct_input_tokens": 4309,
+        "elapsed_seconds": 42.15104079199955,
+        "end_to_end_seconds": 81.97112787514925,
+        "episode_receipt": {
+          "bytes": 7193,
+          "sha256": "ba6ae13d457b14882bfbb79e718d529efba9d7f3e0ca95535811f48e9a20a520"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "sympy/printing/latex.py",
+            "limit": 10,
+            "offset": 699
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 17874,
+          "sha256": "e2b0ca36b5473069d798341bd773155fd9bb0fdd41937fd65c5eef16dcb1b8fd"
+        },
+        "manifest_guidance_note": "RNA returned the relevant LaTeX Subs test and printer location; first action read latex.py, but the patch semantics were wrong.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3740,
+          "sha256": "727a188a0e299a86271454ecbc5b99320db77b1803cb0ee7f58e8fb5a7d8763f"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 2554,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 135719,
+        "rna_retrieval_seconds": 39.8200870831497,
+        "rna_visible_bytes": 7989,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 4,
+            "Edit": 2,
+            "Grep": 1,
+            "Read": 2
+          },
+          "total": 9
+        },
+        "total_input_tokens": 209637
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -4.2435135979993746,
+        "cache_read_input_tokens": -35.110655531096135,
+        "cost_usd": -30.81284203281128,
+        "direct_input_tokens": 419.78287092882994,
+        "elapsed_seconds": -82.53623201770611,
+        "end_to_end_seconds": -66.03821088255881,
+        "output_tokens": -54.73236440978376,
+        "tool_calls": -57.142857142857146,
+        "total_input_tokens": -32.629430857730505
+      },
+      "instance_id": "sympy__sympy-18763",
+      "rank": 13
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 7971,
+        "cache_read_input_tokens": 194010,
+        "cost_usd": 0.149304,
+        "direct_input_tokens": 707,
+        "elapsed_seconds": 170.22128879185766,
+        "episode_receipt": {
+          "bytes": 8731,
+          "sha256": "be9792313bbba84bdebbb3fdb748fa984f1d926d0679c9070c55bb43cb800392"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 2844,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 2,
+            "Grep": 3,
+            "Read": 2,
+            "Write": 1
+          },
+          "total": 16
+        },
+        "total_input_tokens": 202688
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 14121,
+        "cache_read_input_tokens": 324649,
+        "cost_usd": 0.23683070000000003,
+        "direct_input_tokens": 3796,
+        "elapsed_seconds": 53.10427958308719,
+        "end_to_end_seconds": 62.40749237500131,
+        "episode_receipt": {
+          "bytes": 9470,
+          "sha256": "1bb2731fc344abb6e94df8db1b63bdf41ed33bf3f5552c9f32b81190b604fd66"
+        },
+        "first_tool": {
+          "input": {
+            "-n": true,
+            "output_mode": "content",
+            "pattern": "follow_symlinks"
+          },
+          "name": "Grep"
+        },
+        "input_manifest": {
+          "bytes": 19802,
+          "sha256": "18feb0b12ea9cd5a1e4c61fc7e2ea0462a15edff0e0659d96c96e431a0ba4d9e"
+        },
+        "manifest_guidance_note": "RNA returned symlink-collection symbols including test_collect_symlink_file_arg; first action searched follow_symlinks and then read the exact traversal function.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3892,
+          "sha256": "f66a16cd832998c0941b0f712b484bb21b4485275f50d9a91c322ea43d98405c"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 3400,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 51819,
+        "rna_retrieval_seconds": 9.30321279191412,
+        "rna_visible_bytes": 8023,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 2,
+            "Glob": 1,
+            "Grep": 1,
+            "Read": 2,
+            "Write": 1
+          },
+          "total": 15
+        },
+        "total_input_tokens": 342566
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 77.15468573579224,
+        "cache_read_input_tokens": 67.33621978248544,
+        "cost_usd": 58.623144724856694,
+        "direct_input_tokens": 436.91654879773694,
+        "elapsed_seconds": -68.80279784039129,
+        "end_to_end_seconds": -63.337433984939665,
+        "output_tokens": 19.549929676511955,
+        "tool_calls": -6.25,
+        "total_input_tokens": 69.01148563309125
+      },
+      "instance_id": "pytest-dev__pytest-7982",
+      "rank": 14
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 9648,
+        "cache_read_input_tokens": 130544,
+        "cost_usd": 0.15053619999999998,
+        "direct_input_tokens": 795,
+        "elapsed_seconds": 48.404036375228316,
+        "episode_receipt": {
+          "bytes": 8748,
+          "sha256": "028e42efae126a580a0a03b4f6652c33906372959fec47d63db5b72e66dbe7c2"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 3522,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 5,
+            "Edit": 1,
+            "Read": 2,
+            "Write": 1
+          },
+          "total": 9
+        },
+        "total_input_tokens": 140987
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 18049,
+        "cache_read_input_tokens": 287199,
+        "cost_usd": 0.2510247,
+        "direct_input_tokens": 4028,
+        "elapsed_seconds": 68.15062516694888,
+        "end_to_end_seconds": 77.87265504174866,
+        "episode_receipt": {
+          "bytes": 9336,
+          "sha256": "6749cc4a6afe4431ca69f0e218e7cf9509e065c893a8aef4c4a87df14f75cf57"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "src/_pytest/skipping.py"
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 18229,
+          "sha256": "f9ace1e6d8288d338cb770daed3cdc5336aa40bdd5d460b65b7456cac0d8cc4b"
+        },
+        "manifest_guidance_note": "RNA returned src/_pytest/skipping.py; first action read it.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3960,
+          "sha256": "a7a29105e456db96b2e6c5f9367298c38225796d74a889a7604287751e8e1ec7"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 3511,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 55402,
+        "rna_retrieval_seconds": 9.722029874799773,
+        "rna_visible_bytes": 8171,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 7,
+            "Edit": 2,
+            "Read": 2
+          },
+          "total": 11
+        },
+        "total_input_tokens": 309276
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 87.07504145936981,
+        "cache_read_input_tokens": 120.00168525554602,
+        "cost_usd": 66.75371106750404,
+        "direct_input_tokens": 406.6666666666667,
+        "elapsed_seconds": 40.79533499777771,
+        "end_to_end_seconds": 60.88049855611105,
+        "output_tokens": -0.31232254400908577,
+        "tool_calls": 22.22222222222222,
+        "total_input_tokens": 119.36490598423968
+      },
+      "instance_id": "pytest-dev__pytest-7432",
+      "rank": 15
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 33016,
+        "cache_read_input_tokens": 1051131,
+        "cost_usd": 0.6781132999999999,
+        "direct_input_tokens": 828,
+        "elapsed_seconds": 213.36811241693795,
+        "episode_receipt": {
+          "bytes": 6950,
+          "sha256": "a84d111fca636038dde387ce8c96b1fb357b57a296e94cc1b2702adbcc2f2bfa"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 10922,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 42,
+            "Edit": 2,
+            "Grep": 1,
+            "Read": 3,
+            "Write": 1
+          },
+          "total": 49
+        },
+        "total_input_tokens": 1084975
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 23089,
+        "cache_read_input_tokens": 594978,
+        "cost_usd": 0.4182594,
+        "direct_input_tokens": 3876,
+        "elapsed_seconds": 104.78156529203989,
+        "end_to_end_seconds": 134.86133308289573,
+        "episode_receipt": {
+          "bytes": 7288,
+          "sha256": "45dca0a5f81f5e2fa4f948fcbb8d242827d41965ff462e677652b700a2f8e1c6"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/contrib/postgres/forms/array.py",
+            "limit": 65,
+            "offset": 105
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 90092,
+          "sha256": "b567f52fdb26a6ed4342cb40510194aaeb83db904a8832dc7299e67265c137f3"
+        },
+        "manifest_guidance_note": "RNA returned SplitArrayWidget/SplitArrayField in postgres/forms/array.py; first action read that region.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3894,
+          "sha256": "152a33940fea3774bfe75db37cfddafbdb27d9827bec22f33c4bafd52472f3d3"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 6496,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 374841,
+        "rna_retrieval_seconds": 30.07976779085584,
+        "rna_visible_bytes": 8049,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 17,
+            "Edit": 3,
+            "Read": 2,
+            "Write": 1
+          },
+          "total": 23
+        },
+        "total_input_tokens": 621943
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -30.067240125999515,
+        "cache_read_input_tokens": -43.396398736218416,
+        "cost_usd": -38.32013027911412,
+        "direct_input_tokens": 368.1159420289855,
+        "elapsed_seconds": -50.89164725453983,
+        "end_to_end_seconds": -36.794054390205154,
+        "output_tokens": -40.52371360556675,
+        "tool_calls": -53.06122448979592,
+        "total_input_tokens": -42.676743703771976
+      },
+      "instance_id": "django__django-12193",
+      "rank": 16
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 11521,
+        "cache_read_input_tokens": 249201,
+        "cost_usd": 0.2037773,
+        "direct_input_tokens": 660,
+        "elapsed_seconds": 65.64101129211485,
+        "episode_receipt": {
+          "bytes": 6866,
+          "sha256": "d0993016fac0e4b905e94e1687e449e0d10e29804893a633c9301c8f74f21c82"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 3955,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 9,
+            "Edit": 4,
+            "Grep": 2,
+            "Read": 3
+          },
+          "total": 18
+        },
+        "total_input_tokens": 261382
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 19978,
+        "cache_read_input_tokens": 447287,
+        "cost_usd": 0.3590741,
+        "direct_input_tokens": 3654,
+        "elapsed_seconds": 88.70762879191898,
+        "end_to_end_seconds": 121.89196374989115,
+        "episode_receipt": {
+          "bytes": 7329,
+          "sha256": "ff95c3e44db4a9b59f5c658ed3221983b04a546fd194caba8cbfe8e3bb852a93"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/template/defaultfilters.py",
+            "limit": 110,
+            "offset": 96
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 19188,
+          "sha256": "758da2784f8dc61e783ae1877867d0f3b1b15400a07ee43f5ed79237c5483277"
+        },
+        "manifest_guidance_note": "RNA returned django/template/defaultfilters.py:floatformat; first action read that exact function.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3861,
+          "sha256": "a35c48d597dbbc30013dde6801d44dea2476e908c5bf1ddd0c5319cc0aefbfe2"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 6764,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 406268,
+        "rna_retrieval_seconds": 33.18433495797217,
+        "rna_visible_bytes": 8042,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 12,
+            "Edit": 3,
+            "Read": 3
+          },
+          "total": 18
+        },
+        "total_input_tokens": 470919
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": 73.4050863640309,
+        "cache_read_input_tokens": 79.48844507044514,
+        "cost_usd": 76.20907726228585,
+        "direct_input_tokens": 453.6363636363636,
+        "elapsed_seconds": 35.140557778967384,
+        "end_to_end_seconds": 85.69482911749938,
+        "output_tokens": 71.02402022756004,
+        "tool_calls": 0.0,
+        "total_input_tokens": 80.16504579504327
+      },
+      "instance_id": "django__django-16485",
+      "rank": 17
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 19339,
+        "cache_read_input_tokens": 541835,
+        "cost_usd": 0.3858935000000001,
+        "direct_input_tokens": 710,
+        "elapsed_seconds": 238.15082299988717,
+        "episode_receipt": {
+          "bytes": 6946,
+          "sha256": "3be6aca54049c03c05bbb75abae0f7f07e6d122eceacb08b41a53b8cb1166b75"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 7109,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 18,
+            "Edit": 5,
+            "Grep": 1,
+            "Read": 4,
+            "Write": 2
+          },
+          "total": 30
+        },
+        "total_input_tokens": 561884
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 16366,
+        "cache_read_input_tokens": 388230,
+        "cost_usd": 0.288748,
+        "direct_input_tokens": 3671,
+        "elapsed_seconds": 72.61602291697636,
+        "end_to_end_seconds": 104.29165362613276,
+        "episode_receipt": {
+          "bytes": 7303,
+          "sha256": "fbdb7eda794994aa1056e73a19da693dcc08d16e34b381bac94e1906d932c5e2"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/template/defaultfilters.py",
+            "limit": 70,
+            "offset": 430
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 17754,
+          "sha256": "273cd34bda0d72585d0bdf2642e77e3377b6952f5629ccac34a1bf7da21f74b2"
+        },
+        "manifest_guidance_note": "RNA returned django/template/defaultfilters.py; first action read that file.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3893,
+          "sha256": "5131831c2acb7ce2bc36ed4a292c625a301f7e21c28a68d7cdbb54470b0820f0"
+        },
+        "official_verdict": "UNRESOLVED",
+        "output_tokens": 4700,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 410997,
+        "rna_retrieval_seconds": 31.675630709156394,
+        "rna_visible_bytes": 7985,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 7,
+            "Edit": 3,
+            "Grep": 2,
+            "Read": 4,
+            "Write": 1
+          },
+          "total": 17
+        },
+        "total_input_tokens": 408267
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -15.373080304048813,
+        "cache_read_input_tokens": -28.349036145690107,
+        "cost_usd": -25.17417370336636,
+        "direct_input_tokens": 417.0422535211268,
+        "elapsed_seconds": -69.50838884272478,
+        "end_to_end_seconds": -56.207729071680696,
+        "output_tokens": -33.886622591081725,
+        "tool_calls": -43.333333333333336,
+        "total_input_tokens": -27.339628820183524
+      },
+      "instance_id": "django__django-16877",
+      "rank": 18
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 13434,
+        "cache_read_input_tokens": 222222,
+        "cost_usd": 0.19176559999999998,
+        "direct_input_tokens": 1100,
+        "elapsed_seconds": 70.4802744591143,
+        "episode_receipt": {
+          "bytes": 6940,
+          "sha256": "e7a601f1dd6bd1987cef062b850ffb03629244ccf9e9cfda18c5d3bd6383ec13"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 2905,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 2,
+            "Grep": 1,
+            "Read": 3
+          },
+          "total": 14
+        },
+        "total_input_tokens": 236756
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 12570,
+        "cache_read_input_tokens": 196577,
+        "cost_usd": 0.1728431,
+        "direct_input_tokens": 4120,
+        "elapsed_seconds": 39.87725629215129,
+        "end_to_end_seconds": 68.34531766711734,
+        "episode_receipt": {
+          "bytes": 7283,
+          "sha256": "20742a3bb4de94e7b98a8f87018b7f4c58677727d09b04e9bbdba40dc13f0f48"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "django/contrib/auth/backends.py",
+            "limit": 60,
+            "offset": 34
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 26887,
+          "sha256": "5bfd35a7b1118431aa4634a3987beaff73a4798a9ee98d380de8265355a8c2cd"
+        },
+        "manifest_guidance_note": "RNA's first record was ModelBackend in django/contrib/auth/backends.py; first action read it.",
+        "manifest_guided_first_action": true,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3891,
+          "sha256": "c7042ea0216ca2cf57219467ec42f652018e01ca11273b4c63bc37d5a8743642"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 2302,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 369193,
+        "rna_retrieval_seconds": 28.468061374966055,
+        "rna_visible_bytes": 8158,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 5,
+            "Edit": 2,
+            "Read": 2
+          },
+          "total": 9
+        },
+        "total_input_tokens": 213267
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -6.43144260830728,
+        "cache_read_input_tokens": -11.54026154026154,
+        "cost_usd": -9.86751534164625,
+        "direct_input_tokens": 274.54545454545456,
+        "elapsed_seconds": -43.42068529360773,
+        "end_to_end_seconds": -3.02915504853127,
+        "output_tokens": -20.757314974182442,
+        "tool_calls": -35.714285714285715,
+        "total_input_tokens": -9.921184679585734
+      },
+      "instance_id": "django__django-11451",
+      "rank": 19
+    },
+    {
+      "A": {
+        "cache_creation_input_tokens": 20773,
+        "cache_read_input_tokens": 501649,
+        "cost_usd": 0.3762177,
+        "direct_input_tokens": 2037,
+        "elapsed_seconds": 230.0612745829858,
+        "episode_receipt": {
+          "bytes": 8739,
+          "sha256": "b86b9a4ad36737cc4e06d5a815cb9bd34d453505d635fa2499b2815877a416eb"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 6610,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 13,
+            "Edit": 6,
+            "Grep": 1,
+            "Read": 4,
+            "Write": 2
+          },
+          "total": 26
+        },
+        "total_input_tokens": 524459
+      },
+      "T_PD": {
+        "cache_creation_input_tokens": 18965,
+        "cache_read_input_tokens": 409351,
+        "cost_usd": 0.3177093,
+        "direct_input_tokens": 5081,
+        "elapsed_seconds": 74.10571400006302,
+        "end_to_end_seconds": 83.79238500003703,
+        "episode_receipt": {
+          "bytes": 9347,
+          "sha256": "27763c28402363728451085af72a4b7a33fdcf5cbe5f67367b0e86d79d14482d"
+        },
+        "first_tool": {
+          "input": {
+            "file_path": "src/_pytest/setuponly.py"
+          },
+          "name": "Read"
+        },
+        "input_manifest": {
+          "bytes": 19998,
+          "sha256": "1953e66d83d8367d8121c5968804e098c7901ec682defefa606e2680451a46ad"
+        },
+        "manifest_guidance_note": "RNA results were parametrization/runner noise and did not surface setuponly.py; first action independently read setuponly.py.",
+        "manifest_guided_first_action": false,
+        "model_follow_up_rna_calls": 0,
+        "official_evaluation": {
+          "bytes": 3922,
+          "sha256": "02c90e23c10531fa43eb2740aaa08bcafa2297b52718e861fcc11b62602cbb97"
+        },
+        "official_verdict": "RESOLVED",
+        "output_tokens": 5079,
+        "pre_injected_rna_calls": 1,
+        "rna_raw_bytes": 51678,
+        "rna_retrieval_seconds": 9.686670999974012,
+        "rna_visible_bytes": 8069,
+        "tool_calls": {
+          "by_type": {
+            "Bash": 8,
+            "Edit": 5,
+            "Read": 2,
+            "Write": 1
+          },
+          "total": 16
+        },
+        "total_input_tokens": 433397
+      },
+      "delta_percent": {
+        "cache_creation_input_tokens": -8.703605641939056,
+        "cache_read_input_tokens": -18.398920360650575,
+        "cost_usd": -15.55174038861011,
+        "direct_input_tokens": 149.43544428080511,
+        "elapsed_seconds": -67.78870579831886,
+        "end_to_end_seconds": -63.578231429030815,
+        "output_tokens": -23.161875945537066,
+        "tool_calls": -38.46153846153846,
+        "total_input_tokens": -17.363035051357684
+      },
+      "instance_id": "pytest-dev__pytest-7205",
+      "rank": 20
+    }
+  ],
+  "coverage": {
+    "excluded_before_model_spend": [],
+    "officially_evaluated_pairs": 20
+  },
+  "design": {
+    "A": "Canonical successful Sonnet control episode reused; standard SWE-bench task and ordinary repository/test tools.",
+    "A_reruns": 0,
+    "T_PD": "Same standard task, plus a developer RNA progressive-disclosure directive and one prepended worked hybrid-rerank RNA search response bounded to complete records within 8 KiB. Nineteen captures passed the later strict qualification layer; rank 12 reused an earlier hash-verified semantic+reranked capture under the same visible 8 KiB contract after that layer rejected its cache attachment. Caller-selected one-hop traversal remained available; no automatic graph root.",
+    "model": "claude-sonnet-5",
+    "model_follow_up_rna_calls": 0,
+    "official_evaluator": "stock SWE-bench 4.1.0 with the canonical per-instance image tag",
+    "rank12_cache_exception": "Rank 12 reuses a retained semantic+reranked result with byte/hash provenance. This is a cache-attachment exception, not a model-visible treatment change; it is disclosed separately rather than silently dropping the case.",
+    "rna_source_or_default_changes": 0,
+    "time_accounting": "Model wall time is reported directly; T_PD also reports issue-specific RNA retrieval and model-plus-retrieval end-to-end time. Full repository cache construction is excluded as reusable preprocessing."
+  },
+  "interpretation": [
+    "T_PD matched A's official efficacy verdict in every evaluated pair.",
+    "Efficiency changes are descriptive single-episode paired observations, not a variance-controlled estimate.",
+    "Including issue-specific RNA retrieval, T_PD end-to-end time remains lower than A; full cache construction is intentionally separate reusable preprocessing.",
+    "The injected manifest visibly guided the first repository action in 18 of 20 transcripts; ranks 4 and 20 are counterexamples where the initial payload was not useful.",
+    "No model made a follow-up RNA call. That is compatible with the context-efficacy hypothesis because the initial modeled representation was pre-injected; it does not measure interactive traversal value.",
+    "In the three-case E pilot, explicitly preferring RNA and priming with an adjacent query/result still produced zero model follow-up RNA calls and the same 1/3 efficacy pattern as D.",
+    "Rank 7 materially drives aggregate token and cost savings. Excluding it leaves time and tool reductions strong but total-input savings near zero.",
+    "Rank 12 independently reproduced a previously resolved patch byte-for-byte while reducing model time, tokens, output, cost, and tool calls versus its reused A control."
+  ],
+  "model": "claude-sonnet-5",
+  "schema_version": "issue836-bounded-progressive-disclosure-population-v1",
+  "scope": {
+    "new_control_episodes": 0,
+    "officially_evaluated_pairs": 20,
+    "paid_treatment_episodes": 20,
+    "rank12_cached_retrieval_exception": true,
+    "ranks": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "reused_control_episodes": 20
+  },
+  "sensitivity": {
+    "excluding_rank_7": {
+      "cases": 19,
+      "cost_delta_percent": -2.35888384225238,
+      "end_to_end_time_delta_percent": -19.780681033709573,
+      "model_time_delta_percent": -35.65810906529945,
+      "output_tokens_delta_percent": -20.628461254461172,
+      "reason": "Rank 7 has the largest A input and a large favorable treatment delta; remove it to test aggregate dependence on that pair.",
+      "tool_calls_delta_percent": -29.247311827956988,
+      "total_input_tokens_delta_percent": 0.7985170740838621
+    }
+  },
+  "source_report": {
+    "bytes": 135952,
+    "sha256": "31f50615cdecbd8938fbac7b89932750100a27f7d12b461f85f5a74e44e79bf4"
+  },
+  "status": "TWENTY_CASE_PAIRED_COHORT_COMPLETE"
+}
