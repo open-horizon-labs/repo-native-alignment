@@ -36,6 +36,9 @@ struct Cli {
     port: u16,
     #[arg(long)]
     log_path: Option<PathBuf>,
+    /// Serve only an existing admitted cache; never scan, enrich, download, or mutate it.
+    #[arg(long)]
+    cache_only: bool,
     /// Include RNA-specific `.oh` and Git-history context in produced indexes.
     #[arg(long, default_value_t = BusinessContextMode::Enabled)]
     business_context: BusinessContextMode,
@@ -614,10 +617,16 @@ fn hydrate_lsp_status_from_ledger(
 
 async fn load_existing_embedding_index(
     repo_root: &std::path::Path,
+    offline: bool,
     warn: impl FnOnce(String),
 ) -> Option<repo_native_alignment::embed::EmbeddingIndex> {
-    match repo_native_alignment::embed::EmbeddingIndex::new(repo_root).await {
-        Ok(idx) => match idx.has_table().await {
+    let opened = if offline {
+        repo_native_alignment::embed::EmbeddingIndex::open_existing_offline(repo_root).await
+    } else {
+        repo_native_alignment::embed::EmbeddingIndex::open_existing(repo_root).await
+    };
+    match opened {
+        Ok(Some(idx)) => match idx.has_table().await {
             Ok(true) => Some(idx),
             Ok(false) => None,
             Err(e) => {
@@ -625,6 +634,7 @@ async fn load_existing_embedding_index(
                 None
             }
         },
+        Ok(None) => None,
         Err(e) => {
             warn(format!("EmbeddingIndex init failed: {}", e));
             None
@@ -1012,7 +1022,7 @@ async fn async_main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             handler.prepare_business_context_cache()?;
-            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, false, |msg| {
                 if enrichment.runs_embeddings() {
                     tracing::warn!("{}; scan summary may show embeddings unavailable", msg);
                 } else {
@@ -1313,7 +1323,7 @@ async fn async_main() -> anyhow::Result<()> {
             };
             handler.graph.store(Arc::new(Some(Arc::new(graph))));
             if capability == EnrichmentCapability::Embeddings {
-                if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
+                if let Some(embed_idx) = load_existing_embedding_index(&repo_root, false, |msg| {
                     tracing::warn!(
                         "{}; explicit embedding enrichment may need a repo-scope run",
                         msg
@@ -1752,6 +1762,7 @@ async fn async_main() -> anyhow::Result<()> {
         .lsp_only_roots();
     let handler = RnaHandler {
         repo_root: repo_root.clone(),
+        cache_only: cli.cache_only,
         business_context: BusinessContextAdmission::new(business_context_mode),
         lsp_only_roots: Arc::new(lsp_only_roots),
         ..Default::default()
@@ -1762,17 +1773,35 @@ async fn async_main() -> anyhow::Result<()> {
         other => anyhow::bail!("Unknown transport: {}. Use 'stdio' or 'http'.", other),
     }
     handler.prepare_business_context_cache()?;
+    let graph_load_started = std::time::Instant::now();
     match try_load_cached_graph(&repo_root).await {
-        Ok(Some(_)) => {
-            if let Some(embed_idx) = load_existing_embedding_index(&repo_root, |msg| {
-                tracing::warn!("{}; MCP semantic search will be unavailable", msg);
-            })
-            .await
+        Ok(Some(state)) => {
+            tracing::info!(
+                target: "rna_query_timing",
+                phase = "graph_load",
+                elapsed_ms = graph_load_started.elapsed().as_secs_f64() * 1000.0
+            );
+            handler.install_cached_graph(state);
+            let embedding_open_started = std::time::Instant::now();
+            if let Some(embed_idx) =
+                load_existing_embedding_index(&repo_root, cli.cache_only, |msg| {
+                    tracing::warn!("{}; MCP semantic search will be unavailable", msg);
+                })
+                .await
             {
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
+            tracing::info!(
+                target: "rna_query_timing",
+                phase = "embedding_open",
+                elapsed_ms = embedding_open_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(None) if cli.cache_only => {
+            anyhow::bail!("cache-only runtime requires an existing persisted graph")
         }
         Ok(None) => {}
+        Err(err) if cli.cache_only => return Err(err),
         Err(err) => tracing::warn!(
             "MCP startup could not preload the cached graph: {err:#}; background prewarm will recover it"
         ),
@@ -1824,13 +1853,25 @@ mod tests {
     use repo_native_alignment::server::{EnrichmentTrigger, JobStart, LspState};
 
     #[test]
+    fn cache_only_server_flag_is_explicit_and_opt_in() {
+        let ordinary = Cli::try_parse_from(["repo-native-alignment"]).unwrap();
+        assert!(!ordinary.cache_only);
+
+        let cache_only = Cli::try_parse_from([
+            "repo-native-alignment",
+            "--cache-only",
+            "--transport",
+            "http",
+        ])
+        .unwrap();
+        assert!(cache_only.cache_only);
+        assert_eq!(cache_only.transport, "http");
+    }
+
+    #[test]
     fn search_cli_preserves_defaults_and_accepts_explicit_content_exclusion() {
         for (arguments, expected_artifacts, expected_markdown) in [
-            (
-                vec!["repo-native-alignment", "search", "query"],
-                true,
-                true,
-            ),
+            (vec!["repo-native-alignment", "search", "query"], true, true),
             (
                 vec![
                     "repo-native-alignment",

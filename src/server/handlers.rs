@@ -165,6 +165,11 @@ impl RnaHandler {
         // When `repo` is provided, load an external graph from that path.
         // Semantic search is skipped (no embed_index for external repos).
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -185,12 +190,18 @@ impl RnaHandler {
             return Ok(text_result(markdown));
         }
 
+        let root_discovery_started = std::time::Instant::now();
         let root_filter = self.effective_root_filter(Self::non_blank_arg(args.root.as_deref()));
         let non_code_slugs = if root_filter.is_some() {
             self.non_code_root_slugs()
         } else {
             std::collections::HashSet::new()
         };
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "root_discovery",
+            elapsed_ms = root_discovery_started.elapsed().as_secs_f64() * 1000.0
+        );
         let graph_state = match self.get_graph().await {
             Ok(g) => g,
             Err(e) => return Ok(text_result(format!("Graph error: {}", e))),

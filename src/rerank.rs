@@ -119,6 +119,12 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
         match TextRerank::try_new(init_opts) {
             Ok(reranker) => {
                 tracing::info!("Reranker: ready in {:?}", start.elapsed());
+                tracing::info!(
+                    target: "rna_query_timing",
+                    phase = "reranker_initialization",
+                    strict = false,
+                    elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
+                );
                 *guard = Some(reranker);
             }
             Err(e) => {
@@ -129,13 +135,14 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
     }
 
     let reranker = guard.as_mut().expect("reranker guaranteed Some after init");
-    rerank_with_model(reranker, query, candidates)
+    rerank_with_model(reranker, query, candidates, false)
 }
 
 fn rerank_with_model(
     reranker: &mut TextRerank,
     query: &str,
     candidates: &[RerankCandidate],
+    strict: bool,
 ) -> Result<Vec<RerankedResult>> {
     let start = std::time::Instant::now();
 
@@ -150,6 +157,13 @@ fn rerank_with_model(
         "Reranker: scored {} candidates in {:?}",
         candidates.len(),
         start.elapsed()
+    );
+    tracing::info!(
+        target: "rna_query_timing",
+        phase = "reranker_inference",
+        strict,
+        candidate_count = candidates.len(),
+        elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
     );
 
     // Map fastembed results back to our candidates using the index field.
@@ -213,6 +227,12 @@ pub fn rerank_results_strict(
             files.snapshot.display(),
             start.elapsed()
         );
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "reranker_initialization",
+            strict = true,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
+        );
         *guard = Some(StrictReranker {
             cache_digest: verified_cache.digest.clone(),
             model,
@@ -222,7 +242,7 @@ pub fn rerank_results_strict(
     let reranker = guard
         .as_mut()
         .expect("strict reranker guaranteed Some after initialization");
-    let results = rerank_with_model(&mut reranker.model, query, candidates)?;
+    let results = rerank_with_model(&mut reranker.model, query, candidates, true)?;
     validate_strict_rerank(candidates, &results)?;
     let observed_after_inference = strict_reranker_cache_digest_at(&verified_cache.root)?;
     if observed_after_inference != verified_cache.digest {

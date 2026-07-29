@@ -1156,6 +1156,7 @@ pub struct EmbeddingIndex {
     table_name: String,
     repo_root: Arc<PathBuf>,
     require_metal: bool,
+    query_model: Arc<tokio::sync::Mutex<Option<metal_candle::embeddings::EmbeddingModel>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
@@ -1688,6 +1689,28 @@ impl EmbeddingIndex {
         Self::new_with_policy(repo_root, require_metal, GenerationOpenPurpose::Serving).await
     }
 
+    /// Open only a published generation. Missing state stays missing and never
+    /// creates an unpublished scratch database.
+    pub async fn open_existing(repo_root: &Path) -> Result<Option<Self>> {
+        if generation::load_current_generation(repo_root)?.is_none() {
+            return Ok(None);
+        }
+        Self::new(repo_root).await.map(Some)
+    }
+
+    /// Open an existing semantic generation without permitting model downloads.
+    /// The sealed bundle contract proves every encoder and reranker asset first.
+    pub async fn open_existing_offline(repo_root: &Path) -> Result<Option<Self>> {
+        if generation::load_current_generation(repo_root)?.is_none() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            generation::sealed_semantic_bundle_build(),
+            "cache-only semantic serving requires a sealed semantic bundle artifact"
+        );
+        Self::new(repo_root).await.map(Some)
+    }
+
     /// Open the semantic index with the #786 fail-closed execution policy.
     /// Building or querying through this handle never falls back from Metal to CPU.
     pub async fn new_strict(repo_root: &Path) -> Result<Self> {
@@ -1794,6 +1817,7 @@ impl EmbeddingIndex {
             table_name: "artifacts".to_string(),
             repo_root: Arc::new(repo_root.to_path_buf()),
             require_metal,
+            query_model: Arc::new(tokio::sync::Mutex::new(None)),
             _unpublished_scratch: unpublished_scratch,
         };
         if requires_active_generation_graph_validation(
@@ -1813,6 +1837,40 @@ impl EmbeddingIndex {
             .expect("embedding generation lock poisoned")
             .db
             .clone()
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let wait_started = std::time::Instant::now();
+        let mut model = self.query_model.lock().await;
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "query_encoder_wait",
+            elapsed_ms = wait_started.elapsed().as_secs_f64() * 1000.0
+        );
+        if model.is_none() {
+            let init_started = std::time::Instant::now();
+            let (loaded, _) = new_model_with_policy(self.require_metal)?;
+            *model = Some(loaded);
+            tracing::info!(
+                target: "rna_query_timing",
+                phase = "query_encoder_initialization",
+                elapsed_ms = init_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let encoding_started = std::time::Instant::now();
+        let embedding = single_query_embedding(
+            embed_texts_with_model(
+                model.as_ref().expect("query model initialized above"),
+                vec![query.to_string()],
+            )
+            .await?,
+        )?;
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "query_encoding",
+            elapsed_ms = encoding_started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(embedding)
     }
 
     fn replace_active_generation(&self, db: lancedb::Connection, manifest: GenerationManifest) {
@@ -3624,22 +3682,20 @@ impl EmbeddingIndex {
                 if let Some(ref sql) = pre_filter_sql {
                     q = q.only_if(sql.clone());
                 }
+                let retrieval_started = std::time::Instant::now();
                 let results = q.execute().await.context("FTS keyword search failed")?;
-                (
-                    results.try_collect().await?,
-                    product_retrieval_score_kind(mode, false),
-                )
+                let batches = results.try_collect().await?;
+                tracing::info!(
+                    target: "rna_query_timing",
+                    phase = "candidate_retrieval",
+                    mode = "keyword",
+                    elapsed_ms = retrieval_started.elapsed().as_secs_f64() * 1000.0
+                );
+                (batches, product_retrieval_score_kind(mode, false))
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding = if strict {
-                    let (model, _) = new_model_with_policy(true)?;
-                    single_query_embedding(
-                        embed_texts_with_model(&model, vec![query.to_string()]).await?,
-                    )?
-                } else {
-                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?
-                };
+                let query_embedding = self.embed_query(query).await?;
                 let mut search = table
                     .vector_search(query_embedding)
                     .context("Failed to create vector search")?
@@ -3648,30 +3704,29 @@ impl EmbeddingIndex {
                 if let Some(ref sql) = pre_filter_sql {
                     search = search.only_if(sql.clone());
                 }
+                let retrieval_started = std::time::Instant::now();
                 let results = search.execute().await.context("Vector search failed")?;
-                (
-                    results.try_collect().await?,
-                    product_retrieval_score_kind(mode, false),
-                )
+                let batches = results.try_collect().await?;
+                tracing::info!(
+                    target: "rna_query_timing",
+                    phase = "candidate_retrieval",
+                    mode = "semantic",
+                    elapsed_ms = retrieval_started.elapsed().as_secs_f64() * 1000.0
+                );
+                (batches, product_retrieval_score_kind(mode, false))
             }
             SearchMode::Hybrid => {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding = if strict {
-                    let (model, _) = new_model_with_policy(true)?;
-                    single_query_embedding(
-                        embed_texts_with_model(&model, vec![query.to_string()]).await?,
-                    )?
-                } else {
-                    single_query_embedding(embed_texts(vec![query.to_string()]).await?)?
-                };
+                let query_embedding = self.embed_query(query).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
                 if let Some(ref sql) = pre_filter_sql {
                     q = q.only_if(sql.clone());
                 }
+                let retrieval_started = std::time::Instant::now();
                 let hybrid_result = q
                     .nearest_to(query_embedding.as_slice())
                     .context("Failed to create hybrid search")?
@@ -3680,10 +3735,16 @@ impl EmbeddingIndex {
                     .await;
 
                 match hybrid_result {
-                    Ok(stream) => (
-                        stream.try_collect().await?,
-                        product_retrieval_score_kind(mode, false),
-                    ),
+                    Ok(stream) => {
+                        let batches = stream.try_collect().await?;
+                        tracing::info!(
+                            target: "rna_query_timing",
+                            phase = "candidate_retrieval",
+                            mode = "hybrid",
+                            elapsed_ms = retrieval_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                        (batches, product_retrieval_score_kind(mode, false))
+                    }
                     Err(error) if strict => {
                         return Err(error).context(
                             "strict hybrid semantic search failed; vector-only fallback is forbidden",
@@ -3705,10 +3766,14 @@ impl EmbeddingIndex {
                             .execute()
                             .await
                             .context("Fallback vector search failed")?;
-                        (
-                            results.try_collect().await?,
-                            product_retrieval_score_kind(mode, true),
-                        )
+                        let batches = results.try_collect().await?;
+                        tracing::info!(
+                            target: "rna_query_timing",
+                            phase = "candidate_retrieval",
+                            mode = "hybrid_vector_fallback",
+                            elapsed_ms = retrieval_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                        (batches, product_retrieval_score_kind(mode, true))
                     }
                 }
             }

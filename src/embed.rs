@@ -230,6 +230,14 @@ impl EmbeddingIndex {
         Ok(Self)
     }
 
+    pub async fn open_existing(_repo_root: &Path) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
+    pub async fn open_existing_offline(_repo_root: &Path) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
     pub async fn new_strict(_repo_root: &Path) -> Result<Self> {
         Err(anyhow!(
             "strict embedding execution requires an artifact built with embeddings and Metal support"

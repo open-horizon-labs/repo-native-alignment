@@ -461,7 +461,11 @@ mod tests {
             &nodes,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("failed to plan changed-file LSP nodes"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to plan changed-file LSP nodes")
+        );
         assert!(format!("{error:#}").contains("exceeds its bound"));
     }
 }
@@ -510,6 +514,13 @@ impl RnaHandler {
     /// Tool calls never block on a write lock — they always see the last
     /// complete graph snapshot (#574).
     pub(crate) async fn get_graph(&self) -> anyhow::Result<Arc<GraphState>> {
+        if self.cache_only {
+            let current = self.graph.load_full();
+            let Some(ref graph) = *current else {
+                anyhow::bail!("cache-only runtime has no admitted resident graph");
+            };
+            return Ok(Arc::clone(graph));
+        }
         // Fast path: if a graph exists, scan for changes. The scanner is cheap
         // relative to MCP timeout budgets, and skipping it for a cooldown window
         // makes rapid add/change/delete edits invisible to agents.
@@ -2575,11 +2586,8 @@ impl RnaHandler {
             // when there are changed/new/deleted files in the primary root).
             let dirty_slugs: Option<std::collections::HashSet<String>> =
                 Some(std::iter::once(primary_slug.clone()).collect());
-            let lsp_node_filter = plan_inner_incremental_lsp_node_filter(
-                enrichment,
-                &files_to_remove,
-                &graph.nodes,
-            )?;
+            let lsp_node_filter =
+                plan_inner_incremental_lsp_node_filter(enrichment, &files_to_remove, &graph.nodes)?;
 
             let pipeline_result =
                 crate::extract::consumers::emit_enrichment_pipeline_with_validations(
@@ -3009,11 +3017,8 @@ impl RnaHandler {
             } else if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                 let detail =
                     "incremental call-reference output was not durably persisted".to_string();
-                self.enrichment_jobs.mark_failed(
-                    &self.repo_root,
-                    job_id,
-                    detail.clone(),
-                );
+                self.enrichment_jobs
+                    .mark_failed(&self.repo_root, job_id, detail.clone());
                 self.enrichment_jobs.record_lsp_evidence(
                     &self.repo_root,
                     job_id,

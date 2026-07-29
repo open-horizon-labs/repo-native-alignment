@@ -254,6 +254,27 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `enrich --capability embeddings\|call-references --scope repo` | — | Run one enrichment capability against an existing cache without re-extracting source; use OperationReport output to see readiness/degradation. |
 | `test` | — | 29 pipeline checks end-to-end |
 
+### Resident cache-only MCP
+
+For repeated or concurrent queries against a prepared repository, keep one public MCP
+endpoint resident instead of starting a CLI process per request:
+
+```bash
+repo-native-alignment \
+  --repo /path/to/project \
+  --transport http \
+  --host 127.0.0.1 \
+  --port 3000 \
+  --cache-only
+```
+
+`--cache-only` admits the existing graph and semantic generation without scanning,
+enrichment, downloads, or cache mutation. It fails closed when the graph cache or its
+business-context marker is absent or incompatible. Semantic serving additionally
+requires the sealed offline bundle; exact and graph queries remain available when no
+semantic generation exists. The graph, LanceDB connection, encoder, and reranker stay
+resident after the first query.
+
 ### CLI Subcommands
 
 | Command | What it does |
