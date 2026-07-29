@@ -90,9 +90,12 @@ classified and assigned to #844 rather than hidden or deleted in #839.
 - Verbose search emits at most five job summaries, validation counts rather
   than validation arrays, bounded scope/phase/identifier/failure/evidence
   text, and explicit paths to the full persisted diagnostics.
-- Report persistence also writes a fixed-shape completeness summary. Search
-  reads that small summary to report ready/degraded status, counts, violations,
-  and digest. An older cache with only the full report is labeled `status
+- Report persistence also writes a fixed-shape completeness summary and
+  publishes a small commit marker only after the full report and summary are
+  durable. The marker binds the exact summary bytes to the report digest,
+  length, and modification identity. Search reports ready/degraded status,
+  counts, violations, and digest only when that binding verifies. Older,
+  interrupted, stale, tampered, or oversized pairs are labeled `status
   unverified` rather than being treated as ready or forcing a full-report read.
 - Full observability remains under `.oh/.cache/`; it is not copied into agent
   context.
