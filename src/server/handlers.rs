@@ -205,7 +205,11 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
-            enrichment_jobs: self.enrichment_jobs.all_jobs(&self.repo_root),
+            enrichment_jobs: if params.verbose {
+                self.enrichment_jobs.all_jobs(&self.repo_root)
+            } else {
+                Vec::new()
+            },
             business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;

@@ -279,6 +279,8 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 
 Recent scan/enrich operation history is bounded diagnostic state under `.oh/.cache/operation_reports.json`. It is repo-native control-plane state for CLI/MCP visibility, not source truth; non-terminal records from a previous process are marked stale on read.
 
+Search and graph traversal keep diagnostic sidecars off the normal query path. Pass `search --verbose` to append concise readiness and recent-job counts. RNA reads the fixed-shape `.oh/.cache/lsp_completeness_summary.json` for that bounded status; full per-file and per-request evidence remains in `.oh/.cache/lsp_completeness.json` and `.oh/.cache/enrichment_jobs.json` instead of being copied into agent context. A cache with a full completeness report but no valid summary is reported as `status unverified`, never silently promoted to ready.
+
 Use `--business-context disabled` only when a run must exclude RNA-specific business and history context, such as a benchmark. The mode is producer-based: README, Markdown, RST, source, tests, and configuration paths are not excluded by the context policy. Extraction and LSP availability for each admitted file type still follow the repository's configured baseline capabilities.
 
 ### ADR validation primitive

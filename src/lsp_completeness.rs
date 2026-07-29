@@ -28,6 +28,9 @@ use crate::server::{
 
 pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 6;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
+pub const LSP_COMPLETENESS_SUMMARY_PATH: &str = ".oh/.cache/lsp_completeness_summary.json";
+const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 1;
+const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
 const FROZEN_POPULATION_JSON: &[u8] =
@@ -335,6 +338,35 @@ pub struct ReportSummary {
     pub by_status: BTreeMap<String, u64>,
     #[serde(default)]
     pub by_extension: BTreeMap<String, u64>,
+}
+
+/// Bounded query-path projection of the complete per-file report.
+///
+/// The full report can be hundreds of megabytes. Search reads only this fixed-
+/// shape summary; detailed per-file evidence remains in the canonical report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspCompletenessSummary {
+    pub schema_version: u32,
+    pub ready: bool,
+    pub total_files: u64,
+    pub included_files: u64,
+    pub excluded_files: u64,
+    pub violation_count: u64,
+    pub report_digest: String,
+}
+
+impl LspCompletenessSummary {
+    fn from_report(report: &LspCompletenessReport) -> Self {
+        Self {
+            schema_version: LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+            ready: report.is_ready(),
+            total_files: report.summary.total_files,
+            included_files: report.summary.included_files,
+            excluded_files: report.summary.excluded_files,
+            violation_count: report.violations.len() as u64,
+            report_digest: report.digest.clone(),
+        }
+    }
 }
 
 /// Normalized proof for the current report generation. Inherited evidence is
@@ -1582,8 +1614,26 @@ pub fn report_path(repo_root: &Path) -> PathBuf {
     repo_root.join(LSP_COMPLETENESS_REPORT_PATH)
 }
 
+pub fn summary_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(LSP_COMPLETENESS_SUMMARY_PATH)
+}
+
+fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
 pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Result<()> {
     let path = report_path(repo_root);
+    let summary_path = summary_path(repo_root);
     let parent = path
         .parent()
         .context("LSP completeness report path has no parent")?;
@@ -1594,23 +1644,81 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
         )
     })?;
     let temp = parent.join(format!(".lsp_completeness.json.tmp-{}", std::process::id()));
+    let summary_temp = parent.join(format!(
+        ".lsp_completeness_summary.json.tmp-{}",
+        std::process::id()
+    ));
     let bytes = serde_json::to_vec_pretty(report)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)
-        .with_context(|| format!("failed to open {}", temp.display()))?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+    let summary_bytes = serde_json::to_vec_pretty(&LspCompletenessSummary::from_report(report))?;
+    anyhow::ensure!(
+        summary_bytes.len() <= MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        "LSP completeness summary exceeds {} bytes",
+        MAX_LSP_COMPLETENESS_SUMMARY_BYTES
+    );
+    write_synced_temp(&temp, &bytes)?;
+    write_synced_temp(&summary_temp, &summary_bytes)?;
+    // Invalidate the old summary before publishing a new full report. If the
+    // process stops between the two renames, readers fail closed as
+    // `status unverified` instead of pairing a stale summary with a new report.
+    match fs::remove_file(&summary_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to invalidate LSP completeness summary {}",
+                    summary_path.display()
+                )
+            });
+        }
+    }
     fs::rename(&temp, &path).with_context(|| {
         format!(
             "failed to atomically replace LSP completeness report {}",
             path.display()
         )
     })?;
+    fs::rename(&summary_temp, &summary_path).with_context(|| {
+        format!(
+            "failed to atomically replace LSP completeness summary {}",
+            summary_path.display()
+        )
+    })?;
     Ok(())
+}
+
+pub fn load_summary(repo_root: &Path) -> Result<LspCompletenessSummary> {
+    let path = summary_path(repo_root);
+    let file = OpenOptions::new().read(true).open(&path).with_context(|| {
+        format!(
+            "LSP completeness summary is missing or unreadable at {}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(MAX_LSP_COMPLETENESS_SUMMARY_BYTES);
+    file.take((MAX_LSP_COMPLETENESS_SUMMARY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed to read LSP completeness summary at {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        "LSP completeness summary exceeds {} bytes at {}",
+        MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        path.display()
+    );
+    let summary: LspCompletenessSummary = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid LSP completeness summary at {}", path.display()))?;
+    anyhow::ensure!(
+        summary.schema_version == LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+        "unsupported LSP completeness summary schema {} at {}",
+        summary.schema_version,
+        path.display()
+    );
+    Ok(summary)
 }
 
 pub fn load_report(repo_root: &Path) -> Result<LspCompletenessReport> {
@@ -4706,6 +4814,17 @@ mod tests {
     }
 
     #[test]
+    fn completeness_summary_reader_rejects_oversized_sidecars() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = summary_path(repo.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_LSP_COMPLETENESS_SUMMARY_BYTES + 1]).unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("summary exceeds 4096 bytes"), "got: {error}");
+    }
+
+    #[test]
     fn document_symbol_output_must_survive_graph_persistence() {
         let node = Node {
             id: NodeId {
@@ -4972,12 +5091,9 @@ mod tests {
         assert_eq!(document_links.observed_result_count, 0);
         assert!(document_links.output_nodes.is_empty());
         assert!(document_links.output_edges.is_empty());
-        assert!(
-            file_records
-                .iter()
-                .all(|record| record.state == LspWorkItemState::Completed
-                    && record.last_error.is_none())
-        );
+        assert!(file_records.iter().all(
+            |record| record.state == LspWorkItemState::Completed && record.last_error.is_none()
+        ));
 
         let jobs = vec![completed_job(vec![validation.clone()])];
         let status = terminal_status_for_file(

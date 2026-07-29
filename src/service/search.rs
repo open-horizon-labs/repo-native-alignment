@@ -797,29 +797,31 @@ fn format_verbose_readiness(
             .max_by_key(|job| (job.updated_at, job.revision))
         {
             let status = LspEnrichmentStatus::default();
-            let detail = degraded_job
-                .lsp_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.detail.as_deref())
-                .or(degraded_job.failure.as_deref())
-                .unwrap_or("call-reference enrichment finalized with degraded output");
+            let detail = bounded_diagnostic_text(
+                degraded_job
+                    .lsp_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.detail.as_deref())
+                    .or(degraded_job.failure.as_deref())
+                    .unwrap_or("call-reference enrichment finalized with degraded output"),
+            );
             if let Some(evidence) = degraded_job.lsp_evidence.as_ref() {
                 if degraded_job.scope == EnrichmentScope::Repo {
                     status.set_degraded_with_coverage(
                         degraded_job.counters.edge_count.unwrap_or(0),
                         persisted_lsp_edges,
-                        detail,
+                        &detail,
                     );
                 } else {
                     status.set_degraded_scoped(
                         degraded_job.counters.edge_count.unwrap_or(0),
                         persisted_lsp_edges,
-                        evidence.scope.clone(),
-                        detail,
+                        bounded_diagnostic_text(&evidence.scope),
+                        &detail,
                     );
                 }
             } else {
-                status.set_degraded(persisted_lsp_edges, detail);
+                status.set_degraded(persisted_lsp_edges, &detail);
             }
             Some(status)
         } else if let Some(completed_repo_job) = completed_repo_job {
@@ -831,14 +833,15 @@ fn format_verbose_readiness(
                     evidence.readiness == crate::server::LspEvidenceReadiness::DefaultProfile
                 })
             {
+                let detail = completed_repo_job
+                    .lsp_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.detail.as_deref())
+                    .unwrap_or("broad references were omitted");
                 status.set_complete_default_profile(
                     completed_repo_job.counters.edge_count.unwrap_or(0),
                     persisted_lsp_edges,
-                    completed_repo_job
-                        .lsp_evidence
-                        .as_ref()
-                        .and_then(|evidence| evidence.detail.clone())
-                        .unwrap_or_else(|| "broad references were omitted".to_string()),
+                    bounded_diagnostic_text(detail),
                 );
             } else {
                 status.set_complete(persisted_lsp_edges);
@@ -861,7 +864,7 @@ fn format_verbose_readiness(
             status.set_complete_scoped(
                 scoped_edge_count,
                 scoped_edge_count,
-                format!("{} scope", scoped_job.scope.stable_key()),
+                format!("{} scope", bounded_scope_summary(&scoped_job.scope)),
             );
             Some(status)
         } else if let Some(job) = ctx
@@ -886,19 +889,23 @@ fn format_verbose_readiness(
                         evidence.readiness == crate::server::LspEvidenceReadiness::Unavailable
                     }) =>
                 {
-                    status.set_unavailable_with_detail(
+                    let detail = bounded_diagnostic_text(
                         job.lsp_evidence
                             .as_ref()
                             .and_then(|evidence| evidence.detail.as_deref())
                             .or(job.failure.as_deref())
                             .unwrap_or("call-reference evidence unavailable"),
-                    )
+                    );
+                    status.set_unavailable_with_detail(&detail)
                 }
-                EnrichmentJobState::Failed => status.set_failed(
-                    job.failure
-                        .as_deref()
-                        .unwrap_or("call-reference enrichment failed"),
-                ),
+                EnrichmentJobState::Failed => {
+                    let detail = bounded_diagnostic_text(
+                        job.failure
+                            .as_deref()
+                            .unwrap_or("call-reference enrichment failed"),
+                    );
+                    status.set_failed(&detail)
+                }
                 EnrichmentJobState::Queued
                 | EnrichmentJobState::Running
                 | EnrichmentJobState::Persisting => status.set_running(),
@@ -931,51 +938,71 @@ fn format_verbose_readiness(
             semantic_index_attached,
             semantic_index_available,
         ),
-        format_lsp_completeness(ctx.repo_root, &gs.nodes, &gs.edges),
+        format_lsp_completeness(ctx.repo_root),
         format_enrichment_jobs(ctx),
     )
 }
 
-fn format_lsp_completeness(
-    repo_root: &Path,
-    nodes: &[crate::graph::Node],
-    edges: &[crate::graph::Edge],
-) -> String {
-    match crate::lsp_completeness::load_readiness_check_with_graph(
-        repo_root,
-        crate::business_context::BusinessContextMode::Disabled,
-        nodes,
-        edges,
-    ) {
-        Ok(check) => {
-            let blocked_paths = check
-                .report
-                .violations
-                .iter()
-                .filter_map(|violation| violation.path.as_deref())
-                .collect::<std::collections::BTreeSet<_>>();
-            let covered = if check.compatibility_violations.is_empty() {
-                check
-                .report
-                .files
-                .iter()
-                .filter(|file| {
-                    file.role.is_included() && !blocked_paths.contains(file.path.as_str())
-                })
-                .count()
+fn format_lsp_completeness(repo_root: &Path) -> String {
+    let report = crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH;
+    if !repo_root.join(report).is_file() {
+        return "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
+    }
+
+    match crate::lsp_completeness::load_summary(repo_root) {
+        Ok(summary) => format!(
+            "\n- **benchmark per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
+            if summary.ready {
+                "ready"
             } else {
-                0
-            };
-            format!(
-                "\n- **benchmark per-file LSP completeness**: {} — {}/{} included files covered; {} violation(s); digest={}",
-                if check.ready { "ready" } else { "partial/degraded" },
-                covered,
-                check.report.summary.included_files,
-                check.report.violations.len() + check.compatibility_violations.len(),
-                check.report.digest,
-            )
+                "partial/degraded"
+            },
+            summary.included_files,
+            summary.total_files,
+            summary.excluded_files,
+            summary.violation_count,
+            bounded_diagnostic_text(&summary.report_digest),
+        ),
+        Err(_) => format!(
+            "\n- **benchmark per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
+        ),
+    }
+}
+
+const VERBOSE_JOB_DISPLAY_LIMIT: usize = 5;
+const VERBOSE_DIAGNOSTIC_TEXT_LIMIT: usize = 240;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let mut chars = value.chars();
+    let bounded = chars
+        .by_ref()
+        .take(VERBOSE_DIAGNOSTIC_TEXT_LIMIT)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+fn bounded_scope_summary(scope: &EnrichmentScope) -> String {
+    match scope {
+        EnrichmentScope::Repo => "repo".to_string(),
+        EnrichmentScope::Root(root) => {
+            format!("root:{}", bounded_diagnostic_text(root))
         }
-        Err(_) => "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string(),
+        EnrichmentScope::ChangedFiles => "changed_files".to_string(),
+        EnrichmentScope::TargetSymbols(symbols) => {
+            format!("target_symbols(count={})", symbols.len())
+        }
+        EnrichmentScope::TaskRelevant { files, symbols } => format!(
+            "task_relevant(files={},symbols={})",
+            files.len(),
+            symbols.len()
+        ),
+        EnrichmentScope::Explicit(value) => {
+            format!("explicit:{}", bounded_diagnostic_text(value))
+        }
     }
 }
 
@@ -985,38 +1012,20 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
     }
 
     let mut lines = vec!["\n\nEnrichment jobs:".to_string()];
-    for job in &ctx.enrichment_jobs {
+    for job in ctx.enrichment_jobs.iter().take(VERBOSE_JOB_DISPLAY_LIMIT) {
         let state = format!("{:?}", job.state).to_lowercase();
-        let phase = job.phase.as_deref().unwrap_or("unknown");
+        let phase = bounded_diagnostic_text(job.phase.as_deref().unwrap_or("unknown"));
         let failure = job
             .failure
             .as_ref()
-            .map(|msg| format!("; failure: {}", msg))
+            .map(|msg| format!("; failure: {}", bounded_diagnostic_text(msg)))
             .unwrap_or_default();
         let evidence = job
             .lsp_evidence
             .as_ref()
             .map(|evidence| {
-                let validations = if evidence.validations.is_empty() {
-                    String::new()
-                } else {
-                    let summaries = evidence
-                        .validations
-                        .iter()
-                        .map(|validation| {
-                            format!(
-                                "{}/{}: {}",
-                                validation.language,
-                                validation.server_name,
-                                validation.summary()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(" validation=[{summaries}]")
-                };
                 format!(
-                    " evidence={} declared_nodes={} requests={}/{} elapsed_ms={}/{} circuit_open={}{}",
+                    " evidence={} declared_nodes={} requests={}/{} elapsed_ms={}/{} circuit_open={} validations={}",
                     evidence.readiness.as_str(),
                     evidence.declared_node_count,
                     evidence.scheduled_requests,
@@ -1028,20 +1037,29 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
                         .max_duration_ms
                         .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
                     evidence.circuit_open,
-                    validations,
+                    evidence.validations.len(),
                 )
             })
             .unwrap_or_default();
         lines.push(format!(
             "- `{}` {} {} scope={} phase={} updated={}{}{}",
-            job.job_id,
+            bounded_diagnostic_text(&job.job_id),
             job.capability.as_str(),
             state,
-            job.scope.stable_key(),
+            bounded_scope_summary(&job.scope),
             phase,
             job.updated_at,
             evidence,
             failure
+        ));
+    }
+    let omitted = ctx
+        .enrichment_jobs
+        .len()
+        .saturating_sub(VERBOSE_JOB_DISPLAY_LIMIT);
+    if omitted > 0 {
+        lines.push(format!(
+            "- … {omitted} older job(s) omitted; full diagnostics: `.oh/.cache/enrichment_jobs.json`"
         ));
     }
     lines.join("\n")
@@ -9077,6 +9095,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rank9_sized_exact_traversal_is_interactive_and_bounded() {
+        const NODE_COUNT: usize = 300_000;
+        const MAX_GRAPH_BUILD: std::time::Duration = std::time::Duration::from_secs(30);
+        const MAX_QUERY: std::time::Duration = std::time::Duration::from_secs(10);
+        const MAX_OUTPUT_BYTES: usize = 8 * 1024;
+
+        let build_started = std::time::Instant::now();
+        let target = make_node("target", NodeKind::Function, "src/target.rs");
+        let callees = (0..9)
+            .map(|index| {
+                make_node(
+                    &format!("callee_{index}"),
+                    NodeKind::Function,
+                    &format!("src/callee_{index}.rs"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let edges = callees
+            .iter()
+            .map(|callee| make_edge(&target, callee, crate::graph::EdgeKind::Calls))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::with_capacity(NODE_COUNT);
+        nodes.push(target.clone());
+        nodes.extend(callees);
+        for index in nodes.len()..NODE_COUNT {
+            nodes.push(make_node(
+                &format!("unrelated_{index}"),
+                NodeKind::Function,
+                &format!("src/unrelated_{index}.rs"),
+            ));
+        }
+        let graph_state = make_graph_state_with_edges(nodes, edges);
+        let build_elapsed = build_started.elapsed();
+        assert!(
+            build_elapsed < MAX_GRAPH_BUILD,
+            "300k-node in-memory graph initialization took {build_elapsed:?}"
+        );
+
+        let repo_root = PathBuf::from("/tmp/rna-rank9-sized-regression");
+        let ctx = make_search_context(&graph_state, &repo_root);
+        let params = SearchParams {
+            node: Some(target.stable_id()),
+            mode: Some("neighbors".to_string()),
+            limit: Some(20),
+            compact: true,
+            verbose: false,
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let query_started = std::time::Instant::now();
+        let output = search(&params, &ctx).await;
+        let query_elapsed = query_started.elapsed();
+
+        assert!(
+            query_elapsed < MAX_QUERY,
+            "300k-node exact traversal took {query_elapsed:?}"
+        );
+        assert!(
+            output.len() < MAX_OUTPUT_BYTES,
+            "exact traversal emitted {} bytes",
+            output.len()
+        );
+        assert!(output.contains("9 result(s)"), "got: {output}");
+        assert!(!output.contains("Capability readiness"), "got: {output}");
+        assert!(!output.contains("Enrichment jobs"), "got: {output}");
+    }
+
     #[test]
     fn embedding_candidates_are_deduplicated_before_reranking() {
         let first = make_node("first", NodeKind::Function, "src/first.rs");
@@ -9666,9 +9754,8 @@ mod tests {
         assert!(result.contains("default query profile"));
         assert!(result.contains("broad references were omitted"));
         assert!(result.contains("evidence=default_profile"));
-        assert!(result.contains(
-            "validation=[json/vscode-json-languageserver: processed via textDocument/documentSymbol (0 symbols)]"
-        ));
+        assert!(result.contains("validations=1"));
+        assert!(!result.contains("vscode-json-languageserver"));
         assert!(!result.contains("LSP call/reference coverage**: ready"));
     }
 
@@ -9764,6 +9851,143 @@ mod tests {
         }
         assert!(result.contains("requests=1/1"));
         assert!(result.contains("circuit_open=true"));
+    }
+
+    #[test]
+    fn verbose_enrichment_diagnostics_are_bounded_by_counts_not_validation_arrays() {
+        let caller = make_node("caller", NodeKind::Function, "src/caller.rs");
+        let gs = make_graph_state(vec![caller]);
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                tmp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .expect("begin call-reference job")
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(tmp.path(), &job_id, 1, 1);
+        ledger.record_lsp_evidence(
+            tmp.path(),
+            &job_id,
+            crate::server::LspEvidenceCoverage {
+                readiness: crate::server::LspEvidenceReadiness::Full,
+                scope: crate::server::EnrichmentScope::Repo.stable_key(),
+                declared_node_count: 10_000,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 10_000,
+                elapsed_ms: 1,
+                circuit_open: false,
+                detail: None,
+                validations: (0..10_000)
+                    .map(|index| {
+                        crate::extract::scan_stats::LspValidationEvidence::processed(
+                            "python",
+                            format!("server-{index}"),
+                            "textDocument/documentSymbol",
+                            index,
+                        )
+                    })
+                    .collect(),
+            },
+        );
+
+        let base_job = ledger
+            .recent_jobs(tmp.path(), 1)
+            .into_iter()
+            .next()
+            .expect("persisted job");
+        let mut ctx = make_search_context(&gs, tmp.path());
+        ctx.enrichment_jobs = (0..12)
+            .map(|index| {
+                let mut job = base_job.clone();
+                job.job_id = format!("job-{index}-{}", "identifier".repeat(100));
+                job.phase = Some("phase".repeat(1_000));
+                job.failure = Some("failure".repeat(1_000));
+                job.scope = crate::server::EnrichmentScope::TargetSymbols(
+                    (0..10_000)
+                        .map(|symbol| format!("symbol-{symbol}"))
+                        .collect(),
+                );
+                job
+            })
+            .collect();
+
+        let output = format_enrichment_jobs(&ctx);
+
+        assert!(
+            output.len() < 8_000,
+            "diagnostics were not bounded: {} bytes",
+            output.len()
+        );
+        assert!(output.contains("validations=10000"), "got: {output}");
+        assert!(
+            output.contains("target_symbols(count=10000)"),
+            "got: {output}"
+        );
+        assert!(output.contains("7 older job(s) omitted"), "got: {output}");
+        assert!(!output.contains("textDocument/documentSymbol"));
+        assert!(!output.contains("server-9999"));
+        assert!(!output.contains("symbol-9999"));
+        assert!(!output.contains(&"phase".repeat(100)));
+        assert!(!output.contains(&"failure".repeat(100)));
+    }
+
+    #[test]
+    fn verbose_scope_summaries_bound_every_scope_shape() {
+        let many_values = (0..10_000)
+            .map(|index| format!("value-{index}"))
+            .collect::<Vec<_>>();
+        let summaries = [
+            bounded_scope_summary(&EnrichmentScope::TargetSymbols(many_values.clone())),
+            bounded_scope_summary(&EnrichmentScope::TaskRelevant {
+                files: many_values.clone(),
+                symbols: many_values.clone(),
+            }),
+            bounded_scope_summary(&EnrichmentScope::Root("root".repeat(1_000))),
+            bounded_scope_summary(&EnrichmentScope::Explicit("explicit".repeat(1_000))),
+        ];
+
+        assert_eq!(summaries[0], "target_symbols(count=10000)");
+        assert_eq!(summaries[1], "task_relevant(files=10000,symbols=10000)");
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.chars().count() < 300)
+        );
+        assert!(!summaries[2].contains(&"root".repeat(100)));
+        assert!(!summaries[3].contains(&"explicit".repeat(100)));
+    }
+
+    #[test]
+    fn verbose_search_reports_lsp_completeness_location_without_deserializing_it() {
+        let tmp = tempfile::tempdir().expect("temp repo");
+        let report_path = tmp
+            .path()
+            .join(crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH);
+        std::fs::create_dir_all(report_path.parent().expect("report parent"))
+            .expect("create report parent");
+        std::fs::write(
+            &report_path,
+            b"not valid json and intentionally unreadable as a report",
+        )
+        .expect("write sentinel report");
+
+        let output = format_lsp_completeness(tmp.path());
+
+        assert!(output.contains("persisted"), "got: {output}");
+        assert!(output.contains("status unverified"), "got: {output}");
+        assert!(
+            output.contains("summary missing or invalid"),
+            "got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -12765,7 +12989,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_per_file_lsp_completeness_is_mcp_visible() {
+    fn persisted_per_file_lsp_completeness_is_referenced_without_loading() {
         use crate::lsp_completeness::{
             AdvertisedCapability, FileCoverageRecord, FileRole, FileTerminalStatus,
             LspCompletenessReport, PersistedResults, RequestAttempt, RequestOutcome,
@@ -12808,10 +13032,19 @@ mod tests {
             }],
         );
         crate::lsp_completeness::persist_report(repo.path(), &report).unwrap();
-        let rendered = format_lsp_completeness(repo.path(), &[], &[]);
+        let rendered = format_lsp_completeness(repo.path());
         assert!(rendered.contains("benchmark per-file LSP completeness**: partial/degraded"));
+        assert!(rendered.contains("1 included / 1 total files"));
+        assert!(rendered.contains("1 report violation(s)"));
+        assert!(rendered.contains(crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH));
         assert!(rendered.contains(&report.digest));
-        assert!(rendered.contains("0/1 included files covered"));
+        let summary_size = std::fs::metadata(crate::lsp_completeness::summary_path(repo.path()))
+            .unwrap()
+            .len();
+        assert!(
+            summary_size < 2_048,
+            "summary is not bounded: {summary_size} bytes"
+        );
     }
 
     #[test]
