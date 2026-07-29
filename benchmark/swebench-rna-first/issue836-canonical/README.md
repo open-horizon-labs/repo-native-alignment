@@ -57,6 +57,15 @@ cell details, and evidence bindings are `prompt-replay-analysis.json` and
 `prompt-replay-analysis-evidence-manifest.json`. This is a mechanism check,
 not a population or scale claim.
 
+The final three-case D/E diagnostic asks whether a 4 KiB stable-ID manifest
+causes Sonnet to request caller-selected expansion when RNA is first optional
+and then explicitly preferred. E reuses D's primed query/result prompt
+byte-for-byte. Neither condition produces a follow-up RNA call, both resolve
+1/3 selected cases, and no scale or RNA-default change follows. Its path-free
+ledger and evidence bindings are
+`compact-progressive-disclosure-results.json` and
+`compact-progressive-disclosure-evidence-manifest.json`.
+
 Read [METHOD.md](METHOD.md) before interpreting the unified
 [REPORT.md](REPORT.md), which reports all 36 conditions and includes per-case
 metrics, quality measurements, and tool-type details. `results.json`,
@@ -95,6 +104,9 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_prompt_replay_analysis.py
+
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_compact_progressive_disclosure.py
 ```
 
 That mode recomputes aggregates, parity, effects, matrix/tool rows, registered
@@ -130,4 +142,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
 PYTHONDONTWRITEBYTECODE=1 \
   python3 benchmark/swebench-rna-first/issue836-canonical/verify_prompt_replay_analysis.py
+
+ISSUE836_EVIDENCE_ROOT="$PWD/../issue836-selector-20case-20260724" \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 benchmark/swebench-rna-first/issue836-canonical/verify_compact_progressive_disclosure.py
 ```

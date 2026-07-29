@@ -258,6 +258,69 @@ This remains a one-case mechanism check, not a population-effect estimate, so
 artifacts bound by
 [`prompt-replay-analysis-evidence-manifest.json`](prompt-replay-analysis-evidence-manifest.json).
 
+## Compact progressive-disclosure pilot: preference did not trigger expansion
+
+The later D/E pilot tested the product-shape question raised by the canonical
+prefix-replay analysis on three deliberately selected Sonnet cases (ranks 6,
+16, and 18). This is a post-hoc mechanism diagnostic, not a population
+estimate, and no scale run or RNA default change followed.
+
+D replaced the earlier 8 KiB treatment prefix with a 4 KiB complete-record
+manifest containing stable node IDs. It exposed bounded focused search and
+caller-selected one-hop expansion through an attempt-local RNA CLI wrapper,
+but made RNA optional. E then reused each D user prompt **byte-for-byte**—the
+verbatim `rna_tool_search(query)` call still appeared immediately above its
+compact result—and changed only the developer instruction to prefer RNA over
+Grep/Read for repository discovery and navigation.
+
+All six paid episodes completed normally and all six patches received stock
+SWE-bench 4.1.0 verdicts. Sonnet made **zero follow-up RNA calls in all three D
+episodes and all three E episodes**. Its first E tool was Grep on rank 6 and
+Read on ranks 16 and 18, using paths/symbols already present in the manifest.
+Thus D/E measured the compact pre-injected manifest, not interactive
+caller-selected expansion.
+
+| Condition | Resolved | Model time | RNA preprocessing | End-to-end | Direct input | Cache write | Cache read | Total input | Output | Cost | Tools |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Reused A | 1/3 | 688.3s | — | 688.3s | 2,232 | 89,363 | 2,671,575 | 2,763,170 | 33,878 | $1.848043 | 122 |
+| Previous graph-injected T | 2/3 | 702.6s | — | — | 28,025 | 86,659 | 2,242,817 | 2,357,501 | 26,412 | $1.616798 | 78 |
+| B / 8 KiB manifest | 1/3 | 358.0s | 92.3s | 450.3s | 11,230 | 72,320 | 1,876,373 | 1,959,923 | 21,818 | $1.335134 | 70 |
+| D / 4 KiB optional RNA | 1/3 | 410.3s | 83.0s | 493.3s | 6,811 | 75,750 | 1,628,832 | 1,711,393 | 18,005 | $1.219804 | 69 |
+| E / 4 KiB preferred RNA | 1/3 | 299.7s | 81.9s | 381.7s | 6,783 | 90,063 | 1,263,423 | 1,360,269 | 19,098 | $1.212340 | 55 |
+
+Relative to D, E changed model/end-to-end time by −26.9%/−22.6%, direct,
+cache-write, and cache-read input by −0.4%/+18.9%/−22.4%, total input by
+−20.5%, output by +6.1%, cost by −0.6%, and tools by −20.3%. E and D had the
+same 1/3 efficacy. These single-episode differences are descriptive trajectory
+variation or prompt-wording effects; because neither arm invoked RNA, they are
+not evidence that interactive progressive disclosure improved efficiency.
+
+Per-case D/E details, including tool type, are:
+
+| Rank | Arm | Verdict | First tool | Model/RNA/end-to-end | Direct / write / read input | Total input / output | Cost | Tools by type |
+|---:|---|---|---|---:|---:|---:|---:|---|
+| 6 | D | RESOLVED | — | 106.9 / 27.8 / 134.7s | 2,198 / 37,054 / 502,219 | 541,471 / 6,606 | $0.474216 | 21 (Bash=13, Edit=5, Grep=1, Read=2) |
+| 6 | E | RESOLVED | Grep | 142.6 / 26.9 / 169.4s | 2,204 / 38,077 / 601,300 | 641,581 / 9,552 | $0.554266 | 24 (Bash=11, Edit=6, Grep=3, Read=4) |
+| 16 | D | UNRESOLVED | — | 223.6 / 26.8 / 250.4s | 2,383 / 22,437 / 592,154 | 616,974 / 6,426 | $0.410931 | 24 (Bash=14, Edit=3, Read=6, Write=1) |
+| 16 | E | UNRESOLVED | Read | 50.9 / 26.8 / 77.7s | 2,351 / 22,589 / 153,665 | 178,605 / 2,413 | $0.220006 | 8 (Bash=5, Edit=1, Read=2) |
+| 18 | D | UNRESOLVED | — | 79.8 / 28.3 / 108.1s | 2,230 / 16,259 / 534,459 | 552,948 / 4,973 | $0.334657 | 24 (Bash=13, Edit=4, Read=6, Write=1) |
+| 18 | E | UNRESOLVED | Read | 106.3 / 28.3 / 134.6s | 2,228 / 29,397 / 508,458 | 540,083 / 7,133 | $0.438068 | 23 (Bash=12, Edit=4, Grep=1, Read=5, Write=1) |
+
+Rank 16 repeated D's semantic miss: it copied attributes only inside
+`SplitArrayWidget` and still failed
+`CheckboxInput.get_context()`'s no-mutation contract. Rank 18 again escaped
+unconditionally and failed `test_autoescape_off` and `test_basic`. Rank 6
+resolved. These were model patch failures, not provider, runner, RNA, or
+evaluator failures.
+
+The result rules out another prompt-only exhortation as the next useful test.
+A true progressive-disclosure test needs a native RNA tool/action affordance;
+plain text describing an executable wrapper did not induce Sonnet to traverse.
+The path-free ledger is
+[`compact-progressive-disclosure-results.json`](compact-progressive-disclosure-results.json),
+with 59 retained artifacts bound by
+[`compact-progressive-disclosure-evidence-manifest.json`](compact-progressive-disclosure-evidence-manifest.json).
+
 For continuity with the preregistered two-model A/T analysis, its original
 executive rows are retained verbatim:
 

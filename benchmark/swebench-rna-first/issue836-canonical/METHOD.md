@@ -465,6 +465,48 @@ terminal patch, and stock SWE-bench evaluation. All four cells passed. The
 same request-level replay formula above was then applied to the matched pair;
 no post-hoc cell filtering or scale execution followed.
 
+### Three-case D/E compact progressive-disclosure diagnostic
+
+After the matched A6/T6 gate, a separate Sonnet-only diagnostic tested whether
+bounded search results could serve as an index for caller-selected expansion.
+Ranks 6, 16, and 18 were frozen for this mechanism check before either D or E
+execution. Their existing canonical A observations were reused; no A episode
+was rerun. D and E each added three paid treatment episodes. This selected
+three-case pilot is explicitly outside the 720 canonical cells and cannot
+estimate a population effect.
+
+D used the unchanged warm exact-tree caches, strict hybrid retrieval with the
+unchanged reranker, and a hard 4,096-byte consumer-side response ceiling. The
+initial response contained as many complete metadata records as fit, including
+stable IDs but no bodies. The harness injected no graph and selected no
+automatic traversal root. It exposed bounded focused search and caller-selected
+one-hop, bidirectional expansion through an attempt-local RNA CLI wrapper.
+Ordinary repository, edit, and test tools remained available.
+
+E reused every D user-prompt byte exactly. In both arms the prompt began with
+the deterministic title-plus-normalized-first-512 query represented as
+`rna_tool_search(<query>)`, immediately followed by its compact result and then
+the standard SWE-bench task. E changed only the developer wording and
+attempt-local wrapper path: it said to prefer RNA over Grep/Read for discovery
+and to continue the demonstrated call/result pattern when more context was
+needed. Live zero-spend preflight reproduced each D compact result byte-for-byte
+before E model execution.
+
+Both arms used Claude Sonnet 5 through the logged-in CLI, the ordinary
+unrestricted episode runner, the same case commit/tree, a fresh episode
+checkout, and the stock SWE-bench 4.1.0 evaluator with the canonical image tag.
+No RNA source, producer, cache, reranker, or default changed. Preprocessing time
+is reported separately and added to model time for end-to-end accounting; it
+is not counted as a model tool call.
+
+Admission required successful provider completion, exact prompt hashes, a
+terminal patch, transcript/tool recount, an official patch-hash-bound verdict,
+and explicit accounting of direct, cache-write, cache-read, output, cost, and
+tools by type. All six D/E cells passed those gates. Neither transcript invoked
+the RNA wrapper, so the observed treatment is compact pre-injected context;
+interactive expansion remains untested. No scale run or RNA default change was
+authorized from this diagnostic.
+
 ## Model runtimes
 
 - **Sonnet:** Claude Sonnet 5 through the logged-in Claude CLI.

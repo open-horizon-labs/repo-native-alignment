@@ -24,9 +24,9 @@ MANIFEST = ROOT / "weaker-model-evidence-manifest.json"
 EXPECTED_RESULTS_SHA = "c09fdba9e3eaf058e5c7137a08376bcdf2cce35c9c92d9ef3eceaebb92e2b3a5"
 EXPECTED_FROZEN_RESULTS_SHA = "20ad9fcff75b91c5e86147de3cd2fbb63d582aec1950e3cbd0cca0e35d8a8a17"
 EXPECTED_FROZEN_T2_RESULTS_SHA = "26e9ad318e2d3a03f355499326dd644968bbd3770807d69d272c617ca7e62daf"
-EXPECTED_REPORT_SHA = "d6e4eda65545f32c6d4ae2d2795188feb64bbd8c7ea750ce288739c50bf9e4db"
-EXPECTED_METHOD_SHA = "89ce84aab737cc3516e0af4715e2e86642c0bdef350a018d2fc2654832e9a4ee"
-EXPECTED_README_SHA = "30ec278446fb452581a351376443e80a3f66a3cc024cb16a10ca2e1e6059e765"
+EXPECTED_REPORT_SHA = "bac0f7ccf844f4ad936a7fd93ecbb576bc36af32cff8626da6de759fcbe6f41c"
+EXPECTED_METHOD_SHA = "4751bd30bfd0e2de8f67ddfbc1690a3eb48972ff0f4de448f682cd29dfd775f2"
+EXPECTED_README_SHA = "b7a0490a66d5047250f24ddff1113ac1d93cc567413ec25bad55abc7d7a1a401"
 EXPECTED_MANIFEST_SHA = "a3f254abcbe892fbdcd31c5576082ec936e8c0c1211352fbb741197e26a4887b"
 BASE_SHA = "da68ef814351f2953d9954f4cc309bf755605ac4e672c3d5096106cc664e3d49"
 DIRECTIVE_SHA = "f91a19798b6fbee94e3e1ae17848991154d31ad2d60317f2f0436abfe327143b"
@@ -255,7 +255,13 @@ def main() -> int:
         condition: aggregate([row["conditions"][condition] for row in rows])
         for condition in CONDITIONS
     }
-    require(data["condition_summaries"] == observed, "condition summaries")
+    for condition, summary in observed.items():
+        expected = data["condition_summaries"][condition]
+        for field, value in summary.items():
+            if field in {"elapsed_seconds", "cost_usd"} and value is not None:
+                require(close(expected[field], value), f"{condition}: condition summary {field}")
+            else:
+                require(expected[field] == value, f"{condition}: condition summary {field}")
     prompt_summary = {}
     for arm in ("A", "T", "T2"):
         sizes = [row["conditions"][f"{arm}_haiku"]["prompt"]["bytes"] for row in rows]

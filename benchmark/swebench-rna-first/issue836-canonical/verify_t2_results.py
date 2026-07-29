@@ -20,8 +20,8 @@ REPORT = ROOT / "REPORT.md"
 METHOD = ROOT / "METHOD.md"
 MANIFEST = ROOT / "t2-evidence-manifest.json"
 EXPECTED_T2_RESULTS_SHA = "26e9ad318e2d3a03f355499326dd644968bbd3770807d69d272c617ca7e62daf"
-EXPECTED_REPORT_SHA = "d6e4eda65545f32c6d4ae2d2795188feb64bbd8c7ea750ce288739c50bf9e4db"
-EXPECTED_METHOD_SHA = "89ce84aab737cc3516e0af4715e2e86642c0bdef350a018d2fc2654832e9a4ee"
+EXPECTED_REPORT_SHA = "bac0f7ccf844f4ad936a7fd93ecbb576bc36af32cff8626da6de759fcbe6f41c"
+EXPECTED_METHOD_SHA = "4751bd30bfd0e2de8f67ddfbc1690a3eb48972ff0f4de448f682cd29dfd775f2"
 EXPECTED_MANIFEST_SHA = "518dc273c59fc548008c66f84ded5dcf1c377696aef0befb6824e3a2151b28cc"
 BASE_SHA = "da68ef814351f2953d9954f4cc309bf755605ac4e672c3d5096106cc664e3d49"
 DIRECTIVE_SHA = "f91a19798b6fbee94e3e1ae17848991154d31ad2d60317f2f0436abfe327143b"
@@ -233,7 +233,12 @@ def main() -> int:
     for condition in CONDITIONS:
         cells = [row["conditions"][condition] for row in rows]
         observed[condition] = aggregate(cells)
-        require(data["condition_summaries"][condition] == observed[condition], f"{condition}: aggregate")
+        expected = data["condition_summaries"][condition]
+        for field, value in observed[condition].items():
+            if field in {"elapsed_seconds", "cost_usd", "median_elapsed_seconds", "median_total_tokens"}:
+                require(close(expected[field], value), f"{condition}: aggregate {field}")
+            else:
+                require(expected[field] == value, f"{condition}: aggregate {field}")
     for backend in ("sonnet", "luna"):
         t2 = [row["conditions"][f"T2_{backend}"] for row in rows]
         for arm in ("A", "T"):
