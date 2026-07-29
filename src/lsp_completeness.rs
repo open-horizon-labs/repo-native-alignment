@@ -1725,7 +1725,7 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
     let bytes = serde_json::to_vec_pretty(report)?;
     let summary_bytes = serde_json::to_vec_pretty(&LspCompletenessSummary::from_report(report))?;
     anyhow::ensure!(
-        summary_bytes.len() + 1 <= MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        summary_bytes.len() < MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
         "LSP completeness summary exceeds {} bytes",
         MAX_LSP_COMPLETENESS_SUMMARY_BYTES
     );
@@ -1773,7 +1773,7 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
     };
     let summary_commit_bytes = serde_json::to_vec_pretty(&summary_commit)?;
     anyhow::ensure!(
-        summary_commit_bytes.len() + 1 <= MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES,
+        summary_commit_bytes.len() < MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES,
         "LSP completeness summary commit exceeds {} bytes",
         MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES
     );
