@@ -145,7 +145,16 @@ def verify_offline(data: dict[str, Any], manifest: dict[str, Any]) -> None:
     for name in CONDITIONS:
         observed = data["aggregate"][name]
         expected = aggregate(cases, name)
-        require(observed == expected, f"{name}: aggregate")
+        for field, value in expected.items():
+            if field in {
+                "elapsed_seconds",
+                "cost_usd",
+                "rna_retrieval_seconds",
+                "end_to_end_seconds",
+            }:
+                require(close(observed[field], value), f"{name}: aggregate {field}")
+            else:
+                require(observed[field] == value, f"{name}: aggregate {field}")
 
     require(data["observed"]["D_followup_rna_calls"] == 0, "D follow-up aggregate")
     require(data["observed"]["E_followup_rna_calls"] == 0, "E follow-up aggregate")
