@@ -9873,37 +9873,32 @@ mod tests {
             crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
         };
         ledger.mark_completed(tmp.path(), &job_id, 1, 1);
-        ledger.record_lsp_evidence(
-            tmp.path(),
-            &job_id,
-            crate::server::LspEvidenceCoverage {
-                readiness: crate::server::LspEvidenceReadiness::Full,
-                scope: crate::server::EnrichmentScope::Repo.stable_key(),
-                declared_node_count: 10_000,
-                max_requests: None,
-                max_duration_ms: None,
-                scheduled_requests: 10_000,
-                elapsed_ms: 1,
-                circuit_open: false,
-                detail: None,
-                validations: (0..10_000)
-                    .map(|index| {
-                        crate::extract::scan_stats::LspValidationEvidence::processed(
-                            "python",
-                            format!("server-{index}"),
-                            "textDocument/documentSymbol",
-                            index,
-                        )
-                    })
-                    .collect(),
-            },
-        );
-
-        let base_job = ledger
+        let mut base_job = ledger
             .recent_jobs(tmp.path(), 1)
             .into_iter()
             .next()
             .expect("persisted job");
+        base_job.lsp_evidence = Some(crate::server::LspEvidenceCoverage {
+            readiness: crate::server::LspEvidenceReadiness::Full,
+            scope: crate::server::EnrichmentScope::Repo.stable_key(),
+            declared_node_count: 10_000,
+            max_requests: None,
+            max_duration_ms: None,
+            scheduled_requests: 10_000,
+            elapsed_ms: 1,
+            circuit_open: false,
+            detail: None,
+            validations: (0..10_000)
+                .map(|index| {
+                    crate::extract::scan_stats::LspValidationEvidence::processed(
+                        "python",
+                        format!("server-{index}"),
+                        "textDocument/documentSymbol",
+                        index,
+                    )
+                })
+                .collect(),
+        });
         let mut ctx = make_search_context(&gs, tmp.path());
         ctx.enrichment_jobs = (0..12)
             .map(|index| {
