@@ -117,7 +117,9 @@ classified and assigned to #844 rather than hidden or deleted in #839.
   sidecars.
 - Verbose search emits at most five job summaries, validation counts rather
   than validation arrays, bounded scope/phase/identifier/failure/evidence
-  text, and explicit paths to the full persisted diagnostics.
+  text, and explicit paths to the full persisted diagnostics. The same bounded
+  delivery applies to explicit MCP `repo=` queries; their ledger is loaded
+  from the selected repository only when verbose diagnostics are requested.
 - Report persistence also writes a fixed-shape completeness summary and
   publishes a small commit marker only after the full report and summary are
   durable. The marker binds the exact summary bytes to the report digest,
@@ -131,5 +133,9 @@ classified and assigned to #844 rather than hidden or deleted in #839.
   files. Older, interrupted, stale, tampered, oversized, identity-mismatched, or
   graph-mismatched pairs are labeled `status unverified` rather than being
   treated as ready or forcing a full-report read.
+- A full graph persist invalidates readiness before mutation. When its retained
+  full report remains exact for the reopened graph and current identity, RNA
+  republishes the bounded summary/commit before returning instead of leaving
+  verbose readiness permanently unverified.
 - Full observability remains under `.oh/.cache/`; it is not copied into agent
   context.

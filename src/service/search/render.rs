@@ -311,7 +311,8 @@ fn render_metadata(plan: &ProjectionPlan) -> String {
                 one_line(&capability.capability),
                 capability.state
             ));
-            if plan.request.projection == SearchProjection::Evidence
+            if (plan.request.projection == SearchProjection::Evidence
+                || capability.capability == "readiness_diagnostics")
                 && !capability.detail.is_empty()
             {
                 output.push_str(&format!(" — {}", one_line(&capability.detail)));

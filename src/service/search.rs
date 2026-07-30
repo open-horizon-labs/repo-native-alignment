@@ -1736,7 +1736,7 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
             .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
             .then_with(|| left.selection.role.cmp(&right.selection.role))
     });
-    capabilities.extend(default_capabilities(ctx, request.projection).await);
+    capabilities.extend(default_capabilities(ctx, request.projection, params.verbose).await);
     capabilities = merge_capabilities(capabilities);
     relationships.extend(projected_relationships(&edge_index, &records));
     relationships.sort();
@@ -2894,7 +2894,8 @@ async fn task_records(
             .collect();
     }
     let request = projection_request(params, SearchIntent::Implement);
-    let default_task_capabilities = default_capabilities(ctx, request.projection).await;
+    let default_task_capabilities =
+        default_capabilities(ctx, request.projection, params.verbose).await;
     let base_output = output;
 
     // A record-level cap is evaluated in the same currency as selection: the
@@ -6425,6 +6426,7 @@ fn selected_from_exact_node(
 async fn default_capabilities(
     ctx: &SearchContext<'_>,
     projection: SearchProjection,
+    verbose: bool,
 ) -> Vec<CapabilityStatus> {
     let semantic_attached = ctx.embed_index.is_some();
     let semantic_probe = match ctx.embed_index {
@@ -6479,7 +6481,7 @@ async fn default_capabilities(
         },
     );
     let mut capabilities = vec![semantic, lsp.clone()];
-    if projection == SearchProjection::Evidence {
+    if verbose || projection == SearchProjection::Evidence {
         capabilities.push(CapabilityStatus {
             capability: "readiness_diagnostics".into(),
             state: lsp.state,
