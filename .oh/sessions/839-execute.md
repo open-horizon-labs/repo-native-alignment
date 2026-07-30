@@ -1,7 +1,7 @@
 ---
 session: issue-839
 artifact_type: session
-updated: 2026-07-29
+updated: 2026-07-30
 status: in-progress
 outcomes:
   - context-assembly
@@ -52,12 +52,16 @@ discarding each first filesystem/recovery run:
 
 The copied Django cache recovered to a 103,057-symbol projection on its first
 final-binary access, so those component measurements are not represented as
-measurements of the historical 301,300-node projection. The executable
-regression separately constructs a 300,000-node graph with the retained
-rank-9 traversal shape and requires graph initialization under 30 s, exact
-lookup/render under 10 s, output under 8 KiB, nine results, and no default
-diagnostics. It completed in 0.33 s on the development machine. This separates
-in-memory traversal/render cost from one-process cache recovery and startup.
+measurements of the historical 301,300-node projection. The final executable
+regression instead persists and reopens a synthetic cache with the exact
+historical inventory shape: 301,300 nodes, 535,850 edges, nine neighbors at the
+target, and sparse diagnostic sidecars of 147, 176, and 119 MiB. It then invokes
+the actual CLI binary against that cache, with a hard 30-second child-process
+deadline, and proves that the source sentinel is not rescanned, node/edge counts
+do not amplify, the sidecars are not touched, output remains under 8 KiB, and
+the nine graph results are preserved. On the M4 Max host, persisted graph load
+took 1.47 s and the separate CLI query took 6.20 s (1,262 output bytes); the full
+test body completed in 11.56 s.
 
 ## Root cause
 
@@ -102,9 +106,12 @@ classified and assigned to #844 rather than hidden or deleted in #839.
 - Report persistence also writes a fixed-shape completeness summary and
   publishes a small commit marker only after the full report and summary are
   durable. The marker binds the exact summary bytes to the report digest,
-  length, and modification identity. Search reports ready/degraded status,
-  counts, violations, and digest only when that binding verifies. Older,
-  interrupted, stale, tampered, or oversized pairs are labeled `status
-  unverified` rather than being treated as ready or forcing a full-report read.
+  length, and modification identity. The bounded summary also carries the
+  producer's graph-snapshot digest; verbose search compares it to the graph
+  serving the query before reporting ready/degraded status. Full/incremental
+  graph writes and root pruning invalidate the publication marker before
+  mutation. Older, interrupted, stale, tampered, oversized, or graph-mismatched
+  pairs are labeled `status unverified` rather than being treated as ready or
+  forcing a full-report read.
 - Full observability remains under `.oh/.cache/`; it is not copied into agent
   context.

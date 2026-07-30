@@ -938,30 +938,41 @@ fn format_verbose_readiness(
             semantic_index_attached,
             semantic_index_available,
         ),
-        format_lsp_completeness(ctx.repo_root),
+        format_lsp_completeness(ctx.repo_root, gs),
         format_enrichment_jobs(ctx),
     )
 }
 
-fn format_lsp_completeness(repo_root: &Path) -> String {
+fn format_lsp_completeness(repo_root: &Path, graph_state: &GraphState) -> String {
     let report = crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH;
     if !repo_root.join(report).is_file() {
         return "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
     }
 
     match crate::lsp_completeness::load_summary(repo_root) {
-        Ok(summary) => format!(
-            "\n- **benchmark per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
-            if summary.ready {
-                "ready"
-            } else {
-                "partial/degraded"
-            },
-            summary.included_files,
-            summary.total_files,
-            summary.excluded_files,
-            summary.violation_count,
-            bounded_diagnostic_text(&summary.report_digest),
+        Ok(summary)
+            if summary.graph_snapshot_digest
+                == crate::lsp_completeness::graph_snapshot_digest(
+                    &graph_state.nodes,
+                    &graph_state.edges,
+                ) =>
+        {
+            format!(
+                "\n- **benchmark per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
+                if summary.ready {
+                    "ready"
+                } else {
+                    "partial/degraded"
+                },
+                summary.included_files,
+                summary.total_files,
+                summary.excluded_files,
+                summary.violation_count,
+                bounded_diagnostic_text(&summary.report_digest),
+            )
+        }
+        Ok(_) => format!(
+            "\n- **benchmark per-file LSP completeness**: persisted, status unverified — bounded summary belongs to a different graph snapshot; full diagnostics: `{report}`"
         ),
         Err(_) => format!(
             "\n- **benchmark per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
@@ -9975,7 +9986,8 @@ mod tests {
         )
         .expect("write sentinel report");
 
-        let output = format_lsp_completeness(tmp.path());
+        let graph_state = make_graph_state_with_edges(Vec::new(), Vec::new());
+        let output = format_lsp_completeness(tmp.path(), &graph_state);
 
         assert!(output.contains("persisted"), "got: {output}");
         assert!(output.contains("status unverified"), "got: {output}");
@@ -12997,7 +13009,8 @@ mod tests {
             crate::business_context::BusinessContextMode::Disabled,
         )
         .unwrap();
-        let report = LspCompletenessReport::new(
+        let graph_state = make_graph_state_with_edges(Vec::new(), Vec::new());
+        let report = LspCompletenessReport::new_bound(
             identity,
             vec![FileCoverageRecord {
                 path: "src/app.py".to_string(),
@@ -13025,9 +13038,11 @@ mod tests {
                 terminal_status: FileTerminalStatus::Processed { result_count: 0 },
                 exclusion: None,
             }],
+            &graph_state.nodes,
+            &graph_state.edges,
         );
         crate::lsp_completeness::persist_report(repo.path(), &report).unwrap();
-        let rendered = format_lsp_completeness(repo.path());
+        let rendered = format_lsp_completeness(repo.path(), &graph_state);
         assert!(rendered.contains("benchmark per-file LSP completeness**: partial/degraded"));
         assert!(rendered.contains("1 included / 1 total files"));
         assert!(rendered.contains("1 report violation(s)"));
@@ -13039,6 +13054,21 @@ mod tests {
         assert!(
             summary_size < 2_048,
             "summary is not bounded: {summary_size} bytes"
+        );
+
+        let changed_graph = make_graph_state_with_edges(
+            vec![make_node(
+                "post_report_change",
+                NodeKind::Function,
+                "src/changed.py",
+            )],
+            Vec::new(),
+        );
+        let rendered = format_lsp_completeness(repo.path(), &changed_graph);
+        assert!(rendered.contains("status unverified"), "got: {rendered}");
+        assert!(
+            rendered.contains("different graph snapshot"),
+            "got: {rendered}"
         );
     }
 

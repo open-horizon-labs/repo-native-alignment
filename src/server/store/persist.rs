@@ -10,6 +10,7 @@ use lancedb::expr::{DfExpr, col, lit};
 
 use crate::graph::store::SCHEMA_VERSION;
 use crate::graph::{Edge, Node};
+use crate::lsp_completeness::invalidate_summary_publication;
 
 use super::batch::{build_edges_batch, build_symbols_batch};
 use super::migrate::{
@@ -54,6 +55,8 @@ pub(crate) async fn persist_graph_to_lance(
     nodes: &[Node],
     edges: &[Edge],
 ) -> anyhow::Result<()> {
+    invalidate_summary_publication(repo_root)
+        .context("failed to invalidate LSP readiness before full graph persistence")?;
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
@@ -315,6 +318,14 @@ async fn persist_graph_incremental_with_retry_limit(
     retry_limit: u64,
     instrumentation: Option<&PersistInstrumentation>,
 ) -> anyhow::Result<bool> {
+    let changes_graph = !upsert_nodes.is_empty()
+        || !upsert_edges.is_empty()
+        || !deleted_edge_ids.is_empty()
+        || !deleted_files.is_empty();
+    if changes_graph {
+        invalidate_summary_publication(repo_root)
+            .context("failed to invalidate LSP readiness before incremental graph persistence")?;
+    }
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
@@ -597,6 +608,9 @@ pub(crate) async fn delete_nodes_for_roots(
         return Ok(());
     }
 
+    invalidate_summary_publication(repo_root)
+        .context("failed to invalidate LSP readiness before stale-root pruning")?;
+
     let db = lancedb::connect(db_path.to_str().unwrap())
         .execute()
         .await
@@ -636,7 +650,11 @@ mod tests {
         drop_all_lance_tables, read_committed_scan_version, scan_version_path,
     };
     use super::*;
+    use crate::business_context::BusinessContextMode;
     use crate::graph::{ExtractionSource, NodeId, NodeKind};
+    use crate::lsp_completeness::{
+        LspCompletenessReport, current_report_identity, load_summary, persist_report,
+    };
 
     fn make_test_node(name: &str) -> Node {
         Node {
@@ -1121,6 +1139,52 @@ mod tests {
             read_committed_scan_version(&db_path),
             2,
             "second persist should write version 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_mutations_invalidate_published_lsp_readiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = current_report_identity(dir.path(), BusinessContextMode::Disabled)
+            .expect("report identity");
+        let report = LspCompletenessReport::new(identity, Vec::new());
+        persist_report(dir.path(), &report).expect("publish bounded readiness");
+        assert!(load_summary(dir.path()).is_ok());
+
+        persist_graph_to_lance(dir.path(), &[make_test_node("changed_graph")], &[])
+            .await
+            .expect("persist changed graph");
+
+        let error = load_summary(dir.path()).expect_err("changed graph must invalidate readiness");
+        assert!(
+            error
+                .to_string()
+                .contains("LSP completeness summary commit is missing"),
+            "unexpected invalidation error: {error:#}"
+        );
+
+        persist_report(dir.path(), &report).expect("republish after full graph write");
+        persist_graph_incremental(
+            dir.path(),
+            &[make_test_node("incremental_change")],
+            &[],
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist incremental graph change");
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "incremental graph write retained stale readiness"
+        );
+
+        persist_report(dir.path(), &report).expect("republish after incremental graph write");
+        delete_nodes_for_roots(dir.path(), &["local".to_string()])
+            .await
+            .expect("prune persisted graph root");
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "root pruning retained stale readiness"
         );
     }
 

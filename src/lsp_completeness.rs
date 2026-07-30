@@ -32,7 +32,7 @@ pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json
 pub const LSP_COMPLETENESS_SUMMARY_PATH: &str = ".oh/.cache/lsp_completeness_summary.json";
 pub const LSP_COMPLETENESS_SUMMARY_COMMIT_PATH: &str =
     ".oh/.cache/lsp_completeness_summary.commit.json";
-const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 1;
+const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 2;
 const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
 static PERSIST_REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -358,6 +358,7 @@ pub struct LspCompletenessSummary {
     pub excluded_files: u64,
     pub violation_count: u64,
     pub report_digest: String,
+    pub graph_snapshot_digest: String,
 }
 
 /// Last publication marker for the bounded summary/full-report pair.
@@ -384,6 +385,7 @@ impl LspCompletenessSummary {
             excluded_files: report.summary.excluded_files,
             violation_count: report.violations.len() as u64,
             report_digest: report.digest.clone(),
+            graph_snapshot_digest: report.graph_snapshot_digest.clone(),
         }
     }
 }
@@ -658,7 +660,7 @@ impl LspCompletenessReport {
     }
 }
 
-fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
+pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
     let mut entries = BTreeSet::new();
     for node in nodes {
         entries.insert(("node", node.stable_id(), format!("{:?}", node.source)));
@@ -1791,6 +1793,24 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
         )
     })?;
     Ok(())
+}
+
+/// Invalidate the bounded readiness publication before the persisted graph is
+/// mutated. The full report remains available for diagnostics, but readers
+/// must not treat its summary as current until a report for the new graph has
+/// been published.
+pub(crate) fn invalidate_summary_publication(repo_root: &Path) -> Result<()> {
+    let path = summary_commit_path(repo_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to invalidate LSP completeness publication {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 pub fn load_summary(repo_root: &Path) -> Result<LspCompletenessSummary> {
