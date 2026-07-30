@@ -122,12 +122,13 @@ classified and assigned to #844 rather than hidden or deleted in #839.
   publishes a small commit marker only after the full report and summary are
   durable. The marker binds the exact summary bytes to the report digest,
   length, and modification identity. The bounded summary also carries the
-  producer's exact serialized node-and-edge snapshot digest; verbose search
-  compares it to the graph serving the query before reporting ready/degraded
-  status. Report publication, full/incremental graph writes, and root pruning
-  share a repo-scoped cross-process advisory lock. Graph writers invalidate the
-  publication marker before mutation, and competing reports cannot cross-pair
-  their final files. Older, interrupted, stale, tampered, oversized, or
+  producer's exact persisted node-and-edge projection plus the report-identity
+  digest. Verbose search compares both to the graph and runtime serving the
+  query before reporting ready/degraded status. Report publication, schema
+  migration, full/incremental graph writes, and root pruning share a repo-scoped
+  cross-process advisory lock. Graph mutations invalidate the publication
+  marker before mutation, and competing reports cannot cross-pair their final
+  files. Older, interrupted, stale, tampered, oversized, identity-mismatched, or
   graph-mismatched pairs are labeled `status unverified` rather than being
   treated as ready or forcing a full-report read.
 - Full observability remains under `.oh/.cache/`; it is not copied into agent

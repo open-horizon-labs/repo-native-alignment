@@ -32,7 +32,7 @@ pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json
 pub const LSP_COMPLETENESS_SUMMARY_PATH: &str = ".oh/.cache/lsp_completeness_summary.json";
 pub const LSP_COMPLETENESS_SUMMARY_COMMIT_PATH: &str =
     ".oh/.cache/lsp_completeness_summary.commit.json";
-const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 2;
+const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 3;
 const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
 const LSP_COMPLETENESS_PUBLICATION_LOCK_PATH: &str = ".oh/.cache/lsp_completeness.publication.lock";
@@ -359,6 +359,7 @@ pub struct LspCompletenessSummary {
     pub excluded_files: u64,
     pub violation_count: u64,
     pub report_digest: String,
+    pub report_identity_digest: String,
     pub graph_snapshot_digest: String,
 }
 
@@ -386,6 +387,7 @@ impl LspCompletenessSummary {
             excluded_files: report.summary.excluded_files,
             violation_count: report.violations.len() as u64,
             report_digest: report.digest.clone(),
+            report_identity_digest: report_identity_digest(&report.identity),
             graph_snapshot_digest: report.graph_snapshot_digest.clone(),
         }
     }
@@ -662,6 +664,21 @@ impl LspCompletenessReport {
 }
 
 pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
+    /// Exact node projection stored in Lance. `Node::language` is deliberately
+    /// absent from the symbols table and is reconstructed from `NodeId::file`
+    /// on reopen, so hashing that derived field would make one persisted graph
+    /// acquire two identities before and after its storage round trip.
+    #[derive(Serialize)]
+    struct PersistedNodeSnapshot<'a> {
+        id: &'a crate::graph::NodeId,
+        line_start: usize,
+        line_end: usize,
+        signature: &'a str,
+        body: &'a str,
+        metadata: &'a BTreeMap<String, String>,
+        source: &'a ExtractionSource,
+    }
+
     let mut ordered_nodes = nodes
         .iter()
         .map(|node| (node.stable_id(), node))
@@ -679,8 +696,16 @@ pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
         hasher.update(stable_id.as_bytes());
         hasher.update(&[0]);
         hasher.update(
-            &serde_json::to_vec(node)
-                .expect("graph node snapshot digest serialization cannot fail"),
+            &serde_json::to_vec(&PersistedNodeSnapshot {
+                id: &node.id,
+                line_start: node.line_start,
+                line_end: node.line_end,
+                signature: &node.signature,
+                body: &node.body,
+                metadata: &node.metadata,
+                source: &node.source,
+            })
+            .expect("graph node snapshot digest serialization cannot fail"),
         );
         hasher.update(&[0xff]);
     }
@@ -695,6 +720,33 @@ pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn report_identity_digest(identity: &ReportIdentity) -> String {
+    let bytes =
+        serde_json::to_vec(identity).expect("LSP report identity digest serialization cannot fail");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// Load the bounded summary only when both its report generation and exact
+/// persisted graph projection match the runtime serving the query.
+pub fn load_runtime_summary(
+    repo_root: &Path,
+    context_mode: BusinessContextMode,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<LspCompletenessSummary> {
+    let summary = load_summary(repo_root)?;
+    let current_identity = current_report_identity(repo_root, context_mode)?;
+    anyhow::ensure!(
+        summary.report_identity_digest == report_identity_digest(&current_identity),
+        "LSP completeness summary report identity does not match the current runtime"
+    );
+    anyhow::ensure!(
+        summary.graph_snapshot_digest == graph_snapshot_digest(nodes, edges),
+        "LSP completeness summary graph identity does not match the current runtime"
+    );
+    Ok(summary)
 }
 
 fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
@@ -6015,6 +6067,66 @@ mod tests {
             graph_snapshot_digest(std::slice::from_ref(&node), &[]),
             graph_snapshot_digest(std::slice::from_ref(&changed_metadata), &[]),
             "metadata-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_derived_language = node.clone();
+        changed_derived_language.language = "reconstructed".to_string();
+        assert_eq!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_derived_language), &[]),
+            "unpersisted language derivation changed persisted graph identity"
+        );
+    }
+
+    #[test]
+    fn bounded_summary_rejects_same_graph_from_a_different_report_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: crate::graph::NodeId {
+                root: "local".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "symbol".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn symbol()".to_string(),
+            line_start: 1,
+            line_end: 1,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let identity = current_report_identity(repo.path(), BusinessContextMode::Disabled).unwrap();
+        let report = LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            std::slice::from_ref(&node),
+            &[],
+        );
+        persist_report(repo.path(), &report).unwrap();
+        load_runtime_summary(
+            repo.path(),
+            BusinessContextMode::Disabled,
+            std::slice::from_ref(&node),
+            &[],
+        )
+        .expect("unchanged runtime identity must admit the bounded summary");
+
+        fs::write(
+            repo.path().join(".oh/config.toml"),
+            b"exclude = [\"target\"]\n",
+        )
+        .unwrap();
+        let error = load_runtime_summary(
+            repo.path(),
+            BusinessContextMode::Disabled,
+            std::slice::from_ref(&node),
+            &[],
+        )
+        .expect_err("changed config identity must reject the bounded summary");
+        assert!(
+            error.to_string().contains("report identity"),
+            "unexpected identity mismatch: {error:#}"
         );
     }
 

@@ -1735,8 +1735,7 @@ impl RnaHandler {
         // Pre-flight: ensure schema version matches. If migration happened,
         // the cache was rebuilt and our loaded graph is stale -- fall back to
         // full rebuild by returning an error that the caller can catch.
-        let db_path = super::store::graph_lance_path(&self.repo_root);
-        if super::store::check_and_migrate_schema(&db_path).await? {
+        if super::store::check_and_migrate_schema(&self.repo_root).await? {
             tracing::info!(
                 "Schema migrated during incremental pre-flight -- falling back to full rebuild"
             );

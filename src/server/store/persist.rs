@@ -16,8 +16,8 @@ use crate::lsp_completeness::{
 
 use super::batch::{build_edges_batch, build_symbols_batch};
 use super::migrate::{
-    check_and_migrate_schema, drop_all_lance_tables, is_conflict_error, is_schema_mismatch_error,
-    read_committed_scan_version, write_committed_scan_version,
+    check_and_migrate_schema_under_lock, drop_all_lance_tables, is_conflict_error,
+    is_schema_mismatch_error, read_committed_scan_version, write_committed_scan_version,
 };
 use super::{PREDICATE_BATCH_SIZE, graph_lance_path, string_isin};
 
@@ -66,7 +66,7 @@ pub(crate) async fn persist_graph_to_lance(
     std::fs::create_dir_all(&db_path)?;
 
     // Safety net: ensure schema is current before any writes.
-    if check_and_migrate_schema(&db_path).await? {
+    if check_and_migrate_schema_under_lock(repo_root, &db_path).await? {
         tracing::info!("Schema migrated to v{} -- cache rebuilt", SCHEMA_VERSION);
     }
 
@@ -338,7 +338,7 @@ async fn persist_graph_incremental_with_retry_limit(
     std::fs::create_dir_all(&db_path)?;
 
     // Pre-flight: ensure schema version matches before any LanceDB writes.
-    if check_and_migrate_schema(&db_path).await? {
+    if check_and_migrate_schema_under_lock(repo_root, &db_path).await? {
         tracing::info!(
             "Schema migrated to v{} during incremental update -- cache rebuilt; caller should do a full persist",
             SCHEMA_VERSION
@@ -664,8 +664,8 @@ mod tests {
     use crate::business_context::BusinessContextMode;
     use crate::graph::{ExtractionSource, NodeId, NodeKind};
     use crate::lsp_completeness::{
-        LspCompletenessReport, current_report_identity, load_summary, persist_report,
-        persist_report_with_precommit_hook,
+        LspCompletenessReport, current_report_identity, graph_snapshot_digest, load_summary,
+        persist_report, persist_report_with_precommit_hook,
     };
 
     fn make_test_node(name: &str) -> Node {
@@ -1190,6 +1190,29 @@ mod tests {
         assert!(
             load_summary(dir.path()).is_err(),
             "root pruning retained stale readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_graph_identity_matches_the_active_delivery_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut repository_sentinel = make_test_node("repository");
+        repository_sentinel.id.file = PathBuf::new();
+        repository_sentinel.language = "derived-before-persist".to_string();
+        let nodes = vec![repository_sentinel];
+
+        persist_graph_to_lance(dir.path(), &nodes, &[])
+            .await
+            .expect("persist graph with an unpersisted language field");
+        let reopened = load_graph_from_lance(dir.path())
+            .await
+            .expect("reopen persisted graph");
+
+        assert_ne!(nodes[0].language, reopened.nodes[0].language);
+        assert_eq!(
+            graph_snapshot_digest(&nodes, &[]),
+            graph_snapshot_digest(&reopened.nodes, &reopened.edges),
+            "one persisted graph acquired different readiness identities before and after reopen"
         );
     }
 
