@@ -12,6 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::business_context::BusinessContextMode;
@@ -34,6 +35,7 @@ pub const LSP_COMPLETENESS_SUMMARY_COMMIT_PATH: &str =
 const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 1;
 const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
+static PERSIST_REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
 const FROZEN_POPULATION_JSON: &[u8] =
@@ -1700,6 +1702,18 @@ fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn report_temp_paths(parent: &Path) -> [PathBuf; 3] {
+    let sequence = PERSIST_REPORT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("{}-{sequence}", std::process::id());
+    [
+        parent.join(format!(".lsp_completeness.json.tmp-{suffix}")),
+        parent.join(format!(".lsp_completeness_summary.json.tmp-{suffix}")),
+        parent.join(format!(
+            ".lsp_completeness_summary.commit.json.tmp-{suffix}"
+        )),
+    ]
+}
+
 pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Result<()> {
     let path = report_path(repo_root);
     let summary_path = summary_path(repo_root);
@@ -1713,15 +1727,7 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
             parent.display()
         )
     })?;
-    let temp = parent.join(format!(".lsp_completeness.json.tmp-{}", std::process::id()));
-    let summary_temp = parent.join(format!(
-        ".lsp_completeness_summary.json.tmp-{}",
-        std::process::id()
-    ));
-    let summary_commit_temp = parent.join(format!(
-        ".lsp_completeness_summary.commit.json.tmp-{}",
-        std::process::id()
-    ));
+    let [temp, summary_temp, summary_commit_temp] = report_temp_paths(parent);
     let bytes = serde_json::to_vec_pretty(report)?;
     let summary_bytes = serde_json::to_vec_pretty(&LspCompletenessSummary::from_report(report))?;
     anyhow::ensure!(
@@ -5035,16 +5041,24 @@ mod tests {
         assert!(error.contains("failed to invalidate"), "got: {error}");
 
         let parent = report_path(repo.path()).parent().unwrap().to_path_buf();
-        for name in [
-            format!(".lsp_completeness.json.tmp-{}", std::process::id()),
-            format!(".lsp_completeness_summary.json.tmp-{}", std::process::id()),
-            format!(
-                ".lsp_completeness_summary.commit.json.tmp-{}",
-                std::process::id()
-            ),
-        ] {
-            assert!(!parent.join(name).exists());
-        }
+        let temp_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect::<Vec<_>>();
+        assert!(temp_names.is_empty(), "leftover temps: {temp_names:?}");
+    }
+
+    #[test]
+    fn report_temp_paths_are_unique_per_invocation() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = report_temp_paths(parent.path());
+        let second = report_temp_paths(parent.path());
+
+        assert!(
+            first.iter().all(|path| !second.contains(path)),
+            "overlapping publications must never share temp paths"
+        );
     }
 
     #[test]
