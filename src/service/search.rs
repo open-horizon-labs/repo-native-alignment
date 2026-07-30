@@ -9106,9 +9106,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn rank9_sized_exact_traversal_is_interactive_and_bounded() {
-        const NODE_COUNT: usize = 300_000;
+    async fn profile_exact_traversal_shape(label: &str, node_count: usize, edge_count: usize) {
         const MAX_GRAPH_BUILD: std::time::Duration = std::time::Duration::from_secs(30);
         const MAX_QUERY: std::time::Duration = std::time::Duration::from_secs(10);
         const MAX_OUTPUT_BYTES: usize = 8 * 1024;
@@ -9124,25 +9122,38 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let edges = callees
+        let target_edges = callees
             .iter()
             .map(|callee| make_edge(&target, callee, crate::graph::EdgeKind::Calls))
             .collect::<Vec<_>>();
-        let mut nodes = Vec::with_capacity(NODE_COUNT);
+        let mut nodes = Vec::with_capacity(node_count);
         nodes.push(target.clone());
         nodes.extend(callees);
-        for index in nodes.len()..NODE_COUNT {
+        for index in nodes.len()..node_count {
             nodes.push(make_node(
                 &format!("unrelated_{index}"),
                 NodeKind::Function,
                 &format!("src/unrelated_{index}.rs"),
             ));
         }
+        let mut edges = Vec::with_capacity(edge_count);
+        edges.extend(target_edges);
+        let unrelated = &nodes[10..];
+        for index in 0..(edge_count - edges.len()) {
+            let from = index % unrelated.len();
+            let hop = 1 + index / unrelated.len();
+            let to = (from + hop) % unrelated.len();
+            edges.push(make_edge(
+                &unrelated[from],
+                &unrelated[to],
+                crate::graph::EdgeKind::Calls,
+            ));
+        }
         let graph_state = make_graph_state_with_edges(nodes, edges);
         let build_elapsed = build_started.elapsed();
         assert!(
             build_elapsed < MAX_GRAPH_BUILD,
-            "300k-node in-memory graph initialization took {build_elapsed:?}"
+            "{label} in-memory graph initialization took {build_elapsed:?}"
         );
 
         let repo_root = PathBuf::from("/tmp/rna-rank9-sized-regression");
@@ -9158,13 +9169,46 @@ mod tests {
             ..Default::default()
         };
 
+        let lookup_started = std::time::Instant::now();
+        let groups = crate::server::handlers::run_traversal_grouped(
+            &graph_state.index,
+            &target.stable_id(),
+            "neighbors",
+            None,
+            Some("outgoing"),
+            None,
+        )
+        .expect("exact one-hop lookup");
+        let lookup_elapsed = lookup_started.elapsed();
+        assert_eq!(groups.values().map(Vec::len).sum::<usize>(), 9);
+
+        let render_started = std::time::Instant::now();
+        let mut phase_render = format_neighbors_grouped_with_root(
+            &graph_state.nodes,
+            &groups,
+            &graph_state.index,
+            true,
+            None,
+            false,
+            false,
+        );
+        let evidence_index = EdgeEvidenceIndex::new(&graph_state.edges);
+        phase_render.push_str(&format_indexed_edge_evidence_for_groups(
+            &evidence_index,
+            &target.stable_id(),
+            &groups,
+            "outgoing",
+        ));
+        let render_elapsed = render_started.elapsed();
+        assert!(phase_render.len() < MAX_OUTPUT_BYTES);
+
         let query_started = std::time::Instant::now();
         let output = search(&params, &ctx).await;
         let query_elapsed = query_started.elapsed();
 
         assert!(
             query_elapsed < MAX_QUERY,
-            "300k-node exact traversal took {query_elapsed:?}"
+            "{label} exact traversal took {query_elapsed:?}"
         );
         assert!(
             output.len() < MAX_OUTPUT_BYTES,
@@ -9174,6 +9218,16 @@ mod tests {
         assert!(output.contains("9 result(s)"), "got: {output}");
         assert!(!output.contains("Capability readiness"), "got: {output}");
         assert!(!output.contains("Enrichment jobs"), "got: {output}");
+        eprintln!(
+            "{label} exact traversal phases: nodes={node_count}, edges={edge_count}, graph_init={build_elapsed:?}, lookup={lookup_elapsed:?}, render={render_elapsed:?}, service_total={query_elapsed:?}, output_bytes={}",
+            output.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_and_rank9_exact_traversal_phases_are_profiled_and_bounded() {
+        profile_exact_traversal_shape("normal", 4_947, 9_537).await;
+        profile_exact_traversal_shape("rank-9", 301_300, 535_850).await;
     }
 
     #[test]

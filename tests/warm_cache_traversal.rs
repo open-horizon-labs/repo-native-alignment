@@ -14,6 +14,8 @@ use repo_native_alignment::server::{GraphState, RnaHandler, load_graph_from_lanc
 
 const RANK9_NODE_COUNT: usize = 301_300;
 const RANK9_EDGE_COUNT: usize = 535_850;
+const NORMAL_NODE_COUNT: usize = 4_947;
+const NORMAL_EDGE_COUNT: usize = 9_537;
 const MAX_WARM_LOAD: Duration = Duration::from_secs(30);
 const MAX_CLI_QUERY: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
@@ -86,8 +88,25 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> Output {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() {
+fn profile_cli_startup() -> (Duration, Duration) {
+    let mut samples = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let started = Instant::now();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"));
+        command.arg("--version");
+        let output = output_with_timeout(&mut command, MAX_CLI_QUERY);
+        assert!(output.status.success(), "CLI startup probe failed");
+        samples.push(started.elapsed());
+    }
+    (samples[0], samples[1])
+}
+
+async fn profile_persisted_cache_shape(
+    label: &str,
+    node_count: usize,
+    edge_count: usize,
+    large_sidecars: bool,
+) {
     let repo = tempfile::tempdir().expect("temporary persisted-cache fixture");
     let handler = RnaHandler {
         repo_root: repo.path().to_path_buf(),
@@ -106,16 +125,16 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
         .iter()
         .map(|callee| edge(&target, callee))
         .collect::<Vec<_>>();
-    let mut nodes = Vec::with_capacity(RANK9_NODE_COUNT);
+    let mut nodes = Vec::with_capacity(node_count);
     nodes.push(target.clone());
     nodes.extend(callees);
-    for index in nodes.len()..RANK9_NODE_COUNT {
+    for index in nodes.len()..node_count {
         nodes.push(node(format!("unrelated_{index}")));
     }
-    let mut edges = Vec::with_capacity(RANK9_EDGE_COUNT);
+    let mut edges = Vec::with_capacity(edge_count);
     edges.extend(target_edges);
     let unrelated = &nodes[10..];
-    for index in 0..(RANK9_EDGE_COUNT - edges.len()) {
+    for index in 0..(edge_count - edges.len()) {
         let from = index % unrelated.len();
         let hop = 1 + index / unrelated.len();
         let to = (from + hop) % unrelated.len();
@@ -130,14 +149,28 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
     handler
         .persist_graph_snapshot(&graph)
         .await
-        .expect("persist rank-9-shaped graph cache");
+        .unwrap_or_else(|error| panic!("persist {label} graph cache: {error:#}"));
     drop(graph);
 
     let cache = repo.path().join(".oh/.cache");
+    let sidecar_megabytes = if large_sidecars {
+        [147_u64, 176, 119]
+    } else {
+        [1_u64, 1, 1]
+    };
     let sidecars = [
-        (cache.join("enrichment_jobs.json"), 147 * 1024 * 1024),
-        (cache.join("lsp_completeness.json"), 176 * 1024 * 1024),
-        (cache.join("lsp_pass1_work_items.json"), 119 * 1024 * 1024),
+        (
+            cache.join("enrichment_jobs.json"),
+            sidecar_megabytes[0] * 1024 * 1024,
+        ),
+        (
+            cache.join("lsp_completeness.json"),
+            sidecar_megabytes[1] * 1024 * 1024,
+        ),
+        (
+            cache.join("lsp_pass1_work_items.json"),
+            sidecar_megabytes[2] * 1024 * 1024,
+        ),
     ];
     for (path, bytes) in &sidecars {
         sparse_sidecar(path, *bytes);
@@ -154,11 +187,11 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
         .await
         .expect("load persisted graph through production cache reader");
     let load_elapsed = load_started.elapsed();
-    assert_eq!(loaded.nodes.len(), RANK9_NODE_COUNT);
-    assert_eq!(loaded.edges.len(), RANK9_EDGE_COUNT);
+    assert_eq!(loaded.nodes.len(), node_count);
+    assert_eq!(loaded.edges.len(), edge_count);
     assert!(
         load_elapsed < MAX_WARM_LOAD,
-        "rank-9-sized warm cache load took {load_elapsed:?}"
+        "{label} warm cache load took {load_elapsed:?}"
     );
     drop(loaded);
 
@@ -192,7 +225,7 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
     );
     assert!(
         query_elapsed < MAX_CLI_QUERY,
-        "rank-9-sized warm CLI traversal took {query_elapsed:?}"
+        "{label} warm CLI traversal took {query_elapsed:?}"
     );
     assert!(
         output.stdout.len() < MAX_OUTPUT_BYTES,
@@ -209,10 +242,10 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
         .expect("reopen cache after CLI traversal");
     assert_eq!(
         reopened.nodes.len(),
-        RANK9_NODE_COUNT,
+        node_count,
         "query path rescanned or amplified the warm inventory"
     );
-    assert_eq!(reopened.edges.len(), RANK9_EDGE_COUNT);
+    assert_eq!(reopened.edges.len(), edge_count);
     assert!(
         reopened
             .nodes
@@ -229,7 +262,15 @@ async fn rank9_sized_persisted_cache_traversal_is_bounded_and_does_not_rescan() 
         );
     }
     eprintln!(
-        "rank-9 warm cache profile: nodes={RANK9_NODE_COUNT}, edges={RANK9_EDGE_COUNT}, load={load_elapsed:?}, cli_query={query_elapsed:?}, output_bytes={}",
+        "{label} warm cache profile: nodes={node_count}, edges={edge_count}, load={load_elapsed:?}, cli_query={query_elapsed:?}, output_bytes={}",
         output.stdout.len()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn normal_and_rank9_persisted_cache_traversal_is_bounded_and_does_not_rescan() {
+    let (cold_startup, warm_startup) = profile_cli_startup();
+    eprintln!("CLI startup phases: cold={cold_startup:?}, warm={warm_startup:?}");
+    profile_persisted_cache_shape("normal", NORMAL_NODE_COUNT, NORMAL_EDGE_COUNT, false).await;
+    profile_persisted_cache_shape("rank-9", RANK9_NODE_COUNT, RANK9_EDGE_COUNT, true).await;
 }

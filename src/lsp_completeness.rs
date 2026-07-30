@@ -35,6 +35,7 @@ pub const LSP_COMPLETENESS_SUMMARY_COMMIT_PATH: &str =
 const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 2;
 const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
+const LSP_COMPLETENESS_PUBLICATION_LOCK_PATH: &str = ".oh/.cache/lsp_completeness.publication.lock";
 static PERSIST_REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
@@ -661,16 +662,39 @@ impl LspCompletenessReport {
 }
 
 pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
-    let mut entries = BTreeSet::new();
-    for node in nodes {
-        entries.insert(("node", node.stable_id(), format!("{:?}", node.source)));
+    let mut ordered_nodes = nodes
+        .iter()
+        .map(|node| (node.stable_id(), node))
+        .collect::<Vec<_>>();
+    ordered_nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ordered_edges = edges
+        .iter()
+        .map(|edge| (edge.stable_id(), edge))
+        .collect::<Vec<_>>();
+    ordered_edges.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (stable_id, node) in ordered_nodes {
+        hasher.update(b"node\0");
+        hasher.update(stable_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(
+            &serde_json::to_vec(node)
+                .expect("graph node snapshot digest serialization cannot fail"),
+        );
+        hasher.update(&[0xff]);
     }
-    for edge in edges {
-        entries.insert(("edge", edge.stable_id(), format!("{:?}", edge.source)));
+    for (stable_id, edge) in ordered_edges {
+        hasher.update(b"edge\0");
+        hasher.update(stable_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(
+            &serde_json::to_vec(edge)
+                .expect("graph edge snapshot digest serialization cannot fail"),
+        );
+        hasher.update(&[0xff]);
     }
-    let bytes =
-        serde_json::to_vec(&entries).expect("graph snapshot digest serialization cannot fail");
-    blake3::hash(&bytes).to_hex().to_string()
+    hasher.finalize().to_hex().to_string()
 }
 
 fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
@@ -1716,7 +1740,82 @@ fn report_temp_paths(parent: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// Cross-process serialization boundary shared by graph mutation and bounded
+/// readiness publication. Advisory locking avoids stale lock files after a
+/// crash while keeping the lock repo-scoped.
+pub(crate) struct LspReadinessMutationLock {
+    file: fs::File,
+}
+
+pub(crate) fn acquire_lsp_readiness_mutation_lock(
+    repo_root: &Path,
+) -> Result<LspReadinessMutationLock> {
+    let path = repo_root.join(LSP_COMPLETENESS_PUBLICATION_LOCK_PATH);
+    let parent = path
+        .parent()
+        .context("LSP readiness mutation lock has no parent")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create LSP readiness mutation lock directory {}",
+            parent.display()
+        )
+    })?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "failed to open LSP readiness mutation lock {}",
+                path.display()
+            )
+        })?;
+    file.lock().with_context(|| {
+        format!(
+            "failed to acquire LSP readiness mutation lock {}",
+            path.display()
+        )
+    })?;
+    Ok(LspReadinessMutationLock { file })
+}
+
+pub(crate) async fn acquire_lsp_readiness_mutation_lock_async(
+    repo_root: &Path,
+) -> Result<LspReadinessMutationLock> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_lsp_readiness_mutation_lock(&repo_root))
+        .await
+        .context("LSP readiness mutation lock task failed")?
+}
+
+impl Drop for LspReadinessMutationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Result<()> {
+    let _lock = acquire_lsp_readiness_mutation_lock(repo_root)?;
+    persist_report_under_lock(repo_root, report, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn persist_report_with_precommit_hook(
+    repo_root: &Path,
+    report: &LspCompletenessReport,
+    precommit_hook: impl FnOnce(),
+) -> Result<()> {
+    let _lock = acquire_lsp_readiness_mutation_lock(repo_root)?;
+    persist_report_under_lock(repo_root, report, precommit_hook)
+}
+
+fn persist_report_under_lock(
+    repo_root: &Path,
+    report: &LspCompletenessReport,
+    precommit_hook: impl FnOnce(),
+) -> Result<()> {
     let path = report_path(repo_root);
     let summary_path = summary_path(repo_root);
     let summary_commit_path = summary_commit_path(repo_root);
@@ -1771,6 +1870,7 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
             summary_path.display()
         )
     })?;
+    precommit_hook();
     let (report_bytes, report_modified_unix_nanos) = report_file_identity(&path)?;
     let summary_commit = LspCompletenessSummaryCommit {
         schema_version: LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
@@ -4961,6 +5061,60 @@ mod tests {
     }
 
     #[test]
+    fn competing_report_publications_cannot_cross_pair_summary_and_report() {
+        use std::sync::{Arc, Barrier, mpsc};
+
+        let repo = tempfile::tempdir().unwrap();
+        let first = report(vec![included(
+            "src/first.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        let second = report(vec![included(
+            "src/second.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        let entered_precommit = Arc::new(Barrier::new(2));
+        let release_precommit = Arc::new(Barrier::new(2));
+        let first_root = repo.path().to_path_buf();
+        let first_entered = Arc::clone(&entered_precommit);
+        let first_release = Arc::clone(&release_precommit);
+        let first_writer = std::thread::spawn(move || {
+            persist_report_with_precommit_hook(&first_root, &first, || {
+                first_entered.wait();
+                first_release.wait();
+            })
+        });
+        entered_precommit.wait();
+
+        let second_root = repo.path().to_path_buf();
+        let expected_digest = second.digest.clone();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_writer = std::thread::spawn(move || {
+            let result = persist_report(&second_root, &second);
+            second_done_tx.send(result).unwrap();
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "second report publication bypassed the repo-scoped lock"
+        );
+
+        release_precommit.wait();
+        first_writer.join().unwrap().unwrap();
+        second_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second publication remained blocked")
+            .unwrap();
+        second_writer.join().unwrap();
+
+        let summary = load_summary(repo.path()).expect("final bounded publication is coherent");
+        let report = load_report(repo.path()).expect("final full report is coherent");
+        assert_eq!(summary.report_digest, expected_digest);
+        assert_eq!(report.digest, expected_digest);
+    }
+
+    #[test]
     fn completeness_summary_reader_rejects_oversized_sidecars() {
         let repo = tempfile::tempdir().unwrap();
         let path = summary_path(repo.path());
@@ -5836,6 +5990,32 @@ mod tests {
             violation.code == ReadinessViolationCode::StaleReport
                 && violation.detail.contains("graph snapshot digest changed")
         }));
+
+        let mut changed_body = node.clone();
+        changed_body.body = "return 1".to_string();
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_body), &[]),
+            "body-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_signature = node.clone();
+        changed_signature.signature = "def symbol(value):".to_string();
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_signature), &[]),
+            "signature-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_metadata = node.clone();
+        changed_metadata
+            .metadata
+            .insert("derived".to_string(), "changed".to_string());
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_metadata), &[]),
+            "metadata-only graph mutation retained the readiness identity"
+        );
     }
 
     #[test]

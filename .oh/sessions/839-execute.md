@@ -59,9 +59,24 @@ target, and sparse diagnostic sidecars of 147, 176, and 119 MiB. It then invokes
 the actual CLI binary against that cache, with a hard 30-second child-process
 deadline, and proves that the source sentinel is not rescanned, node/edge counts
 do not amplify, the sidecars are not touched, output remains under 8 KiB, and
-the nine graph results are preserved. On the M4 Max host, persisted graph load
-took 1.47 s and the separate CLI query took 6.20 s (1,262 output bytes); the full
-test body completed in 11.56 s.
+the nine graph results are preserved. A normal persisted shape (4,947 nodes /
+9,537 edges) runs through the same path first. On the M4 Max host the final
+phase profile was:
+
+| Phase | Normal shape | Rank-9 shape |
+|---|---:|---:|
+| CLI process startup (`--version`) | 5.736 s first invocation / 27.8 ms warm | shared process-level phase; cache independent |
+| Persisted graph load | 26.9 ms | 1.468 s |
+| Exact one-hop graph lookup | 0.027 ms | 0.009 ms |
+| Neighbor + edge-evidence rendering | 0.857 ms | 63.6 ms |
+| In-process service lookup/render total | 1.83 ms | 127 ms |
+| Separate end-to-end warm CLI query | 201 ms | 1.711 s |
+| Output | 1,262 bytes | 1,262 bytes |
+
+The direct lookup/render phases use the same production traversal and rendering
+helpers as service search. The persisted profile uses production Lance reopen
+and the actual CLI, so startup, cache load, lookup/render, and subprocess total
+are no longer conflated.
 
 ## Root cause
 
@@ -107,11 +122,13 @@ classified and assigned to #844 rather than hidden or deleted in #839.
   publishes a small commit marker only after the full report and summary are
   durable. The marker binds the exact summary bytes to the report digest,
   length, and modification identity. The bounded summary also carries the
-  producer's graph-snapshot digest; verbose search compares it to the graph
-  serving the query before reporting ready/degraded status. Full/incremental
-  graph writes and root pruning invalidate the publication marker before
-  mutation. Older, interrupted, stale, tampered, oversized, or graph-mismatched
-  pairs are labeled `status unverified` rather than being treated as ready or
-  forcing a full-report read.
+  producer's exact serialized node-and-edge snapshot digest; verbose search
+  compares it to the graph serving the query before reporting ready/degraded
+  status. Report publication, full/incremental graph writes, and root pruning
+  share a repo-scoped cross-process advisory lock. Graph writers invalidate the
+  publication marker before mutation, and competing reports cannot cross-pair
+  their final files. Older, interrupted, stale, tampered, oversized, or
+  graph-mismatched pairs are labeled `status unverified` rather than being
+  treated as ready or forcing a full-report read.
 - Full observability remains under `.oh/.cache/`; it is not copied into agent
   context.
