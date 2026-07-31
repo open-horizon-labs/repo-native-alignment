@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +69,13 @@ pub struct LspWorkIdentity {
     pub request_anchor: String,
     pub operations_digest: String,
     pub toolchain_contract: String,
+    /// The planner-contract version live when this identity was computed.
+    /// Compared explicitly in `identity_disposition` so a routine
+    /// `PLANNER_CONTRACT_VERSION` bump maps to `RerunPlannerContract` instead
+    /// of `RejectedTampered`; absent on pre-migration records (defaults to
+    /// empty), which still mismatches the current version and reruns.
+    #[serde(default)]
+    pub planner_contract: String,
     pub digest: String,
 }
 
@@ -82,6 +89,7 @@ pub enum LspRecoveryDisposition {
     RerunRequestAnchor,
     RerunOperations,
     RerunToolchain,
+    RerunPlannerContract,
     RerunSchema,
     RejectedTampered,
     RejectedDuplicate,
@@ -96,6 +104,7 @@ impl LspRecoveryDisposition {
             Self::RerunRequestAnchor => "rerun_request_anchor",
             Self::RerunOperations => "rerun_operations",
             Self::RerunToolchain => "rerun_toolchain",
+            Self::RerunPlannerContract => "rerun_planner_contract",
             Self::RerunSchema => "rerun_schema",
             Self::RejectedTampered => "rejected_tampered",
             Self::RejectedDuplicate => "rejected_duplicate",
@@ -372,24 +381,41 @@ impl LspWorkItemLedger {
                 .or_default()
                 .push(record);
         }
+        // Tracks, per node ID, how many distinct-operations-digest keys for that
+        // node remain in `prior_by_key`. Kept in sync as keys are removed below
+        // so `changed_operations` stays an O(log n) lookup instead of rescanning
+        // every remaining key on every seed with no exact match.
+        let mut prior_node_id_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (prior_node_id, _) in prior_by_key.keys() {
+            *prior_node_id_counts
+                .entry(prior_node_id.clone())
+                .or_insert(0) += 1;
+        }
         let mut store = LspWorkItemStore::default();
         let mut runnable_item_ids = BTreeSet::new();
         let mut recovered_edges = Vec::new();
         let mut recovered_nodes = Vec::new();
+        let source_cache = SourceLineCache::default();
 
         for seed in seeds {
             let node_id = seed.node.stable_id();
-            let current_identity = work_identity(repo_root, seed, &source_snapshot);
+            let current_identity = work_identity(repo_root, seed, &source_snapshot, &source_cache);
             let key = (node_id.clone(), current_identity.operations_digest.clone());
             let candidates = prior_by_key.remove(&key).unwrap_or_default();
+            if !candidates.is_empty()
+                && let Some(count) = prior_node_id_counts.get_mut(&node_id)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    prior_node_id_counts.remove(&node_id);
+                }
+            }
             let (prior_record, disposition) = if duplicate_retained_keys.contains(&key) {
                 (None, LspRecoveryDisposition::RejectedDuplicate)
             } else {
                 match candidates.len() {
                     0 => {
-                        let changed_operations = prior_by_key
-                            .keys()
-                            .any(|(prior_node_id, _)| prior_node_id == &node_id);
+                        let changed_operations = prior_node_id_counts.contains_key(&node_id);
                         (
                             None,
                             if changed_operations {
@@ -568,8 +594,9 @@ impl LspWorkItemLedger {
         let mut store = LspWorkItemStore::default();
         let now = unix_millis();
         let source_snapshot = source_snapshot_identity(repo_root)?;
+        let source_cache = SourceLineCache::default();
         for seed in seeds {
-            let identity = work_identity(repo_root, seed, &source_snapshot);
+            let identity = work_identity(repo_root, seed, &source_snapshot, &source_cache);
             let record = new_record(repo_root, &job_id, seed, identity, now);
             store
                 .records
@@ -840,7 +867,85 @@ fn canonical_operations_digest(requested_operations: &[String]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn request_anchor(repo_root: &Path, node: &Node) -> String {
+/// Per-file source line cache shared across a batch of position lookups.
+///
+/// `source_request_position` is invoked once per requested operation per node,
+/// and a single file commonly holds many symbols, so without this cache a
+/// K-symbol file is read from disk K times per batch (ledger identity build,
+/// and again for each actual LSP request). Safe to share across concurrent
+/// lookups: reads race harmlessly onto the same cached `Arc<Vec<String>>`.
+#[derive(Default)]
+pub(crate) struct SourceLineCache {
+    lines_by_file: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
+}
+
+impl SourceLineCache {
+    fn lines(&self, path: &Path) -> Arc<Vec<String>> {
+        if let Some(cached) = self
+            .lines_by_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+        {
+            return Arc::clone(cached);
+        }
+        let lines = std::fs::read_to_string(path)
+            .map(|source| source.lines().map(str::to_owned).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let lines = Arc::new(lines);
+        self.lines_by_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), Arc::clone(&lines));
+        lines
+    }
+}
+
+/// True if `byte` can continue an identifier (ASCII alnum or underscore).
+///
+/// Non-ASCII bytes (UTF-8 continuation bytes included) are treated as
+/// boundaries; this only needs to reject accidental substring matches inside
+/// a longer ASCII identifier, not fully tokenize the line.
+fn is_identifier_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Finds `name` on `line` at an identifier boundary, skipping matches that are
+/// a substring of a longer identifier (avoids matching inside e.g. `get_name`
+/// when searching for `name`). Still line-local, so it does not distinguish a
+/// real occurrence from one inside a same-line comment or string literal.
+fn find_identifier_boundary(line: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut search_start = 0;
+    while let Some(offset) = line[search_start..].find(name) {
+        let match_start = search_start + offset;
+        let match_end = match_start + name.len();
+        let before_ok = match_start == 0 || !is_identifier_continue(bytes[match_start - 1]);
+        let after_ok = match_end == bytes.len() || !is_identifier_continue(bytes[match_end]);
+        if before_ok && after_ok {
+            return Some(match_start);
+        }
+        // Advance by one full char, not one byte: `match_start` is a valid
+        // char boundary (from `str::find`), but a multi-byte character there
+        // (e.g. a unicode identifier) would make `match_start + 1` land
+        // mid-sequence and panic on the next slice.
+        let matched_char_len = line[match_start..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        search_start = match_start + matched_char_len;
+        if search_start >= bytes.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn request_anchor(repo_root: &Path, node: &Node, cache: &SourceLineCache) -> String {
     let relative_file = if node.id.file.is_absolute() {
         node.id
             .file
@@ -850,7 +955,7 @@ fn request_anchor(repo_root: &Path, node: &Node) -> String {
     } else {
         node.id.file.clone()
     };
-    let (zero_based_line, zero_based_character) = source_request_position(repo_root, node);
+    let (zero_based_line, zero_based_character) = source_request_position(repo_root, node, cache);
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{zero_based_line}\u{1f}{zero_based_character}",
         node.id.root,
@@ -859,19 +964,19 @@ fn request_anchor(repo_root: &Path, node: &Node) -> String {
     )
 }
 
-pub(super) fn source_request_position(repo_root: &Path, node: &Node) -> (u32, u32) {
+pub(super) fn source_request_position(
+    repo_root: &Path,
+    node: &Node,
+    cache: &SourceLineCache,
+) -> (u32, u32) {
     let source_path = repo_root.join(&node.id.file);
     let zero_based_line = node.line_start.saturating_sub(1) as u32;
-    let zero_based_character = std::fs::read_to_string(&source_path)
-        .ok()
-        .and_then(|source| {
-            source
-                .lines()
-                .nth(zero_based_line as usize)
-                .and_then(|line| {
-                    line.find(&node.id.name)
-                        .map(|byte| line[..byte].encode_utf16().count() as u32)
-                })
+    let lines = cache.lines(&source_path);
+    let zero_based_character = lines
+        .get(zero_based_line as usize)
+        .and_then(|line| {
+            find_identifier_boundary(line, &node.id.name)
+                .map(|byte| line[..byte].encode_utf16().count() as u32)
         })
         .unwrap_or(0);
     (zero_based_line, zero_based_character)
@@ -953,7 +1058,71 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     Ok(format!("content:{}", hasher.finalize().to_hex()))
 }
 
-fn ignored_lsp_influence_identity(workdir: &Path) -> Result<Option<String>> {
+/// Upper bound on how long the `git ls-files` enumeration in
+/// `ignored_lsp_influence_identity` may run. This is a local filesystem
+/// query, not a network or language-server call, so a few seconds is ample;
+/// bounding it keeps a stuck or oversized Git invocation from hanging
+/// recovery indefinitely.
+const IGNORED_INPUT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `command` to completion, killing it and returning an error if it has
+/// not exited within `timeout`. Unlike `Command::output`, this never blocks
+/// indefinitely on a hung child process.
+///
+/// Stdout/stderr are drained concurrently on dedicated threads for the same
+/// reason `Command::output()` does it internally: a child that writes more
+/// than the OS pipe buffer (a few tens of KB) will block on write() until
+/// someone reads, so polling `try_wait()` without draining the pipes would
+/// deadlock against exactly the timeout this function exists to enforce.
+fn run_bounded(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn command")?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("failed to poll spawned command")? {
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            anyhow::bail!("command timed out after {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Enumerates ignored files matching descriptor-declared influence patterns.
+///
+/// Runs `git ls-files` with `repo_root` as the working directory (not the
+/// enclosing repository's workdir) so both pathspec resolution and returned
+/// paths are scoped to `repo_root`: a nested startup root's identity is then
+/// unaffected by ignored files elsewhere in the outer repository. Git ignore
+/// rules still apply from the real repository root outward regardless of
+/// `current_dir`, so `.gitignore` files above `repo_root` are still honored.
+fn ignored_lsp_influence_identity(repo_root: &Path) -> Result<Option<String>> {
     let mut patterns = super::builtin_lsp_descriptors()
         .iter()
         .flat_map(|descriptor| descriptor.partition_influence_patterns())
@@ -974,7 +1143,8 @@ fn ignored_lsp_influence_identity(workdir: &Path) -> Result<Option<String>> {
         };
         pathspecs.push(pathspec);
     }
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg("core.quotePath=false")
         .arg("ls-files")
@@ -984,17 +1154,36 @@ fn ignored_lsp_influence_identity(workdir: &Path) -> Result<Option<String>> {
         .arg("--exclude-standard")
         .arg("--")
         .args(&pathspecs)
-        .current_dir(workdir)
-        .output();
-    let output = match output {
+        .current_dir(repo_root);
+    let output = match run_bounded(&mut command, IGNORED_INPUT_DISCOVERY_TIMEOUT) {
         Ok(output) if output.status.success() => output.stdout,
-        _ => {
+        Ok(output) => {
+            tracing::warn!(
+                repo_root = %repo_root.display(),
+                status = ?output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "git ls-files exited non-zero enumerating ignored LSP inputs; falling back to full content snapshot"
+            );
             return Ok(Some(format!(
                 "full-fallback:{}",
-                non_git_source_snapshot(workdir)?
+                non_git_source_snapshot(repo_root)?
+            )));
+        }
+        Err(error) => {
+            tracing::warn!(
+                repo_root = %repo_root.display(),
+                %error,
+                "failed to run git ls-files enumerating ignored LSP inputs; falling back to full content snapshot"
+            );
+            return Ok(Some(format!(
+                "full-fallback:{}",
+                non_git_source_snapshot(repo_root)?
             )));
         }
     };
+    // Bounded: only descriptor-declared patterns are enumerated (never a bare
+    // `--others --ignored` sweep of the whole ignored tree), and the result is
+    // collapsed into one digest rather than an unbounded per-file list.
     let mut paths = String::from_utf8_lossy(&output)
         .split('\0')
         .filter(|path| !path.is_empty())
@@ -1018,10 +1207,32 @@ fn ignored_lsp_influence_identity(workdir: &Path) -> Result<Option<String>> {
     for relative in paths {
         hasher.update(relative.as_bytes());
         hasher.update(&[0]);
-        update_path_identity(&mut hasher, &workdir.join(&relative))?;
+        update_path_identity(&mut hasher, &repo_root.join(&relative))?;
         hasher.update(&[0]);
     }
     Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
+/// Root-relative slash-separated path of `repo_root` within the repository
+/// `workdir` that contains it, or `""` when they are the same directory.
+fn root_relative_to_workdir(repo_root: &Path, workdir: &Path) -> String {
+    repo_root
+        .strip_prefix(workdir)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+/// Strips `root_relative` (a `root_relative_to_workdir` prefix) from a
+/// workdir-relative Git status path, returning `None` for paths outside
+/// `repo_root` so unrelated ancestor changes cannot affect its identity.
+fn strip_to_repo_root(workdir_relative_path: &str, root_relative: &str) -> Option<String> {
+    if root_relative.is_empty() {
+        return Some(workdir_relative_path.to_string());
+    }
+    workdir_relative_path
+        .strip_prefix(root_relative)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
 }
 
 fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
@@ -1037,7 +1248,20 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         Err(_) => return non_git_source_snapshot(repo_root),
     };
     let tree = head.tree()?;
-    let ignored_influences = ignored_lsp_influence_identity(workdir)?;
+    // `repo_root` may be a subdirectory of the discovered repository (a
+    // monorepo startup root). Scope both the tree and status identity to it,
+    // so changes elsewhere in the repository do not invalidate this root's
+    // recovery, and so `.oh/.cache/` exclusion matches nested roots too.
+    let root_relative = root_relative_to_workdir(repo_root, workdir);
+    let scoped_tree_id = if root_relative.is_empty() {
+        tree.id().to_string()
+    } else {
+        match tree.get_path(Path::new(&root_relative)) {
+            Ok(entry) => entry.id().to_string(),
+            Err(_) => format!("missing:{root_relative}"),
+        }
+    };
+    let ignored_influences = ignored_lsp_influence_identity(repo_root)?;
     let mut options = git2::StatusOptions::new();
     options
         .include_untracked(true)
@@ -1046,6 +1270,9 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         .include_unmodified(false)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true);
+    if !root_relative.is_empty() {
+        options.pathspec(root_relative.as_str());
+    }
     let mut changes = repository
         .statuses(Some(&mut options))?
         .iter()
@@ -1053,27 +1280,28 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
             entry
                 .path()
                 .ok()
-                .map(|path| (path.to_string(), entry.status().bits()))
+                .and_then(|path| strip_to_repo_root(path, &root_relative))
+                .map(|path| (path, entry.status().bits()))
         })
         .filter(|(path, _)| !path.starts_with(".oh/.cache/"))
         .collect::<Vec<_>>();
     changes.sort();
     if changes.is_empty() {
         return Ok(match ignored_influences {
-            Some(influences) => format!("git-tree:{}:ignored:{influences}", tree.id()),
-            None => format!("git-tree:{}:clean", tree.id()),
+            Some(influences) => format!("git-tree:{scoped_tree_id}:ignored:{influences}"),
+            None => format!("git-tree:{scoped_tree_id}:clean"),
         });
     }
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rna-lsp-source-snapshot-git-dirty-v2");
-    hasher.update(tree.id().as_bytes());
+    hasher.update(scoped_tree_id.as_bytes());
     for (relative, status) in changes {
         hasher.update(relative.as_bytes());
         hasher.update(&[0]);
         hasher.update(&status.to_le_bytes());
         hasher.update(&[0]);
-        let path = workdir.join(&relative);
+        let path = repo_root.join(&relative);
         if path.exists() || path.is_symlink() {
             update_path_identity(&mut hasher, &path)?;
         } else {
@@ -1094,8 +1322,9 @@ fn work_identity(
     repo_root: &Path,
     seed: &LspWorkItemSeed,
     source_snapshot: &str,
+    cache: &SourceLineCache,
 ) -> LspWorkIdentity {
-    let request_anchor = request_anchor(repo_root, &seed.node);
+    let request_anchor = request_anchor(repo_root, &seed.node, cache);
     let operations_digest = canonical_operations_digest(&seed.requested_operations);
     let mut identity = LspWorkIdentity {
         schema_version: WORK_IDENTITY_SCHEMA_VERSION,
@@ -1103,6 +1332,7 @@ fn work_identity(
         request_anchor,
         operations_digest,
         toolchain_contract: seed.toolchain_contract.clone(),
+        planner_contract: PLANNER_CONTRACT_VERSION.to_string(),
         digest: String::new(),
     };
     identity.digest = work_identity_digest(&identity);
@@ -1117,7 +1347,7 @@ pub(crate) fn work_identity_digest(identity: &LspWorkIdentity) -> String {
         identity.request_anchor.clone(),
         identity.operations_digest.clone(),
         identity.toolchain_contract.clone(),
-        PLANNER_CONTRACT_VERSION.to_string(),
+        identity.planner_contract.clone(),
     ] {
         hasher.update(component.as_bytes());
         hasher.update(&[0]);
@@ -1129,8 +1359,20 @@ pub(crate) fn current_source_snapshot_identity(repo_root: &Path) -> Result<Strin
     source_snapshot_identity(repo_root)
 }
 
-pub(crate) fn current_request_anchor(repo_root: &Path, node: &Node) -> String {
-    request_anchor(repo_root, node)
+pub(crate) fn current_request_anchor(
+    repo_root: &Path,
+    node: &Node,
+    cache: &SourceLineCache,
+) -> String {
+    request_anchor(repo_root, node, cache)
+}
+
+pub(crate) const fn current_work_identity_schema_version() -> u32 {
+    WORK_IDENTITY_SCHEMA_VERSION
+}
+
+pub(crate) fn current_planner_contract_version() -> &'static str {
+    PLANNER_CONTRACT_VERSION
 }
 
 pub(crate) fn requested_operations_digest(requested_operations: &[String]) -> String {
@@ -1152,7 +1394,12 @@ pub(crate) fn build_work_identity(
         attempt_count: 1,
         toolchain_contract: toolchain_contract.to_string(),
     };
-    Ok(work_identity(repo_root, &seed, &source_snapshot))
+    Ok(work_identity(
+        repo_root,
+        &seed,
+        &source_snapshot,
+        &SourceLineCache::default(),
+    ))
 }
 
 fn identity_disposition(
@@ -1169,6 +1416,13 @@ fn identity_disposition(
         LspRecoveryDisposition::RerunOperations
     } else if prior.toolchain_contract != current.toolchain_contract {
         LspRecoveryDisposition::RerunToolchain
+    } else if prior.planner_contract != current.planner_contract {
+        // A `PLANNER_CONTRACT_VERSION` bump changes `digest` (it is one of the
+        // hashed components) even though every other named field still
+        // matches. Without this explicit check that would fall through to
+        // the tamper branch below and mislabel a routine contract bump as
+        // tampering. Rerun instead; the digest mismatch is expected.
+        LspRecoveryDisposition::RerunPlannerContract
     } else if prior.digest != current.digest {
         LspRecoveryDisposition::RejectedTampered
     } else {
@@ -1599,6 +1853,10 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
         store.schema_version = STORE_SCHEMA_VERSION;
         return Ok(store);
     }
+    // `integrity_digest` is an unkeyed BLAKE3 hash: it detects accidental
+    // corruption and partial writes to `.oh/.cache`, not tampering by a
+    // process that can already write there, since such a writer can
+    // recompute a matching digest for any content it substitutes.
     for record in store.records.values_mut() {
         let observed = record_integrity_digest(record)?;
         if record.integrity_digest != observed {
@@ -1721,7 +1979,56 @@ mod tests {
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
         std::fs::write(repo.path().join("src/item.rs"), "💡 fn item() {}\n").unwrap();
 
-        assert_eq!(source_request_position(repo.path(), &source_node), (0, 6));
+        assert_eq!(
+            source_request_position(repo.path(), &source_node, &SourceLineCache::default()),
+            (0, 6)
+        );
+    }
+
+    #[test]
+    fn find_identifier_boundary_skips_rejected_multibyte_match_without_panicking() {
+        // "π" at byte 1 is a substring of the longer identifier "aπ" and must
+        // be rejected; the retry step used to advance by one raw byte, which
+        // landed inside "π"'s 2-byte UTF-8 encoding and panicked on the next
+        // slice. No other "π" exists on this line, so this must return None,
+        // not panic.
+        assert_eq!(find_identifier_boundary("aπ = 1", "π"), None);
+    }
+
+    #[test]
+    fn find_identifier_boundary_finds_valid_match_after_rejected_multibyte_match() {
+        // First "π" (byte 1) is inside the longer identifier "xπfoo" and is
+        // rejected; the standalone "π" later on the line must still be found
+        // once the retry correctly steps past the rejected multi-byte match.
+        let line = "xπfoo π bar";
+        let found = find_identifier_boundary(line, "π").unwrap();
+        assert_eq!(&line[found..found + "π".len()], "π");
+        assert_eq!(line.as_bytes()[found - 1], b' ');
+    }
+
+    #[test]
+    fn run_bounded_drains_output_larger_than_pipe_buffer_without_deadlock() {
+        // A child writing more than the OS pipe buffer (tens of KB) blocks on
+        // write() until someone reads. `run_bounded` only polled `try_wait`
+        // without draining the pipes, so this used to hang until the timeout
+        // fired instead of completing almost immediately.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("head -c 200000 /dev/zero");
+        let started = Instant::now();
+        let output = run_bounded(&mut command, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_bounded_times_out_and_kills_hung_child() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let result = run_bounded(&mut command, Duration::from_millis(200));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     fn seeds(count: usize) -> Vec<LspWorkItemSeed> {
@@ -1988,6 +2295,23 @@ mod tests {
             "[tool.fixture]\nvalue = 1\n",
         )
         .unwrap();
+        // Commit both files first so `source_snapshot_identity` takes the Git
+        // snapshot path (a clean git-tree identity) rather than
+        // `non_git_source_snapshot`, which hashes every file under the root
+        // regardless of which one changed and so would pass this assertion
+        // for any edit, not specifically a cross-file `pyproject.toml` change.
+        let repository = git2::Repository::init(repo.path()).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("src/item_0.rs")).unwrap();
+        index.add_path(Path::new("pyproject.toml")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("RNA test", "rna@example.com").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        drop(tree);
         let ledger = LspWorkItemLedger::begin_with_job_id(
             repo.path(),
             "changed-input-job".to_string(),
@@ -2232,6 +2556,29 @@ mod tests {
         assert_eq!(
             store.records["changed-toolchain-job:0"].recovery_disposition,
             LspRecoveryDisposition::RerunToolchain
+        );
+    }
+
+    #[test]
+    fn planner_contract_bump_reruns_instead_of_tampering() {
+        let mut prior = LspWorkIdentity {
+            schema_version: WORK_IDENTITY_SCHEMA_VERSION,
+            source_snapshot: "snapshot".to_string(),
+            request_anchor: "anchor".to_string(),
+            operations_digest: "operations".to_string(),
+            toolchain_contract: "toolchain".to_string(),
+            planner_contract: "lsp-pass1-work-planner-v0".to_string(),
+            digest: String::new(),
+        };
+        prior.digest = work_identity_digest(&prior);
+        let mut current = prior.clone();
+        current.planner_contract = PLANNER_CONTRACT_VERSION.to_string();
+        current.digest = work_identity_digest(&current);
+
+        assert_ne!(prior.digest, current.digest);
+        assert_eq!(
+            identity_disposition(&prior, &current),
+            LspRecoveryDisposition::RerunPlannerContract
         );
     }
 

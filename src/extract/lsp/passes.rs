@@ -20,11 +20,11 @@ use super::policy::{
     LspServerCapabilities,
 };
 use super::transport::{PipelinedTransport, path_to_uri, uri_to_relative_path};
-use super::work_items::{LspWorkItemLedger, LspWorkItemSeed};
+use super::work_items::{LspWorkItemLedger, LspWorkItemSeed, SourceLineCache};
 use super::{
     EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
     ZERO_EDGE_TIMEOUT, lsp_job_timeout, lsp_language_id, materialize_document_symbols,
-    normalized_document_symbol_evidence, read_lsp_text,
+    normalized_document_symbol_evidence, read_lsp_text, resolved_venv_dir,
 };
 use crate::scanner::LspConfig;
 
@@ -53,13 +53,17 @@ fn resolved_executable_digest(command: &str) -> String {
 
 fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
     let mut hasher = blake3::Hasher::new();
-    let startup_root = enricher
+    let startup_root_abs = enricher
         .startup_root_override
         .get()
-        .map(|root| root.strip_prefix(repo_root).unwrap_or(root))
-        .unwrap_or_else(|| Path::new("."))
+        .map(|root| root.as_path())
+        .unwrap_or(repo_root);
+    let startup_root = startup_root_abs
+        .strip_prefix(repo_root)
+        .unwrap_or(startup_root_abs)
         .to_string_lossy()
         .replace('\\', "/");
+    let venv_selection = resolved_venv_dir(startup_root_abs, &enricher.language).unwrap_or("none");
     for value in [
         "lsp-toolchain-contract-v1".to_string(),
         enricher.language.clone(),
@@ -68,11 +72,18 @@ fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
         resolved_executable_digest(&enricher.server_command),
         serde_json::to_string(&enricher.server_args).unwrap_or_default(),
         serde_json::to_string(&enricher.init_settings).unwrap_or_default(),
+        venv_selection.to_string(),
         enricher.config_file.unwrap_or_default().to_string(),
         startup_root,
         enricher.query_profile.language().to_string(),
         enricher.query_profile.server().to_string(),
-        format!("{:?}", enricher.query_profile.budget()),
+        enricher
+            .query_profile
+            .operation_limits()
+            .iter()
+            .map(|(operation, limit)| format!("{}={limit}", operation.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
     ] {
         hasher.update(value.as_bytes());
         hasher.update(&[0]);
@@ -1579,6 +1590,9 @@ impl LspEnricher {
         let refs_by_file = Arc::clone(refs_by_file_shared);
         let endpoint_index = Arc::new(EndpointLookupIndex::build(refs_by_file_shared));
         let worker_telemetry = Arc::clone(telemetry);
+        // Shared across every work item in this pass so a file with many
+        // symbols is read from disk once rather than once per symbol.
+        let source_cache = Arc::new(SourceLineCache::default());
         let (worker_total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
@@ -1593,6 +1607,7 @@ impl LspEnricher {
                 let error_count = Arc::clone(&error_count);
                 let did_open = Arc::clone(&did_open);
                 let telemetry = Arc::clone(&worker_telemetry);
+                let source_cache = Arc::clone(&source_cache);
                 async move {
                     let operation = item.requested_operations.first().copied();
                     let declaration =
@@ -1628,6 +1643,7 @@ impl LspEnricher {
                         &diagnostics,
                         &error_count,
                         &telemetry,
+                        &source_cache,
                     )
                     .await
                 }
@@ -1858,6 +1874,7 @@ impl LspEnricher {
         diagnostics: &LspPass1Diagnostics,
         error_count: &AtomicI64,
         telemetry: &LspQueryTelemetry,
+        source_cache: &SourceLineCache,
     ) -> Pass1TaskResult {
         let started_at = Instant::now();
         let operation = item.requested_operations.first().copied();
@@ -1922,7 +1939,7 @@ impl LspEnricher {
             .unwrap_or("requesting_lsp_operation");
         diagnostics.set_phase(item, phase).await;
 
-        let (line, col) = Self::node_lsp_position(root, node);
+        let (line, col) = Self::node_lsp_position(root, node, source_cache);
         let mut edges = Vec::new();
         let mut new_nodes = Vec::new();
         let mut had_error = false;
@@ -2644,6 +2661,9 @@ impl LspEnricher {
         let edges_before_pass2 = result.added_edges.len();
         let mut pass2_last_log = std::time::Instant::now();
         let mut pass2_last_count = 0u64;
+        // Shared across every type node in this pass so a file with many
+        // types is read from disk once rather than once per type.
+        let source_cache = SourceLineCache::default();
 
         for node in &type_nodes {
             let query_started = Instant::now();
@@ -2653,7 +2673,7 @@ impl LspEnricher {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            let (line, col) = Self::node_lsp_position(root, node);
+            let (line, col) = Self::node_lsp_position(root, node, &source_cache);
 
             let (ok, observation) = Self::enrich_type_hierarchy_p(
                 transport,

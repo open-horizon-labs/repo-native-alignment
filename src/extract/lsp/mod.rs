@@ -164,7 +164,6 @@ pub(crate) fn partition_influence_pattern_matches(pattern: &str, path: &str) -> 
         path.rsplit('/').next().unwrap_or(path)
     };
     wildcard_match(pattern.as_bytes(), candidate.as_bytes())
-        || (!pattern.contains('/') && wildcard_match(pattern.as_bytes(), path.as_bytes()))
 }
 
 fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
@@ -620,12 +619,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             "cfg", "conf", "ini", "mplstyle", "rc", "template", "hhp", "def"
         ]
     ),
-    builtin_lsp!(
-        "dockerfile",
-        "docker-langserver",
-        &["--stdio"],
-        &["<none>"]
-    ),
+    builtin_lsp!("dockerfile", "docker-langserver", &["--stdio"], &["<none>"]),
     builtin_lsp!(
         "batch",
         "rna-cohort-language-server",
@@ -1105,6 +1099,19 @@ const READINESS_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::
 fn read_lsp_text(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Resolves the virtual-environment directory a language server would pick up at
+/// `startup_root`, using the same descriptor-declared candidates and filesystem
+/// probe as `ensure_initialized_inner`'s `venvPath`/`venv` injection. Shared with
+/// `lsp_toolchain_contract` so the identity hash reflects the venv selection that
+/// actually reaches the server's `initializationOptions`.
+fn resolved_venv_dir(startup_root: &Path, language: &str) -> Option<&'static str> {
+    let venv_dirs = crate::extract::configs::config_for_language(language)?.venv_candidates?;
+    venv_dirs
+        .iter()
+        .find(|&&name| startup_root.join(name).is_dir())
+        .copied()
 }
 
 fn initialization_settings_with_compile_commands(
@@ -2334,52 +2341,44 @@ impl LspEnricher {
         // Apply per-language initialization settings if provided. Descriptors
         // whose LangConfig declares venv_candidates receive the Python-analysis
         // venvPath/venv settings expected by that server family.
-        let lang_config = crate::extract::configs::config_for_language(&self.language);
         let effective_settings =
-            if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
-                let found_venv = venv_dirs
-                    .iter()
-                    .find(|&&name| startup_root.join(name).is_dir());
-                if let Some(venv_name) = found_venv {
-                    let venv_path_str = startup_root.to_string_lossy().to_string();
-                    let mut merged = self
-                        .init_settings
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let python_obj = merged.as_object_mut().and_then(|root| {
-                        if !root.contains_key("python") {
-                            root.insert("python".into(), serde_json::json!({}));
-                        }
-                        root.get_mut("python")
-                    });
-                    if let Some(python_val) = python_obj {
-                        let analysis_obj = python_val.as_object_mut().and_then(|p| {
-                            if !p.contains_key("analysis") {
-                                p.insert("analysis".into(), serde_json::json!({}));
-                            }
-                            p.get_mut("analysis")
-                        });
-                        if let Some(analysis_val) = analysis_obj
-                            && let Some(obj) = analysis_val.as_object_mut()
-                        {
-                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                            obj.insert(
-                                "venv".into(),
-                                serde_json::Value::String(venv_name.to_string()),
-                            );
-                        }
+            if let Some(venv_name) = resolved_venv_dir(startup_root, &self.language) {
+                let venv_path_str = startup_root.to_string_lossy().to_string();
+                let mut merged = self
+                    .init_settings
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let python_obj = merged.as_object_mut().and_then(|root| {
+                    if !root.contains_key("python") {
+                        root.insert("python".into(), serde_json::json!({}));
                     }
-                    tracing::info!(
-                        "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
-                        self.server_command,
-                        venv_name,
-                        startup_root.display()
-                    );
-                    Some(merged)
-                } else {
-                    self.init_settings.clone()
+                    root.get_mut("python")
+                });
+                if let Some(python_val) = python_obj {
+                    let analysis_obj = python_val.as_object_mut().and_then(|p| {
+                        if !p.contains_key("analysis") {
+                            p.insert("analysis".into(), serde_json::json!({}));
+                        }
+                        p.get_mut("analysis")
+                    });
+                    if let Some(analysis_val) = analysis_obj
+                        && let Some(obj) = analysis_val.as_object_mut()
+                    {
+                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                        obj.insert(
+                            "venv".into(),
+                            serde_json::Value::String(venv_name.to_string()),
+                        );
+                    }
                 }
+                tracing::info!(
+                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    self.server_command,
+                    venv_name,
+                    startup_root.display()
+                );
+                Some(merged)
             } else {
                 self.init_settings.clone()
             };
@@ -3201,16 +3200,20 @@ impl LspEnricher {
 
     /// Compute the 0-based LSP line and column for a node.
     ///
-    /// Uses the AST-recorded byte column of the name identifier stored by the
-    /// extractor (metadata key "name_col"). This is exact and language-agnostic:
-    /// tree-sitter records start_position().column for the name field node, so
-    /// it works correctly even when the name appears multiple times in the
-    /// signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
-    /// prefix length varies across languages (Python `def`, Go `func`, etc.).
-    /// If the extractor did not populate name_col (legacy or non-tree-sitter
-    /// nodes), falls back to signature scanning.
-    fn node_lsp_position(repo_root: &Path, node: &Node) -> (u32, u32) {
-        work_items::source_request_position(repo_root, node)
+    /// Re-derived from the current on-disk source rather than the extractor's
+    /// recorded `name_col`/signature metadata: those are reconstruction-time
+    /// fields that can shift across re-extractions of byte-identical source,
+    /// which would make recovery identity unstable. Scans `node.line_start`
+    /// for `node.id.name` at an identifier boundary (so it does not match
+    /// inside a longer identifier), then converts the byte offset to a UTF-16
+    /// column as LSP requires. `cache` avoids re-reading the same file for
+    /// every node it contains.
+    fn node_lsp_position(
+        repo_root: &Path,
+        node: &Node,
+        cache: &work_items::SourceLineCache,
+    ) -> (u32, u32) {
+        work_items::source_request_position(repo_root, node, cache)
     }
 
     /// Update the type hierarchy strike counter after a single enrich attempt.

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::business_context::BusinessContextMode;
-use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState};
+use crate::extract::lsp::work_items::{
+    LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState, SourceLineCache,
+};
 use crate::extract::scan_stats::{
     LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION, LspEnrichmentEntry, LspStatus, LspValidationEvidence,
     LspValidationStatus,
@@ -1570,6 +1572,7 @@ fn select_work_items_for_report(
 ) -> Result<Vec<LspWorkItemRecord>> {
     let current_source_snapshot =
         crate::extract::lsp::work_items::current_source_snapshot_identity(repo_root)?;
+    let source_cache = SourceLineCache::default();
     let nodes_by_id = nodes
         .iter()
         .map(|node| (node.stable_id(), node))
@@ -1618,10 +1621,17 @@ fn select_work_items_for_report(
                 .map_err(anyhow::Error::msg)?;
             if record.root != node.id.root
                 || record_path != node_path
-                || record.work_identity.schema_version == 0
+                || record.work_identity.schema_version
+                    != crate::extract::lsp::work_items::current_work_identity_schema_version()
+                || record.work_identity.planner_contract
+                    != crate::extract::lsp::work_items::current_planner_contract_version()
                 || record.work_identity.source_snapshot != current_source_snapshot
                 || record.work_identity.request_anchor
-                    != crate::extract::lsp::work_items::current_request_anchor(repo_root, node)
+                    != crate::extract::lsp::work_items::current_request_anchor(
+                        repo_root,
+                        node,
+                        &source_cache,
+                    )
                 || record.work_identity.operations_digest
                     != crate::extract::lsp::work_items::requested_operations_digest(
                         &record.requested_operations,
@@ -3965,6 +3975,109 @@ mod tests {
         let error = select_work_items_for_report(
             repo.path(),
             vec![tampered],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn obsolete_nonzero_schema_version_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let operations = vec!["definitions".to_string()];
+        let mut work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        // A nonzero schema is not enough on its own: it must equal the
+        // *current* schema version, or a schema bump would be silently
+        // accepted as if nothing changed. Picks a value guaranteed to differ
+        // from whatever the current schema constant is, rather than
+        // assuming it is greater than 1.
+        let current_schema =
+            crate::extract::lsp::work_items::current_work_identity_schema_version();
+        work_identity.schema_version = if current_schema == 1 { 2 } else { 1 };
+        work_identity.digest =
+            crate::extract::lsp::work_items::work_identity_digest(&work_identity);
+        let stale_schema = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            requested_operations: operations,
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![stale_schema],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn stale_planner_contract_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let operations = vec!["definitions".to_string()];
+        let mut work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        work_identity.planner_contract = "lsp-pass1-work-planner-v0".to_string();
+        work_identity.digest =
+            crate::extract::lsp::work_items::work_identity_digest(&work_identity);
+        let stale_planner = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            requested_operations: operations,
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![stale_planner],
             &BTreeSet::from(["current-job"]),
             10_000,
             std::slice::from_ref(&source),

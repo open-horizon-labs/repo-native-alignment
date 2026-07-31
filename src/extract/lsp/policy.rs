@@ -289,6 +289,10 @@ impl LspQueryProfile {
         LspQueryBudget::from_limits(&self.operation_limits)
     }
 
+    pub(crate) fn operation_limits(&self) -> &BTreeMap<LspQueryOperation, usize> {
+        &self.operation_limits
+    }
+
     pub(crate) fn language(&self) -> &str {
         &self.language
     }
