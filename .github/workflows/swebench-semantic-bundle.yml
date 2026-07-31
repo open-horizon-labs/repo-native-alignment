@@ -1,4 +1,4 @@
-name: SWE-bench semantic M4 Metal bundle
+name: SWE-bench semantic M4-target Metal bundle
 
 on:
   workflow_dispatch:
@@ -50,7 +50,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Prove exact Apple M4 host and initialize isolated paths
+      - name: Prove Apple M4-compatible builder host and initialize isolated paths
         shell: bash
         run: |
           set -euo pipefail
