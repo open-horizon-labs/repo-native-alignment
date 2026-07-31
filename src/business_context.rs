@@ -140,6 +140,11 @@ impl BusinessContextAdmission {
     pub fn prepare_cache(&self, repo_root: &Path) -> Result<CacheModeDisposition> {
         prepare_cache_for_mode(repo_root, self.mode)
     }
+
+    /// Admit an already-built cache without creating, deleting, or rewriting it.
+    pub fn validate_existing_cache(&self, repo_root: &Path) -> Result<()> {
+        validate_existing_cache_for_mode(repo_root, self.mode)
+    }
 }
 
 /// Result of validating the disposable cache's selected context mode.
@@ -249,6 +254,32 @@ fn prepare_cache_for_mode(
     })
 }
 
+fn validate_existing_cache_for_mode(repo_root: &Path, mode: BusinessContextMode) -> Result<()> {
+    let cache_dir = validated_cache_path(repo_root)?;
+    anyhow::ensure!(
+        cache_dir.is_dir(),
+        "cache-only mode requires an existing cache at {}",
+        cache_dir.display()
+    );
+    let marker = cache_dir.join(CACHE_MODE_MARKER);
+    let persisted = std::fs::read_to_string(&marker)
+        .with_context(|| format!("cache-only mode requires {}", marker.display()))?;
+    let observed = persisted
+        .trim()
+        .parse::<BusinessContextMode>()
+        .with_context(|| {
+            format!(
+                "invalid cache business-context marker at {}",
+                marker.display()
+            )
+        })?;
+    anyhow::ensure!(
+        observed == mode,
+        "cache business-context mode mismatch: requested {mode}, persisted {observed}"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +375,31 @@ mod tests {
             std::fs::read_to_string(cache.join(CACHE_MODE_MARKER)).unwrap(),
             "enabled\n"
         );
+    }
+
+    #[test]
+    fn existing_cache_validation_is_fail_closed_and_non_mutating() {
+        let repo = tempfile::tempdir().unwrap();
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let cache = repo.path().join(".oh/.cache");
+
+        assert!(admission.validate_existing_cache(repo.path()).is_err());
+        assert!(!cache.exists());
+
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(CACHE_MODE_MARKER), "enabled\n").unwrap();
+        std::fs::write(cache.join("preserved"), "evidence").unwrap();
+        assert!(admission.validate_existing_cache(repo.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(cache.join("preserved")).unwrap(),
+            "evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join(CACHE_MODE_MARKER)).unwrap(),
+            "enabled\n"
+        );
+
+        std::fs::write(cache.join(CACHE_MODE_MARKER), "disabled\n").unwrap();
+        admission.validate_existing_cache(repo.path()).unwrap();
     }
 }

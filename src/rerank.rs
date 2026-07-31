@@ -34,6 +34,7 @@ static STRICT_RERANKER: Mutex<Option<StrictReranker>> = Mutex::new(None);
 
 struct StrictReranker {
     cache_digest: String,
+    resident_admitted: bool,
     model: TextRerank,
 }
 
@@ -119,6 +120,12 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
         match TextRerank::try_new(init_opts) {
             Ok(reranker) => {
                 tracing::info!("Reranker: ready in {:?}", start.elapsed());
+                tracing::info!(
+                    target: "rna_query_timing",
+                    phase = "reranker_initialization",
+                    strict = false,
+                    elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
+                );
                 *guard = Some(reranker);
             }
             Err(e) => {
@@ -129,13 +136,14 @@ pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec
     }
 
     let reranker = guard.as_mut().expect("reranker guaranteed Some after init");
-    rerank_with_model(reranker, query, candidates)
+    rerank_with_model(reranker, query, candidates, false)
 }
 
 fn rerank_with_model(
     reranker: &mut TextRerank,
     query: &str,
     candidates: &[RerankCandidate],
+    strict: bool,
 ) -> Result<Vec<RerankedResult>> {
     let start = std::time::Instant::now();
 
@@ -150,6 +158,13 @@ fn rerank_with_model(
         "Reranker: scored {} candidates in {:?}",
         candidates.len(),
         start.elapsed()
+    );
+    tracing::info!(
+        target: "rna_query_timing",
+        phase = "reranker_inference",
+        strict,
+        candidate_count = candidates.len(),
+        elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
     );
 
     // Map fastembed results back to our candidates using the index field.
@@ -213,8 +228,15 @@ pub fn rerank_results_strict(
             files.snapshot.display(),
             start.elapsed()
         );
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "reranker_initialization",
+            strict = true,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
+        );
         *guard = Some(StrictReranker {
             cache_digest: verified_cache.digest.clone(),
+            resident_admitted: false,
             model,
         });
     }
@@ -222,12 +244,99 @@ pub fn rerank_results_strict(
     let reranker = guard
         .as_mut()
         .expect("strict reranker guaranteed Some after initialization");
-    let results = rerank_with_model(&mut reranker.model, query, candidates)?;
+    reranker.resident_admitted = false;
+    let results = rerank_with_model(&mut reranker.model, query, candidates, true)?;
     validate_strict_rerank(candidates, &results)?;
     let observed_after_inference = strict_reranker_cache_digest_at(&verified_cache.root)?;
     if observed_after_inference != verified_cache.digest {
         anyhow::bail!("Strict reranker cache changed during inference");
     }
+    Ok(results)
+}
+
+/// Verify and preload the strict reranker before a cache-only runtime accepts
+/// requests. The admitted model tree is immutable for the process lifetime.
+pub fn prepare_strict_reranker_resident() -> Result<()> {
+    let admission_started = std::time::Instant::now();
+    let verified_cache = verify_strict_reranker_cache()?;
+    let mut guard = STRICT_RERANKER
+        .lock()
+        .map_err(|error| anyhow::anyhow!("Strict reranker lock poisoned: {error}"))?;
+
+    let cache_is_loaded = guard
+        .as_ref()
+        .map(|reranker| reranker.cache_digest.as_str())
+        == Some(verified_cache.digest.as_str());
+    if !cache_is_loaded {
+        let start = std::time::Instant::now();
+        let files = locate_strict_reranker_snapshot(&verified_cache.root)?;
+        let model = load_strict_reranker(&files)?;
+        tracing::info!(
+            "Strict reranker: loaded sealed snapshot {} in {:?}",
+            files.snapshot.display(),
+            start.elapsed()
+        );
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "reranker_initialization",
+            strict = true,
+            resident = true,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0
+        );
+        *guard = Some(StrictReranker {
+            cache_digest: verified_cache.digest.clone(),
+            resident_admitted: false,
+            model,
+        });
+    }
+
+    let observed_after_load = strict_reranker_cache_digest_at(&verified_cache.root)?;
+    if observed_after_load != verified_cache.digest {
+        anyhow::bail!("Strict reranker cache changed during resident admission");
+    }
+    guard
+        .as_mut()
+        .expect("strict reranker guaranteed Some after resident admission")
+        .resident_admitted = true;
+    tracing::info!(
+        target: "rna_query_timing",
+        phase = "strict_reranker_full_validation",
+        elapsed_ms = admission_started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+/// Reuse the strict reranker admitted at cache-only startup without re-hashing
+/// the read-only model tree for every request.
+pub fn rerank_results_strict_resident(
+    query: &str,
+    candidates: &[RerankCandidate],
+) -> Result<Vec<RerankedResult>> {
+    let wait_started = std::time::Instant::now();
+    let mut guard = STRICT_RERANKER
+        .lock()
+        .map_err(|error| anyhow::anyhow!("Strict reranker lock poisoned: {error}"))?;
+    tracing::info!(
+        target: "rna_query_timing",
+        phase = "reranker_wait",
+        strict = true,
+        resident = true,
+        elapsed_ms = wait_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let reranker = guard
+        .as_mut()
+        .filter(|reranker| reranker.resident_admitted)
+        .ok_or_else(|| {
+            anyhow::anyhow!("strict resident reranker was not admitted before request handling")
+        })?;
+    let reuse_started = std::time::Instant::now();
+    tracing::info!(
+        target: "rna_query_timing",
+        phase = "strict_reranker_resident_reuse",
+        elapsed_ms = reuse_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let results = rerank_with_model(&mut reranker.model, query, candidates, true)?;
+    validate_strict_rerank(candidates, &results)?;
     Ok(results)
 }
 
@@ -642,6 +751,17 @@ mod tests {
     fn test_rerank_empty_candidates() {
         let results = rerank_results("test query", &[]).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn strict_resident_reranker_fails_closed_before_admission() {
+        let previous = STRICT_RERANKER.lock().unwrap().take();
+        let error = rerank_results_strict_resident("test query", &[])
+            .unwrap_err()
+            .to_string();
+        *STRICT_RERANKER.lock().unwrap() = previous;
+
+        assert!(error.contains("was not admitted before request handling"));
     }
 
     #[test]

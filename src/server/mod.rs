@@ -84,6 +84,8 @@ impl PipelineResult {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
+    /// Serve only already-admitted resident state; never scan or enrich.
+    pub cache_only: bool,
     /// Producer admission and disposable-cache mode shared by every scan path.
     pub business_context: BusinessContextAdmission,
     /// Lock-free graph state via ArcSwap (#574).
@@ -151,6 +153,7 @@ impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            cache_only: false,
             business_context: BusinessContextAdmission::default(),
             graph: Arc::new(ArcSwap::from_pointee(None)),
             embed_index: Arc::new(ArcSwap::from_pointee(None)),
@@ -180,8 +183,20 @@ impl Default for RnaHandler {
 }
 
 impl RnaHandler {
+    /// Install an admitted persisted graph as the resident query snapshot.
+    pub fn install_cached_graph(&self, state: GraphState) {
+        self.graph.store(Arc::new(Some(Arc::new(state))));
+        *self.last_scan.lock().unwrap() = std::time::Instant::now();
+        self.graph_build_status.set_ready();
+    }
+
     /// Validate the exact disposable repo cache before any cache-backed read.
     pub fn prepare_business_context_cache(&self) -> anyhow::Result<CacheModeDisposition> {
+        if self.cache_only {
+            self.business_context
+                .validate_existing_cache(&self.repo_root)?;
+            return Ok(CacheModeDisposition::Compatible);
+        }
         let disposition = self.business_context.prepare_cache(&self.repo_root)?;
         if disposition.rebuilt() {
             self.graph.store(Arc::new(None));
@@ -203,6 +218,7 @@ impl RnaHandler {
     fn clone_shared(&self) -> Self {
         Self {
             repo_root: self.repo_root.clone(),
+            cache_only: self.cache_only,
             business_context: self.business_context.clone(),
             graph: Arc::clone(&self.graph),
             embed_index: Arc::clone(&self.embed_index),
@@ -239,6 +255,22 @@ impl RnaHandler {
     fn start_prewarm(&self) {
         self.prewarm_started
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.cache_only {
+            self.graph_build_status.set_ready();
+            self.prewarm_notify.notify_waiters();
+            return;
+        }
+        if self.graph.load().is_some() {
+            if !self
+                .background_scanner_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.spawn_background_scanner();
+            }
+            self.graph_build_status.set_ready();
+            self.prewarm_notify.notify_waiters();
+            return;
+        }
         self.graph_build_status.set_building(0);
         let handler = self.clone_shared();
         let notify = Arc::clone(&self.prewarm_notify);
@@ -2028,6 +2060,38 @@ mod tests {
         handler.await_background_embed().await;
         // Second call -- handle was already taken, so this is a no-op.
         handler.await_background_embed().await;
+    }
+
+    #[tokio::test]
+    async fn cache_only_get_graph_uses_installed_snapshot_without_background_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = RnaHandler {
+            repo_root: tmp.path().join("does-not-exist"),
+            cache_only: true,
+            ..Default::default()
+        };
+        handler.install_cached_graph(GraphState::new(
+            Vec::new(),
+            Vec::new(),
+            crate::graph::index::GraphIndex::new(),
+            None,
+            std::collections::HashSet::new(),
+        ));
+
+        handler.start_prewarm();
+        let graph = handler.get_graph().await.unwrap();
+
+        assert!(graph.nodes.is_empty());
+        assert!(
+            handler
+                .prewarm_started
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            !handler
+                .background_scanner_started
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// Verify that start_prewarm populates the graph in the background

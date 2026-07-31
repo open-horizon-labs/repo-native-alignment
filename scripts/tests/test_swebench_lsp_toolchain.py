@@ -1138,7 +1138,10 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         workflow = (
             ROOT / ".github/workflows/swebench-semantic-bundle.yml"
         ).read_text()
+        smoke = (ROOT / ".github/scripts/mcp-cache-only-smoke.mjs").read_text()
         source = MODULE_PATH.read_text()
+        main_source = (ROOT / "src/main.rs").read_text()
+        embed_source = (ROOT / "src/embed/real.rs").read_text()
         self.assertEqual(workflow.count("bind-hf-default-cache"), 2)
         self.assertIn(
             "            unset HF_HOME\n"
@@ -1172,6 +1175,51 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             "              search \\\n",
             workflow,
         )
+        self.assertIn(
+            "node .github/scripts/mcp-cache-only-smoke.mjs \\\n"
+            '            --snapshot "$FIXTURE_ROOT"',
+            workflow,
+        )
+        self.assertIn("@modelcontextprotocol/sdk@1.30.0", workflow)
+        self.assertIn('- ".github/scripts/mcp-cache-only-smoke.mjs"', workflow)
+        self.assertIn(
+            '              --cache-only \\\n'
+            "              --business-context disabled \\\n"
+            '              --log-path "$RESIDENT_LOG" &',
+            workflow,
+        )
+        self.assertIn("resident-mcp-three-client.json", workflow)
+        self.assertIn("--verify-snapshot", workflow)
+        self.assertIn('jobs["jobs"][0]["lease_expires_at"] = 0', workflow)
+        self.assertIn('reports["reports"][0]["state"] = "running"', workflow)
+        self.assertIn('callTextTool(clients[0].client, "search"', smoke)
+        self.assertIn('callTextTool(clients[1].client, "list_roots", {})', smoke)
+        self.assertNotIn('phase = "embedding_open"', main_source)
+        lance_open = embed_source.index("let db = lancedb::connect")
+        embedding_open = embed_source.index('phase = "embedding_open"', lance_open)
+        index_install = embed_source.index("let index = Self", embedding_open)
+        self.assertLess(lance_open, embedding_open)
+        self.assertLess(embedding_open, index_install)
+        self.assertIn(
+            '/usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type d -exec /bin/chmod 0555 {} +',
+            workflow,
+        )
+        self.assertIn(
+            'RESIDENT_PROFILE="$PROFILE (allow network-inbound '
+            '(local ip \\"localhost:18765\\"))"',
+            workflow,
+        )
+        self.assertIn(
+            '/usr/bin/sandbox-exec -p "$RESIDENT_PROFILE" \\\n'
+            '            "$BUNDLE_ROOT/repo-native-alignment"',
+            workflow,
+        )
+        self.assertIn(
+            '[[ ! "$CHIP" =~ Apple[[:space:]]M([0-9]+) ]] '
+            '|| (( BASH_REMATCH[1] < 4 ))',
+            workflow,
+        )
+        self.assertIn("requires an Apple M4-or-newer builder", workflow)
         self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)
         self.assertIn(
             'bind_hf_default_cache(\n            Path(environment["HF_HOME"]), '
