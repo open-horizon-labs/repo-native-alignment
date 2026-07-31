@@ -1430,12 +1430,20 @@ fn identity_disposition(
     }
 }
 
-fn record_integrity_digest(record: &LspWorkItemRecord) -> Result<String> {
-    let mut canonical = record.clone();
-    canonical.integrity_digest.clear();
-    let bytes = serde_json::to_vec(&canonical)
-        .context("failed to serialize canonical LSP work-item record")?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+/// Digest every field of `record` except `integrity_digest` itself.
+///
+/// The field is cleared in place and restored before returning, rather than
+/// digesting a clone. `write_store` calls this for every record on every flush
+/// (`FLUSH_INTERVAL`) during Pass 1, so a clone here would allocate and drop a
+/// second full copy of `output_nodes`/`output_edges` per record per flush on
+/// the scan path. Restoring runs before the serialization error is propagated
+/// so a failed flush never leaves a record with a cleared digest.
+fn record_integrity_digest(record: &mut LspWorkItemRecord) -> Result<String> {
+    let stored = std::mem::take(&mut record.integrity_digest);
+    let serialized =
+        serde_json::to_vec(&*record).context("failed to serialize canonical LSP work-item record");
+    record.integrity_digest = stored;
+    Ok(blake3::hash(&serialized?).to_hex().to_string())
 }
 
 struct RecoverySelection {
@@ -1572,7 +1580,7 @@ pub(crate) fn purge_records_for_paths(
     store
         .records
         .retain(|_, record| !paths.contains(&record.file));
-    write_store(repo_root, &store)?;
+    write_store(repo_root, &mut store)?;
     Ok(removed)
 }
 
@@ -1763,7 +1771,7 @@ fn merge_and_write_store(
     persisted.records.extend(current_job.records.clone());
     persisted.schema_version = STORE_SCHEMA_VERSION;
     retain_recent_jobs(&mut persisted, MAX_RETAINED_TERMINAL_JOBS);
-    write_store(repo_root, &persisted)
+    write_store(repo_root, &mut persisted)
 }
 
 fn work_item_lock_is_owned_by(path: &Path, owner: &str) -> bool {
@@ -1878,21 +1886,27 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
     Ok(store)
 }
 
-fn write_store(repo_root: &Path, store: &LspWorkItemStore) -> Result<()> {
+/// Seal `store` in place and write it atomically.
+///
+/// Takes `&mut` so the flush path seals the caller's own store instead of a
+/// clone. Every caller owns a short-lived store that it drops immediately
+/// afterwards, so the sealed `schema_version`/`integrity_digest` values are
+/// exactly what lands on disk.
+fn write_store(repo_root: &Path, store: &mut LspWorkItemStore) -> Result<()> {
     let path = store_path(repo_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed to create LSP work-item cache {}", parent.display())
         })?;
     }
-    let mut sealed = store.clone();
-    sealed.schema_version = STORE_SCHEMA_VERSION;
-    for record in sealed.records.values_mut() {
+    store.schema_version = STORE_SCHEMA_VERSION;
+    for record in store.records.values_mut() {
         record.schema_version = STORE_SCHEMA_VERSION;
-        record.integrity_digest = record_integrity_digest(record)?;
+        let digest = record_integrity_digest(record)?;
+        record.integrity_digest = digest;
     }
     let bytes =
-        serde_json::to_vec_pretty(&sealed).context("failed to serialize LSP work-item ledger")?;
+        serde_json::to_vec_pretty(&store).context("failed to serialize LSP work-item ledger")?;
     let temp_path = path.with_extension(format!(
         "json.tmp-{}-{}",
         std::process::id(),
@@ -2029,6 +2043,52 @@ mod tests {
         let result = run_bounded(&mut command, Duration::from_millis(200));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn record_integrity_digest_restores_stored_digest_and_stays_wire_compatible() {
+        let mut identity = LspWorkIdentity {
+            schema_version: WORK_IDENTITY_SCHEMA_VERSION,
+            source_snapshot: "snapshot".to_string(),
+            request_anchor: "anchor".to_string(),
+            operations_digest: "operations".to_string(),
+            toolchain_contract: "toolchain".to_string(),
+            planner_contract: PLANNER_CONTRACT_VERSION.to_string(),
+            digest: String::new(),
+        };
+        identity.digest = work_identity_digest(&identity);
+        let mut record = new_record(
+            Path::new("/tmp/integrity-fixture"),
+            "integrity-job",
+            &seeds(1)[0],
+            identity,
+            42,
+        );
+        record.output_edges.push(edge("caller", "callee"));
+        record.integrity_digest = "previously-sealed-digest".to_string();
+
+        // Digesting borrows the record mutably and clears the field in place, so
+        // the stored value must survive the call and repeated calls must agree.
+        let first = record_integrity_digest(&mut record).unwrap();
+        assert_eq!(
+            record.integrity_digest, "previously-sealed-digest",
+            "digesting must restore the stored digest, not consume it"
+        );
+        let second = record_integrity_digest(&mut record).unwrap();
+        assert_eq!(first, second, "digest must be stable across calls");
+
+        // Ledgers sealed before the in-place change hashed a clone whose digest
+        // field was cleared. `mem::take` leaves the same empty string, so the
+        // digest of an already-persisted record must still validate.
+        let mut cleared = record.clone();
+        cleared.integrity_digest.clear();
+        let expected = blake3::hash(&serde_json::to_vec(&cleared).unwrap())
+            .to_hex()
+            .to_string();
+        assert_eq!(
+            first, expected,
+            "in-place digest must match the previous clone-and-clear digest"
+        );
     }
 
     fn seeds(count: usize) -> Vec<LspWorkItemSeed> {
