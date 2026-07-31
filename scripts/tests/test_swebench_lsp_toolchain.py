@@ -1180,15 +1180,25 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertIn("@modelcontextprotocol/sdk@1.30.0", workflow)
         self.assertIn('- ".github/scripts/mcp-cache-only-smoke.mjs"', workflow)
         self.assertIn(
-            '            --cache-only \\\n'
-            "            --business-context disabled \\\n"
-            '            --log-path "$RESIDENT_LOG" &',
+            '              --cache-only \\\n'
+            "              --business-context disabled \\\n"
+            '              --log-path "$RESIDENT_LOG" &',
             workflow,
         )
         self.assertIn("resident-mcp-three-client.json", workflow)
         self.assertIn("--verify-snapshot", workflow)
         self.assertIn(
             '/usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type d -exec /bin/chmod 0555 {} +',
+            workflow,
+        )
+        self.assertIn(
+            'RESIDENT_PROFILE="$PROFILE (allow network-inbound '
+            '(local ip \\"localhost:18765\\"))"',
+            workflow,
+        )
+        self.assertIn(
+            '/usr/bin/sandbox-exec -p "$RESIDENT_PROFILE" \\\n'
+            '            "$BUNDLE_ROOT/repo-native-alignment"',
             workflow,
         )
         self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)

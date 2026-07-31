@@ -647,6 +647,16 @@ async fn load_existing_embedding_index(
     }
 }
 
+fn require_cache_only_semantic_generation<T>(
+    cache_only: bool,
+    opened: Option<T>,
+) -> anyhow::Result<Option<T>> {
+    if cache_only && opened.is_none() {
+        anyhow::bail!("cache-only runtime requires a published semantic generation");
+    }
+    Ok(opened)
+}
+
 struct ScanSummaryInput<'a> {
     repo_root: &'a std::path::Path,
     graph: &'a server::state::GraphState,
@@ -1792,11 +1802,12 @@ async fn async_main() -> anyhow::Result<()> {
             );
             handler.install_cached_graph(state);
             let embedding_open_started = std::time::Instant::now();
+            let opened = load_existing_embedding_index(&repo_root, cli.cache_only, |msg| {
+                tracing::warn!("{}; MCP semantic search will be unavailable", msg);
+            })
+            .await?;
             if let Some(embed_idx) =
-                load_existing_embedding_index(&repo_root, cli.cache_only, |msg| {
-                    tracing::warn!("{}; MCP semantic search will be unavailable", msg);
-                })
-                .await?
+                require_cache_only_semantic_generation(cli.cache_only, opened)?
             {
                 if cli.cache_only {
                     tokio::task::spawn_blocking(
@@ -1884,6 +1895,27 @@ mod tests {
         .unwrap();
         assert!(cache_only.cache_only);
         assert_eq!(cache_only.transport, "http");
+    }
+
+    #[test]
+    fn cache_only_requires_a_published_semantic_generation() {
+        assert!(
+            require_cache_only_semantic_generation::<()>(false, None)
+                .unwrap()
+                .is_none()
+        );
+        let error =
+            require_cache_only_semantic_generation::<()>(true, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a published semantic generation")
+        );
+        assert!(
+            require_cache_only_semantic_generation(true, Some(()))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

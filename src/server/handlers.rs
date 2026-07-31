@@ -263,6 +263,11 @@ impl RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -350,6 +355,11 @@ impl RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -1149,7 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_only_external_search_rejects_before_cache_creation() {
+    async fn cache_only_external_tools_reject_before_cache_creation() {
         let server = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(external.path().join("src")).unwrap();
@@ -1177,9 +1187,23 @@ mod tests {
 
         let rendered = call_tool_text(&handler.handle_search(args).await.unwrap());
         assert!(rendered.contains("serves only its admitted repository cache"));
+        let outcome: OutcomeProgress = serde_json::from_value(serde_json::json!({
+            "outcome_id": "fixture",
+            "repo": external.path().to_string_lossy()
+        }))
+        .unwrap();
+        let rendered =
+            call_tool_text(&handler.handle_outcome_progress(outcome).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
+        let repo_map: RepoMap = serde_json::from_value(serde_json::json!({
+            "repo": external.path().to_string_lossy()
+        }))
+        .unwrap();
+        let rendered = call_tool_text(&handler.handle_repo_map(repo_map).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
         assert!(
             !external.path().join(".oh").exists(),
-            "cache-only external rejection must happen before any cache creation"
+            "every cache-only external rejection must happen before cache creation"
         );
     }
 
