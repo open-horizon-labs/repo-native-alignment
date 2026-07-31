@@ -12,7 +12,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::business_context::BusinessContextMode;
 use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState};
@@ -28,6 +29,14 @@ use crate::server::{
 
 pub const LSP_COMPLETENESS_SCHEMA_VERSION: u32 = 6;
 pub const LSP_COMPLETENESS_REPORT_PATH: &str = ".oh/.cache/lsp_completeness.json";
+pub const LSP_COMPLETENESS_SUMMARY_PATH: &str = ".oh/.cache/lsp_completeness_summary.json";
+pub const LSP_COMPLETENESS_SUMMARY_COMMIT_PATH: &str =
+    ".oh/.cache/lsp_completeness_summary.commit.json";
+const LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION: u32 = 3;
+const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
+const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
+const LSP_COMPLETENESS_PUBLICATION_LOCK_PATH: &str = ".oh/.cache/lsp_completeness.publication.lock";
+static PERSIST_REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
 const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
 const FROZEN_POPULATION_JSON: &[u8] =
@@ -337,6 +346,53 @@ pub struct ReportSummary {
     pub by_extension: BTreeMap<String, u64>,
 }
 
+/// Bounded query-path projection of the complete per-file report.
+///
+/// The full report can be hundreds of megabytes. Search reads only this fixed-
+/// shape summary; detailed per-file evidence remains in the canonical report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspCompletenessSummary {
+    pub schema_version: u32,
+    pub ready: bool,
+    pub total_files: u64,
+    pub included_files: u64,
+    pub excluded_files: u64,
+    pub violation_count: u64,
+    pub report_digest: String,
+    pub report_identity_digest: String,
+    pub graph_snapshot_digest: String,
+}
+
+/// Last publication marker for the bounded summary/full-report pair.
+///
+/// The marker is published only after both files and binds the exact summary
+/// bytes to independently observable full-report metadata. Search can reject
+/// a stale, tampered, or interrupted summary without reading the full report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LspCompletenessSummaryCommit {
+    schema_version: u32,
+    summary_sha256: String,
+    report_digest: String,
+    report_bytes: u64,
+    report_modified_unix_nanos: u128,
+}
+
+impl LspCompletenessSummary {
+    fn from_report(report: &LspCompletenessReport) -> Self {
+        Self {
+            schema_version: LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+            ready: report.is_ready(),
+            total_files: report.summary.total_files,
+            included_files: report.summary.included_files,
+            excluded_files: report.summary.excluded_files,
+            violation_count: report.violations.len() as u64,
+            report_digest: report.digest.clone(),
+            report_identity_digest: report_identity_digest(&report.identity),
+            graph_snapshot_digest: report.graph_snapshot_digest.clone(),
+        }
+    }
+}
+
 /// Normalized proof for the current report generation. Inherited evidence is
 /// portable only through a verified archive authorization; historical checkout
 /// paths are deliberately absent from this identity.
@@ -607,17 +663,90 @@ impl LspCompletenessReport {
     }
 }
 
-fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
-    let mut entries = BTreeSet::new();
-    for node in nodes {
-        entries.insert(("node", node.stable_id(), format!("{:?}", node.source)));
+pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
+    /// Exact node projection stored in Lance. `Node::language` is deliberately
+    /// absent from the symbols table and is reconstructed from `NodeId::file`
+    /// on reopen, so hashing that derived field would make one persisted graph
+    /// acquire two identities before and after its storage round trip.
+    #[derive(Serialize)]
+    struct PersistedNodeSnapshot<'a> {
+        id: &'a crate::graph::NodeId,
+        line_start: usize,
+        line_end: usize,
+        signature: &'a str,
+        body: &'a str,
+        metadata: &'a BTreeMap<String, String>,
+        source: &'a ExtractionSource,
     }
-    for edge in edges {
-        entries.insert(("edge", edge.stable_id(), format!("{:?}", edge.source)));
+
+    let mut ordered_nodes = nodes
+        .iter()
+        .map(|node| (node.stable_id(), node))
+        .collect::<Vec<_>>();
+    ordered_nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ordered_edges = edges
+        .iter()
+        .map(|edge| (edge.stable_id(), edge))
+        .collect::<Vec<_>>();
+    ordered_edges.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (stable_id, node) in ordered_nodes {
+        hasher.update(b"node\0");
+        hasher.update(stable_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(
+            &serde_json::to_vec(&PersistedNodeSnapshot {
+                id: &node.id,
+                line_start: node.line_start,
+                line_end: node.line_end,
+                signature: &node.signature,
+                body: &node.body,
+                metadata: &node.metadata,
+                source: &node.source,
+            })
+            .expect("graph node snapshot digest serialization cannot fail"),
+        );
+        hasher.update(&[0xff]);
     }
+    for (stable_id, edge) in ordered_edges {
+        hasher.update(b"edge\0");
+        hasher.update(stable_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(
+            &serde_json::to_vec(edge)
+                .expect("graph edge snapshot digest serialization cannot fail"),
+        );
+        hasher.update(&[0xff]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn report_identity_digest(identity: &ReportIdentity) -> String {
     let bytes =
-        serde_json::to_vec(&entries).expect("graph snapshot digest serialization cannot fail");
+        serde_json::to_vec(identity).expect("LSP report identity digest serialization cannot fail");
     blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// Load the bounded summary only when both its report generation and exact
+/// persisted graph projection match the runtime serving the query.
+pub fn load_runtime_summary(
+    repo_root: &Path,
+    context_mode: BusinessContextMode,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<LspCompletenessSummary> {
+    let summary = load_summary(repo_root)?;
+    let current_identity = current_report_identity(repo_root, context_mode)?;
+    anyhow::ensure!(
+        summary.report_identity_digest == report_identity_digest(&current_identity),
+        "LSP completeness summary report identity does not match the current runtime"
+    );
+    anyhow::ensure!(
+        summary.graph_snapshot_digest == graph_snapshot_digest(nodes, edges),
+        "LSP completeness summary graph identity does not match the current runtime"
+    );
+    Ok(summary)
 }
 
 fn evaluate_files(files: &[FileCoverageRecord]) -> Vec<ReadinessViolation> {
@@ -1582,8 +1711,166 @@ pub fn report_path(repo_root: &Path) -> PathBuf {
     repo_root.join(LSP_COMPLETENESS_REPORT_PATH)
 }
 
+pub fn summary_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(LSP_COMPLETENESS_SUMMARY_PATH)
+}
+
+pub fn summary_commit_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(LSP_COMPLETENESS_SUMMARY_COMMIT_PATH)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn synced_json_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.update(b"\n");
+    format!("{:x}", hasher.finalize())
+}
+
+fn report_file_identity(path: &Path) -> Result<(u64, u128)> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "failed to inspect LSP completeness report {}",
+            path.display()
+        )
+    })?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("missing modification time for {}", path.display()))?
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| {
+            format!(
+                "modification time predates UNIX epoch for {}",
+                path.display()
+            )
+        })?;
+    Ok((metadata.len(), modified.as_nanos()))
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("{label} is missing or unreadable at {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(max_bytes);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} at {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= max_bytes,
+        "{label} exceeds {max_bytes} bytes at {}",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn report_temp_paths(parent: &Path) -> [PathBuf; 3] {
+    let sequence = PERSIST_REPORT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("{}-{sequence}", std::process::id());
+    [
+        parent.join(format!(".lsp_completeness.json.tmp-{suffix}")),
+        parent.join(format!(".lsp_completeness_summary.json.tmp-{suffix}")),
+        parent.join(format!(
+            ".lsp_completeness_summary.commit.json.tmp-{suffix}"
+        )),
+    ]
+}
+
+/// Cross-process serialization boundary shared by graph mutation and bounded
+/// readiness publication. Advisory locking avoids stale lock files after a
+/// crash while keeping the lock repo-scoped.
+pub(crate) struct LspReadinessMutationLock {
+    file: fs::File,
+}
+
+pub(crate) fn acquire_lsp_readiness_mutation_lock(
+    repo_root: &Path,
+) -> Result<LspReadinessMutationLock> {
+    let path = repo_root.join(LSP_COMPLETENESS_PUBLICATION_LOCK_PATH);
+    let parent = path
+        .parent()
+        .context("LSP readiness mutation lock has no parent")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create LSP readiness mutation lock directory {}",
+            parent.display()
+        )
+    })?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "failed to open LSP readiness mutation lock {}",
+                path.display()
+            )
+        })?;
+    file.lock().with_context(|| {
+        format!(
+            "failed to acquire LSP readiness mutation lock {}",
+            path.display()
+        )
+    })?;
+    Ok(LspReadinessMutationLock { file })
+}
+
+pub(crate) async fn acquire_lsp_readiness_mutation_lock_async(
+    repo_root: &Path,
+) -> Result<LspReadinessMutationLock> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_lsp_readiness_mutation_lock(&repo_root))
+        .await
+        .context("LSP readiness mutation lock task failed")?
+}
+
+impl Drop for LspReadinessMutationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Result<()> {
+    let _lock = acquire_lsp_readiness_mutation_lock(repo_root)?;
+    persist_report_under_lock(repo_root, report, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn persist_report_with_precommit_hook(
+    repo_root: &Path,
+    report: &LspCompletenessReport,
+    precommit_hook: impl FnOnce(),
+) -> Result<()> {
+    let _lock = acquire_lsp_readiness_mutation_lock(repo_root)?;
+    persist_report_under_lock(repo_root, report, precommit_hook)
+}
+
+fn persist_report_under_lock(
+    repo_root: &Path,
+    report: &LspCompletenessReport,
+    precommit_hook: impl FnOnce(),
+) -> Result<()> {
     let path = report_path(repo_root);
+    let summary_path = summary_path(repo_root);
+    let summary_commit_path = summary_commit_path(repo_root);
     let parent = path
         .parent()
         .context("LSP completeness report path has no parent")?;
@@ -1593,24 +1880,144 @@ pub fn persist_report(repo_root: &Path, report: &LspCompletenessReport) -> Resul
             parent.display()
         )
     })?;
-    let temp = parent.join(format!(".lsp_completeness.json.tmp-{}", std::process::id()));
+    let [temp, summary_temp, summary_commit_temp] = report_temp_paths(parent);
     let bytes = serde_json::to_vec_pretty(report)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)
-        .with_context(|| format!("failed to open {}", temp.display()))?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+    let summary_bytes = serde_json::to_vec_pretty(&LspCompletenessSummary::from_report(report))?;
+    anyhow::ensure!(
+        summary_bytes.len() < MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        "LSP completeness summary exceeds {} bytes",
+        MAX_LSP_COMPLETENESS_SUMMARY_BYTES
+    );
+    write_synced_temp(&temp, &bytes)?;
+    write_synced_temp(&summary_temp, &summary_bytes)?;
+    // Invalidate the old publication marker before changing either member of
+    // the pair. Any interruption from here until the final marker rename is
+    // reported as `status unverified`.
+    for stale_path in [&summary_commit_path, &summary_path] {
+        match fs::remove_file(stale_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                for temp_path in [&temp, &summary_temp, &summary_commit_temp] {
+                    let _ = fs::remove_file(temp_path);
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to invalidate LSP completeness sidecar {}",
+                        stale_path.display()
+                    )
+                });
+            }
+        }
+    }
     fs::rename(&temp, &path).with_context(|| {
         format!(
             "failed to atomically replace LSP completeness report {}",
             path.display()
         )
     })?;
+    fs::rename(&summary_temp, &summary_path).with_context(|| {
+        format!(
+            "failed to atomically replace LSP completeness summary {}",
+            summary_path.display()
+        )
+    })?;
+    precommit_hook();
+    let (report_bytes, report_modified_unix_nanos) = report_file_identity(&path)?;
+    let summary_commit = LspCompletenessSummaryCommit {
+        schema_version: LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+        summary_sha256: synced_json_sha256(&summary_bytes),
+        report_digest: report.digest.clone(),
+        report_bytes,
+        report_modified_unix_nanos,
+    };
+    let summary_commit_bytes = serde_json::to_vec_pretty(&summary_commit)?;
+    anyhow::ensure!(
+        summary_commit_bytes.len() < MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES,
+        "LSP completeness summary commit exceeds {} bytes",
+        MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES
+    );
+    write_synced_temp(&summary_commit_temp, &summary_commit_bytes)?;
+    fs::rename(&summary_commit_temp, &summary_commit_path).with_context(|| {
+        format!(
+            "failed to atomically publish LSP completeness summary commit {}",
+            summary_commit_path.display()
+        )
+    })?;
     Ok(())
+}
+
+/// Invalidate the bounded readiness publication before the persisted graph is
+/// mutated. The full report remains available for diagnostics, but readers
+/// must not treat its summary as current until a report for the new graph has
+/// been published.
+pub(crate) fn invalidate_summary_publication(repo_root: &Path) -> Result<()> {
+    let path = summary_commit_path(repo_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to invalidate LSP completeness publication {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+pub fn load_summary(repo_root: &Path) -> Result<LspCompletenessSummary> {
+    let path = summary_path(repo_root);
+    let bytes = read_bounded_file(
+        &path,
+        MAX_LSP_COMPLETENESS_SUMMARY_BYTES,
+        "LSP completeness summary",
+    )?;
+    let summary: LspCompletenessSummary = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid LSP completeness summary at {}", path.display()))?;
+    anyhow::ensure!(
+        summary.schema_version == LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+        "unsupported LSP completeness summary schema {} at {}",
+        summary.schema_version,
+        path.display()
+    );
+    let commit_path = summary_commit_path(repo_root);
+    let commit_bytes = read_bounded_file(
+        &commit_path,
+        MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES,
+        "LSP completeness summary commit",
+    )?;
+    let commit: LspCompletenessSummaryCommit =
+        serde_json::from_slice(&commit_bytes).with_context(|| {
+            format!(
+                "invalid LSP completeness summary commit at {}",
+                commit_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        commit.schema_version == LSP_COMPLETENESS_SUMMARY_SCHEMA_VERSION,
+        "unsupported LSP completeness summary commit schema {} at {}",
+        commit.schema_version,
+        commit_path.display()
+    );
+    anyhow::ensure!(
+        commit.summary_sha256 == sha256_hex(&bytes),
+        "LSP completeness summary does not match its publication commit at {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        commit.report_digest == summary.report_digest,
+        "LSP completeness summary digest does not match its publication commit at {}",
+        path.display()
+    );
+    let report = report_path(repo_root);
+    let (report_bytes, report_modified_unix_nanos) = report_file_identity(&report)?;
+    anyhow::ensure!(
+        report_bytes == commit.report_bytes
+            && report_modified_unix_nanos == commit.report_modified_unix_nanos,
+        "LSP completeness report identity does not match the bounded summary publication at {}",
+        report.display()
+    );
+    Ok(summary)
 }
 
 pub fn load_report(repo_root: &Path) -> Result<LspCompletenessReport> {
@@ -4706,6 +5113,181 @@ mod tests {
     }
 
     #[test]
+    fn competing_report_publications_cannot_cross_pair_summary_and_report() {
+        use std::sync::{Arc, Barrier, mpsc};
+
+        let repo = tempfile::tempdir().unwrap();
+        let first = report(vec![included(
+            "src/first.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        let second = report(vec![included(
+            "src/second.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        let entered_precommit = Arc::new(Barrier::new(2));
+        let release_precommit = Arc::new(Barrier::new(2));
+        let first_root = repo.path().to_path_buf();
+        let first_entered = Arc::clone(&entered_precommit);
+        let first_release = Arc::clone(&release_precommit);
+        let first_writer = std::thread::spawn(move || {
+            persist_report_with_precommit_hook(&first_root, &first, || {
+                first_entered.wait();
+                first_release.wait();
+            })
+        });
+        entered_precommit.wait();
+
+        let second_root = repo.path().to_path_buf();
+        let expected_digest = second.digest.clone();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_writer = std::thread::spawn(move || {
+            let result = persist_report(&second_root, &second);
+            second_done_tx.send(result).unwrap();
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "second report publication bypassed the repo-scoped lock"
+        );
+
+        release_precommit.wait();
+        first_writer.join().unwrap().unwrap();
+        second_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second publication remained blocked")
+            .unwrap();
+        second_writer.join().unwrap();
+
+        let summary = load_summary(repo.path()).expect("final bounded publication is coherent");
+        let report = load_report(repo.path()).expect("final full report is coherent");
+        assert_eq!(summary.report_digest, expected_digest);
+        assert_eq!(report.digest, expected_digest);
+    }
+
+    #[test]
+    fn completeness_summary_reader_rejects_oversized_sidecars() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = summary_path(repo.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_LSP_COMPLETENESS_SUMMARY_BYTES + 1]).unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("summary exceeds 4096 bytes"), "got: {error}");
+    }
+
+    #[test]
+    fn completeness_summary_rejects_well_formed_tampering() {
+        let repo = tempfile::tempdir().unwrap();
+        let original = report(vec![included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        persist_report(repo.path(), &original).unwrap();
+        let mut tampered = load_summary(repo.path()).unwrap();
+        tampered.ready = !tampered.ready;
+        std::fs::write(
+            summary_path(repo.path()),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("publication commit"), "got: {error}");
+    }
+
+    #[test]
+    fn completeness_summary_rejects_a_stale_but_valid_prior_summary() {
+        let repo = tempfile::tempdir().unwrap();
+        let first = report(vec![included(
+            "src/first.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        persist_report(repo.path(), &first).unwrap();
+        let stale_summary = std::fs::read(summary_path(repo.path())).unwrap();
+
+        let second = report(vec![included(
+            "src/second.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        persist_report(repo.path(), &second).unwrap();
+        std::fs::write(summary_path(repo.path()), stale_summary).unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("publication commit"), "got: {error}");
+    }
+
+    #[test]
+    fn completeness_summary_rejects_changed_full_report_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let original = report(vec![included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        persist_report(repo.path(), &original).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(report_path(repo.path()))
+            .unwrap();
+        file.write_all(b" ").unwrap();
+        file.sync_all().unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("report identity"), "got: {error}");
+    }
+
+    #[test]
+    fn completeness_summary_rejects_an_interrupted_missing_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let original = report(vec![included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+        persist_report(repo.path(), &original).unwrap();
+        std::fs::remove_file(summary_commit_path(repo.path())).unwrap();
+
+        let error = load_summary(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("commit is missing"), "got: {error}");
+    }
+
+    #[test]
+    fn persist_report_cleans_temps_when_sidecar_invalidation_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let summary = summary_path(repo.path());
+        std::fs::create_dir_all(&summary).unwrap();
+        let report = report(vec![included(
+            "src/a.py",
+            FileTerminalStatus::Processed { result_count: 0 },
+        )]);
+
+        let error = persist_report(repo.path(), &report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to invalidate"), "got: {error}");
+
+        let parent = report_path(repo.path()).parent().unwrap().to_path_buf();
+        let temp_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect::<Vec<_>>();
+        assert!(temp_names.is_empty(), "leftover temps: {temp_names:?}");
+    }
+
+    #[test]
+    fn report_temp_paths_are_unique_per_invocation() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = report_temp_paths(parent.path());
+        let second = report_temp_paths(parent.path());
+
+        assert!(
+            first.iter().all(|path| !second.contains(path)),
+            "overlapping publications must never share temp paths"
+        );
+    }
+
+    #[test]
     fn document_symbol_output_must_survive_graph_persistence() {
         let node = Node {
             id: NodeId {
@@ -4972,12 +5554,9 @@ mod tests {
         assert_eq!(document_links.observed_result_count, 0);
         assert!(document_links.output_nodes.is_empty());
         assert!(document_links.output_edges.is_empty());
-        assert!(
-            file_records
-                .iter()
-                .all(|record| record.state == LspWorkItemState::Completed
-                    && record.last_error.is_none())
-        );
+        assert!(file_records.iter().all(
+            |record| record.state == LspWorkItemState::Completed && record.last_error.is_none()
+        ));
 
         let jobs = vec![completed_job(vec![validation.clone()])];
         let status = terminal_status_for_file(
@@ -5463,6 +6042,92 @@ mod tests {
             violation.code == ReadinessViolationCode::StaleReport
                 && violation.detail.contains("graph snapshot digest changed")
         }));
+
+        let mut changed_body = node.clone();
+        changed_body.body = "return 1".to_string();
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_body), &[]),
+            "body-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_signature = node.clone();
+        changed_signature.signature = "def symbol(value):".to_string();
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_signature), &[]),
+            "signature-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_metadata = node.clone();
+        changed_metadata
+            .metadata
+            .insert("derived".to_string(), "changed".to_string());
+        assert_ne!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_metadata), &[]),
+            "metadata-only graph mutation retained the readiness identity"
+        );
+
+        let mut changed_derived_language = node.clone();
+        changed_derived_language.language = "reconstructed".to_string();
+        assert_eq!(
+            graph_snapshot_digest(std::slice::from_ref(&node), &[]),
+            graph_snapshot_digest(std::slice::from_ref(&changed_derived_language), &[]),
+            "unpersisted language derivation changed persisted graph identity"
+        );
+    }
+
+    #[test]
+    fn bounded_summary_rejects_same_graph_from_a_different_report_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = Node {
+            id: crate::graph::NodeId {
+                root: "local".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "symbol".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn symbol()".to_string(),
+            line_start: 1,
+            line_end: 1,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let identity = current_report_identity(repo.path(), BusinessContextMode::Disabled).unwrap();
+        let report = LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            std::slice::from_ref(&node),
+            &[],
+        );
+        persist_report(repo.path(), &report).unwrap();
+        load_runtime_summary(
+            repo.path(),
+            BusinessContextMode::Disabled,
+            std::slice::from_ref(&node),
+            &[],
+        )
+        .expect("unchanged runtime identity must admit the bounded summary");
+
+        fs::write(
+            repo.path().join(".oh/config.toml"),
+            b"exclude = [\"target\"]\n",
+        )
+        .unwrap();
+        let error = load_runtime_summary(
+            repo.path(),
+            BusinessContextMode::Disabled,
+            std::slice::from_ref(&node),
+            &[],
+        )
+        .expect_err("changed config identity must reject the bounded summary");
+        assert!(
+            error.to_string().contains("report identity"),
+            "unexpected identity mismatch: {error:#}"
+        );
     }
 
     #[test]

@@ -10,11 +10,14 @@ use lancedb::expr::{DfExpr, col, lit};
 
 use crate::graph::store::SCHEMA_VERSION;
 use crate::graph::{Edge, Node};
+use crate::lsp_completeness::{
+    acquire_lsp_readiness_mutation_lock_async, invalidate_summary_publication,
+};
 
 use super::batch::{build_edges_batch, build_symbols_batch};
 use super::migrate::{
-    check_and_migrate_schema, drop_all_lance_tables, is_conflict_error, is_schema_mismatch_error,
-    read_committed_scan_version, write_committed_scan_version,
+    check_and_migrate_schema_under_lock, drop_all_lance_tables, is_conflict_error,
+    is_schema_mismatch_error, read_committed_scan_version, write_committed_scan_version,
 };
 use super::{PREDICATE_BATCH_SIZE, graph_lance_path, string_isin};
 
@@ -54,11 +57,16 @@ pub(crate) async fn persist_graph_to_lance(
     nodes: &[Node],
     edges: &[Edge],
 ) -> anyhow::Result<()> {
+    let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
+        .await
+        .context("failed to serialize full graph persistence with LSP readiness")?;
+    invalidate_summary_publication(repo_root)
+        .context("failed to invalidate LSP readiness before full graph persistence")?;
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
     // Safety net: ensure schema is current before any writes.
-    if check_and_migrate_schema(&db_path).await? {
+    if check_and_migrate_schema_under_lock(repo_root, &db_path).await? {
         tracing::info!("Schema migrated to v{} -- cache rebuilt", SCHEMA_VERSION);
     }
 
@@ -315,11 +323,22 @@ async fn persist_graph_incremental_with_retry_limit(
     retry_limit: u64,
     instrumentation: Option<&PersistInstrumentation>,
 ) -> anyhow::Result<bool> {
+    let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
+        .await
+        .context("failed to serialize incremental graph persistence with LSP readiness")?;
+    let changes_graph = !upsert_nodes.is_empty()
+        || !upsert_edges.is_empty()
+        || !deleted_edge_ids.is_empty()
+        || !deleted_files.is_empty();
+    if changes_graph {
+        invalidate_summary_publication(repo_root)
+            .context("failed to invalidate LSP readiness before incremental graph persistence")?;
+    }
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
     // Pre-flight: ensure schema version matches before any LanceDB writes.
-    if check_and_migrate_schema(&db_path).await? {
+    if check_and_migrate_schema_under_lock(repo_root, &db_path).await? {
         tracing::info!(
             "Schema migrated to v{} during incremental update -- cache rebuilt; caller should do a full persist",
             SCHEMA_VERSION
@@ -597,6 +616,12 @@ pub(crate) async fn delete_nodes_for_roots(
         return Ok(());
     }
 
+    let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
+        .await
+        .context("failed to serialize stale-root pruning with LSP readiness")?;
+    invalidate_summary_publication(repo_root)
+        .context("failed to invalidate LSP readiness before stale-root pruning")?;
+
     let db = lancedb::connect(db_path.to_str().unwrap())
         .execute()
         .await
@@ -628,7 +653,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::super::graph_lance_path;
     use super::super::load::load_graph_from_lance;
@@ -636,7 +661,12 @@ mod tests {
         drop_all_lance_tables, read_committed_scan_version, scan_version_path,
     };
     use super::*;
+    use crate::business_context::BusinessContextMode;
     use crate::graph::{ExtractionSource, NodeId, NodeKind};
+    use crate::lsp_completeness::{
+        LspCompletenessReport, current_report_identity, graph_snapshot_digest, load_summary,
+        persist_report, persist_report_with_precommit_hook,
+    };
 
     fn make_test_node(name: &str) -> Node {
         Node {
@@ -684,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_process_serialization_and_retry_controls_are_independent() {
+    async fn repo_publication_lock_preserves_writes_across_caller_controls() {
         const WRITES_PER_TASK: usize = 12;
 
         for (label, serialized, retry_limit) in [
@@ -741,13 +771,10 @@ mod tests {
                 .map(|result| result.expect("writer task panicked"))
                 .filter_map(Result::err)
                 .collect();
-            if !errors.is_empty() {
-                assert!(
-                    !serialized && retry_limit == 0,
-                    "{label}: protected writer failed: {errors:#?}"
-                );
-                eprintln!("{label}: expected unprotected zero-retry failures: {errors:#?}");
-            }
+            assert!(
+                errors.is_empty(),
+                "{label}: repo-scoped publication lock must protect every writer: {errors:#?}"
+            );
             let state = load_graph_from_lance(dir.path())
                 .await
                 .expect("reopen final graph");
@@ -755,9 +782,7 @@ mod tests {
                 state.nodes.iter().any(|node| node.id.name == "baseline"),
                 "{label}: committed baseline must remain visible"
             );
-            if errors.is_empty() {
-                assert_eq!(state.nodes.len(), 1 + 2 * WRITES_PER_TASK, "{label}");
-            }
+            assert_eq!(state.nodes.len(), 1 + 2 * WRITES_PER_TASK, "{label}");
             let unique: std::collections::HashSet<_> =
                 state.nodes.iter().map(Node::stable_id).collect();
             assert_eq!(unique.len(), state.nodes.len(), "{label}: duplicate IDs");
@@ -774,7 +799,7 @@ mod tests {
                 .await
                 .expect("read table version");
             eprintln!(
-                "LanceDB in-process matrix: scenario={label} serialized={serialized} retry_limit={retry_limit} lock_wait_us={} conflicts={} successful_mutations={} elapsed_ms={} table_version={table_version} final_rows={}",
+                "LanceDB in-process matrix: scenario={label} caller_mutex={serialized} retry_limit={retry_limit} caller_lock_wait_us={} conflicts={} successful_mutations={} elapsed_ms={} table_version={table_version} final_rows={}",
                 lock_wait_micros.load(Ordering::Relaxed),
                 metrics.conflicts.load(Ordering::Relaxed),
                 metrics.successful_mutations.load(Ordering::Relaxed),
@@ -785,12 +810,11 @@ mod tests {
     }
 
     /// Foreground scans and background enrichment both perform full graph
-    /// persists. This scenario demonstrates why their shared mutex protects a
-    /// wider boundary than incremental merge conflict retries: without the
-    /// mutex, both writers may publish the same next scan version and expose a
-    /// union of snapshots rather than one complete snapshot.
+    /// persists. The repo-scoped publication lock is the mandatory correctness
+    /// boundary; an optional caller mutex may reduce contention but cannot
+    /// change the complete-snapshot result.
     #[tokio::test]
-    async fn full_persist_serialization_preserves_snapshot_semantics() {
+    async fn repo_publication_lock_preserves_full_snapshot_semantics() {
         for serialized in [true, false] {
             let dir = tempfile::tempdir().expect("tempdir");
             persist_graph_to_lance(dir.path(), &[make_test_node("baseline")], &[])
@@ -830,16 +854,14 @@ mod tests {
             let unique: std::collections::HashSet<_> =
                 state.nodes.iter().map(Node::stable_id).collect();
             assert_eq!(unique.len(), state.nodes.len(), "duplicate stable IDs");
-            if serialized {
-                assert_eq!(
-                    state.nodes.len(),
-                    1,
-                    "serialized full persists expose exactly one complete snapshot"
-                );
-            }
+            assert_eq!(
+                state.nodes.len(),
+                1,
+                "repo-serialized full persists expose exactly one complete snapshot"
+            );
             let committed = read_committed_scan_version(&graph_lance_path(dir.path()));
             eprintln!(
-                "LanceDB full/background matrix: serialized={serialized} lock_wait_us={} elapsed_ms={} committed_scan_version={committed} final_rows={}",
+                "LanceDB full/background matrix: caller_mutex={serialized} caller_lock_wait_us={} elapsed_ms={} committed_scan_version={committed} final_rows={}",
                 wait_micros.load(Ordering::Relaxed),
                 started.elapsed().as_millis(),
                 state.nodes.len(),
@@ -900,9 +922,10 @@ mod tests {
     }
 
     /// Reproduces the historical failure boundary with genuine OS processes,
-    /// not Tokio tasks sharing an in-process mutex. The matrix varies process
-    /// serialization and merge-conflict retries independently and verifies the
-    /// final store rather than accepting successful exit codes as correctness.
+    /// not Tokio tasks sharing an in-process mutex. The matrix varies launch
+    /// overlap and merge-conflict retries; the repo-scoped publication lock is
+    /// the shared correctness boundary in every scenario. It verifies the final
+    /// store rather than accepting successful exit codes as correctness.
     #[test]
     fn cross_process_write_matrix_preserves_all_rows() {
         const WRITES_PER_PROCESS: usize = 12;
@@ -1121,6 +1144,171 @@ mod tests {
             read_committed_scan_version(&db_path),
             2,
             "second persist should write version 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_mutations_invalidate_published_lsp_readiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = current_report_identity(dir.path(), BusinessContextMode::Disabled)
+            .expect("report identity");
+        let report = LspCompletenessReport::new(identity, Vec::new());
+        persist_report(dir.path(), &report).expect("publish bounded readiness");
+        assert!(load_summary(dir.path()).is_ok());
+
+        persist_graph_to_lance(dir.path(), &[make_test_node("changed_graph")], &[])
+            .await
+            .expect("persist changed graph");
+
+        let error = load_summary(dir.path()).expect_err("changed graph must invalidate readiness");
+        assert!(
+            error
+                .to_string()
+                .contains("LSP completeness summary commit is missing"),
+            "unexpected invalidation error: {error:#}"
+        );
+
+        persist_report(dir.path(), &report).expect("republish after full graph write");
+        persist_graph_incremental(
+            dir.path(),
+            &[make_test_node("incremental_change")],
+            &[],
+            &[],
+            &[],
+        )
+        .await
+        .expect("persist incremental graph change");
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "incremental graph write retained stale readiness"
+        );
+
+        persist_report(dir.path(), &report).expect("republish after incremental graph write");
+        delete_nodes_for_roots(dir.path(), &["local".to_string()])
+            .await
+            .expect("prune persisted graph root");
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "root pruning retained stale readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_graph_identity_matches_the_active_delivery_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut repository_sentinel = make_test_node("repository");
+        repository_sentinel.id.file = PathBuf::new();
+        repository_sentinel.language = "derived-before-persist".to_string();
+        let nodes = vec![repository_sentinel];
+
+        persist_graph_to_lance(dir.path(), &nodes, &[])
+            .await
+            .expect("persist graph with an unpersisted language field");
+        let reopened = load_graph_from_lance(dir.path())
+            .await
+            .expect("reopen persisted graph");
+
+        assert_ne!(nodes[0].language, reopened.nodes[0].language);
+        assert_eq!(
+            graph_snapshot_digest(&nodes, &[]),
+            graph_snapshot_digest(&reopened.nodes, &reopened.edges),
+            "one persisted graph acquired different readiness identities before and after reopen"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_graph_persistence_waits_for_report_publication_and_invalidates_it() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = current_report_identity(dir.path(), BusinessContextMode::Disabled)
+            .expect("report identity");
+        let report = LspCompletenessReport::new(identity, Vec::new());
+        let entered_precommit = Arc::new(Barrier::new(2));
+        let release_precommit = Arc::new(Barrier::new(2));
+        let report_root = dir.path().to_path_buf();
+        let report_entered = Arc::clone(&entered_precommit);
+        let report_release = Arc::clone(&release_precommit);
+        let report_writer = std::thread::spawn(move || {
+            persist_report_with_precommit_hook(&report_root, &report, || {
+                report_entered.wait();
+                report_release.wait();
+            })
+        });
+        entered_precommit.wait();
+
+        let mutation_root = dir.path().to_path_buf();
+        let mutation = tokio::spawn(async move {
+            persist_graph_to_lance(&mutation_root, &[make_test_node("concurrent_full")], &[]).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !mutation.is_finished(),
+            "full graph mutation bypassed the report publication lock"
+        );
+
+        release_precommit.wait();
+        report_writer.join().unwrap().unwrap();
+        mutation.await.unwrap().unwrap();
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "full graph mutation retained the concurrently published readiness"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_graph_persistence_waits_for_report_publication_and_invalidates_it() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = make_test_node("baseline");
+        persist_graph_to_lance(dir.path(), std::slice::from_ref(&baseline), &[])
+            .await
+            .expect("persist baseline graph");
+        let identity = current_report_identity(dir.path(), BusinessContextMode::Disabled)
+            .expect("report identity");
+        let report = LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            std::slice::from_ref(&baseline),
+            &[],
+        );
+        let entered_precommit = Arc::new(Barrier::new(2));
+        let release_precommit = Arc::new(Barrier::new(2));
+        let report_root = dir.path().to_path_buf();
+        let report_entered = Arc::clone(&entered_precommit);
+        let report_release = Arc::clone(&release_precommit);
+        let report_writer = std::thread::spawn(move || {
+            persist_report_with_precommit_hook(&report_root, &report, || {
+                report_entered.wait();
+                report_release.wait();
+            })
+        });
+        entered_precommit.wait();
+
+        let mutation_root = dir.path().to_path_buf();
+        let mutation = tokio::spawn(async move {
+            persist_graph_incremental(
+                &mutation_root,
+                &[make_test_node("concurrent_incremental")],
+                &[],
+                &[],
+                &[],
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !mutation.is_finished(),
+            "incremental graph mutation bypassed the report publication lock"
+        );
+
+        release_precommit.wait();
+        report_writer.join().unwrap().unwrap();
+        mutation.await.unwrap().unwrap();
+        assert!(
+            load_summary(dir.path()).is_err(),
+            "incremental mutation retained the concurrently published readiness"
         );
     }
 

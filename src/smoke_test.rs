@@ -1672,7 +1672,7 @@ async fn run_schema_version_check() -> Check {
     }
 
     // Step 2: First call — expect migration (returns true).
-    let migrated = match check_and_migrate_schema(&db_path).await {
+    let migrated = match check_and_migrate_schema(&temp_dir).await {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1724,7 +1724,7 @@ async fn run_schema_version_check() -> Check {
     }
 
     // Step 4: Second call — must be a no-op (returns false).
-    let noop = match check_and_migrate_schema(&db_path).await {
+    let noop = match check_and_migrate_schema(&temp_dir).await {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);

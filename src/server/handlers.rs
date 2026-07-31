@@ -178,7 +178,11 @@ impl RnaHandler {
                 embed_status: None,
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
-                enrichment_jobs: Vec::new(),
+                enrichment_jobs: if params.verbose {
+                    self.enrichment_jobs.all_jobs(&repo_path)
+                } else {
+                    Vec::new()
+                },
                 business_context: &self.business_context,
             };
             let markdown = crate::service::search(&params, &ctx).await;
@@ -205,7 +209,11 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
-            enrichment_jobs: self.enrichment_jobs.all_jobs(&self.repo_root),
+            enrichment_jobs: if params.verbose {
+                self.enrichment_jobs.all_jobs(&self.repo_root)
+            } else {
+                Vec::new()
+            },
             business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
@@ -643,6 +651,7 @@ mod tests {
     use crate::graph::index::GraphIndex;
     use crate::graph::{EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
     use crate::ranking;
+    use crate::server::{EnrichmentCapability, EnrichmentScope, EnrichmentTrigger, JobStart};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -1105,6 +1114,69 @@ mod tests {
         };
         assert!(sentinel.exists());
         assert_eq!(reopened_graph.nodes.len(), first_graph.nodes.len());
+    }
+
+    #[tokio::test]
+    async fn test_external_verbose_search_loads_external_enrichment_jobs() {
+        let server = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(external.path().join("src")).unwrap();
+        let symbol = "external_verbose_job_probe";
+        std::fs::write(
+            external.path().join("src/lib.rs"),
+            format!("pub fn {symbol}() {{}}\n"),
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: server.path().to_path_buf(),
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        handler
+            .load_external_graph(external.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let job_id = match handler
+            .enrichment_jobs
+            .begin_job(
+                external.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job.job_id,
+            JobStart::Joined { .. } => panic!("fresh external job unexpectedly joined"),
+        };
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": symbol,
+            "repo": external.path().to_string_lossy(),
+            "search_mode": "keyword",
+            "include_artifacts": false,
+            "include_markdown": false,
+            "compact": true,
+            "verbose": true
+        }))
+        .unwrap();
+
+        let rendered = call_tool_text(&handler.handle_search(args).await.unwrap());
+        assert!(
+            rendered.contains(symbol),
+            "external search missed symbol: {rendered}"
+        );
+        assert!(
+            rendered.contains("Enrichment jobs:"),
+            "external verbose search omitted bounded job diagnostics: {rendered}"
+        );
+        assert!(
+            rendered.contains(&job_id),
+            "external verbose search did not use the external ledger: {rendered}"
+        );
     }
 
     /// Verify that load_external_graph returns a clear error for a missing repository.
