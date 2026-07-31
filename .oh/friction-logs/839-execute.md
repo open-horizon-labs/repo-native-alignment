@@ -1,0 +1,21 @@
+---
+title: Issue #839 bounded warm graph traversal friction
+date: 2026-07-29
+issue: 839
+outcome: context-assembly
+---
+
+# Friction Log: #839 Bounded Warm Graph Traversal
+
+| Phase/Step | Tool | What happened | Workaround | Severity |
+|------------|------|---------------|------------|----------|
+| Pre-flight index gate | `repo-native-alignment scan --full` | Rust extraction and graph construction completed, but optional Python and TypeScript LSP enrichment degraded with `Missing Content-Length header`. | Continued with the ready exact Rust graph and recorded that full cross-language caller/reference coverage is unavailable for this change. | medium |
+| Call-site localization | RNA exact search / graph traversal | RNA identified the relevant symbols and callers, but did not return the concrete call-site line needed for a narrow edit. | Used one bounded `rg` query over the already-identified files to locate the indexed calls. | low |
+| Artifact lookup | RNA artifact search | A focused friction-log query returned more than 8,000 tokens and appended full capability/job diagnostics despite `--compact`. | Used the bounded beginning of the result; this is direct reproduction evidence for #839. | high |
+| Formatting | `cargo fmt --check` | The base branch has extensive pre-existing formatting drift in unrelated modules. | Formatted only the four changed Rust files with `rustfmt --config skip_children=true` and verified `git diff --check`. | low |
+| Focused test build | Cargo | The first test-profile build exhausted the filesystem while linking Lance dependencies. | Removed only the main checkout's rebuildable generated `target/` directory (15.5 GiB); preserved every source worktree, branch, cache, and evidence artifact, then resumed successfully. | medium |
+| Focused test assertion inspection | RNA exact search / graph traversal | RNA returned the changed test symbol but the worktree index still exposed the pre-edit body for its called formatter and did not expose the assertion body. | Used a bounded `git diff` hunk for the already-identified test, corrected the inventory-scope wording, and reran the focused test. | low |
+| Repeated large-cache profile | final #839 CLI | The copied historical Django cache recovered from the recorded 301,300-node projection to 103,057 loaded symbols on its first final-binary access. | Reported the projections separately, retained the direct 301,300-node before/after evidence, added a synthetic executable 300,000-node traversal regression, and assigned search-only zero-edge projection work to #844. | medium |
+| Merit-gate regression audit | focused Rust test | The 10,000-validation formatter fixture round-tripped its adversarial vector through the disk ledger. Under low disk, that silent side effect failed and the assertion observed the ledger's earlier zero-validation default profile. | Constructed the large validation evidence directly in memory, preserving the formatter stress case while removing unrelated persistence. Fifteen repeated parallel/serial harness runs passed. | medium |
+| Final fixture relink | Cargo / linker | The worktree again reached `errno=28` while relinking after the merit fix. | Removed only rebuildable generated Rust targets from inactive `metal-candle` (5.3 GiB) and `bottle` (1.0 GiB) checkouts, then reran the focused test successfully. No source, branch, RNA cache, or benchmark evidence was removed. | medium |
+| Adversarial summary integrity | final committed diff | A syntactically valid bounded summary could be changed or replaced with a stale summary and still promote the full report to `ready`; size/schema checks alone did not bind the pair. | Added a bounded publication commit, published last, that binds summary bytes to report digest and file identity. Missing, stale, tampered, oversized, changed-report, or interrupted pairs fail closed as `status unverified`. | high |

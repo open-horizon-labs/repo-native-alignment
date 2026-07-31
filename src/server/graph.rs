@@ -31,8 +31,8 @@ use super::enrichment_jobs::{
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
-    check_and_migrate_schema, delete_nodes_for_roots, get_stored_root_ids, graph_lance_path,
-    load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance,
+    check_and_migrate_schema, delete_nodes_for_roots, get_stored_root_ids, load_graph_from_lance,
+    persist_graph_incremental, persist_graph_to_lance,
 };
 
 fn merge_duplicate_node(into: &mut Node, from: Node) {
@@ -1327,8 +1327,7 @@ impl RnaHandler {
         crate::extract::generic::init_pattern_config(&self.repo_root);
 
         // Pre-flight: ensure schema version matches before any LanceDB reads/writes.
-        let db_path = graph_lance_path(&self.repo_root);
-        if check_and_migrate_schema(&db_path).await? {
+        if check_and_migrate_schema(&self.repo_root).await? {
             tracing::info!("Schema migrated to v{} -- cache rebuilt", SCHEMA_VERSION);
         }
 

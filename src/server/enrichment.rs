@@ -599,6 +599,29 @@ async fn emit_lsp_pipeline_with_budget(
     fut.await.map_err(LspPipelineFailure)
 }
 
+/// Restore the bounded publication after a graph persist invalidated it when
+/// the retained full report still exactly matches the current runtime graph.
+fn republish_current_ready_report(
+    repo_root: &std::path::Path,
+    context_mode: crate::business_context::BusinessContextMode,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> anyhow::Result<bool> {
+    let Ok(check) = crate::lsp_completeness::load_readiness_check_with_graph(
+        repo_root,
+        context_mode,
+        nodes,
+        edges,
+    ) else {
+        return Ok(false);
+    };
+    if !check.ready {
+        return Ok(false);
+    }
+    crate::lsp_completeness::persist_report(repo_root, &check.report)?;
+    Ok(true)
+}
+
 impl RnaHandler {
     /// Spawn the background scanner task (event-driven + 15min heartbeat, worktree-aware).
     ///
@@ -1735,8 +1758,7 @@ impl RnaHandler {
         // Pre-flight: ensure schema version matches. If migration happened,
         // the cache was rebuilt and our loaded graph is stale -- fall back to
         // full rebuild by returning an error that the caller can catch.
-        let db_path = super::store::graph_lance_path(&self.repo_root);
-        if super::store::check_and_migrate_schema(&db_path).await? {
+        if super::store::check_and_migrate_schema(&self.repo_root).await? {
             tracing::info!(
                 "Schema migrated during incremental pre-flight -- falling back to full rebuild"
             );
@@ -3732,14 +3754,12 @@ impl RnaHandler {
             // empty work window would erase valid persistence evidence. Any stale,
             // missing, or blocked report falls through and is replaced by a current
             // fail-closed report with empty executed evidence.
-            if crate::lsp_completeness::load_readiness_check_with_graph(
+            if republish_current_ready_report(
                 &self.repo_root,
                 self.business_context.mode(),
                 &reopened.nodes,
                 &reopened.edges,
-            )
-            .is_ok_and(|check| check.ready)
-            {
+            )? {
                 return Ok(());
             }
         }
@@ -4315,6 +4335,52 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         }
+    }
+
+    #[tokio::test]
+    async fn retained_ready_report_republishes_after_full_graph_persistence() {
+        let repo = tempfile::tempdir().unwrap();
+        let node = make_node("retained", NodeKind::Function);
+        let identity = crate::lsp_completeness::current_report_identity(
+            repo.path(),
+            crate::business_context::BusinessContextMode::Disabled,
+        )
+        .unwrap();
+        let report = crate::lsp_completeness::LspCompletenessReport::new_bound(
+            identity,
+            Vec::new(),
+            std::slice::from_ref(&node),
+            &[],
+        );
+        crate::lsp_completeness::persist_report(repo.path(), &report).unwrap();
+
+        persist_graph_to_lance(repo.path(), std::slice::from_ref(&node), &[])
+            .await
+            .unwrap();
+        assert!(
+            crate::lsp_completeness::load_summary(repo.path()).is_err(),
+            "full graph persistence did not invalidate the old bounded publication"
+        );
+
+        let reopened = load_graph_from_lance(repo.path()).await.unwrap();
+        assert!(
+            republish_current_ready_report(
+                repo.path(),
+                crate::business_context::BusinessContextMode::Disabled,
+                &reopened.nodes,
+                &reopened.edges,
+            )
+            .unwrap(),
+            "matching retained full report was not republished"
+        );
+        let summary = crate::lsp_completeness::load_runtime_summary(
+            repo.path(),
+            crate::business_context::BusinessContextMode::Disabled,
+            &reopened.nodes,
+            &reopened.edges,
+        )
+        .unwrap();
+        assert!(summary.ready);
     }
 
     #[test]

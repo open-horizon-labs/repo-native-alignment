@@ -5,6 +5,11 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::graph::store::SCHEMA_VERSION;
+use crate::lsp_completeness::{
+    acquire_lsp_readiness_mutation_lock_async, invalidate_summary_publication,
+};
+
+use super::graph_lance_path;
 
 /// Path to the committed scan_version pointer file.
 ///
@@ -47,9 +52,21 @@ pub(crate) fn write_committed_scan_version(db_path: &Path, version: u64) -> anyh
 /// of a LanceDB table. This avoids circular dependency: checking LanceDB health
 /// via LanceDB fails when the schema itself is incompatible.
 ///
-/// Downstream callers (`build_full_graph`, `persist_graph_to_lance`) use this to ensure
-/// stale LanceDB tables are discarded before any read or write.
-pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<bool> {
+/// Downstream preflight callers use this locked entry point so a destructive
+/// migration cannot race graph persistence or readiness publication.
+pub(crate) async fn check_and_migrate_schema(repo_root: &Path) -> anyhow::Result<bool> {
+    let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
+        .await
+        .context("failed to serialize graph schema migration with LSP readiness")?;
+    check_and_migrate_schema_under_lock(repo_root, &graph_lance_path(repo_root)).await
+}
+
+/// Migration implementation for persistence paths that already hold the
+/// repo-scoped readiness/mutation lock.
+pub(super) async fn check_and_migrate_schema_under_lock(
+    repo_root: &Path,
+    db_path: &Path,
+) -> anyhow::Result<bool> {
     std::fs::create_dir_all(db_path)?;
 
     let version_file = db_path.join("schema_version");
@@ -72,6 +89,8 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
     let had_stale_data = stored_version.is_some() || has_lance_data(db_path);
 
     if had_stale_data {
+        invalidate_summary_publication(repo_root)
+            .context("failed to invalidate LSP readiness before graph schema migration")?;
         tracing::info!(
             "Schema version mismatch (stored={:?}, current={}) -- dropping all LanceDB data",
             stored_version,
@@ -293,6 +312,59 @@ mod tests {
 
         let not_found = anyhow::anyhow!("table not found");
         assert!(!is_schema_mismatch_error(&not_found));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_migration_waits_for_report_publication_and_invalidates_it() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        use crate::business_context::BusinessContextMode;
+        use crate::lsp_completeness::{
+            LspCompletenessReport, current_report_identity, load_summary,
+            persist_report_with_precommit_hook,
+        };
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let db_path = graph_lance_path(repo.path());
+        std::fs::create_dir_all(db_path.join("symbols.lance")).unwrap();
+        std::fs::write(db_path.join("schema_version"), "0").unwrap();
+
+        let identity = current_report_identity(repo.path(), BusinessContextMode::Disabled)
+            .expect("report identity");
+        let report = LspCompletenessReport::new(identity, Vec::new());
+        let entered_precommit = Arc::new(Barrier::new(2));
+        let release_precommit = Arc::new(Barrier::new(2));
+        let report_root = repo.path().to_path_buf();
+        let report_entered = Arc::clone(&entered_precommit);
+        let report_release = Arc::clone(&release_precommit);
+        let report_writer = std::thread::spawn(move || {
+            persist_report_with_precommit_hook(&report_root, &report, || {
+                report_entered.wait();
+                report_release.wait();
+            })
+        });
+        entered_precommit.wait();
+
+        let migration_root = repo.path().to_path_buf();
+        let migration =
+            tokio::spawn(async move { check_and_migrate_schema(&migration_root).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !migration.is_finished(),
+            "schema migration bypassed the report publication lock"
+        );
+
+        release_precommit.wait();
+        report_writer.join().unwrap().unwrap();
+        assert!(
+            migration.await.unwrap().unwrap(),
+            "stale schema was not migrated"
+        );
+        assert!(
+            load_summary(repo.path()).is_err(),
+            "schema migration retained the concurrently published readiness"
+        );
     }
 
     #[test]

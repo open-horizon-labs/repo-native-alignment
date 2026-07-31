@@ -278,8 +278,8 @@ struct SearchArgs {
     include_body: bool,
     #[arg(long)]
     minify_body: bool,
-    /// Show index stats (default: true for CLI, false for MCP)
-    #[arg(long, default_value_t = true)]
+    /// Show concise index and enrichment diagnostics.
+    #[arg(long)]
     verbose: bool,
     /// Output projection: agent (default) or evidence.
     #[arg(long)]
@@ -1571,7 +1571,11 @@ async fn async_main() -> anyhow::Result<()> {
                 embed_status: None,
                 root_filter,
                 non_code_slugs,
-                enrichment_jobs: EnrichmentJobLedger::default().all_jobs(&repo_root),
+                enrichment_jobs: if args.verbose {
+                    EnrichmentJobLedger::default().all_jobs(&repo_root)
+                } else {
+                    Vec::new()
+                },
                 business_context: &business_context,
             };
             println!("{}", service::search(&params, &ctx).await);
@@ -1919,7 +1923,15 @@ mod tests {
             };
             assert_eq!(args.include_artifacts, expected_artifacts);
             assert_eq!(args.include_markdown, expected_markdown);
+            assert!(!args.verbose, "search diagnostics must be opt-in");
         }
+
+        let cli = Cli::try_parse_from(["repo-native-alignment", "search", "query", "--verbose"])
+            .expect("verbose search CLI should parse");
+        let Some(Commands::Search(args)) = cli.command else {
+            panic!("expected search command");
+        };
+        assert!(args.verbose);
     }
 
     #[test]
