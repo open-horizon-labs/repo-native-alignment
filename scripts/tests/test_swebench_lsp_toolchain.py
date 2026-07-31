@@ -1201,6 +1201,12 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             '            "$BUNDLE_ROOT/repo-native-alignment"',
             workflow,
         )
+        self.assertIn(
+            '[[ ! "$CHIP" =~ Apple[[:space:]]M([0-9]+) ]] '
+            '|| (( BASH_REMATCH[1] < 4 ))',
+            workflow,
+        )
+        self.assertIn("requires an Apple M4-or-newer builder", workflow)
         self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)
         self.assertIn(
             'bind_hf_default_cache(\n            Path(environment["HF_HOME"]), '

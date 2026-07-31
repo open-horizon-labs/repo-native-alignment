@@ -57,10 +57,10 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(uname -m)" = "arm64"
           CHIP="$(sysctl -n machdep.cpu.brand_string)"
-          case "$CHIP" in
-            *M4*) ;;
-            *) echo "SWE-bench semantic artifact requires Apple M4; observed: $CHIP" >&2; exit 1 ;;
-          esac
+          if [[ ! "$CHIP" =~ Apple[[:space:]]M([0-9]+) ]] || (( BASH_REMATCH[1] < 4 )); then
+            echo "SWE-bench semantic artifact requires an Apple M4-or-newer builder; observed: $CHIP" >&2
+            exit 1
+          fi
           BUNDLE_ROOT="$RUNNER_TEMP/rna-semantic-bundle"
           MODEL_DOWNLOAD_ROOT="$RUNNER_TEMP/rna-semantic-model-download"
           LSP_CACHE_ROOT="$RUNNER_TEMP/rna-lsp-artifact-cache"

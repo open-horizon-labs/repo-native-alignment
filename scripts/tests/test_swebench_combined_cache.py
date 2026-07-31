@@ -251,6 +251,23 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
                     fixture["structural_archive"], fixture["structural_sidecar"]
                 )
 
+    def test_m4_target_accepts_m4_or_newer_builder_but_rejects_older_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_path = Path(temporary) / "runtime.json"
+            self.runtime_fixture(runtime_path)
+            runtime = json.loads(runtime_path.read_bytes())
+            runtime["host"]["chip"] = "Apple M5 Max (Virtual)"
+            STRUCTURAL.write_canonical_json(runtime_path, runtime)
+
+            projection = COMBINED._project_runtime_manifest(runtime_path)["projection"]
+            self.assertEqual(projection["build"]["target_cpu"], "apple-m4")
+            self.assertEqual(projection["host"]["chip"], "Apple M5 Max (Virtual)")
+
+            runtime["host"]["chip"] = "Apple M3 Max"
+            STRUCTURAL.write_canonical_json(runtime_path, runtime)
+            with self.assertRaisesRegex(COMBINED.ToolchainError, "M4-or-newer"):
+                COMBINED._project_runtime_manifest(runtime_path)
+
     def test_semantic_verifier_rejects_drift_but_projects_only_active_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
