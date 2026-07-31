@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Edge, Node};
 
-pub(crate) const STORE_SCHEMA_VERSION: u32 = 4;
+pub(crate) const STORE_SCHEMA_VERSION: u32 = 5;
+const WORK_IDENTITY_SCHEMA_VERSION: u32 = 1;
+const PLANNER_CONTRACT_VERSION: &str = "lsp-pass1-work-planner-v1";
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_TERMINAL_JOBS: usize = 16;
@@ -34,6 +36,7 @@ pub(crate) struct LspWorkItemSeed {
     pub node: Node,
     pub requested_operations: Vec<String>,
     pub attempt_count: u32,
+    pub toolchain_contract: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +62,47 @@ pub enum LspWorkItemRecovery {
     Exhausted,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspWorkIdentity {
+    pub schema_version: u32,
+    pub source_snapshot: String,
+    pub request_anchor: String,
+    pub operations_digest: String,
+    pub toolchain_contract: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspRecoveryDisposition {
+    #[default]
+    New,
+    CarriedExact,
+    RerunSourceSnapshot,
+    RerunRequestAnchor,
+    RerunOperations,
+    RerunToolchain,
+    RerunSchema,
+    RejectedTampered,
+    RejectedDuplicate,
+}
+
+impl LspRecoveryDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::CarriedExact => "carried_exact",
+            Self::RerunSourceSnapshot => "rerun_source_snapshot",
+            Self::RerunRequestAnchor => "rerun_request_anchor",
+            Self::RerunOperations => "rerun_operations",
+            Self::RerunToolchain => "rerun_toolchain",
+            Self::RerunSchema => "rerun_schema",
+            Self::RejectedTampered => "rejected_tampered",
+            Self::RejectedDuplicate => "rejected_duplicate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspWorkItemRecord {
@@ -74,6 +118,14 @@ pub struct LspWorkItemRecord {
     pub node_kind: String,
     #[serde(default)]
     pub input_hash: String,
+    #[serde(default)]
+    pub work_identity: LspWorkIdentity,
+    #[serde(default)]
+    pub recovery_disposition: LspRecoveryDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_source_job_id: Option<String>,
+    #[serde(default)]
+    pub integrity_digest: String,
     #[serde(default)]
     pub requested_operations: Vec<String>,
     #[serde(default)]
@@ -145,6 +197,8 @@ pub struct LspWorkItemQueueSnapshot {
     pub resumed: usize,
     pub retried: usize,
     #[serde(default)]
+    pub recovery_dispositions: BTreeMap<String, usize>,
+    #[serde(default)]
     pub phase_counts: BTreeMap<String, usize>,
     #[serde(default)]
     pub oldest_in_flight: Vec<String>,
@@ -165,6 +219,15 @@ impl LspWorkItemQueueSnapshot {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let recovery = if self.recovery_dispositions.is_empty() {
+            "none".to_string()
+        } else {
+            self.recovery_dispositions
+                .iter()
+                .map(|(disposition, count)| format!("{disposition}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let oldest = if self.oldest_in_flight.is_empty() {
             "none".to_string()
         } else {
@@ -176,7 +239,7 @@ impl LspWorkItemQueueSnapshot {
             self.exhausted_items.join("; ")
         };
         format!(
-            "job={} total={} pending={} in_flight={} completed={} failed={} skipped={} exhausted={} resumed={} retried={} phases=[{}] oldest=[{}] exhausted_items=[{}]",
+            "job={} total={} pending={} in_flight={} completed={} failed={} skipped={} exhausted={} resumed={} retried={} recovery=[{}] phases=[{}] oldest=[{}] exhausted_items=[{}]",
             self.job_id,
             self.total,
             self.pending,
@@ -187,6 +250,7 @@ impl LspWorkItemQueueSnapshot {
             self.exhausted,
             self.resumed,
             self.retried,
+            recovery,
             phases,
             oldest,
             exhausted_items
@@ -277,31 +341,37 @@ impl Drop for WorkItemFileLock {
 impl LspWorkItemLedger {
     pub(crate) async fn begin(repo_root: &Path, seeds: &[LspWorkItemSeed]) -> Result<Arc<Self>> {
         let persisted = load_store(repo_root)?;
-        let Some((job_id, prior_records)) = select_recovery_job(&persisted, seeds) else {
+        let Some(recovery) = select_recovery_job(&persisted, seeds) else {
             return Self::begin_with_job_id(repo_root, new_job_id(), seeds).await;
         };
+        let job_id = recovery.job_id;
+        let prior_records = recovery.records;
+        let duplicate_retained_keys = recovery.duplicate_keys;
+        let source_snapshot = source_snapshot_identity(repo_root)?;
         let now = unix_millis();
         let current_item_keys = seeds
             .iter()
-            .map(|seed| (seed.node.stable_id(), seed.requested_operations.clone()))
+            .map(|seed| {
+                (
+                    seed.node.stable_id(),
+                    canonical_operations_digest(&seed.requested_operations),
+                )
+            })
             .collect::<BTreeSet<_>>();
         let current_node_ids = seeds
             .iter()
             .map(|seed| seed.node.stable_id())
             .collect::<BTreeSet<_>>();
-        let mut prior_by_key = prior_records
-            .into_iter()
-            .map(|record| {
-                (
-                    recovery_key(
-                        &record.node_id,
-                        &record.input_hash,
-                        &record.requested_operations,
-                    ),
-                    record,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut prior_by_key: BTreeMap<(String, String), Vec<LspWorkItemRecord>> = BTreeMap::new();
+        for record in prior_records {
+            prior_by_key
+                .entry((
+                    record.node_id.clone(),
+                    canonical_operations_digest(&record.requested_operations),
+                ))
+                .or_default()
+                .push(record);
+        }
         let mut store = LspWorkItemStore::default();
         let mut runnable_item_ids = BTreeSet::new();
         let mut recovered_edges = Vec::new();
@@ -309,12 +379,57 @@ impl LspWorkItemLedger {
 
         for seed in seeds {
             let node_id = seed.node.stable_id();
-            let input_hash = node_input_hash(&seed.node);
-            let key = recovery_key(&node_id, &input_hash, &seed.requested_operations);
-            let prior_record = prior_by_key.remove(&key);
-            let is_new = prior_record.is_none();
-            let mut record =
-                prior_record.unwrap_or_else(|| new_record(repo_root, &job_id, seed, now));
+            let current_identity = work_identity(repo_root, seed, &source_snapshot);
+            let key = (node_id.clone(), current_identity.operations_digest.clone());
+            let candidates = prior_by_key.remove(&key).unwrap_or_default();
+            let (prior_record, disposition) = if duplicate_retained_keys.contains(&key) {
+                (None, LspRecoveryDisposition::RejectedDuplicate)
+            } else {
+                match candidates.len() {
+                    0 => {
+                        let changed_operations = prior_by_key
+                            .keys()
+                            .any(|(prior_node_id, _)| prior_node_id == &node_id);
+                        (
+                            None,
+                            if changed_operations {
+                                LspRecoveryDisposition::RerunOperations
+                            } else {
+                                LspRecoveryDisposition::New
+                            },
+                        )
+                    }
+                    1 => {
+                        let prior = candidates.into_iter().next().expect("one candidate");
+                        let disposition = match prior.recovery_disposition {
+                            LspRecoveryDisposition::RejectedTampered => {
+                                LspRecoveryDisposition::RejectedTampered
+                            }
+                            LspRecoveryDisposition::RerunSchema => {
+                                LspRecoveryDisposition::RerunSchema
+                            }
+                            _ => identity_disposition(&prior.work_identity, &current_identity),
+                        };
+                        (Some(prior), disposition)
+                    }
+                    _ => (None, LspRecoveryDisposition::RejectedDuplicate),
+                }
+            };
+            let is_exact = disposition == LspRecoveryDisposition::CarriedExact;
+            let recovery_source_job_id = prior_record.as_ref().map(|record| record.job_id.clone());
+            let mut record = if is_exact {
+                prior_record.expect("exact disposition requires a prior record")
+            } else {
+                let mut record =
+                    new_record(repo_root, &job_id, seed, current_identity.clone(), now);
+                record.recovery_disposition = disposition;
+                record.recovery_source_job_id = recovery_source_job_id;
+                if disposition != LspRecoveryDisposition::New {
+                    record.last_error =
+                        Some(format!("recovery disposition: {}", disposition.as_str()));
+                }
+                record
+            };
             record.item_id = seed.item_id;
             record.job_id = job_id.clone();
             record.repo = repo_root.display().to_string();
@@ -323,12 +438,17 @@ impl LspWorkItemLedger {
             record.node_id = node_id;
             record.node_name = seed.node.id.name.clone();
             record.node_kind = seed.node.id.kind.to_string();
-            record.input_hash = input_hash;
+            record.input_hash = current_identity.digest.clone();
+            record.work_identity = current_identity;
+            if is_exact {
+                record.recovery_disposition = LspRecoveryDisposition::CarriedExact;
+                record.recovery_source_job_id = Some(job_id.clone());
+            }
             record.requested_operations = seed.requested_operations.clone();
             record.schema_version = STORE_SCHEMA_VERSION;
             record.updated_at_ms = now;
 
-            if is_new {
+            if !is_exact {
                 runnable_item_ids.insert(seed.item_id);
                 store
                     .records
@@ -398,9 +518,11 @@ impl LspWorkItemLedger {
                 .insert(record_key(&job_id, seed.item_id), record);
         }
 
-        let remaining_records = prior_by_key.into_values().filter(|record| {
-            !current_item_keys
-                .contains(&(record.node_id.clone(), record.requested_operations.clone()))
+        let remaining_records = prior_by_key.into_values().flatten().filter(|record| {
+            !current_item_keys.contains(&(
+                record.node_id.clone(),
+                canonical_operations_digest(&record.requested_operations),
+            ))
         });
         let mut next_item_id = seeds.len();
         for mut record in remaining_records {
@@ -445,8 +567,10 @@ impl LspWorkItemLedger {
     ) -> Result<Arc<Self>> {
         let mut store = LspWorkItemStore::default();
         let now = unix_millis();
+        let source_snapshot = source_snapshot_identity(repo_root)?;
         for seed in seeds {
-            let record = new_record(repo_root, &job_id, seed, now);
+            let identity = work_identity(repo_root, seed, &source_snapshot);
+            let record = new_record(repo_root, &job_id, seed, identity, now);
             store
                 .records
                 .insert(record_key(&job_id, seed.item_id), record);
@@ -666,9 +790,11 @@ fn new_record(
     repo_root: &Path,
     job_id: &str,
     seed: &LspWorkItemSeed,
+    work_identity: LspWorkIdentity,
     now: u64,
 ) -> LspWorkItemRecord {
     let node = &seed.node;
+    let input_hash = work_identity.digest.clone();
     LspWorkItemRecord {
         schema_version: STORE_SCHEMA_VERSION,
         job_id: job_id.to_string(),
@@ -679,7 +805,11 @@ fn new_record(
         node_id: node.stable_id(),
         node_name: node.id.name.clone(),
         node_kind: node.id.kind.to_string(),
-        input_hash: node_input_hash(node),
+        input_hash,
+        work_identity,
+        recovery_disposition: LspRecoveryDisposition::New,
+        recovery_source_job_id: None,
+        integrity_digest: String::new(),
         requested_operations: seed.requested_operations.clone(),
         state: LspWorkItemState::Pending,
         attempt_count: seed.attempt_count,
@@ -698,56 +828,301 @@ fn new_record(
     }
 }
 
-pub(crate) fn node_input_hash(node: &Node) -> String {
+fn canonical_operations_digest(requested_operations: &[String]) -> String {
+    let mut operations = requested_operations.to_vec();
+    operations.sort();
+    operations.dedup();
     let mut hasher = blake3::Hasher::new();
-    for value in [
-        node.stable_id(),
-        node.language.clone(),
-        node.line_start.to_string(),
-        node.line_end.to_string(),
-        node.signature.clone(),
-        node.body.clone(),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update(&[0]);
-    }
-    for (key, value) in &node.metadata {
-        hasher.update(key.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(value.as_bytes());
+    for operation in operations {
+        hasher.update(operation.as_bytes());
         hasher.update(&[0]);
     }
     hasher.finalize().to_hex().to_string()
 }
 
-fn recovery_key(node_id: &str, input_hash: &str, requested_operations: &[String]) -> String {
-    let mut operations = requested_operations.to_vec();
-    operations.sort();
+fn request_anchor(repo_root: &Path, node: &Node) -> String {
+    let relative_file = if node.id.file.is_absolute() {
+        node.id
+            .file
+            .strip_prefix(repo_root)
+            .unwrap_or(&node.id.file)
+            .to_path_buf()
+    } else {
+        node.id.file.clone()
+    };
+    let (zero_based_line, zero_based_character) = source_request_position(repo_root, node);
     format!(
-        "{node_id}\u{1f}{input_hash}\u{1f}{}",
-        operations.join("\u{1f}")
+        "{}\u{1f}{}\u{1f}{}\u{1f}{zero_based_line}\u{1f}{zero_based_character}",
+        node.id.root,
+        relative_file.to_string_lossy().replace('\\', "/"),
+        node.language,
     )
+}
+
+pub(super) fn source_request_position(repo_root: &Path, node: &Node) -> (u32, u32) {
+    let source_path = repo_root.join(&node.id.file);
+    let zero_based_line = node.line_start.saturating_sub(1) as u32;
+    let zero_based_character = std::fs::read_to_string(&source_path)
+        .ok()
+        .and_then(|source| {
+            source
+                .lines()
+                .nth(zero_based_line as usize)
+                .and_then(|line| {
+                    line.find(&node.id.name)
+                        .map(|byte| line[..byte].encode_utf16().count() as u32)
+                })
+        })
+        .unwrap_or(0);
+    (zero_based_line, zero_based_character)
+}
+
+fn update_path_identity(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect source snapshot path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        hasher.update(b"symlink");
+        let target = std::fs::read_link(path)
+            .with_context(|| format!("failed to read source symlink {}", path.display()))?;
+        hasher.update(target.to_string_lossy().as_bytes());
+    } else if metadata.is_file() {
+        hasher.update(b"file");
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read source snapshot file {}", path.display()))?;
+        hasher.update(blake3::hash(&bytes).as_bytes());
+    } else if metadata.is_dir() {
+        hasher.update(b"directory");
+        let mut entries = std::fs::read_dir(path)?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "failed to read source snapshot directory {}",
+                    path.display()
+                )
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            hasher.update(entry.file_name().to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            update_path_identity(hasher, &entry.path())?;
+            hasher.update(&[0]);
+        }
+    } else {
+        hasher.update(b"missing");
+    }
+    Ok(())
+}
+
+fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
+    fn visit(root: &Path, directory: &Path, rows: &mut Vec<PathBuf>) -> Result<()> {
+        let mut entries = std::fs::read_dir(directory)
+            .with_context(|| format!("failed to read source directory {}", directory.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            if relative == Path::new(".git")
+                || relative.starts_with(".git/")
+                || relative == Path::new(".oh/.cache")
+                || relative.starts_with(".oh/.cache/")
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                visit(root, &path, rows)?;
+            } else {
+                rows.push(relative.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    let mut rows = Vec::new();
+    visit(repo_root, repo_root, &mut rows)?;
+    rows.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rna-lsp-source-snapshot-non-git-v1");
+    for relative in rows {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        update_path_identity(&mut hasher, &repo_root.join(&relative))?;
+        hasher.update(&[0]);
+    }
+    Ok(format!("content:{}", hasher.finalize().to_hex()))
+}
+
+fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
+    let repository = match git2::Repository::discover(repo_root) {
+        Ok(repository) => repository,
+        Err(_) => return non_git_source_snapshot(repo_root),
+    };
+    let workdir = repository
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("LSP source snapshot requires a non-bare Git repository"))?;
+    let head = match repository.head().and_then(|head| head.peel_to_commit()) {
+        Ok(head) => head,
+        Err(_) => return non_git_source_snapshot(repo_root),
+    };
+    let tree = head.tree()?;
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .include_unmodified(false)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let mut changes = repository
+        .statuses(Some(&mut options))?
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .path()
+                .ok()
+                .map(|path| (path.to_string(), entry.status().bits()))
+        })
+        .filter(|(path, _)| !path.starts_with(".oh/.cache/"))
+        .collect::<Vec<_>>();
+    changes.sort();
+    if changes.is_empty() {
+        return Ok(format!("git-tree:{}:clean", tree.id()));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rna-lsp-source-snapshot-git-dirty-v2");
+    hasher.update(tree.id().as_bytes());
+    for (relative, status) in changes {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&status.to_le_bytes());
+        hasher.update(&[0]);
+        let path = workdir.join(&relative);
+        if path.exists() || path.is_symlink() {
+            update_path_identity(&mut hasher, &path)?;
+        } else {
+            hasher.update(b"deleted");
+        }
+        hasher.update(&[0]);
+    }
+    Ok(format!("git-dirty:{}", hasher.finalize().to_hex()))
+}
+
+fn work_identity(
+    repo_root: &Path,
+    seed: &LspWorkItemSeed,
+    source_snapshot: &str,
+) -> LspWorkIdentity {
+    let request_anchor = request_anchor(repo_root, &seed.node);
+    let operations_digest = canonical_operations_digest(&seed.requested_operations);
+    let mut identity = LspWorkIdentity {
+        schema_version: WORK_IDENTITY_SCHEMA_VERSION,
+        source_snapshot: source_snapshot.to_string(),
+        request_anchor,
+        operations_digest,
+        toolchain_contract: seed.toolchain_contract.clone(),
+        digest: String::new(),
+    };
+    identity.digest = work_identity_digest(&identity);
+    identity
+}
+
+pub(crate) fn work_identity_digest(identity: &LspWorkIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for component in [
+        identity.schema_version.to_string(),
+        identity.source_snapshot.clone(),
+        identity.request_anchor.clone(),
+        identity.operations_digest.clone(),
+        identity.toolchain_contract.clone(),
+        PLANNER_CONTRACT_VERSION.to_string(),
+    ] {
+        hasher.update(component.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn current_source_snapshot_identity(repo_root: &Path) -> Result<String> {
+    source_snapshot_identity(repo_root)
+}
+
+pub(crate) fn current_request_anchor(repo_root: &Path, node: &Node) -> String {
+    request_anchor(repo_root, node)
+}
+
+pub(crate) fn requested_operations_digest(requested_operations: &[String]) -> String {
+    canonical_operations_digest(requested_operations)
+}
+
+#[cfg(test)]
+pub(crate) fn build_work_identity(
+    repo_root: &Path,
+    node: &Node,
+    requested_operations: &[String],
+    toolchain_contract: &str,
+) -> Result<LspWorkIdentity> {
+    let source_snapshot = source_snapshot_identity(repo_root)?;
+    let seed = LspWorkItemSeed {
+        item_id: 0,
+        node: node.clone(),
+        requested_operations: requested_operations.to_vec(),
+        attempt_count: 1,
+        toolchain_contract: toolchain_contract.to_string(),
+    };
+    Ok(work_identity(repo_root, &seed, &source_snapshot))
+}
+
+fn identity_disposition(
+    prior: &LspWorkIdentity,
+    current: &LspWorkIdentity,
+) -> LspRecoveryDisposition {
+    if prior.schema_version != current.schema_version {
+        LspRecoveryDisposition::RerunSchema
+    } else if prior.source_snapshot != current.source_snapshot {
+        LspRecoveryDisposition::RerunSourceSnapshot
+    } else if prior.request_anchor != current.request_anchor {
+        LspRecoveryDisposition::RerunRequestAnchor
+    } else if prior.operations_digest != current.operations_digest {
+        LspRecoveryDisposition::RerunOperations
+    } else if prior.toolchain_contract != current.toolchain_contract {
+        LspRecoveryDisposition::RerunToolchain
+    } else if prior.digest != current.digest {
+        LspRecoveryDisposition::RejectedTampered
+    } else {
+        LspRecoveryDisposition::CarriedExact
+    }
+}
+
+fn record_integrity_digest(record: &LspWorkItemRecord) -> Result<String> {
+    let mut canonical = record.clone();
+    canonical.integrity_digest.clear();
+    let bytes = serde_json::to_vec(&canonical)
+        .context("failed to serialize canonical LSP work-item record")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+struct RecoverySelection {
+    job_id: String,
+    records: Vec<LspWorkItemRecord>,
+    duplicate_keys: BTreeSet<(String, String)>,
 }
 
 fn select_recovery_job(
     store: &LspWorkItemStore,
     seeds: &[LspWorkItemSeed],
-) -> Option<(String, Vec<LspWorkItemRecord>)> {
-    let seed_keys = seeds
+) -> Option<RecoverySelection> {
+    let seed_node_ids = seeds
         .iter()
-        .map(|seed| {
-            recovery_key(
-                &seed.node.stable_id(),
-                &node_input_hash(&seed.node),
-                &seed.requested_operations,
-            )
-        })
+        .map(|seed| seed.node.stable_id())
         .collect::<BTreeSet<_>>();
     let mut jobs: BTreeMap<&str, Vec<&LspWorkItemRecord>> = BTreeMap::new();
     for record in store.records.values() {
         jobs.entry(&record.job_id).or_default().push(record);
     }
-    jobs.into_iter()
+    let eligible = jobs
+        .into_iter()
         .filter_map(|(job_id, records)| {
             let has_unfinished = records.iter().any(|record| {
                 matches!(
@@ -763,13 +1138,7 @@ fn select_recovery_job(
             }
             let overlap = records
                 .iter()
-                .filter(|record| {
-                    seed_keys.contains(&recovery_key(
-                        &record.node_id,
-                        &record.input_hash,
-                        &record.requested_operations,
-                    ))
-                })
+                .filter(|record| seed_node_ids.contains(&record.node_id))
                 .count();
             if overlap == 0 {
                 return None;
@@ -779,14 +1148,35 @@ fn select_recovery_job(
                 .map(|record| record.updated_at_ms)
                 .max()
                 .unwrap_or_default();
-            Some((
-                (updated_at, overlap),
-                job_id.to_string(),
-                records.into_iter().cloned().collect::<Vec<_>>(),
-            ))
+            Some(((updated_at, overlap), job_id.to_string(), records))
         })
+        .collect::<Vec<_>>();
+    let mut jobs_by_key: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for (_, job_id, records) in &eligible {
+        for record in records {
+            if seed_node_ids.contains(&record.node_id) {
+                jobs_by_key
+                    .entry((
+                        record.node_id.clone(),
+                        canonical_operations_digest(&record.requested_operations),
+                    ))
+                    .or_default()
+                    .insert(job_id.clone());
+            }
+        }
+    }
+    let duplicate_keys = jobs_by_key
+        .into_iter()
+        .filter_map(|(key, job_ids)| (job_ids.len() > 1).then_some(key))
+        .collect();
+    eligible
+        .into_iter()
         .max_by_key(|(rank, _, _)| *rank)
-        .map(|(_, job_id, records)| (job_id, records))
+        .map(|(_, job_id, records)| RecoverySelection {
+            job_id,
+            records: records.into_iter().cloned().collect(),
+            duplicate_keys,
+        })
 }
 
 pub fn load_queue_snapshots(
@@ -911,6 +1301,10 @@ fn snapshots_from_store(store: &LspWorkItemStore, limit: usize) -> Vec<LspWorkIt
             for record in records {
                 roots.insert(record.root.clone());
                 snapshot.updated_at_ms = snapshot.updated_at_ms.max(record.updated_at_ms);
+                *snapshot
+                    .recovery_dispositions
+                    .entry(record.recovery_disposition.as_str().to_string())
+                    .or_insert(0) += 1;
                 if record.recovery != LspWorkItemRecovery::New {
                     snapshot.resumed += 1;
                 }
@@ -1108,9 +1502,38 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
             path = %path.display(),
             stored_schema = store.schema_version,
             current_schema = STORE_SCHEMA_VERSION,
-            "Replaying LSP work items because persisted evidence predates raw result counts"
+            "Replaying LSP work items because persisted evidence predates stable work identities"
         );
-        return Ok(LspWorkItemStore::default());
+        for record in store.records.values_mut() {
+            record.recovery_disposition = LspRecoveryDisposition::RerunSchema;
+            record.state = LspWorkItemState::Failed;
+            record.output_edges.clear();
+            record.output_nodes.clear();
+            record.produced_result_ids.clear();
+            record.observed_result_count = 0;
+            record.last_error = Some(format!(
+                "persisted work-item schema predates current schema {STORE_SCHEMA_VERSION}"
+            ));
+        }
+        store.schema_version = STORE_SCHEMA_VERSION;
+        return Ok(store);
+    }
+    for record in store.records.values_mut() {
+        let observed = record_integrity_digest(record)?;
+        if record.integrity_digest != observed {
+            tracing::warn!(
+                job_id = %record.job_id,
+                item_id = record.item_id,
+                "Rejecting tampered LSP work-item record and scheduling exact work again"
+            );
+            record.recovery_disposition = LspRecoveryDisposition::RejectedTampered;
+            record.state = LspWorkItemState::Failed;
+            record.output_edges.clear();
+            record.output_nodes.clear();
+            record.produced_result_ids.clear();
+            record.observed_result_count = 0;
+            record.last_error = Some("persisted work-item integrity digest mismatch".to_string());
+        }
     }
     store.schema_version = STORE_SCHEMA_VERSION;
     Ok(store)
@@ -1123,8 +1546,14 @@ fn write_store(repo_root: &Path, store: &LspWorkItemStore) -> Result<()> {
             format!("failed to create LSP work-item cache {}", parent.display())
         })?;
     }
+    let mut sealed = store.clone();
+    sealed.schema_version = STORE_SCHEMA_VERSION;
+    for record in sealed.records.values_mut() {
+        record.schema_version = STORE_SCHEMA_VERSION;
+        record.integrity_digest = record_integrity_digest(record)?;
+    }
     let bytes =
-        serde_json::to_vec_pretty(store).context("failed to serialize LSP work-item ledger")?;
+        serde_json::to_vec_pretty(&sealed).context("failed to serialize LSP work-item ledger")?;
     let temp_path = path.with_extension(format!(
         "json.tmp-{}-{}",
         std::process::id(),
@@ -1200,6 +1629,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_position_is_source_derived_and_uses_lsp_utf16_columns() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut source_node = node("item");
+        source_node
+            .metadata
+            .insert("name_col".to_string(), "999-derived-and-wrong".to_string());
+        source_node.signature = "derived signature without the identifier".to_string();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item.rs"), "💡 fn item() {}\n").unwrap();
+
+        assert_eq!(source_request_position(repo.path(), &source_node), (0, 6));
+    }
+
     fn seeds(count: usize) -> Vec<LspWorkItemSeed> {
         (0..count)
             .map(|item_id| LspWorkItemSeed {
@@ -1207,6 +1650,7 @@ mod tests {
                 node: node(&format!("item_{item_id}")),
                 requested_operations: vec!["textDocument/references".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             })
             .collect()
     }
@@ -1274,7 +1718,9 @@ mod tests {
         )
         .unwrap();
         let snapshots = load_queue_snapshots(older.path(), 1).unwrap();
-        assert!(snapshots.is_empty());
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].failed, 1);
+        assert_eq!(snapshots[0].recovery_dispositions["rerun_schema"], 1);
     }
 
     #[test]
@@ -1418,34 +1864,49 @@ mod tests {
         .unwrap();
         ledger.mark_completed(0).await.unwrap();
         ledger.mark_phase(1, "requesting_references").await.unwrap();
-        {
-            let mut store = ledger.store.lock().unwrap();
-            store.schema_version = 1;
-            for record in store.records.values_mut() {
-                record.schema_version = 1;
-                record.input_hash.clear();
-                record.output_edges.clear();
-                record.output_nodes.clear();
-            }
+        let mut legacy_store = load_store(repo.path()).unwrap();
+        legacy_store.schema_version = 1;
+        for record in legacy_store.records.values_mut() {
+            record.schema_version = 1;
+            record.input_hash.clear();
+            record.output_edges.clear();
+            record.output_nodes.clear();
         }
-        ledger.flush().await.unwrap();
+        std::fs::write(
+            store_path(repo.path()),
+            serde_json::to_vec_pretty(&legacy_store).unwrap(),
+        )
+        .unwrap();
 
         let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
             .await
             .unwrap();
 
-        assert_ne!(resumed.job_id(), "schema-v1-job");
+        assert_eq!(resumed.job_id(), "schema-v1-job");
         assert!(resumed.should_run(0));
         assert!(resumed.should_run(1));
         let (edges, nodes) = resumed.recovered_output();
         assert!(edges.is_empty());
         assert!(nodes.is_empty());
+        let store = resumed.store.lock().unwrap();
+        assert!(
+            store.records.values().all(|record| {
+                record.recovery_disposition == LspRecoveryDisposition::RerunSchema
+            })
+        );
     }
 
     #[tokio::test]
-    async fn changed_node_input_replays_instead_of_carrying_stale_output() {
+    async fn changed_cross_file_config_snapshot_replays_instead_of_carrying_stale_output() {
         let repo = tempfile::tempdir().unwrap();
         let initial = seeds(2);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item_0.rs"), "fn item_0() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("pyproject.toml"),
+            "[tool.fixture]\nvalue = 1\n",
+        )
+        .unwrap();
         let ledger = LspWorkItemLedger::begin_with_job_id(
             repo.path(),
             "changed-input-job".to_string(),
@@ -1460,8 +1921,12 @@ mod tests {
         ledger.mark_phase(1, "requesting_references").await.unwrap();
         ledger.flush().await.unwrap();
 
-        let mut changed = seeds(2);
-        changed[0].node.body = "let changed = true;".to_string();
+        std::fs::write(
+            repo.path().join("pyproject.toml"),
+            "[tool.fixture]\nvalue = 2\n",
+        )
+        .unwrap();
+        let changed = seeds(2);
         let resumed = LspWorkItemLedger::begin(repo.path(), &changed)
             .await
             .unwrap();
@@ -1472,6 +1937,294 @@ mod tests {
         assert!(resumed.recovered_output().0.is_empty());
         let snapshot = &load_queue_snapshots(repo.path(), 1).unwrap()[0];
         assert_eq!(snapshot.total, changed.len());
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["changed-input-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RerunSourceSnapshot
+        );
+    }
+
+    #[test]
+    fn unborn_git_repository_uses_content_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        std::fs::write(repo.path().join("fixture.py"), "def fixture(): pass\n").unwrap();
+
+        let before = source_snapshot_identity(repo.path()).unwrap();
+        std::fs::write(repo.path().join("fixture.py"), "def fixture(): return 1\n").unwrap();
+        let after = source_snapshot_identity(repo.path()).unwrap();
+
+        assert!(before.starts_with("content:"));
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn clean_git_snapshot_is_bound_to_the_tree_not_commit_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let repository = git2::Repository::init(repo.path()).unwrap();
+        std::fs::write(repo.path().join("fixture.py"), "def fixture(): return 1\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("fixture.py")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("RNA test", "rna@example.com").unwrap();
+        let first_id = repository
+            .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        let before = source_snapshot_identity(repo.path()).unwrap();
+        let first = repository.find_commit(first_id).unwrap();
+        let tree = repository.find_tree(first.tree_id()).unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "metadata-only commit",
+                &tree,
+                &[&first],
+            )
+            .unwrap();
+        drop(tree);
+        drop(first);
+        let after = source_snapshot_identity(repo.path()).unwrap();
+
+        assert_eq!(before, after);
+        assert!(before.starts_with("git-tree:"));
+    }
+
+    #[tokio::test]
+    async fn reconstructed_node_representation_keeps_exact_source_work_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item_0.rs"), "fn item_0() {}\n").unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "reconstructed-node-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut reconstructed = seeds(2);
+        reconstructed[0].node.line_end = 99;
+        reconstructed[0].node.signature = "derived signature drift".to_string();
+        reconstructed[0].node.body = "derived body drift".to_string();
+        reconstructed[0]
+            .node
+            .metadata
+            .insert("derived".to_string(), "changed".to_string());
+        let resumed = LspWorkItemLedger::begin(repo.path(), &reconstructed)
+            .await
+            .unwrap();
+
+        assert!(!resumed.should_run(0));
+        assert!(resumed.should_run(1));
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["reconstructed-node-job:0"].recovery_disposition,
+            LspRecoveryDisposition::CarriedExact
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_request_anchor_replays_with_explainable_disposition() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item_0.rs"), "fn item_0() {}\n").unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-anchor-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut changed = seeds(2);
+        changed[0].node.line_start = 2;
+        let resumed = LspWorkItemLedger::begin(repo.path(), &changed)
+            .await
+            .unwrap();
+
+        assert!(resumed.should_run(0));
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["changed-anchor-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RerunRequestAnchor
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_operations_replay_with_explainable_disposition() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-operations-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut changed = seeds(2);
+        changed[0].requested_operations = vec!["definitions".to_string()];
+        let resumed = LspWorkItemLedger::begin(repo.path(), &changed)
+            .await
+            .unwrap();
+
+        assert!(resumed.should_run(0));
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["changed-operations-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RerunOperations
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_toolchain_contract_replays_with_explainable_disposition() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "changed-toolchain-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let mut changed = seeds(2);
+        changed[0].toolchain_contract = "fixture-toolchain-v2".to_string();
+        let resumed = LspWorkItemLedger::begin(repo.path(), &changed)
+            .await
+            .unwrap();
+
+        assert!(resumed.should_run(0));
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["changed-toolchain-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RerunToolchain
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_completed_output_is_rejected_and_rerun() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(1);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "tampered-output-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        let path = store_path(repo.path());
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["records"]["tampered-output-job:0"]["observed_result_count"] =
+            serde_json::json!(999);
+        std::fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+            .await
+            .unwrap();
+        assert!(resumed.should_run(0));
+        assert!(resumed.recovered_output().0.is_empty());
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["tampered-output-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RejectedTampered
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_retained_identity_is_rejected_and_rerun_once() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(1);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "duplicate-identity-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        {
+            let mut store = ledger.store.lock().unwrap();
+            let mut duplicate = store.records["duplicate-identity-job:0"].clone();
+            duplicate.item_id = 1;
+            duplicate.state = LspWorkItemState::Pending;
+            duplicate.integrity_digest.clear();
+            store
+                .records
+                .insert("duplicate-identity-job:1".to_string(), duplicate);
+        }
+        ledger.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+            .await
+            .unwrap();
+        assert!(resumed.should_run(0));
+        assert_eq!(resumed.runnable_item_ids.len(), 1);
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["duplicate-identity-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RejectedDuplicate
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_identity_across_interrupted_jobs_is_rejected() {
+        let repo = tempfile::tempdir().unwrap();
+        let initial = seeds(2);
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "older-interrupted-job".to_string(),
+            &initial,
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        {
+            let mut store = ledger.store.lock().unwrap();
+            let older_records = store.records.values().cloned().collect::<Vec<_>>();
+            for mut duplicate in older_records {
+                duplicate.job_id = "newer-interrupted-job".to_string();
+                duplicate.updated_at_ms += 1;
+                duplicate.integrity_digest.clear();
+                store.records.insert(
+                    record_key("newer-interrupted-job", duplicate.item_id),
+                    duplicate,
+                );
+            }
+        }
+        ledger.flush().await.unwrap();
+
+        let resumed = LspWorkItemLedger::begin(repo.path(), &initial)
+            .await
+            .unwrap();
+
+        assert!(resumed.should_run(0));
+        assert!(resumed.should_run(1));
+        let store = resumed.store.lock().unwrap();
+        assert_eq!(
+            store.records["newer-interrupted-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RejectedDuplicate
+        );
     }
 
     #[tokio::test]
@@ -1538,12 +2291,14 @@ mod tests {
                 node: node.clone(),
                 requested_operations: vec!["document_links".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             },
             LspWorkItemSeed {
                 item_id: 1,
                 node: node.clone(),
                 requested_operations: vec!["references".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             },
         ];
         let ledger = LspWorkItemLedger::begin_with_job_id(
@@ -1562,6 +2317,7 @@ mod tests {
             node,
             requested_operations: vec!["references".to_string()],
             attempt_count: 1,
+            toolchain_contract: "fixture-toolchain-v1".to_string(),
         }];
         let resumed = LspWorkItemLedger::begin(repo.path(), &current)
             .await
@@ -1584,6 +2340,7 @@ mod tests {
             node: source.clone(),
             requested_operations: vec!["references".to_string()],
             attempt_count: 1,
+            toolchain_contract: "fixture-toolchain-v1".to_string(),
         }];
         let ledger = LspWorkItemLedger::begin_with_job_id(
             repo.path(),
@@ -1603,7 +2360,8 @@ mod tests {
         let mut document_symbol_proof = node("proof");
         document_symbol_proof.id.kind = NodeKind::Other("lsp_document_symbol".to_string());
         document_symbol_proof.source = ExtractionSource::Lsp;
-        let persisted_nodes = repo.path().join("persisted-nodes.json");
+        let persisted_nodes = repo.path().join(".oh/.cache/persisted-nodes.json");
+        std::fs::create_dir_all(persisted_nodes.parent().unwrap()).unwrap();
         std::fs::write(
             &persisted_nodes,
             serde_json::to_vec(&[source.clone(), virtual_function, document_symbol_proof]).unwrap(),
@@ -1621,6 +2379,7 @@ mod tests {
                 node,
                 requested_operations: vec!["references".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             })
             .collect::<Vec<_>>();
 

@@ -83,6 +83,8 @@ MCP output distinguishes freshness from readiness. Freshness says when the index
 
 If a language server stops making progress and RNA aborts the pass, graph finalization still completes and preserves every node and edge produced before the abort. CLI and MCP readiness report this terminal result as `partial/degraded` with the original abort diagnostic. RNA does not write the full-LSP completion sentinel for a degraded run, so a later scan can retry instead of treating partial coverage as complete.
 
+Interrupted Pass 1 recovery carries completed work only when a versioned identity matches the current repository source/config snapshot, source-derived LSP request position, canonical operation set, and planner/server toolchain contract. Derived graph fields such as rendered bodies, signatures, end lines, and enrichment metadata are not part of that identity. The work-item receipt reports exact carries and component-specific reruns; schema changes, duplicate candidates, or record/result tampering rebuild or fail closed instead of rebinding old evidence.
+
 For a benchmark checkout, use the stricter persisted per-file gate after a full scan:
 
 ```bash

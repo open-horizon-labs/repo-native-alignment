@@ -32,6 +32,64 @@ const PASS1_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 const PASS1_DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DID_OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn resolved_executable_digest(command: &str) -> String {
+    let candidate = {
+        let path = Path::new(command);
+        if path.components().count() > 1 {
+            Some(path.to_path_buf())
+        } else {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join(command))
+                    .find(|candidate| candidate.is_file())
+            })
+        }
+    };
+    candidate
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_else(|| format!("unresolved:{command}"))
+}
+
+fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let startup_root = enricher
+        .startup_root_override
+        .get()
+        .map(|root| root.strip_prefix(repo_root).unwrap_or(root))
+        .unwrap_or_else(|| Path::new("."))
+        .to_string_lossy()
+        .replace('\\', "/");
+    for value in [
+        "lsp-toolchain-contract-v1".to_string(),
+        enricher.language.clone(),
+        enricher.display_name.clone(),
+        enricher.server_command.clone(),
+        resolved_executable_digest(&enricher.server_command),
+        serde_json::to_string(&enricher.server_args).unwrap_or_default(),
+        serde_json::to_string(&enricher.init_settings).unwrap_or_default(),
+        enricher.config_file.unwrap_or_default().to_string(),
+        startup_root,
+        enricher.query_profile.language().to_string(),
+        enricher.query_profile.server().to_string(),
+        format!("{:?}", enricher.query_profile.budget()),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(&[0]);
+    }
+    for rule in enricher.compile_command_overrides {
+        hasher.update(rule.suffix.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(rule.compiler.as_bytes());
+        hasher.update(&[0]);
+        for argument in rule.args {
+            hasher.update(argument.as_bytes());
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 #[derive(Debug, Default)]
 struct EndpointLookupIndex {
     functions_by_file_and_name: HashMap<PathBuf, HashMap<String, Vec<NodeId>>>,
@@ -1388,6 +1446,7 @@ impl LspEnricher {
                 attempt_count: 1,
             })
             .collect();
+        let toolchain_contract = lsp_toolchain_contract(self, root);
         let persisted_seeds = work_items
             .iter()
             .map(|item| LspWorkItemSeed {
@@ -1399,6 +1458,7 @@ impl LspEnricher {
                     .map(|operation| operation.to_string())
                     .collect(),
                 attempt_count: item.attempt_count,
+                toolchain_contract: toolchain_contract.clone(),
             })
             .collect::<Vec<_>>();
         let work_item_ledger = match LspWorkItemLedger::begin(root, &persisted_seeds).await {
@@ -1862,7 +1922,7 @@ impl LspEnricher {
             .unwrap_or("requesting_lsp_operation");
         diagnostics.set_phase(item, phase).await;
 
-        let (line, col) = Self::node_lsp_position(node);
+        let (line, col) = Self::node_lsp_position(root, node);
         let mut edges = Vec::new();
         let mut new_nodes = Vec::new();
         let mut had_error = false;
@@ -2593,7 +2653,7 @@ impl LspEnricher {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            let (line, col) = Self::node_lsp_position(node);
+            let (line, col) = Self::node_lsp_position(root, node);
 
             let (ok, observation) = Self::enrich_type_hierarchy_p(
                 transport,
@@ -3683,6 +3743,7 @@ mod tests {
                     .map(|operation| (*operation).to_string())
                     .collect(),
                 attempt_count: item.attempt_count,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             })
             .collect::<Vec<_>>();
         let initial = LspWorkItemLedger::begin_with_job_id(
@@ -3765,6 +3826,7 @@ mod tests {
             node: node.clone(),
             requested_operations: vec!["textDocument/references".to_string()],
             attempt_count: 3,
+            toolchain_contract: "fixture-toolchain-v1".to_string(),
         };
         let initial = LspWorkItemLedger::begin_with_job_id(
             repo.path(),

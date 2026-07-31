@@ -1160,6 +1160,7 @@ mod tests {
                 node,
                 requested_operations: vec!["textDocument/references".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             }],
         )
         .await

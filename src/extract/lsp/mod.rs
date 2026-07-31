@@ -3171,34 +3171,8 @@ impl LspEnricher {
     /// prefix length varies across languages (Python `def`, Go `func`, etc.).
     /// If the extractor did not populate name_col (legacy or non-tree-sitter
     /// nodes), falls back to signature scanning.
-    fn node_lsp_position(node: &Node) -> (u32, u32) {
-        let line = (node.line_start.saturating_sub(1)) as u32;
-        let col = if let Some(col_str) = node.metadata.get("name_col") {
-            col_str.parse::<u32>().unwrap_or_else(|_| {
-                tracing::debug!(
-                    node = %node.id.name,
-                    raw = %col_str,
-                    "name_col metadata could not be parsed as u32; falling back to signature scan"
-                );
-                node.signature
-                    .find(&node.id.name)
-                    .map(|i| i as u32)
-                    .unwrap_or(0)
-            })
-        } else {
-            let fallback = node
-                .signature
-                .find(&node.id.name)
-                .map(|i| i as u32)
-                .unwrap_or(0);
-            tracing::debug!(
-                node = %node.id.name,
-                col = fallback,
-                "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
-            );
-            fallback
-        };
-        (line, col)
+    fn node_lsp_position(repo_root: &Path, node: &Node) -> (u32, u32) {
+        work_items::source_request_position(repo_root, node)
     }
 
     /// Update the type hierarchy strike counter after a single enrich attempt.
