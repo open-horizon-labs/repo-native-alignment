@@ -1149,6 +1149,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_only_external_search_rejects_before_cache_creation() {
+        let server = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(external.path().join("src")).unwrap();
+        std::fs::write(
+            external.path().join("src/lib.rs"),
+            "pub fn must_not_be_scanned() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: server.path().to_path_buf(),
+            cache_only: true,
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": "must_not_be_scanned",
+            "repo": external.path().to_string_lossy(),
+            "search_mode": "keyword",
+            "compact": true
+        }))
+        .unwrap();
+
+        let rendered = call_tool_text(&handler.handle_search(args).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
+        assert!(
+            !external.path().join(".oh").exists(),
+            "cache-only external rejection must happen before any cache creation"
+        );
+    }
+
+    #[tokio::test]
     async fn test_external_verbose_search_loads_external_enrichment_jobs() {
         let server = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();

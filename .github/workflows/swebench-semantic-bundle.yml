@@ -17,6 +17,7 @@ on:
       - "scripts/tests/test_verify_swebench_semantic_bundle.py"
       - "scripts/lsp/**"
       - "benchmark/swebench-act-context/lsp-toolchain/**"
+      - ".github/scripts/mcp-cache-only-smoke.mjs"
       - ".github/workflows/swebench-semantic-bundle.yml"
 
 permissions:
@@ -330,6 +331,16 @@ jobs:
               model_root.chmod(0o555)
           PY
 
+      - name: Prepare real MCP SDK qualification client
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$LSP_ROOT/runtimes/node-v22.12.0-darwin-arm64/bin:$PATH"
+          npm install --no-save --ignore-scripts --package-lock=false \
+            @modelcontextprotocol/sdk@1.30.0
+          node -p 'JSON.parse(require("node:fs").readFileSync("node_modules/@modelcontextprotocol/sdk/package.json", "utf8")).version' \
+            > "$BUNDLE_ROOT/evidence/mcp-sdk-version.txt"
+
       - name: Prove fresh-process offline full-LSP Metal embeddings and reranking
         shell: bash
         env:
@@ -429,6 +440,50 @@ jobs:
           assert "using cpu" not in stderr
           assert "original order" not in stderr
           PY
+
+          # Cache-only admission is the immutable boundary. Make the prepared
+          # repository cache read-only, snapshot bytes/entries/mtimes before
+          # startup, then exercise the exact artifact through three real SDK
+          # clients. The server log lives outside the cache's writable surface.
+          find "$FIXTURE_ROOT/.oh/.cache" -type f -exec chmod 0444 {} +
+          find "$FIXTURE_ROOT/.oh/.cache" -type d -exec chmod 0555 {} +
+          node .github/scripts/mcp-cache-only-smoke.mjs \
+            --snapshot "$FIXTURE_ROOT" \
+            "$HF_HOME" \
+            "$FASTEMBED_CACHE_DIR" \
+            > "$BUNDLE_ROOT/evidence/resident-cache-baseline.json"
+
+          RESIDENT_LOG="$BUNDLE_ROOT/evidence/resident-mcp-server.log"
+          "$BUNDLE_ROOT/repo-native-alignment" \
+            --repo "$FIXTURE_ROOT" \
+            --transport http \
+            --host 127.0.0.1 \
+            --port 18765 \
+            --cache-only \
+            --business-context disabled \
+            --log-path "$RESIDENT_LOG" &
+          RESIDENT_PID=$!
+          cleanup_resident() {
+            kill "$RESIDENT_PID" 2>/dev/null || true
+            wait "$RESIDENT_PID" 2>/dev/null || true
+          }
+          trap cleanup_resident EXIT
+
+          node .github/scripts/mcp-cache-only-smoke.mjs \
+            http://127.0.0.1:18765/mcp \
+            "$FIXTURE_ROOT" \
+            "function returns value" \
+            "$RESIDENT_LOG" \
+            "$BUNDLE_ROOT/evidence/resident-cache-baseline.json" \
+            > "$BUNDLE_ROOT/evidence/resident-mcp-three-client.json"
+
+          cleanup_resident
+          trap - EXIT
+          node .github/scripts/mcp-cache-only-smoke.mjs \
+            --verify-snapshot \
+            "$FIXTURE_ROOT" \
+            "$BUNDLE_ROOT/evidence/resident-cache-baseline.json" \
+            > "$BUNDLE_ROOT/evidence/resident-cache-after-shutdown.json"
 
       - name: Seal deterministic payload and canonical sidecar
         shell: bash
@@ -538,6 +593,20 @@ jobs:
           offline_readiness_stderr = root / "evidence/offline-lsp-readiness.stderr"
           offline_stdout = root / "evidence/offline-strict-search.stdout"
           offline_stderr = root / "evidence/offline-strict-search.stderr"
+          resident_baseline = root / "evidence/resident-cache-baseline.json"
+          resident_after_shutdown = root / "evidence/resident-cache-after-shutdown.json"
+          resident_result_path = root / "evidence/resident-mcp-three-client.json"
+          resident_server_log = root / "evidence/resident-mcp-server.log"
+          mcp_sdk_version = root / "evidence/mcp-sdk-version.txt"
+          resident_result = json.loads(resident_result_path.read_bytes())
+          if (
+              resident_result["requests"] != 60
+              or resident_result["cacheUnchanged"] is not True
+              or resident_result["immutableStateUnchanged"] is not True
+              or resident_result["immutableRoots"] != 3
+              or not isinstance(resident_result["phaseCounts"], dict)
+          ):
+              raise SystemExit("resident cache-only qualification evidence is incomplete")
           lsp_by_name = {record["path"]: record for record in lsp_files}
           manifest = {
               "schema": "rna-swebench-semantic-bundle-manifest-v1",
@@ -617,6 +686,11 @@ jobs:
                               offline_readiness_stderr,
                               offline_stdout,
                               offline_stderr,
+                              resident_baseline,
+                              resident_after_shutdown,
+                              resident_result_path,
+                              resident_server_log,
+                              mcp_sdk_version,
                           )
                       )
                   ).hexdigest(),
@@ -712,6 +786,12 @@ jobs:
           manifest_path = root / "semantic-bundle-manifest.json"
           upload_path = root / "semantic-bundle-upload-attestation.json"
           manifest = json.loads(manifest_path.read_bytes())
+          resident = json.loads(
+              (
+                  Path(os.environ["BUNDLE_ROOT"])
+                  / "evidence/resident-mcp-three-client.json"
+              ).read_bytes()
+          )
           print("## SWE-bench semantic bundle")
           print(f"- head: `{manifest['provenance']['head_sha']}`")
           print(f"- artifact: `{manifest['artifact']['name']}`")
@@ -723,4 +803,10 @@ jobs:
           print(f"- attestation artifact ID: `{os.environ['ATTESTATION_ARTIFACT_ID']}`")
           print(f"- attestation artifact digest: `{os.environ['ATTESTATION_ARTIFACT_DIGEST']}`")
           print("- qualification: `offline strict Metal + hybrid embeddings + rerank, no fallback`")
+          print(
+              "- resident cache-only: "
+              f"`3 clients, {resident['requests']} requests, "
+              f"p95={resident['p95Ms']:.1f} ms, max={resident['maxMs']:.1f} ms, "
+              "cache/models unchanged`"
+          )
           PY

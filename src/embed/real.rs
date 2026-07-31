@@ -1156,6 +1156,7 @@ pub struct EmbeddingIndex {
     table_name: String,
     repo_root: Arc<PathBuf>,
     require_metal: bool,
+    resident_query_runtime: bool,
     query_model: Arc<tokio::sync::Mutex<Option<metal_candle::embeddings::EmbeddingModel>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
@@ -1167,6 +1168,7 @@ pub struct EmbeddingIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationOpenPurpose {
     Serving,
+    ResidentServing,
     Reconciliation,
 }
 
@@ -1176,8 +1178,10 @@ fn requires_active_generation_graph_validation(
     asset_seeding: bool,
     has_active_generation: bool,
 ) -> bool {
-    purpose == GenerationOpenPurpose::Serving
-        && require_metal
+    matches!(
+        purpose,
+        GenerationOpenPurpose::Serving | GenerationOpenPurpose::ResidentServing
+    ) && require_metal
         && !asset_seeding
         && has_active_generation
 }
@@ -1708,7 +1712,24 @@ impl EmbeddingIndex {
             generation::sealed_semantic_bundle_build(),
             "cache-only semantic serving requires a sealed semantic bundle artifact"
         );
-        Self::new(repo_root).await.map(Some)
+        let admission_started = std::time::Instant::now();
+        let index =
+            Self::new_with_policy(repo_root, true, GenerationOpenPurpose::ResidentServing).await?;
+        index.preload_query_model().await?;
+        let post_verification_started = std::time::Instant::now();
+        generation::verify_runtime_encoder_assets()?;
+        index.validate_active_generation_graph().await?;
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "encoder_asset_post_verification",
+            elapsed_ms = post_verification_started.elapsed().as_secs_f64() * 1000.0
+        );
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "strict_semantic_full_validation",
+            elapsed_ms = admission_started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(Some(index))
     }
 
     /// Open the semantic index with the #786 fail-closed execution policy.
@@ -1744,7 +1765,13 @@ impl EmbeddingIndex {
     ) -> Result<Self> {
         let expected_asset_digests = if require_metal && !generation::semantic_asset_seeding() {
             let digests = generation::runtime_asset_digests()?;
+            let verification_started = std::time::Instant::now();
             generation::verify_runtime_encoder_assets()?;
+            tracing::info!(
+                target: "rna_query_timing",
+                phase = "encoder_asset_verification",
+                elapsed_ms = verification_started.elapsed().as_secs_f64() * 1000.0
+            );
             Some(digests)
         } else {
             None
@@ -1817,6 +1844,7 @@ impl EmbeddingIndex {
             table_name: "artifacts".to_string(),
             repo_root: Arc::new(repo_root.to_path_buf()),
             require_metal,
+            resident_query_runtime: purpose == GenerationOpenPurpose::ResidentServing,
             query_model: Arc::new(tokio::sync::Mutex::new(None)),
             _unpublished_scratch: unpublished_scratch,
         };
@@ -1839,7 +1867,9 @@ impl EmbeddingIndex {
             .clone()
     }
 
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+    async fn initialized_query_model(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<metal_candle::embeddings::EmbeddingModel>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
         tracing::info!(
@@ -1857,6 +1887,20 @@ impl EmbeddingIndex {
                 elapsed_ms = init_started.elapsed().as_secs_f64() * 1000.0
             );
         }
+        Ok(model)
+    }
+
+    async fn preload_query_model(&self) -> Result<()> {
+        drop(self.initialized_query_model().await?);
+        Ok(())
+    }
+
+    pub fn resident_query_runtime(&self) -> bool {
+        self.resident_query_runtime
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let model = self.initialized_query_model().await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
@@ -3574,9 +3618,20 @@ impl EmbeddingIndex {
         if generation::semantic_asset_seeding() {
             anyhow::bail!("strict semantic search is forbidden during asset seeding");
         }
-        self.validate_active_generation_graph().await?;
+        if self.resident_query_runtime {
+            let reuse_started = std::time::Instant::now();
+            tracing::info!(
+                target: "rna_query_timing",
+                phase = "strict_semantic_resident_reuse",
+                elapsed_ms = reuse_started.elapsed().as_secs_f64() * 1000.0
+            );
+        } else {
+            self.validate_active_generation_graph().await?;
+        }
         require_metal_device()?;
-        generation::verify_runtime_encoder_assets()?;
+        if !self.resident_query_runtime {
+            generation::verify_runtime_encoder_assets()?;
+        }
         let mut observed = self
             .search_with_filters_policy_observed(
                 query,
@@ -3591,8 +3646,10 @@ impl EmbeddingIndex {
         // Preserve the pre-existing strict observed contract, which reports the
         // requested backend even when the strict table is not ready.
         observed.executed_mode = Some(product_retrieval_score_kind(mode, false).into());
-        generation::verify_runtime_encoder_assets()?;
-        self.validate_active_generation_graph().await?;
+        if !self.resident_query_runtime {
+            generation::verify_runtime_encoder_assets()?;
+            self.validate_active_generation_graph().await?;
+        }
         Ok(observed)
     }
 
@@ -3960,6 +4017,12 @@ mod tests {
     fn stale_generation_is_rejected_for_serving_but_available_to_reconciliation() {
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
+            true,
+            false,
+            true,
+        ));
+        assert!(requires_active_generation_graph_validation(
+            GenerationOpenPurpose::ResidentServing,
             true,
             false,
             true,

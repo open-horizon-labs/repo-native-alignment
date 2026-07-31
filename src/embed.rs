@@ -238,6 +238,10 @@ impl EmbeddingIndex {
         Ok(None)
     }
 
+    pub fn resident_query_runtime(&self) -> bool {
+        false
+    }
+
     pub async fn new_strict(_repo_root: &Path) -> Result<Self> {
         Err(anyhow!(
             "strict embedding execution requires an artifact built with embeddings and Metal support"

@@ -619,7 +619,7 @@ async fn load_existing_embedding_index(
     repo_root: &std::path::Path,
     offline: bool,
     warn: impl FnOnce(String),
-) -> Option<repo_native_alignment::embed::EmbeddingIndex> {
+) -> anyhow::Result<Option<repo_native_alignment::embed::EmbeddingIndex>> {
     let opened = if offline {
         repo_native_alignment::embed::EmbeddingIndex::open_existing_offline(repo_root).await
     } else {
@@ -627,17 +627,22 @@ async fn load_existing_embedding_index(
     };
     match opened {
         Ok(Some(idx)) => match idx.has_table().await {
-            Ok(true) => Some(idx),
-            Ok(false) => None,
+            Ok(true) => Ok(Some(idx)),
+            Ok(false) if offline => {
+                anyhow::bail!("cache-only semantic generation has no artifacts table")
+            }
+            Ok(false) => Ok(None),
+            Err(e) if offline => Err(e),
             Err(e) => {
                 warn(format!("Embedding index check failed: {}", e));
-                None
+                Ok(None)
             }
         },
-        Ok(None) => None,
+        Ok(None) => Ok(None),
+        Err(e) if offline => Err(e),
         Err(e) => {
             warn(format!("EmbeddingIndex init failed: {}", e));
-            None
+            Ok(None)
         }
     }
 }
@@ -1029,7 +1034,7 @@ async fn async_main() -> anyhow::Result<()> {
                     tracing::debug!("{}; no embedding enrichment requested", msg);
                 }
             })
-            .await
+            .await?
             {
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
@@ -1329,7 +1334,7 @@ async fn async_main() -> anyhow::Result<()> {
                         msg
                     );
                 })
-                .await
+                .await?
                 {
                     handler.embed_index.store(Arc::new(Some(embed_idx)));
                 } else if !matches!(scope, EnrichmentScope::Repo) {
@@ -1791,8 +1796,17 @@ async fn async_main() -> anyhow::Result<()> {
                 load_existing_embedding_index(&repo_root, cli.cache_only, |msg| {
                     tracing::warn!("{}; MCP semantic search will be unavailable", msg);
                 })
-                .await
+                .await?
             {
+                if cli.cache_only {
+                    tokio::task::spawn_blocking(
+                        repo_native_alignment::rerank::prepare_strict_reranker_resident,
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("resident strict reranker admission task failed: {error}")
+                    })??;
+                }
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
             tracing::info!(

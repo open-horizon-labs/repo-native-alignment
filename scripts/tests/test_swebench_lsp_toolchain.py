@@ -1172,6 +1172,25 @@ class SwebenchLspToolchainTests(unittest.TestCase):
             "              search \\\n",
             workflow,
         )
+        self.assertIn(
+            "node .github/scripts/mcp-cache-only-smoke.mjs \\\n"
+            '            --snapshot "$FIXTURE_ROOT"',
+            workflow,
+        )
+        self.assertIn("@modelcontextprotocol/sdk@1.30.0", workflow)
+        self.assertIn('- ".github/scripts/mcp-cache-only-smoke.mjs"', workflow)
+        self.assertIn(
+            '            --cache-only \\\n'
+            "            --business-context disabled \\\n"
+            '            --log-path "$RESIDENT_LOG" &',
+            workflow,
+        )
+        self.assertIn("resident-mcp-three-client.json", workflow)
+        self.assertIn("--verify-snapshot", workflow)
+        self.assertIn(
+            'find "$FIXTURE_ROOT/.oh/.cache" -type d -exec chmod 0555 {} +',
+            workflow,
+        )
         self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)
         self.assertIn(
             'bind_hf_default_cache(\n            Path(environment["HF_HOME"]), '

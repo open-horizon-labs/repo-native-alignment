@@ -272,8 +272,13 @@ repo-native-alignment \
 enrichment, downloads, or cache mutation. It fails closed when the graph cache or its
 business-context marker is absent or incompatible. Semantic serving additionally
 requires the sealed offline bundle; exact and graph queries remain available when no
-semantic generation exists. The graph, LanceDB connection, encoder, and reranker stay
-resident after the first query.
+semantic generation exists. Startup fully verifies the admitted graph, semantic
+generation, encoder tree, and reranker tree, then eagerly loads both models before the
+server accepts semantic requests. The graph, LanceDB connection, encoder, and reranker
+remain resident for the process lifetime; request handling does not re-hash those
+trees. The admitted cache and model trees may be mounted read-only. Only the optional
+`--log-path` target needs to be writable, and it should live outside `.oh/.cache`.
+Replacing any admitted cache or model asset requires restarting the server.
 
 ### CLI Subcommands
 
