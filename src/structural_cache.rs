@@ -1049,12 +1049,10 @@ pub fn plan_incremental_impact(
     // produced reusable evidence for that file), so seed the runtime plan from
     // the complete signed execution set rather than relying on a later broad
     // operation-bound escalation to discover them.
-    executed.extend(
-        verifier_authorized_executed_paths(
-            &authorization.authorization,
-            &authorization.inherited_by_path,
-        ),
-    );
+    executed.extend(verifier_authorized_executed_paths(
+        &authorization.authorization,
+        &authorization.inherited_by_path,
+    ));
     executed.extend(
         authorization
             .authorization
@@ -1975,6 +1973,35 @@ mod tests {
         assert!(!crate::extract::lsp::partition_influence_pattern_matches(
             "requirements*.txt",
             "src/main.py"
+        ));
+    }
+
+    /// A dependency manifest under a directory that the pattern prefix names
+    /// must still invalidate the partition. The basename of
+    /// `requirements/dev.txt` is `dev.txt`, so only the whole-path fallback
+    /// clause catches it — none of the cases above exercise that clause, which
+    /// is how its removal went unnoticed. Losing this match is fail-open:
+    /// dependency changes would stop invalidating the Python partition.
+    #[test]
+    fn wildcard_patterns_cover_manifests_under_a_matching_directory() {
+        assert!(crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "requirements/dev.txt"
+        ));
+        // The fallback is prefix-anchored, not a substring search: the pattern
+        // must match the whole path from its first byte. A manifest nested
+        // below an unrelated directory is therefore still only reachable via
+        // its basename, which is the same boundary the pre-consolidation
+        // matcher had.
+        assert!(!crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "deploy/requirements/base.txt"
+        ));
+        // And an unrelated path is not a match just because the whole path is
+        // consulted.
+        assert!(!crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "docs/notes.txt"
         ));
     }
 

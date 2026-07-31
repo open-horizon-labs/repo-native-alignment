@@ -156,6 +156,15 @@ impl BuiltinLspDescriptor {
     }
 }
 
+/// Match a descriptor influence pattern against a repo-relative path.
+///
+/// A pattern without `/` is matched against the basename, and then against the
+/// whole path as a fallback. The second clause is deliberate: descriptor
+/// patterns like `requirements*.txt` are meant to catch dependency manifests
+/// wherever they live, so `requirements/dev.txt` must invalidate the partition
+/// even though its basename is `dev.txt`. Dropping that fallback narrows cache
+/// invalidation — a fail-open direction — so it stays until a descriptor gains
+/// explicit path semantics.
 pub(crate) fn partition_influence_pattern_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim_start_matches("**/");
     let candidate = if pattern.contains('/') {
@@ -164,6 +173,7 @@ pub(crate) fn partition_influence_pattern_matches(pattern: &str, path: &str) -> 
         path.rsplit('/').next().unwrap_or(path)
     };
     wildcard_match(pattern.as_bytes(), candidate.as_bytes())
+        || (!pattern.contains('/') && wildcard_match(pattern.as_bytes(), path.as_bytes()))
 }
 
 fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {

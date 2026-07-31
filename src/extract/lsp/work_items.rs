@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::graph::{Edge, Node};
 
 pub(crate) const STORE_SCHEMA_VERSION: u32 = 5;
-const WORK_IDENTITY_SCHEMA_VERSION: u32 = 1;
+// Bumped to 2 when `request_anchor` stopped hashing the load-derived
+// `Node::language`. The anchor format changed, so prior identities must rebuild
+// rather than migrate.
+const WORK_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const PLANNER_CONTRACT_VERSION: &str = "lsp-pass1-work-planner-v1";
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
@@ -427,11 +430,27 @@ impl LspWorkItemLedger {
                     }
                     1 => {
                         let prior = candidates.into_iter().next().expect("one candidate");
+                        // A tamper rejection or schema rerun is sticky only
+                        // while the record still carries that unresolved
+                        // verdict. Once the work has actually rerun and
+                        // completed, its outputs were freshly produced under
+                        // the current schema, so the stale label must not pin it
+                        // to a permanent rerun — otherwise every record that
+                        // ever crossed a schema bump reruns on every later
+                        // resume and the receipt keeps reporting the old
+                        // reason forever.
+                        //
+                        // This does not weaken fail-closed handling: both
+                        // `load_store` paths that assign these dispositions
+                        // also clear the outputs and set the state to `Failed`,
+                        // so a record that is genuinely tampered or
+                        // schema-stale can never be observed `Completed` here.
+                        let unresolved = prior.state != LspWorkItemState::Completed;
                         let disposition = match prior.recovery_disposition {
-                            LspRecoveryDisposition::RejectedTampered => {
+                            LspRecoveryDisposition::RejectedTampered if unresolved => {
                                 LspRecoveryDisposition::RejectedTampered
                             }
-                            LspRecoveryDisposition::RerunSchema => {
+                            LspRecoveryDisposition::RerunSchema if unresolved => {
                                 LspRecoveryDisposition::RerunSchema
                             }
                             _ => identity_disposition(&prior.work_identity, &current_identity),
@@ -785,7 +804,7 @@ impl LspWorkItemLedger {
             .clone();
         let repo_root = self.repo_root.clone();
         let job_id = self.job_id.clone();
-        tokio::task::spawn_blocking(move || merge_and_write_store(&repo_root, &job_id, &store))
+        tokio::task::spawn_blocking(move || merge_and_write_store(&repo_root, &job_id, store))
             .await
             .context("LSP work-item ledger writer task failed")??;
         Ok(())
@@ -945,6 +964,22 @@ fn find_identifier_boundary(line: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// Build the reconstruction-stable request anchor for `node`.
+///
+/// Deliberately excludes `node.language`. That field is *not* persisted: a
+/// LanceDB reload re-derives it from the file extension via
+/// `infer_language_from_path`, which disagrees with the extractor's
+/// `LangConfig::language_name` for at least `.c` (`"c"` at extraction,
+/// `"cpp"` after reload) and yields `"unknown"` for any extension the store
+/// mapping does not list. Hashing it would reintroduce exactly the defect this
+/// identity exists to remove: a byte-identical tree producing a different
+/// digest after graph reconstruction.
+///
+/// Nothing is lost by excluding it. The enricher's own language and display
+/// name are already covered by `toolchain_contract`, so work for the same file
+/// under different language servers still gets distinct identities, and the
+/// file path in the anchor already determines the language wherever it is
+/// consistently derived.
 fn request_anchor(repo_root: &Path, node: &Node, cache: &SourceLineCache) -> String {
     let relative_file = if node.id.file.is_absolute() {
         node.id
@@ -957,10 +992,9 @@ fn request_anchor(repo_root: &Path, node: &Node, cache: &SourceLineCache) -> Str
     };
     let (zero_based_line, zero_based_character) = source_request_position(repo_root, node, cache);
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{zero_based_line}\u{1f}{zero_based_character}",
+        "{}\u{1f}{}\u{1f}{zero_based_line}\u{1f}{zero_based_character}",
         node.id.root,
         relative_file.to_string_lossy().replace('\\', "/"),
-        node.language,
     )
 }
 
@@ -1438,6 +1472,12 @@ fn identity_disposition(
 /// second full copy of `output_nodes`/`output_edges` per record per flush on
 /// the scan path. Restoring runs before the serialization error is propagated
 /// so a failed flush never leaves a record with a cleared digest.
+///
+/// This removes the per-record copy only. A flush still serializes each record
+/// once to digest it and once more in the pretty write of the whole ledger, and
+/// `flush` still clones the store once to release the ledger mutex before the
+/// blocking write. Those costs are inherent to sealing per-record digests in a
+/// single-file ledger; only the redundant copies were removed.
 fn record_integrity_digest(record: &mut LspWorkItemRecord) -> Result<String> {
     let stored = std::mem::take(&mut record.integrity_digest);
     let serialized =
@@ -1758,17 +1798,22 @@ fn store_lock(repo_root: &Path) -> Result<Arc<tokio::sync::Mutex<()>>> {
     ))
 }
 
+/// Merge this job's records into the persisted ledger and write it.
+///
+/// Takes `current_job` by value: `flush` already cloned the store out from
+/// under the ledger mutex, so re-cloning its records here would be a second
+/// full copy of every record on every flush.
 fn merge_and_write_store(
     repo_root: &Path,
     job_id: &str,
-    current_job: &LspWorkItemStore,
+    current_job: LspWorkItemStore,
 ) -> Result<()> {
     let _file_lock = WorkItemFileLock::acquire(repo_root);
     let mut persisted = load_store(repo_root)?;
     persisted
         .records
         .retain(|_, record| record.job_id != job_id);
-    persisted.records.extend(current_job.records.clone());
+    persisted.records.extend(current_job.records);
     persisted.schema_version = STORE_SCHEMA_VERSION;
     retain_recent_jobs(&mut persisted, MAX_RETAINED_TERMINAL_JOBS);
     write_store(repo_root, &mut persisted)
@@ -2043,6 +2088,62 @@ mod tests {
         let result = run_bounded(&mut command, Duration::from_millis(200));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The extractor and the LanceDB reload path disagree about a `.c` file's
+    /// language: `C_CONFIG::language_name` is `"c"`, while the store's
+    /// `infer_language_from_path` maps `.c` to `"cpp"` (and anything it does
+    /// not list to `"unknown"`). `Node::language` is not persisted, so it is
+    /// re-derived on every reload. If the work identity hashed it, a
+    /// byte-identical tree would produce a different digest after graph
+    /// reconstruction — the exact defect this identity exists to remove. All
+    /// other fixtures here are `.rs`, where both derivations agree, so only a
+    /// non-`.rs` case can catch a regression.
+    #[test]
+    fn request_anchor_ignores_reload_derived_language() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/parser.c"), "int parse(void) { }\n").unwrap();
+
+        let mut extracted = node("parse");
+        extracted.id.file = PathBuf::from("src/parser.c");
+        extracted.language = "c".to_string();
+
+        // Same node after a LanceDB round trip, where the language column is
+        // re-derived from the extension rather than restored.
+        let mut reloaded = extracted.clone();
+        reloaded.language = crate::server::store::infer_language_from_path(&reloaded.id.file);
+        assert_ne!(
+            extracted.language, reloaded.language,
+            "fixture is only meaningful while the two derivations disagree"
+        );
+
+        let cache = SourceLineCache::default();
+        assert_eq!(
+            request_anchor(repo.path(), &extracted, &cache),
+            request_anchor(repo.path(), &reloaded, &cache),
+            "reconstruction must not change the request anchor"
+        );
+
+        // And the same must hold for the full identity digest, not just the
+        // anchor string.
+        let snapshot = source_snapshot_identity(repo.path()).unwrap();
+        let seed_of = |node: Node| LspWorkItemSeed {
+            item_id: 0,
+            node,
+            requested_operations: vec!["textDocument/references".to_string()],
+            attempt_count: 1,
+            toolchain_contract: "fixture-toolchain-v1".to_string(),
+        };
+        let before = work_identity(repo.path(), &seed_of(extracted), &snapshot, &cache);
+        let after = work_identity(repo.path(), &seed_of(reloaded), &snapshot, &cache);
+        assert_eq!(before.request_anchor, after.request_anchor);
+        assert_eq!(before.digest, after.digest);
+        assert_eq!(
+            identity_disposition(&before, &after),
+            LspRecoveryDisposition::CarriedExact,
+            "a reconstructed node must carry, not rerun"
+        );
     }
 
     #[test]
@@ -2341,6 +2442,67 @@ mod tests {
             store.records.values().all(|record| {
                 record.recovery_disposition == LspRecoveryDisposition::RerunSchema
             })
+        );
+    }
+
+    /// A schema rerun must stop being sticky once the work has actually rerun
+    /// and completed. Without this, `begin` re-inherits `RerunSchema` from the
+    /// prior record forever: every record that ever crossed a schema bump
+    /// reruns on every later resume and the receipt keeps reporting
+    /// `rerun_schema` for work that is current. This continues the sequence in
+    /// `schema_v1_completed_items_are_replayed_conservatively` one resume
+    /// further, which is where the loop becomes visible.
+    #[tokio::test]
+    async fn replayed_schema_work_carries_once_it_has_completed() {
+        let repo = tempfile::tempdir().unwrap();
+        let ledger = LspWorkItemLedger::begin_with_job_id(
+            repo.path(),
+            "sticky-schema-job".to_string(),
+            &seeds(2),
+        )
+        .await
+        .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        let mut legacy_store = load_store(repo.path()).unwrap();
+        legacy_store.schema_version = 1;
+        for record in legacy_store.records.values_mut() {
+            record.schema_version = 1;
+            record.input_hash.clear();
+            record.output_edges.clear();
+            record.output_nodes.clear();
+        }
+        std::fs::write(
+            store_path(repo.path()),
+            serde_json::to_vec_pretty(&legacy_store).unwrap(),
+        )
+        .unwrap();
+
+        // First resume: the legacy record is correctly rerun.
+        let replayed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+            .await
+            .unwrap();
+        assert!(replayed.should_run(0));
+        assert_eq!(
+            replayed.store.lock().unwrap().records["sticky-schema-job:0"].recovery_disposition,
+            LspRecoveryDisposition::RerunSchema
+        );
+
+        // The rerun happens and succeeds under the current schema.
+        replayed.mark_completed(0).await.unwrap();
+        replayed.flush().await.unwrap();
+
+        // Second resume: the work is now current, so it must carry.
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+            .await
+            .unwrap();
+        assert!(
+            !resumed.should_run(0),
+            "completed work must not rerun a second time"
+        );
+        assert_eq!(
+            resumed.store.lock().unwrap().records["sticky-schema-job:0"].recovery_disposition,
+            LspRecoveryDisposition::CarriedExact,
+            "the stale rerun_schema label must not persist after the rerun completed"
         );
     }
 
