@@ -26,6 +26,9 @@ let syntheticWorkItemLedgerInstalled = false;
 function installSyntheticWorkItemLedger() {
   const now = Date.now();
   fs.mkdirSync(path.dirname(workItemLedgerPath), { recursive: true });
+  // Deliberately install the prior schema. The current server must expose the
+  // fail-closed schema-rerun receipt through a real MCP list_roots call rather
+  // than treating legacy work as reusable or silently hiding it.
   fs.writeFileSync(
     workItemLedgerPath,
     JSON.stringify({
@@ -674,11 +677,11 @@ try {
     rootsText,
     "LSP Pass 1 Work Queues",
   );
-  assertContains("list_roots delivers in-flight queue count", rootsText, "in_flight=1");
+  assertContains("list_roots fails old-schema work closed", rootsText, "failed=1");
   assertContains(
-    "list_roots delivers current LSP phase",
+    "list_roots delivers deterministic recovery disposition",
     rootsText,
-    "mcp_smoke_probe=1",
+    "rerun_schema=1",
   );
   restoreWorkItemLedger();
 
