@@ -36,6 +36,43 @@ pub fn list_roots_from_slugs(
     lsp_status: Option<&LspEnrichmentStatus>,
     scan_stats: Option<&ScanStats>,
 ) -> String {
+    list_roots_from_slugs_with_report_recovery(
+        repo_root,
+        active_slugs,
+        graph_state,
+        lsp_status,
+        scan_stats,
+        true,
+    )
+}
+
+/// Render the same root diagnostics without recovering persisted operation
+/// reports. This keeps public cache-only requests read-only.
+pub fn list_roots_from_slugs_read_only(
+    repo_root: &Path,
+    active_slugs: &std::collections::HashSet<String>,
+    graph_state: Option<&crate::server::state::GraphState>,
+    lsp_status: Option<&LspEnrichmentStatus>,
+    scan_stats: Option<&ScanStats>,
+) -> String {
+    list_roots_from_slugs_with_report_recovery(
+        repo_root,
+        active_slugs,
+        graph_state,
+        lsp_status,
+        scan_stats,
+        false,
+    )
+}
+
+fn list_roots_from_slugs_with_report_recovery(
+    repo_root: &Path,
+    active_slugs: &std::collections::HashSet<String>,
+    graph_state: Option<&crate::server::state::GraphState>,
+    lsp_status: Option<&LspEnrichmentStatus>,
+    scan_stats: Option<&ScanStats>,
+    recover_stale_reports: bool,
+) -> String {
     let workspace = crate::roots::WorkspaceConfig::load()
         .with_primary_root(repo_root.to_path_buf())
         .with_worktrees(repo_root)
@@ -377,7 +414,17 @@ pub fn list_roots_from_slugs(
         lines.join("\n")
     );
     out.push_str(&crate::extract::lsp::work_items::render_queue_snapshots_markdown(repo_root, 3));
-    out.push_str(&crate::server::operation_report::render_recent_reports_markdown(repo_root, 3));
+    if recover_stale_reports {
+        out.push_str(
+            &crate::server::operation_report::render_recent_reports_markdown(repo_root, 3),
+        );
+    } else {
+        out.push_str(
+            &crate::server::operation_report::render_recent_reports_markdown_read_only(
+                repo_root, 3,
+            ),
+        );
+    }
     out
 }
 

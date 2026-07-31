@@ -1830,6 +1830,11 @@ impl EmbeddingIndex {
             .execute()
             .await
             .context("Failed to connect to LanceDB")?;
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "embedding_open",
+            elapsed_ms = open_start.elapsed().as_secs_f64() * 1000.0
+        );
         tracing::debug!(
             "EmbeddingIndex: opened LanceDB at {} in {:?}",
             db_path.display(),

@@ -49,22 +49,26 @@ an invalid/missing cache.
   graph, installs the graph in the resident handler, and fails closed instead
   of scanning or repairing missing state.
 - Existing semantic generations open without unpublished scratch state;
-  cache-only semantic serving additionally requires the sealed offline bundle.
+  cache-only startup requires both a published generation and the sealed
+  offline bundle.
 - Cache-only startup is the single immutable semantic admission boundary: it
   verifies graph/generation identity and both model trees around eager encoder
   and reranker loading before semantic requests are accepted.
 - One resident encoder is shared behind an async mutex and the admitted strict
   reranker remains resident across requests. Ordinary non-resident strict mode
   retains its per-call verification contract.
-- Query timing emits separate graph load, embedding open, root discovery,
+- Query timing emits separate graph load, isolated LanceDB embedding open, root discovery,
   enrichment-ledger access, encoder wait/initialization/inference, candidate
   retrieval, reranker initialization/inference, full startup validation, and
   resident-reuse phases. Ledger timing and reads occur only for explicit
   verbose diagnostics, including external repos.
+- Cache-only verbose search and `list_roots` use non-recovering persisted-state
+  reads, so stale diagnostics remain visible without lock files or cache writes.
 - The public HTTP MCP smoke uses three SDK clients after one warmup and asserts
   p95 under 2 seconds, no request over 10 seconds, exact startup/request phase
   counts, and byte/entry/file-or-directory-mtime-identical cache state from
-  before startup through shutdown.
+  before startup through shutdown. It seeds stale job/report records and
+  exercises both diagnostic request paths before the immutability comparison.
 - The exact M4 workflow makes the admitted cache and model trees read-only and
   keeps the optional log path outside `.oh/.cache`.
 
@@ -75,4 +79,5 @@ an invalid/missing cache.
 - `cargo check --locked --features embeddings,metal,swebench-semantic-bundle --lib --bin repo-native-alignment`
 - cache-only external repository rejection before cache creation
 - semantic workflow resident-gate contract assertion
+- non-recovering stale job/report read regressions
 - exact-head artifact qualification remains required before release

@@ -1801,13 +1801,11 @@ async fn async_main() -> anyhow::Result<()> {
                 elapsed_ms = graph_load_started.elapsed().as_secs_f64() * 1000.0
             );
             handler.install_cached_graph(state);
-            let embedding_open_started = std::time::Instant::now();
             let opened = load_existing_embedding_index(&repo_root, cli.cache_only, |msg| {
                 tracing::warn!("{}; MCP semantic search will be unavailable", msg);
             })
             .await?;
-            if let Some(embed_idx) =
-                require_cache_only_semantic_generation(cli.cache_only, opened)?
+            if let Some(embed_idx) = require_cache_only_semantic_generation(cli.cache_only, opened)?
             {
                 if cli.cache_only {
                     tokio::task::spawn_blocking(
@@ -1820,11 +1818,6 @@ async fn async_main() -> anyhow::Result<()> {
                 }
                 handler.embed_index.store(Arc::new(Some(embed_idx)));
             }
-            tracing::info!(
-                target: "rna_query_timing",
-                phase = "embedding_open",
-                elapsed_ms = embedding_open_started.elapsed().as_secs_f64() * 1000.0
-            );
         }
         Ok(None) if cli.cache_only => {
             anyhow::bail!("cache-only runtime requires an existing persisted graph")
@@ -1904,8 +1897,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let error =
-            require_cache_only_semantic_generation::<()>(true, None).unwrap_err();
+        let error = require_cache_only_semantic_generation::<()>(true, None).unwrap_err();
         assert!(
             error
                 .to_string()

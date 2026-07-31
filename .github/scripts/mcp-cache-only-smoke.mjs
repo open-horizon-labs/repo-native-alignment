@@ -192,6 +192,17 @@ async function timedSearch(client) {
   return elapsedMs;
 }
 
+async function callTextTool(client, name, toolArgs) {
+  const result = await client.callTool({ name, arguments: toolArgs });
+  if (result.isError) {
+    throw new Error(`${name} returned MCP error: ${JSON.stringify(result.content)}`);
+  }
+  return (result.content ?? [])
+    .filter((item) => item.type === "text")
+    .map((item) => item.text ?? "")
+    .join("\n");
+}
+
 const before = baselinePath
   ? JSON.parse(fs.readFileSync(baselinePath, "utf8"))
   : snapshotState();
@@ -207,6 +218,28 @@ for (let round = 0; round < rounds; round += 1) {
   timings.push(
     ...(await Promise.all(clients.map(({ client }) => timedSearch(client)))),
   );
+}
+
+// Exercise the two diagnostic request paths that historically recovered stale
+// control-plane records on read. They must remain useful without changing the
+// admitted cache, including its directory mtimes.
+const verboseText = await callTextTool(clients[0].client, "search", {
+  query,
+  search_mode: "strict",
+  rerank: true,
+  compact: true,
+  verbose: true,
+  limit: 5,
+});
+if (!verboseText.includes("Enrichment jobs:")) {
+  throw new Error("verbose cache-only search omitted persisted job diagnostics");
+}
+const rootsText = await callTextTool(clients[1].client, "list_roots", {});
+if (
+  !rootsText.includes("## Workspace Roots") ||
+  !rootsText.includes("## Recent Operations")
+) {
+  throw new Error("cache-only list_roots omitted persisted operation diagnostics");
 }
 
 await Promise.all(clients.map(({ client }) => client.close()));
@@ -238,15 +271,15 @@ if (serverLogPath) {
     query_encoder_initialization: 1,
     reranker_initialization: 1,
     strict_reranker_full_validation: 1,
-    query_encoder_wait: timings.length + 2,
-    query_encoding: timings.length + 1,
-    strict_semantic_resident_reuse: timings.length + 1,
-    strict_reranker_resident_reuse: timings.length + 1,
-    reranker_wait: timings.length + 1,
-    candidate_retrieval: timings.length + 1,
-    reranker_inference: timings.length + 1,
-    root_discovery: timings.length + 1,
-    enrichment_ledger_access: 0,
+    query_encoder_wait: timings.length + 3,
+    query_encoding: timings.length + 2,
+    strict_semantic_resident_reuse: timings.length + 2,
+    strict_reranker_resident_reuse: timings.length + 2,
+    reranker_wait: timings.length + 2,
+    candidate_retrieval: timings.length + 2,
+    reranker_inference: timings.length + 2,
+    root_discovery: timings.length + 2,
+    enrichment_ledger_access: 1,
   };
   phaseCounts = Object.fromEntries(
     Object.entries(phases).map(([phase, expected]) => {
@@ -268,6 +301,7 @@ console.log(
       query,
       warmupMs,
       requests: timings.length,
+      diagnosticRequests: 2,
       p95Ms,
       maxMs,
       cacheEntries: before.roots.find(({ label }) => label === "cache").entries

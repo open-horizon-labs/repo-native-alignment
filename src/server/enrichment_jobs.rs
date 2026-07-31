@@ -662,6 +662,35 @@ impl EnrichmentJobLedger {
         self.recent_jobs(repo_root, usize::MAX)
     }
 
+    /// Read persisted jobs without acquiring a filesystem lock or recovering
+    /// stale records. Cache-only request handling uses this projection so
+    /// diagnostics remain available without mutating the admitted cache.
+    pub fn recent_jobs_read_only(
+        &self,
+        repo_root: &Path,
+        limit: usize,
+    ) -> Vec<EnrichmentJobRecord> {
+        let mut store = match read_store(repo_root) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!("Failed to read enrichment job ledger: {}", e);
+                return Vec::new();
+            }
+        };
+        store
+            .jobs
+            .retain(|job| job.schema_version == SCHEMA_VERSION);
+        store
+            .jobs
+            .sort_by_key(|job| std::cmp::Reverse((job.updated_at, job.revision)));
+        store.jobs.truncate(limit);
+        store.jobs
+    }
+
+    pub fn all_jobs_read_only(&self, repo_root: &Path) -> Vec<EnrichmentJobRecord> {
+        self.recent_jobs_read_only(repo_root, usize::MAX)
+    }
+
     pub fn events_for_job(&self, repo_root: &Path, job_id: &str) -> Vec<EnrichmentJobEvent> {
         match read_store(repo_root) {
             Ok(store) => store
@@ -1301,6 +1330,45 @@ mod tests {
 
         assert!(matches!(second, JobStart::Started(_)));
         assert_eq!(ledger.recent_jobs(tmp.path(), 10).len(), 2);
+    }
+
+    #[test]
+    fn read_only_jobs_do_not_recover_or_rewrite_stale_records() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = EnrichmentJobLedger::default();
+        let job = match ledger
+            .begin_job(
+                tmp.path(),
+                EnrichmentCapability::Embeddings,
+                EnrichmentScope::Repo,
+                EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            JobStart::Started(job) => job,
+            JobStart::Joined { .. } => panic!("fresh read-only fixture unexpectedly joined"),
+        };
+        let mut store = read_store(tmp.path()).unwrap();
+        let retained = store
+            .jobs
+            .iter_mut()
+            .find(|candidate| candidate.job_id == job.job_id)
+            .unwrap();
+        retained.state = EnrichmentJobState::Running;
+        retained.owner_id = None;
+        retained.lease_expires_at = Some(0);
+        retained.updated_at = 0;
+        write_store(tmp.path(), &store).unwrap();
+        let path = ledger_path(tmp.path());
+        let before = std::fs::read(&path).unwrap();
+
+        let jobs = ledger.recent_jobs_read_only(tmp.path(), 10);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, EnrichmentJobState::Running);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("lock").exists());
     }
 
     #[test]

@@ -1138,7 +1138,10 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         workflow = (
             ROOT / ".github/workflows/swebench-semantic-bundle.yml"
         ).read_text()
+        smoke = (ROOT / ".github/scripts/mcp-cache-only-smoke.mjs").read_text()
         source = MODULE_PATH.read_text()
+        main_source = (ROOT / "src/main.rs").read_text()
+        embed_source = (ROOT / "src/embed/real.rs").read_text()
         self.assertEqual(workflow.count("bind-hf-default-cache"), 2)
         self.assertIn(
             "            unset HF_HOME\n"
@@ -1187,6 +1190,16 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         )
         self.assertIn("resident-mcp-three-client.json", workflow)
         self.assertIn("--verify-snapshot", workflow)
+        self.assertIn('jobs["jobs"][0]["lease_expires_at"] = 0', workflow)
+        self.assertIn('reports["reports"][0]["state"] = "running"', workflow)
+        self.assertIn('callTextTool(clients[0].client, "search"', smoke)
+        self.assertIn('callTextTool(clients[1].client, "list_roots", {})', smoke)
+        self.assertNotIn('phase = "embedding_open"', main_source)
+        lance_open = embed_source.index("let db = lancedb::connect")
+        embedding_open = embed_source.index('phase = "embedding_open"', lance_open)
+        index_install = embed_source.index("let index = Self", embedding_open)
+        self.assertLess(lance_open, embedding_open)
+        self.assertLess(embedding_open, index_install)
         self.assertIn(
             '/usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type d -exec /bin/chmod 0555 {} +',
             workflow,

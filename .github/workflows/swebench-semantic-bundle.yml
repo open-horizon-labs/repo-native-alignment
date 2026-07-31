@@ -441,6 +441,33 @@ jobs:
           assert "original order" not in stderr
           PY
 
+          # Seed non-terminal control-plane records before the immutable
+          # baseline. Cache-only verbose search and list_roots must render them
+          # without recovery-on-read writes, lock-file churn, or directory-mtime
+          # changes.
+          "$LSP_ROOT/runtimes/python/bin/python3.12" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          cache = Path(os.environ["FIXTURE_ROOT"]) / ".oh" / ".cache"
+          jobs_path = cache / "enrichment_jobs.json"
+          reports_path = cache / "operation_reports.json"
+          jobs = json.loads(jobs_path.read_bytes())
+          reports = json.loads(reports_path.read_bytes())
+          assert jobs["jobs"], "full scan did not publish an enrichment job fixture"
+          assert reports["reports"], "full scan did not publish an operation report fixture"
+          jobs["jobs"][0]["state"] = "running"
+          jobs["jobs"][0]["owner_id"] = None
+          jobs["jobs"][0]["lease_expires_at"] = 0
+          jobs["jobs"][0]["updated_at"] = 0
+          reports["reports"][0]["state"] = "running"
+          reports["reports"][0]["completed_at"] = None
+          reports["reports"][0]["duration_ms"] = None
+          jobs_path.write_text(json.dumps(jobs, sort_keys=True, separators=(",", ":")))
+          reports_path.write_text(json.dumps(reports, sort_keys=True, separators=(",", ":")))
+          PY
+
           # Cache-only admission is the immutable boundary. Make the prepared
           # repository cache read-only, snapshot bytes/entries/mtimes before
           # startup, then exercise the exact artifact through three real SDK

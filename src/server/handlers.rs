@@ -51,7 +51,11 @@ impl RnaHandler {
             return Vec::new();
         }
         let started = std::time::Instant::now();
-        let jobs = self.enrichment_jobs.all_jobs(repo_root);
+        let jobs = if self.cache_only {
+            self.enrichment_jobs.all_jobs_read_only(repo_root)
+        } else {
+            self.enrichment_jobs.all_jobs(repo_root)
+        };
         tracing::info!(
             target: "rna_query_timing",
             phase = "enrichment_ledger_access",
@@ -339,13 +343,23 @@ impl RnaHandler {
         let stats_guard = self.scan_stats.read().ok();
         let scan_stats_ref = stats_guard.as_deref();
 
-        let markdown = crate::service::list_roots_from_slugs(
-            &self.repo_root,
-            &active_slugs,
-            graph_state_ref,
-            Some(&self.lsp_status),
-            scan_stats_ref,
-        );
+        let markdown = if self.cache_only {
+            crate::service::list_roots_from_slugs_read_only(
+                &self.repo_root,
+                &active_slugs,
+                graph_state_ref,
+                Some(&self.lsp_status),
+                scan_stats_ref,
+            )
+        } else {
+            crate::service::list_roots_from_slugs(
+                &self.repo_root,
+                &active_slugs,
+                graph_state_ref,
+                Some(&self.lsp_status),
+                scan_stats_ref,
+            )
+        };
         Ok(text_result(markdown))
     }
 
@@ -1192,8 +1206,7 @@ mod tests {
             "repo": external.path().to_string_lossy()
         }))
         .unwrap();
-        let rendered =
-            call_tool_text(&handler.handle_outcome_progress(outcome).await.unwrap());
+        let rendered = call_tool_text(&handler.handle_outcome_progress(outcome).await.unwrap());
         assert!(rendered.contains("serves only its admitted repository cache"));
         let repo_map: RepoMap = serde_json::from_value(serde_json::json!({
             "repo": external.path().to_string_lossy()
