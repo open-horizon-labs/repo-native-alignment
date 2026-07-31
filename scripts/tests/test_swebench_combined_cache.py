@@ -268,6 +268,11 @@ class SwebenchCombinedCacheTests(unittest.TestCase):
             with self.assertRaisesRegex(COMBINED.ToolchainError, "M4-or-newer"):
                 COMBINED._project_runtime_manifest(runtime_path)
 
+            runtime["host"]["chip"] = "Apple M²"
+            STRUCTURAL.write_canonical_json(runtime_path, runtime)
+            with self.assertRaisesRegex(COMBINED.ToolchainError, "M4-or-newer"):
+                COMBINED._project_runtime_manifest(runtime_path)
+
     def test_semantic_verifier_rejects_drift_but_projects_only_active_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

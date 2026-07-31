@@ -35,9 +35,10 @@ def _apple_silicon_generation(chip: object) -> int | None:
     if len(fields) < 2 or fields[0] != "Apple":
         return None
     generation = fields[1]
-    if not generation.startswith("M") or not generation[1:].isdigit():
+    digits = generation[1:]
+    if not generation.startswith("M") or not digits.isascii() or not digits.isdigit():
         return None
-    return int(generation[1:])
+    return int(digits)
 
 
 COMBINED_CACHE_SCHEMA_VERSION = 1
