@@ -614,6 +614,16 @@ pub struct OperationReportStore {
 
 impl OperationReportStore {
     pub fn read(repo_root: &Path) -> Result<Self> {
+        Self::read_with_recovery(repo_root, true)
+    }
+
+    /// Read reports exactly as persisted, without rewriting non-terminal
+    /// records. Cache-only diagnostics use this path to preserve immutability.
+    pub fn read_only(repo_root: &Path) -> Result<Self> {
+        Self::read_with_recovery(repo_root, false)
+    }
+
+    fn read_with_recovery(repo_root: &Path, recover_stale: bool) -> Result<Self> {
         let path = reports_path(repo_root);
         if !path.exists() {
             return Ok(Self {
@@ -628,7 +638,7 @@ impl OperationReportStore {
         if store.schema_version == 0 {
             store.schema_version = SCHEMA_VERSION;
         }
-        if store.mark_non_terminal_stale() {
+        if recover_stale && store.mark_non_terminal_stale() {
             let raw = serde_json::to_string_pretty(&store)?;
             std::fs::write(&path, raw).with_context(|| {
                 format!("write recovered operation report store {}", path.display())
@@ -639,6 +649,19 @@ impl OperationReportStore {
 
     pub fn recent(repo_root: &Path, limit: usize) -> Vec<OperationReport> {
         match Self::read(repo_root) {
+            Ok(mut store) => {
+                store.reports.sort_by_key(|report| report.started_at);
+                store.reports.into_iter().rev().take(limit).collect()
+            }
+            Err(err) => {
+                tracing::warn!("failed to read operation report history: {err:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn recent_read_only(repo_root: &Path, limit: usize) -> Vec<OperationReport> {
+        match Self::read_only(repo_root) {
             Ok(mut store) => {
                 store.reports.sort_by_key(|report| report.started_at);
                 store.reports.into_iter().rev().take(limit).collect()
@@ -764,7 +787,14 @@ pub fn reports_path(repo_root: &Path) -> PathBuf {
 }
 
 pub fn render_recent_reports_markdown(repo_root: &Path, limit: usize) -> String {
-    let reports = OperationReportStore::recent(repo_root, limit);
+    render_reports_markdown(OperationReportStore::recent(repo_root, limit))
+}
+
+pub fn render_recent_reports_markdown_read_only(repo_root: &Path, limit: usize) -> String {
+    render_reports_markdown(OperationReportStore::recent_read_only(repo_root, limit))
+}
+
+fn render_reports_markdown(reports: Vec<OperationReport>) -> String {
     if reports.is_empty() {
         return String::new();
     }
@@ -1389,6 +1419,25 @@ mod tests {
         );
         let persisted = OperationReportStore::read(repo).unwrap();
         assert_eq!(persisted.reports[0].state, OperationState::Stale);
+    }
+
+    #[test]
+    fn read_only_store_does_not_recover_or_rewrite_non_terminal_reports() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let running = OperationReport::new(OperationKind::Enrich, OperationTrigger::Test, repo);
+        let store = OperationReportStore {
+            schema_version: SCHEMA_VERSION,
+            reports: vec![running],
+        };
+        store.write(repo).unwrap();
+        let path = reports_path(repo);
+        let before = std::fs::read(&path).unwrap();
+
+        let read = OperationReportStore::read_only(repo).unwrap();
+
+        assert!(!read.reports[0].state.is_terminal());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

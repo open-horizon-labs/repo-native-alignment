@@ -7688,7 +7688,9 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         params.rerank && matches.len() > 1
     };
     if should_rerank && use_relevance_sort && !query_str.is_empty() {
-        use crate::rerank::{RerankCandidate, rerank_results, rerank_results_strict};
+        use crate::rerank::{
+            RerankCandidate, rerank_results, rerank_results_strict, rerank_results_strict_resident,
+        };
 
         let candidates: Vec<RerankCandidate> = matches
             .iter()
@@ -7717,8 +7719,14 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
             sealed_semantic_bundle(),
             semantic_asset_seeding(),
         );
+        let resident_reranker = strict_semantic
+            && ctx
+                .embed_index
+                .is_some_and(|index| index.resident_query_runtime());
         let rerank_result = tokio::task::spawn_blocking(move || {
-            if verified_reranker {
+            if resident_reranker {
+                rerank_results_strict_resident(&query_owned, &candidates)
+            } else if verified_reranker {
                 rerank_results_strict(&query_owned, &candidates)
             } else {
                 rerank_results(&query_owned, &candidates)

@@ -41,6 +41,31 @@ use super::store::{load_graph_from_lance, persist_graph_to_lance};
 use super::tools::{OutcomeProgress, RepoMap, Search};
 
 impl RnaHandler {
+    fn search_enrichment_jobs(
+        &self,
+        repo_root: &std::path::Path,
+        verbose: bool,
+        repository: &'static str,
+    ) -> Vec<crate::server::EnrichmentJobRecord> {
+        if !verbose {
+            return Vec::new();
+        }
+        let started = std::time::Instant::now();
+        let jobs = if self.cache_only {
+            self.enrichment_jobs.all_jobs_read_only(repo_root)
+        } else {
+            self.enrichment_jobs.all_jobs(repo_root)
+        };
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "enrichment_ledger_access",
+            repository,
+            job_count = jobs.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        jobs
+    }
+
     /// Persist a complete graph snapshot while holding this handler's Lance write lock.
     pub async fn persist_graph_snapshot(&self, graph: &GraphState) -> anyhow::Result<()> {
         let _lance_guard = self.lance_write_lock.lock().await;
@@ -165,6 +190,11 @@ impl RnaHandler {
         // When `repo` is provided, load an external graph from that path.
         // Semantic search is skipped (no embed_index for external repos).
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -178,23 +208,29 @@ impl RnaHandler {
                 embed_status: None,
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
-                enrichment_jobs: if params.verbose {
-                    self.enrichment_jobs.all_jobs(&repo_path)
-                } else {
-                    Vec::new()
-                },
+                enrichment_jobs: self.search_enrichment_jobs(
+                    &repo_path,
+                    params.verbose,
+                    "external",
+                ),
                 business_context: &self.business_context,
             };
             let markdown = crate::service::search(&params, &ctx).await;
             return Ok(text_result(markdown));
         }
 
+        let root_discovery_started = std::time::Instant::now();
         let root_filter = self.effective_root_filter(Self::non_blank_arg(args.root.as_deref()));
         let non_code_slugs = if root_filter.is_some() {
             self.non_code_root_slugs()
         } else {
             std::collections::HashSet::new()
         };
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "root_discovery",
+            elapsed_ms = root_discovery_started.elapsed().as_secs_f64() * 1000.0
+        );
         let graph_state = match self.get_graph().await {
             Ok(g) => g,
             Err(e) => return Ok(text_result(format!("Graph error: {}", e))),
@@ -209,11 +245,11 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
-            enrichment_jobs: if params.verbose {
-                self.enrichment_jobs.all_jobs(&self.repo_root)
-            } else {
-                Vec::new()
-            },
+            enrichment_jobs: self.search_enrichment_jobs(
+                &self.repo_root,
+                params.verbose,
+                "primary",
+            ),
             business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
@@ -231,6 +267,11 @@ impl RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -302,13 +343,23 @@ impl RnaHandler {
         let stats_guard = self.scan_stats.read().ok();
         let scan_stats_ref = stats_guard.as_deref();
 
-        let markdown = crate::service::list_roots_from_slugs(
-            &self.repo_root,
-            &active_slugs,
-            graph_state_ref,
-            Some(&self.lsp_status),
-            scan_stats_ref,
-        );
+        let markdown = if self.cache_only {
+            crate::service::list_roots_from_slugs_read_only(
+                &self.repo_root,
+                &active_slugs,
+                graph_state_ref,
+                Some(&self.lsp_status),
+                scan_stats_ref,
+            )
+        } else {
+            crate::service::list_roots_from_slugs(
+                &self.repo_root,
+                &active_slugs,
+                graph_state_ref,
+                Some(&self.lsp_status),
+                scan_stats_ref,
+            )
+        };
         Ok(text_result(markdown))
     }
 
@@ -318,6 +369,11 @@ impl RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
+            if self.cache_only {
+                return Ok(text_result(
+                    "cache-only runtime serves only its admitted repository cache".into(),
+                ));
+            }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
@@ -1114,6 +1170,54 @@ mod tests {
         };
         assert!(sentinel.exists());
         assert_eq!(reopened_graph.nodes.len(), first_graph.nodes.len());
+    }
+
+    #[tokio::test]
+    async fn cache_only_external_tools_reject_before_cache_creation() {
+        let server = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(external.path().join("src")).unwrap();
+        std::fs::write(
+            external.path().join("src/lib.rs"),
+            "pub fn must_not_be_scanned() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: server.path().to_path_buf(),
+            cache_only: true,
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        let args: Search = serde_json::from_value(serde_json::json!({
+            "query": "must_not_be_scanned",
+            "repo": external.path().to_string_lossy(),
+            "search_mode": "keyword",
+            "compact": true
+        }))
+        .unwrap();
+
+        let rendered = call_tool_text(&handler.handle_search(args).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
+        let outcome: OutcomeProgress = serde_json::from_value(serde_json::json!({
+            "outcome_id": "fixture",
+            "repo": external.path().to_string_lossy()
+        }))
+        .unwrap();
+        let rendered = call_tool_text(&handler.handle_outcome_progress(outcome).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
+        let repo_map: RepoMap = serde_json::from_value(serde_json::json!({
+            "repo": external.path().to_string_lossy()
+        }))
+        .unwrap();
+        let rendered = call_tool_text(&handler.handle_repo_map(repo_map).await.unwrap());
+        assert!(rendered.contains("serves only its admitted repository cache"));
+        assert!(
+            !external.path().join(".oh").exists(),
+            "every cache-only external rejection must happen before cache creation"
+        );
     }
 
     #[tokio::test]

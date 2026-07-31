@@ -46,6 +46,19 @@ pub mod rerank {
     ) -> Result<Vec<RerankedResult>> {
         rerank_results(query, candidates)
     }
+
+    pub fn prepare_strict_reranker_resident() -> Result<()> {
+        Err(anyhow!(
+            "resident reranker support is not compiled in; rebuild with --features embeddings"
+        ))
+    }
+
+    pub fn rerank_results_strict_resident(
+        query: &str,
+        candidates: &[RerankCandidate],
+    ) -> Result<Vec<RerankedResult>> {
+        rerank_results_strict(query, candidates)
+    }
 }
 pub mod roots;
 pub mod scanner;

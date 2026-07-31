@@ -510,6 +510,13 @@ impl RnaHandler {
     /// Tool calls never block on a write lock — they always see the last
     /// complete graph snapshot (#574).
     pub(crate) async fn get_graph(&self) -> anyhow::Result<Arc<GraphState>> {
+        if self.cache_only {
+            let current = self.graph.load_full();
+            let Some(ref graph) = *current else {
+                anyhow::bail!("cache-only runtime has no admitted resident graph");
+            };
+            return Ok(Arc::clone(graph));
+        }
         // Fast path: if a graph exists, scan for changes. The scanner is cheap
         // relative to MCP timeout budgets, and skipping it for a cooldown window
         // makes rapid add/change/delete edits invisible to agents.

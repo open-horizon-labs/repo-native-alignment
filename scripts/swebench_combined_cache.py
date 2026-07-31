@@ -27,6 +27,20 @@ from scripts import swebench_lsp_toolchain as STRUCTURAL
 
 ToolchainError = STRUCTURAL.ToolchainError
 
+
+def _apple_silicon_generation(chip: object) -> int | None:
+    if not isinstance(chip, str):
+        return None
+    fields = chip.split()
+    if len(fields) < 2 or fields[0] != "Apple":
+        return None
+    generation = fields[1]
+    digits = generation[1:]
+    if not generation.startswith("M") or not digits.isascii() or not digits.isdigit():
+        return None
+    return int(digits)
+
+
 COMBINED_CACHE_SCHEMA_VERSION = 1
 COMBINED_CACHE_ROOT = "combined"
 COMBINED_CACHE_CORE = ".rna-combined-cache-core.json"
@@ -975,13 +989,16 @@ def _project_runtime_manifest(path: Path) -> dict[str, Any]:
         != "embedded-source-runtime"
     ):
         raise ToolchainError("qualified Metal build settings are invalid")
+    host_generation = _apple_silicon_generation(projection["host"]["chip"])
     if (
         projection["host"]["architecture"] != "arm64"
-        or not isinstance(projection["host"]["chip"], str)
-        or "M4" not in projection["host"]["chip"]
+        or host_generation is None
+        or host_generation < 4
         or projection["host"]["metal_device_observed"] is not True
     ):
-        raise ToolchainError("qualified host is not an observed Apple M4 Metal device")
+        raise ToolchainError(
+            "qualified host is not an observed Apple M4-or-newer Metal device"
+        )
     if projection["components"]["executable_path"] != "repo-native-alignment":
         raise ToolchainError("qualified executable path is invalid")
     _require_sha256(

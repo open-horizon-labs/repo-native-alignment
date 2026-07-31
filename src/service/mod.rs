@@ -20,7 +20,7 @@ pub mod search;
 pub use graph::{GraphParams, StatsResult, graph_query, stats};
 pub use progress::{OutcomeProgressContext, OutcomeProgressParams, outcome_progress};
 pub use repomap::{RepoMapContext, RepoMapParams, repo_map};
-pub use roots::{list_roots, list_roots_from_slugs};
+pub use roots::{list_roots, list_roots_from_slugs, list_roots_from_slugs_read_only};
 pub use search::search;
 
 /// Interface-agnostic search parameters.
