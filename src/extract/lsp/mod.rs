@@ -156,6 +156,44 @@ impl BuiltinLspDescriptor {
     }
 }
 
+pub(crate) fn partition_influence_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_start_matches("**/");
+    let candidate = if pattern.contains('/') {
+        path
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    };
+    wildcard_match(pattern.as_bytes(), candidate.as_bytes())
+        || (!pattern.contains('/') && wildcard_match(pattern.as_bytes(), path.as_bytes()))
+}
+
+fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+    let (mut pattern_index, mut value_index, mut star, mut checkpoint) =
+        (0usize, 0usize, None, 0usize);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == value[value_index] || pattern[pattern_index] == b'?')
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            checkpoint = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            checkpoint += 1;
+            value_index = checkpoint;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
 fn cyright_init_settings() -> serde_json::Value {
     serde_json::json!({
         "python": { "analysis": { "autoSearchPaths": true } }

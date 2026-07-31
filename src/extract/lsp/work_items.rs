@@ -953,6 +953,77 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     Ok(format!("content:{}", hasher.finalize().to_hex()))
 }
 
+fn ignored_lsp_influence_identity(workdir: &Path) -> Result<Option<String>> {
+    let mut patterns = super::builtin_lsp_descriptors()
+        .iter()
+        .flat_map(|descriptor| descriptor.partition_influence_patterns())
+        .collect::<Vec<_>>();
+    patterns.sort_unstable();
+    patterns.dedup();
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut pathspecs = Vec::new();
+    for pattern in &patterns {
+        let normalized = pattern.replace('\\', "/");
+        let pathspec = if normalized.contains('/') {
+            format!(":(glob){normalized}")
+        } else {
+            format!(":(glob)**/{normalized}")
+        };
+        pathspecs.push(pathspec);
+    }
+    let output = Command::new("git")
+        .arg("-c")
+        .arg("core.quotePath=false")
+        .arg("ls-files")
+        .arg("-z")
+        .arg("--others")
+        .arg("--ignored")
+        .arg("--exclude-standard")
+        .arg("--")
+        .args(&pathspecs)
+        .current_dir(workdir)
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => {
+            return Ok(Some(format!(
+                "full-fallback:{}",
+                non_git_source_snapshot(workdir)?
+            )));
+        }
+    };
+    let mut paths = String::from_utf8_lossy(&output)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .filter(|path| {
+            path != ".oh/.cache"
+                && !path.starts_with(".oh/.cache/")
+                && patterns
+                    .iter()
+                    .any(|pattern| super::partition_influence_pattern_matches(pattern, path))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rna-lsp-ignored-influences-v1");
+    for relative in paths {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        update_path_identity(&mut hasher, &workdir.join(&relative))?;
+        hasher.update(&[0]);
+    }
+    Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
 fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
     let repository = match git2::Repository::discover(repo_root) {
         Ok(repository) => repository,
@@ -966,6 +1037,7 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         Err(_) => return non_git_source_snapshot(repo_root),
     };
     let tree = head.tree()?;
+    let ignored_influences = ignored_lsp_influence_identity(workdir)?;
     let mut options = git2::StatusOptions::new();
     options
         .include_untracked(true)
@@ -987,7 +1059,10 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         .collect::<Vec<_>>();
     changes.sort();
     if changes.is_empty() {
-        return Ok(format!("git-tree:{}:clean", tree.id()));
+        return Ok(match ignored_influences {
+            Some(influences) => format!("git-tree:{}:ignored:{influences}", tree.id()),
+            None => format!("git-tree:{}:clean", tree.id()),
+        });
     }
 
     let mut hasher = blake3::Hasher::new();
@@ -1004,6 +1079,12 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         } else {
             hasher.update(b"deleted");
         }
+        hasher.update(&[0]);
+    }
+    if let Some(influences) = ignored_influences {
+        hasher.update(b"ignored-influences");
+        hasher.update(&[0]);
+        hasher.update(influences.as_bytes());
         hasher.update(&[0]);
     }
     Ok(format!("git-dirty:{}", hasher.finalize().to_hex()))
@@ -1993,6 +2074,42 @@ mod tests {
 
         assert_eq!(before, after);
         assert!(before.starts_with("git-tree:"));
+    }
+
+    #[test]
+    fn ignored_descriptor_influence_changes_git_source_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        let repository = git2::Repository::init(repo.path()).unwrap();
+        std::fs::write(
+            repo.path().join("fixture.c"),
+            "int fixture(void) { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "build/\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("fixture.c")).unwrap();
+        index.add_path(Path::new(".gitignore")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("RNA test", "rna@example.com").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        std::fs::create_dir_all(repo.path().join("build")).unwrap();
+        let compile_commands = repo.path().join("build/compile_commands.json");
+        std::fs::write(&compile_commands, "[{\"command\":\"cc -O0 fixture.c\"}]\n").unwrap();
+        let before = source_snapshot_identity(repo.path()).unwrap();
+
+        std::fs::write(&compile_commands, "[{\"command\":\"cc -O2 fixture.c\"}]\n").unwrap();
+        let after = source_snapshot_identity(repo.path()).unwrap();
+        assert_ne!(before, after);
+        assert!(after.contains(":ignored:"));
+
+        std::fs::write(repo.path().join("build/unrelated.bin"), b"ignored noise").unwrap();
+        assert_eq!(after, source_snapshot_identity(repo.path()).unwrap());
     }
 
     #[tokio::test]

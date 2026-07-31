@@ -35,6 +35,7 @@ Schema 5 is a rebuild boundary. Older records are retained only long enough to p
 - Identical source with changed end line, signature, body, and metadata carries completed work.
 - Source/config or cross-file content changes rerun with `rerun_source_snapshot`.
 - Different commits with the exact same Git tree retain the same source identity; commit metadata alone never forces LSP replay.
+- Ignored files matching descriptor-owned influence patterns (including generated `compile_commands.json`) invalidate recovery when their content changes; unrelated ignored output does not.
 - Request-anchor, operation, toolchain, and schema changes rerun with their specific dispositions.
 - Tampered result records and duplicate retained identities, including the same identity retained by two interrupted jobs, fail closed.
 - An unborn Git repository falls back to a deterministic content snapshot instead of making Git a hard requirement.
@@ -51,5 +52,7 @@ Schema 5 is a rebuild boundary. Older records are retained only long enough to p
 - Structural-cache replay tests: 4 passed.
 - Full library suite: 2,386 passed, 4 ignored.
 - Default all-target suite: library, binary, CLI-contract, cache-chain, integration, and doctest groups all passed; installed-server-only groups remained explicitly ignored.
+
+The ship dissent pass found that clean-tree identity initially omitted ignored descriptor inputs. That could have carried stale clangd work after a generated, ignored `compile_commands.json` changed. The source snapshot now hashes exactly the ignored paths admitted by the shared descriptor influence matcher; if the Git CLI cannot enumerate them, recovery conservatively falls back to the deterministic full content snapshot.
 
 CI, real-client/manual delivery verification, and independent final-diff approval remain ship gates.
