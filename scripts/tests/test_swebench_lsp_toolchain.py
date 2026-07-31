@@ -1188,7 +1188,7 @@ class SwebenchLspToolchainTests(unittest.TestCase):
         self.assertIn("resident-mcp-three-client.json", workflow)
         self.assertIn("--verify-snapshot", workflow)
         self.assertIn(
-            'find "$FIXTURE_ROOT/.oh/.cache" -type d -exec chmod 0555 {} +',
+            '/usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type d -exec /bin/chmod 0555 {} +',
             workflow,
         )
         self.assertIn('"CANDLE_METAL_ENABLE_FAST_MATH": "1"', source)

@@ -445,8 +445,8 @@ jobs:
           # repository cache read-only, snapshot bytes/entries/mtimes before
           # startup, then exercise the exact artifact through three real SDK
           # clients. The server log lives outside the cache's writable surface.
-          find "$FIXTURE_ROOT/.oh/.cache" -type f -exec chmod 0444 {} +
-          find "$FIXTURE_ROOT/.oh/.cache" -type d -exec chmod 0555 {} +
+          /usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type f -exec /bin/chmod 0444 {} +
+          /usr/bin/find "$FIXTURE_ROOT/.oh/.cache" -type d -exec /bin/chmod 0555 {} +
           node .github/scripts/mcp-cache-only-smoke.mjs \
             --snapshot "$FIXTURE_ROOT" \
             "$HF_HOME" \
