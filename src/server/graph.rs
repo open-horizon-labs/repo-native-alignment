@@ -461,11 +461,7 @@ mod tests {
             &nodes,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to plan changed-file LSP nodes")
-        );
+        assert!(error.to_string().contains("failed to plan changed-file LSP nodes"));
         assert!(format!("{error:#}").contains("exceeds its bound"));
     }
 }
@@ -2585,8 +2581,11 @@ impl RnaHandler {
             // when there are changed/new/deleted files in the primary root).
             let dirty_slugs: Option<std::collections::HashSet<String>> =
                 Some(std::iter::once(primary_slug.clone()).collect());
-            let lsp_node_filter =
-                plan_inner_incremental_lsp_node_filter(enrichment, &files_to_remove, &graph.nodes)?;
+            let lsp_node_filter = plan_inner_incremental_lsp_node_filter(
+                enrichment,
+                &files_to_remove,
+                &graph.nodes,
+            )?;
 
             let pipeline_result =
                 crate::extract::consumers::emit_enrichment_pipeline_with_validations(
@@ -3016,8 +3015,11 @@ impl RnaHandler {
             } else if let Some(job_id) = incremental_lsp_job_id.as_deref() {
                 let detail =
                     "incremental call-reference output was not durably persisted".to_string();
-                self.enrichment_jobs
-                    .mark_failed(&self.repo_root, job_id, detail.clone());
+                self.enrichment_jobs.mark_failed(
+                    &self.repo_root,
+                    job_id,
+                    detail.clone(),
+                );
                 self.enrichment_jobs.record_lsp_evidence(
                     &self.repo_root,
                     job_id,

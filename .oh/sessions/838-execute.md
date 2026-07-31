@@ -42,3 +42,27 @@ second daemon or private query protocol.
 The implementation must preserve deterministic query bytes and exact persisted
 cache admission. It must not weaken semantic qualification or silently rebuild
 an invalid/missing cache.
+
+## Implemented contract
+
+- `--cache-only` validates an existing business-context marker and persisted
+  graph, installs the graph in the resident handler, and fails closed instead
+  of scanning or repairing missing state.
+- Existing semantic generations open without unpublished scratch state;
+  cache-only semantic serving additionally requires the sealed offline bundle.
+- One resident encoder is shared behind an async mutex and the existing strict
+  reranker remains resident across requests.
+- Query timing emits separate graph load, embedding open, root discovery,
+  enrichment-ledger access, encoder wait/initialization/inference, candidate
+  retrieval, and reranker initialization/inference phases. Ledger timing and
+  reads occur only for explicit verbose diagnostics, including external repos.
+- The public HTTP MCP smoke uses three SDK clients after one warmup and asserts
+  p95 under 2 seconds, no request over 10 seconds, and byte/mtime-identical
+  cache state before and after the request wave.
+
+## Local verification after #839 integration
+
+- `cargo check --locked --lib`
+- `cargo clippy --locked --lib --bin repo-native-alignment -- -D warnings`
+- cache-only resident graph, CLI flag, and durable readiness hydration tests
+- external MCP verbose ledger delivery regression

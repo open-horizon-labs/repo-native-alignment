@@ -41,6 +41,27 @@ use super::store::{load_graph_from_lance, persist_graph_to_lance};
 use super::tools::{OutcomeProgress, RepoMap, Search};
 
 impl RnaHandler {
+    fn search_enrichment_jobs(
+        &self,
+        repo_root: &std::path::Path,
+        verbose: bool,
+        repository: &'static str,
+    ) -> Vec<crate::server::EnrichmentJobRecord> {
+        if !verbose {
+            return Vec::new();
+        }
+        let started = std::time::Instant::now();
+        let jobs = self.enrichment_jobs.all_jobs(repo_root);
+        tracing::info!(
+            target: "rna_query_timing",
+            phase = "enrichment_ledger_access",
+            repository,
+            job_count = jobs.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        jobs
+    }
+
     /// Persist a complete graph snapshot while holding this handler's Lance write lock.
     pub async fn persist_graph_snapshot(&self, graph: &GraphState) -> anyhow::Result<()> {
         let _lance_guard = self.lance_write_lock.lock().await;
@@ -183,11 +204,11 @@ impl RnaHandler {
                 embed_status: None,
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
-                enrichment_jobs: if params.verbose {
-                    self.enrichment_jobs.all_jobs(&repo_path)
-                } else {
-                    Vec::new()
-                },
+                enrichment_jobs: self.search_enrichment_jobs(
+                    &repo_path,
+                    params.verbose,
+                    "external",
+                ),
                 business_context: &self.business_context,
             };
             let markdown = crate::service::search(&params, &ctx).await;
@@ -220,11 +241,11 @@ impl RnaHandler {
             embed_status: Some(&self.embed_status),
             root_filter,
             non_code_slugs,
-            enrichment_jobs: if params.verbose {
-                self.enrichment_jobs.all_jobs(&self.repo_root)
-            } else {
-                Vec::new()
-            },
+            enrichment_jobs: self.search_enrichment_jobs(
+                &self.repo_root,
+                params.verbose,
+                "primary",
+            ),
             business_context: &self.business_context,
         };
         let mut markdown = crate::service::search(&params, &ctx).await;
