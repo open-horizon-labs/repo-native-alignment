@@ -227,7 +227,7 @@ jobs:
           # entry under [[patch.unused]] or any other array-of-tables is left
           # alone.
           awk -v version="$VERSION" '
-            /^\[\[/ { in_block = ($0 == "[[package]]"); in_pkg = 0 }
+            /^\[/ { in_block = ($0 == "[[package]]"); in_pkg = 0 }
             in_block && /^name = "repo-native-alignment"$/ { in_pkg = 1 }
             in_pkg && /^version = / { print "version = \"" version "\""; in_pkg = 0; next }
             { print }
@@ -240,19 +240,27 @@ jobs:
           # create-pull-request with GITHUB_TOKEN cannot trigger workflows, so
           # the bump PR receives no Rust CI before it auto-merges.
           #
-          # -F because a version string contains dots, which are regex
-          # wildcards to plain grep.
+          # -F throughout: a version string contains dots, which are wildcards
+          # to plain grep.
           grep -A1 '^name = "repo-native-alignment"$' Cargo.lock \
             | grep -qxF "version = \"$VERSION\"" \
             || { echo "::error::Cargo.lock version patch did not apply"; exit 1; }
           grep -qxF "version = \"$VERSION\"" Cargo.toml \
             || { echo "::error::Cargo.toml version patch did not apply"; exit 1; }
+
           # marketplace.json carries the riskiest edit of the three: the sed is
           # unanchored and global, rewriting every "version" key in the file.
-          # Assert no other value survived.
-          test "$(grep -c "\"version\": \"$VERSION\"" .claude-plugin/marketplace.json)" \
-             = "$(grep -c '"version":' .claude-plugin/marketplace.json)" \
-            || { echo "::error::marketplace.json version patch incomplete"; exit 1; }
+          # Count OCCURRENCES with -o, not lines: `grep -c` reports matching
+          # lines, so a minified file with two version keys on one line passes a
+          # line-count comparison while still holding a stale value. Require at
+          # least one key so an empty or restructured file fails rather than
+          # passing vacuously.
+          total_keys=$(grep -o '"version":' .claude-plugin/marketplace.json | wc -l | tr -d ' ')
+          patched_keys=$(grep -oF "\"version\": \"$VERSION\"" .claude-plugin/marketplace.json | wc -l | tr -d ' ')
+          if [ "$total_keys" -eq 0 ] || [ "$total_keys" != "$patched_keys" ]; then
+            echo "::error::marketplace.json version patch incomplete ($patched_keys/$total_keys keys at $VERSION)"
+            exit 1
+          fi
 
       - name: Create version bump PR
         id: bump-pr

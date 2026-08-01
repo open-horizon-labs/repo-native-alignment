@@ -70,7 +70,8 @@ just now", so no rescan was needed.
 | Step 10c reviewer (round 7) | 9 | 1 caller/impact gap, 5 field-list/test-helper sweeps, 2 unindexed-`.mjs` reads, 1 tool-contract rejection |
 | Step 10c reviewer (round 8, PR #851 final gate) | 3 | 3 unindexed non-code-file gaps (workflow YAML, `Cargo.lock`, `.gitignore`) |
 | Step 10c reviewer (round 9, PR #851 final gate, commit `8ec31d8c`) | 4 | 3 unindexed non-code-file gaps (workflow YAML, `Cargo.lock`, `.gitignore`), 1 isolation-vs-artifact-review conflict |
-| **Total** | **100** | **35 caller/impact gaps, 56 literal/mention/span/field-list events, 1 verdict leak, 1 tool-contract rejection, 6 unindexed-file gaps, 1 isolation/review conflict** |
+| Step 10c reviewer (round 10, PR #851 final gate, commit `1ac6cfb0`) | 7 | 4 unindexed non-code-file gaps (workflow YAML, `Cargo.lock`, `.gitignore`, `.mjs`), 1 isolation-vs-artifact-review conflict, 1 isolation-suppression failure, 1 stale indexed constant value |
+| **Total** | **107** | **35 caller/impact gaps, 56 literal/mention/span/field-list events, 1 verdict leak, 1 tool-contract rejection, 10 unindexed-file gaps, 2 isolation/review conflicts, 1 isolation-suppression failure, 1 stale indexed value** |
 
 **Escalated to `major` by the round-6 reviewer, and it is the most consequential
 entry in this log:** RNA's ranked search returned this friction log and
@@ -272,3 +273,40 @@ evidence checks against the published release are outside RNA's scope by design
 and are not counted as friction. Reproductions: 7 (`awk` against the real
 `Cargo.lock` and 5 synthetic adversarial lockfiles, plus `cargo metadata
 --locked` on both sides). Scratch worktree removed; no source file modified.
+
+## Segment: Ship Step 10c independent final-diff review of PR #851 (round 10)
+
+Reviewer: independent code reviewer, no implementation context. Commit
+`1ac6cfb0`. Isolation flags `include_artifacts: false` +
+`include_markdown: false` on every RNA code search.
+
+| # | Tool wanted | What happened | Fallback used | Cost |
+|---|-------------|---------------|---------------|------|
+| 1 | The `bump-source` job and its new `awk` + assertion block in `.github/workflows/release.yml` | Workflow YAML is not indexed, so there is no symbol entry point and no way to discover the job's line range for bounded-span retrieval. | `sed -n '180,290p'`, then `ruby -ryaml` to confirm the file parses and the step list/`add-paths` are intact | 2 shell invocations |
+| 2 | The `Cargo.lock` change — one line, or a dependency bump hidden in 8,828 lines? | `Cargo.lock` is not indexed and RNA has no diff projection. | `git diff --numstat` + full hunk read, plus `cargo metadata --locked` on `HEAD` (0) and on an `origin/main` worktree (101) | 4 shell invocations |
+| 3 | `.gitignore` over-match check (`node_modules/` vs tracked paths and test fixtures) | `.gitignore` is not indexed; ignore-rule-vs-tracked-path is not a graph question. | `git ls-files \| grep -c node_modules` plus a repo grep for fixture creation sites | 2 shell invocations |
+| 4 | The six delivery-verification check labels the receipt quotes, inside `.github/scripts/mcp-smoke.mjs` | `.mjs` is not indexed as a code language, so string-label existence cannot be answered by symbol or span retrieval. | `grep -n` for each label | 2 shell invocations |
+| 5 | Bounded retrieval on `.oh/sessions/v0.3.0-release.md`, the largest review target in this PR | Same conflict round 9 logged: the isolation contract mandates the exact flags that make `.oh/` unreachable, and here the `.oh/` document *is* the artifact under review. | `Read` on the file, then `git`/`gh` against the repo and the published release | 1 read + ~12 verification calls |
+| 6 | **New evidence for the standing isolation ask:** `search(query="load_store recovery disposition serde skip marker")` with `include_artifacts: false` **and** `include_markdown: false` still returned a `markdown_section` hit from `.oh/sessions/833-dev.md` ("Continuation scope (this session)"). Round 7 logged the identical suppression failure; it is still live. No verdict content in this hit, but the contract did not hold. | Suppression contract is advisory, not enforced. | Disregarded the hit; reported it. | Isolation risk |
+| 7 | Current value of `WORK_IDENTITY_SCHEMA_VERSION` (to check the receipt's `stored_schema=4 current_schema=5` claim) | RNA returned `const WORK_IDENTITY_SCHEMA_VERSION: u32 = 1;` at `src/extract/lsp/work_items.rs:17`; the file at `1ac6cfb0` has `= 3` at line 24. The indexed constant *value* and line were both stale, and a receipt claim was being checked against them. | `grep -n "SCHEMA_VERSION" src/extract/lsp/work_items.rs` — confirmed `STORE_SCHEMA_VERSION = 5` | 1 grep |
+
+RNA was used successfully twice on Rust source: a `kind=const` query that located
+`STORE_SCHEMA_VERSION`, and the `load_store`/`recovery_disposition` query that
+confirmed the `#[serde(skip)]` marker exists. Both answered the receipt claim they
+were asked about.
+
+**Ask (reinforces rounds 8 and 9, adds one):** rounds 8-9 asked for CI/config
+files as first-class nodes and a selective isolation form. Round 10 adds that
+indexed constant *values* can be stale relative to the working tree with no
+staleness signal in the result. A reviewer verifying a numeric claim in a delivery
+record cannot tell a stale index from a wrong document; here the two differed
+(`1` vs `3`) and only a grep resolved it.
+
+**Segment totals:** RNA MCP calls 4 (4 successful, 0 rejected, 1 returned
+suppressed `.oh/` content, 1 returned a stale constant value). Raw fallbacks 11
+shell invocations plus 1 direct read, across 5 diagnosed gaps; `gh`/`git`/
+`shasum` evidence checks against the published release are outside RNA's scope by
+design and are not counted as friction. Reproductions: 8 (`awk` against the real
+`Cargo.lock` and 5 synthetic adversarial lockfiles, the three assertion failure
+paths against synthetic `marketplace.json` inputs, and `cargo metadata --locked`
+on both sides). Scratch worktree removed; no source file modified.
