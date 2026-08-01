@@ -156,6 +156,53 @@ impl BuiltinLspDescriptor {
     }
 }
 
+/// Match a descriptor influence pattern against a repo-relative path.
+///
+/// A pattern without `/` is matched against the basename, and then against the
+/// whole path as a fallback. The second clause is deliberate: descriptor
+/// patterns like `requirements*.txt` are meant to catch dependency manifests
+/// wherever they live, so `requirements/dev.txt` must invalidate the partition
+/// even though its basename is `dev.txt`. Dropping that fallback narrows cache
+/// invalidation — a fail-open direction — so it stays until a descriptor gains
+/// explicit path semantics.
+pub(crate) fn partition_influence_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_start_matches("**/");
+    let candidate = if pattern.contains('/') {
+        path
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    };
+    wildcard_match(pattern.as_bytes(), candidate.as_bytes())
+        || (!pattern.contains('/') && wildcard_match(pattern.as_bytes(), path.as_bytes()))
+}
+
+fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+    let (mut pattern_index, mut value_index, mut star, mut checkpoint) =
+        (0usize, 0usize, None, 0usize);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == value[value_index] || pattern[pattern_index] == b'?')
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            checkpoint = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            checkpoint += 1;
+            value_index = checkpoint;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
 fn cyright_init_settings() -> serde_json::Value {
     serde_json::json!({
         "python": { "analysis": { "autoSearchPaths": true } }
@@ -582,12 +629,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             "cfg", "conf", "ini", "mplstyle", "rc", "template", "hhp", "def"
         ]
     ),
-    builtin_lsp!(
-        "dockerfile",
-        "docker-langserver",
-        &["--stdio"],
-        &["<none>"]
-    ),
+    builtin_lsp!("dockerfile", "docker-langserver", &["--stdio"], &["<none>"]),
     builtin_lsp!(
         "batch",
         "rna-cohort-language-server",
@@ -1067,6 +1109,19 @@ const READINESS_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::
 fn read_lsp_text(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Resolves the virtual-environment directory a language server would pick up at
+/// `startup_root`, using the same descriptor-declared candidates and filesystem
+/// probe as `ensure_initialized_inner`'s `venvPath`/`venv` injection. Shared with
+/// `lsp_toolchain_contract` so the identity hash reflects the venv selection that
+/// actually reaches the server's `initializationOptions`.
+fn resolved_venv_dir(startup_root: &Path, language: &str) -> Option<&'static str> {
+    let venv_dirs = crate::extract::configs::config_for_language(language)?.venv_candidates?;
+    venv_dirs
+        .iter()
+        .find(|&&name| startup_root.join(name).is_dir())
+        .copied()
 }
 
 fn initialization_settings_with_compile_commands(
@@ -2296,52 +2351,44 @@ impl LspEnricher {
         // Apply per-language initialization settings if provided. Descriptors
         // whose LangConfig declares venv_candidates receive the Python-analysis
         // venvPath/venv settings expected by that server family.
-        let lang_config = crate::extract::configs::config_for_language(&self.language);
         let effective_settings =
-            if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
-                let found_venv = venv_dirs
-                    .iter()
-                    .find(|&&name| startup_root.join(name).is_dir());
-                if let Some(venv_name) = found_venv {
-                    let venv_path_str = startup_root.to_string_lossy().to_string();
-                    let mut merged = self
-                        .init_settings
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let python_obj = merged.as_object_mut().and_then(|root| {
-                        if !root.contains_key("python") {
-                            root.insert("python".into(), serde_json::json!({}));
-                        }
-                        root.get_mut("python")
-                    });
-                    if let Some(python_val) = python_obj {
-                        let analysis_obj = python_val.as_object_mut().and_then(|p| {
-                            if !p.contains_key("analysis") {
-                                p.insert("analysis".into(), serde_json::json!({}));
-                            }
-                            p.get_mut("analysis")
-                        });
-                        if let Some(analysis_val) = analysis_obj
-                            && let Some(obj) = analysis_val.as_object_mut()
-                        {
-                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                            obj.insert(
-                                "venv".into(),
-                                serde_json::Value::String(venv_name.to_string()),
-                            );
-                        }
+            if let Some(venv_name) = resolved_venv_dir(startup_root, &self.language) {
+                let venv_path_str = startup_root.to_string_lossy().to_string();
+                let mut merged = self
+                    .init_settings
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let python_obj = merged.as_object_mut().and_then(|root| {
+                    if !root.contains_key("python") {
+                        root.insert("python".into(), serde_json::json!({}));
                     }
-                    tracing::info!(
-                        "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
-                        self.server_command,
-                        venv_name,
-                        startup_root.display()
-                    );
-                    Some(merged)
-                } else {
-                    self.init_settings.clone()
+                    root.get_mut("python")
+                });
+                if let Some(python_val) = python_obj {
+                    let analysis_obj = python_val.as_object_mut().and_then(|p| {
+                        if !p.contains_key("analysis") {
+                            p.insert("analysis".into(), serde_json::json!({}));
+                        }
+                        p.get_mut("analysis")
+                    });
+                    if let Some(analysis_val) = analysis_obj
+                        && let Some(obj) = analysis_val.as_object_mut()
+                    {
+                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                        obj.insert(
+                            "venv".into(),
+                            serde_json::Value::String(venv_name.to_string()),
+                        );
+                    }
                 }
+                tracing::info!(
+                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    self.server_command,
+                    venv_name,
+                    startup_root.display()
+                );
+                Some(merged)
             } else {
                 self.init_settings.clone()
             };
@@ -3163,42 +3210,34 @@ impl LspEnricher {
 
     /// Compute the 0-based LSP line and column for a node.
     ///
-    /// Uses the AST-recorded byte column of the name identifier stored by the
-    /// extractor (metadata key "name_col"). This is exact and language-agnostic:
-    /// tree-sitter records start_position().column for the name field node, so
-    /// it works correctly even when the name appears multiple times in the
-    /// signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
-    /// prefix length varies across languages (Python `def`, Go `func`, etc.).
-    /// If the extractor did not populate name_col (legacy or non-tree-sitter
-    /// nodes), falls back to signature scanning.
-    fn node_lsp_position(node: &Node) -> (u32, u32) {
-        let line = (node.line_start.saturating_sub(1)) as u32;
-        let col = if let Some(col_str) = node.metadata.get("name_col") {
-            col_str.parse::<u32>().unwrap_or_else(|_| {
-                tracing::debug!(
-                    node = %node.id.name,
-                    raw = %col_str,
-                    "name_col metadata could not be parsed as u32; falling back to signature scan"
-                );
-                node.signature
-                    .find(&node.id.name)
-                    .map(|i| i as u32)
-                    .unwrap_or(0)
-            })
-        } else {
-            let fallback = node
-                .signature
-                .find(&node.id.name)
-                .map(|i| i as u32)
-                .unwrap_or(0);
-            tracing::debug!(
-                node = %node.id.name,
-                col = fallback,
-                "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
-            );
-            fallback
-        };
-        (line, col)
+    /// Scans `node.line_start` in the current on-disk source for
+    /// `node.id.name` at an identifier boundary (so it does not match inside a
+    /// longer identifier), then converts the byte offset to a UTF-16 column as
+    /// LSP requires. `cache` avoids re-reading the same file for every node it
+    /// contains.
+    ///
+    /// Deliberately not the extractor's recorded `name_col`. To be accurate
+    /// about why, since it is a soft deviation from `extract-fully-at-parse-time`:
+    /// `name_col` *is* persisted (`meta_name_col` is a typed Arrow column in
+    /// both schema constructors in `graph/store.rs`, written in
+    /// `server/store/batch.rs` and restored in `server/store/load.rs`), so it
+    /// does survive a LanceDB round trip unchanged. The objection is not
+    /// round-trip instability.
+    ///
+    /// It is that `name_col` records where the identifier sat at the *last
+    /// extraction*, while this position is sent to a language server reading
+    /// the file as it exists *now*. Any edit between those two moments makes the
+    /// stored column point at the wrong place, and the value is optional, so
+    /// nodes whose extractor never populated it have no column at all. Deriving
+    /// from current source keeps the request position and the persisted
+    /// `request_anchor` consistent with the document the server is actually
+    /// given.
+    fn node_lsp_position(
+        repo_root: &Path,
+        node: &Node,
+        cache: &work_items::SourceLineCache,
+    ) -> (u32, u32) {
+        work_items::source_request_position(repo_root, node, cache)
     }
 
     /// Update the type hierarchy strike counter after a single enrich attempt.

@@ -1049,12 +1049,10 @@ pub fn plan_incremental_impact(
     // produced reusable evidence for that file), so seed the runtime plan from
     // the complete signed execution set rather than relying on a later broad
     // operation-bound escalation to discover them.
-    executed.extend(
-        verifier_authorized_executed_paths(
-            &authorization.authorization,
-            &authorization.inherited_by_path,
-        ),
-    );
+    executed.extend(verifier_authorized_executed_paths(
+        &authorization.authorization,
+        &authorization.inherited_by_path,
+    ));
     executed.extend(
         authorization
             .authorization
@@ -1532,9 +1530,9 @@ fn partition_identities(
         let matched_file_count = tree_entries
             .iter()
             .filter(|(path, _)| {
-                patterns
-                    .iter()
-                    .any(|pattern| pattern_matches(pattern, path))
+                patterns.iter().any(|pattern| {
+                    crate::extract::lsp::partition_influence_pattern_matches(pattern, path)
+                })
             })
             .count() as u64;
         let language = descriptor.language().to_string();
@@ -1565,52 +1563,14 @@ fn influence_digest_owned(tree_entries: &[(String, String)], patterns: &[String]
     let mut selected = tree_entries
         .iter()
         .filter(|(path, _)| {
-            patterns
-                .iter()
-                .any(|pattern| pattern_matches(pattern, path))
+            patterns.iter().any(|pattern| {
+                crate::extract::lsp::partition_influence_pattern_matches(pattern, path)
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
     selected.sort();
     hex_sha256(&serde_json::to_vec(&selected).expect("tree influence serialization cannot fail"))
-}
-
-fn pattern_matches(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.trim_start_matches("**/");
-    let candidate = if pattern.contains('/') {
-        path
-    } else {
-        path.rsplit('/').next().unwrap_or(path)
-    };
-    wildcard_match(pattern.as_bytes(), candidate.as_bytes())
-        || (!pattern.contains('/') && wildcard_match(pattern.as_bytes(), path.as_bytes()))
-}
-
-fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
-    let (mut pattern_index, mut value_index, mut star, mut checkpoint) =
-        (0usize, 0usize, None, 0usize);
-    while value_index < value.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == value[value_index] || pattern[pattern_index] == b'?')
-        {
-            pattern_index += 1;
-            value_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            star = Some(pattern_index);
-            pattern_index += 1;
-            checkpoint = value_index;
-        } else if let Some(star_index) = star {
-            pattern_index = star_index + 1;
-            checkpoint += 1;
-            value_index = checkpoint;
-        } else {
-            return false;
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
 }
 
 fn git_tree_entries(
@@ -1998,13 +1958,51 @@ mod tests {
 
     #[test]
     fn wildcard_patterns_cover_descriptor_owned_config_files() {
-        assert!(pattern_matches("requirements*.txt", "requirements-dev.txt"));
-        assert!(pattern_matches(
+        assert!(crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "requirements-dev.txt"
+        ));
+        assert!(crate::extract::lsp::partition_influence_pattern_matches(
             "**/requirements*.txt",
             "env/requirements-test.txt"
         ));
-        assert!(pattern_matches("tsconfig.json", "client/tsconfig.json"));
-        assert!(!pattern_matches("requirements*.txt", "src/main.py"));
+        assert!(crate::extract::lsp::partition_influence_pattern_matches(
+            "tsconfig.json",
+            "client/tsconfig.json"
+        ));
+        assert!(!crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "src/main.py"
+        ));
+    }
+
+    /// A dependency manifest under a directory that the pattern prefix names
+    /// must still invalidate the partition. The basename of
+    /// `requirements/dev.txt` is `dev.txt`, so only the whole-path fallback
+    /// clause catches it — none of the cases above exercise that clause, which
+    /// is how its removal went unnoticed. Losing this match is fail-open:
+    /// dependency changes would stop invalidating the Python partition.
+    #[test]
+    fn wildcard_patterns_cover_manifests_under_a_matching_directory() {
+        assert!(crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "requirements/dev.txt"
+        ));
+        // The fallback is prefix-anchored, not a substring search: the pattern
+        // must match the whole path from its first byte. A manifest nested
+        // below an unrelated directory is therefore still only reachable via
+        // its basename, which is the same boundary the pre-consolidation
+        // matcher had.
+        assert!(!crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "deploy/requirements/base.txt"
+        ));
+        // And an unrelated path is not a match just because the whole path is
+        // consulted.
+        assert!(!crate::extract::lsp::partition_influence_pattern_matches(
+            "requirements*.txt",
+            "docs/notes.txt"
+        ));
     }
 
     fn influence_entries(entries: &[(&str, &str)]) -> Vec<(String, String)> {

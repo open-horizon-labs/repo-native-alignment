@@ -1504,6 +1504,7 @@ pub(crate) fn build_and_persist_report_from_evidence(
         _ => unreachable!("authorization/execution pairing was validated above"),
     };
     let work_items = select_work_items_for_report(
+        repo_root,
         crate::extract::lsp::work_items::load_all_records(repo_root)?,
         &related_ids,
         scan_started_at_ms,
@@ -1560,12 +1561,43 @@ fn filter_work_items_for_related_jobs(
 }
 
 fn select_work_items_for_report(
+    repo_root: &Path,
     records: Vec<LspWorkItemRecord>,
     related_job_ids: &BTreeSet<&str>,
     scan_started_at_ms: u64,
     nodes: &[Node],
     authenticated_producer_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<LspWorkItemRecord>> {
+    // Deliberately does NOT recompute the source snapshot or request anchor
+    // from the filesystem here.
+    //
+    // Freshness is the ledger's job: `LspWorkItemLedger::begin` compares every
+    // candidate's sealed identity against the snapshot and anchor captured at
+    // planning time, and only `CarriedExact` survives into a carried record.
+    // Re-deriving them here instead compared a record against the tree as it
+    // stands minutes later, which was either vacuous or harmful:
+    //
+    //   * vacuous for a single pass — every record in a job, new or carried,
+    //     necessarily holds that job's begin-time snapshot, because that is
+    //     what allowed the carry in the first place;
+    //   * harmful across passes and over time — each `begin()` captures its own
+    //     snapshot, so any write during the scan (a developer saving a file, a
+    //     language server writing into the tree, a later language pass)
+    //     desynchronised earlier passes and hard-failed the entire report.
+    //
+    // That is itself a way for verifier-clean carried evidence to become
+    // spuriously invalid between attempts, which is the defect #833 exists to
+    // remove. What remains below is integrity verification of the recorded
+    // work: current schema and planner contract, a recomputed identity digest,
+    // `input_hash == digest`, graph root/path agreement, and output-id
+    // agreement. Those are all fail-closed and none depend on scan timing.
+    //
+    // The invariants dropped here stay pinned on the ledger side, where they
+    // belong:
+    //   * `changed_request_anchor_replays_with_explainable_disposition`
+    //   * `changed_cross_file_config_snapshot_replays_instead_of_carrying_stale_output`
+    // both assert that a changed anchor or source snapshot reruns the work
+    // instead of carrying it.
     let nodes_by_id = nodes
         .iter()
         .map(|node| (node.stable_id(), node))
@@ -1614,7 +1646,33 @@ fn select_work_items_for_report(
                 .map_err(anyhow::Error::msg)?;
             if record.root != node.id.root
                 || record_path != node_path
-                || record.input_hash != crate::extract::lsp::work_items::node_input_hash(node)
+                || record.work_identity.schema_version
+                    != crate::extract::lsp::work_items::current_work_identity_schema_version()
+                || record.work_identity.planner_contract
+                    != crate::extract::lsp::work_items::current_planner_contract_version()
+                || record.work_identity.operations_digest
+                    != crate::extract::lsp::work_items::requested_operations_digest(
+                        &record.requested_operations,
+                    )
+                || record.work_identity.digest
+                    != crate::extract::lsp::work_items::work_identity_digest(&record.work_identity)
+                || record.input_hash != record.work_identity.digest
+                // Bind the sealed anchor to the node this report is about, using
+                // only the part derivable without touching the filesystem: root,
+                // repo-relative file, and line. Without this the position was
+                // unchecked here, so a record sealed for line 0 was accepted for
+                // a node that had since moved to line 500. The column is
+                // deliberately still unchecked — deriving it needs the file, and
+                // re-reading the file at report time is exactly what was removed.
+                || crate::extract::lsp::work_items::sealed_anchor_position_prefix(
+                    &record.work_identity.request_anchor,
+                )
+                .is_none_or(|sealed| {
+                    sealed
+                        != crate::extract::lsp::work_items::request_anchor_position_prefix(
+                            repo_root, node,
+                        )
+                })
             {
                 anyhow::bail!(
                     "recovered LSP work identity mismatch for {}:{}",
@@ -3659,6 +3717,86 @@ mod tests {
         }
     }
 
+    fn fixture_work_identity(
+        repo_root: &Path,
+        node: &Node,
+        operations: &[String],
+    ) -> crate::extract::lsp::work_items::LspWorkIdentity {
+        let source = repo_root.join(&node.id.file);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        if !source.exists() {
+            std::fs::write(&source, format!("{}\n", node.id.name)).unwrap();
+        }
+        crate::extract::lsp::work_items::build_work_identity(
+            repo_root,
+            node,
+            operations,
+            "fixture-toolchain-v1",
+        )
+        .unwrap()
+    }
+
+    /// A recovered record must be bound to the position it was sealed for.
+    ///
+    /// The report deliberately no longer re-derives an anchor from the
+    /// filesystem, but dropping the check entirely let a record sealed for one
+    /// line be accepted for a node that had since moved elsewhere in the file.
+    /// The root/file/line prefix is derivable from the in-memory node at zero I/O
+    /// cost, so that much must still be verified; only the column is exempt.
+    #[test]
+    fn recovered_record_sealed_for_another_line_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let operations = vec!["definitions".to_string()];
+        let mut source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/moved.rs"),
+                name: "moved".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn moved()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        let record = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            requested_operations: operations.clone(),
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 20_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            ..LspWorkItemRecord::default()
+        };
+
+        // Same node, same file, but it now starts far down the file. The sealed
+        // anchor still names line 0.
+        source.line_start = 500;
+        source.line_end = 500;
+
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![record],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .expect_err("a record sealed for another line must not be accepted");
+        assert!(
+            error.to_string().contains("identity mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn dockerfile_variants_share_config_inventory_and_descriptor() {
         let repo = tempfile::tempdir().unwrap();
@@ -3786,6 +3924,7 @@ mod tests {
                 node,
                 requested_operations: vec!["references".to_string()],
                 attempt_count: 1,
+                toolchain_contract: "fixture-toolchain-v1".to_string(),
             }],
         )
         .await
@@ -3806,6 +3945,7 @@ mod tests {
 
     #[test]
     fn exact_recovered_work_refreshed_by_current_plan_is_reported() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -3846,26 +3986,32 @@ mod tests {
         let records = [("definitions", definition), ("references", reference)]
             .into_iter()
             .enumerate()
-            .map(|(item_id, (operation, edge))| LspWorkItemRecord {
-                job_id: "current-enrichment-job".to_string(),
-                item_id,
-                root: source.id.root.clone(),
-                file: source.id.file.to_string_lossy().into_owned(),
-                node_id: source.stable_id(),
-                node_kind: source.id.kind.to_string(),
-                input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
-                requested_operations: vec![operation.to_string()],
-                state: LspWorkItemState::Completed,
-                updated_at_ms: 10_000,
-                recovery: LspWorkItemRecovery::CarriedCompleted,
-                produced_result_ids: BTreeSet::from([edge.stable_id()]),
-                output_edges: vec![edge],
-                observed_result_count: 1,
-                ..LspWorkItemRecord::default()
+            .map(|(item_id, (operation, edge))| {
+                let operations = vec![operation.to_string()];
+                let work_identity = fixture_work_identity(repo.path(), &source, &operations);
+                LspWorkItemRecord {
+                    job_id: "current-enrichment-job".to_string(),
+                    item_id,
+                    root: source.id.root.clone(),
+                    file: source.id.file.to_string_lossy().into_owned(),
+                    node_id: source.stable_id(),
+                    node_kind: source.id.kind.to_string(),
+                    input_hash: work_identity.digest.clone(),
+                    work_identity,
+                    requested_operations: operations,
+                    state: LspWorkItemState::Completed,
+                    updated_at_ms: 10_000,
+                    recovery: LspWorkItemRecovery::CarriedCompleted,
+                    produced_result_ids: BTreeSet::from([edge.stable_id()]),
+                    output_edges: vec![edge],
+                    observed_result_count: 1,
+                    ..LspWorkItemRecord::default()
+                }
             })
             .collect::<Vec<_>>();
 
         let selected = select_work_items_for_report(
+            repo.path(),
             records,
             &BTreeSet::from(["current-enrichment-job"]),
             10_000,
@@ -3890,6 +4036,7 @@ mod tests {
 
     #[test]
     fn recovered_work_identity_mismatch_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -3905,19 +4052,23 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::Markdown,
         };
+        let operations = vec!["definitions".to_string()];
+        let work_identity = fixture_work_identity(repo.path(), &source, &operations);
         let tampered = LspWorkItemRecord {
             job_id: "current-job".to_string(),
             root: source.id.root.clone(),
             file: source.id.file.to_string_lossy().into_owned(),
             node_id: source.stable_id(),
             input_hash: "tampered".to_string(),
-            requested_operations: vec!["definitions".to_string()],
+            work_identity,
+            requested_operations: operations,
             state: LspWorkItemState::Completed,
             updated_at_ms: 10_000,
             recovery: LspWorkItemRecovery::CarriedCompleted,
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
+            repo.path(),
             vec![tampered],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -3929,7 +4080,111 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_nonzero_schema_version_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let operations = vec!["definitions".to_string()];
+        let mut work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        // A nonzero schema is not enough on its own: it must equal the
+        // *current* schema version, or a schema bump would be silently
+        // accepted as if nothing changed. Picks a value guaranteed to differ
+        // from whatever the current schema constant is, rather than
+        // assuming it is greater than 1.
+        let current_schema =
+            crate::extract::lsp::work_items::current_work_identity_schema_version();
+        work_identity.schema_version = if current_schema == 1 { 2 } else { 1 };
+        work_identity.digest =
+            crate::extract::lsp::work_items::work_identity_digest(&work_identity);
+        let stale_schema = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            requested_operations: operations,
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![stale_schema],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn stale_planner_contract_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("docs/guide.md"),
+                name: "Guide".to_string(),
+                kind: NodeKind::Other("markdown_section".to_string()),
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "# Guide".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let operations = vec!["definitions".to_string()];
+        let mut work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        work_identity.planner_contract = "lsp-pass1-work-planner-v0".to_string();
+        work_identity.digest =
+            crate::extract::lsp::work_items::work_identity_digest(&work_identity);
+        let stale_planner = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            requested_operations: operations,
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 10_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            ..LspWorkItemRecord::default()
+        };
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![stale_planner],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
     fn stale_recovered_operation_is_not_reported_without_current_plan_authority() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -3950,7 +4205,6 @@ mod tests {
             root: source.id.root.clone(),
             file: source.id.file.to_string_lossy().into_owned(),
             node_id: source.stable_id(),
-            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
             requested_operations: vec!["document_links".to_string()],
             state: LspWorkItemState::Completed,
             updated_at_ms: 1,
@@ -3959,6 +4213,7 @@ mod tests {
         };
 
         let selected = select_work_items_for_report(
+            repo.path(),
             vec![stale],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -3971,6 +4226,7 @@ mod tests {
 
     #[test]
     fn structural_execution_selects_exact_producer_ids_not_job_siblings() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -3986,21 +4242,27 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         };
-        let record = |item_id, operation: &str| LspWorkItemRecord {
-            job_id: "pass1-job".to_string(),
-            item_id,
-            root: source.id.root.clone(),
-            file: source.id.file.to_string_lossy().into_owned(),
-            node_id: source.stable_id(),
-            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
-            requested_operations: vec![operation.to_string()],
-            state: LspWorkItemState::Completed,
-            updated_at_ms: 10_000,
-            ..LspWorkItemRecord::default()
+        let record = |item_id, operation: &str| {
+            let operations = vec![operation.to_string()];
+            let work_identity = fixture_work_identity(repo.path(), &source, &operations);
+            LspWorkItemRecord {
+                job_id: "pass1-job".to_string(),
+                item_id,
+                root: source.id.root.clone(),
+                file: source.id.file.to_string_lossy().into_owned(),
+                node_id: source.stable_id(),
+                input_hash: work_identity.digest.clone(),
+                work_identity,
+                requested_operations: operations,
+                state: LspWorkItemState::Completed,
+                updated_at_ms: 10_000,
+                ..LspWorkItemRecord::default()
+            }
         };
 
         let authenticated = BTreeSet::from(["pass1-job:0".to_string()]);
         let selected = select_work_items_for_report(
+            repo.path(),
             vec![record(0, "references"), record(1, "document_links")],
             &BTreeSet::from(["pass1-job"]),
             10_000,
@@ -4018,6 +4280,7 @@ mod tests {
 
     #[test]
     fn duplicate_current_work_identity_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -4039,7 +4302,6 @@ mod tests {
             root: source.id.root.clone(),
             file: source.id.file.to_string_lossy().into_owned(),
             node_id: source.stable_id(),
-            input_hash: crate::extract::lsp::work_items::node_input_hash(&source),
             requested_operations: vec!["references".to_string()],
             state: LspWorkItemState::Completed,
             updated_at_ms: 10_000,
@@ -4047,6 +4309,7 @@ mod tests {
         };
 
         let error = select_work_items_for_report(
+            repo.path(),
             vec![record(0), record(1)],
             &BTreeSet::from(["current-job"]),
             10_000,
