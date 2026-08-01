@@ -223,23 +223,36 @@ jobs:
           # dependency would need a full network resolve. The only line that
           # must change is the member's own version, inside its own
           # [[package]] block, so patch exactly that.
+          # `in_block` arms only inside a [[package]] table, so a same-named
+          # entry under [[patch.unused]] or any other array-of-tables is left
+          # alone.
           awk -v version="$VERSION" '
-            /^\[\[package\]\]$/ { in_pkg = 0 }
-            /^name = "repo-native-alignment"$/ { in_pkg = 1 }
+            /^\[\[/ { in_block = ($0 == "[[package]]"); in_pkg = 0 }
+            in_block && /^name = "repo-native-alignment"$/ { in_pkg = 1 }
             in_pkg && /^version = / { print "version = \"" version "\""; in_pkg = 0; next }
             { print }
           ' Cargo.lock > Cargo.lock.bumped
           mv Cargo.lock.bumped Cargo.lock
 
-          # Fail loudly rather than opening a PR that silently leaves the lock
-          # stale again. This job's own checks are the only gate: a PR opened by
+          # Assert every patched file. Fail loudly rather than open a PR that
+          # silently leaves one of them stale: this job's own checks are the
+          # only gate that will ever run, because a PR opened by
           # create-pull-request with GITHUB_TOKEN cannot trigger workflows, so
-          # the bump PR gets no Rust CI before it auto-merges.
+          # the bump PR receives no Rust CI before it auto-merges.
+          #
+          # -F because a version string contains dots, which are regex
+          # wildcards to plain grep.
           grep -A1 '^name = "repo-native-alignment"$' Cargo.lock \
-            | grep -qx "version = \"$VERSION\"" \
+            | grep -qxF "version = \"$VERSION\"" \
             || { echo "::error::Cargo.lock version patch did not apply"; exit 1; }
-          grep -qx "version = \"$VERSION\"" Cargo.toml \
+          grep -qxF "version = \"$VERSION\"" Cargo.toml \
             || { echo "::error::Cargo.toml version patch did not apply"; exit 1; }
+          # marketplace.json carries the riskiest edit of the three: the sed is
+          # unanchored and global, rewriting every "version" key in the file.
+          # Assert no other value survived.
+          test "$(grep -c "\"version\": \"$VERSION\"" .claude-plugin/marketplace.json)" \
+             = "$(grep -c '"version":' .claude-plugin/marketplace.json)" \
+            || { echo "::error::marketplace.json version patch incomplete"; exit 1; }
 
       - name: Create version bump PR
         id: bump-pr
