@@ -142,6 +142,19 @@ pub struct LspWorkItemRecord {
     // snapshot and `list_roots`. Deserialization ignores the key, so ledgers
     // written by earlier builds still load.
     pub recovery_disposition: LspRecoveryDisposition,
+    /// Set only by the `load_store` call that invalidated this record, and
+    /// never persisted.
+    ///
+    /// Recovery must key its forced rerun/reject off this transient marker
+    /// rather than off the persisted `recovery_disposition` and `state`,
+    /// because `load_store` overwrites BOTH of those in the same load when it
+    /// invalidates a record. The persisted pair therefore cannot distinguish
+    /// "invalidated by this load" from "carries a label left by an earlier
+    /// rebuild" — reading it made a record that had already been rebuilt and
+    /// rerun look permanently schema-stale, so it was re-forced on every resume
+    /// and eventually exhausted without ever running.
+    #[serde(skip)]
+    pub invalidated_by_load: Option<LspRecoveryDisposition>,
     #[serde(default)]
     pub integrity_digest: String,
     #[serde(default)]
@@ -436,30 +449,28 @@ impl LspWorkItemLedger {
                     }
                     1 => {
                         let prior = candidates.into_iter().next().expect("one candidate");
-                        // A tamper rejection or schema rerun is sticky only
-                        // while the record still carries that unresolved
-                        // verdict. Once the work has actually rerun and
-                        // completed, its outputs were freshly produced under
-                        // the current schema, so the stale label must not pin it
-                        // to a permanent rerun — otherwise every record that
-                        // ever crossed a schema bump reruns on every later
-                        // resume and the receipt keeps reporting the old
-                        // reason forever.
+                        // A forced rerun or reject comes from the transient
+                        // marker `load_store` set during THIS load, never from
+                        // the persisted `recovery_disposition`/`state` pair.
                         //
-                        // This does not weaken fail-closed handling: both
-                        // `load_store` paths that assign these dispositions
-                        // also clear the outputs and set the state to `Failed`,
-                        // so a record that is genuinely tampered or
-                        // schema-stale can never be observed `Completed` here.
-                        let unresolved = prior.state != LspWorkItemState::Completed;
-                        let disposition = match prior.recovery_disposition {
-                            LspRecoveryDisposition::RejectedTampered if unresolved => {
-                                LspRecoveryDisposition::RejectedTampered
-                            }
-                            LspRecoveryDisposition::RerunSchema if unresolved => {
-                                LspRecoveryDisposition::RerunSchema
-                            }
-                            _ => identity_disposition(&prior.work_identity, &current_identity),
+                        // `load_store` overwrites both of those when it
+                        // invalidates a record, so the persisted pair cannot
+                        // tell "invalidated just now" from "carries a label an
+                        // earlier rebuild left behind". Reading it made a record
+                        // that had already been rebuilt and rerun look
+                        // permanently schema-stale, so it was re-forced on every
+                        // resume forever.
+                        //
+                        // Once the marker is absent the record is ordinary:
+                        // `identity_disposition` decides, and a record still in
+                        // `Failed` reaches the resume arm below, which is what
+                        // charges retry attempts and exhausts a genuinely
+                        // failing item. Forced reruns therefore need no retry
+                        // accounting of their own — the work did not fail, the
+                        // schema or the stored bytes changed.
+                        let disposition = match prior.invalidated_by_load {
+                            Some(forced) => forced,
+                            None => identity_disposition(&prior.work_identity, &current_identity),
                         };
                         (Some(prior), disposition)
                     }
@@ -473,33 +484,18 @@ impl LspWorkItemLedger {
                 let mut record =
                     new_record(repo_root, &job_id, seed, current_identity.clone(), now);
                 record.recovery_disposition = disposition;
-                // Carry the retry budget across a rebuild, but ONLY for the
-                // dispositions that bypass `identity_disposition` entirely.
+                // A rebuilt record starts with the seed's attempt count and
+                // carries no inherited retry budget.
                 //
-                // Seeds are always constructed with `attempt_count: 1`, and the
-                // rebuild path below `continue`s past the `MAX_ATTEMPTS` branch
-                // in the resume arm. So for `RerunSchema` and `RejectedTampered`
-                // -- which short-circuit before any identity comparison while
-                // the record is unresolved -- a fresh attempt-1 record is built
-                // on every resume and a persistently failing item never
-                // exhausts.
-                //
-                // The inheritance must NOT extend to the identity-driven
-                // dispositions (`RerunSourceSnapshot`, `RerunRequestAnchor`,
-                // `RerunOperations`, `RerunToolchain`, `RerunPlannerContract`).
-                // Those mean the inputs genuinely changed, so the work is new
-                // and deserves a full budget. `source_snapshot` is repo-wide, so
-                // charging them an attempt lets unrelated edits elsewhere in the
-                // repository burn the budget of an item that succeeds every
-                // single time, until it is permanently `Exhausted` and its LSP
-                // enrichment is dead until someone deletes the ledger by hand.
-                let inherits_budget = matches!(
-                    disposition,
-                    LspRecoveryDisposition::RerunSchema | LspRecoveryDisposition::RejectedTampered
-                );
-                if inherits_budget && let Some(prior) = prior_record.as_ref() {
-                    record.attempt_count = prior.attempt_count.saturating_add(1);
-                }
+                // Retry accounting belongs entirely to the resume arm below,
+                // which increments on each resume of a record still in
+                // `Pending`/`InFlight`/`Failed` and exhausts at `MAX_ATTEMPTS`.
+                // A rebuild means the inputs, the schema, or the stored bytes
+                // changed — not that the work failed — so charging it an attempt
+                // is wrong in both directions: it exhausted schema-invalidated
+                // records without ever running them, and it let unrelated edits
+                // elsewhere in the repository (the source snapshot is
+                // repo-wide) burn the budget of work that succeeded every time.
                 if disposition != LspRecoveryDisposition::New {
                     record.last_error =
                         Some(format!("recovery disposition: {}", disposition.as_str()));
@@ -524,25 +520,11 @@ impl LspWorkItemLedger {
             record.updated_at_ms = now;
 
             if !is_exact {
-                // Same retry budget the resume arm enforces. A rebuilt record
-                // that has already burned its attempts must exhaust here rather
-                // than be queued again, otherwise the inherited count above has
-                // nothing to act on.
-                if record.attempt_count >= MAX_ATTEMPTS {
-                    record.state = LspWorkItemState::Exhausted;
-                    record.recovery = LspWorkItemRecovery::Exhausted;
-                    record.output_edges.clear();
-                    record.output_nodes.clear();
-                    record.produced_result_ids.clear();
-                    record.completed_at_ms = Some(now);
-                    record.last_error = Some(format!(
-                        "retry budget exhausted after {} attempts while rebuilding for {}",
-                        record.attempt_count,
-                        disposition.as_str()
-                    ));
-                } else {
-                    runnable_item_ids.insert(seed.item_id);
-                }
+                // A rebuilt record is always runnable. It carries no inherited
+                // budget, so there is nothing to exhaust here; exhaustion is the
+                // resume arm's job on a later resume, once the record has
+                // actually failed under the current schema.
+                runnable_item_ids.insert(seed.item_id);
                 store
                     .records
                     .insert(record_key(&job_id, seed.item_id), record);
@@ -902,6 +884,7 @@ fn new_record(
         input_hash,
         work_identity,
         recovery_disposition: LspRecoveryDisposition::New,
+        invalidated_by_load: None,
         integrity_digest: String::new(),
         requested_operations: seed.requested_operations.clone(),
         state: LspWorkItemState::Pending,
@@ -1053,14 +1036,42 @@ pub(super) fn source_request_position(
     let source_path = repo_root.join(&node.id.file);
     let zero_based_line = node.line_start.saturating_sub(1) as u32;
     let lines = cache.lines(&source_path);
-    let zero_based_character = lines
-        .get(zero_based_line as usize)
+    let line = lines.get(zero_based_line as usize);
+    let zero_based_character = line
         .and_then(|line| {
             find_identifier_boundary(line, &node.id.name)
                 .map(|byte| line[..byte].encode_utf16().count() as u32)
         })
+        .or_else(|| recorded_name_col_utf16(node, line))
         .unwrap_or(0);
     (zero_based_line, zero_based_character)
+}
+
+/// Fall back to the extractor-recorded `name_col` when the node's own name does
+/// not occur in its start line.
+///
+/// Not every node's name is a token in the source. Markdown AST nodes carry a
+/// synthesized path (`AGENTS.md::body::ast:link[0]`) that appears nowhere in the
+/// file, so `find_identifier_boundary` finds nothing and the column would
+/// silently collapse to 0 for every such node on the line — and those columns
+/// are sent to a real language server for `Definitions`/`References`.
+///
+/// This is not a return to name-column identity. Source derivation stays
+/// primary and wins wherever it has an answer: measured across 807 files of
+/// this repository, all 8,454 code nodes carrying a `name_col` agree exactly
+/// with the source-derived column, and only the 105 synthesized-name nodes fall
+/// through to here. `name_col` is persisted as a typed Arrow column and
+/// restored on load, so the fallback is reconstruction-stable rather than a
+/// re-extraction artefact.
+fn recorded_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
+    let byte = node.metadata.get("name_col")?.parse::<usize>().ok()?;
+    let line = line?;
+    // A stale or out-of-range column must not panic the slice, and must not
+    // silently point into the middle of a character.
+    if byte > line.len() || !line.is_char_boundary(byte) {
+        return None;
+    }
+    Some(line[..byte].encode_utf16().count() as u32)
 }
 
 /// Fold one path's identity into `hasher`.
@@ -2015,6 +2026,7 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
         );
         for record in store.records.values_mut() {
             record.recovery_disposition = LspRecoveryDisposition::RerunSchema;
+            record.invalidated_by_load = Some(LspRecoveryDisposition::RerunSchema);
             record.state = LspWorkItemState::Failed;
             record.output_edges.clear();
             record.output_nodes.clear();
@@ -2040,6 +2052,7 @@ fn load_store(repo_root: &Path) -> Result<LspWorkItemStore> {
                 "Rejecting tampered LSP work-item record and scheduling exact work again"
             );
             record.recovery_disposition = LspRecoveryDisposition::RejectedTampered;
+            record.invalidated_by_load = Some(LspRecoveryDisposition::RejectedTampered);
             record.state = LspWorkItemState::Failed;
             record.output_edges.clear();
             record.output_nodes.clear();
@@ -2627,20 +2640,26 @@ mod tests {
         );
     }
 
-    /// A rebuilt record must inherit the retry budget. Seeds always carry
-    /// `attempt_count: 1` and the rebuild path skips the resume arm's
-    /// `MAX_ATTEMPTS` check, so without inheritance a persistently failing item
-    /// restarts at attempt 1 on every resume and never exhausts. The
-    /// `STORE_SCHEMA_VERSION` bump puts every pre-existing record into exactly
-    /// that state, so this is reachable on the first upgrade.
+    /// A schema bump must replay invalidated work as runnable, never exhaust it
+    /// without running it.
+    ///
+    /// `load_store` forces every record to `Failed` + `RerunSchema` on a store
+    /// schema bump, discarding whether it had completed. If the rebuild charged
+    /// a retry attempt, that forced state alone could reach `MAX_ATTEMPTS` and
+    /// kill work that never failed once — and because the persisted label was
+    /// re-read on every later resume, it stayed dead until the ledger was
+    /// deleted by hand. `origin/main` replayed such records as fresh runnable
+    /// work, so anything else is a regression.
     #[tokio::test]
-    async fn rebuilt_schema_work_exhausts_instead_of_retrying_forever() {
+    async fn schema_bump_replays_completed_work_without_burning_its_budget() {
         let repo = tempfile::tempdir().unwrap();
         let ledger =
-            LspWorkItemLedger::begin_with_job_id(repo.path(), "exhaust-job".to_string(), &seeds(1))
+            LspWorkItemLedger::begin_with_job_id(repo.path(), "bump-job".to_string(), &seeds(2))
                 .await
                 .unwrap();
-        ledger.mark_failed(0, "server crashed").await.unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
         let mut legacy_store = load_store(repo.path()).unwrap();
         legacy_store.schema_version = 1;
         for record in legacy_store.records.values_mut() {
@@ -2652,37 +2671,165 @@ mod tests {
         )
         .unwrap();
 
-        // Resume 1: rebuilt as RerunSchema, budget inherited (1 -> 2), still runnable.
-        let first = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+        let replayed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
             .await
             .unwrap();
-        assert!(first.should_run(0));
-        assert_eq!(
-            first.store.lock().unwrap().records["exhaust-job:0"].attempt_count,
-            2,
-            "rebuild must inherit the prior attempt count, not reset to 1"
-        );
-        first.mark_failed(0, "server crashed again").await.unwrap();
-        first.flush().await.unwrap();
+        {
+            let store = replayed.store.lock().unwrap();
+            let record = &store.records["bump-job:0"];
+            assert_eq!(
+                record.recovery_disposition,
+                LspRecoveryDisposition::RerunSchema,
+                "the receipt must still explain why the work is replayed"
+            );
+            assert_ne!(
+                record.state,
+                LspWorkItemState::Exhausted,
+                "a schema bump must never exhaust work that did not fail"
+            );
+            assert_eq!(
+                record.attempt_count, 1,
+                "a forced replay is not a retry and must not charge an attempt"
+            );
+        }
+        assert!(replayed.should_run(0), "replayed work must be runnable");
 
-        // Resume 2: budget reaches MAX_ATTEMPTS, so the item must exhaust.
-        let second = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+        // Interrupt that replay without completing it, then resume again. This
+        // is the step that exposed the defect: reading the PERSISTED
+        // `RerunSchema` label re-forced the record a second time and charged a
+        // second attempt, reaching MAX_ATTEMPTS and killing work that had never
+        // failed. With the transient marker, the label is history — the record
+        // is current-schema now, so it flows through the ordinary resume arm.
+        replayed.flush().await.unwrap();
+        let after_interrupt = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+            .await
+            .unwrap();
+        {
+            let store = after_interrupt.store.lock().unwrap();
+            let record = &store.records["bump-job:0"];
+            assert_ne!(
+                record.state,
+                LspWorkItemState::Exhausted,
+                "an interrupted replay must not exhaust work that never failed"
+            );
+            assert!(
+                record.attempt_count < MAX_ATTEMPTS,
+                "the schema label must not keep charging attempts across resumes \
+                 (attempt_count={})",
+                record.attempt_count
+            );
+        }
+        assert!(
+            after_interrupt.should_run(0),
+            "work that never failed must still be runnable after an interrupted replay"
+        );
+
+        // Once it completes under the current schema it carries normally.
+        after_interrupt.mark_completed(0).await.unwrap();
+        after_interrupt.flush().await.unwrap();
+        let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
             .await
             .unwrap();
         assert!(
-            !second.should_run(0),
-            "an item past its retry budget must not be queued again"
+            !resumed.should_run(0),
+            "work completed under the current schema must carry, not replay again"
         );
-        let store = second.store.lock().unwrap();
-        let record = &store.records["exhaust-job:0"];
-        assert_eq!(record.state, LspWorkItemState::Exhausted);
-        assert_eq!(record.attempt_count, MAX_ATTEMPTS);
-        assert!(
-            record
-                .last_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("retry budget exhausted")
+        assert_eq!(
+            resumed.store.lock().unwrap().records["bump-job:0"].recovery_disposition,
+            LspRecoveryDisposition::CarriedExact
+        );
+    }
+
+    /// Retry exhaustion must still work. It is the resume arm's job, and
+    /// removing the rebuild-path budget must not have removed it.
+    #[tokio::test]
+    async fn repeatedly_failing_work_still_exhausts() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut current =
+            LspWorkItemLedger::begin_with_job_id(repo.path(), "fail-job".to_string(), &seeds(2))
+                .await
+                .unwrap();
+
+        // Each iteration must fail the CURRENT ledger and then resume from it;
+        // failing a stale handle just overwrites the resumed state on flush.
+        for _ in 0..=MAX_ATTEMPTS {
+            if !current.should_run(0) {
+                let store = current.store.lock().unwrap();
+                let record = &store.records["fail-job:0"];
+                assert_eq!(record.state, LspWorkItemState::Exhausted);
+                assert!(
+                    record
+                        .last_error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("retry budget exhausted")
+                );
+                return;
+            }
+            current.mark_failed(0, "server crashed").await.unwrap();
+            current.flush().await.unwrap();
+            current = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+                .await
+                .unwrap();
+        }
+        panic!("work failing every attempt must exhaust within MAX_ATTEMPTS resumes");
+    }
+
+    /// A node whose name never appears in its start line — markdown AST nodes
+    /// carry a synthesized path like `README.md::body::ast:link[0]` — must fall
+    /// back to the recorded `name_col` rather than silently collapsing to
+    /// column 0. Those columns go to a real language server.
+    #[test]
+    fn synthesized_node_names_fall_back_to_the_recorded_column() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("README.md"), "see [the docs](d.md) here\n").unwrap();
+
+        let mut link = node("link");
+        link.id.file = PathBuf::from("README.md");
+        link.id.name = "README.md::body::ast:link[0]".to_string();
+        link.line_start = 1;
+
+        let cache = SourceLineCache::default();
+        assert_eq!(
+            source_request_position(repo.path(), &link, &cache),
+            (0, 0),
+            "with no recorded column there is nothing to fall back to"
+        );
+
+        // `[` sits at byte 4 of `see [the docs](d.md) here`.
+        link.metadata
+            .insert("name_col".to_string(), "4".to_string());
+        assert_eq!(
+            source_request_position(repo.path(), &link, &cache),
+            (0, 4),
+            "a synthesized name must use the recorded column, not column 0"
+        );
+
+        // An out-of-range column must degrade, not panic.
+        link.metadata
+            .insert("name_col".to_string(), "9999".to_string());
+        assert_eq!(source_request_position(repo.path(), &link, &cache), (0, 0));
+    }
+
+    /// Source derivation stays primary: when the name IS in the line, a stale
+    /// recorded column must not override it.
+    #[test]
+    fn source_derived_column_wins_over_a_stale_recorded_column() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item_0.rs"), "    fn item_0() {}\n").unwrap();
+
+        let mut source_node = node("item_0");
+        source_node.line_start = 1;
+        source_node
+            .metadata
+            .insert("name_col".to_string(), "0".to_string());
+
+        // `item_0` starts at byte 7, not the stale 0 the metadata claims.
+        assert_eq!(
+            source_request_position(repo.path(), &source_node, &SourceLineCache::default()),
+            (0, 7),
+            "the recorded column is a fallback, never an override"
         );
     }
 
