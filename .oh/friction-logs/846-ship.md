@@ -26,13 +26,25 @@ just now", so no rescan was needed.
 | 2026-07-31 | Step 10c reviewer — RNA search → bounded `grep`/`sed` for static tables and string literals | minor | Verifying reconstruction stability required reading *static data tables and match arms*, not symbols: `infer_language_from_path` arms, `C_CONFIG`/`CPP_CONFIG` `language_name`+`extensions`, `BUILTIN_LSP_DESCRIPTORS` influence-pattern literals, `meta_name_col` Arrow write/read sites, `.oh/.cache` path constructions. Symbol search returns the enclosing function but not the literal rows, and ranked search surfaced unrelated markdown instead. | Six bounded `grep`/`sed` sweeps scoped to files RNA had already located. They produced blocking findings B1 and B4. Six friction events. | A "constants/table rows for this symbol" or per-file literal projection would keep identity-stability review inside RNA; today the highest-value reviewer evidence lives in match arms that RNA does not project. |
 | 2026-07-31 | Step 10c reviewer — raw `git diff` | n/a | RNA has no diff projection, so the mandated final-diff read used `git diff origin/main...HEAD` plus the pre-generated patch. Not treated as substitutable by RNA. | Four bounded diff reads (per-file). | Consider a commit-range projection so review agents can read a diff with RNA provenance attached. |
 
-**Step 10c reviewer friction:** 8 events (2 caller/impact gaps, 6 static-table
-literal sweeps). Both classes are the same underlying gap: RNA answers "which
-symbol" well and "which literal row / which caller" not at all, and those are
-exactly the two questions a reconstruction-stability review turns on.
+| 2026-08-01 | Ship agent, finding remediation — RNA search → bounded `grep`/`sed` | minor | Verifying the round-2 blocking findings needed the same two unsupported query shapes: static table rows (`C_CONFIG.language_name`/`extensions` vs `infer_language_from_path` match arms — the B1 evidence) and call-site enumeration of private functions (`record_integrity_digest`, `write_store`, `merge_and_write_store`, `select_work_items_for_report`, `current_request_anchor`). Dead-code confirmation after removing the report-path wrappers also required a repo-wide textual sweep, because with no `Calls` edges RNA cannot answer "is this now unreferenced". | Nine bounded sweeps, all scoped to files RNA had already located. Nine friction events. | Unchanged, and now load-bearing three sessions running: syntax-level same-crate references, plus a per-file literal/table projection. |
 
-**Total friction events:** 8 (2 impact-query gaps, 6 in-file mention sweeps).
+### Friction totals
+
+| Session segment | Events | Dominant cause |
+|---|---|---|
+| Ship agent — initial audit of `f97bdb38` | 8 | 2 caller/impact gaps, 6 in-file mention sweeps |
+| Step 10c reviewer (round 2) | 8 | 2 caller/impact gaps, 6 static-table literal sweeps |
+| Ship agent — round-2 finding remediation | 9 | 4 caller/impact gaps, 5 static-table sweeps |
+| **Total** | **25** | **8 caller/impact gaps, 17 literal/mention sweeps** |
+
+`git diff` reads are excluded from the totals: RNA has no diff projection, so
+they are not an RNA substitution.
+
 **Recurring theme:** short-lived fix worktrees never have LSP enrichment
 attached, so every ship/review pass in a worktree loses caller/reference
 navigation and falls back to bounded text search for exactly the questions a
-reviewer asks most.
+reviewer asks most. Two query shapes account for all 25 events: "who references
+this symbol" and "which literal rows belong to this table". Both blocking
+findings that the round-2 review contributed (B1, B4) came out of the second
+shape, and confirming the round-2 fixes required both — so this is not
+incidental friction, it is the review workload itself falling outside RNA.
