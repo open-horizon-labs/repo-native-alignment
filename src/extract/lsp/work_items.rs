@@ -927,12 +927,30 @@ fn canonical_operations_digest(requested_operations: &[String]) -> String {
 /// K-symbol file is read from disk K times per batch (ledger identity build,
 /// and again for each actual LSP request). Safe to share across concurrent
 /// lookups: reads race harmlessly onto the same cached `Arc<Vec<String>>`.
+///
+/// A FAILED read is deliberately never cached (see `lines()`), only a
+/// successful one. The trade-off: a file that is persistently unreadable for
+/// the whole pass — not merely transiently, which is the case this exists to
+/// handle — is re-read from disk on every lookup instead of once. That is the
+/// right default for a cache whose entire purpose is correctness of position
+/// data sent to a real language server; silently and permanently trusting a
+/// stale "no content" result for a file that might already be readable again
+/// is the worse failure mode.
 #[derive(Default)]
 pub(crate) struct SourceLineCache {
     lines_by_file: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
+    read_failures: std::sync::atomic::AtomicU64,
 }
 
 impl SourceLineCache {
+    /// Read failures observed so far: `read_to_string` returning `Err`, not a
+    /// genuinely empty file. Exposed so a pass can report the degradation
+    /// instead of it being invisible in a receipt.
+    pub(crate) fn read_failures(&self) -> u64 {
+        self.read_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn lines(&self, path: &Path) -> Arc<Vec<String>> {
         if let Some(cached) = self
             .lines_by_file
@@ -942,9 +960,20 @@ impl SourceLineCache {
         {
             return Arc::clone(cached);
         }
-        let lines = std::fs::read_to_string(path)
-            .map(|source| source.lines().map(str::to_owned).collect::<Vec<_>>())
-            .unwrap_or_default();
+        // A failed read must NOT be cached. `unwrap_or_default()` on a
+        // permission-denied or transiently missing file previously produced
+        // and PERMANENTLY cached an empty Vec, indistinguishable from a
+        // genuinely empty file — so a file unreadable once stayed at column 0
+        // for the rest of the pass even after the transient condition cleared.
+        let read = std::fs::read_to_string(path);
+        let lines = match read {
+            Ok(source) => source.lines().map(str::to_owned).collect::<Vec<_>>(),
+            Err(_) => {
+                self.read_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Arc::new(Vec::new());
+            }
+        };
         let lines = Arc::new(lines);
         self.lines_by_file
             .lock()
@@ -1114,30 +1143,18 @@ pub(super) fn source_request_position(
     (zero_based_line, zero_based_character)
 }
 
-/// Fall back to the extractor-recorded `name_col` when the node's own name does
-/// not occur in its start line.
-///
-/// Not every node's name is a token in the source. Markdown AST nodes carry a
-/// synthesized path (`AGENTS.md::body::ast:link[0]`) that appears nowhere in the
-/// file, so `find_identifier_boundary` finds nothing and the column would
-/// silently collapse to 0 for every such node on the line — and those columns
-/// are sent to a real language server for `Definitions`/`References`.
-///
-/// This is not a return to name-column identity. Source derivation stays
-/// primary and wins wherever it has an answer: measured across 807 files of
-/// this repository, all 8,454 code nodes carrying a `name_col` agree exactly
-/// with the source-derived column, and only the 105 synthesized-name nodes fall
-/// through to here. `name_col` is persisted as a typed Arrow column and
-/// restored on load, so the fallback is reconstruction-stable rather than a
-/// re-extraction artefact.
 /// The recorded `name_col`, accepted only if the current source still carries
 /// the node's name at exactly that column, on identifier boundaries.
 ///
 /// This is what distinguishes a declaration from an earlier use of the same word
-/// on the same line, which a first-occurrence scan cannot do. Because the column
-/// is confirmed against the file as it exists now, a stale or moved column is
-/// rejected rather than trusted — so this is a source-verified position, not a
-/// reconstruction-time artefact. Costs no extra I/O: the line is already cached.
+/// on the same line, which a first-occurrence scan cannot do: for
+/// `func (s *Server) Server() string`, the `Server` method node's name also
+/// occurs at column 9 (the receiver type) as well as its own column 17, and both
+/// are valid identifier boundaries, so a boundary scan alone cannot tell them
+/// apart. Because the column is confirmed against the file as it exists now, a
+/// stale or moved column is rejected rather than trusted — so this is a
+/// source-verified position, not a reconstruction-time artefact. Costs no extra
+/// I/O: the line is already cached.
 fn verified_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
     let byte = node.metadata.get("name_col")?.parse::<usize>().ok()?;
     let line = line?;
@@ -1157,6 +1174,23 @@ fn verified_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
     Some(line[..byte].encode_utf16().count() as u32)
 }
 
+/// Fall back to the extractor-recorded `name_col` unverified, for a node whose
+/// name does not occur in its start line at all.
+///
+/// Not every node's name is a token in the source. Markdown AST nodes carry a
+/// synthesized path (`AGENTS.md::body::ast:link[0]`) that appears nowhere in the
+/// file, so both the boundary scan and `verified_name_col_utf16` find nothing,
+/// and the column would silently collapse to 0 for every such node on the line
+/// — and those columns are sent to a real language server for
+/// `Definitions`/`References`.
+///
+/// This is not a return to name-column identity. Source derivation stays
+/// primary and wins wherever it has an answer: measured across 807 files of
+/// this repository, all 8,454 code nodes carrying a `name_col` agree exactly
+/// with the source-derived column, and only the 105 synthesized-name nodes fall
+/// through to here. `name_col` is persisted as a typed Arrow column and
+/// restored on load, so the fallback is reconstruction-stable rather than a
+/// re-extraction artefact.
 fn recorded_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
     let byte = node.metadata.get("name_col")?.parse::<usize>().ok()?;
     let line = line?;
@@ -1273,6 +1307,121 @@ fn excluded_from_content_snapshot(relative: &Path, is_dir: bool) -> bool {
     })
 }
 
+/// Bounded search for declared influence-pattern matches beneath a directory
+/// that `excluded_from_content_snapshot` would otherwise prune entirely.
+///
+/// This is the non-Git equivalent of the Git path's `git ls-files` pathspec
+/// search in `ignored_lsp_influence_identity`: on a Git root, a declared
+/// pattern binds wherever it sits, ignored or not, because `git ls-files` can
+/// find it without touching disk beyond the index. A non-Git root has no
+/// index, so without this, `excluded_from_content_snapshot` had no way for a
+/// pattern to override the directory-level prune at all — a `pyproject.toml`
+/// or `go.mod` sitting under `env/`, `vendor/`, or any other excluded
+/// directory name never invalidated recovery, however it changed.
+///
+/// Deliberately bounded rather than an unpruned walk, but the bound applies
+/// only to RECURSION fan-out, never to whether a file at the current level is
+/// checked. `max_depth` limits how many directory levels this descends, and
+/// `max_subdirs_per_level` caps how many subdirectories it recurses into at
+/// each level — that is the actual cost driver, since each recursion is
+/// another `read_dir` call and an unbounded fan-out could multiply that across
+/// a directory with very many subdirectories. Checking a file's name against a
+/// handful of patterns is an in-memory string comparison with no I/O cost, so
+/// EVERY file at a level examined is checked; an earlier version of this
+/// function applied the bound before separating files from directories, so a
+/// match sitting past the Nth directory-listing entry (in arbitrary,
+/// filesystem-dependent order) was silently missed even at depth 1 — a
+/// correctness bug disguised as a performance bound, found and reproduced by
+/// an independent review with a 2,000-subdirectory synthetic `node_modules/`.
+///
+/// Declared patterns describe project-config files at or near a (sub)project
+/// root (`Cargo.toml`, `go.mod`, `pyproject.toml`), not content nested
+/// arbitrarily deep inside a dependency tree, so bounding depth and fan-out
+/// does not need to be exhaustive to close the actual gap. The bound still
+/// means this can never degrade into scanning the full contents of a large
+/// `node_modules/`/`target/`: the overwhelming common case — an excluded
+/// directory with no influence match nearby — costs at most
+/// `max_subdirs_per_level` recursive calls per level, not the size of the
+/// subtree, and returns nothing exactly as before this function existed.
+/// Subdirectories are sorted before the fan-out cap is applied, so which ones
+/// get recursed into is deterministic rather than dependent on `read_dir`'s
+/// arbitrary order.
+///
+/// Everything this returns is a FILE matching a declared pattern. Anything
+/// else encountered along the way — a non-matching file, a directory beyond
+/// the depth or fan-out bound — contributes nothing, so ordinary build noise
+/// inside an excluded directory still cannot invalidate recovery.
+fn find_influence_matches_under(
+    root: &Path,
+    directory: &Path,
+    patterns: &[&str],
+    max_depth: u32,
+    max_subdirs_per_level: usize,
+) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    if max_depth == 0 {
+        return matches;
+    }
+    let Ok(read_dir) = std::fs::read_dir(directory) else {
+        return matches;
+    };
+    let mut entries = read_dir.filter_map(std::io::Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    // Every FILE at this level is checked, unconditionally. This is the fix:
+    // a pattern match must never depend on where its entry happened to land in
+    // an arbitrary directory listing.
+    for entry in &entries {
+        if entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        if patterns
+            .iter()
+            .any(|pattern| super::partition_influence_pattern_matches(pattern, &relative_str))
+        {
+            matches.push(relative.to_path_buf());
+        }
+    }
+
+    // Only the RECURSION fan-out is bounded, since that is what could
+    // multiply cost across a directory with very many subdirectories.
+    for entry in entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .take(max_subdirs_per_level)
+    {
+        matches.extend(find_influence_matches_under(
+            root,
+            &entry.path(),
+            patterns,
+            max_depth - 1,
+            max_subdirs_per_level,
+        ));
+    }
+    matches
+}
+
+/// How far beneath an otherwise fully-excluded directory
+/// `find_influence_matches_under` looks for a declared-pattern match, and how
+/// many SUBDIRECTORIES it recurses into per level (every file at a checked
+/// level is examined regardless of this cap — see that function's doc
+/// comment). Small and constant on purpose: bounds recursive fan-out, not
+/// correctness.
+const INFLUENCE_OVERRIDE_MAX_DEPTH: u32 = 2;
+const INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL: usize = 500;
+
 fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     // Per-path I/O errors are hashed as a sentinel rather than propagated.
     // Propagating them made `begin` fail, which made `run_pass1` start no work
@@ -1280,7 +1429,9 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     // file deleted between the directory read and the stat) disabled LSP
     // enrichment for the whole repository. A sentinel still changes the digest,
     // so the affected work reruns rather than being carried.
-    fn visit(root: &Path, directory: &Path, rows: &mut Vec<PathBuf>) {
+    let influence_patterns = declared_influence_patterns();
+
+    fn visit(root: &Path, directory: &Path, rows: &mut Vec<PathBuf>, influence_patterns: &[&str]) {
         let Ok(read_dir) = std::fs::read_dir(directory) else {
             rows.push(
                 directory
@@ -1300,10 +1451,21 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
                 .map(|file_type| file_type.is_dir())
                 .unwrap_or(false);
             if excluded_from_content_snapshot(&relative, is_dir) {
+                // A pruned FILE never binds — only a pruned directory may hide
+                // a declared influence file beneath it.
+                if is_dir {
+                    rows.extend(find_influence_matches_under(
+                        root,
+                        &path,
+                        influence_patterns,
+                        INFLUENCE_OVERRIDE_MAX_DEPTH,
+                        INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL,
+                    ));
+                }
                 continue;
             }
             if is_dir {
-                visit(root, &path, rows);
+                visit(root, &path, rows, influence_patterns);
             } else {
                 rows.push(relative);
             }
@@ -1311,7 +1473,7 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     }
 
     let mut rows = Vec::new();
-    visit(repo_root, repo_root, &mut rows);
+    visit(repo_root, repo_root, &mut rows, &influence_patterns);
     rows.sort();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rna-lsp-source-snapshot-non-git-v2");
@@ -1388,13 +1550,24 @@ fn run_bounded(command: &mut Command, timeout: Duration) -> Result<std::process:
 /// unaffected by ignored files elsewhere in the outer repository. Git ignore
 /// rules still apply from the real repository root outward regardless of
 /// `current_dir`, so `.gitignore` files above `repo_root` are still honored.
-fn ignored_lsp_influence_identity(repo_root: &Path) -> Result<Option<String>> {
+/// Every descriptor-declared cross-file influence pattern, deduplicated.
+///
+/// Shared between the Git path (`ignored_lsp_influence_identity`, which asks
+/// `git ls-files` to find matches anywhere the index knows about) and the
+/// non-Git path (`find_influence_matches_under`, which has no index to ask and
+/// must probe the filesystem directly).
+fn declared_influence_patterns() -> Vec<&'static str> {
     let mut patterns = super::builtin_lsp_descriptors()
         .iter()
         .flat_map(|descriptor| descriptor.partition_influence_patterns())
         .collect::<Vec<_>>();
     patterns.sort_unstable();
     patterns.dedup();
+    patterns
+}
+
+fn ignored_lsp_influence_identity(repo_root: &Path) -> Result<Option<String>> {
+    let patterns = declared_influence_patterns();
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -1506,9 +1679,15 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         Ok(repository) => repository,
         Err(_) => return non_git_source_snapshot(repo_root),
     };
-    let workdir = repository
-        .workdir()
-        .ok_or_else(|| anyhow::anyhow!("LSP source snapshot requires a non-bare Git repository"))?;
+    // A bare repository falls back like every other Git failure below,
+    // consistent with `git-is-optimization-not-requirement`: Git is an
+    // optimization for change detection, not something a repo root must
+    // provide. Previously this branch alone used `?`, so a bare-repo startup
+    // root hard-errored `begin` and disabled LSP enrichment for the whole
+    // repo rather than degrading to a content snapshot.
+    let Some(workdir) = repository.workdir() else {
+        return non_git_source_snapshot(repo_root);
+    };
     let head = match repository.head().and_then(|head| head.peel_to_commit()) {
         Ok(head) => head,
         Err(_) => return non_git_source_snapshot(repo_root),
@@ -2269,6 +2448,86 @@ mod tests {
         assert_eq!(
             source_request_position(repo.path(), &source_node, &SourceLineCache::default()),
             (0, 6)
+        );
+    }
+
+    /// A transient read failure (permission denied, a file briefly deleted
+    /// mid-scan) must not be cached forever. `unwrap_or_default()` previously
+    /// cached the empty result of a failed read exactly like a genuinely empty
+    /// file, so a file unreadable once stayed at column 0 for the rest of the
+    /// pass even after the condition cleared. This test is skipped when not
+    /// running as the file owner (e.g. root, which can read `chmod 000` files
+    /// anyway), since the permission trick would not reproduce the failure.
+    #[test]
+    fn source_line_cache_does_not_permanently_cache_a_failed_read() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let repo = tempfile::tempdir().unwrap();
+            let path = repo.path().join("locked.rs");
+            std::fs::write(&path, "fn locked() {}\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let cache = SourceLineCache::default();
+            let unreadable = cache.lines(&path);
+            let is_root = std::fs::read(&path).is_ok();
+            if is_root {
+                // Running as a user that can bypass the permission bits (root,
+                // or a filesystem that does not enforce them): the premise of
+                // this test does not hold here, so skip rather than assert a
+                // failure that cannot occur.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
+            assert!(unreadable.is_empty(), "a failed read yields no lines");
+            assert_eq!(
+                cache.read_failures(),
+                1,
+                "the failure must be observable, not silent"
+            );
+
+            // The condition clears. A cached failure would keep returning the
+            // stale empty result; the fix must re-read and succeed.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let recovered = cache.lines(&path);
+            assert_eq!(
+                recovered.as_slice(),
+                &["fn locked() {}".to_string()],
+                "a cache that permanently remembers failures never recovers"
+            );
+            assert_eq!(
+                cache.read_failures(),
+                1,
+                "the successful retry must not itself be counted or trigger a new failure"
+            );
+        }
+    }
+
+    /// `SourceLineCache` is shared as one `Arc` across every concurrent Pass 1
+    /// worker task (see `passes.rs`, where `source_cache` is cloned into each
+    /// worker closure). `read_failures()` must accumulate correctly under that
+    /// real usage pattern, not only in a single-threaded call.
+    #[tokio::test]
+    async fn source_line_cache_read_failures_accumulate_correctly_across_concurrent_workers() {
+        let cache = Arc::new(SourceLineCache::default());
+        let mut workers = tokio::task::JoinSet::new();
+        const UNREADABLE_PATHS: usize = 20;
+        for i in 0..UNREADABLE_PATHS {
+            let cache = Arc::clone(&cache);
+            workers.spawn(async move {
+                // A path that does not exist fails `read_to_string` the same
+                // way a permission-denied path does, without needing root
+                // privileges to be absent for the assertion to hold.
+                let path = PathBuf::from(format!("/nonexistent-{i}/does-not-exist.rs"));
+                cache.lines(&path)
+            });
+        }
+        while workers.join_next().await.is_some() {}
+        assert_eq!(
+            cache.read_failures() as usize,
+            UNREADABLE_PATHS,
+            "every concurrent failure must be counted exactly once, with no lost updates"
         );
     }
 
@@ -3039,6 +3298,129 @@ mod tests {
         }
     }
 
+    /// A descriptor-declared influence file must invalidate the non-Git
+    /// content snapshot even when it sits inside an otherwise fully-excluded
+    /// directory. The Git path already handles this via `git ls-files`; the
+    /// non-Git path had no equivalent, so `pyproject.toml` (a real declared
+    /// pattern) editing inside `env/` (a real `DEFAULT_EXCLUDES` entry) left
+    /// the snapshot unchanged. Also pins the fail-safe boundary: an ordinary,
+    /// non-matching file in the same excluded directory must still be noise,
+    /// and a large excluded directory with no match anywhere nearby must still
+    /// prune entirely rather than degrade into a full scan.
+    #[test]
+    fn content_snapshot_binds_declared_influence_files_inside_excluded_directories() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // `env/` is a real DEFAULT_EXCLUDES entry; `pyproject.toml` is a real
+        // declared partition_influence_patterns entry.
+        std::fs::create_dir_all(root.join("env")).unwrap();
+        std::fs::write(root.join("env/pyproject.toml"), "[project]\nname = \"a\"\n").unwrap();
+        std::fs::write(root.join("env/ordinary_noise.txt"), "one").unwrap();
+
+        let baseline = non_git_source_snapshot(root).unwrap();
+
+        // Editing the declared influence file must invalidate the snapshot,
+        // exactly as it would on a Git root via git ls-files.
+        std::fs::write(root.join("env/pyproject.toml"), "[project]\nname = \"b\"\n").unwrap();
+        let after_influence_edit = non_git_source_snapshot(root).unwrap();
+        assert_ne!(
+            baseline, after_influence_edit,
+            "a declared influence file inside an excluded directory must invalidate the snapshot"
+        );
+
+        // An ordinary file in the SAME excluded directory must still be noise:
+        // the override binds the specific declared pattern, not the whole
+        // directory.
+        std::fs::write(root.join("env/ordinary_noise.txt"), "two").unwrap();
+        assert_eq!(
+            after_influence_edit,
+            non_git_source_snapshot(root).unwrap(),
+            "an unrelated file in the same excluded directory must remain noise"
+        );
+
+        // A large excluded directory with nothing matching anywhere nearby
+        // must still prune entirely -- this is the fail-safe boundary that
+        // keeps the override from degrading into a full scan of e.g.
+        // node_modules/.
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        for i in 0..50 {
+            std::fs::write(
+                root.join(format!("node_modules/pkg/file_{i}.js")),
+                format!("module.exports = {i};\n"),
+            )
+            .unwrap();
+        }
+        let with_node_modules = non_git_source_snapshot(root).unwrap();
+        assert_eq!(
+            after_influence_edit, with_node_modules,
+            "populating an excluded directory with non-matching content must not change the snapshot"
+        );
+        std::fs::write(root.join("node_modules/pkg/file_0.js"), "changed").unwrap();
+        assert_eq!(
+            with_node_modules,
+            non_git_source_snapshot(root).unwrap(),
+            "churn inside node_modules with no declared influence file must not invalidate"
+        );
+    }
+
+    /// A match must not depend on where its directory entry happened to land
+    /// in `read_dir`'s arbitrary (filesystem-dependent, not creation- or
+    /// name-ordered) listing. An earlier version of
+    /// `find_influence_matches_under` applied the subdirectory-count bound
+    /// BEFORE separating files from directories, so a match one level below a
+    /// directory with many siblings could be silently missed depending on
+    /// where its entry fell in that raw order — reproduced by an independent
+    /// review with a synthetic 2,000-subdirectory `node_modules/` and a match
+    /// in one of them. This reproduces the same shape and shows the fix: every
+    /// FILE at a level examined is now checked unconditionally, so the outcome
+    /// no longer depends on filesystem entry order at all.
+    ///
+    /// This does not claim files at arbitrary depth or fan-out are always
+    /// found — the subdirectory RECURSION is still bounded by
+    /// `INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL`, which is deliberate (see
+    /// that constant's doc comment) and is exercised by
+    /// `content_snapshot_binds_declared_influence_files_inside_excluded_directories`'s
+    /// large-node_modules case above. What changed here is specifically:
+    /// whether a match get found no longer depends on incidental ordering.
+    #[test]
+    fn content_snapshot_finds_an_influence_match_regardless_of_listing_position() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        // 2,000 sibling directories, matching the scale of the independent
+        // review's reproduction. The match sits in the first, which is where
+        // the prior, unsorted, truncate-before-filtering bug could still fail
+        // depending on the filesystem's raw enumeration order -- this test
+        // does not depend on that order to demonstrate the point, since the
+        // fix makes file-level checking exhaustive at every level examined.
+        for i in 0..2000 {
+            std::fs::create_dir_all(root.join(format!("node_modules/pkg_{i}"))).unwrap();
+        }
+        std::fs::write(
+            root.join("node_modules/pkg_0/pyproject.toml"),
+            "[project]\nname = \"a\"\n",
+        )
+        .unwrap();
+
+        let baseline = non_git_source_snapshot(root).unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg_0/pyproject.toml"),
+            "[project]\nname = \"b\"\n",
+        )
+        .unwrap();
+        assert_ne!(
+            baseline,
+            non_git_source_snapshot(root).unwrap(),
+            "a declared influence file must be found regardless of directory listing order"
+        );
+    }
+
     /// The content snapshot must ignore build output and nested repository
     /// internals. Hashing them made every non-Git recovery depend on whether a
     /// build had run, and a vendored `.git`'s `index`/`logs` churn made the
@@ -3218,6 +3600,30 @@ mod tests {
 
         assert!(before.starts_with("content:"));
         assert_ne!(before, after);
+    }
+
+    /// A bare repository must fall back to a content snapshot like every
+    /// other Git failure in `source_snapshot_identity`, not hard-error. Before
+    /// this fix, `.workdir()` was the one branch in this function that
+    /// propagated with `?` instead of falling back, so a bare-repo startup
+    /// root made `begin` return `Err`, which disabled LSP enrichment for the
+    /// entire repository rather than degrading to a content snapshot.
+    #[test]
+    fn bare_git_repository_falls_back_to_content_snapshot_instead_of_erroring() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(repo.path()).unwrap();
+        std::fs::write(repo.path().join("fixture.py"), "def fixture(): pass\n").unwrap();
+
+        let before =
+            source_snapshot_identity(repo.path()).expect("a bare repo must fall back, not error");
+        assert!(before.starts_with("content:"));
+
+        std::fs::write(repo.path().join("fixture.py"), "def fixture(): return 1\n").unwrap();
+        let after = source_snapshot_identity(repo.path()).unwrap();
+        assert_ne!(
+            before, after,
+            "the content fallback must still detect source changes"
+        );
     }
 
     #[test]

@@ -1593,6 +1593,9 @@ impl LspEnricher {
         // Shared across every work item in this pass so a file with many
         // symbols is read from disk once rather than once per symbol.
         let source_cache = Arc::new(SourceLineCache::default());
+        // Kept outside the `move` closure below so its read-failure count is
+        // still readable after the workers finish.
+        let source_cache_for_diagnostics = Arc::clone(&source_cache);
         let (worker_total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
@@ -1846,12 +1849,34 @@ impl LspEnricher {
             telemetry.record_job_timeout();
         }
 
+        // Deliberately log-only, not a persisted job-ledger field. Per
+        // `.oh/metis/degraded-enrichment-needs-a-durable-negative-proof.md`,
+        // a durable negative proof matters for degraded output that could
+        // otherwise be silently promoted to "ready" after a restart. A source
+        // read failure does not have that shape: the record it affects is
+        // still explained by its own `recovery_disposition` and column-0
+        // anchor, both of which are already persisted, so there is no
+        // survives-a-restart correctness gap this closes by being durable —
+        // only an operability one (this count is not visible without reading
+        // logs from that specific run). Making it durable would mean a new
+        // persisted field on every ledger record or a job-level summary,
+        // which is a larger, separate change than #849's scope; tracked as a
+        // follow-up rather than done here.
+        let source_read_failures = source_cache_for_diagnostics.read_failures();
+        if source_read_failures > 0 {
+            tracing::warn!(
+                "LSP Pass 1: {} source read failures produced column-0 request positions \
+                 for affected nodes on this pass",
+                source_read_failures
+            );
+        }
         tracing::info!(
-            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
+            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors, {} source read failures)",
             pass1_start.elapsed(),
             result.added_edges.len(),
             attempted,
             errors,
+            source_read_failures,
         );
 
         (attempted, errors, aborted, abort_diagnostic)
