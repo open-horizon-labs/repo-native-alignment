@@ -110,10 +110,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       - name: Patch version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
-          sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+        run: bash .github/scripts/patch-version.sh "${GITHUB_REF_NAME#v}"
       - name: Install protoc
         run: bash .github/scripts/install-protoc.sh
       - name: Install Rust toolchain
