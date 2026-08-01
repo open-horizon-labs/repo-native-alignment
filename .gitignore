@@ -11,3 +11,6 @@ target-574/
 # Python bytecode caches (never belong in the repo)
 __pycache__/
 *.pyc
+
+# Node dependencies (the MCP smoke test installs the SDK locally)
+node_modules/
