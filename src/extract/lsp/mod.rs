@@ -3210,14 +3210,28 @@ impl LspEnricher {
 
     /// Compute the 0-based LSP line and column for a node.
     ///
-    /// Re-derived from the current on-disk source rather than the extractor's
-    /// recorded `name_col`/signature metadata: those are reconstruction-time
-    /// fields that can shift across re-extractions of byte-identical source,
-    /// which would make recovery identity unstable. Scans `node.line_start`
-    /// for `node.id.name` at an identifier boundary (so it does not match
-    /// inside a longer identifier), then converts the byte offset to a UTF-16
-    /// column as LSP requires. `cache` avoids re-reading the same file for
-    /// every node it contains.
+    /// Scans `node.line_start` in the current on-disk source for
+    /// `node.id.name` at an identifier boundary (so it does not match inside a
+    /// longer identifier), then converts the byte offset to a UTF-16 column as
+    /// LSP requires. `cache` avoids re-reading the same file for every node it
+    /// contains.
+    ///
+    /// Deliberately not the extractor's recorded `name_col`. To be accurate
+    /// about why, since it is a soft deviation from `extract-fully-at-parse-time`:
+    /// `name_col` *is* persisted (`meta_name_col` is a typed Arrow column in
+    /// both schema constructors in `graph/store.rs`, written in
+    /// `server/store/batch.rs` and restored in `server/store/load.rs`), so it
+    /// does survive a LanceDB round trip unchanged. The objection is not
+    /// round-trip instability.
+    ///
+    /// It is that `name_col` records where the identifier sat at the *last
+    /// extraction*, while this position is sent to a language server reading
+    /// the file as it exists *now*. Any edit between those two moments makes the
+    /// stored column point at the wrong place, and the value is optional, so
+    /// nodes whose extractor never populated it have no column at all. Deriving
+    /// from current source keeps the request position and the persisted
+    /// `request_anchor` consistent with the document the server is actually
+    /// given.
     fn node_lsp_position(
         repo_root: &Path,
         node: &Node,

@@ -473,19 +473,31 @@ impl LspWorkItemLedger {
                 let mut record =
                     new_record(repo_root, &job_id, seed, current_identity.clone(), now);
                 record.recovery_disposition = disposition;
-                // Carry the retry budget across a rebuild.
+                // Carry the retry budget across a rebuild, but ONLY for the
+                // dispositions that bypass `identity_disposition` entirely.
                 //
                 // Seeds are always constructed with `attempt_count: 1`, and the
                 // rebuild path below `continue`s past the `MAX_ATTEMPTS` branch
-                // in the resume arm. Without inheriting the prior count, a
-                // disposition that never consults `identity_disposition` --
-                // `RerunSchema` and `RejectedTampered` while the record is
-                // unresolved -- produces a fresh attempt-1 record on every
-                // resume, so a persistently failing item retries forever and
-                // never exhausts. The `STORE_SCHEMA_VERSION` bump in this change
-                // stamps every pre-existing record `RerunSchema` + `Failed`,
-                // which is exactly that state.
-                if let Some(prior) = prior_record.as_ref() {
+                // in the resume arm. So for `RerunSchema` and `RejectedTampered`
+                // -- which short-circuit before any identity comparison while
+                // the record is unresolved -- a fresh attempt-1 record is built
+                // on every resume and a persistently failing item never
+                // exhausts.
+                //
+                // The inheritance must NOT extend to the identity-driven
+                // dispositions (`RerunSourceSnapshot`, `RerunRequestAnchor`,
+                // `RerunOperations`, `RerunToolchain`, `RerunPlannerContract`).
+                // Those mean the inputs genuinely changed, so the work is new
+                // and deserves a full budget. `source_snapshot` is repo-wide, so
+                // charging them an attempt lets unrelated edits elsewhere in the
+                // repository burn the budget of an item that succeeds every
+                // single time, until it is permanently `Exhausted` and its LSP
+                // enrichment is dead until someone deletes the ledger by hand.
+                let inherits_budget = matches!(
+                    disposition,
+                    LspRecoveryDisposition::RerunSchema | LspRecoveryDisposition::RejectedTampered
+                );
+                if inherits_budget && let Some(prior) = prior_record.as_ref() {
                     record.attempt_count = prior.attempt_count.saturating_add(1);
                 }
                 if disposition != LspRecoveryDisposition::New {
@@ -1143,7 +1155,14 @@ fn excluded_from_content_snapshot(relative: &Path, is_dir: bool) -> bool {
         if let Some(extension) = pattern.strip_prefix("*.") {
             // File pattern, e.g. `*.pyc` — build artifacts the scanner skips
             // and whose churn must not invalidate recovery.
-            return !is_dir && name.ends_with(extension) && name.len() > extension.len();
+            //
+            // Compare the real extension, not a suffix. A bare
+            // `name.ends_with(extension)` makes `*.o` swallow `main.go` and
+            // `*.a` swallow `Main.java`, which drops whole languages out of the
+            // snapshot and lets stale LSP evidence replay against edited
+            // source.
+            return !is_dir
+                && relative.extension().and_then(|value| value.to_str()) == Some(extension);
         }
         !is_dir && name == *pattern
     })
@@ -2667,6 +2686,65 @@ mod tests {
         );
     }
 
+    /// Work that succeeds on every attempt must never exhaust, no matter how
+    /// many times unrelated repository edits force it to be re-planned.
+    ///
+    /// `source_snapshot` is repo-wide, so any edit anywhere yields
+    /// `RerunSourceSnapshot`. If a rebuild under that disposition charged an
+    /// attempt, an item that never once failed would hit `MAX_ATTEMPTS` after a
+    /// few unrelated commits and be permanently `Exhausted` — its LSP
+    /// enrichment dead until the ledger is deleted by hand.
+    #[tokio::test]
+    async fn unrelated_edits_do_not_burn_the_retry_budget_of_succeeding_work() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/item_0.rs"), "fn item_0() {}\n").unwrap();
+
+        // Item 1 is deliberately never finished: `select_recovery_job` only
+        // reselects a job that still has unfinished work, so it keeps the job
+        // eligible across resumes while item 0 is the one under test.
+        let ledger =
+            LspWorkItemLedger::begin_with_job_id(repo.path(), "budget-job".to_string(), &seeds(2))
+                .await
+                .unwrap();
+        ledger.mark_completed(0).await.unwrap();
+        ledger.flush().await.unwrap();
+
+        // Several resumes, each preceded by an edit to an unrelated file.
+        for revision in 0..4 {
+            std::fs::write(
+                repo.path().join("NOTES.md"),
+                format!("unrelated revision {revision}\n"),
+            )
+            .unwrap();
+
+            let resumed = LspWorkItemLedger::begin(repo.path(), &seeds(2))
+                .await
+                .unwrap();
+            {
+                let store = resumed.store.lock().unwrap();
+                let record = &store.records["budget-job:0"];
+                assert_eq!(
+                    record.recovery_disposition,
+                    LspRecoveryDisposition::RerunSourceSnapshot,
+                    "an unrelated edit changes the repo-wide snapshot"
+                );
+                assert_ne!(
+                    record.state,
+                    LspWorkItemState::Exhausted,
+                    "work that always succeeds must never exhaust (revision {revision})"
+                );
+                assert_eq!(
+                    record.attempt_count, 1,
+                    "an identity-driven rerun is new work and must not inherit a burnt budget"
+                );
+            }
+            assert!(resumed.should_run(0));
+            resumed.mark_completed(0).await.unwrap();
+            resumed.flush().await.unwrap();
+        }
+    }
+
     /// The content snapshot must ignore build output and nested repository
     /// internals. Hashing them made every non-Git recovery depend on whether a
     /// build had run, and a vendored `.git`'s `index`/`logs` churn made the
@@ -2709,6 +2787,51 @@ mod tests {
         std::fs::write(root.join("src/main.rs"), "fn main() { work() }\n").unwrap();
         let after_source = non_git_source_snapshot(root).unwrap();
         assert_ne!(baseline, after_source, "source changes must invalidate");
+
+        // Source extensions that merely END WITH an excluded pattern's letters
+        // must not be swallowed. `*.o` must not match `.go`, and `*.a` must not
+        // match `.java` — matching on a bare suffix instead of the real
+        // extension silently drops whole languages out of the snapshot and lets
+        // stale LSP evidence replay against edited source.
+        for (relative, initial, edited) in [
+            (
+                "src/server.go",
+                "package main\n",
+                "package main // edited\n",
+            ),
+            (
+                "src/Main.java",
+                "class Main {}\n",
+                "class Main { int x; }\n",
+            ),
+            ("src/mod.lua", "return {}\n", "return { x = 1 }\n"),
+            (
+                "src/api.proto",
+                "message A {}\n",
+                "message A { int32 b = 1; }\n",
+            ),
+        ] {
+            std::fs::write(root.join(relative), initial).unwrap();
+            let before = non_git_source_snapshot(root).unwrap();
+            std::fs::write(root.join(relative), edited).unwrap();
+            assert_ne!(
+                before,
+                non_git_source_snapshot(root).unwrap(),
+                "editing {relative} must invalidate the snapshot"
+            );
+        }
+
+        // The genuinely excluded object-file extensions still are excluded.
+        std::fs::write(root.join("src/obj.o"), "one").unwrap();
+        std::fs::write(root.join("src/lib.a"), "one").unwrap();
+        let with_objects = non_git_source_snapshot(root).unwrap();
+        std::fs::write(root.join("src/obj.o"), "two").unwrap();
+        std::fs::write(root.join("src/lib.a"), "two").unwrap();
+        assert_eq!(
+            with_objects,
+            non_git_source_snapshot(root).unwrap(),
+            "*.o and *.a churn must not invalidate"
+        );
 
         // Source in a nested repository's working tree is still source: only
         // the `.git` directory itself is skipped.

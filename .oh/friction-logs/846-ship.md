@@ -32,6 +32,12 @@ just now", so no rescan was needed.
 | 2026-08-01 | Step 10c reviewer (round 3) — RNA search → bounded `grep` for static tables and literals | minor | Judging the new `git` CLI dependency and the influence-pattern breadth required reading literal rows, not symbols: `Command::new("git")` production vs test call sites, `BUILTIN_LSP_DESCRIPTORS` `partition_influence_patterns:` literals, `DEFAULT_EXCLUDES`, `join(".oh")` path constructions, `FLUSH_INTERVAL`. Ranked search returned unrelated markdown for these shapes. | Five bounded sweeps scoped to files RNA had already located. Five friction events. They produced blocking finding B3 and warnings W6/W8. | Same as rounds 1-2: a per-file literal/table projection would keep identity-and-cost review inside RNA. |
 | 2026-08-01 | Step 10c reviewer (round 3) — raw `git diff` / `gh` / workflow YAML | n/a | RNA has no diff projection, no CI-run projection, and does not index GitHub Actions job `if:` conditions. The mandated final-diff read, the reviewed-SHA-vs-HEAD check (HEAD had already advanced to `67de388b`), and the `smoke`-job gating check (`workflow_dispatch`/tag only, so the changed `mcp-smoke.mjs` assertions never run on a PR) all required raw inspection. | Six diff/`gh`/YAML reads. Not treated as RNA-substitutable. | Consider a commit-range projection and a CI-status projection so review agents can gather release evidence with RNA provenance attached. |
 | 2026-08-01 | Ship agent, finding remediation — RNA search → bounded `grep`/`sed` | minor | Verifying the round-2 blocking findings needed the same two unsupported query shapes: static table rows (`C_CONFIG.language_name`/`extensions` vs `infer_language_from_path` match arms — the B1 evidence) and call-site enumeration of private functions (`record_integrity_digest`, `write_store`, `merge_and_write_store`, `select_work_items_for_report`, `current_request_anchor`). Dead-code confirmation after removing the report-path wrappers also required a repo-wide textual sweep, because with no `Calls` edges RNA cannot answer "is this now unreferenced". | Nine bounded sweeps, all scoped to files RNA had already located. Nine friction events. | Unchanged, and now load-bearing three sessions running: syntax-level same-crate references, plus a per-file literal/table projection. |
+| 2026-08-01 | Step 10c reviewer (round 4) — RNA MCP `search` with `file`+`line`/`end_line` | none | Bounded current-filesystem retrieval answered every contract question for the round-4 review: `begin` disposition/retry arm (`work_items.rs:495-640`), constants block (`16-40`), `select_recovery_job` (`1596-1665`), `retain_recent_jobs`/`merge_and_write_store` (`1860-1922`), `load_store` (`1930-1990`), `mark_terminal` (`700-800`), `flush`/`maybe_flush` (`800-870`), `select_work_items_for_report` (`lsp_completeness.rs:1596-1717`), `DEFAULT_EXCLUDES` rows (`scanner.rs:37-85`), clangd influence patterns (`mod.rs:440-470`), `startup_root_override` (`mod.rs:1725-1745`, `2278-2300`), `installSyntheticWorkItemLedger` (`mcp-smoke.mjs:20-90`). | Twelve bounded spans replaced twelve `Read` calls. Zero friction. | — |
+| 2026-08-01 | Step 10c reviewer (round 4) — RNA CLI `search --compact` | none | Worktree binary confirmed the live index (52,508 symbols) and resolved `LspWorkIdentity` with a stable node ID on the first query. | No fallback needed. | — |
+| 2026-08-01 | Step 10c reviewer (round 4) — RNA neighbors/impact → bounded `grep` | minor | Four reader/consumer questions were unanswerable (`lsp_call_references: unavailable`, no `Calls`/`ReferencedBy` edges): "who consumes `recovery_dispositions`/`LspWorkItemQueueSnapshot::render`" (the `computed-but-not-delivered` delivery proof — answered by one grep hit at `server/operation_report.rs:196`), "where is `startup_root_override` set vs read" (needed to judge whether `lsp_toolchain_contract` hashes the venv the server actually gets), "where is `name_col` written and read across the LanceDB round trip" (the load-bearing evidence for warning W3 against `extract-fully-at-parse-time`), and "where is `infer_language_from_path` defined" (the test's import path `src/server/store.rs` does not exist; the module is `src/server/store/mod.rs`). | Four bounded repo-scoped `grep` sweeps. Four friction events. | Unchanged and now load-bearing five sessions running: syntax-level same-crate reference fallback when LSP edges are absent. |
+| 2026-08-01 | Step 10c reviewer (round 4) — RNA search → bounded `grep`/`awk` for static tables, literals, and struct field lists | minor | Seven verification questions were table-shaped, not symbol-shaped: `DEFAULT_EXCLUDES` literal rows, `compile_commands.json` in `BUILTIN_LSP_DESCRIPTORS.partition_influence_patterns`, `lsp_enrichable_kinds` rows, `.oh/.cache` path constructions (lance/scan-state/embeddings — needed to prove the snapshot is self-stable), `mcp-smoke.mjs` `in_flight`/`mcp_smoke_probe`/`schema_version` literals, exact line numbers for the finding table, and full field lists for `Node`/`Edge`/`LspWorkItemRecord` (RNA returns `signature_only`, and digest determinism depends on whether any field is a `HashMap`). | Seven bounded sweeps, all scoped to files RNA had already located. Seven friction events. They produced blocking finding **B1** and warnings **W1**/**W3**. | Two asks, both repeated from rounds 1-3: a per-file literal/table projection, and an `include_body`-equivalent for struct field lists so type-shape questions do not need `awk`. |
+| 2026-08-01 | Step 10c reviewer (round 4) — RNA ranked search leaked prior-round verdicts | minor | A flat `search("DEFAULT_EXCLUDES", kind=constant)` returned **zero** code hits and instead surfaced two large chunks of this friction log verbatim, including prior rounds' finding labels (B1-B4, W2/W6/W8) and their conclusions. The round-4 reviewer was explicitly instructed to form an independent verdict without reading prior conclusions, so RNA's own markdown-over-code ranking actively worked against the review contract. | Discarded the returned text, used a bounded `grep` for the constant instead, and formed findings from the code. One friction event (counted in the static-table row above, not double-counted here). | Add an artifact-class filter that keeps `.oh/friction-logs/` and `.oh/sessions/` out of `kind`-filtered code searches, or an `exclude_artifact_types` parameter; ranked markdown should never outrank an exact-named `constant` lookup. |
+| 2026-08-01 | Step 10c reviewer (round 4) — temporary probe tests + `cargo test --lib` | n/a | Confirming the two blocking findings needed executable evidence, not reading: three throwaway `reviewer_probe_*` tests were added to `work_items.rs`, run with `cargo test --locked --lib reviewer_probe -- --nocapture`, and reverted with `git checkout --` (tree verified clean at `3e7bcba5`). Not an RNA gap — RNA has no execution projection and should not. | Three probe tests, two `cargo test --lib` runs, one revert. | — |
 
 ### Friction totals
 
@@ -42,7 +48,18 @@ just now", so no rescan was needed.
 | Ship agent — round-2 finding remediation | 9 | 4 caller/impact gaps, 5 static-table sweeps |
 | Step 10c reviewer (round 3) | 9 | 4 caller/impact gaps, 5 static-table/literal sweeps |
 | Ship agent — round-3 finding remediation | 6 | 3 caller/impact gaps, 3 static-table sweeps |
-| **Total** | **40** | **15 caller/impact gaps, 25 literal/mention sweeps** |
+| Step 10c reviewer (round 4) | 11 | 4 caller/impact gaps, 7 static-table/literal/field-list sweeps |
+| Ship agent — round-4 finding remediation | 3 | 1 caller/impact gap, 2 static-table sweeps |
+| **Total** | **54** | **20 caller/impact gaps, 34 literal/mention sweeps** |
+
+Round-4 remediation detail: three sweeps, all of the shapes already logged.
+Confirming the `name_col` persistence claim (round-4 W3) needed the
+`meta_name_col` Arrow write/read rows in `graph/store.rs`,
+`server/store/batch.rs` and `server/store/load.rs` — a producer/consumer
+question RNA cannot answer without `ReferencedBy` edges, and one where being
+wrong had already put a false justification into a shipped doc comment. Reading
+`DEFAULT_EXCLUDES` again was what showed the `*.o`-matches-`main.go` defect was
+mine rather than the reviewer's misreading.
 
 Round-3 remediation detail: confirming the dead `recovery_source_job_id` field
 (blocking B2) needed a repo-wide reader sweep that RNA cannot answer without
@@ -53,14 +70,32 @@ as an enclosing const. Reading that table directly is what caught that `vendor/`
 and `.cache/` are already excluded — which corrected a wrong assertion in the
 first draft of the regression test.
 
-`git diff` reads are excluded from the totals: RNA has no diff projection, so
-they are not an RNA substitution.
+Round-4 review detail: the same two shapes again. The blocking exclusion-matcher
+finding came out of reading the `DEFAULT_EXCLUDES` rows next to the new
+`excluded_from_content_snapshot` arms; the retry-budget finding came out of
+reading `MAX_ATTEMPTS`, `mark_terminal`, and the `begin` rebuild arm together.
+Neither is reachable from a ranked search result. A new shape also appeared:
+struct **field lists** (`Node`, `Edge`, `LspWorkItemRecord`) had to be dumped
+with `awk` because RNA returns `signature_only`, yet whether the new integrity
+digest is deterministic depends entirely on whether any serialized field is a
+`HashMap`.
+
+`git diff` reads, `cargo test` probe runs, and `rustc` scratch programs are
+excluded from the totals: RNA has no diff or execution projection, so they are
+not RNA substitutions.
 
 **Recurring theme:** short-lived fix worktrees never have LSP enrichment
 attached, so every ship/review pass in a worktree loses caller/reference
 navigation and falls back to bounded text search for exactly the questions a
-reviewer asks most. Two query shapes account for all 25 events: "who references
-this symbol" and "which literal rows belong to this table". Both blocking
-findings that the round-2 review contributed (B1, B4) came out of the second
-shape, and confirming the round-2 fixes required both — so this is not
-incidental friction, it is the review workload itself falling outside RNA.
+reviewer asks most. Two query shapes account for all 32 non-caller events: "who
+references this symbol" and "which literal rows belong to this table". Every
+blocking finding contributed by an independent review round so far has come out
+of the second shape — so this is not incidental friction, it is the review
+workload itself falling outside RNA.
+
+**New in round 4:** RNA search actively *harmed* the review contract once. A
+`kind=constant` lookup for a Rust constant returned no code and two verbatim
+chunks of this friction log, exposing prior rounds' finding labels and verdicts
+to a reviewer explicitly told not to read them. Independent review is a
+first-class RNA workflow; ranked markdown outranking an exact-named symbol
+lookup is a correctness bug for that workflow, not just noise.
