@@ -1593,6 +1593,9 @@ impl LspEnricher {
         // Shared across every work item in this pass so a file with many
         // symbols is read from disk once rather than once per symbol.
         let source_cache = Arc::new(SourceLineCache::default());
+        // Kept outside the `move` closure below so its read-failure count is
+        // still readable after the workers finish.
+        let source_cache_for_diagnostics = Arc::clone(&source_cache);
         let (worker_total_nodes, diagnostics, mut join_set, mut result_rx) = spawn_pass1_workers(
             work_items,
             &work_item_ledger,
@@ -1846,12 +1849,21 @@ impl LspEnricher {
             telemetry.record_job_timeout();
         }
 
+        let source_read_failures = source_cache_for_diagnostics.read_failures();
+        if source_read_failures > 0 {
+            tracing::warn!(
+                "LSP Pass 1: {} source read failures produced column-0 request positions \
+                 for affected nodes on this pass",
+                source_read_failures
+            );
+        }
         tracing::info!(
-            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
+            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors, {} source read failures)",
             pass1_start.elapsed(),
             result.added_edges.len(),
             attempted,
             errors,
+            source_read_failures,
         );
 
         (attempted, errors, aborted, abort_diagnostic)
