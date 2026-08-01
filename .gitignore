@@ -11,3 +11,7 @@ target-574/
 # Python bytecode caches (never belong in the repo)
 __pycache__/
 *.pyc
+
+# Node dependencies: .github/scripts/mcp-smoke.mjs needs the MCP SDK, which
+# both CI and local delivery verification install into the repo root
+node_modules/
