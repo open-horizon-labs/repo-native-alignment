@@ -12,5 +12,6 @@ target-574/
 __pycache__/
 *.pyc
 
-# Node dependencies (the MCP smoke test installs the SDK locally)
+# Node dependencies: .github/scripts/mcp-smoke.mjs needs the MCP SDK, which
+# both CI and local delivery verification install into the repo root
 node_modules/

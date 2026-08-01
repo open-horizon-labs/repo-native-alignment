@@ -211,11 +211,35 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
           sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
-          # Cargo.lock records the workspace member's own version, so bumping
-          # Cargo.toml without it leaves main unbuildable under --locked.
-          # --offline touches only the workspace member, never dependencies.
-          cargo update --workspace --offline
-          cargo metadata --locked --format-version 1 > /dev/null
+
+          # Cargo.lock records this workspace member's own version. Bumping
+          # Cargo.toml without it leaves main failing every `--locked` command,
+          # which is how v0.3.0 shipped a stale lock.
+          #
+          # Patched with awk rather than cargo, deliberately. This job installs
+          # no Rust toolchain, and adding one would not be enough: `cargo update
+          # --workspace --offline` cannot resolve the metal-candle git
+          # dependency on a cold cache, and this job has none. A non-workspace
+          # dependency would need a full network resolve. The only line that
+          # must change is the member's own version, inside its own
+          # [[package]] block, so patch exactly that.
+          awk -v version="$VERSION" '
+            /^\[\[package\]\]$/ { in_pkg = 0 }
+            /^name = "repo-native-alignment"$/ { in_pkg = 1 }
+            in_pkg && /^version = / { print "version = \"" version "\""; in_pkg = 0; next }
+            { print }
+          ' Cargo.lock > Cargo.lock.bumped
+          mv Cargo.lock.bumped Cargo.lock
+
+          # Fail loudly rather than opening a PR that silently leaves the lock
+          # stale again. This job's own checks are the only gate: a PR opened by
+          # create-pull-request with GITHUB_TOKEN cannot trigger workflows, so
+          # the bump PR gets no Rust CI before it auto-merges.
+          grep -A1 '^name = "repo-native-alignment"$' Cargo.lock \
+            | grep -qx "version = \"$VERSION\"" \
+            || { echo "::error::Cargo.lock version patch did not apply"; exit 1; }
+          grep -qx "version = \"$VERSION\"" Cargo.toml \
+            || { echo "::error::Cargo.toml version patch did not apply"; exit 1; }
 
       - name: Create version bump PR
         id: bump-pr

@@ -67,7 +67,9 @@ just now", so no rescan was needed.
 | Ship agent — round-5 finding remediation | 4 | 2 caller/impact gaps, 2 static-table sweeps |
 | Step 10c reviewer (round 6) | 9 | 5 caller/impact gaps, 3 static-table sweeps, 1 ranked-search verdict leak |
 | Ship agent — round-6 finding remediation | 2 | 1 caller/impact gap, 1 static-table sweep |
-| **Total** | **84** | **34 caller/impact gaps, 49 literal/mention/span events, 1 verdict leak** |
+| Step 10c reviewer (round 7) | 9 | 1 caller/impact gap, 5 field-list/test-helper sweeps, 2 unindexed-`.mjs` reads, 1 tool-contract rejection |
+| Step 10c reviewer (round 8, PR #851 final gate) | 3 | 3 unindexed non-code-file gaps (workflow YAML, `Cargo.lock`, `.gitignore`) |
+| **Total** | **96** | **35 caller/impact gaps, 56 literal/mention/span/field-list events, 1 verdict leak, 1 tool-contract rejection, 3 unindexed-file gaps** |
 
 **Escalated to `major` by the round-6 reviewer, and it is the most consequential
 entry in this log:** RNA's ranked search returned this friction log and
@@ -186,3 +188,45 @@ the primary navigation tool: 5 successful spans, no fallback needed.
 Raw fallbacks 8 grep/sed invocations, each with a diagnosed reason above.
 Probe tests: 7 written against the real code paths, 3 passed, 4 failed and became
 findings; all reverted, tree left clean apart from this log.
+
+## Segment: Ship Step 10c independent final-diff review of PR #851 (round 8)
+
+Reviewer: independent code reviewer, no implementation context. Commit
+`bcca868d45f7b207d71987e668f598de7d330ab6`. Isolation flags
+`include_artifacts: false` + `include_markdown: false` on every RNA search.
+
+This diff touches no Rust source, so the usual caller/impact gaps did not apply.
+All three events are the same shape: **RNA does not index the non-code files that
+this PR consists of**, so the review could not be driven from RNA at all.
+
+| # | Tool wanted | What happened | Fallback used | Cost |
+|---|-------------|---------------|---------------|------|
+| 1 | The `bump-source` job in `.github/workflows/release.yml` — its steps, `runs-on`, and whether it installs a Rust toolchain | Workflow YAML is not indexed as symbols, so there is no `search(query="bump-source")` entry point. Bounded-span retrieval works but requires knowing the line range first, and the file length is not discoverable: `file+line=180+end_line=245` was rejected with `end line 245 is out of range (file has 239 lines)`. | `grep -n` to map job/step boundaries, then `sed -n` for the job body, then `ruby -ryaml` to confirm the parse and the `add-paths` list | 1 rejected span request + 3 shell invocations |
+| 2 | The `Cargo.lock` change — "is this one line or is a dependency bump hidden in 6,200 lines?" | `Cargo.lock` is not an indexed artifact and RNA has no diff projection, so the single highest-risk question in this PR is entirely outside RNA. | `git diff --numstat` plus a `grep "^[+-]"` filter, then a reproduction of `cargo update --workspace --offline` in a scratch worktree to compare blobs | 3 shell invocations |
+| 3 | Whether `node_modules/` over-matches anything tracked, and where the npm install that motivates it actually runs | `.gitignore` is not indexed, and ignore-rule-vs-tracked-path is not a graph question. | `git ls-files \| grep node_modules` and a repo grep for `npm install` | 2 shell invocations |
+
+RNA was used successfully for two bounded source spans
+(`src/structural_cache_replay.rs:1044-1064` to classify a stray `0.2.10` literal as
+a test fixture, and one flat `CARGO_PKG_VERSION` query to confirm the version
+string has no consumer affected by a lockfile-only change). Both answered cleanly
+and both were about Rust source — the only part of this PR RNA could see.
+
+The isolation flags held on this round: no `.oh/sessions/` or `.oh/friction-logs/`
+content was returned by either RNA call. That is weaker evidence than round 7's,
+because only two RNA queries were issued and neither was an exact symbol name of
+the kind that leaked in rounds 2-7.
+
+**Ask (new, and distinct from the standing asks above):** a release-engineering
+review has almost no RNA surface. Workflow YAML, `Cargo.lock`, `Cargo.toml`, and
+`.gitignore` are all unindexed, yet they are exactly the files a ship-step review
+of a release repair must reason about. Every finding in this round came from
+shell tooling. Either index CI/config files as first-class nodes, or accept that
+Step 10c on infrastructure PRs is a non-RNA workflow and stop counting it as
+friction.
+
+**Segment totals:** RNA MCP calls 3 (2 successful, 1 rejected as out-of-range).
+Raw fallbacks 8 shell invocations across 3 diagnosed gaps, plus `gh`/`git`
+verification calls that are outside RNA's scope by design and are not counted as
+friction. Reproductions: 3 (cold-cache `cargo update --offline`, warm-cache
+`cargo update --offline`, `cargo metadata --locked` on `origin/main` and on
+`bcca868d`). Scratch worktree removed; no source file modified.
