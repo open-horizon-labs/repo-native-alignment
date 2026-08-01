@@ -1849,6 +1849,19 @@ impl LspEnricher {
             telemetry.record_job_timeout();
         }
 
+        // Deliberately log-only, not a persisted job-ledger field. Per
+        // `.oh/metis/degraded-enrichment-needs-a-durable-negative-proof.md`,
+        // a durable negative proof matters for degraded output that could
+        // otherwise be silently promoted to "ready" after a restart. A source
+        // read failure does not have that shape: the record it affects is
+        // still explained by its own `recovery_disposition` and column-0
+        // anchor, both of which are already persisted, so there is no
+        // survives-a-restart correctness gap this closes by being durable —
+        // only an operability one (this count is not visible without reading
+        // logs from that specific run). Making it durable would mean a new
+        // persisted field on every ledger record or a job-level summary,
+        // which is a larger, separate change than #849's scope; tracked as a
+        // follow-up rather than done here.
         let source_read_failures = source_cache_for_diagnostics.read_failures();
         if source_read_failures > 0 {
             tracing::warn!(

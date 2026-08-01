@@ -927,6 +927,15 @@ fn canonical_operations_digest(requested_operations: &[String]) -> String {
 /// K-symbol file is read from disk K times per batch (ledger identity build,
 /// and again for each actual LSP request). Safe to share across concurrent
 /// lookups: reads race harmlessly onto the same cached `Arc<Vec<String>>`.
+///
+/// A FAILED read is deliberately never cached (see `lines()`), only a
+/// successful one. The trade-off: a file that is persistently unreadable for
+/// the whole pass — not merely transiently, which is the case this exists to
+/// handle — is re-read from disk on every lookup instead of once. That is the
+/// right default for a cache whose entire purpose is correctness of position
+/// data sent to a real language server; silently and permanently trusting a
+/// stale "no content" result for a file that might already be readable again
+/// is the worse failure mode.
 #[derive(Default)]
 pub(crate) struct SourceLineCache {
     lines_by_file: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
@@ -1310,29 +1319,44 @@ fn excluded_from_content_snapshot(relative: &Path, is_dir: bool) -> bool {
 /// or `go.mod` sitting under `env/`, `vendor/`, or any other excluded
 /// directory name never invalidated recovery, however it changed.
 ///
-/// Deliberately bounded rather than an unpruned walk: `max_depth` limits how
-/// far beneath the excluded directory this looks, and `max_entries_per_level`
-/// caps the cost of a single level even if it holds many entries. Declared
-/// patterns describe project-config files at or near a (sub)project root
-/// (`Cargo.toml`, `go.mod`, `pyproject.toml`), not content nested arbitrarily
-/// deep inside a dependency tree, so this does not need to be exhaustive to
-/// close the actual gap. The bound also means this can never degrade into
-/// scanning the full contents of a large `node_modules/`/`target/`: the
-/// overwhelming common case — an excluded directory with no influence match
-/// nearby — costs at most `max_entries_per_level` reads per level, not the
-/// size of the subtree, and returns nothing exactly as before this function
-/// existed.
+/// Deliberately bounded rather than an unpruned walk, but the bound applies
+/// only to RECURSION fan-out, never to whether a file at the current level is
+/// checked. `max_depth` limits how many directory levels this descends, and
+/// `max_subdirs_per_level` caps how many subdirectories it recurses into at
+/// each level — that is the actual cost driver, since each recursion is
+/// another `read_dir` call and an unbounded fan-out could multiply that across
+/// a directory with very many subdirectories. Checking a file's name against a
+/// handful of patterns is an in-memory string comparison with no I/O cost, so
+/// EVERY file at a level examined is checked; an earlier version of this
+/// function applied the bound before separating files from directories, so a
+/// match sitting past the Nth directory-listing entry (in arbitrary,
+/// filesystem-dependent order) was silently missed even at depth 1 — a
+/// correctness bug disguised as a performance bound, found and reproduced by
+/// an independent review with a 2,000-subdirectory synthetic `node_modules/`.
+///
+/// Declared patterns describe project-config files at or near a (sub)project
+/// root (`Cargo.toml`, `go.mod`, `pyproject.toml`), not content nested
+/// arbitrarily deep inside a dependency tree, so bounding depth and fan-out
+/// does not need to be exhaustive to close the actual gap. The bound still
+/// means this can never degrade into scanning the full contents of a large
+/// `node_modules/`/`target/`: the overwhelming common case — an excluded
+/// directory with no influence match nearby — costs at most
+/// `max_subdirs_per_level` recursive calls per level, not the size of the
+/// subtree, and returns nothing exactly as before this function existed.
+/// Subdirectories are sorted before the fan-out cap is applied, so which ones
+/// get recursed into is deterministic rather than dependent on `read_dir`'s
+/// arbitrary order.
 ///
 /// Everything this returns is a FILE matching a declared pattern. Anything
 /// else encountered along the way — a non-matching file, a directory beyond
-/// the depth bound — contributes nothing, so ordinary build noise inside an
-/// excluded directory still cannot invalidate recovery.
+/// the depth or fan-out bound — contributes nothing, so ordinary build noise
+/// inside an excluded directory still cannot invalidate recovery.
 fn find_influence_matches_under(
     root: &Path,
     directory: &Path,
     patterns: &[&str],
     max_depth: u32,
-    max_entries_per_level: usize,
+    max_subdirs_per_level: usize,
 ) -> Vec<PathBuf> {
     let mut matches = Vec::new();
     if max_depth == 0 {
@@ -1341,26 +1365,22 @@ fn find_influence_matches_under(
     let Ok(read_dir) = std::fs::read_dir(directory) else {
         return matches;
     };
-    for entry in read_dir
-        .filter_map(std::io::Result::ok)
-        .take(max_entries_per_level)
-    {
-        let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let is_dir = entry
+    let mut entries = read_dir.filter_map(std::io::Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    // Every FILE at this level is checked, unconditionally. This is the fix:
+    // a pattern match must never depend on where its entry happened to land in
+    // an arbitrary directory listing.
+    for entry in &entries {
+        if entry
             .file_type()
             .map(|file_type| file_type.is_dir())
-            .unwrap_or(false);
-        if is_dir {
-            matches.extend(find_influence_matches_under(
-                root,
-                &path,
-                patterns,
-                max_depth - 1,
-                max_entries_per_level,
-            ));
+            .unwrap_or(false)
+        {
             continue;
         }
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
         let relative_str = relative.to_string_lossy().replace('\\', "/");
         if patterns
             .iter()
@@ -1369,15 +1389,38 @@ fn find_influence_matches_under(
             matches.push(relative.to_path_buf());
         }
     }
+
+    // Only the RECURSION fan-out is bounded, since that is what could
+    // multiply cost across a directory with very many subdirectories.
+    for entry in entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .take(max_subdirs_per_level)
+    {
+        matches.extend(find_influence_matches_under(
+            root,
+            &entry.path(),
+            patterns,
+            max_depth - 1,
+            max_subdirs_per_level,
+        ));
+    }
     matches
 }
 
 /// How far beneath an otherwise fully-excluded directory
 /// `find_influence_matches_under` looks for a declared-pattern match, and how
-/// many entries it reads per level. Small and constant on purpose — see that
-/// function's doc comment for why exhaustive search is not required here.
+/// many SUBDIRECTORIES it recurses into per level (every file at a checked
+/// level is examined regardless of this cap — see that function's doc
+/// comment). Small and constant on purpose: bounds recursive fan-out, not
+/// correctness.
 const INFLUENCE_OVERRIDE_MAX_DEPTH: u32 = 2;
-const INFLUENCE_OVERRIDE_MAX_ENTRIES_PER_LEVEL: usize = 500;
+const INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL: usize = 500;
 
 fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
     // Per-path I/O errors are hashed as a sentinel rather than propagated.
@@ -1416,7 +1459,7 @@ fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
                         &path,
                         influence_patterns,
                         INFLUENCE_OVERRIDE_MAX_DEPTH,
-                        INFLUENCE_OVERRIDE_MAX_ENTRIES_PER_LEVEL,
+                        INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL,
                     ));
                 }
                 continue;
@@ -2461,6 +2504,33 @@ mod tests {
         }
     }
 
+    /// `SourceLineCache` is shared as one `Arc` across every concurrent Pass 1
+    /// worker task (see `passes.rs`, where `source_cache` is cloned into each
+    /// worker closure). `read_failures()` must accumulate correctly under that
+    /// real usage pattern, not only in a single-threaded call.
+    #[tokio::test]
+    async fn source_line_cache_read_failures_accumulate_correctly_across_concurrent_workers() {
+        let cache = Arc::new(SourceLineCache::default());
+        let mut workers = tokio::task::JoinSet::new();
+        const UNREADABLE_PATHS: usize = 20;
+        for i in 0..UNREADABLE_PATHS {
+            let cache = Arc::clone(&cache);
+            workers.spawn(async move {
+                // A path that does not exist fails `read_to_string` the same
+                // way a permission-denied path does, without needing root
+                // privileges to be absent for the assertion to hold.
+                let path = PathBuf::from(format!("/nonexistent-{i}/does-not-exist.rs"));
+                cache.lines(&path)
+            });
+        }
+        while workers.join_next().await.is_some() {}
+        assert_eq!(
+            cache.read_failures() as usize,
+            UNREADABLE_PATHS,
+            "every concurrent failure must be counted exactly once, with no lost updates"
+        );
+    }
+
     #[test]
     fn find_identifier_boundary_skips_rejected_multibyte_match_without_panicking() {
         // "π" at byte 1 is a substring of the longer identifier "aπ" and must
@@ -3293,6 +3363,61 @@ mod tests {
             with_node_modules,
             non_git_source_snapshot(root).unwrap(),
             "churn inside node_modules with no declared influence file must not invalidate"
+        );
+    }
+
+    /// A match must not depend on where its directory entry happened to land
+    /// in `read_dir`'s arbitrary (filesystem-dependent, not creation- or
+    /// name-ordered) listing. An earlier version of
+    /// `find_influence_matches_under` applied the subdirectory-count bound
+    /// BEFORE separating files from directories, so a match one level below a
+    /// directory with many siblings could be silently missed depending on
+    /// where its entry fell in that raw order — reproduced by an independent
+    /// review with a synthetic 2,000-subdirectory `node_modules/` and a match
+    /// in one of them. This reproduces the same shape and shows the fix: every
+    /// FILE at a level examined is now checked unconditionally, so the outcome
+    /// no longer depends on filesystem entry order at all.
+    ///
+    /// This does not claim files at arbitrary depth or fan-out are always
+    /// found — the subdirectory RECURSION is still bounded by
+    /// `INFLUENCE_OVERRIDE_MAX_SUBDIRS_PER_LEVEL`, which is deliberate (see
+    /// that constant's doc comment) and is exercised by
+    /// `content_snapshot_binds_declared_influence_files_inside_excluded_directories`'s
+    /// large-node_modules case above. What changed here is specifically:
+    /// whether a match get found no longer depends on incidental ordering.
+    #[test]
+    fn content_snapshot_finds_an_influence_match_regardless_of_listing_position() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        // 2,000 sibling directories, matching the scale of the independent
+        // review's reproduction. The match sits in the first, which is where
+        // the prior, unsorted, truncate-before-filtering bug could still fail
+        // depending on the filesystem's raw enumeration order -- this test
+        // does not depend on that order to demonstrate the point, since the
+        // fix makes file-level checking exhaustive at every level examined.
+        for i in 0..2000 {
+            std::fs::create_dir_all(root.join(format!("node_modules/pkg_{i}"))).unwrap();
+        }
+        std::fs::write(
+            root.join("node_modules/pkg_0/pyproject.toml"),
+            "[project]\nname = \"a\"\n",
+        )
+        .unwrap();
+
+        let baseline = non_git_source_snapshot(root).unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg_0/pyproject.toml"),
+            "[project]\nname = \"b\"\n",
+        )
+        .unwrap();
+        assert_ne!(
+            baseline,
+            non_git_source_snapshot(root).unwrap(),
+            "a declared influence file must be found regardless of directory listing order"
         );
     }
 
