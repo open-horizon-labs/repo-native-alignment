@@ -16,9 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::business_context::BusinessContextMode;
-use crate::extract::lsp::work_items::{
-    LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState, SourceLineCache,
-};
+use crate::extract::lsp::work_items::{LspWorkItemRecord, LspWorkItemRecovery, LspWorkItemState};
 use crate::extract::scan_stats::{
     LSP_VALIDATION_EVIDENCE_SCHEMA_VERSION, LspEnrichmentEntry, LspStatus, LspValidationEvidence,
     LspValidationStatus,
@@ -1506,7 +1504,6 @@ pub(crate) fn build_and_persist_report_from_evidence(
         _ => unreachable!("authorization/execution pairing was validated above"),
     };
     let work_items = select_work_items_for_report(
-        repo_root,
         crate::extract::lsp::work_items::load_all_records(repo_root)?,
         &related_ids,
         scan_started_at_ms,
@@ -1563,16 +1560,42 @@ fn filter_work_items_for_related_jobs(
 }
 
 fn select_work_items_for_report(
-    repo_root: &Path,
     records: Vec<LspWorkItemRecord>,
     related_job_ids: &BTreeSet<&str>,
     scan_started_at_ms: u64,
     nodes: &[Node],
     authenticated_producer_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<LspWorkItemRecord>> {
-    let current_source_snapshot =
-        crate::extract::lsp::work_items::current_source_snapshot_identity(repo_root)?;
-    let source_cache = SourceLineCache::default();
+    // Deliberately does NOT recompute the source snapshot or request anchor
+    // from the filesystem here.
+    //
+    // Freshness is the ledger's job: `LspWorkItemLedger::begin` compares every
+    // candidate's sealed identity against the snapshot and anchor captured at
+    // planning time, and only `CarriedExact` survives into a carried record.
+    // Re-deriving them here instead compared a record against the tree as it
+    // stands minutes later, which was either vacuous or harmful:
+    //
+    //   * vacuous for a single pass — every record in a job, new or carried,
+    //     necessarily holds that job's begin-time snapshot, because that is
+    //     what allowed the carry in the first place;
+    //   * harmful across passes and over time — each `begin()` captures its own
+    //     snapshot, so any write during the scan (a developer saving a file, a
+    //     language server writing into the tree, a later language pass)
+    //     desynchronised earlier passes and hard-failed the entire report.
+    //
+    // That is itself a way for verifier-clean carried evidence to become
+    // spuriously invalid between attempts, which is the defect #833 exists to
+    // remove. What remains below is integrity verification of the recorded
+    // work: current schema and planner contract, a recomputed identity digest,
+    // `input_hash == digest`, graph root/path agreement, and output-id
+    // agreement. Those are all fail-closed and none depend on scan timing.
+    //
+    // The invariants dropped here stay pinned on the ledger side, where they
+    // belong:
+    //   * `changed_request_anchor_replays_with_explainable_disposition`
+    //   * `changed_cross_file_config_snapshot_replays_instead_of_carrying_stale_output`
+    // both assert that a changed anchor or source snapshot reruns the work
+    // instead of carrying it.
     let nodes_by_id = nodes
         .iter()
         .map(|node| (node.stable_id(), node))
@@ -1625,13 +1648,6 @@ fn select_work_items_for_report(
                     != crate::extract::lsp::work_items::current_work_identity_schema_version()
                 || record.work_identity.planner_contract
                     != crate::extract::lsp::work_items::current_planner_contract_version()
-                || record.work_identity.source_snapshot != current_source_snapshot
-                || record.work_identity.request_anchor
-                    != crate::extract::lsp::work_items::current_request_anchor(
-                        repo_root,
-                        node,
-                        &source_cache,
-                    )
                 || record.work_identity.operations_digest
                     != crate::extract::lsp::work_items::requested_operations_digest(
                         &record.requested_operations,
@@ -3916,7 +3932,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         let selected = select_work_items_for_report(
-            repo.path(),
             records,
             &BTreeSet::from(["current-enrichment-job"]),
             10_000,
@@ -3973,7 +3988,6 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
-            repo.path(),
             vec![tampered],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4028,7 +4042,6 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
-            repo.path(),
             vec![stale_schema],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4076,7 +4089,6 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
-            repo.path(),
             vec![stale_planner],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4089,7 +4101,6 @@ mod tests {
 
     #[test]
     fn stale_recovered_operation_is_not_reported_without_current_plan_authority() {
-        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -4118,7 +4129,6 @@ mod tests {
         };
 
         let selected = select_work_items_for_report(
-            repo.path(),
             vec![stale],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4167,7 +4177,6 @@ mod tests {
 
         let authenticated = BTreeSet::from(["pass1-job:0".to_string()]);
         let selected = select_work_items_for_report(
-            repo.path(),
             vec![record(0, "references"), record(1, "document_links")],
             &BTreeSet::from(["pass1-job"]),
             10_000,
@@ -4185,7 +4194,6 @@ mod tests {
 
     #[test]
     fn duplicate_current_work_identity_fails_closed() {
-        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -4214,7 +4222,6 @@ mod tests {
         };
 
         let error = select_work_items_for_report(
-            repo.path(),
             vec![record(0), record(1)],
             &BTreeSet::from(["current-job"]),
             10_000,

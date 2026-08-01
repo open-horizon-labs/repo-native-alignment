@@ -1389,17 +1389,11 @@ pub(crate) fn work_identity_digest(identity: &LspWorkIdentity) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-pub(crate) fn current_source_snapshot_identity(repo_root: &Path) -> Result<String> {
-    source_snapshot_identity(repo_root)
-}
-
-pub(crate) fn current_request_anchor(
-    repo_root: &Path,
-    node: &Node,
-    cache: &SourceLineCache,
-) -> String {
-    request_anchor(repo_root, node, cache)
-}
+// `current_source_snapshot_identity` and `current_request_anchor` were the
+// report path's filesystem re-derivation hooks. They are gone with that check:
+// freshness is settled by `identity_disposition` at `begin`, and re-deriving
+// either one at report time was vacuous within a pass and desynchronising
+// across passes. See the comment in `select_work_items_for_report`.
 
 pub(crate) const fn current_work_identity_schema_version() -> u32 {
     WORK_IDENTITY_SCHEMA_VERSION
