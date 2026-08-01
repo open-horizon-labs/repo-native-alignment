@@ -133,9 +133,15 @@ pub struct LspWorkItemRecord {
     #[serde(default)]
     pub work_identity: LspWorkIdentity,
     #[serde(default)]
+    // No `recovery_source_job_id`: it was persisted and hashed into the
+    // integrity digest but never read, rendered, or asserted anywhere, and it
+    // was degenerate besides — `select_recovery_job` reuses the recovered job's
+    // id and adopts records only from that one job, so the value was always
+    // either absent or the current `job_id`. Recovery lineage is delivered by
+    // `job_id` plus `recovery_disposition`, both of which reach the queue
+    // snapshot and `list_roots`. Deserialization ignores the key, so ledgers
+    // written by earlier builds still load.
     pub recovery_disposition: LspRecoveryDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery_source_job_id: Option<String>,
     #[serde(default)]
     pub integrity_digest: String,
     #[serde(default)]
@@ -461,14 +467,27 @@ impl LspWorkItemLedger {
                 }
             };
             let is_exact = disposition == LspRecoveryDisposition::CarriedExact;
-            let recovery_source_job_id = prior_record.as_ref().map(|record| record.job_id.clone());
             let mut record = if is_exact {
                 prior_record.expect("exact disposition requires a prior record")
             } else {
                 let mut record =
                     new_record(repo_root, &job_id, seed, current_identity.clone(), now);
                 record.recovery_disposition = disposition;
-                record.recovery_source_job_id = recovery_source_job_id;
+                // Carry the retry budget across a rebuild.
+                //
+                // Seeds are always constructed with `attempt_count: 1`, and the
+                // rebuild path below `continue`s past the `MAX_ATTEMPTS` branch
+                // in the resume arm. Without inheriting the prior count, a
+                // disposition that never consults `identity_disposition` --
+                // `RerunSchema` and `RejectedTampered` while the record is
+                // unresolved -- produces a fresh attempt-1 record on every
+                // resume, so a persistently failing item retries forever and
+                // never exhausts. The `STORE_SCHEMA_VERSION` bump in this change
+                // stamps every pre-existing record `RerunSchema` + `Failed`,
+                // which is exactly that state.
+                if let Some(prior) = prior_record.as_ref() {
+                    record.attempt_count = prior.attempt_count.saturating_add(1);
+                }
                 if disposition != LspRecoveryDisposition::New {
                     record.last_error =
                         Some(format!("recovery disposition: {}", disposition.as_str()));
@@ -487,14 +506,31 @@ impl LspWorkItemLedger {
             record.work_identity = current_identity;
             if is_exact {
                 record.recovery_disposition = LspRecoveryDisposition::CarriedExact;
-                record.recovery_source_job_id = Some(job_id.clone());
             }
             record.requested_operations = seed.requested_operations.clone();
             record.schema_version = STORE_SCHEMA_VERSION;
             record.updated_at_ms = now;
 
             if !is_exact {
-                runnable_item_ids.insert(seed.item_id);
+                // Same retry budget the resume arm enforces. A rebuilt record
+                // that has already burned its attempts must exhaust here rather
+                // than be queued again, otherwise the inherited count above has
+                // nothing to act on.
+                if record.attempt_count >= MAX_ATTEMPTS {
+                    record.state = LspWorkItemState::Exhausted;
+                    record.recovery = LspWorkItemRecovery::Exhausted;
+                    record.output_edges.clear();
+                    record.output_nodes.clear();
+                    record.produced_result_ids.clear();
+                    record.completed_at_ms = Some(now);
+                    record.last_error = Some(format!(
+                        "retry budget exhausted after {} attempts while rebuilding for {}",
+                        record.attempt_count,
+                        disposition.as_str()
+                    ));
+                } else {
+                    runnable_item_ids.insert(seed.item_id);
+                }
                 store
                     .records
                     .insert(record_key(&job_id, seed.item_id), record);
@@ -854,7 +890,6 @@ fn new_record(
         input_hash,
         work_identity,
         recovery_disposition: LspRecoveryDisposition::New,
-        recovery_source_job_id: None,
         integrity_digest: String::new(),
         requested_operations: seed.requested_operations.clone(),
         state: LspWorkItemState::Pending,
@@ -1016,77 +1051,150 @@ pub(super) fn source_request_position(
     (zero_based_line, zero_based_character)
 }
 
-fn update_path_identity(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect source snapshot path {}", path.display()))?;
+/// Fold one path's identity into `hasher`.
+///
+/// Infallible by design. An unreadable path hashes an `unreadable` sentinel
+/// instead of propagating: this runs over whole directory trees, and letting a
+/// single permission-denied path or a file deleted mid-walk abort the caller
+/// disabled LSP enrichment for the entire repository. The sentinel still
+/// changes the digest, so affected work reruns rather than being carried.
+///
+/// `root` scopes the exclusion check so the directory recursion skips nested
+/// `.git` directories and build output for the same reasons
+/// `non_git_source_snapshot` does.
+fn update_path_identity(hasher: &mut blake3::Hasher, root: &Path, path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        hasher.update(b"unreadable");
+        return;
+    };
     if metadata.file_type().is_symlink() {
         hasher.update(b"symlink");
-        let target = std::fs::read_link(path)
-            .with_context(|| format!("failed to read source symlink {}", path.display()))?;
-        hasher.update(target.to_string_lossy().as_bytes());
+        match std::fs::read_link(path) {
+            Ok(target) => hasher.update(target.to_string_lossy().as_bytes()),
+            Err(_) => hasher.update(b"unreadable"),
+        };
     } else if metadata.is_file() {
         hasher.update(b"file");
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read source snapshot file {}", path.display()))?;
-        hasher.update(blake3::hash(&bytes).as_bytes());
+        match std::fs::read(path) {
+            Ok(bytes) => hasher.update(blake3::hash(&bytes).as_bytes()),
+            Err(_) => hasher.update(b"unreadable"),
+        };
     } else if metadata.is_dir() {
         hasher.update(b"directory");
-        let mut entries = std::fs::read_dir(path)?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| {
-                format!(
-                    "failed to read source snapshot directory {}",
-                    path.display()
-                )
-            })?;
+        let Ok(read_dir) = std::fs::read_dir(path) else {
+            hasher.update(b"unreadable");
+            return;
+        };
+        let mut entries = read_dir.filter_map(std::io::Result::ok).collect::<Vec<_>>();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
+            let child = entry.path();
+            let relative = child.strip_prefix(root).unwrap_or(&child).to_path_buf();
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if excluded_from_content_snapshot(&relative, is_dir) {
+                continue;
+            }
             hasher.update(entry.file_name().to_string_lossy().as_bytes());
             hasher.update(&[0]);
-            update_path_identity(hasher, &entry.path())?;
+            update_path_identity(hasher, root, &child);
             hasher.update(&[0]);
         }
     } else {
         hasher.update(b"missing");
     }
-    Ok(())
+}
+
+/// True for directories that must never contribute to a content snapshot.
+///
+/// `.git` is matched at *any* depth, not just the root: a vendored dependency
+/// or submodule carries its own `.git` whose `index`, `logs/HEAD`,
+/// `FETCH_HEAD`, and `packed-refs` churn on ordinary Git activity, which would
+/// make the snapshot nondeterministic across runs that changed no source.
+///
+/// The scanner's `DEFAULT_EXCLUDES` are honored for the same reason the
+/// scanner honors them: `target/`, `node_modules/`, `.venv/` and friends are
+/// build output, not source. Hashing them made every LSP recovery on a non-Git
+/// root depend on whether a build had run.
+fn excluded_from_content_snapshot(relative: &Path, is_dir: bool) -> bool {
+    if relative == Path::new(".oh/.cache") || relative.starts_with(".oh/.cache/") {
+        return true;
+    }
+    if relative
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return true;
+    }
+    let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    crate::scanner::DEFAULT_EXCLUDES.iter().any(|pattern| {
+        if let Some(directory) = pattern.strip_suffix('/') {
+            // Directory pattern, e.g. `node_modules/` or `target*/`.
+            return is_dir
+                && match directory.strip_suffix('*') {
+                    Some(prefix) => name.starts_with(prefix),
+                    None => name == directory,
+                };
+        }
+        if let Some(extension) = pattern.strip_prefix("*.") {
+            // File pattern, e.g. `*.pyc` — build artifacts the scanner skips
+            // and whose churn must not invalidate recovery.
+            return !is_dir && name.ends_with(extension) && name.len() > extension.len();
+        }
+        !is_dir && name == *pattern
+    })
 }
 
 fn non_git_source_snapshot(repo_root: &Path) -> Result<String> {
-    fn visit(root: &Path, directory: &Path, rows: &mut Vec<PathBuf>) -> Result<()> {
-        let mut entries = std::fs::read_dir(directory)
-            .with_context(|| format!("failed to read source directory {}", directory.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
+    // Per-path I/O errors are hashed as a sentinel rather than propagated.
+    // Propagating them made `begin` fail, which made `run_pass1` start no work
+    // at all: one unreadable unrelated file (a permission-denied path, or a
+    // file deleted between the directory read and the stat) disabled LSP
+    // enrichment for the whole repository. A sentinel still changes the digest,
+    // so the affected work reruns rather than being carried.
+    fn visit(root: &Path, directory: &Path, rows: &mut Vec<PathBuf>) {
+        let Ok(read_dir) = std::fs::read_dir(directory) else {
+            rows.push(
+                directory
+                    .strip_prefix(root)
+                    .unwrap_or(directory)
+                    .to_path_buf(),
+            );
+            return;
+        };
+        let mut entries = read_dir.filter_map(std::io::Result::ok).collect::<Vec<_>>();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            if relative == Path::new(".git")
-                || relative.starts_with(".git/")
-                || relative == Path::new(".oh/.cache")
-                || relative.starts_with(".oh/.cache/")
-            {
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if excluded_from_content_snapshot(&relative, is_dir) {
                 continue;
             }
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.is_dir() {
-                visit(root, &path, rows)?;
+            if is_dir {
+                visit(root, &path, rows);
             } else {
-                rows.push(relative.to_path_buf());
+                rows.push(relative);
             }
         }
-        Ok(())
     }
 
     let mut rows = Vec::new();
-    visit(repo_root, repo_root, &mut rows)?;
+    visit(repo_root, repo_root, &mut rows);
     rows.sort();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"rna-lsp-source-snapshot-non-git-v1");
+    hasher.update(b"rna-lsp-source-snapshot-non-git-v2");
     for relative in rows {
         hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update(&[0]);
-        update_path_identity(&mut hasher, &repo_root.join(&relative))?;
+        update_path_identity(&mut hasher, repo_root, &repo_root.join(&relative));
         hasher.update(&[0]);
     }
     Ok(format!("content:{}", hasher.finalize().to_hex()))
@@ -1241,7 +1349,7 @@ fn ignored_lsp_influence_identity(repo_root: &Path) -> Result<Option<String>> {
     for relative in paths {
         hasher.update(relative.as_bytes());
         hasher.update(&[0]);
-        update_path_identity(&mut hasher, &repo_root.join(&relative))?;
+        update_path_identity(&mut hasher, repo_root, &repo_root.join(&relative));
         hasher.update(&[0]);
     }
     Ok(Some(hasher.finalize().to_hex().to_string()))
@@ -1337,7 +1445,7 @@ fn source_snapshot_identity(repo_root: &Path) -> Result<String> {
         hasher.update(&[0]);
         let path = repo_root.join(&relative);
         if path.exists() || path.is_symlink() {
-            update_path_identity(&mut hasher, &path)?;
+            update_path_identity(&mut hasher, repo_root, &path);
         } else {
             hasher.update(b"deleted");
         }
@@ -2497,6 +2605,122 @@ mod tests {
             resumed.store.lock().unwrap().records["sticky-schema-job:0"].recovery_disposition,
             LspRecoveryDisposition::CarriedExact,
             "the stale rerun_schema label must not persist after the rerun completed"
+        );
+    }
+
+    /// A rebuilt record must inherit the retry budget. Seeds always carry
+    /// `attempt_count: 1` and the rebuild path skips the resume arm's
+    /// `MAX_ATTEMPTS` check, so without inheritance a persistently failing item
+    /// restarts at attempt 1 on every resume and never exhausts. The
+    /// `STORE_SCHEMA_VERSION` bump puts every pre-existing record into exactly
+    /// that state, so this is reachable on the first upgrade.
+    #[tokio::test]
+    async fn rebuilt_schema_work_exhausts_instead_of_retrying_forever() {
+        let repo = tempfile::tempdir().unwrap();
+        let ledger =
+            LspWorkItemLedger::begin_with_job_id(repo.path(), "exhaust-job".to_string(), &seeds(1))
+                .await
+                .unwrap();
+        ledger.mark_failed(0, "server crashed").await.unwrap();
+        let mut legacy_store = load_store(repo.path()).unwrap();
+        legacy_store.schema_version = 1;
+        for record in legacy_store.records.values_mut() {
+            record.schema_version = 1;
+        }
+        std::fs::write(
+            store_path(repo.path()),
+            serde_json::to_vec_pretty(&legacy_store).unwrap(),
+        )
+        .unwrap();
+
+        // Resume 1: rebuilt as RerunSchema, budget inherited (1 -> 2), still runnable.
+        let first = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+            .await
+            .unwrap();
+        assert!(first.should_run(0));
+        assert_eq!(
+            first.store.lock().unwrap().records["exhaust-job:0"].attempt_count,
+            2,
+            "rebuild must inherit the prior attempt count, not reset to 1"
+        );
+        first.mark_failed(0, "server crashed again").await.unwrap();
+        first.flush().await.unwrap();
+
+        // Resume 2: budget reaches MAX_ATTEMPTS, so the item must exhaust.
+        let second = LspWorkItemLedger::begin(repo.path(), &seeds(1))
+            .await
+            .unwrap();
+        assert!(
+            !second.should_run(0),
+            "an item past its retry budget must not be queued again"
+        );
+        let store = second.store.lock().unwrap();
+        let record = &store.records["exhaust-job:0"];
+        assert_eq!(record.state, LspWorkItemState::Exhausted);
+        assert_eq!(record.attempt_count, MAX_ATTEMPTS);
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("retry budget exhausted")
+        );
+    }
+
+    /// The content snapshot must ignore build output and nested repository
+    /// internals. Hashing them made every non-Git recovery depend on whether a
+    /// build had run, and a vendored `.git`'s `index`/`logs` churn made the
+    /// digest nondeterministic across runs that changed no source.
+    #[test]
+    fn content_snapshot_ignores_build_output_and_nested_git() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/artifact"), "one").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "one").unwrap();
+        // `third_party/` is deliberately NOT in DEFAULT_EXCLUDES, so this
+        // exercises nested-`.git` exclusion on its own rather than riding on a
+        // wholly excluded parent directory.
+        std::fs::create_dir_all(root.join("third_party/dep/.git/logs")).unwrap();
+        std::fs::write(root.join("third_party/dep/.git/index"), "one").unwrap();
+        std::fs::write(root.join("third_party/dep/.git/logs/HEAD"), "one").unwrap();
+        std::fs::write(root.join("third_party/dep/lib.rs"), "pub fn dep() {}\n").unwrap();
+        std::fs::write(root.join("src/main.pyc"), "one").unwrap();
+
+        let baseline = non_git_source_snapshot(root).unwrap();
+
+        // Churn in build output, an ignored file type, and a nested
+        // repository's internals.
+        std::fs::write(root.join("target/debug/artifact"), "two").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "two").unwrap();
+        std::fs::write(root.join("third_party/dep/.git/index"), "two").unwrap();
+        std::fs::write(root.join("third_party/dep/.git/logs/HEAD"), "two").unwrap();
+        std::fs::write(root.join("src/main.pyc"), "two").unwrap();
+        assert_eq!(
+            baseline,
+            non_git_source_snapshot(root).unwrap(),
+            "build output, *.pyc, and nested .git internals must not change the snapshot"
+        );
+
+        // Real source still moves the digest.
+        std::fs::write(root.join("src/main.rs"), "fn main() { work() }\n").unwrap();
+        let after_source = non_git_source_snapshot(root).unwrap();
+        assert_ne!(baseline, after_source, "source changes must invalidate");
+
+        // Source in a nested repository's working tree is still source: only
+        // the `.git` directory itself is skipped.
+        std::fs::write(
+            root.join("third_party/dep/lib.rs"),
+            "pub fn dep(x: u8) {}\n",
+        )
+        .unwrap();
+        assert_ne!(
+            after_source,
+            non_git_source_snapshot(root).unwrap(),
+            "source beside a nested .git must still invalidate"
         );
     }
 

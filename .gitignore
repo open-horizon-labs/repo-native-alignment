@@ -7,3 +7,7 @@
 .claude/worktrees/
 .mcp.json
 target-574/
+
+# Python bytecode caches (never belong in the repo)
+__pycache__/
+*.pyc
