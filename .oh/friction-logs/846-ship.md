@@ -306,7 +306,8 @@ record cannot tell a stale index from a wrong document; here the two differed
 suppressed `.oh/` content, 1 returned a stale constant value). Raw fallbacks 11
 shell invocations plus 1 direct read, across 5 diagnosed gaps; `gh`/`git`/
 `shasum` evidence checks against the published release are outside RNA's scope by
-design and are not counted as friction. Reproductions: 8 (`awk` against the real
-`Cargo.lock` and 5 synthetic adversarial lockfiles, the three assertion failure
-paths against synthetic `marketplace.json` inputs, and `cargo metadata --locked`
-on both sides). Scratch worktree removed; no source file modified.
+design and are not counted as friction. Reproductions: 11 command executions — `awk` against
+the real `Cargo.lock` (1) and 5 synthetic adversarial lockfiles (5), the three
+assertion failure paths against synthetic `marketplace.json` inputs (3), and
+`cargo metadata --locked` on both sides (2). Counted as individual command
+executions, not as logical cases. Scratch worktree removed; no source file modified.
