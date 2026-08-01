@@ -14,10 +14,14 @@ use serde::{Deserialize, Serialize};
 use crate::graph::{Edge, Node};
 
 pub(crate) const STORE_SCHEMA_VERSION: u32 = 5;
-// Bumped to 2 when `request_anchor` stopped hashing the load-derived
-// `Node::language`. The anchor format changed, so prior identities must rebuild
-// rather than migrate.
-const WORK_IDENTITY_SCHEMA_VERSION: u32 = 2;
+// 2: `request_anchor` stopped hashing the load-derived `Node::language`.
+// 3: position resolution now prefers a source-verified `name_col`, which moves
+//    the anchor column for any node whose name also occurs earlier on its start
+//    line (a Go method on its receiver type, a C++ constructor, a name mentioned
+//    in a leading comment).
+// Each bump changes the anchor format, so prior identities rebuild rather than
+// migrate.
+const WORK_IDENTITY_SCHEMA_VERSION: u32 = 3;
 const PLANNER_CONTRACT_VERSION: &str = "lsp-pass1-work-planner-v1";
 const STORE_FILE: &str = "lsp_pass1_work_items.json";
 const MAX_RETAINED_ACTIVE_JOBS: usize = 32;
@@ -1028,6 +1032,46 @@ fn request_anchor(repo_root: &Path, node: &Node, cache: &SourceLineCache) -> Str
     )
 }
 
+/// The part of a request anchor derivable from an in-memory node with no file
+/// access: root, repo-relative file, and zero-based line.
+///
+/// The completeness report deliberately does not re-derive a full anchor, since
+/// that re-read the filesystem long after the identity was sealed and turned any
+/// concurrent write into a hard report failure. But the position must still be
+/// bound to the node the report is about, otherwise a record sealed for line 0
+/// is accepted for a node that now sits at line 500. This prefix restores that
+/// binding at zero I/O cost; only the column, which genuinely needs the file, is
+/// left unchecked there.
+pub(crate) fn request_anchor_position_prefix(repo_root: &Path, node: &Node) -> String {
+    let relative_file = if node.id.file.is_absolute() {
+        node.id
+            .file
+            .strip_prefix(repo_root)
+            .unwrap_or(&node.id.file)
+            .to_path_buf()
+    } else {
+        node.id.file.clone()
+    };
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        node.id.root,
+        relative_file.to_string_lossy().replace('\\', "/"),
+        node.line_start.saturating_sub(1)
+    )
+}
+
+/// The same three leading fields taken from an already-sealed anchor string.
+pub(crate) fn sealed_anchor_position_prefix(anchor: &str) -> Option<&str> {
+    let mut boundaries = anchor
+        .char_indices()
+        .filter(|(_, character)| *character == '\u{1f}')
+        .map(|(index, _)| index);
+    boundaries.next()?;
+    boundaries.next()?;
+    let third = boundaries.next()?;
+    Some(&anchor[..third])
+}
+
 pub(super) fn source_request_position(
     repo_root: &Path,
     node: &Node,
@@ -1037,10 +1081,33 @@ pub(super) fn source_request_position(
     let zero_based_line = node.line_start.saturating_sub(1) as u32;
     let lines = cache.lines(&source_path);
     let line = lines.get(zero_based_line as usize);
-    let zero_based_character = line
-        .and_then(|line| {
-            find_identifier_boundary(line, &node.id.name)
-                .map(|byte| line[..byte].encode_utf16().count() as u32)
+    // Resolution order matters, and each step exists for a defect the previous
+    // ordering caused:
+    //
+    // 1. The recorded `name_col`, but only once verified to still carry the
+    //    node's name at that exact column in the CURRENT source. A bare
+    //    first-occurrence scan cannot tell a declaration from an earlier use of
+    //    the same word on the same line: for
+    //    `func (s *Server) Server() string`, the `Server` method node scans to
+    //    the receiver type at column 9 instead of the method at column 17, so
+    //    the language server is asked about the type and its references are
+    //    attributed to the method — wrong edges, not missing ones. Verifying
+    //    against current source means this is not a stale-metadata read: a
+    //    column that no longer matches is rejected.
+    // 2. Otherwise scan the line for the name at an identifier boundary, which
+    //    covers nodes whose extractor never recorded a column and repairs a
+    //    recorded column that source edits have moved.
+    // 3. Otherwise the recorded column unverified, for nodes whose name is not a
+    //    source token at all (markdown AST nodes carry a synthesized path like
+    //    `README.md::body::ast:link[0]`), which would otherwise collapse every
+    //    such node on the line to column 0.
+    // 4. Otherwise column 0.
+    let zero_based_character = verified_name_col_utf16(node, line)
+        .or_else(|| {
+            line.and_then(|line| {
+                find_identifier_boundary(line, &node.id.name)
+                    .map(|byte| line[..byte].encode_utf16().count() as u32)
+            })
         })
         .or_else(|| recorded_name_col_utf16(node, line))
         .unwrap_or(0);
@@ -1063,6 +1130,33 @@ pub(super) fn source_request_position(
 /// through to here. `name_col` is persisted as a typed Arrow column and
 /// restored on load, so the fallback is reconstruction-stable rather than a
 /// re-extraction artefact.
+/// The recorded `name_col`, accepted only if the current source still carries
+/// the node's name at exactly that column, on identifier boundaries.
+///
+/// This is what distinguishes a declaration from an earlier use of the same word
+/// on the same line, which a first-occurrence scan cannot do. Because the column
+/// is confirmed against the file as it exists now, a stale or moved column is
+/// rejected rather than trusted — so this is a source-verified position, not a
+/// reconstruction-time artefact. Costs no extra I/O: the line is already cached.
+fn verified_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
+    let byte = node.metadata.get("name_col")?.parse::<usize>().ok()?;
+    let line = line?;
+    if byte > line.len() || !line.is_char_boundary(byte) {
+        return None;
+    }
+    if !line[byte..].starts_with(node.id.name.as_str()) {
+        return None;
+    }
+    let end = byte + node.id.name.len();
+    let bytes = line.as_bytes();
+    let starts_cleanly = byte == 0 || !is_identifier_continue(bytes[byte - 1]);
+    let ends_cleanly = end == bytes.len() || !is_identifier_continue(bytes[end]);
+    if !starts_cleanly || !ends_cleanly {
+        return None;
+    }
+    Some(line[..byte].encode_utf16().count() as u32)
+}
+
 fn recorded_name_col_utf16(node: &Node, line: Option<&String>) -> Option<u32> {
     let byte = node.metadata.get("name_col")?.parse::<usize>().ok()?;
     let line = line?;
@@ -2809,6 +2903,59 @@ mod tests {
         link.metadata
             .insert("name_col".to_string(), "9999".to_string());
         assert_eq!(source_request_position(repo.path(), &link, &cache), (0, 0));
+    }
+
+    /// A name that also occurs EARLIER on its own start line must not steal the
+    /// request position.
+    ///
+    /// `func (s *Server) Server() string` has `Server` twice: the receiver type
+    /// at column 9 and the method at column 17. A first-occurrence boundary scan
+    /// picks the type, so the language server is asked about the type and its
+    /// references get attributed to the method node — wrong edges, not merely
+    /// missing ones. Both occurrences sit on identifier boundaries, so the
+    /// boundary check alone cannot separate them; only the recorded column can,
+    /// and it is verified against current source before use.
+    #[test]
+    fn a_name_recurring_earlier_on_the_line_does_not_steal_the_position() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let cache = SourceLineCache::default();
+
+        // Go method whose receiver type shares its name.
+        std::fs::write(
+            repo.path().join("src/srv.go"),
+            "func (s *Server) Server() string { return s.name }\n",
+        )
+        .unwrap();
+        let mut method = node("Server");
+        method.id.file = PathBuf::from("src/srv.go");
+        method.id.name = "Server".to_string();
+        method.line_start = 1;
+        method
+            .metadata
+            .insert("name_col".to_string(), "17".to_string());
+        assert_eq!(
+            source_request_position(repo.path(), &method, &cache),
+            (0, 17),
+            "must target the method at column 17, not the receiver type at 9"
+        );
+
+        // A name mentioned in a leading comment on the same line.
+        std::fs::write(
+            repo.path().join("src/item_0.rs"),
+            "/* item_0 helper */ fn item_0() {}\n",
+        )
+        .unwrap();
+        let mut commented = node("item_0");
+        commented.line_start = 1;
+        commented
+            .metadata
+            .insert("name_col".to_string(), "23".to_string());
+        assert_eq!(
+            source_request_position(repo.path(), &commented, &cache),
+            (0, 23),
+            "must target the declaration, not the mention inside the comment"
+        );
     }
 
     /// Source derivation stays primary: when the name IS in the line, a stale

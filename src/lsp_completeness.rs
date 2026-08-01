@@ -1504,6 +1504,7 @@ pub(crate) fn build_and_persist_report_from_evidence(
         _ => unreachable!("authorization/execution pairing was validated above"),
     };
     let work_items = select_work_items_for_report(
+        repo_root,
         crate::extract::lsp::work_items::load_all_records(repo_root)?,
         &related_ids,
         scan_started_at_ms,
@@ -1560,6 +1561,7 @@ fn filter_work_items_for_related_jobs(
 }
 
 fn select_work_items_for_report(
+    repo_root: &Path,
     records: Vec<LspWorkItemRecord>,
     related_job_ids: &BTreeSet<&str>,
     scan_started_at_ms: u64,
@@ -1655,6 +1657,22 @@ fn select_work_items_for_report(
                 || record.work_identity.digest
                     != crate::extract::lsp::work_items::work_identity_digest(&record.work_identity)
                 || record.input_hash != record.work_identity.digest
+                // Bind the sealed anchor to the node this report is about, using
+                // only the part derivable without touching the filesystem: root,
+                // repo-relative file, and line. Without this the position was
+                // unchecked here, so a record sealed for line 0 was accepted for
+                // a node that had since moved to line 500. The column is
+                // deliberately still unchecked — deriving it needs the file, and
+                // re-reading the file at report time is exactly what was removed.
+                || crate::extract::lsp::work_items::sealed_anchor_position_prefix(
+                    &record.work_identity.request_anchor,
+                )
+                .is_none_or(|sealed| {
+                    sealed
+                        != crate::extract::lsp::work_items::request_anchor_position_prefix(
+                            repo_root, node,
+                        )
+                })
             {
                 anyhow::bail!(
                     "recovered LSP work identity mismatch for {}:{}",
@@ -3718,6 +3736,67 @@ mod tests {
         .unwrap()
     }
 
+    /// A recovered record must be bound to the position it was sealed for.
+    ///
+    /// The report deliberately no longer re-derives an anchor from the
+    /// filesystem, but dropping the check entirely let a record sealed for one
+    /// line be accepted for a node that had since moved elsewhere in the file.
+    /// The root/file/line prefix is derivable from the in-memory node at zero I/O
+    /// cost, so that much must still be verified; only the column is exempt.
+    #[test]
+    fn recovered_record_sealed_for_another_line_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
+        let operations = vec!["definitions".to_string()];
+        let mut source = Node {
+            id: NodeId {
+                root: "fixture".to_string(),
+                file: PathBuf::from("src/moved.rs"),
+                name: "moved".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn moved()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let work_identity = fixture_work_identity(repo.path(), &source, &operations);
+        let record = LspWorkItemRecord {
+            job_id: "current-job".to_string(),
+            root: source.id.root.clone(),
+            file: source.id.file.to_string_lossy().into_owned(),
+            node_id: source.stable_id(),
+            requested_operations: operations.clone(),
+            state: LspWorkItemState::Completed,
+            updated_at_ms: 20_000,
+            recovery: LspWorkItemRecovery::CarriedCompleted,
+            input_hash: work_identity.digest.clone(),
+            work_identity,
+            ..LspWorkItemRecord::default()
+        };
+
+        // Same node, same file, but it now starts far down the file. The sealed
+        // anchor still names line 0.
+        source.line_start = 500;
+        source.line_end = 500;
+
+        let error = select_work_items_for_report(
+            repo.path(),
+            vec![record],
+            &BTreeSet::from(["current-job"]),
+            10_000,
+            std::slice::from_ref(&source),
+            None,
+        )
+        .expect_err("a record sealed for another line must not be accepted");
+        assert!(
+            error.to_string().contains("identity mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn dockerfile_variants_share_config_inventory_and_descriptor() {
         let repo = tempfile::tempdir().unwrap();
@@ -3932,6 +4011,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let selected = select_work_items_for_report(
+            repo.path(),
             records,
             &BTreeSet::from(["current-enrichment-job"]),
             10_000,
@@ -3988,6 +4068,7 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
+            repo.path(),
             vec![tampered],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4042,6 +4123,7 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
+            repo.path(),
             vec![stale_schema],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4089,6 +4171,7 @@ mod tests {
             ..LspWorkItemRecord::default()
         };
         let error = select_work_items_for_report(
+            repo.path(),
             vec![stale_planner],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4101,6 +4184,7 @@ mod tests {
 
     #[test]
     fn stale_recovered_operation_is_not_reported_without_current_plan_authority() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -4129,6 +4213,7 @@ mod tests {
         };
 
         let selected = select_work_items_for_report(
+            repo.path(),
             vec![stale],
             &BTreeSet::from(["current-job"]),
             10_000,
@@ -4177,6 +4262,7 @@ mod tests {
 
         let authenticated = BTreeSet::from(["pass1-job:0".to_string()]);
         let selected = select_work_items_for_report(
+            repo.path(),
             vec![record(0, "references"), record(1, "document_links")],
             &BTreeSet::from(["pass1-job"]),
             10_000,
@@ -4194,6 +4280,7 @@ mod tests {
 
     #[test]
     fn duplicate_current_work_identity_fails_closed() {
+        let repo = tempfile::tempdir().unwrap();
         let source = Node {
             id: NodeId {
                 root: "fixture".to_string(),
@@ -4222,6 +4309,7 @@ mod tests {
         };
 
         let error = select_work_items_for_report(
+            repo.path(),
             vec![record(0), record(1)],
             &BTreeSet::from(["current-job"]),
             10_000,
