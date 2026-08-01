@@ -211,6 +211,11 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
           sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+          # Cargo.lock records the workspace member's own version, so bumping
+          # Cargo.toml without it leaves main unbuildable under --locked.
+          # --offline touches only the workspace member, never dependencies.
+          cargo update --workspace --offline
+          cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Create version bump PR
         id: bump-pr
@@ -224,6 +229,7 @@ jobs:
           base: main
           add-paths: |
             Cargo.toml
+            Cargo.lock
             .claude-plugin/marketplace.json
 
       - name: Enable auto-merge

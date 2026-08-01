@@ -163,3 +163,26 @@ chunks of this friction log, exposing prior rounds' finding labels and verdicts
 to a reviewer explicitly told not to read them. Independent review is a
 first-class RNA workflow; ranked markdown outranking an exact-named symbol
 lookup is a correctness bug for that workflow, not just noise.
+
+## Segment: Ship Step 10c independent final-diff review (round 7)
+
+Reviewer: independent code reviewer, no implementation context. Commit
+`c608276940ae2b8bc09f14f61aefc04f06e7954c`. Isolation flags
+`include_artifacts: false` + `include_markdown: false` on every RNA search.
+
+| # | Tool wanted | What happened | Fallback used | Cost |
+|---|-------------|---------------|---------------|------|
+| 1 | `search(query="retain_recent_jobs", include_body=true)` | Rejected: `include_body requires 'node' or 'nodes' parameter`. A flat query cannot ask for a body in one call; it needs a second round trip to resolve the node ID first. | `grep -n "fn retain_recent_jobs" -A 45` | 1 wasted MCP call + 1 grep |
+| 2 | Field lists for `Node`, `Edge`, `LspWorkItemRecord` (needed to reason about serde round-trip determinism of the new `integrity_digest`) | `search(kind="struct", compact=true)` returns signature + location only; struct field lists are not retrievable without the node-ID round trip from #1. | `grep -n "pub struct ..." -A N` | 3 greps |
+| 3 | Callers of `source_snapshot_identity` / `node_lsp_position` | Known degradation: no LSP enrichment in this worktree, so `Calls`/`ReferencedBy` edges are absent and `mode=neighbors direction=incoming` cannot answer "who calls this". | `grep -n "LspWorkItemLedger::begin" -A 22 src/extract/lsp/passes.rs` | 1 grep |
+| 4 | Test-module fixtures (`fn node`, `fn edge`, `fn seeds`) inside `mod tests` | Not surfaced usefully by flat search; private test helpers rank below production symbols. | `grep -n "    fn node(" -A 22` | 2 greps |
+| 5 | `.github/scripts/mcp-smoke.mjs` content | `.mjs` is not indexed as a code language, so no symbol or bounded-span retrieval is available. | `sed -n` on the file | 2 reads |
+| 6 | Isolation flags did not fully suppress `.oh/` markdown | With `include_artifacts: false` **and** `include_markdown: false`, the query `LspWorkItemLedger::begin` still returned a `markdown_section` hit from `.oh/sessions/733-execute.md` ("Chosen solution", heading only). Unrelated issue, no verdict content, but the suppression contract did not hold. | Disregarded the hit; reported the leak in the PR comment. | Isolation risk |
+
+Bounded-span retrieval (`search` with `file` + `line` + `end_line`) worked well and was
+the primary navigation tool: 5 successful spans, no fallback needed.
+
+**Segment totals:** RNA MCP calls 9 (8 successful, 1 rejected on tool contract).
+Raw fallbacks 8 grep/sed invocations, each with a diagnosed reason above.
+Probe tests: 7 written against the real code paths, 3 passed, 4 failed and became
+findings; all reverted, tree left clean apart from this log.
