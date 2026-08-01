@@ -96,6 +96,13 @@ jobs:
       - name: Rust workflow pins agree
         if: needs.changes.outputs.rust == 'true'
         run: bash .github/scripts/check-rust-toolchain-pins.sh
+      - name: Release version-patch script tests
+        # The patch logic release.yml runs on every tag push previously had no
+        # test coverage and ran only in production, which is how v0.3.0
+        # shipped a stale Cargo.lock. Now every PR touching .github/scripts/**
+        # exercises it, including the negative cases that actually bit.
+        if: needs.changes.outputs.rust == 'true'
+        run: bash .github/scripts/tests/test-patch-version.sh
       - name: No language-specific conditionals in generic.rs
         if: needs.changes.outputs.rust == 'true'
         run: |
