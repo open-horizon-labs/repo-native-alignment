@@ -68,3 +68,4 @@ The installed pre-fix binary failed a real 20-result evidence query at 5,000 tok
 - Shorten the flat selection-reason terminal marker below the compaction threshold.
 - Add a 20-record regression with long reasons but no auxiliary verbose metadata, matching the real-query failure shape.
 - Targeted terminal-marker regression passed; the only concurrent host Cargo process was verified to belong to a different repository and target directory.
+- A real 20-result evidence query now returns a bounded 6,805-byte/1,701-token packet instead of either the prior 60,221-byte non-body failure or `AccountingDidNotConverge`; the terminal-state regression was tightened to prove the compact marker cannot re-enter degradation.

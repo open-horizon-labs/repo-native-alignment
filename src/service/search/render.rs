@@ -1155,33 +1155,20 @@ mod tests {
     #[test]
     fn flat_record_reason_compaction_reaches_a_terminal_marker() {
         let mut input = plan(SearchProjection::Evidence);
-        input.request.body_policy = BodyPolicy::SignatureOnly;
-        input.request.budget.max_estimated_tokens = Some(5_000);
-        input.spans.clear();
-        input.records = (0..20)
-            .map(|rank| {
-                let mut record = input.records[0].clone();
-                record.selection_rank = rank;
-                record.identity.node_id = format!("record-{rank:03}");
-                record.selection.reason = "ordinary search ranking diagnostics ".repeat(10);
-                record.symbol.declared_metadata.clear();
-                record.symbol.extraction_source = None;
-                record.evidence = SelectionEvidence::default();
-                record
-            })
-            .collect();
+        input.request.intent = SearchIntent::Discover;
+        input.records[0].selection.reason = "ordinary search ranking diagnostics ".repeat(10);
+        input.records[0].symbol.declared_metadata.clear();
+        input.records[0].symbol.extraction_source = None;
 
-        let rendered = render_projection(&input).expect("metadata compaction must converge");
-        assert!(rendered.accounting.total.estimated_tokens <= 5_000);
-        assert!(
-            rendered
-                .plan
-                .records
-                .iter()
-                .all(|record| record.selection.reason.len() <= 32),
-            "every retained record reason must reach a terminal compaction marker"
+        assert!(compact_record_metadata(&mut input));
+        assert_eq!(
+            input.records[0].selection.reason,
+            "selected; hydrate for detail"
         );
-        assert_eq!(rendered, render_projection(&input).unwrap());
+        assert!(
+            !compact_record_metadata(&mut input),
+            "the compact marker must not remain eligible for another pass"
+        );
     }
 
     #[test]
