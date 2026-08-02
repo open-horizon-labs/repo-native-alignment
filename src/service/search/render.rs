@@ -190,15 +190,26 @@ fn drop_last_flat_record(plan: &mut ProjectionPlan) -> bool {
         return false;
     }
     let removed = plan.records.pop().expect("non-empty record list");
-    let id = removed.identity.node_id;
+    let id = removed.identity.node_id.clone();
+    let source = removed.identity.source.clone();
+    let hydration = removed
+        .source_handle
+        .as_ref()
+        .or(removed.evidence_handle.as_ref())
+        .map(HydrationHandle::encode_compact);
     for span in &mut plan.spans {
         span.mappings.retain(|mapping| mapping.record_id != id);
     }
     plan.spans.retain(|span| !span.mappings.is_empty());
-    add_compact_degradation(
-        plan,
-        "lower-ranked record omitted; hydrate from a larger-budget search for additional detail",
-    );
+    plan.omissions.push(ProjectionOmission {
+        record_id: Some(id),
+        source,
+        code: OmissionCode::RenderBudget,
+        detail: hydration.map_or_else(
+            || "lower-ranked record omitted; no stable hydration handle was available".into(),
+            |handle| format!("lower-ranked record omitted; hydrate={handle}"),
+        ),
+    });
     true
 }
 
@@ -207,12 +218,26 @@ fn compact_omissions(plan: &mut ProjectionPlan) -> bool {
         return false;
     }
     let count = plan.omissions.len();
-    plan.omissions = vec![ProjectionOmission {
-        record_id: None,
-        source: None,
-        code: OmissionCode::RenderBudget,
-        detail: format!("delivery metadata compacted; omitted_detail_count={count}"),
-    }];
+    let retained_hydration = plan
+        .omissions
+        .iter()
+        .find(|omission| omission.detail.contains("hydrate=rna-h2:"))
+        .cloned();
+    plan.omissions = vec![retained_hydration.map_or_else(
+        || ProjectionOmission {
+            record_id: None,
+            source: None,
+            code: OmissionCode::RenderBudget,
+            detail: format!("delivery metadata compacted; omitted_detail_count={count}"),
+        },
+        |mut omission| {
+            omission.detail = format!(
+                "{}; omitted_detail_count={count}",
+                omission.detail
+            );
+            omission
+        },
+    )];
     true
 }
 
@@ -1115,6 +1140,15 @@ mod tests {
         assert!(!rendered.plan.records.is_empty());
         assert!(rendered.plan.records.len() < 120);
         assert!(rendered.plan.records[0].source_handle.is_some());
+        assert!(
+            rendered
+                .plan
+                .omissions
+                .iter()
+                .any(|omission| omission.detail.contains("hydrate=rna-h2:")),
+            "an omitted flat-tail record must retain a compact hydration handle"
+        );
+        assert!(rendered.text.contains("hydrate=rna-h2:"));
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
