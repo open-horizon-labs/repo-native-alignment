@@ -2425,7 +2425,6 @@ fn evidence_capsule_capability(records: &[SelectedRecord]) -> CapabilityStatus {
 }
 
 const TASK_LANE_CANDIDATE_LIMIT: usize = 12;
-const TASK_ROLE_SUPPLEMENT_LIMIT: usize = 1;
 const TASK_GRAPH_CANDIDATE_LIMIT: usize = 64;
 
 #[derive(Default, Clone)]
@@ -2649,89 +2648,6 @@ async fn task_records(
                     );
                     output.candidate_audit.push(audit);
                 }
-            }
-        }
-        // Fusion is intentionally projection-agnostic, so its bounded head
-        // can contain imports, tests, or executable symbols that are
-        // ineligible for this role. Fill the remainder from a bounded,
-        // role-filtered lexical pass over the graph already loaded in memory.
-        // Primary fused candidates keep their original ranks; this pass only
-        // prevents pre-eligibility truncation from making an authoritative
-        // role impossible to satisfy.
-        if role != TaskRole::BehavioralAnalogue && eligible < TASK_LANE_CANDIDATE_LIMIT {
-            let query_terms = task_query_terms(base_query);
-            let mut supplements = candidate_nodes
-                .values()
-                .copied()
-                .filter(|node| {
-                    !assemblies
-                        .get(&node.stable_id())
-                        .is_some_and(|assembly| assembly.roles.contains(&role))
-                })
-                .filter_map(|node| {
-                    let role_evidence = task_lane_candidate_evidence(
-                        node,
-                        role,
-                        &assemblies,
-                        ctx.graph_state,
-                        edge_index,
-                    )
-                    .ok()?;
-                    let all_terms = task_text_terms(&format!(
-                        "{} {} {} {}",
-                        node.id.name,
-                        node.signature,
-                        node.body,
-                        node.id.file.display()
-                    ));
-                    let affinity = query_terms.intersection(&all_terms).count();
-                    if affinity == 0 {
-                        return None;
-                    }
-                    let name_terms = task_text_terms(&node.id.name);
-                    let name_affinity = query_terms.intersection(&name_terms).count();
-                    if task_candidate_quality_for_roles(
-                        node,
-                        &BTreeSet::from([role]),
-                        false,
-                        base_query,
-                    ) != EvidenceQuality::Actionable
-                    {
-                        return None;
-                    }
-                    Some((name_affinity, affinity, node.stable_id(), role_evidence))
-                })
-                .collect::<Vec<_>>();
-            supplements.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| right.1.cmp(&left.1))
-                    .then_with(|| left.2.cmp(&right.2))
-            });
-            for (_, _, id, role_evidence) in supplements
-                .into_iter()
-                .take(
-                    (TASK_LANE_CANDIDATE_LIMIT - eligible).min(TASK_ROLE_SUPPLEMENT_LIMIT),
-                )
-            {
-                eligible += 1;
-                merge_task_assembly(
-                    &mut assemblies,
-                    single_channel_fused(
-                        &id,
-                        EvidenceChannel::ExactLexical,
-                        ScoreKind::ExactMatchTier,
-                    ),
-                    role,
-                    lane,
-                    facet,
-                    None,
-                    u32::try_from(observed + eligible).unwrap_or(u32::MAX),
-                    format!(
-                        "role-filtered query-affine supplement after bounded {lane:?} fusion; {role_evidence}"
-                    ),
-                );
             }
         }
         let degraded = capabilities
@@ -3075,20 +2991,6 @@ async fn task_records(
 }
 
 fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> EvidenceQuality {
-    task_candidate_quality_for_roles(
-        node,
-        &assembly.roles,
-        assembly.reason.starts_with("typed graph"),
-        query,
-    )
-}
-
-fn task_candidate_quality_for_roles(
-    node: &Node,
-    roles: &BTreeSet<TaskRole>,
-    graph_only: bool,
-    query: &str,
-) -> EvidenceQuality {
     let source_text = format!("{}\n{}", node.signature, node.body);
     let trimmed = source_text.trim();
     let has_identifier = trimmed.chars().any(|ch| ch.is_alphanumeric() || ch == '_');
@@ -3104,12 +3006,6 @@ fn task_candidate_quality_for_roles(
     if !complete_anchor || (!complete_declaration && node.body.trim().len() < 8) {
         return EvidenceQuality::Supporting;
     }
-    if matches!(node.id.kind, NodeKind::Const)
-        && node.line_start == node.line_end
-        && node.signature.split_whitespace().count() < 2
-    {
-        return EvidenceQuality::Supporting;
-    }
 
     let query_terms = task_query_terms(query);
     let candidate_terms = task_text_terms(&format!(
@@ -3123,32 +3019,16 @@ fn task_candidate_quality_for_roles(
         .iter()
         .filter(|term| candidate_terms.contains(*term))
         .count();
+    let graph_only = assembly.reason.starts_with("typed graph");
     let required_graph_affinity = query_terms.len().min(2);
     let unrelated_graph_neighbor = graph_only && affinity_count < required_graph_affinity;
-    let generic_test = roles.contains(&TaskRole::Test)
-        && (!crate::ranking::is_test_function(node) || !task_test_has_actionable_assertion(node));
+    let generic_test = assembly.roles.contains(&TaskRole::Test)
+        && !crate::ranking::is_test_function(node);
     if unrelated_graph_neighbor || generic_test {
         EvidenceQuality::Supporting
     } else {
         EvidenceQuality::Actionable
     }
-}
-
-fn task_test_has_actionable_assertion(node: &Node) -> bool {
-    let name = node.id.name.to_lowercase();
-    let body = node.body.to_lowercase();
-    let test_identity = name.starts_with("test")
-        || name.ends_with("test")
-        || body.contains("#[test]")
-        || body.contains("@test")
-        || body.contains("describe(")
-        || body.contains("it(");
-    let assertion = body.contains("assert")
-        || body.contains("expect(")
-        || body.contains("should")
-        || body.contains("raises(")
-        || body.contains("panic!");
-    test_identity && assertion
 }
 
 fn task_candidate_obligations(
@@ -3166,43 +3046,7 @@ fn task_candidate_obligations(
         node.body,
         node.id.file.display()
     );
-    let mut obligations = task_obligations_for_text(&haystack, &assembly.roles, query);
-    let matched = obligations
-        .iter()
-        .filter_map(|obligation| obligation.strip_prefix("concept:"))
-        .collect::<Vec<_>>()
-        .join("+");
-    if !matched.is_empty() {
-        for role in &assembly.roles {
-            for carrier in task_operation_carriers(&node.id.name) {
-                obligations.insert(format!("carrier:{role:?}:{matched}:{carrier}"));
-            }
-        }
-    }
-    obligations
-}
-
-fn task_operation_carriers(identifier: &str) -> BTreeSet<&'static str> {
-    task_text_terms(identifier)
-        .into_iter()
-        .filter_map(|term| match term.as_str() {
-            "structure" | "structuring" => Some("structure"),
-            "unstructure" | "unstructuring" => Some("unstructure"),
-            "serialize" | "serialization" => Some("serialize"),
-            "deserialize" | "deserialization" => Some("deserialize"),
-            "encode" | "encoding" => Some("encode"),
-            "decode" | "decoding" => Some("decode"),
-            "read" | "reader" => Some("read"),
-            "write" | "writer" => Some("write"),
-            "load" | "loader" => Some("load"),
-            "save" | "saver" => Some("save"),
-            "parse" | "parser" => Some("parse"),
-            "render" | "renderer" => Some("render"),
-            "import" => Some("import"),
-            "export" => Some("export"),
-            _ => None,
-        })
-        .collect()
+    task_obligations_for_text(&haystack, &assembly.roles, query)
 }
 
 fn task_obligations_for_text(
@@ -3658,13 +3502,6 @@ fn materialize_task_output(
 ) -> TaskAdapterOutput {
     let mut output = base_output.clone();
     let selected_set = selected_ids.iter().cloned().collect::<BTreeSet<_>>();
-    // A final task packet is an evidence bundle, not an audit of every graph
-    // neighbor considered during acquisition. Keep relationships only when
-    // both endpoints survived selection; omitted endpoints remain recoverable
-    // through their compact omission/hydration records.
-    output.relationships.retain(|relationship| {
-        selected_set.contains(&relationship.from) && selected_set.contains(&relationship.to)
-    });
     let mut covered_roles = BTreeSet::new();
     let mut covered_lanes = BTreeSet::new();
     let mut covered_facets = BTreeSet::new();
@@ -14576,24 +14413,6 @@ mod tests {
             }
             nodes.push(node);
         }
-        // Crowd the fused head with highly query-affine records that cannot
-        // satisfy any requested delivery role. This reproduces the production
-        // failure where role filtering happened only after a fixed top-k and
-        // the authoritative state definition was never offered to selection.
-        for index in 0..TASK_LANE_CANDIDATE_LIMIT {
-            let path = format!("src/noise_{index}.py");
-            let source =
-                "from noise import Annotated, override, NotRequired, TypedDict, NamedTuple";
-            let full_path = repository.path().join(&path);
-            std::fs::write(&full_path, format!("{source}\n")).unwrap();
-            let mut node = make_node(&format!("noise_import_{index}"), NodeKind::Import, &path);
-            node.language = "python".into();
-            node.signature = source.into();
-            node.body = source.into();
-            node.line_start = 1;
-            node.line_end = 1;
-            nodes.push(node);
-        }
         let override_node = nodes
             .iter()
             .find(|node| node.id.name == "AttributeOverride")
@@ -14679,10 +14498,6 @@ mod tests {
             "missing compact hydration handle"
         );
         assert!(rendered.len() <= 24_000);
-        assert!(
-            !rendered.contains("required task context role DefinitionOrApiState is not covered"),
-            "role-filtered acquisition must deliver the authoritative state definition:\n{rendered}"
-        );
         assert!(
             rendered.contains("quality=actionable"),
             "the producer must emit the stable evidence-quality token"
