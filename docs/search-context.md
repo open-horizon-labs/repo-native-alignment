@@ -16,6 +16,34 @@ The evidence projection changes presentation, not qualification. A caller can
 therefore inspect why a result was selected without paying for that audit data
 in every agent prompt.
 
+## Rendered delivery budget
+
+Byte and token limits apply to the complete self-accounted response, including
+headers, metadata, bodies, relationships, omissions, and the accounting footer.
+Selection and rendering use the same bounded fitter. When optional
+server-owned detail does not fit, RNA degrades it deterministically: capability
+and candidate diagnostics, per-record evidence/metadata, relationship detail,
+source bodies, then the lowest-ranked flat-search tail. Task-selected records
+are protected because a role or task obligation is covered only when its
+actionable carrier remains in the final fitted packet.
+
+Every retained record whose detail can be omitted keeps a stable
+`rna-h2` version-2 source or evidence handle. V2 is a compact, checksummed,
+self-describing encoding; the hydration endpoint continues to accept existing
+V1 handles. Budgets below the compact header/result/handle/accounting envelope
+still fail with a typed `BudgetTooSmall` error rather than returning an empty or
+misleading success.
+
+The minimum envelope is measured, not a repository-wide magic number because
+stable identity and path lengths vary. For a request with candidates it is the
+exact final `RenderCost` of the fully degraded fixed scaffold plus the
+lowest-cost actionable record identity, compact obligation certificate,
+source handle, and self-accounting footer. The bounded fitter computes that
+same value during admission; if neither caller limit can hold it,
+`BudgetTooSmall.minimum` reports the final byte/token cost of that irreducible
+plan. Tests freeze this definition and the degradation order rather than one
+incidental global byte count.
+
 ## Ranking evidence
 
 Product search combines channels only after deterministic within-channel
@@ -139,8 +167,11 @@ and graph-impact lanes. Exact hits, ambiguities, and misses remain distinct.
 Callers may request bounded `context_roles`, `context_facets`, graph edge types
 and hops, a body policy, and a render budget. Unknown roles/facets and values
 above the service's hard limits fail closed. Selection maximizes newly covered
-roles per marginal rendered cost; one span may satisfy several roles without
-duplicating its source.
+roles and generic task obligations per marginal final-packet cost; one
+actionable record or span may satisfy several obligations without duplicating
+its source. Punctuation-only constants are rejected, while incomplete spans,
+unrelated graph neighbors, and generic tests cannot satisfy coverage merely by
+carrying a nominal role.
 
 Example CLI request:
 

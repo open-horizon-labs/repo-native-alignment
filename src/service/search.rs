@@ -54,8 +54,8 @@ use model::{
     SourceSpan as ProjectionSourceSpan, SymbolSummary,
 };
 use task_context::{
-    ContextRole as TaskRole, EvidenceCandidate as TaskEvidenceCandidate, ExactCandidate,
-    ExactReferenceKind, ExactResolution, RetrievalLane as TaskLane,
+    ContextRole as TaskRole, EvidenceCandidate as TaskEvidenceCandidate, EvidenceQuality,
+    ExactCandidate, ExactReferenceKind, ExactResolution, RetrievalLane as TaskLane,
     SelectionPolicy as TaskSelectionPolicy, SelectionReason as TaskSelectionReason, SourceAnchor,
     TaskFacet,
 };
@@ -2863,6 +2863,16 @@ async fn task_records(
                 roles: assembly.roles.clone(),
                 lanes: assembly.lanes.clone(),
                 facets: assembly.facets.clone(),
+                quality: task_candidate_quality(
+                    node,
+                    assembly,
+                    params.query.as_deref().unwrap_or_default(),
+                ),
+                obligations: task_candidate_obligations(
+                    node,
+                    assembly,
+                    params.query.as_deref().unwrap_or_default(),
+                ),
                 // Replaced below with the exact canonical singleton bundle
                 // cost once fixed task-only sections are available.
                 rendered_cost: 1,
@@ -2879,11 +2889,11 @@ async fn task_records(
     }
 
     let mut policy = TaskSelectionPolicy::default();
-    // Admission uses one deterministic byte currency. A token-only request is
-    // conservatively projected at four bytes per estimated token; when callers
-    // supply both bounds, the tighter one wins. The final renderer still
-    // validates the exact independently measured byte and token totals.
-    policy.rendered_budget = task_admission_budget(params, policy.rendered_budget);
+    // The bounded renderer is the feasibility oracle for the caller's exact
+    // byte and token limits. This scalar cap bounds Pareto state cost only; it
+    // must not approximate tokens as bytes because Unicode makes those
+    // currencies non-equivalent.
+    policy.rendered_budget = task_context::MAX_RENDERED_BUDGET;
     policy.per_record_limit = policy.rendered_budget;
     policy.candidate_limit = typed.len().clamp(1, task_context::MAX_SELECTION_CANDIDATES);
     policy.per_file_limit = policy.per_file_limit.min(policy.candidate_limit).max(1);
@@ -2896,7 +2906,8 @@ async fn task_records(
     let request = projection_request(params, SearchIntent::Implement);
     let default_task_capabilities =
         default_capabilities(ctx, request.projection, params.verbose).await;
-    let base_output = output;
+    let mut base_output = output;
+    let infeasible_cost = policy.rendered_budget.saturating_add(1);
 
     // A record-level cap is evaluated in the same currency as selection: the
     // canonical final task response with that identity selected and every
@@ -2904,7 +2915,7 @@ async fn task_records(
     let candidate_ids = typed.keys().cloned().collect::<Vec<_>>();
     for id in candidate_ids {
         let singleton = [id.clone()];
-        let cost = rendered_task_bundle_cost(
+        let cost = match rendered_task_bundle_cost(
             params,
             &reader,
             &singleton,
@@ -2917,7 +2928,20 @@ async fn task_records(
             &policy.required_roles,
             &default_task_capabilities,
             edge_index,
-        )?;
+        ) {
+            Ok(cost) => cost,
+            Err(reason) => {
+                base_output.omissions.push(ProjectionOmission {
+                    record_id: Some(id.clone()),
+                    source: candidate_nodes.get(&id).copied().and_then(node_source_span),
+                    code: OmissionCode::RenderBudget,
+                    detail: format!(
+                        "task candidate is infeasible under the shared rendered budget and was omitted: {reason}"
+                    ),
+                });
+                infeasible_cost
+            }
+        };
         if let Some(candidate) = typed.get_mut(&id) {
             candidate.rendered_cost = cost.max(1);
         }
@@ -2927,7 +2951,7 @@ async fn task_records(
         typed.values().cloned().collect(),
         &policy,
         |selected_ids| {
-            rendered_task_bundle_cost(
+            Ok(rendered_task_bundle_cost(
                 params,
                 &reader,
                 selected_ids,
@@ -2941,7 +2965,7 @@ async fn task_records(
                 &default_task_capabilities,
                 edge_index,
             )
-            .map_err(|reason| task_context::TaskContextError::BundleCost { reason })
+            .unwrap_or(infeasible_cost))
         },
         |selected_ids, remaining_ids| {
             task_future_interaction_signature(selected_ids, remaining_ids, edge_index)
@@ -2966,17 +2990,158 @@ async fn task_records(
     Ok(output)
 }
 
-fn task_admission_budget(params: &SearchParams, default_budget: usize) -> usize {
-    let token_budget_bytes = params
-        .max_output_tokens
-        .map(|tokens| tokens.saturating_mul(4));
-    match (params.max_output_bytes, token_budget_bytes) {
-        (Some(bytes), Some(token_bytes)) => bytes.min(token_bytes),
-        (Some(bytes), None) => bytes,
-        (None, Some(token_bytes)) => token_bytes,
-        (None, None) => default_budget,
+fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> EvidenceQuality {
+    let source_text = format!("{}\n{}", node.signature, node.body);
+    let trimmed = source_text.trim();
+    let has_identifier = trimmed.chars().any(|ch| ch.is_alphanumeric() || ch == '_');
+    if !has_identifier
+        || (matches!(node.id.kind, NodeKind::Const)
+            && node.body.trim().chars().all(|ch| ch.is_ascii_punctuation()))
+    {
+        return EvidenceQuality::Rejected;
     }
-    .min(task_context::MAX_RENDERED_BUDGET)
+
+    let complete_anchor = node.line_start > 0 && node.line_end >= node.line_start;
+    let complete_declaration = node.signature.split_whitespace().count() >= 2;
+    if !complete_anchor || (!complete_declaration && node.body.trim().len() < 8) {
+        return EvidenceQuality::Supporting;
+    }
+
+    let query_terms = task_query_terms(query);
+    let affinity_count = query_terms
+        .iter()
+        .filter(|term| {
+            node.id.name.to_ascii_lowercase().contains(*term)
+                || node.signature.to_ascii_lowercase().contains(*term)
+                || node.body.to_ascii_lowercase().contains(*term)
+                || node
+                    .id
+                    .file
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains(*term)
+        })
+        .count();
+    let affinity = affinity_count > 0;
+    let graph_only = assembly.reason.starts_with("typed graph");
+    let required_test_affinity = query_terms.len().min(2);
+    let generic_test =
+        assembly.roles.contains(&TaskRole::Test) && affinity_count < required_test_affinity;
+    if (graph_only && !affinity) || generic_test {
+        EvidenceQuality::Supporting
+    } else {
+        EvidenceQuality::Actionable
+    }
+}
+
+fn task_candidate_obligations(
+    node: &Node,
+    assembly: &TaskAssembly,
+    query: &str,
+) -> BTreeSet<String> {
+    if task_candidate_quality(node, assembly, query) != EvidenceQuality::Actionable {
+        return BTreeSet::new();
+    }
+    let haystack = format!(
+        "{} {} {} {}",
+        node.id.name,
+        node.signature,
+        node.body,
+        node.id.file.display()
+    )
+    .to_ascii_lowercase();
+    task_obligations_for_text(&haystack, &assembly.roles, query)
+}
+
+fn task_obligations_for_text(
+    haystack: &str,
+    roles: &BTreeSet<TaskRole>,
+    query: &str,
+) -> BTreeSet<String> {
+    let query_terms = task_query_terms(query);
+    let mut obligations = query_terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .map(|term| format!("concept:{term}"))
+        .collect::<BTreeSet<_>>();
+
+    // Structural branches are useful only when tied to a requested concept;
+    // a unique path by itself would reward unrelated graph neighbors.
+    for role in roles {
+        for term in query_terms.iter().filter(|term| haystack.contains(*term)) {
+            obligations.insert(format!("branch:{role:?}:{term}"));
+        }
+    }
+
+    let structured_generation = query_terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "annotated" | "notrequired" | "typeddict" | "namedtuple"
+        )
+    });
+    if structured_generation {
+        if contains_any(haystack, &["attrs", "__attrs_attrs__"])
+            && contains_any(
+                haystack,
+                &["generat", "structure", "unstructure", "converter"],
+            )
+        {
+            obligations.insert("generation:attrs".into());
+        }
+        if haystack.contains("dataclass")
+            && contains_any(
+                haystack,
+                &["generat", "structure", "unstructure", "converter"],
+            )
+        {
+            obligations.insert("generation:dataclass".into());
+        }
+        if haystack.contains("typeddict") {
+            obligations.insert("generation:typeddict".into());
+        }
+        if haystack.contains("notrequired") && haystack.contains("annotated") {
+            obligations.insert("typing:notrequired-annotated".into());
+        }
+        if haystack.contains("namedtuple")
+            && contains_any(haystack, &["dict", "mapping", "asdict", "structure"])
+        {
+            obligations.insert("generation:namedtuple-dict".into());
+        }
+    }
+
+    if query_terms.contains("override") {
+        if contains_any(haystack, &["attributeoverride", "override"]) {
+            obligations.insert("override:metadata".into());
+        }
+        if contains_any(
+            haystack,
+            &[
+                "precedence",
+                "effective override",
+                ".overrides",
+                "overrides.get",
+            ],
+        ) {
+            obligations.insert("override:precedence-effective".into());
+        }
+    }
+
+    if roles.contains(&TaskRole::Test) && query_terms.iter().any(|term| haystack.contains(term)) {
+        obligations.insert("validation:task-relevant-tests".into());
+    }
+    obligations
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn task_query_terms(query: &str) -> BTreeSet<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 3)
+        .collect()
 }
 
 fn task_lane_candidate_evidence(
@@ -3353,41 +3518,68 @@ fn materialize_task_output(
     let mut covered_roles = BTreeSet::new();
     let mut covered_lanes = BTreeSet::new();
     let mut covered_facets = BTreeSet::new();
+    let mut covered_obligations = BTreeSet::new();
+    let required_obligations = typed
+        .values()
+        .filter(|candidate| candidate.quality == EvidenceQuality::Actionable)
+        .flat_map(|candidate| candidate.obligations.iter())
+        .filter(|obligation| !obligation.starts_with("branch:"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     for (rank, id) in selected_ids.iter().enumerate() {
         let Some(candidate) = typed.get(id) else {
             continue;
         };
+        let actionable = candidate.quality == EvidenceQuality::Actionable;
         let reason = if let Some(reference) = candidate.exact_reference.clone() {
             TaskSelectionReason::ExactReference { reference }
         } else {
             TaskSelectionReason::CoveragePerCost {
-                newly_covered_roles: candidate
-                    .roles
-                    .intersection(required_roles)
-                    .filter(|role| !covered_roles.contains(*role))
-                    .copied()
-                    .collect(),
-                newly_covered_lanes: candidate
-                    .lanes
-                    .difference(&covered_lanes)
-                    .copied()
-                    .collect(),
-                newly_covered_facets: candidate
-                    .facets
-                    .difference(&covered_facets)
-                    .copied()
-                    .collect(),
+                newly_covered_roles: actionable
+                    .then(|| {
+                        candidate
+                            .roles
+                            .intersection(required_roles)
+                            .filter(|role| !covered_roles.contains(*role))
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                newly_covered_lanes: actionable
+                    .then(|| {
+                        candidate
+                            .lanes
+                            .difference(&covered_lanes)
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                newly_covered_facets: actionable
+                    .then(|| {
+                        candidate
+                            .facets
+                            .difference(&covered_facets)
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         };
-        covered_roles.extend(candidate.roles.iter().copied());
-        covered_lanes.extend(candidate.lanes.iter().copied());
-        covered_facets.extend(candidate.facets.iter().copied());
+        if actionable {
+            covered_roles.extend(candidate.roles.iter().copied());
+            covered_lanes.extend(candidate.lanes.iter().copied());
+            covered_facets.extend(candidate.facets.iter().copied());
+            covered_obligations.extend(candidate.obligations.iter().cloned());
+        }
         let reason = task_selection_reason(&reason);
         if let Some(records) = bundles.get(id) {
             for mut record in records.clone() {
                 record.selection_rank = rank;
-                record.selection.reason = format!("{}; {reason}", record.selection.reason);
+                record.selection.reason = format!(
+                    "{}; {reason}; quality={:?}; obligations={:?}",
+                    record.selection.reason, candidate.quality, candidate.obligations
+                );
                 output.records.push(record);
             }
         }
@@ -3433,6 +3625,10 @@ fn materialize_task_output(
         .difference(&covered_roles)
         .copied()
         .collect::<BTreeSet<_>>();
+    let missing_obligations = required_obligations
+        .difference(&covered_obligations)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     for role in &missing_roles {
         output.omissions.push(ProjectionOmission {
             record_id: None,
@@ -3441,9 +3637,17 @@ fn materialize_task_output(
             detail: format!("required task context role {role:?} is not covered"),
         });
     }
+    for obligation in &missing_obligations {
+        output.omissions.push(ProjectionOmission {
+            record_id: None,
+            source: None,
+            code: OmissionCode::MissingSource,
+            detail: format!("required task obligation {obligation} is not covered"),
+        });
+    }
     output.capabilities.push(CapabilityStatus {
         capability: "task_context_selection".into(),
-        state: if missing_roles.is_empty() {
+        state: if missing_roles.is_empty() && missing_obligations.is_empty() {
             CapabilityState::Ready
         } else {
             CapabilityState::Degraded
@@ -3451,7 +3655,7 @@ fn materialize_task_output(
         // Do not put the measured cost in the response being measured: that
         // would make task admission self-referential.
         detail: format!(
-            "selected {} of {} candidates using canonical final-bundle cost; missing_roles={missing_roles:?}",
+            "selected {} of {} candidates using canonical final-bundle cost; missing_roles={missing_roles:?}; missing_obligations={missing_obligations:?}; covered_obligations={covered_obligations:?}",
             selected_ids.len(),
             typed.len()
         ),
@@ -3512,9 +3716,10 @@ fn rendered_task_bundle_cost(
             .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
     });
 
-    let mut request = projection_request(params, SearchIntent::Implement);
-    request.budget.max_rendered_bytes = None;
-    request.budget.max_estimated_tokens = None;
+    // Selection and rendering share this exact bounded fitter. Optional
+    // server-owned verbosity is degraded before a candidate set is declared
+    // infeasible, and both caller limits are measured on the final packet.
+    let request = projection_request(params, SearchIntent::Implement);
     let plan = projection::plan_projection(
         request,
         ProjectionInput {
@@ -13257,42 +13462,6 @@ mod tests {
     }
 
     #[test]
-    fn task_admission_uses_token_only_and_tighter_combined_budget() {
-        assert_eq!(
-            task_admission_budget(
-                &SearchParams {
-                    max_output_tokens: Some(250),
-                    ..Default::default()
-                },
-                9_999,
-            ),
-            1_000
-        );
-        assert_eq!(
-            task_admission_budget(
-                &SearchParams {
-                    max_output_bytes: Some(700),
-                    max_output_tokens: Some(250),
-                    ..Default::default()
-                },
-                9_999,
-            ),
-            700
-        );
-        assert_eq!(
-            task_admission_budget(
-                &SearchParams {
-                    max_output_bytes: Some(2_000),
-                    max_output_tokens: Some(250),
-                    ..Default::default()
-                },
-                9_999,
-            ),
-            1_000
-        );
-    }
-
-    #[test]
     fn graph_delta_beta_requires_bounded_non_binary_proposal() {
         let missing = SearchParams {
             context_mode: Some("graph-delta-beta".to_string()),
@@ -14000,6 +14169,395 @@ mod tests {
                 flat_rendered.len()
             );
         }
+    }
+
+    #[test]
+    fn production_task_quality_rejects_punctuation_and_demotes_generic_tests() {
+        let query = "Annotated override NotRequired TypedDict NamedTuple";
+        let assembly = |node: &Node, role: TaskRole| {
+            let mut assemblies = BTreeMap::new();
+            merge_task_assembly(
+                &mut assemblies,
+                single_channel_fused(
+                    &node.stable_id(),
+                    EvidenceChannel::ExactLexical,
+                    ScoreKind::ExactMatchTier,
+                ),
+                role,
+                TaskLane::Tests,
+                TaskFacet::Test,
+                None,
+                0,
+                "lexical task candidate".into(),
+            );
+            assemblies.remove(&node.stable_id()).unwrap()
+        };
+
+        let mut punctuation = make_node(")", NodeKind::Const, "src/typeddicts.py");
+        punctuation.signature = ")".into();
+        punctuation.body = ")".into();
+        punctuation.line_start = 438;
+        punctuation.line_end = 438;
+        assert_eq!(
+            task_candidate_quality(
+                &punctuation,
+                &assembly(&punctuation, TaskRole::DefinitionOrApiState),
+                query
+            ),
+            EvidenceQuality::Rejected
+        );
+
+        let mut generic_test = make_node("A", NodeKind::Struct, "tests/test_typeddicts.py");
+        generic_test.signature = "class A(TypedDict):".into();
+        generic_test.body = "class A(TypedDict): pass".into();
+        generic_test.line_start = 1;
+        generic_test.line_end = 1;
+        assert_eq!(
+            task_candidate_quality(
+                &generic_test,
+                &assembly(&generic_test, TaskRole::Test),
+                query
+            ),
+            EvidenceQuality::Supporting
+        );
+
+        let mut relevant_test = make_node(
+            "test_override",
+            NodeKind::Function,
+            "tests/test_generics.py",
+        );
+        relevant_test.signature = "def test_override_typeddict():".into();
+        relevant_test.body = "assert override_for(TypedDict)".into();
+        relevant_test.line_start = 1;
+        relevant_test.line_end = 1;
+        assert_eq!(
+            task_candidate_quality(
+                &relevant_test,
+                &assembly(&relevant_test, TaskRole::Test),
+                query
+            ),
+            EvidenceQuality::Actionable
+        );
+    }
+
+    #[test]
+    fn production_cattrs_obligations_are_query_affine_and_semantic() {
+        let roles = BTreeSet::from([TaskRole::EditableSource]);
+        let obligations = task_obligations_for_text(
+            "attributeoverride override attrs dataclass generator typeddict notrequired annotated namedtuple dict precedence effective override .overrides",
+            &roles,
+            "Annotated override NotRequired TypedDict NamedTuple",
+        );
+
+        for obligation in [
+            "override:metadata",
+            "generation:attrs",
+            "generation:dataclass",
+            "generation:typeddict",
+            "typing:notrequired-annotated",
+            "generation:namedtuple-dict",
+            "override:precedence-effective",
+        ] {
+            assert!(
+                obligations.contains(obligation),
+                "missing production obligation {obligation}: {obligations:?}"
+            );
+        }
+        assert!(
+            obligations
+                .iter()
+                .all(|obligation| !obligation.contains("src/")),
+            "path uniqueness must not create task obligations: {obligations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cattrs_task_packet_exercises_production_selection_and_rendering() {
+        let repository = tempfile::tempdir().unwrap();
+        let fixtures = [
+            (
+                "src/metadata.py",
+                "AttributeOverride",
+                NodeKind::Struct,
+                "class AttributeOverride: override metadata",
+                false,
+            ),
+            (
+                "src/generators.py",
+                "make_dict_structure_fn",
+                NodeKind::Function,
+                "def make_dict_structure_fn(): generate attrs dataclass converter for AttributeOverride Annotated override",
+                false,
+            ),
+            (
+                "src/typeddicts.py",
+                "gen_typeddict",
+                NodeKind::Function,
+                "def gen_typeddict(): generate TypedDict NotRequired Annotated structure",
+                false,
+            ),
+            (
+                "src/namedtuples.py",
+                "gen_namedtuple",
+                NodeKind::Function,
+                "def gen_namedtuple(): generate dict mapping NamedTuple structure",
+                false,
+            ),
+            (
+                "src/overrides.py",
+                "effective_overrides",
+                NodeKind::Function,
+                "def effective_overrides(): precedence effective override self.overrides.get",
+                false,
+            ),
+            (
+                "tests/test_generators.py",
+                "test_override_generation",
+                NodeKind::Function,
+                "def test_override_generation(): assert override TypedDict NamedTuple Annotated NotRequired",
+                true,
+            ),
+            (
+                "tests/test_generic.py",
+                "A",
+                NodeKind::Struct,
+                "class A(TypedDict): pass",
+                true,
+            ),
+            (
+                "src/typeddicts.py",
+                "NotRequired",
+                NodeKind::Const,
+                ")",
+                false,
+            ),
+            (
+                "src/hooks.py",
+                "impl",
+                NodeKind::Function,
+                "def impl(): decorator",
+                false,
+            ),
+        ];
+        let mut nodes = Vec::new();
+        for (path, name, kind, source, is_test) in fixtures {
+            let full_path = repository.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(&full_path, format!("{source}\n")).unwrap();
+            let mut node = make_node(name, kind, path);
+            node.language = "python".into();
+            node.signature = source.into();
+            node.body = source.into();
+            node.line_start = 1;
+            node.line_end = 1;
+            if is_test {
+                node.metadata.insert("is_test".into(), "true".into());
+            }
+            nodes.push(node);
+        }
+        let override_node = nodes
+            .iter()
+            .find(|node| node.id.name == "AttributeOverride")
+            .unwrap()
+            .clone();
+        let unrelated_neighbor = nodes
+            .iter()
+            .find(|node| node.id.name == "impl")
+            .unwrap()
+            .clone();
+        let graph = make_graph_state_with_edges(
+            nodes,
+            vec![make_edge(
+                &override_node,
+                &unrelated_neighbor,
+                EdgeKind::Calls,
+            )],
+        );
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let ctx = make_search_context(&graph, repository.path());
+        let params = SearchParams {
+            query: Some("Annotated override NotRequired TypedDict NamedTuple".into()),
+            context_mode: Some("task".into()),
+            projection: Some("evidence".into()),
+            body_policy: Some("focused".into()),
+            limit: Some(20),
+            max_output_tokens: Some(6_000),
+            context_roles: Some(vec![
+                "editable_source".into(),
+                "definition_or_api_state".into(),
+                "test".into(),
+            ]),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let selected = task_records(&params, &ctx, &edge_index).await.unwrap();
+        let selected_names = selected
+            .records
+            .iter()
+            .map(|record| record.symbol.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            selected_names.contains("AttributeOverride"),
+            "selected production names: {selected_names:?}; capabilities={:?}; omissions={:?}",
+            selected.capabilities,
+            selected.omissions
+        );
+        assert!(selected_names.contains("make_dict_structure_fn"));
+        assert!(selected_names.contains("gen_typeddict"));
+        assert!(selected_names.contains("gen_namedtuple"));
+        assert!(selected_names.contains("effective_overrides"));
+        assert!(selected_names.contains("test_override_generation"));
+        assert!(!selected_names.contains("A"));
+        assert!(!selected_names.contains("NotRequired"));
+        assert!(!selected_names.contains("impl"));
+        assert!(
+            selected.capabilities.iter().any(|capability| {
+                capability.capability == "task_context_selection"
+                    && capability.detail.contains("missing_obligations={}")
+            }),
+            "final selection did not certify obligation coverage: {:?}",
+            selected.capabilities
+        );
+
+        let rendered = projected_search(&params, &ctx).await;
+        for evidence in [
+            "AttributeOverride",
+            "attrs dataclass",
+            "NotRequired Annotated",
+            "dict mapping NamedTuple",
+            "precedence effective override",
+            "test_override_generation",
+        ] {
+            assert!(
+                rendered.contains(evidence),
+                "missing {evidence:?}:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("rna-h2:"),
+            "missing compact hydration handle"
+        );
+        assert!(rendered.len() <= 24_000);
+    }
+
+    #[tokio::test]
+    async fn infeasible_exact_candidate_does_not_abort_a_fitting_task_packet() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        let oversized_source = format!(
+            "fn oversized_candidate() {{ /* {} */ }}\n",
+            "x".repeat(30_000)
+        );
+        std::fs::write(
+            repository.path().join("src/oversized.rs"),
+            &oversized_source,
+        )
+        .unwrap();
+        std::fs::write(repository.path().join("src/target.rs"), "fn target() {}\n").unwrap();
+
+        let mut oversized = make_node(
+            "oversized_candidate",
+            NodeKind::Function,
+            "src/oversized.rs",
+        );
+        oversized.signature = oversized_source.trim().into();
+        oversized.body = oversized_source.trim().into();
+        oversized.line_start = 1;
+        oversized.line_end = 1;
+        let oversized_id = oversized.stable_id();
+        let mut target = make_node("target", NodeKind::Function, "src/target.rs");
+        target.signature = "fn target() {}".into();
+        target.body = "fn target() {}".into();
+        target.line_start = 1;
+        target.line_end = 1;
+        let target_id = target.stable_id();
+
+        let graph = make_graph_state(vec![oversized, target]);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let ctx = make_search_context(&graph, repository.path());
+        let output = task_records(
+            &SearchParams {
+                query: Some("Change `oversized_candidate` and `target`".into()),
+                context_mode: Some("task".into()),
+                context_roles: Some(vec!["editable_source".into()]),
+                context_facets: Some(Vec::new()),
+                max_output_bytes: Some(5_000),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+            &edge_index,
+        )
+        .await
+        .expect("an infeasible candidate must not abort other fitting evidence");
+
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == target_id)
+        );
+        assert!(
+            output
+                .records
+                .iter()
+                .all(|record| record.identity.node_id != oversized_id)
+        );
+        assert!(output.omissions.iter().any(|omission| {
+            omission.record_id.as_deref() == Some(oversized_id.as_str())
+                && omission
+                    .detail
+                    .contains("infeasible under the shared rendered budget")
+        }));
+    }
+
+    #[tokio::test]
+    async fn token_only_unicode_task_uses_rendered_token_feasibility() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        let unicode_detail = "界".repeat(16_000);
+        let source = format!("fn unicode_target() {{ /* {unicode_detail} */ }}\n");
+        std::fs::write(repository.path().join("src/unicode.rs"), &source).unwrap();
+
+        let mut target = make_node("unicode_target", NodeKind::Function, "src/unicode.rs");
+        target.signature = source.trim().into();
+        target.body = source.trim().into();
+        target.line_start = 1;
+        target.line_end = 1;
+        let target_id = target.stable_id();
+        let graph = make_graph_state(vec![target]);
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let ctx = make_search_context(&graph, repository.path());
+        let params = SearchParams {
+            query: Some("Change `unicode_target`".into()),
+            context_mode: Some("task".into()),
+            context_roles: Some(vec!["editable_source".into()]),
+            context_facets: Some(Vec::new()),
+            max_output_tokens: Some(6_000),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let output = task_records(&params, &ctx, &edge_index).await.expect(
+            "renderer-feasible multibyte context must not be rejected by a byte approximation",
+        );
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| record.identity.node_id == target_id)
+        );
+
+        let rendered = projected_search(&params, &ctx).await;
+        assert!(rendered.contains("unicode_target"));
+        assert!(
+            rendered.len() > 24_000,
+            "fixture must exceed the old tokens*4 byte approximation"
+        );
     }
 
     #[test]

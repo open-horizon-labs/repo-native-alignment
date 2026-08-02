@@ -116,9 +116,6 @@ pub(crate) enum TaskContextError {
     ConflictingDuplicate {
         evidence_id: String,
     },
-    BundleCost {
-        reason: String,
-    },
     BundleCostExceedsBudget {
         actual: usize,
         limit: usize,
@@ -158,9 +155,6 @@ impl fmt::Display for TaskContextError {
                 formatter,
                 "candidate {evidence_id:?} was supplied with conflicting metadata"
             ),
-            Self::BundleCost { reason } => {
-                write!(formatter, "canonical task bundle cost failed: {reason}")
-            }
             Self::BundleCostExceedsBudget { actual, limit } => write!(
                 formatter,
                 "canonical task bundle fixed sections cost {actual} bytes; budget is {limit}"
@@ -709,11 +703,22 @@ pub(crate) struct SourceAnchor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EvidenceQuality {
+    Rejected,
+    Supporting,
+    Actionable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvidenceCandidate {
     pub(crate) evidence_id: String,
     pub(crate) roles: BTreeSet<ContextRole>,
     pub(crate) lanes: BTreeSet<RetrievalLane>,
     pub(crate) facets: BTreeSet<TaskFacet>,
+    /// Only actionable candidates may satisfy roles, lanes, facets, or task
+    /// obligations. Supporting candidates can still be exact pins.
+    pub(crate) quality: EvidenceQuality,
+    pub(crate) obligations: BTreeSet<String>,
     pub(crate) rendered_cost: usize,
     /// Present only when this record is an unambiguous exact-reference hit.
     pub(crate) exact_reference: Option<String>,
@@ -795,6 +800,8 @@ pub(crate) struct ContextSelection {
     pub(crate) missing_roles: BTreeSet<ContextRole>,
     pub(crate) covered_lanes: BTreeSet<RetrievalLane>,
     pub(crate) covered_facets: BTreeSet<TaskFacet>,
+    pub(crate) covered_obligations: BTreeSet<String>,
+    pub(crate) missing_obligations: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,6 +869,17 @@ where
     }
 
     let candidates = canonicalize_candidates(candidates)?;
+    // Obligations are required only when actionable candidates prove that the
+    // repository can satisfy them. Branch obligations remain optional
+    // diversity signals; concept and semantic obligations form the delivery
+    // contract for this candidate set.
+    let required_obligations = candidates
+        .values()
+        .filter(|candidate| candidate.quality == EvidenceQuality::Actionable)
+        .flat_map(|candidate| candidate.obligations.iter())
+        .filter(|obligation| !obligation.starts_with("branch:"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut selected = Vec::new();
     let mut omitted = Vec::new();
     let mut selected_ids = BTreeSet::new();
@@ -869,6 +887,7 @@ where
     let mut covered_roles = BTreeSet::new();
     let mut covered_lanes = BTreeSet::new();
     let mut covered_facets = BTreeSet::new();
+    let mut covered_obligations = BTreeSet::new();
     let mut file_counts = BTreeMap::<String, usize>::new();
     let mut source_plan = BTreeMap::<String, Vec<(u32, u32)>>::new();
     let mut rendered_cost = bundle_cost(&[])?;
@@ -918,9 +937,12 @@ where
             .entry(candidate.source.path.clone())
             .or_default() += 1;
         add_source_range(&mut source_plan, &candidate.source);
-        covered_roles.extend(candidate.roles.iter().copied());
-        covered_lanes.extend(candidate.lanes.iter().copied());
-        covered_facets.extend(candidate.facets.iter().copied());
+        if candidate.quality == EvidenceQuality::Actionable {
+            covered_roles.extend(candidate.roles.iter().copied());
+            covered_lanes.extend(candidate.lanes.iter().copied());
+            covered_facets.extend(candidate.facets.iter().copied());
+            covered_obligations.extend(candidate.obligations.iter().cloned());
+        }
         selected.push(SelectedEvidence {
             evidence_id: candidate.evidence_id.clone(),
             reason: SelectionReason::ExactReference {
@@ -942,6 +964,10 @@ where
         role_mask: role_mask(&covered_roles, &policy.required_roles),
         lane_mask: lane_mask(&covered_lanes),
         facet_mask: facet_mask(&covered_facets),
+        obligations: covered_obligations.clone(),
+        required_obligation_count: covered_obligations
+            .intersection(&required_obligations)
+            .count(),
         file_counts: file_counts.clone(),
         source_plan: source_plan.clone(),
         future_overlap_signature: Vec::new(),
@@ -975,12 +1001,22 @@ where
                 continue;
             }
 
-            let candidate_role_mask = role_mask(&candidate.roles, &policy.required_roles);
-            let candidate_lane_mask = lane_mask(&candidate.lanes);
-            let candidate_facet_mask = facet_mask(&candidate.facets);
+            let actionable = candidate.quality == EvidenceQuality::Actionable;
+            let candidate_role_mask = actionable
+                .then(|| role_mask(&candidate.roles, &policy.required_roles))
+                .unwrap_or(0);
+            let candidate_lane_mask = actionable.then(|| lane_mask(&candidate.lanes)).unwrap_or(0);
+            let candidate_facet_mask = actionable
+                .then(|| facet_mask(&candidate.facets))
+                .unwrap_or(0);
+            let candidate_obligations = actionable
+                .then_some(&candidate.obligations)
+                .cloned()
+                .unwrap_or_default();
             if candidate_role_mask & !state.role_mask == 0
                 && candidate_lane_mask & !state.lane_mask == 0
                 && candidate_facet_mask & !state.facet_mask == 0
+                && candidate_obligations.is_subset(&state.obligations)
             {
                 continue;
             }
@@ -1000,6 +1036,11 @@ where
             added.role_mask |= candidate_role_mask;
             added.lane_mask |= candidate_lane_mask;
             added.facet_mask |= candidate_facet_mask;
+            added.obligations.extend(candidate_obligations);
+            added.required_obligation_count = added
+                .obligations
+                .intersection(&required_obligations)
+                .count();
             *added
                 .file_counts
                 .entry(candidate.source.path.clone())
@@ -1064,9 +1105,12 @@ where
         *file_counts
             .entry(candidate.source.path.clone())
             .or_default() += 1;
-        covered_roles.extend(candidate.roles.iter().copied());
-        covered_lanes.extend(candidate.lanes.iter().copied());
-        covered_facets.extend(candidate.facets.iter().copied());
+        if candidate.quality == EvidenceQuality::Actionable {
+            covered_roles.extend(candidate.roles.iter().copied());
+            covered_lanes.extend(candidate.lanes.iter().copied());
+            covered_facets.extend(candidate.facets.iter().copied());
+            covered_obligations.extend(candidate.obligations.iter().cloned());
+        }
         selected.push(SelectedEvidence {
             evidence_id: candidate.evidence_id.clone(),
             reason: SelectionReason::CoveragePerCost {
@@ -1116,6 +1160,10 @@ where
         .difference(&covered_roles)
         .copied()
         .collect();
+    let missing_obligations = required_obligations
+        .difference(&covered_obligations)
+        .cloned()
+        .collect();
     Ok(ContextSelection {
         selected,
         omitted,
@@ -1124,6 +1172,8 @@ where
         missing_roles,
         covered_lanes,
         covered_facets,
+        covered_obligations,
+        missing_obligations,
     })
 }
 
@@ -1134,6 +1184,8 @@ struct SelectionState {
     role_mask: u16,
     lane_mask: u16,
     facet_mask: u8,
+    obligations: BTreeSet<String>,
+    required_obligation_count: usize,
     file_counts: BTreeMap<String, usize>,
     /// Canonical coalesced source geometry. Non-additive bundle costs may only
     /// dominate another state when future source overlap will be identical.
@@ -1230,7 +1282,13 @@ fn facet_mask(facets: &BTreeSet<TaskFacet>) -> u8 {
 }
 
 fn selection_state_value(state: &SelectionState) -> u32 {
-    state.role_mask.count_ones() * 64
+    u32::try_from(state.required_obligation_count)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(1_024)
+        + state.role_mask.count_ones() * 64
+        + u32::try_from(state.obligations.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(8)
         + state.facet_mask.count_ones() * 4
         + state.lane_mask.count_ones() * 2
 }
@@ -1248,7 +1306,8 @@ fn state_dominates(left: &SelectionState, right: &SelectionState) -> bool {
     // prior masks, so a superset can have different future bundle bytes.
     let coverage_equal = left.role_mask == right.role_mask
         && left.lane_mask == right.lane_mask
-        && left.facet_mask == right.facet_mask;
+        && left.facet_mask == right.facet_mask
+        && left.obligations == right.obligations;
     let source_interactions_equivalent = left.source_plan == right.source_plan
         || (left
             .future_overlap_signature
@@ -1367,6 +1426,13 @@ fn coverage_gain(
     covered_lanes: &BTreeSet<RetrievalLane>,
     covered_facets: &BTreeSet<TaskFacet>,
 ) -> CoverageGain {
+    if candidate.quality != EvidenceQuality::Actionable {
+        return CoverageGain {
+            roles: BTreeSet::new(),
+            lanes: BTreeSet::new(),
+            facets: BTreeSet::new(),
+        };
+    }
     CoverageGain {
         roles: candidate
             .roles
@@ -1402,6 +1468,8 @@ mod tests {
             roles: set(roles),
             lanes: set(lanes),
             facets: set([TaskFacet::Behavior]),
+            quality: EvidenceQuality::Actionable,
+            obligations: BTreeSet::new(),
             rendered_cost: cost,
             exact_reference: None,
             source: SourceAnchor {
@@ -1410,6 +1478,184 @@ mod tests {
                 end_line: 3,
             },
             channel_rank: 0,
+        }
+    }
+
+    #[test]
+    fn nominal_role_coverage_requires_actionable_evidence() {
+        let mut named_tuple = candidate(
+            "dict_namedtuple_generation",
+            10,
+            [ContextRole::EditableSource],
+            [RetrievalLane::EditableSource],
+        );
+        named_tuple.obligations = set(["concept:namedtuple".into()]);
+
+        let mut punctuation = candidate(
+            "punctuation_constant",
+            1,
+            [ContextRole::DefinitionOrApiState],
+            [RetrievalLane::DefinitionOrState],
+        );
+        punctuation.quality = EvidenceQuality::Rejected;
+        let mut unrelated_neighbor = candidate(
+            "unrelated_impl_decorator",
+            1,
+            [ContextRole::DirectDependency],
+            [RetrievalLane::Dependencies],
+        );
+        unrelated_neighbor.quality = EvidenceQuality::Supporting;
+        let mut generic_test = candidate(
+            "generic_typed_dict_fixture",
+            1,
+            [ContextRole::Test],
+            [RetrievalLane::Tests],
+        );
+        generic_test.quality = EvidenceQuality::Supporting;
+
+        let mut override_definition = candidate(
+            "attribute_override",
+            10,
+            [ContextRole::DefinitionOrApiState],
+            [RetrievalLane::DefinitionOrState],
+        );
+        override_definition.obligations = set(["concept:override".into()]);
+        let mut relevant_test = candidate(
+            "test_effective_overrides",
+            10,
+            [ContextRole::Test],
+            [RetrievalLane::Tests],
+        );
+        relevant_test.obligations = set(["concept:override".into(), "branch:test".into()]);
+
+        let policy = SelectionPolicy {
+            rendered_budget: 100,
+            per_record_limit: 100,
+            candidate_limit: 16,
+            per_file_limit: 4,
+            state_limit: 1_024,
+            required_roles: set([
+                ContextRole::EditableSource,
+                ContextRole::DefinitionOrApiState,
+                ContextRole::Test,
+            ]),
+        };
+        let selection = select_context(
+            vec![
+                named_tuple,
+                punctuation,
+                unrelated_neighbor,
+                generic_test,
+                override_definition,
+                relevant_test,
+            ],
+            &policy,
+        )
+        .unwrap();
+        let ids = selection
+            .selected
+            .iter()
+            .map(|item| item.evidence_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(ids.contains("dict_namedtuple_generation"));
+        assert!(ids.contains("attribute_override"));
+        assert!(ids.contains("test_effective_overrides"));
+        assert!(!ids.contains("punctuation_constant"));
+        assert!(!ids.contains("unrelated_impl_decorator"));
+        assert!(!ids.contains("generic_typed_dict_fixture"));
+        assert!(selection.missing_roles.is_empty());
+    }
+
+    #[test]
+    fn cattrs_fixture_covers_actionable_obligations_without_fixed_ranking() {
+        let specs = [
+            (
+                "attribute_override",
+                ContextRole::DefinitionOrApiState,
+                vec!["override", "attributeoverride"],
+            ),
+            (
+                "attrs_dataclass_generation",
+                ContextRole::EditableSource,
+                vec!["attrs", "dataclass"],
+            ),
+            (
+                "typeddict_notrequired_annotated",
+                ContextRole::EditableSource,
+                vec!["typeddict", "notrequired", "annotated"],
+            ),
+            (
+                "dict_namedtuple_generation",
+                ContextRole::EditableSource,
+                vec!["namedtuple"],
+            ),
+            (
+                "effective_overrides_precedence",
+                ContextRole::EditableSource,
+                vec!["precedence", "effective_overrides"],
+            ),
+            (
+                "test_generation_overrides",
+                ContextRole::Test,
+                vec!["relevant_tests"],
+            ),
+        ];
+        let candidates = specs
+            .into_iter()
+            .map(|(id, role, obligations)| {
+                let lane = if role == ContextRole::Test {
+                    RetrievalLane::Tests
+                } else {
+                    RetrievalLane::EditableSource
+                };
+                let mut item = candidate(id, 10, [role], [lane]);
+                item.obligations = obligations
+                    .into_iter()
+                    .map(|value| format!("concept:{value}"))
+                    .collect();
+                item
+            })
+            .collect::<Vec<_>>();
+        let by_id = candidates
+            .iter()
+            .map(|item| (item.evidence_id.clone(), item.obligations.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let policy = SelectionPolicy {
+            rendered_budget: 1_000,
+            per_record_limit: 1_000,
+            candidate_limit: 16,
+            per_file_limit: 4,
+            state_limit: 1_024,
+            required_roles: set([
+                ContextRole::EditableSource,
+                ContextRole::DefinitionOrApiState,
+                ContextRole::Test,
+            ]),
+        };
+        let selection = select_context(candidates, &policy).unwrap();
+        let covered = selection
+            .selected
+            .iter()
+            .flat_map(|item| by_id[&item.evidence_id].iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for obligation in [
+            "override",
+            "attributeoverride",
+            "attrs",
+            "dataclass",
+            "typeddict",
+            "notrequired",
+            "annotated",
+            "namedtuple",
+            "precedence",
+            "effective_overrides",
+            "relevant_tests",
+        ] {
+            assert!(
+                covered.contains(&format!("concept:{obligation}")),
+                "missing {obligation}; selected={:?}",
+                selection.selected
+            );
         }
     }
 
