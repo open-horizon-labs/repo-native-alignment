@@ -1177,7 +1177,12 @@ mod tests {
             "{}; quality=Actionable; obligations={{concept:override,generation:attrs}}",
             "verbose retrieval detail ".repeat(30)
         );
-        input.relationships[0].reason = "verbose relationship detail ".repeat(40);
+        input.relationships.push(ProjectedRelationship {
+            from: input.records[0].identity.node_id.clone(),
+            kind: "depends_on".into(),
+            to: "node:dependency".into(),
+            reason: "verbose relationship detail ".repeat(40),
+        });
         input.spans[0].text = "task source body ".repeat(500);
 
         let rendered = render_projection(&input).unwrap();
