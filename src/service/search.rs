@@ -3022,12 +3022,12 @@ fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> 
                     .contains(*term)
         })
         .count();
-    let affinity = affinity_count > 0;
     let graph_only = assembly.reason.starts_with("typed graph");
-    let required_test_affinity = query_terms.len().min(2);
-    let generic_test =
-        assembly.roles.contains(&TaskRole::Test) && affinity_count < required_test_affinity;
-    if (graph_only && !affinity) || generic_test {
+    let required_graph_affinity = query_terms.len().min(2);
+    let unrelated_graph_neighbor = graph_only && affinity_count < required_graph_affinity;
+    let generic_test = assembly.roles.contains(&TaskRole::Test)
+        && !crate::ranking::is_test_function(node);
+    if unrelated_graph_neighbor || generic_test {
         EvidenceQuality::Supporting
     } else {
         EvidenceQuality::Actionable
@@ -14209,7 +14209,8 @@ mod tests {
 
         let mut generic_test = make_node("A", NodeKind::Struct, "tests/test_typeddicts.py");
         generic_test.signature = "class A(TypedDict):".into();
-        generic_test.body = "class A(TypedDict): pass".into();
+        generic_test.body =
+            "class A(TypedDict): value: NotRequired[Annotated[str, override]]".into();
         generic_test.line_start = 1;
         generic_test.line_end = 1;
         assert_eq!(
@@ -14218,6 +14219,18 @@ mod tests {
                 &assembly(&generic_test, TaskRole::Test),
                 query
             ),
+            EvidenceQuality::Supporting
+        );
+
+        let mut incidental_neighbor = make_node("impl", NodeKind::Function, "src/hooks.py");
+        incidental_neighbor.signature = "def impl(override):".into();
+        incidental_neighbor.body = "def impl(override): return decorator".into();
+        incidental_neighbor.line_start = 1;
+        incidental_neighbor.line_end = 1;
+        let mut neighbor_assembly = assembly(&incidental_neighbor, TaskRole::DirectDependency);
+        neighbor_assembly.reason = "typed graph Calls dependency".into();
+        assert_eq!(
+            task_candidate_quality(&incidental_neighbor, &neighbor_assembly, query),
             EvidenceQuality::Supporting
         );
 

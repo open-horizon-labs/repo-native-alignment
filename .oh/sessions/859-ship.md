@@ -27,4 +27,22 @@
 **PR evidence:** https://github.com/open-horizon-labs/repo-native-alignment/pull/859#issuecomment-5159627322
 
 ### Step 2: Independent Code Review
-**Status:** pending fresh reviewer
+**Reviewer:** `/root/issue_858_ship/step2_review_b`
+**Reviewed commit:** `4b00f60cbe5fe041c4e6185aad261ae554a93fbc`
+**Verdict:** REQUEST CHANGES
+
+- P1: generic test declarations with superficial multi-token affinity and graph-only decorators with one incidental query token can become Actionable.
+- P1: real warmed-repository MCP delivery and matched unsteered trial remain unproven; this is resolved only by the prescribed Step 7b real-delivery gate, not by fabricating another synthetic fixture in Step 3.
+- PR evidence: https://github.com/open-horizon-labs/repo-native-alignment/pull/859#issuecomment-5159652103
+
+The first Step 2 reviewer self-disqualified before posting after `gh pr diff --exclude` leaked a forbidden session patch. The binding review came from a new distinct reviewer using pre-emission GitHub API filtering.
+
+### Step 3: Fix
+**Status:** complete
+
+- Require actual test-function evidence before a Test-role candidate can be Actionable.
+- Require two query-term matches for graph-only candidates when the query supplies at least two terms.
+- Add negative regressions for a multi-term generic TypedDict fixture and superficially query-affine unrelated decorator.
+- Step 2 delivery finding is assigned to mandatory Step 7b; completion evidence will be posted there before merge.
+
+**Verification:** reviewer negative-quality regression 1/1 passed; integrated production-path cattrs packet regression 1/1 passed.
