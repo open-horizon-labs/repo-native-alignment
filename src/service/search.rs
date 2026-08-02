@@ -3652,8 +3652,14 @@ fn task_record_selection_reason(
     quality: &EvidenceQuality,
     obligations: &BTreeSet<String>,
 ) -> String {
+    let obligation_floor = obligations
+        .iter()
+        .filter(|obligation| !obligation.starts_with("branch:"))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{prior}; {selection_reason}; quality={}; obligations={obligations:?}",
+        "{prior}; {selection_reason}; quality={}; obligations={obligation_floor}",
         quality.as_str()
     )
 }
@@ -14301,6 +14307,26 @@ mod tests {
                 || obligation.starts_with("branch:")
                 || obligation.starts_with("structure:")
         }));
+    }
+
+    #[test]
+    fn task_record_reason_exposes_a_compact_non_branch_obligation_floor() {
+        let reason = task_record_selection_reason(
+            "ranking diagnostics",
+            "coverage",
+            &EvidenceQuality::Actionable,
+            &BTreeSet::from([
+                "branch:Test:override".to_string(),
+                "concept:override".to_string(),
+                "structure:EditableSource:override".to_string(),
+                "validation:task-relevant-tests".to_string(),
+            ]),
+        );
+
+        assert_eq!(
+            reason,
+            "ranking diagnostics; coverage; quality=actionable; obligations=concept:override,structure:EditableSource:override,validation:task-relevant-tests"
+        );
     }
 
     #[tokio::test]

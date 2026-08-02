@@ -41,7 +41,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
         .saturating_mul(2)
         .saturating_add(plan.records.len().saturating_mul(3))
         .saturating_add(plan.relationships.len().saturating_mul(2))
-        .saturating_add(16);
+        .saturating_add(17);
     for _ in 0..attempts {
         let (text, accounting) = render_once(&plan)?;
         if within_budget(&accounting.total, &plan.request.budget) {
@@ -53,6 +53,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
         }
         if !compact_capability_diagnostics(&mut plan)
             && !compact_candidate_audit(&mut plan)
+            && !compact_capability_list(&mut plan)
             && !shrink_last_record_evidence(&mut plan)
             && !compact_record_metadata(&mut plan)
             && !compact_relationship_details(&mut plan)
@@ -83,6 +84,20 @@ fn compact_capability_diagnostics(plan: &mut ProjectionPlan) -> bool {
             "capability diagnostics omitted; hydrate or retry with a larger budget",
         );
         return true;
+    }
+    false
+}
+
+fn compact_capability_list(plan: &mut ProjectionPlan) -> bool {
+    // Graph-delta capability names are part of that projection's delivery
+    // contract, not diagnostics. Preserve their states after details and
+    // duplicate candidate audit have been compacted.
+    if plan
+        .records
+        .iter()
+        .any(|record| record.selection.role == Some(ContextRole::ProposalDelta))
+    {
+        return false;
     }
     if plan.capabilities.len() <= 1 {
         return false;
@@ -130,7 +145,9 @@ fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
         !record.symbol.declared_metadata.is_empty()
             || record.symbol.extraction_source.is_some()
             || (record.selection.reason.len() > 32
-                && !(task_intent && record.selection.reason.ends_with("obligations=hydrate")))
+                && !(task_intent
+                    && record.selection.reason.starts_with("quality=")
+                    && record.selection.reason.contains("; obligations=")))
     }) else {
         return false;
     };
@@ -138,23 +155,29 @@ fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
     record.symbol.extraction_source = None;
     if record.selection.reason.len() > 32 {
         record.selection.reason = if task_intent {
-            record
-                .selection
-                .reason
-                .find("quality=")
-                .map(|start| {
-                    let quality = record.selection.reason[start..]
-                        .split(';')
-                        .next()
-                        .unwrap_or("quality=actionable");
-                    format!("{quality}; obligations=hydrate")
-                })
-                .unwrap_or_else(|| "selected task evidence; hydrate".into())
+            compact_task_selection_reason(&record.selection.reason)
         } else {
             "selected; hydrate for detail".into()
         };
     }
     true
+}
+
+fn compact_task_selection_reason(reason: &str) -> String {
+    let quality = reason
+        .find("quality=")
+        .map(|start| {
+            reason[start..]
+                .split(';')
+                .next()
+                .unwrap_or("quality=actionable")
+        })
+        .unwrap_or("quality=actionable");
+    let obligations = reason
+        .rfind("obligations=")
+        .map(|start| &reason[start..])
+        .unwrap_or("obligations=");
+    format!("{quality}; {obligations}")
 }
 
 fn compact_relationship_details(plan: &mut ProjectionPlan) -> bool {
@@ -231,10 +254,7 @@ fn compact_omissions(plan: &mut ProjectionPlan) -> bool {
             detail: format!("delivery metadata compacted; omitted_detail_count={count}"),
         },
         |mut omission| {
-            omission.detail = format!(
-                "{}; omitted_detail_count={count}",
-                omission.detail
-            );
+            omission.detail = format!("{}; omitted_detail_count={count}", omission.detail);
             omission
         },
     )];
@@ -1052,6 +1072,57 @@ mod tests {
     }
 
     #[test]
+    fn graph_delta_budget_preserves_capability_states_before_duplicate_audit() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(4_096);
+        input.records[0].selection.role = Some(ContextRole::ProposalDelta);
+        input.capabilities = [
+            "graph_delta_proposal_parsing",
+            "graph_delta_live_graph_inference",
+            "graph_delta_route_analysis",
+            "graph_delta_card_coverage",
+            "graph_delta_changed_files",
+            "graph_delta_affected_locus_checklist",
+            "proposal_overlay_persistence",
+        ]
+        .into_iter()
+        .map(|capability| CapabilityStatus {
+            capability: capability.into(),
+            state: CapabilityState::Ready,
+            detail: "verbose graph-delta diagnostic detail ".repeat(20),
+        })
+        .collect();
+        input.candidate_audit = (1..=100)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank:02}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "duplicate graph-delta candidate audit ".repeat(10),
+                evidence: SelectionEvidence::default(),
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.accounting.total.utf8_bytes <= 4_096);
+        assert!(rendered.plan.candidate_audit.is_empty());
+        assert!(!rendered.text.contains("delivery_capabilities"));
+        for capability in &input.capabilities {
+            assert!(
+                rendered
+                    .text
+                    .contains(&format!("{}: ready", capability.capability)),
+                "missing capability {}",
+                capability.capability
+            );
+        }
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
     fn evidence_budget_preserves_selected_identities_while_omitting_duplicate_audit_detail() {
         let mut input = plan(SearchProjection::Evidence);
         input.request.budget.max_rendered_bytes = Some(6_000);
@@ -1074,18 +1145,14 @@ mod tests {
         assert!(rendered.text.len() <= 6_000);
         assert_eq!(rendered.plan.records.len(), 8);
         assert!(rendered.plan.candidate_audit.is_empty());
-        assert!(
-            rendered
-                .plan
-                .records
-                .iter()
-                .any(|record| record.evidence == SelectionEvidence::default())
-        );
-        assert!(
-            rendered
-                .text
-                .contains("selected record audit detail omitted")
-        );
+        assert!(rendered
+            .plan
+            .records
+            .iter()
+            .any(|record| record.evidence == SelectionEvidence::default()));
+        assert!(rendered
+            .text
+            .contains("selected record audit detail omitted"));
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
@@ -1250,13 +1317,23 @@ mod tests {
         assert_eq!(rendered.plan.records.len(), 1);
         assert_eq!(
             rendered.plan.records[0].selection.reason,
-            "quality=actionable; obligations=hydrate"
+            "quality=actionable; obligations=concept:override,structure:EditableSource:override"
         );
         assert!(
             rendered.plan.relationships.is_empty()
                 || rendered.plan.relationships[0].reason.is_empty()
         );
         assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn task_metadata_compaction_retains_the_producer_obligation_floor() {
+        let reason = "retrieval; coverage; quality=actionable; obligations=concept:override,structure:Test:override,validation:task-relevant-tests";
+
+        assert_eq!(
+            compact_task_selection_reason(reason),
+            "quality=actionable; obligations=concept:override,structure:Test:override,validation:task-relevant-tests"
+        );
     }
 
     #[test]

@@ -102,3 +102,32 @@ Final matched real flat query on the same warmed RNA worktree (`render budget`, 
 - The critical non-terminating flat marker was already fixed in `f13e5532` and regression-tested in `ec3eb958`.
 
 **Validation:** `cargo check --lib` passed (14.9s). Managed-PTY obligation test 1/1 passed. Exact linked binary newer than all changed Rust sources: quality 1/1, integrated cattrs 1/1, selector 18/18, renderer 16/16, hydration model 4/4.
+
+### Step 7a: Computation Verification
+**Status:** complete on `727d84ce`, then re-entered after smoke finding
+
+- Exact-head Rust CI test, lint, and audit jobs passed.
+- Focused renderer 16/16, selector 18/18, handles 4/4, production obligation seam, and explicit 24,000-byte self-task tests passed.
+- Performance gate is N/A: no extraction/enrichment pass or scan-complexity seam changed.
+- PR evidence: https://github.com/open-horizon-labs/repo-native-alignment/pull/859#issuecomment-5159849907
+
+### Step 7b Preparation: Real App Server and cattrs Reproduction
+
+- Fresh upstream checkout acquired and exact task identified as cattrs PR #717, `Support overrides in annotated attributes`.
+- Reproduction commit: `309e9d1413cfb0947b8ba4e704dd5dcd2652ae27` (parent of the upstream implementation commit).
+- Full warmed scan: 4,120 symbols, 13,555 edges, 187 files, nonzero exact/structural graph; no embeddings or LSP call/reference edges.
+- Current Codex App Server JSON-RPC client completed `initialize` → `thread/start` → `mcpServerStatus/list` → `mcpServer/tool/call` through the real RNA stdio server.
+- Installed pre-fix RNA returned the expected failure for the issue-exact request: fixed sections cost 77,014 bytes against the derived 24,000-byte budget.
+- Two fresh matched trial clones, identical dependency environments, one fixed task prompt, and the real App Server trial client are prepared. The task-only arm completed; the RNA-context arm awaits the exact-head CI packet.
+
+### Step 3 Re-entry: Graph-Delta Projection Semantics
+**Status:** complete locally; exact-head CI rerun required
+
+Workflow-dispatch smoke found that generic capability-list compaction removed seven named graph-delta capability states. The remediation:
+
+- separates diagnostic-detail compaction from capability-list collapse;
+- compacts duplicate candidate audit before collapsing ordinary capability names;
+- treats ProposalDelta capability states as projection semantics and preserves them;
+- retains the producer-derived, non-branch obligation floor in compact task-selection reasons, closing the final-packet obligation-certification blindspot.
+
+Validation on the freshly linked code: graph-delta regression 1/1; obligation producer 1/1; obligation renderer floor 1/1; cattrs production seam 1/1; complete real MCP stdio smoke passed, including all seven graph-delta assertions.
