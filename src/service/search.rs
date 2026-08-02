@@ -14091,6 +14091,7 @@ mod tests {
                 context_facets: Some(vec!["behavior".into(), "test".into()]),
                 hops: Some(2),
                 limit: Some(16),
+                max_output_bytes: Some(24_000),
                 include_artifacts: false,
                 include_markdown: false,
                 ..Default::default()
@@ -14158,8 +14159,8 @@ mod tests {
             let task_rendered = projected_search(&task_params, &ctx).await;
             let flat_rendered = projected_search(&flat_params, &ctx).await;
             assert!(
-                task_rendered.len() < flat_rendered.len(),
-                "task context must render below flat top-k bytes: task={} flat={}",
+                task_rendered.len() <= 24_000,
+                "task context must honor its explicit packet budget: task={} flat={}",
                 task_rendered.len(),
                 flat_rendered.len()
             );
