@@ -3517,34 +3517,34 @@ fn materialize_task_output(
             TaskSelectionReason::ExactReference { reference }
         } else {
             TaskSelectionReason::CoveragePerCost {
-                newly_covered_roles: actionable
-                    .then(|| {
-                        candidate
-                            .roles
-                            .intersection(required_roles)
-                            .filter(|role| !covered_roles.contains(*role))
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                newly_covered_lanes: actionable
-                    .then(|| {
-                        candidate
-                            .lanes
-                            .difference(&covered_lanes)
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                newly_covered_facets: actionable
-                    .then(|| {
-                        candidate
-                            .facets
-                            .difference(&covered_facets)
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                newly_covered_roles: if actionable {
+                    candidate
+                        .roles
+                        .intersection(required_roles)
+                        .filter(|role| !covered_roles.contains(*role))
+                        .copied()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                },
+                newly_covered_lanes: if actionable {
+                    candidate
+                        .lanes
+                        .difference(&covered_lanes)
+                        .copied()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                },
+                newly_covered_facets: if actionable {
+                    candidate
+                        .facets
+                        .difference(&covered_facets)
+                        .copied()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                },
             }
         };
         if actionable {

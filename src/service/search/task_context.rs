@@ -1018,13 +1018,21 @@ where
             }
 
             let actionable = candidate.quality == EvidenceQuality::Actionable;
-            let candidate_role_mask = actionable
-                .then(|| role_mask(&candidate.roles, &policy.required_roles))
-                .unwrap_or(0);
-            let candidate_lane_mask = actionable.then(|| lane_mask(&candidate.lanes)).unwrap_or(0);
-            let candidate_facet_mask = actionable
-                .then(|| facet_mask(&candidate.facets))
-                .unwrap_or(0);
+            let candidate_role_mask = if actionable {
+                role_mask(&candidate.roles, &policy.required_roles)
+            } else {
+                0
+            };
+            let candidate_lane_mask = if actionable {
+                lane_mask(&candidate.lanes)
+            } else {
+                0
+            };
+            let candidate_facet_mask = if actionable {
+                facet_mask(&candidate.facets)
+            } else {
+                0
+            };
             let candidate_obligations = actionable
                 .then_some(&candidate.obligations)
                 .cloned()
