@@ -151,7 +151,7 @@ fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
                 })
                 .unwrap_or_else(|| "selected task evidence; hydrate".into())
         } else {
-            "selected; detail omitted for budget".into()
+            "selected; hydrate for detail".into()
         };
     }
     true
@@ -1149,6 +1149,38 @@ mod tests {
             "an omitted flat-tail record must retain a compact hydration handle"
         );
         assert!(rendered.text.contains("hydrate=rna-h2:"));
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn flat_record_reason_compaction_reaches_a_terminal_marker() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.body_policy = BodyPolicy::SignatureOnly;
+        input.request.budget.max_estimated_tokens = Some(5_000);
+        input.spans.clear();
+        input.records = (0..20)
+            .map(|rank| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("record-{rank:03}");
+                record.selection.reason = "ordinary search ranking diagnostics ".repeat(10);
+                record.symbol.declared_metadata.clear();
+                record.symbol.extraction_source = None;
+                record.evidence = SelectionEvidence::default();
+                record
+            })
+            .collect();
+
+        let rendered = render_projection(&input).expect("metadata compaction must converge");
+        assert!(rendered.accounting.total.estimated_tokens <= 5_000);
+        assert!(
+            rendered
+                .plan
+                .records
+                .iter()
+                .all(|record| record.selection.reason.len() <= 32),
+            "every retained record reason must reach a terminal compaction marker"
+        );
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 

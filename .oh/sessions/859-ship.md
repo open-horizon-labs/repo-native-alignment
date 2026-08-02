@@ -46,3 +46,25 @@ The first Step 2 reviewer self-disqualified before posting after `gh pr diff --e
 - Step 2 delivery finding is assigned to mandatory Step 7b; completion evidence will be posted there before merge.
 
 **Verification:** reviewer negative-quality regression 1/1 passed; integrated production-path cattrs packet regression 1/1 passed.
+
+### Step 3b: Mark Ready
+**Status:** complete
+**Ready head:** `849b9ec50fa38d2f8456515503f543e3b7d39c73`
+
+### Step 4: Regression Oracle
+**Status:** complete
+**Tests written/strengthened:** 11
+**Exact linked-binary results:** renderer 15/15; task-context 18/18; hydration model 4/4; production-path issue filters 5/5.
+**PR evidence:** https://github.com/open-horizon-labs/repo-native-alignment/pull/859#issuecomment-5159687696
+
+### Step 5: Merit Assessment
+**Initial verdict:** NEEDS MORE WORK
+
+The installed pre-fix binary failed a real 20-result evidence query at 5,000 tokens with a 60,221-byte/15,017-token non-body response. The branch binary removed that failure but exposed `AccountingDidNotConverge`: flat reason compaction rewrote a long reason to another reason above its own 32-character terminal threshold. Returned to Step 3 for a terminal marker and regression before reassessment.
+
+### Step 3 Re-entry: Merit Finding
+**Status:** complete
+
+- Shorten the flat selection-reason terminal marker below the compaction threshold.
+- Add a 20-record regression with long reasons but no auxiliary verbose metadata, matching the real-query failure shape.
+- Targeted terminal-marker regression passed; the only concurrent host Cargo process was verified to belong to a different repository and target directory.
