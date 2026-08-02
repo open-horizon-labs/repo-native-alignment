@@ -131,3 +131,12 @@ Workflow-dispatch smoke found that generic capability-list compaction removed se
 - retains the producer-derived, non-branch obligation floor in compact task-selection reasons, closing the final-packet obligation-certification blindspot.
 
 Validation on the freshly linked code: graph-delta regression 1/1; obligation producer 1/1; obligation renderer floor 1/1; cattrs production seam 1/1; complete real MCP stdio smoke passed, including all seven graph-delta assertions.
+
+### Step 7b Preview Re-entry: Final-Packet Obligation Visibility
+**Status:** corrected locally; exact-head artifact verification required
+
+The first real Codex App Server cattrs preview on `727d84ce` fit the envelope at 14,951 bytes / 3,733 estimated tokens, but renderer compaction replaced every producer-certified obligation set with `obligations=hydrate`. That bounded packet could no longer show why its retained records satisfied the task, so it failed the issue's final-packet usefulness criterion and returned the pipeline to Step 3.
+
+The generic correction keeps producer-derived, non-branch concept/structure/validation obligations in each compact task-selection reason while dropping branch bookkeeping. No cattrs vocabulary, path, symbol, or ranking order is hardcoded. The corrected real-client preview selected nine hydratable records and fit at 15,340 bytes / 3,831 estimated tokens. Its retained signatures and compact obligation floors visibly connect attrs/dataclass factories, TypedDict generation, Annotated/NotRequired handling, dict-style NamedTuple tests, override behavior, and task-relevant tests; exact CI-artifact delivery and the matched unsteered trial remain mandatory before this gate can pass.
+
+Correction validation: renderer 18/18; obligation producer 1/1; production cattrs seam 1/1; strict clippy passed; `git diff --check` passed.
