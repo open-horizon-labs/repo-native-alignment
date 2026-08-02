@@ -23,9 +23,11 @@ headers, metadata, bodies, relationships, omissions, and the accounting footer.
 Selection and rendering use the same bounded fitter. When optional
 server-owned detail does not fit, RNA degrades it deterministically: capability
 and candidate diagnostics, per-record evidence/metadata, relationship detail,
-source bodies, then the lowest-ranked flat-search tail. Task-selected records
-are protected because a role or task obligation is covered only when its
-actionable carrier remains in the final fitted packet.
+source bodies, the lowest-ranked flat-search tail, and finally the omission
+list itself, which collapses into one entry reporting `omitted_detail_count`
+while retaining one compact hydration handle. Task-selected records are
+protected because a role or task obligation is covered only when its actionable
+carrier remains in the final fitted packet.
 
 Every retained record whose detail can be omitted keeps a stable
 `rna-h2` version-2 source or evidence handle. V2 is a compact, checksummed,
@@ -43,6 +45,11 @@ same value during admission; if neither caller limit can hold it,
 `BudgetTooSmall.minimum` reports the final byte/token cost of that irreducible
 plan. Tests freeze this definition and the degradation order rather than one
 incidental global byte count.
+
+Generic query-concept and query-affine structural-profile obligations apply to
+every language. Structural profiles distinguish independently useful evidence
+branches by role and matched query concepts, without embedding repository- or
+language-specific vocabulary in the selector.
 
 ## Ranking evidence
 

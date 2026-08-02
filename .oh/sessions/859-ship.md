@@ -1,3 +1,12 @@
+---
+session: 859-ship
+artifact_type: ship-pipeline
+issue: 858
+pull_request: 859
+outcome: context-assembly
+updated: 2026-08-02T18:30:00Z
+---
+
 ## Ship Pipeline — PR #859
 **Started:** 2026-08-02 13:46 EDT
 **Issue:** #858
@@ -69,3 +78,27 @@ The installed pre-fix binary failed a real 20-result evidence query at 5,000 tok
 - Add a 20-record regression with long reasons but no auxiliary verbose metadata, matching the real-query failure shape.
 - Targeted terminal-marker regression passed; the only concurrent host Cargo process was verified to belong to a different repository and target directory.
 - A real 20-result evidence query now returns a bounded 6,805-byte/1,701-token packet instead of either the prior 60,221-byte non-body failure or `AccountingDidNotConverge`; the terminal-state regression was tightened to prove the compact marker cannot re-enter degradation.
+
+### Step 4 Revalidation After Merit Fix
+**Status:** complete
+**Exact-source linked-binary results:** renderer 16/16; task-context 18/18; hydration model 4/4; production-path issue filters 5/5.
+
+### Step 5: Merit Reassessment
+**Verdict:** MERGE, contingent on mandatory real cattrs Step 7b
+
+Final matched real flat query on the same warmed RNA worktree (`render budget`, evidence, signature-only, limit 20, 5,000 tokens):
+- installed pre-fix binary: failed at 60,221 bytes / 15,017 estimated tokens;
+- branch binary: succeeded with one selected hydratable record, a compact handle-bearing omitted-tail entry, and self-accounted 2,147 bytes / 537 estimated tokens (3,364 captured bytes including process diagnostics).
+
+### Step 6: Resolve TODOs and Ready-Review Findings
+**Status:** complete for currently visible findings
+
+- Added required YAML frontmatter to this session artifact.
+- Documented final omission-list compaction and retained hydration.
+- Replaced repository/language-specific semantic vocabulary with generic query-concept plus query-affine structural-profile obligations.
+- Hardened graph affinity with stopword filtering, character-aware term length, and identifier/camel-boundary matching; added the two-incidental-substring negative regression.
+- Added stable lowercase `EvidenceQuality::as_str` tokens and exercised the real producer through tight-budget renderer compaction.
+- Extracted the shared actionable, non-branch required-obligation derivation used by selector and materializer.
+- The critical non-terminating flat marker was already fixed in `f13e5532` and regression-tested in `ec3eb958`.
+
+**Validation:** `cargo check --lib` passed (14.9s). Managed-PTY obligation test 1/1 passed. Exact linked binary newer than all changed Rust sources: quality 1/1, integrated cattrs 1/1, selector 18/18, renderer 16/16, hydration model 4/4.

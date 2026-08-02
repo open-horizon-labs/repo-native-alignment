@@ -709,6 +709,16 @@ pub(crate) enum EvidenceQuality {
     Actionable,
 }
 
+impl EvidenceQuality {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Supporting => "supporting",
+            Self::Actionable => "actionable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvidenceCandidate {
     pub(crate) evidence_id: String,
@@ -725,6 +735,18 @@ pub(crate) struct EvidenceCandidate {
     pub(crate) source: SourceAnchor,
     /// Rank inside the candidate's retrieval channel. Lower is better.
     pub(crate) channel_rank: u32,
+}
+
+pub(crate) fn required_obligations<'a>(
+    candidates: impl IntoIterator<Item = &'a EvidenceCandidate>,
+) -> BTreeSet<String> {
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.quality == EvidenceQuality::Actionable)
+        .flat_map(|candidate| candidate.obligations.iter())
+        .filter(|obligation| !obligation.starts_with("branch:"))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -873,13 +895,7 @@ where
     // repository can satisfy them. Branch obligations remain optional
     // diversity signals; concept and semantic obligations form the delivery
     // contract for this candidate set.
-    let required_obligations = candidates
-        .values()
-        .filter(|candidate| candidate.quality == EvidenceQuality::Actionable)
-        .flat_map(|candidate| candidate.obligations.iter())
-        .filter(|obligation| !obligation.starts_with("branch:"))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let required_obligations = required_obligations(candidates.values());
     let mut selected = Vec::new();
     let mut omitted = Vec::new();
     let mut selected_ids = BTreeSet::new();

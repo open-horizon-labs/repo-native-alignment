@@ -146,7 +146,7 @@ fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
                     let quality = record.selection.reason[start..]
                         .split(';')
                         .next()
-                        .unwrap_or("quality=Actionable");
+                        .unwrap_or("quality=actionable");
                     format!("{quality}; obligations=hydrate")
                 })
                 .unwrap_or_else(|| "selected task evidence; hydrate".into())
@@ -724,6 +724,7 @@ fn safe_fence(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn plan(projection: SearchProjection) -> ProjectionPlan {
         let source = SourceSpan {
@@ -1184,7 +1185,7 @@ mod tests {
                 record.identity.node_id = format!("task-record-{rank:02}");
                 record.symbol.name = format!("actionable_task_symbol_{rank:02}");
                 record.selection.reason = format!(
-                    "retrieval detail {}; quality=Actionable; obligations={{concept:task-{rank:02}}}",
+                    "retrieval detail {}; quality=actionable; obligations={{concept:task-{rank:02}}}",
                     "server-owned ".repeat(20)
                 );
                 record
@@ -1226,9 +1227,14 @@ mod tests {
         let mut input = plan(SearchProjection::Evidence);
         input.request.intent = SearchIntent::Implement;
         input.request.budget.max_rendered_bytes = Some(2_500);
-        input.records[0].selection.reason = format!(
-            "{}; quality=Actionable; obligations={{concept:override,generation:attrs}}",
-            "verbose retrieval detail ".repeat(30)
+        input.records[0].selection.reason = super::super::task_record_selection_reason(
+            &"verbose retrieval detail ".repeat(30),
+            "coverage per exact rendered cost",
+            &super::super::task_context::EvidenceQuality::Actionable,
+            &BTreeSet::from([
+                "concept:override".to_string(),
+                "structure:EditableSource:override".to_string(),
+            ]),
         );
         input.relationships.push(ProjectedRelationship {
             from: input.records[0].identity.node_id.clone(),
@@ -1244,7 +1250,7 @@ mod tests {
         assert_eq!(rendered.plan.records.len(), 1);
         assert_eq!(
             rendered.plan.records[0].selection.reason,
-            "quality=Actionable; obligations=hydrate"
+            "quality=actionable; obligations=hydrate"
         );
         assert!(
             rendered.plan.relationships.is_empty()

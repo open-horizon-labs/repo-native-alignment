@@ -3008,19 +3008,16 @@ fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> 
     }
 
     let query_terms = task_query_terms(query);
+    let candidate_terms = task_text_terms(&format!(
+        "{} {} {} {}",
+        node.id.name,
+        node.signature,
+        node.body,
+        node.id.file.display()
+    ));
     let affinity_count = query_terms
         .iter()
-        .filter(|term| {
-            node.id.name.to_ascii_lowercase().contains(*term)
-                || node.signature.to_ascii_lowercase().contains(*term)
-                || node.body.to_ascii_lowercase().contains(*term)
-                || node
-                    .id
-                    .file
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains(*term)
-        })
+        .filter(|term| candidate_terms.contains(*term))
         .count();
     let graph_only = assembly.reason.starts_with("typed graph");
     let required_graph_affinity = query_terms.len().min(2);
@@ -3048,8 +3045,7 @@ fn task_candidate_obligations(
         node.signature,
         node.body,
         node.id.file.display()
-    )
-    .to_ascii_lowercase();
+    );
     task_obligations_for_text(&haystack, &assembly.roles, query)
 }
 
@@ -3059,89 +3055,80 @@ fn task_obligations_for_text(
     query: &str,
 ) -> BTreeSet<String> {
     let query_terms = task_query_terms(query);
-    let mut obligations = query_terms
+    let evidence_terms = task_text_terms(haystack);
+    let matched_terms = query_terms
+        .intersection(&evidence_terms)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut obligations = matched_terms
         .iter()
-        .filter(|term| haystack.contains(term.as_str()))
         .map(|term| format!("concept:{term}"))
         .collect::<BTreeSet<_>>();
 
     // Structural branches are useful only when tied to a requested concept;
     // a unique path by itself would reward unrelated graph neighbors.
     for role in roles {
-        for term in query_terms.iter().filter(|term| haystack.contains(*term)) {
+        for term in &matched_terms {
             obligations.insert(format!("branch:{role:?}:{term}"));
         }
-    }
-
-    let structured_generation = query_terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "annotated" | "notrequired" | "typeddict" | "namedtuple"
-        )
-    });
-    if structured_generation {
-        if contains_any(haystack, &["attrs", "__attrs_attrs__"])
-            && contains_any(
-                haystack,
-                &["generat", "structure", "unstructure", "converter"],
-            )
-        {
-            obligations.insert("generation:attrs".into());
-        }
-        if haystack.contains("dataclass")
-            && contains_any(
-                haystack,
-                &["generat", "structure", "unstructure", "converter"],
-            )
-        {
-            obligations.insert("generation:dataclass".into());
-        }
-        if haystack.contains("typeddict") {
-            obligations.insert("generation:typeddict".into());
-        }
-        if haystack.contains("notrequired") && haystack.contains("annotated") {
-            obligations.insert("typing:notrequired-annotated".into());
-        }
-        if haystack.contains("namedtuple")
-            && contains_any(haystack, &["dict", "mapping", "asdict", "structure"])
-        {
-            obligations.insert("generation:namedtuple-dict".into());
+        if !matched_terms.is_empty() {
+            // Distinct query-affine structural profiles are required delivery
+            // units. This keeps independent evidence branches without
+            // embedding repository- or language-specific vocabulary.
+            obligations.insert(format!(
+                "structure:{role:?}:{}",
+                matched_terms.iter().cloned().collect::<Vec<_>>().join("+")
+            ));
         }
     }
 
-    if query_terms.contains("override") {
-        if contains_any(haystack, &["attributeoverride", "override"]) {
-            obligations.insert("override:metadata".into());
-        }
-        if contains_any(
-            haystack,
-            &[
-                "precedence",
-                "effective override",
-                ".overrides",
-                "overrides.get",
-            ],
-        ) {
-            obligations.insert("override:precedence-effective".into());
-        }
-    }
-
-    if roles.contains(&TaskRole::Test) && query_terms.iter().any(|term| haystack.contains(term)) {
+    if roles.contains(&TaskRole::Test) && !matched_terms.is_empty() {
         obligations.insert("validation:task-relevant-tests".into());
     }
     obligations
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn task_query_terms(query: &str) -> BTreeSet<String> {
+    const TASK_QUERY_STOPWORDS: &[&str] = &[
+        "add", "and", "any", "are", "can", "change", "fix", "for", "from", "has", "into",
+        "not", "that", "the", "this", "update", "use", "when", "with",
+    ];
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .filter(|term| term.chars().count() >= 3)
+        .filter(|term| !TASK_QUERY_STOPWORDS.contains(&term.as_str()))
+        .collect()
 }
 
-fn task_query_terms(query: &str) -> BTreeSet<String> {
-    query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .map(str::to_ascii_lowercase)
-        .filter(|term| term.len() >= 3)
-        .collect()
+fn task_text_terms(text: &str) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    for raw in text.split(|ch: char| !ch.is_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = raw.to_lowercase();
+        terms.insert(normalized.clone());
+        if normalized.ends_with('s') && normalized.chars().count() > 3 {
+            terms.insert(normalized.trim_end_matches('s').to_string());
+        }
+
+        let mut segment = String::new();
+        let mut previous_lowercase = false;
+        for ch in raw.chars() {
+            if ch.is_uppercase() && previous_lowercase && !segment.is_empty() {
+                terms.insert(segment.to_lowercase());
+                segment.clear();
+            }
+            previous_lowercase = ch.is_lowercase();
+            segment.push(ch);
+        }
+        if !segment.is_empty() {
+            terms.insert(segment.to_lowercase());
+        }
+    }
+    terms
 }
 
 fn task_lane_candidate_evidence(
@@ -3519,13 +3506,7 @@ fn materialize_task_output(
     let mut covered_lanes = BTreeSet::new();
     let mut covered_facets = BTreeSet::new();
     let mut covered_obligations = BTreeSet::new();
-    let required_obligations = typed
-        .values()
-        .filter(|candidate| candidate.quality == EvidenceQuality::Actionable)
-        .flat_map(|candidate| candidate.obligations.iter())
-        .filter(|obligation| !obligation.starts_with("branch:"))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let required_obligations = task_context::required_obligations(typed.values());
 
     for (rank, id) in selected_ids.iter().enumerate() {
         let Some(candidate) = typed.get(id) else {
@@ -3576,9 +3557,11 @@ fn materialize_task_output(
         if let Some(records) = bundles.get(id) {
             for mut record in records.clone() {
                 record.selection_rank = rank;
-                record.selection.reason = format!(
-                    "{}; {reason}; quality={:?}; obligations={:?}",
-                    record.selection.reason, candidate.quality, candidate.obligations
+                record.selection.reason = task_record_selection_reason(
+                    &record.selection.reason,
+                    &reason,
+                    &candidate.quality,
+                    &candidate.obligations,
                 );
                 output.records.push(record);
             }
@@ -3661,6 +3644,18 @@ fn materialize_task_output(
         ),
     });
     output
+}
+
+fn task_record_selection_reason(
+    prior: &str,
+    selection_reason: &str,
+    quality: &EvidenceQuality,
+    obligations: &BTreeSet<String>,
+) -> String {
+    format!(
+        "{prior}; {selection_reason}; quality={}; obligations={obligations:?}",
+        quality.as_str()
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14234,6 +14229,24 @@ mod tests {
             EvidenceQuality::Supporting
         );
 
+        let mut substring_neighbor = make_node("impl", NodeKind::Function, "src/theme.py");
+        substring_neighbor.signature = "def other_standard_address():".into();
+        substring_neighbor.body = "def other_standard_address(): return decorator".into();
+        substring_neighbor.line_start = 1;
+        substring_neighbor.line_end = 1;
+        let mut substring_assembly =
+            assembly(&substring_neighbor, TaskRole::DirectDependency);
+        substring_assembly.reason = "typed graph Calls dependency".into();
+        assert_eq!(
+            task_candidate_quality(
+                &substring_neighbor,
+                &substring_assembly,
+                "Change the handler and add a regression test"
+            ),
+            EvidenceQuality::Supporting,
+            "stopwords and incidental substrings must not create graph affinity"
+        );
+
         let mut relevant_test = make_node(
             "test_override",
             NodeKind::Function,
@@ -14263,13 +14276,12 @@ mod tests {
         );
 
         for obligation in [
-            "override:metadata",
-            "generation:attrs",
-            "generation:dataclass",
-            "generation:typeddict",
-            "typing:notrequired-annotated",
-            "generation:namedtuple-dict",
-            "override:precedence-effective",
+            "concept:annotated",
+            "concept:namedtuple",
+            "concept:notrequired",
+            "concept:override",
+            "concept:typeddict",
+            "structure:EditableSource:annotated+namedtuple+notrequired+override+typeddict",
         ] {
             assert!(
                 obligations.contains(obligation),
@@ -14282,6 +14294,12 @@ mod tests {
                 .all(|obligation| !obligation.contains("src/")),
             "path uniqueness must not create task obligations: {obligations:?}"
         );
+
+        assert!(obligations.iter().all(|obligation| {
+            obligation.starts_with("concept:")
+                || obligation.starts_with("branch:")
+                || obligation.starts_with("structure:")
+        }));
     }
 
     #[tokio::test]
@@ -14453,6 +14471,10 @@ mod tests {
             "missing compact hydration handle"
         );
         assert!(rendered.len() <= 24_000);
+        assert!(
+            rendered.contains("quality=actionable"),
+            "the producer must emit the stable evidence-quality token"
+        );
     }
 
     #[tokio::test]
