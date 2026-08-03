@@ -60,7 +60,13 @@ use std::path::PathBuf;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 
-type ImportedBinding = (String, Option<String>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportedBinding {
+    imported_symbol: String,
+    local_name: String,
+    module_path: Option<String>,
+}
+
 type ImportedBindingsByFile = HashMap<(String, PathBuf), HashSet<ImportedBinding>>;
 
 // ---------------------------------------------------------------------------
@@ -113,13 +119,12 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     for node in all_nodes {
         if node.id.kind == NodeKind::Import {
             let text = &node.id.name; // Import node name = full import text
-            let names = parse_imported_names(text);
-            if !names.is_empty() {
-                let module = parse_import_module(text);
+            let bindings = parse_import_bindings(text);
+            if !bindings.is_empty() {
                 imported_names_by_file
                     .entry((node.id.root.clone(), node.id.file.clone()))
                     .or_default()
-                    .extend(names.into_iter().map(|name| (name, module.clone())));
+                    .extend(bindings);
             }
         }
     }
@@ -147,20 +152,25 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // Perf optimization: extract call sites from the body ONCE, then check
         // each against the imports set. This is O(body_size + imports) instead
         // of O(imports × body_size) when iterating imports first.
-        let called_names = extract_call_sites(&node.body);
+        let allowed_aliases = imported_names
+            .iter()
+            .filter(|binding| binding.local_name != binding.imported_symbol)
+            .map(|binding| binding.local_name.as_str())
+            .collect::<HashSet<_>>();
+        let called_names = extract_call_sites_with_allowed_stopwords(&node.body, &allowed_aliases);
 
 
         // For each imported name that appears as a call in this function body
-        for (imported_name, module_path) in imported_names {
+        for binding in imported_names {
             // Skip names known to be common builtins / accessors. The previous
             // blanket `len() < 4` filter dropped legitimate short imports
             // (`init`, `tick`, `save`); the stopword list keeps the noisy
             // names out without the false negatives.
-            if is_call_stopword(imported_name.as_str()) {
+            if is_call_stopword(binding.imported_symbol.as_str()) {
                 continue;
             }
             // Skip if caller name == imported name (self-call / wrapper pattern).
-            if node.id.name == imported_name.as_str() {
+            if node.id.name == binding.local_name {
                 continue;
             }
             // Check if the imported name appears as a call site (`name(`).
@@ -168,7 +178,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             // text here: a byte-level whole-word match would also fire inside
             // comments, string literals, or shadowing declarations, which would
             // incorrectly keep callees alive for dead-code analysis.
-            let is_called = called_names.contains(imported_name.as_str());
+            let is_called = called_names.contains(binding.local_name.as_str());
             if !is_called {
                 continue;
             }
@@ -179,7 +189,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             // Python `from … import` can only resolve Python modules; etc.
             // Filtering by language prevents cross-language false positives in
             // polyglot repositories.
-            let Some(candidates) = fn_by_name.get(imported_name.as_str()) else {
+            let Some(candidates) = fn_by_name.get(binding.imported_symbol.as_str()) else {
                 continue;
             };
             let caller_lang = node.language.as_str();
@@ -191,7 +201,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 })
                 .collect();
 
-            let resolved = if let Some(module) = module_path {
+            let resolved = if let Some(module) = &binding.module_path {
                 let narrowed = cross_file_candidates
                     .iter()
                     .copied()
@@ -256,14 +266,13 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             continue;
         }
         let text = &import_node.id.name;
-        let names = parse_imported_names(text);
+        let bindings = parse_import_bindings(text);
         let importer_lang = import_node.language.as_str();
-        let module_path = parse_import_module(text);
-        for name in &names {
-            if is_call_stopword(name.as_str()) {
+        for binding in &bindings {
+            if is_call_stopword(binding.imported_symbol.as_str()) {
                 continue;
             }
-            let Some(candidates) = fn_by_name.get(name.as_str()) else {
+            let Some(candidates) = fn_by_name.get(binding.imported_symbol.as_str()) else {
                 continue;
             };
 
@@ -284,7 +293,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if compatible.is_empty() {
                 continue;
             }
-            let resolved: Vec<&&Node> = if let Some(ref module) = module_path {
+            let resolved: Vec<&&Node> = if let Some(ref module) = binding.module_path {
                 // An explicit module path was written; require a compatible
                 // candidate whose file matches that path before accepting it.
                 // Falling back to `candidates.len() == 1` here would wrongly
@@ -469,8 +478,34 @@ fn callee_is_nested_local(callee: &Node) -> bool {
 /// object, not a callable function.  `os.path.exists()` is a method call which
 /// `body_contains_call` rejects.  Use `from os import exists` to import a
 /// callable function.
+#[cfg(test)]
 pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
+    parse_import_bindings(import_text)
+        .into_iter()
+        .map(|binding| binding.imported_symbol)
+        .collect()
+}
+
+fn parse_import_bindings(import_text: &str) -> Vec<ImportedBinding> {
     let text = import_text.trim();
+    let module_path = parse_import_module(text);
+    let with_module = |pairs: Vec<(String, String)>| {
+        pairs
+            .into_iter()
+            .filter(|(imported_symbol, local_name)| {
+                !imported_symbol.is_empty()
+                    && imported_symbol != "*"
+                    && imported_symbol != "self"
+                    && !local_name.is_empty()
+                    && local_name != "_"
+            })
+            .map(|(imported_symbol, local_name)| ImportedBinding {
+                imported_symbol,
+                local_name,
+                module_path: module_path.clone(),
+            })
+            .collect()
+    };
 
     // ------------------------------------------------------------------
     // TypeScript/JavaScript ES6
@@ -481,7 +516,7 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
         if text.starts_with("import type ") {
             return Vec::new();
         }
-        return parse_es6_import_names(text);
+        return with_module(parse_es6_import_bindings(text));
     }
 
     // ------------------------------------------------------------------
@@ -494,11 +529,12 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
             .unwrap_or("")
             .trim()
             .trim_end_matches(';');
-        return after_import
+        return with_module(
+            after_import
             .split(',')
-            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
-            .filter(|s| !s.is_empty() && s != "*")
-            .collect();
+            .filter_map(parse_as_binding)
+            .collect(),
+        );
     }
 
     // ------------------------------------------------------------------
@@ -528,30 +564,30 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
             && let Some(brace_end) = after.rfind('}')
         {
             let inner = &after[brace_start + 1..brace_end];
-            return inner
+            return with_module(
+                inner
                 .split(',')
-                .map(|s| {
-                    // Handle `A as _` style
-                    s.trim()
-                        .split(" as ")
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                })
-                .filter(|s| !s.is_empty() && s != "*" && s != "self")
-                .collect();
+                .filter_map(parse_as_binding)
+                .collect(),
+            );
         }
         // Bare path: `use crate::foo::Bar`
-        if let Some(last_segment) = after.split("::").last() {
-            let name = last_segment.trim();
-            if !name.is_empty() && name != "*" && name != "self" {
-                return vec![name.to_string()];
-            }
+        if let Some(last_segment) = after.split("::").last()
+            && let Some(binding) = parse_as_binding(last_segment)
+        {
+            return with_module(vec![binding]);
         }
     }
 
     Vec::new()
+}
+
+fn parse_as_binding(specifier: &str) -> Option<(String, String)> {
+    let mut parts = specifier.trim().splitn(2, " as ");
+    let imported_symbol = parts.next()?.trim();
+    let local_name = parts.next().map(str::trim).unwrap_or(imported_symbol);
+    (!imported_symbol.is_empty() && !local_name.is_empty())
+        .then(|| (imported_symbol.to_string(), local_name.to_string()))
 }
 
 /// Extract the module/path string from an import statement.
@@ -660,7 +696,7 @@ fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
 /// namespace-qualified calls (`ns.foo()`) would require member-access tracking
 /// which is out of scope for this v1 pass.  Namespace imports return an empty
 /// list; they are not yet supported.
-fn parse_es6_import_names(text: &str) -> Vec<String> {
+fn parse_es6_import_bindings(text: &str) -> Vec<(String, String)> {
     // Strip `import ` prefix and optional `type ` keyword.
     let body = text.strip_prefix("import ").unwrap_or(text).trim();
     let body = body.strip_prefix("type ").unwrap_or(body).trim();
@@ -696,16 +732,14 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
 
     // Default import (e.g. `import React from 'react'`).
     if !default_part.is_empty() && default_part != "*" {
-        names.push(default_part.to_string());
+        names.push((default_part.to_string(), default_part.to_string()));
     }
 
     // Named imports from `{ A, B as C }`.
     if let Some(inner) = named_part {
         for part in inner.split(',') {
-            // `B as C` → take `B` (the original name in the module)
-            let original = part.trim().split(" as ").next().unwrap_or("").trim();
-            if !original.is_empty() {
-                names.push(original.to_string());
+            if let Some(binding) = parse_as_binding(part) {
+                names.push(binding);
             }
         }
     }
@@ -733,7 +767,15 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
 /// considered "in string" by the simple-quote rules; the worst case is
 /// dropping a real call inside a template expression, which only loses a
 /// possible edge — never a false positive.
+#[cfg(test)]
 pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
+    extract_call_sites_with_allowed_stopwords(body, &HashSet::new())
+}
+
+fn extract_call_sites_with_allowed_stopwords<'a>(
+    body: &'a str,
+    allowed_stopwords: &HashSet<&str>,
+) -> HashSet<&'a str> {
     let mut result = HashSet::new();
     let bytes = body.as_bytes();
     let len = bytes.len();
@@ -848,7 +890,9 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
                 // Byte slice is ASCII because the walk only accepted ASCII
                 // identifier bytes; conversion is infallible in practice.
                 let ident = std::str::from_utf8(&bytes[j..end]).unwrap_or("");
-                if !ident.is_empty() && !is_call_stopword(ident) {
+                if !ident.is_empty()
+                    && (!is_call_stopword(ident) || allowed_stopwords.contains(ident))
+                {
                     let prev = if j > 0 { bytes[j - 1] } else { 0 };
                     if prev != b'.' && prev != b':' {
                         result.insert(ident);
@@ -1078,6 +1122,10 @@ mod tests {
         // `import { Foo as F }` — take the original name `Foo`
         let names = parse_imported_names("import { Foo as F, Bar } from './mod'");
         assert_eq!(names, vec!["Foo", "Bar"]);
+        let bindings = parse_import_bindings("import { Foo as F, Bar } from './mod'");
+        assert_eq!(bindings[0].imported_symbol, "Foo");
+        assert_eq!(bindings[0].local_name, "F");
+        assert_eq!(bindings[0].module_path.as_deref(), Some("./mod"));
     }
 
     #[test]
@@ -1429,6 +1477,94 @@ mod tests {
             "qualified module must disambiguate the scoped target: {edges:?}"
         );
         assert_eq!(calls[0].to, worker.id);
+    }
+
+    #[test]
+    fn aliased_python_import_calls_local_name_and_references_canonical_symbol() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute as run\n\ndef orchestrate():\n    return run()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "def execute():\n    return 1\n",
+        ));
+        let caller = nodes.iter().find(|node| node.id.name == "orchestrate").unwrap();
+        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+        let import = nodes.iter().find(|node| node.id.kind == NodeKind::Import).unwrap();
+
+        let edges = import_calls_pass(&nodes);
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+        }), "aliased Python call must bind to canonical symbol: {edges:?}");
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
+        }));
+    }
+
+    #[test]
+    fn aliased_es_import_calls_local_name_and_references_canonical_symbol() {
+        let caller = make_fn("caller.ts", "orchestrate", "function orchestrate() { return run(); }");
+        let callee = make_fn("worker.ts", "execute", "function execute() { return 1; }");
+        let import = make_import("caller.ts", "import { execute as run } from './worker'");
+        let edges = import_calls_pass(&[caller.clone(), callee.clone(), import.clone()]);
+
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+        }), "aliased ES call must bind to canonical symbol: {edges:?}");
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
+        }));
+    }
+
+    #[test]
+    fn aliased_rust_import_calls_local_name_and_references_canonical_symbol() {
+        let mut caller = make_fn("caller.rs", "orchestrate", "fn orchestrate() { run(); }");
+        caller.language = "rust".into();
+        let mut callee = make_fn("worker.rs", "execute", "fn execute() {}");
+        callee.language = "rust".into();
+        let mut import = make_import("caller.rs", "use crate::worker::execute as run;");
+        import.language = "rust".into();
+        let edges = import_calls_pass(&[caller.clone(), callee.clone(), import.clone()]);
+
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+        }), "aliased Rust call must bind to canonical symbol: {edges:?}");
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
+        }));
+    }
+
+    #[test]
+    fn imported_alias_does_not_match_original_or_wrong_local_call_name() {
+        let caller = make_fn(
+            "caller.ts",
+            "orchestrate",
+            "function orchestrate() { execute(); wrong(); }",
+        );
+        let callee = make_fn("worker.ts", "execute", "function execute() { return 1; }");
+        let import = make_import("caller.ts", "import { execute as run } from './worker'");
+        let edges = import_calls_pass(&[caller.clone(), callee, import]);
+
+        assert!(edges.iter().all(|edge| {
+            edge.kind != EdgeKind::Calls || edge.from != caller.id
+        }), "only the declared local alias may satisfy the call binding: {edges:?}");
+    }
+
+    #[test]
+    fn imported_alias_in_comments_strings_or_non_call_text_emits_no_call() {
+        let caller = make_fn(
+            "caller.ts",
+            "orchestrate",
+            "function orchestrate() { const run = 'run()'; /* run() */ return run; }",
+        );
+        let callee = make_fn("worker.ts", "execute", "function execute() { return 1; }");
+        let import = make_import("caller.ts", "import { execute as run } from './worker'");
+        let edges = import_calls_pass(&[caller.clone(), callee, import]);
+
+        assert!(edges.iter().all(|edge| {
+            edge.kind != EdgeKind::Calls || edge.from != caller.id
+        }), "non-call alias occurrences must not become Calls evidence: {edges:?}");
     }
 
     #[test]

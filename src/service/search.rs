@@ -1090,6 +1090,29 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
 pub struct SearchDelivery {
     pub markdown: String,
     pub context_injection_eligible: bool,
+    pub error: Option<SearchDeliveryError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchDeliveryError {
+    BudgetTooSmall {
+        minimum_bytes: usize,
+        minimum_tokens: usize,
+    },
+}
+
+impl std::fmt::Display for SearchDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BudgetTooSmall {
+                minimum_bytes,
+                minimum_tokens,
+            } => write!(
+                f,
+                "BudgetTooSmall: convergence response requires at least {minimum_bytes} bytes and {minimum_tokens} estimated tokens"
+            ),
+        }
+    }
 }
 
 impl SearchDelivery {
@@ -1097,6 +1120,7 @@ impl SearchDelivery {
         Self {
             markdown,
             context_injection_eligible: true,
+            error: None,
         }
     }
 
@@ -1104,13 +1128,28 @@ impl SearchDelivery {
         Self {
             markdown,
             context_injection_eligible: false,
+            error: None,
+        }
+    }
+
+    fn budget_too_small(minimum_bytes: usize, minimum_tokens: usize) -> Self {
+        Self {
+            markdown: String::new(),
+            context_injection_eligible: false,
+            error: Some(SearchDeliveryError::BudgetTooSmall {
+                minimum_bytes,
+                minimum_tokens,
+            }),
         }
     }
 }
 
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
-    search_delivery(params, ctx).await.markdown
+    let delivery = search_delivery(params, ctx).await;
+    delivery
+        .error
+        .map_or(delivery.markdown, |error| error.to_string())
 }
 
 /// Unified search entry point with delivery semantics for MCP response composition.
@@ -1343,6 +1382,10 @@ enum SelectorBinding {
 enum ConvergenceDelivery {
     Injectable(String),
     NotInjectable(String),
+    BudgetTooSmall {
+        minimum_bytes: usize,
+        minimum_tokens: usize,
+    },
 }
 
 impl ConvergenceDelivery {
@@ -1350,6 +1393,10 @@ impl ConvergenceDelivery {
         match self {
             Self::Injectable(markdown) => SearchDelivery::eligible(markdown),
             Self::NotInjectable(markdown) => SearchDelivery::not_eligible(markdown),
+            Self::BudgetTooSmall {
+                minimum_bytes,
+                minimum_tokens,
+            } => SearchDelivery::budget_too_small(minimum_bytes, minimum_tokens),
         }
     }
 }
@@ -1575,7 +1622,10 @@ fn convergence_unresolved(params: &SearchParams, detail: &str) -> ConvergenceDel
             return ConvergenceDelivery::NotInjectable(rendered);
         }
         if detail.pop().is_none() {
-            return ConvergenceDelivery::NotInjectable(rendered);
+            return ConvergenceDelivery::BudgetTooSmall {
+                minimum_bytes: rendered.len(),
+                minimum_tokens: rendered.chars().count().saturating_add(3) / 4,
+            };
         }
     }
 }
@@ -10867,6 +10917,39 @@ mod tests {
             let delivery = search_delivery(&params, &ctx).await;
             assert!(delivery.markdown.starts_with("Invalid search context:"));
             assert!(!delivery.context_injection_eligible);
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_convergence_reports_typed_error_when_byte_or_token_budget_is_infeasible() {
+        let temp = TempDir::new().unwrap();
+        let graph = make_graph_state(Vec::new());
+        let ctx = make_search_context(&graph, temp.path());
+
+        for (max_output_bytes, max_output_tokens) in [(Some(1), None), (None, Some(1))] {
+            let delivery = search_delivery(
+                &SearchParams {
+                    mode: Some("convergence".into()),
+                    nodes: Some(vec!["Missing.one".into(), "Missing.two".into()]),
+                    direction: Some("outgoing".into()),
+                    edge_types: Some(vec!["calls".into()]),
+                    depth: Some(3),
+                    max_output_bytes,
+                    max_output_tokens,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .await;
+            assert!(delivery.markdown.is_empty());
+            assert!(!delivery.context_injection_eligible);
+            assert!(matches!(
+                delivery.error,
+                Some(SearchDeliveryError::BudgetTooSmall {
+                    minimum_bytes: _,
+                    minimum_tokens: _
+                })
+            ));
         }
     }
 

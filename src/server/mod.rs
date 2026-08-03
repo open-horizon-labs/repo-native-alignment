@@ -763,6 +763,35 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
 
+        for budget_key in ["max_output_bytes", "max_output_tokens"] {
+            let mut arguments = serde_json::json!({
+                "nodes": ["Missing.one", "Missing.two"],
+                "direction": "outgoing",
+                "edge_types": ["calls"],
+                "depth": 3
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            arguments.insert(budget_key.into(), serde_json::json!(1));
+            let error = handler
+                .dispatch_call_tool_request(CallToolRequestParams {
+                    name: "convergence".into(),
+                    meta: None,
+                    task: None,
+                    arguments: Some(arguments),
+                })
+                .await
+                .expect_err("infeasible convergence budget must be a tool error");
+            assert!(format!("{error:?}").contains("BudgetTooSmall"));
+            assert!(
+                !handler
+                    .context_injected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "tiny-budget error must defer first-call business context"
+            );
+        }
+
         let unresolved = handler
             .dispatch_call_tool_request(CallToolRequestParams {
                 name: "convergence".into(),

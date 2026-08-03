@@ -243,6 +243,9 @@ impl RnaHandler {
                 business_context: &self.business_context,
             };
             let delivery = crate::service::search_delivery(&params, &ctx).await;
+            if let Some(error) = delivery.error {
+                return Err(CallToolError::from_message(error.to_string()));
+            }
             return Ok(SearchToolDelivery::text(
                 delivery.markdown,
                 delivery.context_injection_eligible,
@@ -288,6 +291,9 @@ impl RnaHandler {
             business_context: &self.business_context,
         };
         let mut delivery = crate::service::search_delivery(&params, &ctx).await;
+        if let Some(error) = delivery.error {
+            return Err(CallToolError::from_message(error.to_string()));
+        }
         if self.graph_build_status.is_building() && !convergence_requested {
             delivery.markdown.push_str(
                 "\n\n_Index updating in background — results reflect last complete scan._",

@@ -958,7 +958,11 @@ fn collect_nodes(
                     } else {
                         node_kind
                     };
-                let scope = Some((name, scope_kind));
+                // Descendants must inherit the canonical identity of their
+                // immediate parent. Using the parent's lexical name here
+                // drops outer scopes (`A.outer` -> `outer.inner`) and creates
+                // dangling Defines edges plus cross-class ID collisions.
+                let scope = Some((identity_name, scope_kind));
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
                         collect_nodes(child, path, source, config, &scope, nodes, edges);
@@ -6599,6 +6603,47 @@ class Session:
                 && node.metadata.get("lexical_name").map(String::as_str) == Some("prepare")
         }));
         assert_ne!(functions[0].stable_id(), functions[1].stable_id());
+    }
+
+    #[test]
+    fn nested_python_functions_inherit_canonical_method_identity() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+class A:
+    def outer(self):
+        def inner():
+            return 1
+        return inner()
+
+class B:
+    def outer(self):
+        def inner():
+            return 2
+        return inner()
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("nested.py"), code)
+            .unwrap();
+        let function_names = result
+            .nodes
+            .iter()
+            .filter(|node| node.id.kind == NodeKind::Function)
+            .map(|node| node.id.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(function_names.contains(&"A.outer.inner"));
+        assert!(function_names.contains(&"B.outer.inner"));
+        assert!(!function_names.contains(&"outer.inner"));
+
+        for (parent, child) in [
+            ("A.outer", "A.outer.inner"),
+            ("B.outer", "B.outer.inner"),
+        ] {
+            assert!(result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Defines
+                    && edge.from.name == parent
+                    && edge.to.name == child
+            }), "missing canonical Defines edge {parent} -> {child}: {:?}", result.edges);
+        }
     }
 
     #[test]
