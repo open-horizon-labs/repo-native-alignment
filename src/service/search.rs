@@ -3146,9 +3146,11 @@ const TASK_GRAPH_CANDIDATE_LIMIT: usize = 4;
 const TASK_GRAPH_TRAVERSAL_LIMIT: usize = 16;
 const TASK_PROOF_RESERVE_LIMIT: usize = 4;
 const TASK_PROOF_CANDIDATE_POOL_LIMIT: usize = 8;
+const TASK_PROOF_LEXICAL_POOL_LIMIT: usize = 6;
 const TASK_PROOF_TRAVERSAL_LIMIT: usize = 128;
 const TASK_PROOF_FILE_SIBLING_LIMIT: usize = 64;
 const TASK_PROOF_MAX_DEPTH: u32 = 4;
+const TASK_PROOF_LEXICAL_SEEDS_PER_FACET: usize = 2;
 
 #[derive(Default, Clone)]
 struct TaskAdapterOutput {
@@ -3902,6 +3904,12 @@ async fn task_records(
             .get(&proof.id)
             .and_then(|records| records.first())
             .and_then(|record| record.focused_span.clone());
+        let proof_focus = proof
+            .obligation
+            .contains("state.")
+            .then(|| task_effective_state_focus(node, &task_query_terms(base_query)))
+            .flatten()
+            .or(retained_focus);
         let assembly = TaskAssembly {
             fused: fused.clone(),
             roles: BTreeSet::from([proof.role]),
@@ -3926,8 +3934,8 @@ async fn task_records(
             params.query.as_deref(),
             ctx.repo_root,
         );
-        if retained_focus.is_some() {
-            selected.focused_span = retained_focus;
+        if proof_focus.is_some() {
+            selected.focused_span = proof_focus;
         }
         let candidate = TaskEvidenceCandidate {
             evidence_id: proof.id.clone(),
@@ -4608,6 +4616,7 @@ fn task_proof_reserve_candidates(
         .cloned()
         .collect::<Vec<_>>();
     let mut discovered = BTreeMap::<String, (u32, String)>::new();
+    let mut lexical_production_seeds = BTreeSet::new();
     for anchor in &production_anchors {
         if !candidate_nodes.contains_key(anchor) {
             continue;
@@ -4707,6 +4716,25 @@ fn task_proof_reserve_candidates(
                     .or_insert((TASK_PROOF_MAX_DEPTH + 1, anchor.clone()));
             }
         }
+
+        // Graph reachability is useful corroboration, but it is not a
+        // completeness prerequisite. LSP fleets and partial indexes can omit
+        // the exact call that connects an already-selected public seam to its
+        // generator. Seed a small, deterministic production lane for every
+        // query facet so the final render oracle can still consider executable
+        // evidence. Eligibility is intentionally stronger than lexical match:
+        // the node must be a non-test function with a real body, an operation
+        // carrier, and production/state evidence. Imports, constants, tiny
+        // spans, and unrelated keyword neighbors cannot enter this lane.
+        for id in task_lexical_production_seed_ids(candidate_nodes, &query_terms) {
+            if reserved_ids.contains(&id) {
+                continue;
+            }
+            lexical_production_seeds.insert(id.clone());
+            discovered
+                .entry(id)
+                .or_insert((TASK_PROOF_MAX_DEPTH + 1, anchor.clone()));
+        }
     }
 
     let mut candidates = Vec::new();
@@ -4727,7 +4755,13 @@ fn task_proof_reserve_candidates(
             asserting_test,
             member_assertion,
             typed_state_affinity,
-        )) = task_proof_candidate(node, &query_terms, direct_anchor.is_some(), depth)
+        )) = task_proof_candidate(
+            node,
+            &query_terms,
+            direct_anchor.is_some(),
+            lexical_production_seeds.contains(&id),
+            depth,
+        )
         else {
             continue;
         };
@@ -4769,9 +4803,31 @@ fn task_proof_reserve_candidates(
             .then_with(|| left.9.cmp(&right.9))
             .then_with(|| left.10.cmp(&right.10))
     });
+    let mut retained_positions = BTreeSet::new();
+    retained_positions.extend(
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| lexical_production_seeds.contains(&candidate.10))
+            .take(TASK_PROOF_LEXICAL_POOL_LIMIT)
+            .map(|(index, _)| index),
+    );
+    let supplemental_positions = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| {
+            !retained_positions.contains(index)
+                && !lexical_production_seeds.contains(&candidate.10)
+        })
+        .take(TASK_PROOF_CANDIDATE_POOL_LIMIT.saturating_sub(retained_positions.len()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    retained_positions.extend(supplemental_positions);
     candidates
         .into_iter()
-        .take(TASK_PROOF_CANDIDATE_POOL_LIMIT)
+        .enumerate()
+        .filter(|(index, _)| retained_positions.contains(index))
+        .map(|(_, candidate)| candidate)
         .enumerate()
         .map(|(
             index,
@@ -4854,6 +4910,7 @@ fn task_proof_candidate(
     node: &Node,
     query_terms: &BTreeSet<String>,
     direct_anchor: bool,
+    lexical_production_seed: bool,
     depth: u32,
 ) -> Option<TaskProofCandidate> {
     if node.line_end <= node.line_start {
@@ -4888,6 +4945,7 @@ fn task_proof_candidate(
         && !query_matches.is_empty()
         && !operation_carriers.is_empty()
         && (direct_anchor
+            || lexical_production_seed
             || (depth <= 2
                 && (query_matches.len() >= 2
                     || operation_carriers.len() >= 2
@@ -4976,6 +5034,98 @@ fn task_proof_candidate(
         member_assertion,
         typed_state_terms.len(),
     ))
+}
+
+fn task_lexical_production_seed_ids(
+    candidate_nodes: &BTreeMap<String, &Node>,
+    query_terms: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut by_facet = BTreeMap::<String, Vec<(usize, usize, usize, usize, String)>>::new();
+    for (id, node) in candidate_nodes {
+        if default_role(node) == ProjectionRole::Test
+            || node.id.kind != NodeKind::Function
+            || node.line_end <= node.line_start
+        {
+            continue;
+        }
+        let body_lines = node
+            .body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if body_lines < 3 {
+            continue;
+        }
+        let all_terms = task_text_terms(&format!(
+            "{} {} {}",
+            node.id.name, node.signature, node.body
+        ));
+        let matched = query_terms
+            .iter()
+            .filter(|term| {
+                all_terms.contains(term.as_str())
+                    || all_terms.contains(&format!("{term}s"))
+                    || term
+                        .strip_suffix('s')
+                        .is_some_and(|singular| all_terms.contains(singular))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if matched.is_empty() {
+            continue;
+        }
+        let operation_count = task_operation_carriers(&node.id.name).len();
+        if operation_count == 0 {
+            continue;
+        }
+        let state_count = task_effective_state_proof_terms(&node.body, query_terms).len()
+            + task_effective_merge_proof_terms(&node.body, query_terms).len();
+        let typed_state_count =
+            task_typed_state_terms(&format!("{} {}", node.signature, node.body)).len();
+        if matched.len() < 2 && state_count == 0 && typed_state_count == 0 {
+            continue;
+        }
+        let mut proof_facets = matched;
+        proof_facets.extend(
+            task_effective_state_proof_terms(&node.body, query_terms)
+                .into_iter()
+                .map(|facet| format!("state:{facet}")),
+        );
+        proof_facets.extend(
+            task_typed_state_terms(&format!("{} {}", node.signature, node.body))
+                .into_iter()
+                .map(|facet| format!("typed-state:{facet}")),
+        );
+        for facet in proof_facets {
+            by_facet.entry(facet).or_default().push((
+                state_count,
+                typed_state_count,
+                operation_count,
+                body_lines,
+                id.clone(),
+            ));
+        }
+    }
+
+    let mut selected = BTreeSet::new();
+    for candidates in by_facet.values_mut() {
+        candidates.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.4.cmp(&right.4))
+        });
+        selected.extend(
+            candidates
+                .iter()
+                .take(TASK_PROOF_LEXICAL_SEEDS_PER_FACET)
+                .map(|candidate| candidate.4.clone()),
+        );
+    }
+    selected
 }
 
 fn task_effective_state_proof_terms(
@@ -17523,17 +17673,34 @@ mod tests {
             NodeKind::Function,
             "def render_override_neighbor():\n    value = override\n    return value\n",
         );
+        let punctuation = proof_node(
+            ")",
+            "src/noise.py",
+            NodeKind::Const,
+            ") = override NamedTuple TypedDict\n",
+        );
+        let tiny = proof_node(
+            "render_override",
+            "src/noise.py",
+            NodeKind::Function,
+            "def render_override(): return override\n",
+        );
+        let import_only = proof_node(
+            "override_import",
+            "src/noise.py",
+            NodeKind::Import,
+            "from elsewhere import Annotated, NotRequired, TypedDict\n",
+        );
 
-        let edges = vec![
-            make_edge(&namedtuple, &attrs_internal, EdgeKind::Calls),
-            make_edge(&attrs_public, &attrs_internal, EdgeKind::Calls),
-            make_edge(
-                &typeddict_import,
-                &typeddict_generation,
-                EdgeKind::References,
-            ),
-            make_edge(&attribute_override, &unrelated, EdgeKind::Defines),
-        ];
+        // Deliberately omit every edge to the production generators. This is
+        // the installed-artifact failure mode: the corpus has the authoritative
+        // bodies, but an otherwise healthy partial LSP graph does not connect
+        // the selected public/import seams to them.
+        let edges = vec![make_edge(
+            &attribute_override,
+            &unrelated,
+            EdgeKind::Defines,
+        )];
         let graph = make_graph_state_with_edges(
             vec![
                 namedtuple,
@@ -17545,6 +17712,9 @@ mod tests {
                 attrs_public,
                 typeddict_generation,
                 unrelated,
+                punctuation,
+                tiny,
+                import_only,
             ],
             edges,
         );
@@ -17619,6 +17789,9 @@ mod tests {
             "both attrs/dataclass and TypedDict production seams must survive: {reserved_paths:?}"
         );
         assert!(!reserved_names.contains(&"render_override_neighbor"));
+        assert!(!reserved_names.contains(&")"));
+        assert!(!reserved_names.contains(&"render_override"));
+        assert!(!reserved_names.contains(&"override_import"));
         assert!(reserved.len() <= TASK_PROOF_CANDIDATE_POOL_LIMIT);
         for path in ["src/cattrs/gen/__init__.py", "src/cattrs/gen/typeddicts.py"] {
             assert!(
@@ -17656,6 +17829,35 @@ mod tests {
                 "bounded final identities omit actionable evidence {evidence:?}:\n{bounded_packet}"
             );
         }
+
+        for permuted_query in [
+            "NamedTuple TypedDict NotRequired override Annotated",
+            "override Annotated NamedTuple NotRequired TypedDict",
+        ] {
+            let permuted = task_proof_reserve_candidates(
+                &selected_ids,
+                &candidate_nodes,
+                &edge_index,
+                permuted_query,
+                &task_query_terms(permuted_query),
+            );
+            let names = permuted
+                .iter()
+                .filter_map(|candidate| candidate_nodes.get(&candidate.id))
+                .map(|node| node.id.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"make_dict_structure_fn_from_attrs"));
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| **name == "make_dict_structure_fn")
+                    .count(),
+                2,
+                "query term order must not change authoritative production coverage: {names:?}"
+            );
+            assert!(!names.contains(&"render_override_neighbor"));
+            assert!(!names.contains(&"render_override"));
+        }
     }
 
     #[test]
@@ -17681,9 +17883,9 @@ mod tests {
         wrapper.line_end = 35;
 
         let (_, _, literal_terms, _, literal_compound, ..) =
-            task_proof_candidate(&literal, &query_terms, false, 1).unwrap();
+            task_proof_candidate(&literal, &query_terms, false, false, 1).unwrap();
         let (_, _, wrapper_terms, _, wrapper_compound, ..) =
-            task_proof_candidate(&wrapper, &query_terms, true, 1).unwrap();
+            task_proof_candidate(&wrapper, &query_terms, true, false, 1).unwrap();
         assert!(literal_compound && wrapper_compound);
         assert!(literal.body.len() < wrapper.body.len());
         assert!(literal_terms.contains(&"annotated".into()));
