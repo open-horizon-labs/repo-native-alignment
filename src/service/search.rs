@@ -1099,6 +1099,13 @@ impl SearchDelivery {
             context_injection_eligible: true,
         }
     }
+
+    fn not_eligible(markdown: String) -> Self {
+        Self {
+            markdown,
+            context_injection_eligible: false,
+        }
+    }
 }
 
 /// Unified search entry point. Returns formatted markdown.
@@ -1108,8 +1115,14 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
 
 /// Unified search entry point with delivery semantics for MCP response composition.
 pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> SearchDelivery {
+    let convergence_requested = params.normalized_mode() == Some("convergence");
     if let Err(reason) = validate_search_experience(params) {
-        return SearchDelivery::eligible(format!("Invalid search context: {reason}."));
+        let markdown = format!("Invalid search context: {reason}.");
+        return if convergence_requested {
+            SearchDelivery::not_eligible(markdown)
+        } else {
+            SearchDelivery::eligible(markdown)
+        };
     }
     let strict_semantic = strict_semantic_requested(params);
     if strict_semantic && let Err(reason) = strict_semantic_preflight(params, ctx).await {
@@ -1332,10 +1345,7 @@ impl ConvergenceDelivery {
     fn into_search_delivery(self) -> SearchDelivery {
         match self {
             Self::Injectable(markdown) => SearchDelivery::eligible(markdown),
-            Self::NotInjectable(markdown) => SearchDelivery {
-                markdown,
-                context_injection_eligible: false,
-            },
+            Self::NotInjectable(markdown) => SearchDelivery::not_eligible(markdown),
         }
     }
 }
@@ -10822,6 +10832,37 @@ mod tests {
                 SelectorBinding::Missing,
                 "selector {fuzzy_or_missing:?} must not use case, substring, signature, or terminal fallback"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn convergence_validation_failures_are_not_context_injection_eligible() {
+        let temp = TempDir::new().unwrap();
+        let graph = make_graph_state(Vec::new());
+        let ctx = make_search_context(&graph, temp.path());
+
+        for params in [
+            SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["A.one".into(), "B.two".into()]),
+                direction: Some("outgoing".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(33),
+                ..Default::default()
+            },
+            SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["A.one".into(), "B.two".into()]),
+                direction: Some("outgoing".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(3),
+                max_output_bytes: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let delivery = search_delivery(&params, &ctx).await;
+            assert!(delivery.markdown.starts_with("Invalid search context:"));
+            assert!(!delivery.context_injection_eligible);
         }
     }
 

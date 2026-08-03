@@ -706,6 +706,35 @@ mod tests {
             .unwrap();
         handler.install_cached_graph(graph);
 
+        let invalid = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "convergence".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "nodes": ["Missing.one", "Missing.two"],
+                        "direction": "outgoing",
+                        "edge_types": ["calls"],
+                        "depth": 3,
+                        "max_output_bytes": 0
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let invalid_text = call_tool_text(&invalid);
+        assert!(invalid_text.starts_with("Invalid search context:"));
+        assert!(!invalid_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
         let unresolved = handler
             .dispatch_call_tool_request(CallToolRequestParams {
                 name: "convergence".into(),

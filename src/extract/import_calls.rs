@@ -74,7 +74,9 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind}
 /// import-based cross-file calls are detected.
 pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // ------------------------------------------------------------------
-    // 1. Index function nodes by name for O(1) cross-file lookup.
+    // 1. Index function nodes by canonical and lexical name for O(1)
+    //    cross-file lookup. Scoped function identities remain authoritative;
+    //    lexical aliases exist only to bind parser-owned call metadata.
     // ------------------------------------------------------------------
     // name -> list of (file, node) pairs.  Multiple files may define the
     // same function name, so we keep all candidates.
@@ -85,6 +87,14 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 .entry(node.id.name.as_str())
                 .or_default()
                 .push(node);
+            if let Some(lexical_name) = node.metadata.get("lexical_name")
+                && lexical_name != &node.id.name
+            {
+                fn_by_name
+                    .entry(lexical_name.as_str())
+                    .or_default()
+                    .push(node);
+            }
         }
     }
 
@@ -109,10 +119,6 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     .extend(names);
             }
         }
-    }
-
-    if imported_names_by_file.is_empty() {
-        return Vec::new();
     }
 
     // ------------------------------------------------------------------
@@ -301,9 +307,9 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // 6. Emit ReferencedBy edges from attribute access in function bodies.
     //    When a function body contains `obj.method_name()`, the attr_refs
     //    metadata (extracted at parse time by GenericExtractor) includes
-    //    "method_name". Match against fn_by_name to create cross-file edges.
-    //    This is the vulture-style flat name matching approach — low precision
-    //    (same-named methods on different classes match) but high recall.
+    //    "method_name". Match its lexical alias against fn_by_name while
+    //    retaining the canonical owner-qualified target identity. Multiple
+    //    eligible owners are ambiguous and fail closed.
     // ------------------------------------------------------------------
     let mut attr_ref_count = 0usize;
     for node in all_nodes {
@@ -1293,6 +1299,85 @@ mod tests {
     // -----------------------------------------------------------------------
     // import_calls_pass integration tests
     // -----------------------------------------------------------------------
+
+    fn extract_python_nodes(path: &str, source: &str) -> Vec<Node> {
+        use crate::extract::configs::PYTHON_CONFIG;
+        use crate::extract::generic::GenericExtractor;
+
+        let mut nodes = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(std::path::Path::new(path), source)
+            .unwrap()
+            .nodes;
+        for node in &mut nodes {
+            node.id.root = "r".into();
+        }
+        nodes
+    }
+
+    #[test]
+    fn generic_scoped_method_lexical_alias_emits_canonical_cross_file_reference() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "def orchestrate(worker):\n    return worker.execute()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "class Worker:\n    def execute(self):\n        return 1\n",
+        ));
+
+        let caller = nodes
+            .iter()
+            .find(|node| node.id.name == "orchestrate")
+            .unwrap();
+        assert_eq!(caller.metadata.get("attr_refs").map(String::as_str), Some("execute"));
+        let callee = nodes
+            .iter()
+            .find(|node| node.id.name == "Worker.execute")
+            .unwrap();
+        assert_eq!(
+            callee.metadata.get("lexical_name").map(String::as_str),
+            Some("execute")
+        );
+
+        let edges = import_calls_pass(&nodes);
+        let references = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::ReferencedBy
+                    && edge.from == caller.id
+                    && edge.to == callee.id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 1, "expected canonical qualified target: {edges:?}");
+    }
+
+    #[test]
+    fn generic_duplicate_scoped_method_lexical_alias_fails_closed() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "def orchestrate(worker):\n    return worker.execute()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "class Worker:\n    def execute(self):\n        return 1\n",
+        ));
+        nodes.extend(extract_python_nodes(
+            "other.py",
+            "class Other:\n    def execute(self):\n        return 2\n",
+        ));
+        let caller = nodes
+            .iter()
+            .find(|node| node.id.name == "orchestrate")
+            .unwrap();
+
+        let edges = import_calls_pass(&nodes);
+        assert!(
+            edges.iter().all(|edge| {
+                edge.kind != EdgeKind::ReferencedBy || edge.from != caller.id
+            }),
+            "ambiguous bare method alias must not choose an arbitrary owner: {edges:?}"
+        );
+    }
 
     #[test]
     fn test_cross_file_call_emitted() {
