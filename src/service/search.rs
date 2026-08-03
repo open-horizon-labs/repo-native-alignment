@@ -2425,7 +2425,7 @@ fn evidence_capsule_capability(records: &[SelectedRecord]) -> CapabilityStatus {
 }
 
 const TASK_LANE_CANDIDATE_LIMIT: usize = 12;
-const TASK_ROLE_SUPPLEMENT_LIMIT: usize = TASK_LANE_CANDIDATE_LIMIT;
+const TASK_ROLE_SUPPLEMENT_LIMIT: usize = 4;
 const TASK_GRAPH_CANDIDATE_LIMIT: usize = 64;
 
 #[derive(Default, Clone)]
