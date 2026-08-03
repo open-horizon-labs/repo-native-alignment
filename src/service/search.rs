@@ -2425,6 +2425,7 @@ fn evidence_capsule_capability(records: &[SelectedRecord]) -> CapabilityStatus {
 }
 
 const TASK_LANE_CANDIDATE_LIMIT: usize = 12;
+const TASK_LANE_ACQUISITION_LIMIT: usize = TASK_LANE_CANDIDATE_LIMIT * 3;
 const TASK_ROLE_SUPPLEMENT_LIMIT: usize = 4;
 const TASK_GRAPH_CANDIDATE_LIMIT: usize = 64;
 
@@ -2594,25 +2595,56 @@ async fn task_records(
         }
         let mut lane_params = params.clone();
         lane_params.query = Some(format!("{base_query}\n{qualifier}"));
-        lane_params.limit = Some(TASK_LANE_CANDIDATE_LIMIT);
+        lane_params.limit = Some(TASK_LANE_ACQUISITION_LIMIT);
         lane_params.node = None;
         lane_params.nodes = None;
         lane_params.mode = None;
         let (fused, capabilities, lane_score_audit) =
             projected_fused_candidates(&lane_params, ctx, edge_index).await?;
         merge_product_score_audit(&mut product_score_audit, lane_score_audit);
-        let observed = fused.len().min(TASK_LANE_CANDIDATE_LIMIT);
+        let observed = fused.len().min(TASK_LANE_ACQUISITION_LIMIT);
         let mut eligible = 0usize;
         let mut rejected = 0usize;
         for (rank, candidate) in fused
             .into_iter()
-            .take(TASK_LANE_CANDIDATE_LIMIT)
+            .take(TASK_LANE_ACQUISITION_LIMIT)
             .enumerate()
         {
+            if eligible == TASK_LANE_CANDIDATE_LIMIT {
+                break;
+            }
             let Some(node) = candidate_nodes.get(&candidate.stable_id).copied() else {
                 rejected += 1;
                 continue;
             };
+            let quality = task_candidate_quality_for_roles(
+                node,
+                &BTreeSet::from([role]),
+                false,
+                base_query,
+            );
+            if quality != EvidenceQuality::Actionable {
+                rejected += 1;
+                let audit_rank = output.candidate_audit.len();
+                let mut audit = candidate_audit_from_fused(
+                    node,
+                    &candidate,
+                    audit_rank,
+                    false,
+                    &format!(
+                        "ineligible for independent {lane:?} lane: evidence quality is {}",
+                        quality.as_str()
+                    ),
+                );
+                append_product_score_audit(
+                    &mut audit.evidence,
+                    product_score_audit
+                        .get(&candidate.stable_id)
+                        .map(Vec::as_slice),
+                );
+                output.candidate_audit.push(audit);
+                continue;
+            }
             match task_lane_candidate_evidence(node, role, &assemblies, ctx.graph_state, edge_index)
             {
                 Ok(role_evidence) => {
