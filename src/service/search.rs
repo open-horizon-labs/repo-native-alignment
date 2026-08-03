@@ -1093,7 +1093,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     let params = &normalized_params;
 
     if let Some(node) = params.node.as_deref()
-        && node.starts_with("rna-hydrate-v1:")
+        && HydrationHandle::is_encoded(node)
     {
         if params.normalized_mode().is_some()
             || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
@@ -13742,11 +13742,27 @@ mod tests {
             focused_span: None,
         };
         let handle = persist_semantic_evidence_capsule(repository.path(), &selected, body).unwrap();
+        let compact_handle = handle.encode_compact();
+        let mut rendered_selected = selected.clone();
+        rendered_selected.evidence_hydration = Some(handle);
         let graph = make_graph_state(Vec::new());
         let ctx = make_search_context(&graph, repository.path());
+        let rendered = render_projected_input(
+            ProjectionRequest::default(),
+            ProjectionInput {
+                records: vec![rendered_selected],
+                ..Default::default()
+            },
+            &SearchParams::default(),
+            &ctx,
+        );
+        assert!(
+            rendered.contains(&compact_handle),
+            "rendered evidence handle missing: {rendered}"
+        );
         let response = search(
             &SearchParams {
-                node: Some(handle.encode()),
+                node: Some(compact_handle),
                 projection: Some("evidence".into()),
                 ..Default::default()
             },
@@ -13755,6 +13771,56 @@ mod tests {
         .await;
         assert!(response.contains("terminal sentinel"));
         assert!(response.contains("content-addressed semantic row body"));
+    }
+
+    #[tokio::test]
+    async fn rendered_compact_source_handle_round_trips_through_shared_search() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        std::fs::write(
+            repository.path().join("src/lib.rs"),
+            "fn hydrate_target() { let source_hydration_sentinel = true; }\n",
+        )
+        .unwrap();
+        let mut node = make_node("hydrate_target", NodeKind::Function, "src/lib.rs");
+        node.id.root = source_roots(&SearchParams::default(), repository.path())[0]
+            .0
+            .clone();
+        node.signature = "fn hydrate_target()".into();
+        node.body = "fn hydrate_target() { let source_hydration_sentinel = true; }".into();
+        node.line_start = 1;
+        node.line_end = 1;
+        let node_id = node.stable_id();
+        let span = node_source_span(&node).unwrap();
+        let compact_handle = HydrationHandle::source(&node_id, span).encode_compact();
+        let graph = make_graph_state(vec![node]);
+        let ctx = make_search_context(&graph, repository.path());
+        let params = SearchParams {
+            query: Some("hydrate_target".into()),
+            projection: Some("agent".into()),
+            body_policy: Some("signature_only".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let rendered = search(&params, &ctx).await;
+        assert!(
+            rendered.contains(&compact_handle),
+            "rendered source handle missing: {rendered}"
+        );
+        let hydrated = search(
+            &SearchParams {
+                node: Some(compact_handle),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            hydrated.contains("source_hydration_sentinel"),
+            "compact source handle did not route to hydration: {hydrated}"
+        );
     }
 
     #[tokio::test]

@@ -167,6 +167,10 @@ pub(crate) struct HydrationHandle {
 }
 
 impl HydrationHandle {
+    pub(crate) fn is_encoded(value: &str) -> bool {
+        value.starts_with("rna-hydrate-v1:") || value.starts_with("rna-h2:")
+    }
+
     pub(crate) fn source(record_id: impl Into<String>, source: SourceSpan) -> Self {
         Self {
             kind: HydrationKind::Source,
