@@ -3146,7 +3146,7 @@ const TASK_GRAPH_CANDIDATE_LIMIT: usize = 4;
 const TASK_GRAPH_TRAVERSAL_LIMIT: usize = 16;
 const TASK_PROOF_RESERVE_LIMIT: usize = 4;
 const TASK_PROOF_CANDIDATE_POOL_LIMIT: usize = 8;
-const TASK_PROOF_LEXICAL_POOL_LIMIT: usize = 6;
+const TASK_PROOF_LEXICAL_POOL_LIMIT: usize = 4;
 const TASK_PROOF_TRAVERSAL_LIMIT: usize = 128;
 const TASK_PROOF_FILE_SIBLING_LIMIT: usize = 64;
 const TASK_PROOF_MAX_DEPTH: u32 = 4;
@@ -4803,26 +4803,11 @@ fn task_proof_reserve_candidates(
             .then_with(|| left.9.cmp(&right.9))
             .then_with(|| left.10.cmp(&right.10))
     });
-    let mut retained_positions = BTreeSet::new();
-    retained_positions.extend(
-        candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| lexical_production_seeds.contains(&candidate.10))
-            .take(TASK_PROOF_LEXICAL_POOL_LIMIT)
-            .map(|(index, _)| index),
-    );
-    let supplemental_positions = candidates
+    let lexical_flags = candidates
         .iter()
-        .enumerate()
-        .filter(|(index, candidate)| {
-            !retained_positions.contains(index)
-                && !lexical_production_seeds.contains(&candidate.10)
-        })
-        .take(TASK_PROOF_CANDIDATE_POOL_LIMIT.saturating_sub(retained_positions.len()))
-        .map(|(index, _)| index)
+        .map(|candidate| lexical_production_seeds.contains(&candidate.10))
         .collect::<Vec<_>>();
-    retained_positions.extend(supplemental_positions);
+    let retained_positions = task_proof_pool_positions(&lexical_flags);
     candidates
         .into_iter()
         .enumerate()
@@ -4867,6 +4852,29 @@ fn task_proof_reserve_candidates(
             }
         })
         .collect()
+}
+
+fn task_proof_pool_positions(lexical_flags: &[bool]) -> BTreeSet<usize> {
+    let mut retained = lexical_flags
+        .iter()
+        .enumerate()
+        .filter(|(_, lexical)| **lexical)
+        .take(TASK_PROOF_LEXICAL_POOL_LIMIT)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let supplemental_limit = TASK_GRAPH_CANDIDATE_LIMIT.min(
+        TASK_PROOF_CANDIDATE_POOL_LIMIT.saturating_sub(retained.len()),
+    );
+    retained.extend(
+        lexical_flags
+            .iter()
+            .enumerate()
+            .filter(|(_, lexical)| !**lexical)
+            .take(supplemental_limit)
+            .map(|(index, _)| index),
+    );
+    debug_assert!(retained.len() <= TASK_PROOF_CANDIDATE_POOL_LIMIT);
+    retained
 }
 
 fn task_proof_direct_relation(
@@ -17527,7 +17535,30 @@ mod tests {
     }
 
     #[test]
-    fn bounded_proof_subset_is_exact_and_order_independent_with_distractors() {
+    fn mixed_proof_pool_caps_lanes_and_selects_stable_actionable_subset() {
+        let arrangements = [
+            vec![
+                true, true, true, true, true, true, false, false, false, false, false, false,
+            ],
+            vec![
+                true, false, true, false, true, false, true, false, true, false, true, false,
+            ],
+            vec![
+                false, false, false, false, false, false, true, true, true, true, true, true,
+            ],
+        ];
+        for lexical_flags in arrangements {
+            let retained = task_proof_pool_positions(&lexical_flags);
+            let lexical = retained
+                .iter()
+                .filter(|index| lexical_flags[**index])
+                .count();
+            let graph = retained.len() - lexical;
+            assert_eq!(lexical, TASK_PROOF_LEXICAL_POOL_LIMIT);
+            assert_eq!(graph, TASK_GRAPH_CANDIDATE_LIMIT);
+            assert_eq!(retained.len(), TASK_PROOF_CANDIDATE_POOL_LIMIT);
+        }
+
         let candidate = |id: &str, rank: u32| TaskProofReserveCandidate {
             anchor: "anchor".into(),
             id: id.into(),
@@ -17591,7 +17622,12 @@ mod tests {
             "effective_overrides".to_string(),
             "typeddict_generation".to_string(),
         ]);
-        assert_eq!(select(&candidates), expected);
+        let selected = select(&candidates);
+        assert!(selected.len() <= TASK_PROOF_RESERVE_LIMIT);
+        assert!(!selected.contains("punctuation"));
+        assert!(!selected.contains("tiny_span"));
+        assert!(!selected.contains("unrelated_neighbor"));
+        assert_eq!(selected, expected);
         let mut reversed = candidates;
         reversed.reverse();
         assert_eq!(select(&reversed), expected);
