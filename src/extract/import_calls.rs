@@ -73,13 +73,19 @@ type ImportedBindingsByFile = HashMap<(String, PathBuf), HashSet<ImportedBinding
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Post-extraction pass: emit `Calls` edges from callers to imported functions.
+/// Post-extraction pass: resolve imports to `ReferencedBy` edges and, only when
+/// parse-time scope evidence is complete, imported invocations to `Calls`.
 ///
 /// Call this after all nodes from all roots are merged so that cross-file
 /// import/callee pairs are discovered correctly during incremental scans.
 ///
-/// Returns the new edges to add.  The returned `Vec` may be empty if no
-/// import-based cross-file calls are detected.
+/// Function body text cannot prove that an import is the active lexical
+/// binding: a parameter or local value may shadow either an aliased or an
+/// unaliased import. Extractors that can prove a scope complete may set
+/// `scope_bindings_complete = "true"` and list shadowing names in the
+/// comma-separated `local_bindings` metadata. Without that proof this pass
+/// deliberately emits no function-scoped Tree-sitter `Calls`; LSP enrichment
+/// remains the authoritative source for those edges.
 pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // ------------------------------------------------------------------
     // 1. Index function nodes by canonical and lexical name for O(1)
@@ -172,6 +178,25 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         if node.body.is_empty() {
             continue;
         }
+        if node
+            .metadata
+            .get("scope_bindings_complete")
+            .map(String::as_str)
+            != Some("true")
+        {
+            continue;
+        }
+        let local_bindings = node
+            .metadata
+            .get("local_bindings")
+            .map(|bindings| {
+                bindings
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
 
         // Perf optimization: extract call sites from the body ONCE, then check
         // each against the imports set. This is O(body_size + imports) instead
@@ -192,9 +217,11 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             Some(caller_lexical_name),
         );
 
-
         // For each imported name that appears as a call in this function body
         for binding in imported_names {
+            if local_bindings.contains(binding.local_name.as_str()) {
+                continue;
+            }
             // Skip names known to be common builtins / accessors. The previous
             // blanket `len() < 4` filter dropped legitimate short imports
             // (`init`, `tick`, `save`); the stopword list keeps the noisy
@@ -207,12 +234,15 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             // local inside the method body, so `C.run { run() }` may still
             // call an imported alias.
             let is_member_scope = node.metadata.contains_key("parent_scope")
-                && node.metadata.get("parent_scope_kind").map(String::as_str)
-                    != Some("function");
+                && node.metadata.get("parent_scope_kind").map(String::as_str) != Some("function");
             if caller_lexical_name == binding.local_name && !is_member_scope {
                 continue;
             }
-            let nested_key = (node.id.root.clone(), node.id.file.clone(), node.id.name.clone());
+            let nested_key = (
+                node.id.root.clone(),
+                node.id.file.clone(),
+                node.id.name.clone(),
+            );
             if nested_bindings
                 .get(&nested_key)
                 .is_some_and(|names| names.contains(&binding.local_name))
@@ -296,10 +326,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
     }
 
-    let calls_count = edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Calls)
-        .count();
+    let calls_count = edges.iter().filter(|e| e.kind == EdgeKind::Calls).count();
     // ------------------------------------------------------------------
     // 5. Emit ReferencedBy edges for imports that resolve to functions.
     //    This catches references that aren't bare call sites (keyword args,
@@ -331,8 +358,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             let compatible: Vec<&&Node> = candidates
                 .iter()
                 .filter(|c| {
-                    (c.id.root != import_node.id.root
-                        || c.id.file != import_node.id.file)
+                    (c.id.root != import_node.id.root || c.id.file != import_node.id.file)
                         && languages_compatible(importer_lang, c.language.as_str())
                 })
                 .collect();
@@ -349,7 +375,11 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     .copied()
                     .filter(|c| import_path_matches_file(module, &c.id.file))
                     .collect();
-                if narrowed.len() == 1 { narrowed } else { continue; }
+                if narrowed.len() == 1 {
+                    narrowed
+                } else {
+                    continue;
+                }
             } else if compatible.len() == 1 {
                 compatible
             } else {
@@ -610,12 +640,7 @@ fn parse_import_bindings(import_text: &str) -> Vec<ImportedBinding> {
             && let Some(brace_end) = after.rfind('}')
         {
             let inner = &after[brace_start + 1..brace_end];
-            return with_module(
-                inner
-                .split(',')
-                .filter_map(parse_as_binding)
-                .collect(),
-            );
+            return with_module(inner.split(',').filter_map(parse_as_binding).collect());
         }
         // Bare path: `use crate::foo::Bar`
         if let Some(last_segment) = after.split("::").last()
@@ -699,14 +724,8 @@ fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
     let Some(last) = segments.last() else {
         return false;
     };
-    let file_stem = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let file_name = file
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file_stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name = file.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if *last == file_stem || *last == file_name {
         return true;
     }
@@ -714,7 +733,17 @@ fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
     // the callee lives in an index-like re-export module inside that directory.
     // Matching any descendant file here would let `../api` resolve to an
     // arbitrary `api/*.ts` file even when the import clearly points at `api/index.ts`.
-    let is_index_module = matches!(file_name, "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "index.mjs" | "index.cjs" | "__init__.py" | "mod.rs");
+    let is_index_module = matches!(
+        file_name,
+        "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
+            | "index.mjs"
+            | "index.cjs"
+            | "__init__.py"
+            | "mod.rs"
+    );
     if !is_index_module {
         return false;
     }
@@ -767,7 +796,10 @@ fn parse_es6_import_bindings(text: &str) -> Vec<(String, String)> {
     // Split named `{ … }` block from default import prefix.
     let (default_part, named_part) = if let Some(brace_start) = specifier.find('{') {
         let before = specifier[..brace_start].trim().trim_end_matches(',').trim();
-        let Some(brace_end) = specifier[brace_start + 1..].find('}').map(|i| brace_start + 1 + i) else {
+        let Some(brace_end) = specifier[brace_start + 1..]
+            .find('}')
+            .map(|i| brace_start + 1 + i)
+        else {
             return Vec::new();
         };
         let inner = &specifier[brace_start + 1..brace_end];
@@ -792,7 +824,6 @@ fn parse_es6_import_bindings(text: &str) -> Vec<(String, String)> {
 
     names
 }
-
 
 // ---------------------------------------------------------------------------
 // Helper: check if a function body contains a bare call to a name
@@ -951,8 +982,8 @@ fn extract_call_sites_with_allowed_stopwords<'a>(
                 let previous_word =
                     std::str::from_utf8(&bytes[previous_start..previous_end]).unwrap_or("");
                 let is_declaration = matches!(previous_word, "def" | "fn" | "function");
-                let is_braced_member_declaration = declaration_name == Some(ident)
-                    && closing_paren_is_followed_by_brace(bytes, i);
+                let is_braced_member_declaration =
+                    declaration_name == Some(ident) && closing_paren_is_followed_by_brace(bytes, i);
                 if !ident.is_empty()
                     && !is_declaration
                     && !is_braced_member_declaration
@@ -1006,8 +1037,7 @@ fn closing_paren_is_followed_by_brace(bytes: &[u8], open_paren: usize) -> bool {
 pub(crate) fn is_call_stopword(name: &str) -> bool {
     matches!(
         name,
-        "id"
-            | "is"
+        "id" | "is"
             | "do"
             | "go"
             | "ok"
@@ -1166,7 +1196,7 @@ mod tests {
             line_end: 10,
             signature: format!("function {}()", name),
             body: body.into(),
-            metadata: BTreeMap::new(),
+            metadata: BTreeMap::from([("scope_bindings_complete".to_string(), "true".to_string())]),
             source: ExtractionSource::TreeSitter,
         }
     }
@@ -1306,7 +1336,11 @@ mod tests {
         let body = "let s = \"render(component)\"; helper(x);";
         let calls = extract_call_sites(body);
         assert!(calls.contains("helper"), "got {:?}", calls);
-        assert!(!calls.contains("render"), "render inside a string must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("render"),
+            "render inside a string must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1314,7 +1348,11 @@ mod tests {
         let body = "// helper(x) is intentionally commented out\nrender(c);";
         let calls = extract_call_sites(body);
         assert!(calls.contains("render"), "got {:?}", calls);
-        assert!(!calls.contains("helper"), "call inside a // comment must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("helper"),
+            "call inside a // comment must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1322,7 +1360,11 @@ mod tests {
         let body = "/* helper(x); */ render(c);";
         let calls = extract_call_sites(body);
         assert!(calls.contains("render"), "got {:?}", calls);
-        assert!(!calls.contains("helper"), "call inside /*…*/ must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("helper"),
+            "call inside /*…*/ must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1330,7 +1372,11 @@ mod tests {
         let body = "def f():\n    # helper(x)\n    render(c)";
         let calls = extract_call_sites(body);
         assert!(calls.contains("render"), "got {:?}", calls);
-        assert!(!calls.contains("helper"), "call inside # comment must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("helper"),
+            "call inside # comment must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1342,7 +1388,11 @@ mod tests {
         // including the `${…}` interpolation. That's fine: the worst case is
         // dropping a real call inside a template expression — never a false
         // positive. helper does not get a phantom edge.
-        assert!(!calls.contains("helper"), "call inside `…` template must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("helper"),
+            "call inside `…` template must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1352,7 +1402,11 @@ mod tests {
         let body = "let s = \"abc \\\" helper(x) \\\" def\"; render(c);";
         let calls = extract_call_sites(body);
         assert!(calls.contains("render"), "got {:?}", calls);
-        assert!(!calls.contains("helper"), "escaped-quote inner must remain string-context, got {:?}", calls);
+        assert!(
+            !calls.contains("helper"),
+            "escaped-quote inner must remain string-context, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1360,8 +1414,16 @@ mod tests {
         let body = "get(x); set(y); render(c);";
         let calls = extract_call_sites(body);
         assert!(calls.contains("render"), "got {:?}", calls);
-        assert!(!calls.contains("get"), "stopword 'get' must not register, got {:?}", calls);
-        assert!(!calls.contains("set"), "stopword 'set' must not register, got {:?}", calls);
+        assert!(
+            !calls.contains("get"),
+            "stopword 'get' must not register, got {:?}",
+            calls
+        );
+        assert!(
+            !calls.contains("set"),
+            "stopword 'set' must not register, got {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -1481,7 +1543,10 @@ mod tests {
             .iter()
             .find(|node| node.id.name == "orchestrate")
             .unwrap();
-        assert_eq!(caller.metadata.get("attr_refs").map(String::as_str), Some("execute"));
+        assert_eq!(
+            caller.metadata.get("attr_refs").map(String::as_str),
+            Some("execute")
+        );
         let callee = nodes
             .iter()
             .find(|node| node.id.name == "Worker.execute")
@@ -1500,7 +1565,11 @@ mod tests {
                     && edge.to == callee.id
             })
             .collect::<Vec<_>>();
-        assert_eq!(references.len(), 1, "expected canonical qualified target: {edges:?}");
+        assert_eq!(
+            references.len(),
+            1,
+            "expected canonical qualified target: {edges:?}"
+        );
     }
 
     #[test]
@@ -1524,15 +1593,15 @@ mod tests {
 
         let edges = import_calls_pass(&nodes);
         assert!(
-            edges.iter().all(|edge| {
-                edge.kind != EdgeKind::ReferencedBy || edge.from != caller.id
-            }),
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::ReferencedBy || edge.from != caller.id }),
             "ambiguous bare method alias must not choose an arbitrary owner: {edges:?}"
         );
     }
 
     #[test]
-    fn qualified_import_selects_canonical_scoped_call_target() {
+    fn qualified_import_references_canonical_scoped_target_without_scope_proof() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute\n\ndef orchestrate():\n    return execute()\n",
@@ -1555,20 +1624,22 @@ mod tests {
             .unwrap();
 
         let edges = import_calls_pass(&nodes);
-        let calls = edges
-            .iter()
-            .filter(|edge| edge.kind == EdgeKind::Calls && edge.from == caller.id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            calls.len(),
-            1,
-            "qualified module must disambiguate the scoped target: {edges:?}"
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "function-scoped Calls require complete binding proof: {edges:?}"
         );
-        assert_eq!(calls[0].to, worker.id);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| { edge.kind == EdgeKind::ReferencedBy && edge.to == worker.id }),
+            "qualified import must retain canonical reference evidence: {edges:?}"
+        );
     }
 
     #[test]
-    fn aliased_python_import_calls_local_name_and_references_canonical_symbol() {
+    fn aliased_python_import_fails_closed_without_scope_proof_and_references_symbol() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute as run\n\ndef orchestrate():\n    return run()\n",
@@ -1577,29 +1648,85 @@ mod tests {
             "worker.py",
             "def execute():\n    return 1\n",
         ));
-        let caller = nodes.iter().find(|node| node.id.name == "orchestrate").unwrap();
+        let caller = nodes
+            .iter()
+            .find(|node| node.id.name == "orchestrate")
+            .unwrap();
         let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
-        let import = nodes.iter().find(|node| node.id.kind == NodeKind::Import).unwrap();
+        let import = nodes
+            .iter()
+            .find(|node| node.id.kind == NodeKind::Import)
+            .unwrap();
 
         let edges = import_calls_pass(&nodes);
-        assert!(edges.iter().any(|edge| {
-            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-        }), "aliased Python call must bind to canonical symbol: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "aliased Python call must fail closed without binding proof: {edges:?}"
+        );
         assert!(edges.iter().any(|edge| {
             edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
         }));
     }
 
     #[test]
+    fn imported_function_shadowed_by_parameter_never_emits_heuristic_call() {
+        for (import_line, parameter, invocation) in [
+            ("from worker import execute as run", "run", "run()"),
+            ("from worker import execute", "execute", "execute()"),
+        ] {
+            let mut nodes = extract_python_nodes(
+                "caller.py",
+                &format!(
+                    "{import_line}\n\ndef orchestrate({parameter}):\n    return {invocation}\n"
+                ),
+            );
+            nodes.extend(extract_python_nodes(
+                "worker.py",
+                "def execute():\n    return 1\n",
+            ));
+            let caller = nodes
+                .iter()
+                .find(|node| node.id.name == "orchestrate")
+                .unwrap();
+            let import = nodes
+                .iter()
+                .find(|node| node.id.kind == NodeKind::Import)
+                .unwrap();
+            let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+            let edges = import_calls_pass(&nodes);
+            assert!(
+                edges
+                    .iter()
+                    .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+                "parameter shadow must fail closed for {import_line}: {edges:?}"
+            );
+            assert!(edges.iter().any(|edge| {
+                edge.kind == EdgeKind::ReferencedBy
+                    && edge.from == import.id
+                    && edge.to == callee.id
+            }));
+        }
+    }
+
+    #[test]
     fn aliased_es_import_calls_local_name_and_references_canonical_symbol() {
-        let caller = make_fn("caller.ts", "orchestrate", "function orchestrate() { return run(); }");
+        let caller = make_fn(
+            "caller.ts",
+            "orchestrate",
+            "function orchestrate() { return run(); }",
+        );
         let callee = make_fn("worker.ts", "execute", "function execute() { return 1; }");
         let import = make_import("caller.ts", "import { execute as run } from './worker'");
         let edges = import_calls_pass(&[caller.clone(), callee.clone(), import.clone()]);
 
-        assert!(edges.iter().any(|edge| {
-            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-        }), "aliased ES call must bind to canonical symbol: {edges:?}");
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            }),
+            "aliased ES call must bind to canonical symbol: {edges:?}"
+        );
         assert!(edges.iter().any(|edge| {
             edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
         }));
@@ -1615,9 +1742,12 @@ mod tests {
         import.language = "rust".into();
         let edges = import_calls_pass(&[caller.clone(), callee.clone(), import.clone()]);
 
-        assert!(edges.iter().any(|edge| {
-            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-        }), "aliased Rust call must bind to canonical symbol: {edges:?}");
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            }),
+            "aliased Rust call must bind to canonical symbol: {edges:?}"
+        );
         assert!(edges.iter().any(|edge| {
             edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
         }));
@@ -1634,9 +1764,12 @@ mod tests {
         let import = make_import("caller.ts", "import { execute as run } from './worker'");
         let edges = import_calls_pass(&[caller.clone(), callee, import]);
 
-        assert!(edges.iter().all(|edge| {
-            edge.kind != EdgeKind::Calls || edge.from != caller.id
-        }), "only the declared local alias may satisfy the call binding: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "only the declared local alias may satisfy the call binding: {edges:?}"
+        );
     }
 
     #[test]
@@ -1650,9 +1783,12 @@ mod tests {
         let import = make_import("caller.ts", "import { execute as run } from './worker'");
         let edges = import_calls_pass(&[caller.clone(), callee, import]);
 
-        assert!(edges.iter().all(|edge| {
-            edge.kind != EdgeKind::Calls || edge.from != caller.id
-        }), "non-call alias occurrences must not become Calls evidence: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "non-call alias occurrences must not become Calls evidence: {edges:?}"
+        );
     }
 
     #[test]
@@ -1668,9 +1804,12 @@ mod tests {
         let scoped = nodes.iter().find(|node| node.id.name == "C.run").unwrap();
         let edges = import_calls_pass(&nodes);
 
-        assert!(edges.iter().all(|edge| {
-            edge.kind != EdgeKind::Calls || edge.from != scoped.id
-        }), "a scoped method declaration must not call its same-named import alias: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != scoped.id }),
+            "a scoped method declaration must not call its same-named import alias: {edges:?}"
+        );
     }
 
     #[test]
@@ -1693,23 +1832,24 @@ mod tests {
         ] {
             let mut scoped = make_fn(caller_file, "C.run", declaration);
             scoped.language = language.into();
-            scoped
-                .metadata
-                .insert("lexical_name".into(), "run".into());
+            scoped.metadata.insert("lexical_name".into(), "run".into());
             let mut callee = make_fn(callee_file, "execute", "execute() {}");
             callee.language = language.into();
             let mut import = make_import(caller_file, import_text);
             import.language = language.into();
             let edges = import_calls_pass(&[scoped.clone(), callee, import]);
 
-            assert!(edges.iter().all(|edge| {
-                edge.kind != EdgeKind::Calls || edge.from != scoped.id
-            }), "{language} scoped declaration must not become an alias call: {edges:?}");
+            assert!(
+                edges
+                    .iter()
+                    .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != scoped.id }),
+                "{language} scoped declaration must not become an alias call: {edges:?}"
+            );
         }
     }
 
     #[test]
-    fn differently_named_scoped_method_can_call_imported_alias() {
+    fn differently_named_scoped_method_fails_closed_without_scope_proof() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute as run\n\nclass C:\n    def invoke(self):\n        return run()\n",
@@ -1718,17 +1858,22 @@ mod tests {
             "worker.py",
             "def execute():\n    return 1\n",
         ));
-        let caller = nodes.iter().find(|node| node.id.name == "C.invoke").unwrap();
-        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+        let caller = nodes
+            .iter()
+            .find(|node| node.id.name == "C.invoke")
+            .unwrap();
         let edges = import_calls_pass(&nodes);
 
-        assert!(edges.iter().any(|edge| {
-            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-        }), "a differently named scoped method must retain a real alias call: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "a scoped method without complete binding proof must fail closed: {edges:?}"
+        );
     }
 
     #[test]
-    fn same_named_python_method_can_call_bare_imported_alias() {
+    fn same_named_python_method_fails_closed_without_scope_proof() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute as run\n\nclass C:\n    def run(self):\n        return run()\n",
@@ -1738,12 +1883,14 @@ mod tests {
             "def execute():\n    return 1\n",
         ));
         let caller = nodes.iter().find(|node| node.id.name == "C.run").unwrap();
-        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
         let edges = import_calls_pass(&nodes);
 
-        assert!(edges.iter().any(|edge| {
-            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-        }), "a method name does not shadow the bare imported alias in its body: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
+            "a scoped method without complete binding proof must fail closed: {edges:?}"
+        );
     }
 
     #[test]
@@ -1777,9 +1924,12 @@ mod tests {
             import.language = language.into();
             let edges = import_calls_pass(&[caller.clone(), callee.clone(), import]);
 
-            assert!(edges.iter().any(|edge| {
-                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
-            }), "{language} method must retain the real bare alias call: {edges:?}");
+            assert!(
+                edges.iter().any(|edge| {
+                    edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+                }),
+                "{language} method must retain the real bare alias call: {edges:?}"
+            );
         }
     }
 
@@ -1799,9 +1949,12 @@ mod tests {
             .unwrap();
         let edges = import_calls_pass(&nodes);
 
-        assert!(edges.iter().all(|edge| {
-            edge.kind != EdgeKind::Calls || edge.from != orchestrate.id
-        }), "an invoked nested local alias must not become an imported call: {edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != orchestrate.id }),
+            "an invoked nested local alias must not become an imported call: {edges:?}"
+        );
     }
 
     #[test]
@@ -1820,7 +1973,10 @@ mod tests {
         assert_eq!(calls[0].to.name, "helper");
         assert_eq!(calls[0].kind, EdgeKind::Calls);
         // Also expect a ReferencedBy edge from the import
-        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        let refs: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ReferencedBy)
+            .collect();
         assert_eq!(refs.len(), 1, "expected 1 import ReferencedBy edge");
     }
 
@@ -1866,13 +2022,24 @@ mod tests {
         let edges = import_calls_pass(&nodes);
         // No Calls edge (helper not called in body), but import creates a ReferencedBy edge
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert!(calls.is_empty(), "no call in body → no Calls edge, got {:?}", calls);
-        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
-        assert_eq!(refs.len(), 1, "import creates ReferencedBy even without body call");
+        assert!(
+            calls.is_empty(),
+            "no call in body → no Calls edge, got {:?}",
+            calls
+        );
+        let refs: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ReferencedBy)
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "import creates ReferencedBy even without body call"
+        );
     }
 
     #[test]
-    fn test_python_cross_file_call() {
+    fn test_python_cross_file_call_requires_complete_scope_bindings() {
         let caller = Node {
             id: NodeId {
                 root: "r".into(),
@@ -1923,9 +2090,18 @@ mod tests {
         let edges = import_calls_pass(&nodes);
 
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert_eq!(calls.len(), 1, "expected 1 Python Calls edge, got {:?}", edges);
-        assert_eq!(calls[0].from.name, "get_workspace");
-        assert_eq!(calls[0].to.name, "fetch_data");
+        assert!(
+            calls.is_empty(),
+            "unproven Python binding must not emit Calls: {edges:?}"
+        );
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::ReferencedBy)
+                .count(),
+            1,
+            "import reference remains available"
+        );
     }
 
     #[test]
@@ -1999,9 +2175,16 @@ mod tests {
 
         // No Calls edge (method call, not bare call), but import ReferencedBy still emitted
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert!(calls.is_empty(), "method call `obj.helper()` must not emit Calls edge, got {:?}", calls);
+        assert!(
+            calls.is_empty(),
+            "method call `obj.helper()` must not emit Calls edge, got {:?}",
+            calls
+        );
         // Import ReferencedBy is still emitted since helper is imported
-        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        let refs: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ReferencedBy)
+            .collect();
         assert_eq!(refs.len(), 1, "import ReferencedBy still emitted");
     }
 
@@ -2016,7 +2199,11 @@ mod tests {
 
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].confidence, Confidence::Detected, "relative import should produce Detected confidence");
+        assert_eq!(
+            calls[0].confidence,
+            Confidence::Detected,
+            "relative import should produce Detected confidence"
+        );
     }
 
     #[test]
@@ -2031,7 +2218,10 @@ mod tests {
         let edges = import_calls_pass(&nodes);
 
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert!(calls.is_empty(), "external module must not bind a local same-name target: {edges:?}");
+        assert!(
+            calls.is_empty(),
+            "external module must not bind a local same-name target: {edges:?}"
+        );
     }
 
     #[test]
@@ -2226,24 +2416,27 @@ mod tests {
         ];
         let edges = import_calls_pass(&nodes);
 
-        // Expected: 2 Calls edges — mainA→helperA (root-a) and mainB→helperB (root-b).
-        // Plus 2 import ReferencedBy edges.
+        // Neither caller has complete scope-binding evidence, so Calls fail
+        // closed. Import references remain isolated by root.
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert_eq!(
-            calls.len(),
-            2,
-            "expected 2 isolated cross-file Calls edges, got {:?}",
-            calls.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        assert!(
+            calls.is_empty(),
+            "unproven function bindings must fail closed: {calls:?}"
         );
-
-        let edge_a = calls.iter().find(|e| e.from.root == "root-a");
-        assert!(edge_a.is_some(), "missing root-a edge");
-        assert_eq!(edge_a.unwrap().from.name, "mainA");
-        assert_eq!(edge_a.unwrap().to.name, "helperA");
-
-        let edge_b = calls.iter().find(|e| e.from.root == "root-b");
-        assert!(edge_b.is_some(), "missing root-b edge");
-        assert_eq!(edge_b.unwrap().from.name, "mainB");
-        assert_eq!(edge_b.unwrap().to.name, "helperB");
+        let references = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::ReferencedBy)
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 2);
+        assert!(
+            references
+                .iter()
+                .any(|edge| edge.from.root == "root-a" && edge.to == callee_a.id)
+        );
+        assert!(
+            references
+                .iter()
+                .any(|edge| edge.from.root == "root-b" && edge.to == callee_b.id)
+        );
     }
 }

@@ -1564,19 +1564,15 @@ fn scoped_convergence_calls_candidates(
             .iter()
             .zip(&candidate.witness_edge_kinds)
             .collect::<Vec<_>>();
-        if let (Some(onward), Some(edge_kinds)) =
-            (&candidate.onward, &candidate.onward_edge_kinds)
+        if let (Some(onward), Some(edge_kinds)) = (&candidate.onward, &candidate.onward_edge_kinds)
         {
             paths.push((onward, edge_kinds));
         }
         let all_hops_exact = paths.iter().all(|(path, edge_kinds)| {
             path.len() == edge_kinds.len().saturating_add(1)
-                && path
-                    .windows(2)
-                    .zip(edge_kinds.iter())
-                    .all(|(pair, kind)| {
-                        *kind != EdgeKind::Calls || edge_is_exact(&pair[0], &pair[1])
-                    })
+                && path.windows(2).zip(edge_kinds.iter()).all(|(pair, kind)| {
+                    *kind != EdgeKind::Calls || edge_is_exact(&pair[0], &pair[1])
+                })
         });
         if !all_hops_exact {
             continue;
@@ -10926,6 +10922,45 @@ mod tests {
     }
 
     #[test]
+    fn convergence_binding_accepts_qualified_ids_from_specialized_extractors() {
+        use crate::extract::Extractor;
+        use crate::extract::go::GoExtractor;
+
+        let extraction = GoExtractor
+            .extract(
+                Path::new("interfaces.go"),
+                "package api\n\ntype Reader interface { Read([]byte) error }\ntype Auditor interface { Read([]byte) error }\n",
+            )
+            .unwrap();
+        let reader = extraction
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "Reader.Read")
+            .unwrap()
+            .clone();
+        let auditor = extraction
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "Auditor.Read")
+            .unwrap()
+            .clone();
+        let graph = make_graph_state(extraction.nodes);
+
+        assert_eq!(
+            bind_convergence_selector("Reader.Read", &graph),
+            SelectorBinding::Resolved(reader.stable_id())
+        );
+        assert_eq!(
+            bind_convergence_selector("Auditor::Read", &graph),
+            SelectorBinding::Resolved(auditor.stable_id())
+        );
+        let SelectorBinding::Ambiguous(ids) = bind_convergence_selector("Read", &graph) else {
+            panic!("bare specialized method name must remain ambiguous")
+        };
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
     fn convergence_binding_adversarial_matrix_fails_closed_without_fuzzy_matching() {
         let mut alpha = make_scoped_method("Request", "prepare", "requests/models.py");
         alpha.id.root = "alpha".into();
@@ -11055,7 +11090,11 @@ mod tests {
         )
         .await;
 
-        assert!(delivery.markdown.contains("at least two source selectors are required"));
+        assert!(
+            delivery
+                .markdown
+                .contains("at least two source selectors are required")
+        );
         assert!(!delivery.markdown.contains("def visible"));
         assert!(!delivery.context_injection_eligible);
     }
@@ -11254,8 +11293,7 @@ mod tests {
 
         let run = |confirmed_session_call: bool| {
             let request = make_scoped_method("Request", "prepare", "requests/models.py");
-            let session =
-                make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+            let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
             let join =
                 make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
             let boundary = make_scoped_method("Schema", "contract", "schema/types.py");
@@ -11269,10 +11307,7 @@ mod tests {
                 session_edge,
                 make_edge(&join, &boundary, EdgeKind::DependsOn),
             ];
-            let graph = make_graph_state_with_edges(
-                vec![request, session, join, boundary],
-                edges,
-            );
+            let graph = make_graph_state_with_edges(vec![request, session, join, boundary], edges);
             (tempfile::tempdir().unwrap(), graph)
         };
 
@@ -11304,13 +11339,19 @@ mod tests {
             .await;
 
             if expect_injectable {
-                assert!(rendered.contains("delivery_status: injectable_proof"), "{rendered}");
+                assert!(
+                    rendered.contains("delivery_status: injectable_proof"),
+                    "{rendered}"
+                );
                 assert!(rendered.contains("-[calls]->"), "{rendered}");
                 assert!(rendered.contains("-[depends_on]->"), "{rendered}");
                 assert!(rendered.contains("Schema.contract"), "{rendered}");
             } else {
                 assert!(rendered.contains("coverage_unknown"), "{rendered}");
-                assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+                assert!(
+                    rendered.contains("delivery_status: not_injectable"),
+                    "{rendered}"
+                );
                 assert!(!rendered.contains("hydrate_source:"), "{rendered}");
             }
         }
@@ -17216,9 +17257,8 @@ mod tests {
         let graph = make_graph_state_with_edges(nodes, edges);
         let edge_index = ProjectedEdgeIndex::new(&graph);
         let ctx = make_search_context(&graph, repository.path());
-        let changed_line = line_of(
-            "return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);",
-        );
+        let changed_line =
+            line_of("return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);");
         let proposal = format!(
             "diff --git a/src/service/search.rs b/src/service/search.rs\n--- a/src/service/search.rs\n+++ b/src/service/search.rs\n@@ -{changed_line},1 +{changed_line},1 @@\n-        return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);\n+        return SearchDelivery::eligible(projected_search(params, ctx).await);\n"
         );

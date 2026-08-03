@@ -395,6 +395,7 @@ fn collect_js_specials(
                     };
 
                     let mut metadata = BTreeMap::new();
+                    let mut identity_name = name_str.clone();
                     metadata.insert(
                         "name_col".to_string(),
                         name_n.start_position().column.to_string(),
@@ -411,12 +412,15 @@ fn collect_js_specials(
                         && let Ok(class_name) = class_name_node.utf8_text(source)
                     {
                         metadata.insert("parent_scope".to_string(), class_name.to_string());
+                        metadata.insert("parent_scope_kind".to_string(), "class".to_string());
+                        metadata.insert("lexical_name".to_string(), name_str.clone());
+                        identity_name = format!("{class_name}.{name_str}");
                         // Emit class -> member Defines edge (mirrors generic
                         // extractor's parent-scope Defines for methods)
                         emit_class_defines_edge(
                             path,
                             class_name,
-                            &name_str,
+                            &identity_name,
                             NodeKind::Function,
                             edges,
                         );
@@ -426,7 +430,7 @@ fn collect_js_specials(
                         id: NodeId {
                             root: String::new(),
                             file: path.to_path_buf(),
-                            name: name_str,
+                            name: identity_name,
                             kind: NodeKind::Function,
                         },
                         language: "javascript".to_string(),
@@ -744,14 +748,14 @@ class Foo {
         let handler = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.handler" && n.id.kind == NodeKind::Function)
             .expect("Should find handler as Function");
         assert_eq!(handler.id.kind, NodeKind::Function);
 
         let on_click = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "onClick" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.onClick" && n.id.kind == NodeKind::Function)
             .expect("Should find onClick as Function");
         assert_eq!(on_click.id.kind, NodeKind::Function);
     }
@@ -807,7 +811,7 @@ class Foo {
                 e.kind == EdgeKind::Defines
                     && e.from.name == "Foo"
                     && e.from.kind == NodeKind::Struct
-                    && e.to.name == "handler"
+                    && e.to.name == "Foo.handler"
                     && e.to.kind == NodeKind::Function
             })
             .collect();
@@ -840,7 +844,7 @@ class Foo {
         let handler = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.handler" && n.id.kind == NodeKind::Function)
             .expect("Should find handler as Function");
         assert!(
             handler.signature.contains("function"),
@@ -852,6 +856,33 @@ class Foo {
             "function_expression class property should NOT have '=>' in signature, got: {}",
             handler.signature
         );
+    }
+
+    #[test]
+    fn class_function_properties_with_same_lexical_name_keep_owner_identity() {
+        let result = JavaScriptExtractor::new()
+            .extract(
+                Path::new("src/app.js"),
+                "class Alpha { run = () => 1; }\nclass Beta { run = () => 2; }",
+            )
+            .unwrap();
+        for owner in ["Alpha", "Beta"] {
+            let identity = format!("{owner}.run");
+            let node = result
+                .nodes
+                .iter()
+                .find(|node| node.id.kind == NodeKind::Function && node.id.name == identity)
+                .unwrap_or_else(|| panic!("missing {identity}"));
+            assert_eq!(
+                node.metadata.get("lexical_name").map(String::as_str),
+                Some("run")
+            );
+            assert!(result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Defines
+                    && edge.from.name == owner
+                    && edge.to.name == identity
+            }));
+        }
     }
 
     // --- Defines edge tests for imports and consts (#168) ---
