@@ -3,7 +3,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn task_and_flat_infeasible_render_budgets_exit_nonzero_without_stdout() {
+fn projected_search_infeasible_render_budgets_exit_nonzero_without_stdout() {
     let tmp = TempDir::new().expect("temp dir");
     std::fs::create_dir_all(tmp.path().join("src")).expect("create src dir");
     std::fs::write(
@@ -49,6 +49,84 @@ fn task_and_flat_infeasible_render_budgets_exit_nonzero_without_stdout() {
             assert!(
                 String::from_utf8_lossy(&output.stderr).contains("BudgetTooSmall"),
                 "typed error missing from stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    let emitted = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+        .args([
+            "search",
+            "actionable",
+            "--repo",
+            repo,
+            "--include-artifacts=false",
+            "--include-markdown=false",
+        ])
+        .output()
+        .expect("emit a real hydration handle");
+    assert!(
+        emitted.status.success(),
+        "handle-emitting search failed: {}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let emitted_stdout = String::from_utf8(emitted.stdout).expect("utf-8 search output");
+    let hydration_handle = emitted_stdout
+        .split_whitespace()
+        .map(|token| token.trim_matches(|character| matches!(character, '`' | ',' | ')')))
+        .find(|token| token.starts_with("rna-h2:"))
+        .expect("search output must contain an emitted hydration handle")
+        .to_string();
+    let proposal = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn actionable() -> bool { true }\n+pub fn actionable() -> bool { false }\n";
+
+    for budget_flag in ["--max-output-bytes", "--max-output-tokens"] {
+        for (label, arguments) in [
+            (
+                "hydration",
+                vec![
+                    "search",
+                    "--repo",
+                    repo,
+                    "--node",
+                    hydration_handle.as_str(),
+                    budget_flag,
+                    "1",
+                ],
+            ),
+            (
+                "graph-delta",
+                vec![
+                    "search",
+                    "review actionable",
+                    "--repo",
+                    repo,
+                    "--context-mode",
+                    "graph-delta-beta",
+                    "--proposal",
+                    proposal,
+                    "--include-artifacts=false",
+                    "--include-markdown=false",
+                    budget_flag,
+                    "1",
+                ],
+            ),
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+                .args(arguments)
+                .output()
+                .expect("run bounded projected search");
+            assert!(
+                !output.status.success(),
+                "infeasible {label} {budget_flag} search must fail"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "infeasible {label} search must not emit oversized stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("BudgetTooSmall"),
+                "typed {label} error missing from stderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }

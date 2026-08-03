@@ -1224,7 +1224,14 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
                     .to_string(),
             );
         }
-        return SearchDelivery::eligible(hydrate_from_handle(node, params, ctx).await);
+        return match hydrate_from_handle(node, params, ctx).await {
+            Ok(markdown) => SearchDelivery::eligible(markdown),
+            Err(error) => SearchDelivery {
+                markdown: String::new(),
+                context_injection_eligible: false,
+                error: Some(error),
+            },
+        };
     }
 
     if params.line.is_some()
@@ -2002,41 +2009,41 @@ async fn hydrate_from_handle(
     encoded: &str,
     params: &SearchParams,
     ctx: &SearchContext<'_>,
-) -> String {
+) -> Result<String, SearchDeliveryError> {
     let handle = match HydrationHandle::decode(encoded) {
         Ok(handle) => handle,
-        Err(error) => return format!("Invalid hydration handle: {error}."),
+        Err(error) => return Ok(format!("Invalid hydration handle: {error}.")),
     };
     match handle.kind {
         HydrationKind::Source => {
             let Some(page) = handle.source.clone() else {
-                return "Invalid hydration handle: source target is missing.".to_string();
+                return Ok("Invalid hydration handle: source target is missing.".to_string());
             };
             if let Some(span_id) = handle.record_id.strip_prefix("span:") {
                 let authority = match ProjectionSourceSpan::from_stable_id(span_id) {
                     Ok(authority) => authority,
                     Err(error) => {
-                        return format!("Hydration span authority is invalid: {error}.");
+                        return Ok(format!("Hydration span authority is invalid: {error}."));
                     }
                 };
                 if !authority.contains(&page) {
-                    return "Hydration page is outside its bound source authority.".to_string();
+                    return Ok("Hydration page is outside its bound source authority.".to_string());
                 }
                 let reader = match projection_source_reader(params, ctx.repo_root) {
                     Ok(reader) => reader,
                     Err(error) => {
-                        return format!("Hydration source projection unavailable: {error}.");
+                        return Ok(format!("Hydration source projection unavailable: {error}."));
                     }
                 };
                 if let Err(error) = reader.read(&page) {
-                    return format!("Hydration source validation failed: {error}.");
+                    return Ok(format!("Hydration source validation failed: {error}."));
                 }
                 let selected =
                     selected_for_source_span_hydration(&handle.record_id, authority, page);
                 let mut request = projection_request(params, SearchIntent::Hydrate);
                 request.projection = SearchProjection::Agent;
                 request.body_policy = BodyPolicy::FocusedSpan;
-                return render_projected_input(
+                return render_projected_input_delivery(
                     request,
                     ProjectionInput {
                         records: vec![selected],
@@ -2052,21 +2059,23 @@ async fn hydrate_from_handle(
                 .iter()
                 .find(|node| node.stable_id() == handle.record_id);
             let Some(node) = node else {
-                return "Hydration source target is no longer present in the graph.".to_string();
+                return Ok("Hydration source target is no longer present in the graph.".to_string());
             };
             // If the record still exists, bind the handle to its authoritative
             // identity. A changed path/range fails closed instead of redirecting.
             let Some(authority) = node_source_span(node) else {
-                return "Hydration source target has no current authoritative span.".to_string();
+                return Ok("Hydration source target has no current authoritative span.".to_string());
             };
             if !authority.contains(&page) {
-                return "Hydration handle no longer matches the indexed record source.".to_string();
+                return Ok(
+                    "Hydration handle no longer matches the indexed record source.".to_string(),
+                );
             }
             let selected = selected_for_hydration(node, &handle.record_id, authority, page);
             let mut request = projection_request(params, SearchIntent::Hydrate);
             request.projection = SearchProjection::Agent;
             request.body_policy = BodyPolicy::FocusedSpan;
-            render_projected_input(
+            render_projected_input_delivery(
                 request,
                 ProjectionInput {
                     records: vec![selected],
@@ -2085,24 +2094,26 @@ async fn hydrate_from_handle(
             }
             let (digest, node_id) = match parse_evidence_capsule_reference(&handle.record_id) {
                 Ok(reference) => reference,
-                Err(error) => return format!("Evidence hydration rejected: {error}."),
+                Err(error) => return Ok(format!("Evidence hydration rejected: {error}.")),
             };
             let directory = match evidence_capsule_directory(ctx.repo_root, false) {
                 Ok(directory) => directory,
-                Err(error) => return format!("Evidence hydration rejected: {error}."),
+                Err(error) => return Ok(format!("Evidence hydration rejected: {error}.")),
             };
             let path = directory.join(format!("{digest}.json"));
             let bytes = match read_evidence_capsule_bytes(&path) {
                 Ok(bytes) => bytes,
-                Err(error) => return format!("Evidence hydration rejected: {error}."),
+                Err(error) => return Ok(format!("Evidence hydration rejected: {error}.")),
             };
             if blake3::hash(&bytes).to_hex().as_str() != digest {
-                return "Evidence hydration rejected: capsule digest mismatch.".to_string();
+                return Ok("Evidence hydration rejected: capsule digest mismatch.".to_string());
             }
             let capsule: EvidenceCapsuleV1 = match serde_json::from_slice(&bytes) {
                 Ok(capsule) => capsule,
                 Err(error) => {
-                    return format!("Evidence hydration rejected: invalid capsule: {error}.");
+                    return Ok(format!(
+                        "Evidence hydration rejected: invalid capsule: {error}."
+                    ));
                 }
             };
             if capsule.schema_version != EVIDENCE_CAPSULE_SCHEMA_VERSION
@@ -2113,28 +2124,31 @@ async fn hydrate_from_handle(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
-                return "Evidence hydration rejected: capsule binding mismatch.".to_string();
+                return Ok("Evidence hydration rejected: capsule binding mismatch.".to_string());
             }
             let canonical = match serde_json::to_vec(&capsule) {
                 Ok(canonical) => canonical,
                 Err(error) => {
-                    return format!(
+                    return Ok(format!(
                         "Evidence hydration rejected: capsule canonicalization failed: {error}."
-                    );
+                    ));
                 }
             };
             if canonical != bytes {
-                return "Evidence hydration rejected: capsule is not canonical.".to_string();
+                return Ok("Evidence hydration rejected: capsule is not canonical.".to_string());
             }
             let Some(node) = find_node(ctx.graph_state, node_id) else {
-                return "Evidence hydration rejected: selected node is no longer present."
-                    .to_string();
+                return Ok(
+                    "Evidence hydration rejected: selected node is no longer present.".to_string(),
+                );
             };
             let current_hash = node_projection_digest(node);
             if capsule.current_node_content_hash != current_hash
                 || capsule.evidence.content_hash.as_deref() != Some(current_hash.as_str())
             {
-                return "Evidence hydration rejected: selected node content changed.".to_string();
+                return Ok(
+                    "Evidence hydration rejected: selected node content changed.".to_string(),
+                );
             }
             let selected = SelectedRecord {
                 selection_rank: capsule.selection_rank,
@@ -2151,7 +2165,7 @@ async fn hydrate_from_handle(
             let mut request = projection_request(params, SearchIntent::Hydrate);
             request.projection = SearchProjection::Evidence;
             request.body_policy = BodyPolicy::SignatureOnly;
-            render_projected_input(
+            render_projected_input_delivery(
                 request,
                 ProjectionInput {
                     records: vec![selected],
@@ -2168,26 +2182,28 @@ fn hydrate_semantic_evidence_capsule(
     handle: &HydrationHandle,
     params: &SearchParams,
     ctx: &SearchContext<'_>,
-) -> String {
+) -> Result<String, SearchDeliveryError> {
     let (digest, record_id) = match parse_semantic_evidence_capsule_reference(&handle.record_id) {
         Ok(reference) => reference,
-        Err(error) => return format!("Semantic evidence hydration rejected: {error}."),
+        Err(error) => return Ok(format!("Semantic evidence hydration rejected: {error}.")),
     };
     let directory = match evidence_capsule_directory(ctx.repo_root, false) {
         Ok(directory) => directory,
-        Err(error) => return format!("Semantic evidence hydration rejected: {error}."),
+        Err(error) => return Ok(format!("Semantic evidence hydration rejected: {error}.")),
     };
     let bytes = match read_evidence_capsule_bytes(&directory.join(format!("{digest}.json"))) {
         Ok(bytes) => bytes,
-        Err(error) => return format!("Semantic evidence hydration rejected: {error}."),
+        Err(error) => return Ok(format!("Semantic evidence hydration rejected: {error}.")),
     };
     if blake3::hash(&bytes).to_hex().as_str() != digest {
-        return "Semantic evidence hydration rejected: capsule digest mismatch.".into();
+        return Ok("Semantic evidence hydration rejected: capsule digest mismatch.".into());
     }
     let capsule: SemanticEvidenceCapsuleV1 = match serde_json::from_slice(&bytes) {
         Ok(capsule) => capsule,
         Err(error) => {
-            return format!("Semantic evidence hydration rejected: invalid capsule: {error}.");
+            return Ok(format!(
+                "Semantic evidence hydration rejected: invalid capsule: {error}."
+            ));
         }
     };
     let body_hash = blake3::hash(capsule.body.as_bytes()).to_hex().to_string();
@@ -2195,18 +2211,18 @@ fn hydrate_semantic_evidence_capsule(
         || capsule.record_id != record_id
         || capsule.evidence.content_hash.as_deref() != Some(body_hash.as_str())
     {
-        return "Semantic evidence hydration rejected: capsule binding mismatch.".into();
+        return Ok("Semantic evidence hydration rejected: capsule binding mismatch.".into());
     }
     let canonical = match serde_json::to_vec(&capsule) {
         Ok(canonical) => canonical,
         Err(error) => {
-            return format!(
+            return Ok(format!(
                 "Semantic evidence hydration rejected: canonicalization failed: {error}."
-            );
+            ));
         }
     };
     if canonical != bytes {
-        return "Semantic evidence hydration rejected: capsule is not canonical.".into();
+        return Ok("Semantic evidence hydration rejected: capsule is not canonical.".into());
     }
     let mut symbol = capsule.symbol;
     symbol.signature = capsule.body;
@@ -2230,7 +2246,7 @@ fn hydrate_semantic_evidence_capsule(
     let mut request = projection_request(params, SearchIntent::Hydrate);
     request.projection = SearchProjection::Evidence;
     request.body_policy = BodyPolicy::SignatureOnly;
-    render_projected_input(
+    render_projected_input_delivery(
         request,
         ProjectionInput {
             records: vec![selected],
@@ -2305,7 +2321,7 @@ async fn projected_search_delivery(
 ) -> Result<String, SearchDeliveryError> {
     let edge_index = ProjectedEdgeIndex::new(ctx.graph_state);
     if params.context_mode.as_deref() == Some("graph-delta-beta") {
-        return Ok(projected_graph_delta(params, ctx, &edge_index).await);
+        return projected_graph_delta(params, ctx, &edge_index).await;
     }
     let intent = if params.context_mode.as_deref() == Some("task") {
         SearchIntent::Implement
@@ -5863,14 +5879,14 @@ async fn projected_graph_delta(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
     edge_index: &ProjectedEdgeIndex<'_>,
-) -> String {
+) -> Result<String, SearchDeliveryError> {
     let card = match live_graph_delta_card(params, ctx, edge_index) {
         Ok(card) => card,
-        Err(error) => return format!("Graph-delta analysis failed: {error}."),
+        Err(error) => return Ok(format!("Graph-delta analysis failed: {error}.")),
     };
     let (records, relationships, capabilities, omissions, candidate_audit) =
         graph_delta_projection(&card, params, ctx);
-    render_projected_input(
+    render_projected_input_delivery(
         projection_request(params, SearchIntent::Review),
         ProjectionInput {
             records,
@@ -7457,19 +7473,30 @@ fn render_projected_input_result(
         .map_err(ProjectionRenderFailure::Render)
 }
 
+fn render_projected_input_delivery(
+    request: ProjectionRequest,
+    input: ProjectionInput,
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Result<String, SearchDeliveryError> {
+    match render_projected_input_result(request, input, params, ctx) {
+        Ok(markdown) => Ok(markdown),
+        Err(ProjectionRenderFailure::Source(error)) => {
+            Ok(format!("Search source projection unavailable: {error}."))
+        }
+        Err(ProjectionRenderFailure::Render(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
 fn render_projected_input(
     request: ProjectionRequest,
     input: ProjectionInput,
     params: &SearchParams,
     ctx: &SearchContext<'_>,
 ) -> String {
-    match render_projected_input_result(request, input, params, ctx) {
-        Ok(markdown) => markdown,
-        Err(ProjectionRenderFailure::Source(error)) => {
-            format!("Search source projection unavailable: {error}.")
-        }
-        Err(ProjectionRenderFailure::Render(error)) => format!("Search render failed: {error}."),
-    }
+    render_projected_input_delivery(request, input, params, ctx)
+        .unwrap_or_else(|error| error.to_string())
 }
 
 async fn projected_fused_candidates(
@@ -11649,6 +11676,73 @@ mod tests {
                     delivery.markdown,
                     delivery.error
                 );
+                assert!(!delivery.context_injection_eligible);
+                assert!(matches!(
+                    delivery.error,
+                    Some(SearchDeliveryError::BudgetTooSmall {
+                        minimum_bytes: _,
+                        minimum_tokens: _
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn emitted_hydration_and_graph_delta_infeasible_budgets_are_typed() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn actionable() -> bool { true }\n",
+        )
+        .unwrap();
+        let mut node = make_node("actionable", NodeKind::Function, "src/lib.rs");
+        node.line_start = 1;
+        node.line_end = 1;
+        node.body = "pub fn actionable() -> bool { true }".into();
+        let graph = make_graph_state(vec![node]);
+        let ctx = make_search_context(&graph, temp.path());
+
+        let emitted = search_delivery(
+            &SearchParams {
+                query: Some("actionable".into()),
+                include_artifacts: false,
+                include_markdown: false,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+        let handle = emitted
+            .markdown
+            .split_whitespace()
+            .map(|token| token.trim_matches(|character| matches!(character, '`' | ',' | ')')))
+            .find(|token| token.starts_with("rna-h2:"))
+            .expect("feasible search must emit a real compact hydration handle")
+            .to_string();
+        let proposal = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn actionable() -> bool { true }\n+pub fn actionable() -> bool { false }\n";
+
+        for (max_output_bytes, max_output_tokens) in [(Some(1), None), (None, Some(1))] {
+            for params in [
+                SearchParams {
+                    node: Some(handle.clone()),
+                    max_output_bytes,
+                    max_output_tokens,
+                    ..Default::default()
+                },
+                SearchParams {
+                    context_mode: Some("graph-delta-beta".into()),
+                    proposal: Some(proposal.into()),
+                    max_output_bytes,
+                    max_output_tokens,
+                    include_artifacts: false,
+                    include_markdown: false,
+                    ..Default::default()
+                },
+            ] {
+                let delivery = search_delivery(&params, &ctx).await;
+                assert!(delivery.markdown.is_empty());
                 assert!(!delivery.context_injection_eligible);
                 assert!(matches!(
                     delivery.error,
@@ -18282,7 +18376,8 @@ mod tests {
             &ctx,
             &edge_index,
         )
-        .await;
+        .await
+        .unwrap();
         // The card covers all affected loci in one bounded response. The
         // context-equivalent legacy baseline therefore needs the neighbors and
         // impact view for every locus, not only the edited seed.

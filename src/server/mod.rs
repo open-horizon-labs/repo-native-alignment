@@ -695,6 +695,42 @@ mod tests {
         )
         .unwrap();
 
+        let emitter = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Disabled),
+            ..RnaHandler::default()
+        };
+        let emitter_graph = emitter
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .unwrap();
+        emitter.install_cached_graph(emitter_graph);
+        let emitted = emitter
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "search".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "query": "present_symbol",
+                        "include_artifacts": false,
+                        "include_markdown": false
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let emitted_text = call_tool_text(&emitted);
+        let hydration_handle = emitted_text
+            .split_whitespace()
+            .map(|token| token.trim_matches(|character| matches!(character, '`' | ',' | ')')))
+            .find(|token| token.starts_with("rna-h2:"))
+            .expect("real CallTool search must emit a compact hydration handle")
+            .to_string();
+
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
             business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
@@ -762,6 +798,40 @@ mod tests {
                 .context_injected
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+
+        let graph_delta_proposal = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn present_symbol() {}\n+pub fn present_symbol() { eprintln!(\"changed\"); }\n";
+        for budget_key in ["max_output_bytes", "max_output_tokens"] {
+            for mut arguments in [
+                serde_json::json!({"node": hydration_handle}),
+                serde_json::json!({
+                    "context_mode": "graph-delta-beta",
+                    "proposal": graph_delta_proposal,
+                    "include_artifacts": false,
+                    "include_markdown": false
+                }),
+            ] {
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(budget_key.into(), serde_json::json!(1));
+                let error = handler
+                    .dispatch_call_tool_request(CallToolRequestParams {
+                        name: "search".into(),
+                        meta: None,
+                        task: None,
+                        arguments: arguments.as_object().cloned(),
+                    })
+                    .await
+                    .expect_err("infeasible hydration/graph-delta budget must be a tool error");
+                assert!(format!("{error:?}").contains("BudgetTooSmall"));
+                assert!(
+                    !handler
+                        .context_injected
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "tiny-budget hydration/graph-delta error must defer first-call context"
+                );
+            }
+        }
 
         for context_mode in [None, Some("task")] {
             for budget_key in ["max_output_bytes", "max_output_tokens"] {
