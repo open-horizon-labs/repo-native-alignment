@@ -457,8 +457,13 @@ fn enrich_test_paths(
             && n.language == "rust"
             && n.metadata.get("is_test").map(|v| v.as_str()) == Some("true")
         {
+            let lexical_name = n
+                .metadata
+                .get("lexical_name")
+                .cloned()
+                .unwrap_or_else(|| n.id.name.clone());
             by_name_line
-                .entry((n.id.name.clone(), n.line_start))
+                .entry((lexical_name, n.line_start))
                 .or_default()
                 .push(i);
         }
@@ -543,7 +548,12 @@ fn enrich_test_paths_walk(
                         segments.push(scope.to_string());
                     }
                 }
-                segments.push(nodes[idx].id.name.clone());
+                let lexical_name = nodes[idx]
+                    .metadata
+                    .get("lexical_name")
+                    .cloned()
+                    .unwrap_or_else(|| nodes[idx].id.name.clone());
+                segments.push(lexical_name);
                 nodes[idx]
                     .metadata
                     .insert(TEST_PATH_KEY.to_string(), segments.join("::"));
@@ -1938,6 +1948,33 @@ mod tests {
             test.metadata.get("test_path").map(|s| s.as_str()),
             Some("extract::event_bus::tests::test_depth_first_ordering")
         );
+    }
+
+    #[test]
+    fn test_enrich_test_paths_qualifies_owner_once_for_associated_test() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct Worker;
+
+impl Worker {
+    #[test]
+    fn verifies() {}
+}
+"#;
+        let result = extractor.extract(Path::new("src/worker.rs"), code).unwrap();
+        let test = result
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "Worker.verifies")
+            .expect("associated test should use canonical owner-qualified identity");
+        assert_eq!(
+            test.metadata.get("test_path").map(String::as_str),
+            Some("worker::Worker::verifies")
+        );
+        assert!(!test
+            .metadata
+            .get("test_path")
+            .is_some_and(|path| path.contains("Worker::Worker")));
     }
 
     #[test]

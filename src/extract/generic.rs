@@ -1890,12 +1890,16 @@ fn run_route_queries(
     // Built once before the outer loop so it doesn't scale with O(routes × nodes).
     // Only includes nodes already in `nodes` (tree-sitter extracted Functions) —
     // ApiEndpoint nodes emitted during this pass are not yet present and need not be.
-    let fn_by_line: std::collections::HashMap<usize, (NodeId, Option<String>)> = nodes
+    let fn_by_line: std::collections::HashMap<
+        usize,
+        (NodeId, Option<String>, Option<String>),
+    > = nodes
         .iter()
         .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
         .map(|n| {
             let scope = n.metadata.get("parent_scope").cloned();
-            (n.line_start, (n.id.clone(), scope))
+            let lexical_name = n.metadata.get("lexical_name").cloned();
+            (n.line_start, (n.id.clone(), scope, lexical_name))
         })
         .collect();
 
@@ -1947,9 +1951,10 @@ fn run_route_queries(
             // the handler function name as discriminator so two @Get() in the same
             // file don't collapse into one NodeId.
             let name = if http_path.is_empty() {
-                if let Some((handler_id, scope)) = &handler {
+                if let Some((handler_id, scope, lexical_name)) = &handler {
                     if let Some(s) = scope {
-                        format!("{} {}::{}", method, s, handler_id.name)
+                        let handler_name = lexical_name.as_deref().unwrap_or(&handler_id.name);
+                        format!("{} {}::{}", method, s, handler_name)
                     } else {
                         format!("{} {}", method, handler_id.name)
                     }
@@ -1990,7 +1995,7 @@ fn run_route_queries(
                 kind: NodeKind::ApiEndpoint,
             };
 
-            if let Some((handler_id, _scope)) = handler {
+            if let Some((handler_id, _scope, _lexical_name)) = handler {
                 edges.push(crate::graph::Edge {
                     from: endpoint_node_id.clone(),
                     to: handler_id.clone(),
@@ -5629,6 +5634,16 @@ class ItemsController {
             get_node.is_some(),
             "should have GET endpoint with empty path"
         );
+        let get_node = get_node.unwrap();
+        assert_eq!(
+            get_node.id.name, "GET ItemsController::findAll",
+            "bare route identity must qualify the lexical handler exactly once"
+        );
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Implements
+                && edge.from == get_node.id
+                && edge.to.name == "ItemsController.findAll"
+        }), "bare endpoint must implement the canonical handler: {:?}", result.edges);
 
         // Bare @Post() should have empty http_path
         let post_node = api_nodes.iter().find(|n| {
@@ -5893,6 +5908,17 @@ class ItemsController {
             "two bare @Get() must produce different NodeId names, got {:?} and {:?}",
             api_nodes[0].id.name, api_nodes[1].id.name
         );
+        let names = api_nodes
+            .iter()
+            .map(|node| node.id.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "GET ItemsController::findAll",
+                "GET ItemsController::findOne",
+            ])
+        );
         // Both should have empty http_path in metadata
         for node in &api_nodes {
             assert_eq!(
@@ -5937,6 +5963,21 @@ class PublicController {
             "AdminController::list and PublicController::list must differ: {:?} vs {:?}",
             api_nodes[0].id.name, api_nodes[1].id.name
         );
+        let names = api_nodes
+            .iter()
+            .map(|node| node.id.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "GET AdminController::list",
+                "GET PublicController::list",
+            ])
+        );
+        assert!(api_nodes
+            .iter()
+            .all(|node| !node.id.name.contains("Controller::AdminController")
+                && !node.id.name.contains("Controller::PublicController")));
     }
 
     /// Regression: TypeScript decorators with explicit paths must not be

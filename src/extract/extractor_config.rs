@@ -513,7 +513,11 @@ pub fn extractor_config_pass_with_configs(
                 if !class_sig.contains(&hook.class_contains) {
                     continue;
                 }
-                if hook.method_names.iter().any(|m| m == &node.id.name) {
+                let lexical_name = node
+                    .metadata
+                    .get("lexical_name")
+                    .unwrap_or(&node.id.name);
+                if hook.method_names.iter().any(|m| m == lexical_name) {
                     hook_count += 1;
                     let mut metadata = node.metadata.clone();
                     metadata.insert("framework_hook".to_string(), config.meta.name.clone());
@@ -978,6 +982,61 @@ decorator = true
             result.edges.is_empty(),
             "Language mismatch → no edges (got {:?})",
             result.edges
+        );
+    }
+
+    #[test]
+    fn framework_hooks_match_lexical_name_of_canonical_scoped_method() {
+        let cfg = parse_config(
+            r#"
+[meta]
+name = "sqlalchemy-hooks"
+applies_when = { language = "python", imports_contain = "sqlalchemy" }
+
+[[hooks]]
+class_contains = "TypeDecorator"
+method_names = ["process_bind_param"]
+"#,
+        );
+        let import = make_import("repo", "python", "import sqlalchemy", "import sqlalchemy");
+        let class = Node {
+            id: NodeId {
+                root: "repo".into(),
+                file: PathBuf::from("src/types.py"),
+                name: "SlugType".into(),
+                kind: NodeKind::Struct,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 3,
+            signature: "class SlugType(TypeDecorator):".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut method = make_fn(
+            "repo",
+            "python",
+            "src/types.py",
+            "SlugType.process_bind_param",
+            "def process_bind_param(self, value): return value",
+        );
+        method
+            .metadata
+            .insert("parent_scope".into(), "SlugType".into());
+        method
+            .metadata
+            .insert("lexical_name".into(), "process_bind_param".into());
+
+        let result = extractor_config_pass_with_configs(&[import, class, method], "repo", &[cfg]);
+        let hook = result
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "SlugType.process_bind_param")
+            .expect("canonical scoped hook should be enriched");
+        assert_eq!(
+            hook.metadata.get("framework_hook").map(String::as_str),
+            Some("sqlalchemy-hooks")
         );
     }
 
