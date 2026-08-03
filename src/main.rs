@@ -1985,7 +1985,7 @@ mod tests {
             "--nodes",
             "Request.prepare,Session.prepare_request",
             "--before",
-            "HTTPAdapter.send",
+            "PreparedRequest.prepare_method",
             "--direction",
             "outgoing",
             "--edge-types",
@@ -2021,7 +2021,10 @@ mod tests {
             params.nodes,
             Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
         );
-        assert_eq!(params.before.as_deref(), Some("HTTPAdapter.send"));
+        assert_eq!(
+            params.before.as_deref(),
+            Some("PreparedRequest.prepare_method")
+        );
         assert_eq!(params.direction.as_deref(), Some("outgoing"));
         assert_eq!(params.edge_types, Some(vec!["calls".into()]));
         assert_eq!(params.depth, Some(6));
