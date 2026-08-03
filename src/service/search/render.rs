@@ -265,6 +265,12 @@ fn obligation_terms(obligation: &str) -> Vec<&str> {
     if let Some(term) = obligation.strip_prefix("concept:") {
         return vec![term];
     }
+    if let Some(terms) = obligation.strip_prefix("proof:") {
+        return terms.split('+').filter(|term| !term.is_empty()).collect();
+    }
+    if let Some(terms) = obligation.strip_prefix("state:") {
+        return terms.split('+').filter(|term| !term.is_empty()).collect();
+    }
     obligation
         .strip_prefix("structure:")
         .and_then(|rest| rest.rsplit_once(':').map(|(_, terms)| terms))
@@ -564,7 +570,9 @@ fn refresh_compact_task_obligation_visibility(plan: &mut ProjectionPlan) {
 }
 
 fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
-    let Some(index) = plan.spans.iter().rposition(|span| !span.text.is_empty()) else {
+    let Some(index) = plan.spans.iter().rposition(|span| {
+        !span.text.is_empty() && !span_requires_visible_proof_body(plan, span)
+    }) else {
         return false;
     };
     let span = &plan.spans[index];
@@ -617,6 +625,20 @@ fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
     }
     refresh_compact_task_obligation_visibility(plan);
     true
+}
+
+fn span_requires_visible_proof_body(plan: &ProjectionPlan, span: &ProjectedSpan) -> bool {
+    span.mappings.iter().any(|mapping| {
+        let Some(record) = plan.records.iter().find(|record| {
+            record.selection_rank == mapping.selection_rank
+                && record.identity.node_id == mapping.record_id
+        }) else {
+            return false;
+        };
+        task_obligations_from_reason(&record.selection.reason)
+            .into_iter()
+            .any(|obligation| obligation.starts_with("proof:"))
+    })
 }
 
 fn update_records(

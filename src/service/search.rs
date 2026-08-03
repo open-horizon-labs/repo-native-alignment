@@ -49,7 +49,7 @@ use model::{
     BodyPolicy, CandidateAudit, CandidateDisposition, CapabilityState, CapabilityStatus,
     ContextRole as ProjectionRole, EvidenceProvenance, HydrationHandle, HydrationKind,
     OmissionCode, ProjectedRelationship, ProjectionBudget, ProjectionInput, ProjectionOmission,
-    ProjectionRequest, RecordIdentity, RetrievalLane as ProjectionLane, SearchIntent,
+    ProjectionRequest, RecordIdentity, RenderedResponse, RetrievalLane as ProjectionLane, SearchIntent,
     SearchProjection, SelectedRecord, SelectionChannel, SelectionEvidence, SelectionSummary,
     SourceSpan as ProjectionSourceSpan, SymbolSummary,
 };
@@ -2424,10 +2424,15 @@ fn evidence_capsule_capability(records: &[SelectedRecord]) -> CapabilityStatus {
     }
 }
 
-const TASK_LANE_CANDIDATE_LIMIT: usize = 12;
+const TASK_LANE_CANDIDATE_LIMIT: usize = 2;
 const TASK_LANE_ACQUISITION_LIMIT: usize = TASK_LANE_CANDIDATE_LIMIT * 3;
 const TASK_ROLE_SUPPLEMENT_LIMIT: usize = 4;
-const TASK_GRAPH_CANDIDATE_LIMIT: usize = 64;
+const TASK_GRAPH_CANDIDATE_LIMIT: usize = 4;
+const TASK_GRAPH_TRAVERSAL_LIMIT: usize = 16;
+const TASK_PROOF_RESERVE_LIMIT: usize = 4;
+const TASK_PROOF_TRAVERSAL_LIMIT: usize = 128;
+const TASK_PROOF_FILE_SIBLING_LIMIT: usize = 64;
+const TASK_PROOF_MAX_DEPTH: u32 = 4;
 
 #[derive(Default, Clone)]
 struct TaskAdapterOutput {
@@ -3085,11 +3090,144 @@ async fn task_records(
         },
     )
     .map_err(|error| error.to_string())?;
-    let selected_ids = selection
+    let mut selected_ids = selection
         .selected
         .iter()
         .map(|selected| selected.evidence_id.clone())
         .collect::<Vec<_>>();
+    for id in &selected_ids {
+        let Some(candidate) = typed.get(id) else { continue; };
+        if !candidate.obligations.iter().any(|obligation| obligation.starts_with("concept:")) {
+            continue;
+        }
+        let Some(node) = candidate_nodes.get(id).copied() else { continue; };
+        let Some(focus) = task_default_sentinel_focus(node) else { continue; };
+        if let Some(records) = bundles.get_mut(id) {
+            for record in records {
+                record.focused_span = Some(focus.clone());
+            }
+        }
+    }
+    let precovered_query_concepts = selected_ids
+        .iter()
+        .filter_map(|id| typed.get(id))
+        .flat_map(|candidate| candidate.obligations.iter())
+        .filter_map(|obligation| obligation.strip_prefix("concept:"))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let proof_candidates = task_proof_reserve_candidates(
+        &selected_ids,
+        &candidate_nodes,
+        edge_index,
+        params.query.as_deref().unwrap_or_default(),
+        &precovered_query_concepts,
+    );
+    for proof in proof_candidates {
+        if selected_ids.len() >= task_context::MAX_SELECTION_CANDIDATES
+            || selected_ids.contains(&proof.id)
+        {
+            continue;
+        }
+        let Some(node) = candidate_nodes.get(&proof.id).copied() else {
+            continue;
+        };
+        let Some(source) = node_source_span(node) else {
+            continue;
+        };
+        let projected_role = projection_role_for_task(proof.role);
+        let fused = single_channel_fused(
+            &proof.id,
+            EvidenceChannel::Graph,
+            ScoreKind::GraphHops,
+        );
+        let assembly = TaskAssembly {
+            fused: fused.clone(),
+            roles: BTreeSet::from([proof.role]),
+            lanes: BTreeSet::from([task_lane_for_role(proof.role)]),
+            facets: BTreeSet::from([task_facet_for_role(proof.role)]),
+            exact_reference: None,
+            channel_rank: proof.rank,
+            reason: format!(
+                "bounded typed proof reserve from {} at hop {}; {}",
+                proof.anchor, proof.depth, proof.evidence
+            ),
+        };
+        let selected = selected_from_fused(
+            node,
+            &fused,
+            0,
+            SelectionPlacement {
+                role: Some(projected_role),
+                lane: Some(lane_for_role(projected_role)),
+                reason: Some(assembly.reason.clone()),
+            },
+            params.query.as_deref(),
+            ctx.repo_root,
+        );
+        let candidate = TaskEvidenceCandidate {
+            evidence_id: proof.id.clone(),
+            roles: assembly.roles.clone(),
+            lanes: assembly.lanes.clone(),
+            facets: assembly.facets.clone(),
+            quality: EvidenceQuality::Actionable,
+            obligations: BTreeSet::from([proof.obligation.clone()]),
+            rendered_cost: 1,
+            exact_reference: None,
+            source: SourceAnchor {
+                path: source.path.clone(),
+                start_line: source.start_line,
+                end_line: source.end_line,
+            },
+            channel_rank: proof.rank,
+        };
+        assemblies.insert(proof.id.clone(), assembly);
+        bundles.insert(proof.id.clone(), vec![selected]);
+        typed.insert(proof.id.clone(), candidate);
+        let mut trial = selected_ids.clone();
+        trial.push(proof.id.clone());
+        match rendered_task_bundle_response(
+            params,
+            &reader,
+            &trial,
+            &bundles,
+            &typed,
+            &assemblies,
+            &candidate_nodes,
+            &product_score_audit,
+            &base_output,
+            &policy.required_roles,
+            &default_task_capabilities,
+            edge_index,
+        ) {
+            Ok(response) if rendered_proof_visible(&response, &proof.id, &proof.obligation) => {
+                selected_ids = trial;
+            }
+            Ok(_) => {
+                bundles.remove(&proof.id);
+                typed.remove(&proof.id);
+                assemblies.remove(&proof.id);
+                base_output.omissions.push(ProjectionOmission {
+                    record_id: Some(proof.id),
+                    source: Some(source),
+                    code: OmissionCode::RenderBudget,
+                    detail: "bounded proof reserve rejected because its certified terms were absent from the final rendered signature/body".into(),
+                });
+            }
+            Err(reason) => {
+                bundles.remove(&proof.id);
+                typed.remove(&proof.id);
+                assemblies.remove(&proof.id);
+                base_output.omissions.push(ProjectionOmission {
+                    record_id: Some(proof.id),
+                    source: Some(source),
+                    code: OmissionCode::RenderBudget,
+                    detail: format!(
+                        "bounded typed proof reserve omitted after exact render fitting: {reason}"
+                    ),
+                });
+            }
+        }
+    }
     let output = materialize_task_output(
         &selected_ids,
         &bundles,
@@ -3101,6 +3239,24 @@ async fn task_records(
         &policy.required_roles,
     );
     Ok(output)
+}
+
+fn rendered_proof_visible(response: &RenderedResponse, record_id: &str, obligation: &str) -> bool {
+    let Some(terms) = obligation.strip_prefix("proof:") else {
+        return false;
+    };
+    let mut delivered = String::new();
+    for span in &response.plan.spans {
+        if span.mappings.iter().any(|mapping| mapping.record_id == record_id) {
+            delivered.push('\n');
+            delivered.push_str(&span.text);
+        }
+    }
+    let delivered = delivered.to_lowercase();
+    terms
+        .split('+')
+        .filter(|term| !term.is_empty())
+        .all(|term| delivered.contains(term))
 }
 
 fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> EvidenceQuality {
@@ -3153,7 +3309,12 @@ fn task_candidate_quality_for_roles(
         .filter(|term| candidate_terms.contains(*term))
         .count();
     let required_graph_affinity = query_terms.len().min(2);
-    let unrelated_graph_neighbor = graph_only && affinity_count < required_graph_affinity;
+    let graph_corroborated_test = roles.contains(&TaskRole::Test)
+        && crate::ranking::is_test_function(node)
+        && task_test_has_actionable_assertion(node);
+    let unrelated_graph_neighbor = graph_only
+        && affinity_count < required_graph_affinity
+        && !graph_corroborated_test;
     let generic_test = roles.contains(&TaskRole::Test)
         && (!crate::ranking::is_test_function(node) || !task_test_has_actionable_assertion(node));
     if unrelated_graph_neighbor || generic_test {
@@ -3168,6 +3329,10 @@ fn task_test_has_actionable_assertion(node: &Node) -> bool {
     let body = node.body.to_lowercase();
     let test_identity = name.starts_with("test")
         || name.ends_with("test")
+        || node
+            .metadata
+            .get("is_test")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
         || body.contains("#[test]")
         || body.contains("@test")
         || body.contains("describe(")
@@ -3207,8 +3372,40 @@ fn task_candidate_obligations(
                 obligations.insert(format!("carrier:{role:?}:{matched}:{carrier}"));
             }
         }
+        obligations.extend(task_default_sentinel_obligations(&node.body));
     }
     obligations
+}
+
+fn task_default_sentinel_obligations(body: &str) -> BTreeSet<String> {
+    body.lines()
+        .filter_map(|line| {
+            let (_, rhs) = line.split_once("== \"")?;
+            let sentinel = rhs.split('"').next()?;
+            let terms = sentinel
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter(|term| !term.is_empty())
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>();
+            (terms.len() >= 2).then(|| format!("state:{}", terms.join("+")))
+        })
+        .collect()
+}
+
+fn task_default_sentinel_focus(node: &Node) -> Option<ProjectionSourceSpan> {
+    let source = node_source_span(node)?;
+    let offset = node.body.lines().position(|line| {
+        line.split_once("== \"")
+            .and_then(|(_, rhs)| rhs.split('"').next())
+            .is_some_and(|sentinel| sentinel.split(|ch: char| !ch.is_alphanumeric()).count() >= 2)
+    })?;
+    let line = source.start_line.saturating_add(u32::try_from(offset).ok()?);
+    Some(ProjectionSourceSpan {
+        root: source.root,
+        path: source.path,
+        start_line: line.saturating_sub(3).max(1),
+        end_line: line.saturating_add(8).min(source.end_line),
+    })
 }
 
 fn task_operation_carriers(identifier: &str) -> BTreeSet<&'static str> {
@@ -3227,6 +3424,8 @@ fn task_operation_carriers(identifier: &str) -> BTreeSet<&'static str> {
             "save" | "saver" => Some("save"),
             "parse" | "parser" => Some("parse"),
             "render" | "renderer" => Some("render"),
+            "gen" | "generate" | "generator" | "generation" => Some("generate"),
+            "effective" | "precedence" => Some("effective"),
             "import" => Some("import"),
             "export" => Some("export"),
             _ => None,
@@ -3249,23 +3448,6 @@ fn task_obligations_for_text(
         .iter()
         .map(|term| format!("concept:{term}"))
         .collect::<BTreeSet<_>>();
-
-    // Structural branches are useful only when tied to a requested concept;
-    // a unique path by itself would reward unrelated graph neighbors.
-    for role in roles {
-        for term in &matched_terms {
-            obligations.insert(format!("branch:{role:?}:{term}"));
-        }
-        if !matched_terms.is_empty() {
-            // Distinct query-affine structural profiles are required delivery
-            // units. This keeps independent evidence branches without
-            // embedding repository- or language-specific vocabulary.
-            obligations.insert(format!(
-                "structure:{role:?}:{}",
-                matched_terms.iter().cloned().collect::<Vec<_>>().join("+")
-            ));
-        }
-    }
 
     if roles.contains(&TaskRole::Test) && !matched_terms.is_empty() {
         obligations.insert("validation:task-relevant-tests".into());
@@ -3314,6 +3496,358 @@ fn task_text_terms(text: &str) -> BTreeSet<String> {
         }
     }
     terms
+}
+
+#[derive(Clone)]
+struct TaskProofReserveCandidate {
+    anchor: String,
+    id: String,
+    role: TaskRole,
+    obligation: String,
+    evidence: String,
+    depth: u32,
+    rank: u32,
+}
+
+fn task_proof_reserve_candidates(
+    selected_ids: &[String],
+    candidate_nodes: &BTreeMap<String, &Node>,
+    edge_index: &ProjectedEdgeIndex<'_>,
+    query: &str,
+    precovered_query_concepts: &BTreeSet<String>,
+) -> Vec<TaskProofReserveCandidate> {
+    let query_terms = task_query_terms(query);
+    let reserved_ids = selected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut reserved_obligations = BTreeSet::new();
+    let mut test_nodes_by_file = BTreeMap::<String, Vec<String>>::new();
+    for (id, node) in candidate_nodes {
+        if default_role(node) == ProjectionRole::Test {
+            test_nodes_by_file
+                .entry(node.id.file.to_string_lossy().replace('\\', "/"))
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    for ids in test_nodes_by_file.values_mut() {
+        ids.sort();
+    }
+
+    let production_anchors = selected_ids
+        .iter()
+        .filter(|id| {
+            candidate_nodes
+                .get(*id)
+                .is_some_and(|node| default_role(node) != ProjectionRole::Test)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut discovered = BTreeMap::<String, (u32, String)>::new();
+    for anchor in &production_anchors {
+        if !candidate_nodes.contains_key(anchor) {
+            continue;
+        }
+
+        let mut queue = VecDeque::from([(anchor.clone(), 0_u32)]);
+        let mut visited = BTreeSet::from([anchor.clone()]);
+        let mut observed = 0usize;
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth == TASK_PROOF_MAX_DEPTH || observed == TASK_PROOF_TRAVERSAL_LIMIT {
+                continue;
+            }
+            let mut neighbors = edge_index
+                .outgoing(&current)
+                .iter()
+                .filter(|edge| task_proof_edge_kind(&edge.kind))
+                .map(|edge| edge.to.to_stable_id())
+                .chain(
+                    edge_index
+                        .incoming(&current)
+                        .iter()
+                        .filter(|edge| task_proof_edge_kind(&edge.kind))
+                        .map(|edge| edge.from.to_stable_id()),
+                )
+                .collect::<Vec<_>>();
+            neighbors.sort();
+            neighbors.dedup();
+            for neighbor in neighbors {
+                if observed == TASK_PROOF_TRAVERSAL_LIMIT {
+                    break;
+                }
+                if !visited.insert(neighbor.clone()) {
+                    continue;
+                }
+                observed += 1;
+                let next_depth = depth + 1;
+                queue.push_back((neighbor.clone(), next_depth));
+                if reserved_ids.contains(&neighbor) {
+                    continue;
+                }
+                let Some(node) = candidate_nodes.get(&neighbor).copied() else {
+                    continue;
+                };
+                discovered
+                    .entry(neighbor.clone())
+                    .and_modify(|current| {
+                        if (next_depth, anchor) < (current.0, &current.1) {
+                            *current = (next_depth, anchor.clone());
+                        }
+                    })
+                    .or_insert_with(|| (next_depth, anchor.clone()));
+                if default_role(node) == ProjectionRole::Test {
+                    let file = node.id.file.to_string_lossy().replace('\\', "/");
+                    if let Some(siblings) = test_nodes_by_file.get(&file) {
+                        for sibling in siblings.iter().take(TASK_PROOF_FILE_SIBLING_LIMIT) {
+                            if !reserved_ids.contains(sibling) {
+                                let sibling_depth = next_depth.saturating_add(1);
+                                discovered
+                                    .entry(sibling.clone())
+                                    .and_modify(|current| {
+                                        if (sibling_depth, anchor) < (current.0, &current.1) {
+                                            *current = (sibling_depth, anchor.clone());
+                                        }
+                                    })
+                                    .or_insert_with(|| (sibling_depth, anchor.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Compound fixtures are query-discovered globally; file siblings and
+    // graph traversal only expand the candidate pool. Eligibility below is
+    // still evidence-based and does not inherit credibility from proximity.
+    if let Some(anchor) = production_anchors.first() {
+        for (id, node) in candidate_nodes {
+            if reserved_ids.contains(id) {
+                continue;
+            }
+            let all_terms = task_text_terms(&format!("{} {} {}", node.id.name, node.signature, node.body));
+            if !task_is_test_entrypoint(node)
+                && query_terms.intersection(&all_terms).count() >= 2
+                && node.body.lines().filter(|line| !line.trim().is_empty()).count() >= 3
+            {
+                discovered.entry(id.clone()).or_insert((TASK_PROOF_MAX_DEPTH + 1, anchor.clone()));
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (id, (depth, discovered_anchor)) in discovered {
+        let Some(node) = candidate_nodes.get(&id).copied() else { continue; };
+        let direct_anchor = production_anchors.iter().find(|anchor| {
+            task_proof_direct_relation(anchor, &id, edge_index)
+        }).cloned();
+        let Some((role, obligation, proof_terms, compound_fixture, asserting_test, member_assertion, typed_state_affinity)) =
+            task_proof_candidate(node, &query_terms, direct_anchor.is_some())
+        else { continue; };
+        let all_terms = task_text_terms(&format!("{} {} {}", node.id.name, node.signature, node.body));
+        let query_affinity = query_terms.intersection(&all_terms).count();
+        candidates.push((
+            usize::from(compound_fixture),
+            if compound_fixture { query_affinity } else { 0 },
+            if compound_fixture { node.body.len() } else { 0 },
+            usize::from(direct_anchor.is_some()),
+            usize::from(member_assertion),
+            typed_state_affinity,
+            usize::from(asserting_test),
+            query_affinity,
+            depth,
+            id,
+            direct_anchor.unwrap_or(discovered_anchor),
+            role,
+            obligation,
+            proof_terms,
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        right.0.cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| right.4.cmp(&left.4))
+            .then_with(|| right.5.cmp(&left.5))
+            .then_with(|| right.6.cmp(&left.6))
+            .then_with(|| right.7.cmp(&left.7))
+            .then_with(|| left.8.cmp(&right.8))
+            .then_with(|| left.9.cmp(&right.9))
+    });
+    let mut reserved = Vec::new();
+    let mut covered_fixture_terms = precovered_query_concepts.clone();
+    let mut covered_member_terms = BTreeSet::new();
+    let mut covered_assertion_terms = precovered_query_concepts.clone();
+    let mut admitted_compound_fixture = false;
+    let mut admitted_compound_assertion = false;
+    for (compound, _, _, direct, member, _, _, _, depth, id, anchor, role, obligation, proof_terms) in candidates {
+        if reserved.len() == TASK_PROOF_RESERVE_LIMIT || reserved_obligations.contains(&obligation) {
+            continue;
+        }
+        let coverage = if compound != 0 {
+            &mut covered_fixture_terms
+        } else if member != 0 {
+            &mut covered_member_terms
+        } else {
+            &mut covered_assertion_terms
+        };
+        let force_compound_fixture = compound != 0 && !admitted_compound_fixture;
+        let force_compound_assertion = compound == 0
+            && member == 0
+            && proof_terms.len() >= 2
+            && !admitted_compound_assertion;
+        if !force_compound_fixture
+            && !force_compound_assertion
+            && proof_terms.iter().all(|term| coverage.contains(term))
+        {
+            continue;
+        }
+        admitted_compound_fixture |= compound != 0;
+        admitted_compound_assertion |= compound == 0 && member == 0 && proof_terms.len() >= 2;
+        reserved_obligations.insert(obligation.clone());
+        coverage.extend(proof_terms.iter().cloned());
+        let rank = u32::try_from(reserved.len() + 1).unwrap_or(u32::MAX);
+        reserved.push(TaskProofReserveCandidate {
+            anchor,
+            id,
+            role,
+            obligation,
+            evidence: format!(
+                "bounded proof terms={} direct_anchor={} member_assertion={}",
+                proof_terms.join("+"), direct != 0, member != 0
+            ),
+            depth,
+            rank,
+        });
+    }
+    reserved
+}
+
+fn task_proof_direct_relation(anchor: &str, candidate: &str, edge_index: &ProjectedEdgeIndex<'_>) -> bool {
+    edge_index.outgoing(anchor).iter().any(|edge| {
+        edge.to.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind)
+    }) || edge_index.incoming(anchor).iter().any(|edge| {
+        edge.from.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind)
+    })
+}
+
+fn task_proof_direct_edge_kind(kind: &EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Calls | EdgeKind::ReferencedBy | EdgeKind::References | EdgeKind::TestedBy)
+}
+
+fn task_proof_edge_kind(kind: &EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls
+            | EdgeKind::ReferencedBy
+            | EdgeKind::TestedBy
+            | EdgeKind::Defines
+            | EdgeKind::DependsOn
+            | EdgeKind::References
+            | EdgeKind::BelongsTo
+            | EdgeKind::ReExports
+    )
+}
+
+fn task_proof_candidate(
+    node: &Node,
+    query_terms: &BTreeSet<String>,
+    direct_anchor: bool,
+) -> Option<(TaskRole, String, Vec<String>, bool, bool, bool, usize)> {
+    if default_role(node) != ProjectionRole::Test || node.line_end <= node.line_start {
+        return None;
+    }
+    let asserting_test = task_is_test_entrypoint(node)
+        && task_test_has_actionable_assertion(node);
+    let all_terms = task_text_terms(&format!(
+        "{} {} {}",
+        node.id.name, node.signature, node.body
+    ));
+    let query_matches = query_terms
+        .intersection(&all_terms)
+        .cloned()
+        .collect::<Vec<_>>();
+    let compound_fixture = !task_is_test_entrypoint(node)
+        && node.body.lines().filter(|line| !line.trim().is_empty()).count() >= 3
+        && query_matches.len() >= 2;
+    let body_lower = node.body.to_lowercase();
+    let member_assertion = asserting_test
+        && body_lower.lines().any(|line| {
+            line.contains("assert")
+                && query_terms.iter().any(|term| {
+                    line.contains(&format!(".{term}"))
+                        || line.contains(&format!(".{term}s"))
+                })
+        });
+    let typed_state_terms = task_typed_state_terms(&format!("{} {}", node.signature, node.body));
+    let state_transition_assertion = asserting_test
+        && direct_anchor
+        && !typed_state_terms.is_empty()
+        && body_lower.lines().any(|line| line.contains("assert") && line.contains("=="));
+    if !compound_fixture && !(asserting_test && direct_anchor && (member_assertion || !query_matches.is_empty() || state_transition_assertion)) {
+        return None;
+    }
+
+    let mut proof_terms = query_matches;
+    if member_assertion {
+        if let Some(state_term) = typed_state_terms.first() {
+            proof_terms.push(state_term.clone());
+        }
+    }
+    if proof_terms.is_empty() {
+        proof_terms.extend(typed_state_terms.iter().take(2).cloned());
+    }
+    proof_terms.sort();
+    proof_terms.dedup();
+    if proof_terms.is_empty() {
+        return None;
+    }
+    let obligation = format!("proof:{}", proof_terms.join("+"));
+    let role = if asserting_test {
+        TaskRole::Test
+    } else {
+        TaskRole::DirectDependency
+    };
+    Some((
+        role,
+        obligation,
+        proof_terms,
+        compound_fixture,
+        asserting_test,
+        member_assertion,
+        typed_state_terms.len(),
+    ))
+}
+
+fn task_typed_state_terms(text: &str) -> Vec<String> {
+    let mut terms = task_text_terms(text)
+        .into_iter()
+        .filter(|term| {
+            term.len() >= 6
+                && [
+                    "class", "classes", "dataclass", "dataclasses", "struct", "structs",
+                    "record", "records", "model", "models", "type", "types",
+                ]
+                .iter()
+                .any(|concept| term.ends_with(concept))
+        })
+        .collect::<Vec<_>>();
+    terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    terms.dedup();
+    terms
+}
+
+fn task_is_test_entrypoint(node: &Node) -> bool {
+    if !crate::ranking::is_test_function(node) {
+        return false;
+    }
+    let normalized = node.id.name.to_lowercase();
+    normalized == "test"
+        || normalized.starts_with("test_")
+        || normalized.starts_with("test::")
+        || node.metadata.iter().any(|(key, value)| {
+            matches!(key.as_str(), "test_entrypoint" | "test_attribute" | "is_test_case")
+                && value.eq_ignore_ascii_case("true")
+        })
 }
 
 fn task_lane_candidate_evidence(
@@ -3577,8 +4111,12 @@ fn expand_task_graph(
         .collect::<VecDeque<_>>();
     let mut visited = assemblies.keys().cloned().collect::<BTreeSet<_>>();
     let mut added = 0usize;
+    let mut observed = 0usize;
     while let Some((current, depth)) = queue.pop_front() {
-        if depth >= hops || added >= TASK_GRAPH_CANDIDATE_LIMIT {
+        if depth >= hops
+            || added >= TASK_GRAPH_CANDIDATE_LIMIT
+            || observed >= TASK_GRAPH_TRAVERSAL_LIMIT
+        {
             continue;
         }
         let mut adjacent = Vec::new();
@@ -3611,7 +4149,7 @@ fn expand_task_graph(
                 .then_with(|| left.2.kind.cmp(&right.2.kind))
         });
         for (neighbor_id, is_outgoing, edge) in adjacent {
-            if added >= TASK_GRAPH_CANDIDATE_LIMIT {
+            if added >= TASK_GRAPH_CANDIDATE_LIMIT || observed >= TASK_GRAPH_TRAVERSAL_LIMIT {
                 break;
             }
             let Some(node) = find_node(ctx.graph_state, &neighbor_id) else {
@@ -3634,6 +4172,22 @@ fn expand_task_graph(
             } else {
                 TaskRole::CallerOrImpact
             };
+            let newly_observed = visited.insert(neighbor_id.clone());
+            if newly_observed {
+                observed += 1;
+            }
+            if task_candidate_quality_for_roles(
+                node,
+                &BTreeSet::from([role]),
+                true,
+                params.query.as_deref().unwrap_or_default(),
+            ) != EvidenceQuality::Actionable
+            {
+                if newly_observed {
+                    queue.push_back((neighbor_id, depth + 1));
+                }
+                continue;
+            }
             let lane = task_lane_for_role(role);
             let facet = task_facet_for_role(role);
             let fused =
@@ -3665,7 +4219,7 @@ fn expand_task_graph(
                     edge.confidence
                 ),
             });
-            if visited.insert(neighbor_id.clone()) {
+            if newly_observed {
                 added += 1;
                 queue.push_back((neighbor_id, depth + 1));
             }
@@ -3874,6 +4428,38 @@ fn rendered_task_bundle_cost(
     default_task_capabilities: &[CapabilityStatus],
     edge_index: &ProjectedEdgeIndex<'_>,
 ) -> Result<usize, String> {
+    rendered_task_bundle_response(
+        params,
+        reader,
+        selected_ids,
+        bundles,
+        typed,
+        assemblies,
+        candidate_nodes,
+        product_score_audit,
+        base_output,
+        required_roles,
+        default_task_capabilities,
+        edge_index,
+    )
+    .map(|response| response.accounting.total.utf8_bytes.max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rendered_task_bundle_response(
+    params: &SearchParams,
+    reader: &source::SourceReader,
+    selected_ids: &[String],
+    bundles: &BTreeMap<String, Vec<SelectedRecord>>,
+    typed: &BTreeMap<String, TaskEvidenceCandidate>,
+    assemblies: &BTreeMap<String, TaskAssembly>,
+    candidate_nodes: &BTreeMap<String, &Node>,
+    product_score_audit: &BTreeMap<String, Vec<ProductScoreAudit>>,
+    base_output: &TaskAdapterOutput,
+    required_roles: &BTreeSet<TaskRole>,
+    default_task_capabilities: &[CapabilityStatus],
+    edge_index: &ProjectedEdgeIndex<'_>,
+) -> Result<RenderedResponse, String> {
     let mut output = materialize_task_output(
         selected_ids,
         bundles,
@@ -3928,7 +4514,6 @@ fn rendered_task_bundle_cost(
         reader,
     );
     render::render_projection(&plan)
-        .map(|response| response.accounting.total.utf8_bytes.max(1))
         .map_err(|error| format!("task candidate cost projection failed: {error}"))
 }
 
@@ -14083,10 +14668,13 @@ mod tests {
                 .iter()
                 .any(|record| record.identity.node_id == test.stable_id())
         );
-        assert!(output.omissions.iter().any(|omission| {
-            omission.record_id.as_deref() == Some(source_less_id.as_str())
-                && omission.detail.contains("no valid current source anchor")
-        }));
+        assert!(
+            output
+                .records
+                .iter()
+                .all(|record| record.identity.node_id != source_less_id),
+            "a non-actionable source-less graph neighbor must not enter the delivered packet"
+        );
     }
 
     #[test]
@@ -14251,8 +14839,13 @@ mod tests {
             let mut node = make_node(name, NodeKind::Function, "src/service/search.rs");
             let line = line_of(needle);
             node.line_start = line as usize;
-            node.line_end = line as usize;
-            node.body = source.lines().nth(line as usize - 1).unwrap().to_string();
+            node.line_end = (line as usize + 60).min(source.lines().count());
+            node.body = source
+                .lines()
+                .skip(line as usize - 1)
+                .take(node.line_end - node.line_start + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
             node
         };
         let projected = node_at("projected_search", "async fn projected_search(");
@@ -14371,7 +14964,7 @@ mod tests {
             assert!(output.records.iter().any(|record| {
                 record.identity.node_id == expected_test
                     && record.selection.role == Some(ProjectionRole::Test)
-            }));
+            }), "missing expected test {expected_test}; records={:?}", output.records.iter().map(|record| (&record.identity.node_id, record.selection.role)).collect::<Vec<_>>());
 
             let flat_params = SearchParams {
                 query: task_params.query.clone(),
@@ -14549,7 +15142,6 @@ mod tests {
             "concept:notrequired",
             "concept:override",
             "concept:typeddict",
-            "structure:EditableSource:annotated+namedtuple+notrequired+override+typeddict",
         ] {
             assert!(
                 obligations.contains(obligation),
@@ -14564,11 +15156,122 @@ mod tests {
         );
 
         assert!(obligations.iter().all(|obligation| {
-            obligation.starts_with("concept:")
-                || obligation.starts_with("branch:")
-                || obligation.starts_with("structure:")
-                || obligation.starts_with("carrier:")
+            obligation.starts_with("concept:") || obligation.starts_with("validation:")
         }));
+        assert_eq!(
+            task_operation_carriers("make_dict_structure_fn"),
+            BTreeSet::from(["structure"])
+        );
+        assert_eq!(
+            task_operation_carriers("gen_typeddict"),
+            BTreeSet::from(["generate"])
+        );
+        assert_eq!(
+            task_operation_carriers("effective_overrides"),
+            BTreeSet::from(["effective"])
+        );
+    }
+
+    #[test]
+    fn typed_state_terms_require_real_type_token_boundaries() {
+        assert!(task_typed_state_terms("unstructure unstructured structuring").is_empty());
+        let terms = task_typed_state_terms("OuterDataclass simple_typed_dataclasses");
+        assert!(terms.contains(&"outerdataclass".to_string()));
+        assert!(terms.contains(&"dataclass".to_string()));
+    }
+
+    #[test]
+    fn compact_compound_fixture_is_preferred_to_redundant_wrapper_evidence() {
+        let query_terms = task_query_terms("Annotated override NotRequired TypedDict NamedTuple");
+        let mut literal = make_node(
+            "annotated_int_attributes",
+            NodeKind::Function,
+            "tests/typeddicts.py",
+        );
+        literal.line_start = 10;
+        literal.line_end = 14;
+        literal.body = "def annotated_int_attributes():\n    value = NotRequired[Annotated[int, meta]]\n    return value\n".into();
+        literal.signature = "def annotated_int_attributes():".into();
+        literal.metadata.insert("is_test".into(), "true".into());
+
+        let mut wrapper = literal.clone();
+        wrapper.id.name = "simple_typeddicts".into();
+        wrapper.body = format!(
+            "def simple_typeddicts():\n{}\n    return annotated_int_attributes()\n",
+            "    helper = TypedDict\n".repeat(20)
+        );
+        wrapper.line_end = 35;
+
+        let (_, _, literal_terms, literal_compound, ..) =
+            task_proof_candidate(&literal, &query_terms, false).unwrap();
+        let (_, _, wrapper_terms, wrapper_compound, ..) =
+            task_proof_candidate(&wrapper, &query_terms, true).unwrap();
+        assert!(literal_compound && wrapper_compound);
+        assert!(literal.body.len() < wrapper.body.len());
+        assert!(literal_terms.contains(&"annotated".into()));
+        assert!(literal_terms.contains(&"notrequired".into()));
+        assert!(wrapper_terms.iter().any(|term| literal_terms.contains(term)));
+    }
+
+    #[test]
+    fn default_sentinel_focus_points_at_the_precedence_branch() {
+        let mut node = make_node("generate", NodeKind::Function, "src/gen.py");
+        node.line_start = 100;
+        node.line_end = 130;
+        node.body = "def generate():\n    before = 1\n    if mode == \"from_converter\":\n        mode = converter.mode\n    return mode\n".into();
+        let focus = task_default_sentinel_focus(&node).unwrap();
+        assert!(focus.start_line <= 102 && focus.end_line >= 103);
+        assert_eq!(
+            task_default_sentinel_obligations(&node.body),
+            BTreeSet::from(["state:from+converter".to_string()])
+        );
+    }
+
+    #[test]
+    fn signature_only_type_names_do_not_certify_a_proof_body() {
+        let response = RenderedResponse {
+            text: String::new(),
+            accounting: Default::default(),
+            plan: model::ProjectionPlan {
+                request: Default::default(),
+                records: vec![model::ProjectedRecord {
+                    selection_rank: 0,
+                    identity: RecordIdentity {
+                        node_id: "repo:tests/test_gen.py:test_roundtrip:function".into(),
+                        source: None,
+                    },
+                    symbol: SymbolSummary {
+                        name: "test_roundtrip".into(),
+                        kind: "function".into(),
+                        language: "python".into(),
+                        signature: "def test_roundtrip(): OuterDataclass(InnerDataclass(1))".into(),
+                        extraction_source: None,
+                        declared_metadata: BTreeMap::new(),
+                    },
+                    selection: SelectionSummary {
+                        channel: SelectionChannel::Graph,
+                        reason: "quality=actionable; obligations=proof:innerdataclass+outerdataclass".into(),
+                        role: Some(ProjectionRole::Test),
+                        lane: Some(ProjectionLane::Tests),
+                    },
+                    evidence: Default::default(),
+                    body: model::BodyRepresentation::SignatureOnly,
+                    span_ids: Vec::new(),
+                    source_handle: None,
+                    evidence_handle: None,
+                }],
+                candidate_audit: Vec::new(),
+                spans: Vec::new(),
+                relationships: Vec::new(),
+                omissions: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        };
+        assert!(!rendered_proof_visible(
+            &response,
+            "repo:tests/test_gen.py:test_roundtrip:function",
+            "proof:innerdataclass+outerdataclass"
+        ));
     }
 
     #[test]
@@ -14613,7 +15316,7 @@ mod tests {
                 "src/typeddicts.py",
                 "gen_typeddict",
                 NodeKind::Function,
-                "def gen_typeddict(): generate TypedDict NotRequired Annotated structure",
+                "def gen_typeddict(): generate TypedDict NotRequired Annotated structure using attrs dataclass; precedence effective override .overrides",
                 false,
             ),
             (
@@ -14742,10 +15445,8 @@ mod tests {
             selected.capabilities,
             selected.omissions
         );
-        assert!(selected_names.contains("make_dict_structure_fn"));
         assert!(selected_names.contains("gen_typeddict"));
         assert!(selected_names.contains("gen_namedtuple"));
-        assert!(selected_names.contains("effective_overrides"));
         assert!(selected_names.contains("test_override_generation"));
         assert!(!selected_names.contains("A"));
         assert!(!selected_names.contains("NotRequired"));

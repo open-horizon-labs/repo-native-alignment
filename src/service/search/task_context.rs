@@ -768,7 +768,7 @@ impl Default for SelectionPolicy {
             per_record_limit: 16 * 1024,
             candidate_limit: MAX_SELECTION_CANDIDATES,
             per_file_limit: 4,
-            state_limit: 1_024,
+            state_limit: HARD_MAX_SELECTION_STATES,
             required_roles: BTreeSet::from([
                 ContextRole::EditableSource,
                 ContextRole::DefinitionOrApiState,
