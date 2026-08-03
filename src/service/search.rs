@@ -4199,11 +4199,13 @@ fn task_proof_edge_kind(kind: &EdgeKind) -> bool {
     )
 }
 
+type TaskProofCandidate = (TaskRole, String, Vec<String>, bool, bool, bool, usize);
+
 fn task_proof_candidate(
     node: &Node,
     query_terms: &BTreeSet<String>,
     direct_anchor: bool,
-) -> Option<(TaskRole, String, Vec<String>, bool, bool, bool, usize)> {
+) -> Option<TaskProofCandidate> {
     if default_role(node) != ProjectionRole::Test || node.line_end <= node.line_start {
         return None;
     }
@@ -4239,10 +4241,10 @@ fn task_proof_candidate(
     }
 
     let mut proof_terms = query_matches;
-    if member_assertion {
-        if let Some(state_term) = typed_state_terms.first() {
-            proof_terms.push(state_term.clone());
-        }
+    if member_assertion
+        && let Some(state_term) = typed_state_terms.first()
+    {
+        proof_terms.push(state_term.clone());
     }
     if proof_terms.is_empty() {
         proof_terms.extend(typed_state_terms.iter().take(2).cloned());

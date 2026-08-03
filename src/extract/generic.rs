@@ -2421,7 +2421,7 @@ fn detect_same_file_calls(
         fn_by_line.insert(function.line_start, (function.id.clone(), scope));
     }
     for candidates in file_fns.values_mut() {
-        candidates.sort_by(|left, right| left.0.to_stable_id().cmp(&right.0.to_stable_id()));
+        candidates.sort_by_key(|candidate| candidate.0.to_stable_id());
     }
 
     if file_fns.is_empty() {
