@@ -169,8 +169,16 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if is_call_stopword(binding.imported_symbol.as_str()) {
                 continue;
             }
-            // Skip if caller name == imported name (self-call / wrapper pattern).
-            if node.id.name == binding.local_name {
+            // Skip when the binding is shadowed by this function's own lexical
+            // declaration. Scoped identities (`C.run`) retain `run` in
+            // metadata, so comparing only the canonical ID would mistake the
+            // declaration itself for an imported call.
+            let caller_lexical_name = node
+                .metadata
+                .get("lexical_name")
+                .map(String::as_str)
+                .unwrap_or(node.id.name.as_str());
+            if caller_lexical_name == binding.local_name {
                 continue;
             }
             // Check if the imported name appears as a call site (`name(`).
@@ -890,7 +898,22 @@ fn extract_call_sites_with_allowed_stopwords<'a>(
                 // Byte slice is ASCII because the walk only accepted ASCII
                 // identifier bytes; conversion is infallible in practice.
                 let ident = std::str::from_utf8(&bytes[j..end]).unwrap_or("");
+                let mut previous_end = j;
+                while previous_end > 0 && bytes[previous_end - 1].is_ascii_whitespace() {
+                    previous_end -= 1;
+                }
+                let mut previous_start = previous_end;
+                while previous_start > 0
+                    && (bytes[previous_start - 1].is_ascii_alphanumeric()
+                        || bytes[previous_start - 1] == b'_')
+                {
+                    previous_start -= 1;
+                }
+                let previous_word =
+                    std::str::from_utf8(&bytes[previous_start..previous_end]).unwrap_or("");
+                let is_declaration = matches!(previous_word, "def" | "fn" | "function");
                 if !ident.is_empty()
+                    && !is_declaration
                     && (!is_call_stopword(ident) || allowed_stopwords.contains(ident))
                 {
                     let prev = if j > 0 { bytes[j - 1] } else { 0 };
@@ -1565,6 +1588,99 @@ mod tests {
         assert!(edges.iter().all(|edge| {
             edge.kind != EdgeKind::Calls || edge.from != caller.id
         }), "non-call alias occurrences must not become Calls evidence: {edges:?}");
+    }
+
+    #[test]
+    fn imported_alias_matching_scoped_method_declaration_emits_no_call() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute as run\n\nclass C:\n    def run(self):\n        return 1\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "def execute():\n    return 1\n",
+        ));
+        let scoped = nodes.iter().find(|node| node.id.name == "C.run").unwrap();
+        let edges = import_calls_pass(&nodes);
+
+        assert!(edges.iter().all(|edge| {
+            edge.kind != EdgeKind::Calls || edge.from != scoped.id
+        }), "a scoped method declaration must not call its same-named import alias: {edges:?}");
+    }
+
+    #[test]
+    fn es_and_rust_scoped_alias_declarations_emit_no_call() {
+        for (language, caller_file, callee_file, import_text, declaration) in [
+            (
+                "typescript",
+                "caller.ts",
+                "worker.ts",
+                "import { execute as run } from './worker'",
+                "run() { return 1; }",
+            ),
+            (
+                "rust",
+                "caller.rs",
+                "worker.rs",
+                "use crate::worker::execute as run;",
+                "fn run(&self) {}",
+            ),
+        ] {
+            let mut scoped = make_fn(caller_file, "C.run", declaration);
+            scoped.language = language.into();
+            scoped
+                .metadata
+                .insert("lexical_name".into(), "run".into());
+            let mut callee = make_fn(callee_file, "execute", "execute() {}");
+            callee.language = language.into();
+            let mut import = make_import(caller_file, import_text);
+            import.language = language.into();
+            let edges = import_calls_pass(&[scoped.clone(), callee, import]);
+
+            assert!(edges.iter().all(|edge| {
+                edge.kind != EdgeKind::Calls || edge.from != scoped.id
+            }), "{language} scoped declaration must not become an alias call: {edges:?}");
+        }
+    }
+
+    #[test]
+    fn differently_named_scoped_method_can_call_imported_alias() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute as run\n\nclass C:\n    def invoke(self):\n        return run()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "def execute():\n    return 1\n",
+        ));
+        let caller = nodes.iter().find(|node| node.id.name == "C.invoke").unwrap();
+        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+        let edges = import_calls_pass(&nodes);
+
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+        }), "a differently named scoped method must retain a real alias call: {edges:?}");
+    }
+
+    #[test]
+    fn nested_local_alias_declaration_without_invocation_emits_no_import_call() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute as run\n\ndef orchestrate():\n    def run():\n        return 2\n    return 1\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "def execute():\n    return 1\n",
+        ));
+        let orchestrate = nodes
+            .iter()
+            .find(|node| node.id.name == "orchestrate")
+            .unwrap();
+        let edges = import_calls_pass(&nodes);
+
+        assert!(edges.iter().all(|edge| {
+            edge.kind != EdgeKind::Calls || edge.from != orchestrate.id
+        }), "a nested local alias declaration must shadow the import without creating a call: {edges:?}");
     }
 
     #[test]
