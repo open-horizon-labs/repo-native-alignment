@@ -45,6 +45,12 @@ returns a typed `BudgetTooSmall` delivery error and the MCP adapter exposes it
 as a tool error; it never emits an over-budget diagnostic or consumes the
 one-time business-context preamble.
 
+Structural convergence witnesses render the selected edge kind on every hop.
+When a request allows mixed relationships, scoped LSP completeness is required
+only for hops actually selected as `Calls`; other requested kinds such as
+`DependsOn` retain their own graph provenance and are not misclassified as
+call-hierarchy evidence. Parallel eligible edges are resolved deterministically.
+
 The minimum envelope is measured, not a repository-wide magic number because
 stable identity and path lengths vary. For a request with candidates it is the
 exact final `RenderCost` of the fully degraded fixed scaffold plus the

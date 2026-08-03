@@ -110,6 +110,30 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         return Vec::new();
     }
 
+    // Canonical parent identity -> lexical names declared in that function.
+    // These extracted child nodes are stronger scope evidence than body text:
+    // a later bare call binds the local declaration, not an imported alias.
+    let mut nested_bindings: HashMap<(String, PathBuf, String), HashSet<String>> = HashMap::new();
+    for node in all_nodes {
+        if node.id.kind != NodeKind::Function
+            || node.metadata.get("parent_scope_kind").map(String::as_str) != Some("function")
+        {
+            continue;
+        }
+        let Some(parent) = node.metadata.get("parent_scope") else {
+            continue;
+        };
+        let lexical_name = node
+            .metadata
+            .get("lexical_name")
+            .cloned()
+            .unwrap_or_else(|| node.id.name.clone());
+        nested_bindings
+            .entry((node.id.root.clone(), node.id.file.clone(), parent.clone()))
+            .or_default()
+            .insert(lexical_name);
+    }
+
     // ------------------------------------------------------------------
     // 2. For each (root, file) pair, build the set of imported symbol names.
     // ------------------------------------------------------------------
@@ -152,12 +176,21 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // Perf optimization: extract call sites from the body ONCE, then check
         // each against the imports set. This is O(body_size + imports) instead
         // of O(imports × body_size) when iterating imports first.
+        let caller_lexical_name = node
+            .metadata
+            .get("lexical_name")
+            .map(String::as_str)
+            .unwrap_or(node.id.name.as_str());
         let allowed_aliases = imported_names
             .iter()
             .filter(|binding| binding.local_name != binding.imported_symbol)
             .map(|binding| binding.local_name.as_str())
             .collect::<HashSet<_>>();
-        let called_names = extract_call_sites_with_allowed_stopwords(&node.body, &allowed_aliases);
+        let called_names = extract_call_sites_with_allowed_stopwords(
+            &node.body,
+            &allowed_aliases,
+            Some(caller_lexical_name),
+        );
 
 
         // For each imported name that appears as a call in this function body
@@ -169,16 +202,21 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if is_call_stopword(binding.imported_symbol.as_str()) {
                 continue;
             }
-            // Skip when the binding is shadowed by this function's own lexical
-            // declaration. Scoped identities (`C.run`) retain `run` in
-            // metadata, so comparing only the canonical ID would mistake the
-            // declaration itself for an imported call.
-            let caller_lexical_name = node
-                .metadata
-                .get("lexical_name")
-                .map(String::as_str)
-                .unwrap_or(node.id.name.as_str());
-            if caller_lexical_name == binding.local_name {
+            // A top-level or nested local function declaration shadows the
+            // import. A class/impl method does not bind its name as a bare
+            // local inside the method body, so `C.run { run() }` may still
+            // call an imported alias.
+            let is_member_scope = node.metadata.contains_key("parent_scope")
+                && node.metadata.get("parent_scope_kind").map(String::as_str)
+                    != Some("function");
+            if caller_lexical_name == binding.local_name && !is_member_scope {
+                continue;
+            }
+            let nested_key = (node.id.root.clone(), node.id.file.clone(), node.id.name.clone());
+            if nested_bindings
+                .get(&nested_key)
+                .is_some_and(|names| names.contains(&binding.local_name))
+            {
                 continue;
             }
             // Check if the imported name appears as a call site (`name(`).
@@ -777,12 +815,13 @@ fn parse_es6_import_bindings(text: &str) -> Vec<(String, String)> {
 /// possible edge — never a false positive.
 #[cfg(test)]
 pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
-    extract_call_sites_with_allowed_stopwords(body, &HashSet::new())
+    extract_call_sites_with_allowed_stopwords(body, &HashSet::new(), None)
 }
 
 fn extract_call_sites_with_allowed_stopwords<'a>(
     body: &'a str,
     allowed_stopwords: &HashSet<&str>,
+    declaration_name: Option<&str>,
 ) -> HashSet<&'a str> {
     let mut result = HashSet::new();
     let bytes = body.as_bytes();
@@ -912,8 +951,11 @@ fn extract_call_sites_with_allowed_stopwords<'a>(
                 let previous_word =
                     std::str::from_utf8(&bytes[previous_start..previous_end]).unwrap_or("");
                 let is_declaration = matches!(previous_word, "def" | "fn" | "function");
+                let is_braced_member_declaration = declaration_name == Some(ident)
+                    && closing_paren_is_followed_by_brace(bytes, i);
                 if !ident.is_empty()
                     && !is_declaration
+                    && !is_braced_member_declaration
                     && (!is_call_stopword(ident) || allowed_stopwords.contains(ident))
                 {
                     let prev = if j > 0 { bytes[j - 1] } else { 0 };
@@ -926,6 +968,29 @@ fn extract_call_sites_with_allowed_stopwords<'a>(
         i += 1;
     }
     result
+}
+
+fn closing_paren_is_followed_by_brace(bytes: &[u8], open_paren: usize) -> bool {
+    let mut depth = 0usize;
+    let mut index = open_paren;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    index += 1;
+                    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                        index += 1;
+                    }
+                    return bytes.get(index) == Some(&b'{');
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Common short identifiers that almost always denote builtins, accessors,
@@ -1663,10 +1728,66 @@ mod tests {
     }
 
     #[test]
+    fn same_named_python_method_can_call_bare_imported_alias() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute as run\n\nclass C:\n    def run(self):\n        return run()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "def execute():\n    return 1\n",
+        ));
+        let caller = nodes.iter().find(|node| node.id.name == "C.run").unwrap();
+        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+        let edges = import_calls_pass(&nodes);
+
+        assert!(edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+        }), "a method name does not shadow the bare imported alias in its body: {edges:?}");
+    }
+
+    #[test]
+    fn same_named_es_and_rust_methods_can_call_bare_imported_alias() {
+        for (language, caller_file, callee_file, import_text, body) in [
+            (
+                "typescript",
+                "caller.ts",
+                "worker.ts",
+                "import { execute as run } from './worker'",
+                "run() { return run(); }",
+            ),
+            (
+                "rust",
+                "caller.rs",
+                "worker.rs",
+                "use crate::worker::execute as run;",
+                "fn run(&self) { run(); }",
+            ),
+        ] {
+            let mut caller = make_fn(caller_file, "C.run", body);
+            caller.language = language.into();
+            caller.metadata.insert("lexical_name".into(), "run".into());
+            caller.metadata.insert("parent_scope".into(), "C".into());
+            caller
+                .metadata
+                .insert("parent_scope_kind".into(), "class".into());
+            let mut callee = make_fn(callee_file, "execute", "execute() {}");
+            callee.language = language.into();
+            let mut import = make_import(caller_file, import_text);
+            import.language = language.into();
+            let edges = import_calls_pass(&[caller.clone(), callee.clone(), import]);
+
+            assert!(edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            }), "{language} method must retain the real bare alias call: {edges:?}");
+        }
+    }
+
+    #[test]
     fn nested_local_alias_declaration_without_invocation_emits_no_import_call() {
         let mut nodes = extract_python_nodes(
             "caller.py",
-            "from worker import execute as run\n\ndef orchestrate():\n    def run():\n        return 2\n    return 1\n",
+            "from worker import execute as run\n\ndef orchestrate():\n    def run():\n        return 2\n    return run()\n",
         );
         nodes.extend(extract_python_nodes(
             "worker.py",
@@ -1680,7 +1801,7 @@ mod tests {
 
         assert!(edges.iter().all(|edge| {
             edge.kind != EdgeKind::Calls || edge.from != orchestrate.id
-        }), "a nested local alias declaration must shadow the import without creating a call: {edges:?}");
+        }), "an invoked nested local alias must not become an imported call: {edges:?}");
     }
 
     #[test]

@@ -89,7 +89,9 @@ pub struct ConvergenceCandidate {
     pub max_distance: usize,
     pub total_distance: usize,
     pub witnesses: Vec<Vec<String>>,
+    pub witness_edge_kinds: Vec<Vec<EdgeKind>>,
     pub onward: Option<Vec<String>>,
+    pub onward_edge_kinds: Option<Vec<EdgeKind>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +576,7 @@ impl GraphIndex {
             let onward = before_id.and_then(|boundary| {
                 self.bounded_paths(&node_id, max_hops, filter, direction)
                     .get(boundary)
-                    .map(|(_, path)| path.clone())
+                    .map(|(_, path, edge_kinds)| (path.clone(), edge_kinds.clone()))
             });
             if before_id.is_some() && onward.is_none() {
                 continue;
@@ -591,7 +593,12 @@ impl GraphIndex {
                     .iter()
                     .map(|map| map.get(&node_id).expect("intersection member").1.clone())
                     .collect(),
-                onward,
+                witness_edge_kinds: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").2.clone())
+                    .collect(),
+                onward: onward.as_ref().map(|(path, _)| path.clone()),
+                onward_edge_kinds: onward.map(|(_, edge_kinds)| edge_kinds),
             });
         }
         candidates.sort_by(|left, right| {
@@ -610,11 +617,14 @@ impl GraphIndex {
         max_hops: usize,
         edge_types: &[EdgeKind],
         direction: ConvergenceDirection,
-    ) -> BTreeMap<String, (usize, Vec<String>)> {
+    ) -> BTreeMap<String, (usize, Vec<String>, Vec<EdgeKind>)> {
         let Some(&start) = self.node_lookup.get(start_id) else {
             return BTreeMap::new();
         };
-        let mut result = BTreeMap::from([(start_id.to_string(), (0, vec![start_id.to_string()]))]);
+        let mut result = BTreeMap::from([(
+            start_id.to_string(),
+            (0, vec![start_id.to_string()], Vec::new()),
+        )]);
         let mut queue = VecDeque::from([(start, 0usize)]);
         while let Some((current, depth)) = queue.pop_front() {
             if depth >= max_hops {
@@ -635,23 +645,31 @@ impl GraphIndex {
                         Direction::Outgoing => edge.target(),
                         Direction::Incoming => edge.source(),
                     };
-                    neighbors.push((self.graph[next].id.clone(), next));
+                    neighbors.push((
+                        self.graph[next].id.clone(),
+                        edge.weight().edge_type.clone(),
+                        next,
+                    ));
                 }
             }
-            neighbors.sort_by(|left, right| left.0.cmp(&right.0));
+            neighbors.sort_by(|left, right| {
+                (&left.0, &left.1).cmp(&(&right.0, &right.1))
+            });
             neighbors.dedup_by(|left, right| left.0 == right.0);
-            let current_path = result
+            let (_, current_path, current_edge_kinds) = result
                 .get(&self.graph[current].id)
-                .expect("queued nodes have a path")
-                .1
-                .clone();
-            for (next_id, next) in neighbors {
+                .expect("queued nodes have a path");
+            let current_path = current_path.clone();
+            let current_edge_kinds = current_edge_kinds.clone();
+            for (next_id, edge_kind, next) in neighbors {
                 if result.contains_key(&next_id) {
                     continue;
                 }
                 let mut path = current_path.clone();
                 path.push(next_id.clone());
-                result.insert(next_id, (depth + 1, path));
+                let mut path_edge_kinds = current_edge_kinds.clone();
+                path_edge_kinds.push(edge_kind);
+                result.insert(next_id, (depth + 1, path, path_edge_kinds));
                 queue.push_back((next, depth + 1));
             }
         }
@@ -3367,9 +3385,14 @@ mod tests {
         assert_eq!(result[0].witnesses[0], vec!["left", "join"]);
         assert_eq!(result[0].witnesses[1], vec!["right", "join"]);
         assert_eq!(
+            result[0].witness_edge_kinds,
+            vec![vec![EdgeKind::Calls], vec![EdgeKind::Calls]]
+        );
+        assert_eq!(
             result[0].onward,
             Some(vec!["join".into(), "boundary".into()])
         );
+        assert_eq!(result[0].onward_edge_kinds, Some(vec![EdgeKind::Calls]));
     }
 
     #[test]
@@ -3424,6 +3447,17 @@ mod tests {
         );
         assert_eq!(result[0].node_id, "join");
         assert!(result.iter().all(|candidate| candidate.node_id != "dead_join"));
+        assert_eq!(
+            result[0].witness_edge_kinds,
+            vec![
+                vec![EdgeKind::Calls, EdgeKind::Calls],
+                vec![EdgeKind::DependsOn]
+            ]
+        );
+        assert_eq!(
+            result[0].onward_edge_kinds,
+            Some(vec![EdgeKind::Calls])
+        );
     }
 
     #[test]

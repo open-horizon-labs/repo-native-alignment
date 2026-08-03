@@ -1499,6 +1499,17 @@ fn scoped_convergence_calls_candidates(
     candidates: &[crate::graph::index::ConvergenceCandidate],
     direction: ConvergenceDirection,
 ) -> Result<Vec<crate::graph::index::ConvergenceCandidate>, String> {
+    let candidate_uses_calls = |candidate: &crate::graph::index::ConvergenceCandidate| {
+        candidate
+            .witness_edge_kinds
+            .iter()
+            .flatten()
+            .chain(candidate.onward_edge_kinds.iter().flatten())
+            .any(|kind| *kind == EdgeKind::Calls)
+    };
+    if !candidates.iter().any(candidate_uses_calls) {
+        return Ok(candidates.to_vec());
+    }
     let report = crate::lsp_completeness::load_report(ctx.repo_root)
         .map_err(|error| format!("full LSP report unavailable: {error}"))?;
     let expected = crate::lsp_completeness::current_report_identity(
@@ -1544,21 +1555,40 @@ fn scoped_convergence_calls_candidates(
 
     let mut proven = Vec::new();
     for candidate in candidates {
-        let paths = candidate
+        if !candidate_uses_calls(candidate) {
+            proven.push(candidate.clone());
+            continue;
+        }
+        let mut paths = candidate
             .witnesses
             .iter()
-            .chain(candidate.onward.iter())
+            .zip(&candidate.witness_edge_kinds)
             .collect::<Vec<_>>();
-        let all_hops_exact = paths.iter().all(|path| {
-            path.windows(2)
-                .all(|pair| edge_is_exact(&pair[0], &pair[1]))
+        if let (Some(onward), Some(edge_kinds)) =
+            (&candidate.onward, &candidate.onward_edge_kinds)
+        {
+            paths.push((onward, edge_kinds));
+        }
+        let all_hops_exact = paths.iter().all(|(path, edge_kinds)| {
+            path.len() == edge_kinds.len().saturating_add(1)
+                && path
+                    .windows(2)
+                    .zip(edge_kinds.iter())
+                    .all(|(pair, kind)| {
+                        *kind != EdgeKind::Calls || edge_is_exact(&pair[0], &pair[1])
+                    })
         });
         if !all_hops_exact {
             continue;
         }
         let relevant_files = paths
             .iter()
-            .flat_map(|path| path.iter())
+            .flat_map(|(path, edge_kinds)| {
+                path.windows(2)
+                    .zip(edge_kinds.iter())
+                    .filter(|(_, kind)| **kind == EdgeKind::Calls)
+                    .flat_map(|(pair, _)| pair.iter())
+            })
             .filter_map(|id| {
                 node_index
                     .get(id)
@@ -1568,7 +1598,7 @@ fn scoped_convergence_calls_candidates(
             .collect::<BTreeSet<_>>();
         let every_node_bound = paths
             .iter()
-            .flat_map(|path| path.iter())
+            .flat_map(|(path, _)| path.iter())
             .all(|id| node_index.contains_key(id));
         if !every_node_bound
             || report
@@ -1806,14 +1836,23 @@ fn render_convergence(
                 .encode_compact();
                 body.push_str(&format!("   - hydrate_source: `{handle}`\n"));
             }
-            for (source, witness) in sources.iter().zip(&candidate.witnesses) {
+            for ((source, witness), edge_kinds) in sources
+                .iter()
+                .zip(&candidate.witnesses)
+                .zip(&candidate.witness_edge_kinds)
+            {
                 body.push_str(&format!(
                     "   - witness `{source}`: {}\n",
-                    witness.join(" → ")
+                    render_typed_convergence_path(witness, edge_kinds)
                 ));
             }
-            if let Some(onward) = &candidate.onward {
-                body.push_str(&format!("   - onward_before: {}\n", onward.join(" → ")));
+            if let (Some(onward), Some(edge_kinds)) =
+                (&candidate.onward, &candidate.onward_edge_kinds)
+            {
+                body.push_str(&format!(
+                    "   - onward_before: {}\n",
+                    render_typed_convergence_path(onward, edge_kinds)
+                ));
             }
             body.push('\n');
         }
@@ -1831,6 +1870,17 @@ fn render_convergence(
             );
         }
     }
+}
+
+fn render_typed_convergence_path(nodes: &[String], edge_kinds: &[EdgeKind]) -> String {
+    let Some(first) = nodes.first() else {
+        return String::new();
+    };
+    let mut rendered = first.clone();
+    for (kind, node) in edge_kinds.iter().zip(nodes.iter().skip(1)) {
+        rendered.push_str(&format!(" -[{kind}]-> {node}"));
+    }
+    rendered
 }
 
 fn convergence_accounted(body: String) -> String {
@@ -10788,6 +10838,41 @@ mod tests {
         }
     }
 
+    fn persist_complete_calls_report(repo: &Path, graph: &GraphState, files: &[&str]) {
+        use crate::business_context::BusinessContextMode;
+        use crate::lsp_completeness::{
+            LspCompletenessReport, LspEvidenceDisposition, LspFileEvidence,
+            current_report_identity, persist_report,
+        };
+
+        let identity = current_report_identity(repo, BusinessContextMode::Disabled).unwrap();
+        let mut report = LspCompletenessReport::new_bound(
+            identity.clone(),
+            files.iter().map(|path| calls_coverage_file(path)).collect(),
+            &graph.nodes,
+            &graph.edges,
+        );
+        report.evidence = report
+            .files
+            .iter()
+            .map(|file| LspFileEvidence {
+                path: file.path.clone(),
+                disposition: LspEvidenceDisposition::Executed,
+                generation: identity.enrichment_generation.clone(),
+                blob: "a".repeat(40),
+                partition_signature: "b".repeat(64),
+                input_hashes: vec!["fixture-input".to_string()],
+                operations: vec!["call_hierarchy".to_string()],
+                result_ids: Vec::new(),
+                result_producers: Vec::new(),
+                base_archive_sha256: None,
+                base_report_digest: None,
+            })
+            .collect();
+        report.finalize();
+        persist_report(repo, &report).unwrap();
+    }
+
     fn make_search_context<'a>(
         graph_state: &'a GraphState,
         repo_root: &'a Path,
@@ -11161,6 +11246,74 @@ mod tests {
         assert!(rendered.contains("proof_records: 0"), "{rendered}");
         assert!(rendered.contains("delivered_handles: 0"), "{rendered}");
         assert!(!rendered.contains("hydrate_source:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn scoped_convergence_proves_only_calls_hops_in_mixed_edge_paths() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let run = |confirmed_session_call: bool| {
+            let request = make_scoped_method("Request", "prepare", "requests/models.py");
+            let session =
+                make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+            let join =
+                make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
+            let boundary = make_scoped_method("Schema", "contract", "schema/types.py");
+            let session_edge = if confirmed_session_call {
+                make_confirmed_lsp_call(&session, &join)
+            } else {
+                make_edge(&session, &join, EdgeKind::Calls)
+            };
+            let edges = vec![
+                make_confirmed_lsp_call(&request, &join),
+                session_edge,
+                make_edge(&join, &boundary, EdgeKind::DependsOn),
+            ];
+            let graph = make_graph_state_with_edges(
+                vec![request, session, join, boundary],
+                edges,
+            );
+            (tempfile::tempdir().unwrap(), graph)
+        };
+
+        for (confirmed_session_call, expect_injectable) in [(true, true), (false, false)] {
+            let (temp, graph) = run(confirmed_session_call);
+            persist_complete_calls_report(
+                temp.path(),
+                &graph,
+                &["requests/models.py", "requests/sessions.py"],
+            );
+            let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+            let mut ctx = make_search_context(&graph, temp.path());
+            ctx.business_context = &admission;
+            let rendered = search(
+                &SearchParams {
+                    mode: Some("convergence".into()),
+                    nodes: Some(vec![
+                        "Request.prepare".into(),
+                        "Session.prepare_request".into(),
+                    ]),
+                    before: Some("Schema.contract".into()),
+                    direction: Some("outgoing".into()),
+                    edge_types: Some(vec!["calls".into(), "depends_on".into()]),
+                    depth: Some(3),
+                    ..SearchParams::default()
+                },
+                &ctx,
+            )
+            .await;
+
+            if expect_injectable {
+                assert!(rendered.contains("delivery_status: injectable_proof"), "{rendered}");
+                assert!(rendered.contains("-[calls]->"), "{rendered}");
+                assert!(rendered.contains("-[depends_on]->"), "{rendered}");
+                assert!(rendered.contains("Schema.contract"), "{rendered}");
+            } else {
+                assert!(rendered.contains("coverage_unknown"), "{rendered}");
+                assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+                assert!(!rendered.contains("hydrate_source:"), "{rendered}");
+            }
+        }
     }
 
     #[tokio::test]
