@@ -60,6 +60,9 @@ use std::path::PathBuf;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 
+type ImportedBinding = (String, Option<String>);
+type ImportedBindingsByFile = HashMap<(String, PathBuf), HashSet<ImportedBinding>>;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -106,16 +109,17 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // ------------------------------------------------------------------
     // Key: (root, file) — file alone is not unique in multi-root workspaces
     // where two roots may both contain `src/lib.ts`.
-    let mut imported_names_by_file: HashMap<(String, PathBuf), HashSet<String>> = HashMap::new();
+    let mut imported_names_by_file: ImportedBindingsByFile = HashMap::new();
     for node in all_nodes {
         if node.id.kind == NodeKind::Import {
             let text = &node.id.name; // Import node name = full import text
             let names = parse_imported_names(text);
             if !names.is_empty() {
+                let module = parse_import_module(text);
                 imported_names_by_file
                     .entry((node.id.root.clone(), node.id.file.clone()))
                     .or_default()
-                    .extend(names);
+                    .extend(names.into_iter().map(|name| (name, module.clone())));
             }
         }
     }
@@ -147,7 +151,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 
 
         // For each imported name that appears as a call in this function body
-        for imported_name in imported_names {
+        for (imported_name, module_path) in imported_names {
             // Skip names known to be common builtins / accessors. The previous
             // blanket `len() < 4` filter dropped legitimate short imports
             // (`init`, `tick`, `save`); the stopword list keeps the noisy
@@ -187,16 +191,29 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 })
                 .collect();
 
-            if cross_file_candidates.len() != 1 {
+            let resolved = if let Some(module) = module_path {
+                let narrowed = cross_file_candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| import_path_matches_file(module, &candidate.id.file))
+                    .collect::<Vec<_>>();
+                if narrowed.len() == 1 {
+                    narrowed
+                } else {
+                    continue;
+                }
+            } else if cross_file_candidates.len() == 1 {
+                cross_file_candidates
+            } else {
                 continue;
-            }
+            };
 
             // All import-call edges use Detected confidence.  Both relative and
             // non-relative imports are treated the same: finding a local function
             // node with a matching name confirms the call target.
             let confidence = Confidence::Detected;
 
-            for &callee in &cross_file_candidates {
+            for callee in resolved {
                 let key = (node.id.to_stable_id(), callee.id.to_stable_id());
                 if seen.contains(&key) {
                     continue;
@@ -1379,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_call_with_duplicate_scoped_lexical_alias_fails_closed() {
+    fn qualified_import_selects_canonical_scoped_call_target() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute\n\ndef orchestrate():\n    return execute()\n",
@@ -1396,14 +1413,22 @@ mod tests {
             .iter()
             .find(|node| node.id.name == "orchestrate")
             .unwrap();
+        let worker = nodes
+            .iter()
+            .find(|node| node.id.name == "Worker.execute")
+            .unwrap();
 
         let edges = import_calls_pass(&nodes);
-        assert!(
-            edges
-                .iter()
-                .all(|edge| edge.kind != EdgeKind::Calls || edge.from != caller.id),
-            "ambiguous imported method alias must not fan out to arbitrary owners: {edges:?}"
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.from == caller.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "qualified module must disambiguate the scoped target: {edges:?}"
         );
+        assert_eq!(calls[0].to, worker.id);
     }
 
     #[test]
@@ -1622,21 +1647,18 @@ mod tests {
     }
 
     #[test]
-    fn test_non_relative_import_also_emits_edge() {
+    fn external_module_does_not_bind_unique_unrelated_local_name() {
         let caller = make_fn("a.ts", "main", "function main() { return helper(42); }");
         let callee = make_fn("b.ts", "helper", "function helper(x) { return x; }");
-        // Non-relative import but matching function exists in local graph
+        // A unique local lexical match is still unrelated to the declared
+        // external module and must not receive a false edge.
         let import = make_import("a.ts", "import { helper } from 'some-library'");
 
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        // Calls edge + import ReferencedBy edge
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        assert_eq!(calls.len(), 1, "expected 1 Calls edge for the non-relative import");
-        for e in &edges {
-            assert_eq!(e.confidence, Confidence::Detected, "all import-calls edges use Detected confidence");
-        }
+        assert!(calls.is_empty(), "external module must not bind a local same-name target: {edges:?}");
     }
 
     #[test]
