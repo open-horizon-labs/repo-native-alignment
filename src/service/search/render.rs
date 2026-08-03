@@ -33,6 +33,49 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradationStep {
+    CapabilityDiagnostics,
+    CandidateAudit,
+    CapabilityList,
+    Omissions,
+    RecordEvidence,
+    RecordMetadata,
+    RelationshipDetails,
+    Relationship,
+    TaskObligationExcerpt,
+    Body,
+    FlatTail,
+}
+
+fn degrade_once(plan: &mut ProjectionPlan, cost: &RenderCost) -> Option<DegradationStep> {
+    if compact_capability_diagnostics(plan) {
+        Some(DegradationStep::CapabilityDiagnostics)
+    } else if compact_candidate_audit(plan) {
+        Some(DegradationStep::CandidateAudit)
+    } else if compact_capability_list(plan) {
+        Some(DegradationStep::CapabilityList)
+    } else if compact_omissions(plan) {
+        Some(DegradationStep::Omissions)
+    } else if shrink_last_record_evidence(plan) {
+        Some(DegradationStep::RecordEvidence)
+    } else if compact_record_metadata(plan) {
+        Some(DegradationStep::RecordMetadata)
+    } else if compact_relationship_details(plan) {
+        Some(DegradationStep::RelationshipDetails)
+    } else if shrink_last_relationship(plan) {
+        Some(DegradationStep::Relationship)
+    } else if compact_last_task_body_to_obligation_excerpt(plan) {
+        Some(DegradationStep::TaskObligationExcerpt)
+    } else if shrink_last_body(plan, cost) {
+        Some(DegradationStep::Body)
+    } else if drop_last_flat_record(plan) {
+        Some(DegradationStep::FlatTail)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedResponse, RenderError> {
     let mut plan = plan.clone();
     // Every degradation step below is monotonic.  The generous bound is only
@@ -53,21 +96,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
                 plan,
             });
         }
-        if !compact_capability_diagnostics(&mut plan)
-            && !compact_candidate_audit(&mut plan)
-            && !compact_capability_list(&mut plan)
-            // Omission rows describe evidence that is not in the packet. In
-            // task mode they must yield before audit detail or source bodies
-            // from the actionable evidence that is actually being delivered.
-            && !compact_omissions(&mut plan)
-            && !shrink_last_record_evidence(&mut plan)
-            && !compact_record_metadata(&mut plan)
-            && !compact_relationship_details(&mut plan)
-            && !shrink_last_relationship(&mut plan)
-            && !compact_last_task_body_to_obligation_excerpt(&mut plan)
-            && !shrink_last_body(&mut plan, &accounting.total)
-            && !drop_last_flat_record(&mut plan)
-        {
+        if degrade_once(&mut plan, &accounting.total).is_none() {
             return Err(RenderError::BudgetTooSmall {
                 minimum: accounting.total,
             });
@@ -1553,6 +1582,61 @@ mod tests {
         );
         assert!(rendered.plan.records[0].source_handle.is_some());
         assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn degradation_ladder_order_is_explicit_and_deterministic() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.capabilities.push(CapabilityStatus {
+            capability: "semantic".into(),
+            state: CapabilityState::Ready,
+            detail: "verbose capability detail".into(),
+        });
+        input.omissions.extend([
+            ProjectionOmission {
+                record_id: Some("omitted-a".into()),
+                source: None,
+                code: OmissionCode::RenderBudget,
+                detail: "first omitted detail".into(),
+            },
+            ProjectionOmission {
+                record_id: Some("omitted-b".into()),
+                source: None,
+                code: OmissionCode::RenderBudget,
+                detail: "second omitted detail".into(),
+            },
+        ]);
+        input.records[0]
+            .symbol
+            .declared_metadata
+            .insert("verbose".into(), "metadata".into());
+        input.relationships.push(ProjectedRelationship {
+            from: "node".into(),
+            kind: "depends_on".into(),
+            to: "dependency".into(),
+            reason: "verbose relationship detail".into(),
+        });
+
+        let cost = RenderCost::default();
+        let steps = (0..10)
+            .map(|_| degrade_once(&mut input, &cost).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            vec![
+                DegradationStep::CapabilityDiagnostics,
+                DegradationStep::CandidateAudit,
+                DegradationStep::CapabilityList,
+                DegradationStep::Omissions,
+                DegradationStep::RecordEvidence,
+                DegradationStep::Omissions,
+                DegradationStep::RecordMetadata,
+                DegradationStep::RelationshipDetails,
+                DegradationStep::Relationship,
+                DegradationStep::Omissions,
+            ]
+        );
+
     }
 
     #[test]

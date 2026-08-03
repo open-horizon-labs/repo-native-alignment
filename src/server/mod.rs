@@ -706,6 +706,34 @@ mod tests {
             .unwrap();
         handler.install_cached_graph(graph);
 
+        let compatible_search_bypass = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "search".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "mode": "convergence",
+                        "file": "src/lib.rs",
+                        "line": 1
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let compatible_text = call_tool_text(&compatible_search_bypass);
+        assert!(compatible_text.contains("at least two source selectors are required"));
+        assert!(!compatible_text.contains("present_symbol"));
+        assert!(!compatible_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
         let invalid = handler
             .dispatch_call_tool_request(CallToolRequestParams {
                 name: "convergence".into(),

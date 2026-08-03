@@ -22,10 +22,13 @@ Byte and token limits apply to the complete self-accounted response, including
 headers, metadata, bodies, relationships, omissions, and the accounting footer.
 Selection and rendering use the same bounded fitter. When optional
 server-owned detail does not fit, RNA degrades it deterministically: capability
-and candidate diagnostics, per-record evidence/metadata, relationship detail,
-source bodies, the lowest-ranked flat-search tail, and finally the omission
-list itself, which collapses into one entry reporting `omitted_detail_count`
-while retaining one compact hydration handle. Task-selected records are
+diagnostics, candidate audit, capability-list detail, and then the omission
+list, which collapses into one entry reporting `omitted_detail_count` while
+retaining one compact hydration handle. It next degrades per-record evidence
+and metadata, relationship detail/rows, task bodies to obligation excerpts,
+remaining source bodies, and finally the lowest-ranked flat-search tail.
+New degradation omissions re-enter the same ladder and are compacted before
+later evidence-bearing stages. Task-selected records are
 protected because a role or task obligation is covered only when its actionable
 carrier remains in the final fitted packet.
 

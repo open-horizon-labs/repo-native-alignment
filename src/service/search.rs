@@ -1124,6 +1124,13 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
             SearchDelivery::eligible(markdown)
         };
     }
+    // Convergence owns a single typed delivery contract. Route it before
+    // hydration, source-span, strict-semantic, and product-search dispatch so
+    // no compatible `search(mode=convergence)` shape can return an eligible
+    // non-proof response.
+    if convergence_requested {
+        return search_convergence(params, ctx).into_search_delivery();
+    }
     let strict_semantic = strict_semantic_requested(params);
     if strict_semantic && let Err(reason) = strict_semantic_preflight(params, ctx).await {
         return SearchDelivery::eligible(strict_semantic_failure(reason));
@@ -1187,9 +1194,6 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
     // typed projection adapters exist. In particular, never reinterpret a
     // node/mode request as a flat product search.
     if legacy_dispatch {
-        if params.normalized_mode() == Some("convergence") {
-            return search_convergence(params, ctx).into_search_delivery();
-        }
         return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
 
@@ -10864,6 +10868,28 @@ mod tests {
             assert!(delivery.markdown.starts_with("Invalid search context:"));
             assert!(!delivery.context_injection_eligible);
         }
+    }
+
+    #[tokio::test]
+    async fn compatible_convergence_cannot_bypass_proof_dispatch_via_source_span() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("fixture.py"), "def visible():\n    pass\n").unwrap();
+        let graph = make_graph_state(Vec::new());
+        let ctx = make_search_context(&graph, temp.path());
+        let delivery = search_delivery(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                file: Some("fixture.py".into()),
+                line: Some(1),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(delivery.markdown.contains("at least two source selectors are required"));
+        assert!(!delivery.markdown.contains("def visible"));
+        assert!(!delivery.context_injection_eligible);
     }
 
     #[tokio::test]

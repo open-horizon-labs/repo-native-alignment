@@ -25,9 +25,8 @@
 //! 3. For each `Function` node in the same file, scan its body for bare
 //!    identifiers matching any imported name (word-boundary check).
 //! 4. For each match, look up a `Function` node with that name in a different
-//!    file.  If exactly one candidate exists, emit a `Calls` edge.  If
-//!    multiple candidates exist, emit edges to all of them (LSP will later
-//!    confirm or prune).
+//!    file. Emit a `Calls` edge only when language/root/module constraints
+//!    leave one canonical candidate; ambiguous lexical aliases fail closed.
 //!
 //! # Language support
 //!
@@ -188,7 +187,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 })
                 .collect();
 
-            if cross_file_candidates.is_empty() {
+            if cross_file_candidates.len() != 1 {
                 continue;
             }
 
@@ -1376,6 +1375,34 @@ mod tests {
                 edge.kind != EdgeKind::ReferencedBy || edge.from != caller.id
             }),
             "ambiguous bare method alias must not choose an arbitrary owner: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn imported_call_with_duplicate_scoped_lexical_alias_fails_closed() {
+        let mut nodes = extract_python_nodes(
+            "caller.py",
+            "from worker import execute\n\ndef orchestrate():\n    return execute()\n",
+        );
+        nodes.extend(extract_python_nodes(
+            "worker.py",
+            "class Worker:\n    def execute(self):\n        return 1\n",
+        ));
+        nodes.extend(extract_python_nodes(
+            "other.py",
+            "class Other:\n    def execute(self):\n        return 2\n",
+        ));
+        let caller = nodes
+            .iter()
+            .find(|node| node.id.name == "orchestrate")
+            .unwrap();
+
+        let edges = import_calls_pass(&nodes);
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::Calls || edge.from != caller.id),
+            "ambiguous imported method alias must not fan out to arbitrary owners: {edges:?}"
         );
     }
 
