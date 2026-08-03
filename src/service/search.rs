@@ -16,7 +16,7 @@ use crate::embed::{
     ObservedSearchOutcome, ScoreAdjustment, ScoreNormalization, SearchFilters, SearchMode,
     SearchOutcome, SearchResult, SearchScoreProvenance, TestResultPolicy,
 };
-use crate::graph::index::{ConvergenceDirection, GraphIndex};
+use crate::graph::index::{ConvergenceDirection, ConvergenceHopDirection, GraphIndex};
 use crate::graph::{Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
@@ -1497,7 +1497,6 @@ fn convergence_calls_coverage_ready(ctx: &SearchContext<'_>) -> bool {
 fn scoped_convergence_calls_candidates(
     ctx: &SearchContext<'_>,
     candidates: &[crate::graph::index::ConvergenceCandidate],
-    direction: ConvergenceDirection,
 ) -> Result<Vec<crate::graph::index::ConvergenceCandidate>, String> {
     let candidate_uses_calls = |candidate: &crate::graph::index::ConvergenceCandidate| {
         candidate
@@ -1533,7 +1532,7 @@ fn scoped_convergence_calls_candidates(
     }
 
     let node_index = ctx.graph_state.node_index_map();
-    let edge_is_exact = |left: &str, right: &str| {
+    let edge_is_exact = |left: &str, right: &str, direction: ConvergenceHopDirection| {
         ctx.graph_state.edges.iter().any(|edge| {
             if edge.kind != EdgeKind::Calls
                 || edge.source != ExtractionSource::Lsp
@@ -1544,11 +1543,8 @@ fn scoped_convergence_calls_candidates(
             let from = edge.from.to_stable_id();
             let to = edge.to.to_stable_id();
             match direction {
-                ConvergenceDirection::Outgoing => from == left && to == right,
-                ConvergenceDirection::Incoming => from == right && to == left,
-                ConvergenceDirection::Both => {
-                    (from == left && to == right) || (from == right && to == left)
-                }
+                ConvergenceHopDirection::Forward => from == left && to == right,
+                ConvergenceHopDirection::Reverse => from == right && to == left,
             }
         })
     };
@@ -1563,23 +1559,36 @@ fn scoped_convergence_calls_candidates(
             .witnesses
             .iter()
             .zip(&candidate.witness_edge_kinds)
+            .zip(&candidate.witness_edge_directions)
+            .map(|((path, edge_kinds), edge_directions)| {
+                (path, edge_kinds, edge_directions)
+            })
             .collect::<Vec<_>>();
-        if let (Some(onward), Some(edge_kinds)) = (&candidate.onward, &candidate.onward_edge_kinds)
+        if let (Some(onward), Some(edge_kinds), Some(edge_directions)) = (
+            &candidate.onward,
+            &candidate.onward_edge_kinds,
+            &candidate.onward_edge_directions,
+        )
         {
-            paths.push((onward, edge_kinds));
+            paths.push((onward, edge_kinds, edge_directions));
         }
-        let all_hops_exact = paths.iter().all(|(path, edge_kinds)| {
+        let all_hops_exact = paths.iter().all(|(path, edge_kinds, edge_directions)| {
             path.len() == edge_kinds.len().saturating_add(1)
-                && path.windows(2).zip(edge_kinds.iter()).all(|(pair, kind)| {
-                    *kind != EdgeKind::Calls || edge_is_exact(&pair[0], &pair[1])
-                })
+                && edge_kinds.len() == edge_directions.len()
+                && path
+                    .windows(2)
+                    .zip(edge_kinds.iter().zip(edge_directions.iter()))
+                    .all(|(pair, (kind, direction))| {
+                        *kind != EdgeKind::Calls
+                            || edge_is_exact(&pair[0], &pair[1], *direction)
+                    })
         });
         if !all_hops_exact {
             continue;
         }
         let relevant_files = paths
             .iter()
-            .flat_map(|(path, edge_kinds)| {
+            .flat_map(|(path, edge_kinds, _)| {
                 path.windows(2)
                     .zip(edge_kinds.iter())
                     .filter(|(_, kind)| **kind == EdgeKind::Calls)
@@ -1594,7 +1603,7 @@ fn scoped_convergence_calls_candidates(
             .collect::<BTreeSet<_>>();
         let every_node_bound = paths
             .iter()
-            .flat_map(|(path, _)| path.iter())
+            .flat_map(|(path, _, _)| path.iter())
             .all(|id| node_index.contains_key(id));
         if !every_node_bound
             || report
@@ -1759,8 +1768,8 @@ fn search_convergence(params: &SearchParams, ctx: &SearchContext<'_>) -> Converg
             "no structural convergence witness exists within the requested bound",
         );
     }
-    if uses_calls && !convergence_calls_coverage_ready(ctx) {
-        candidates = match scoped_convergence_calls_candidates(ctx, &candidates, direction) {
+    if uses_calls {
+        candidates = match scoped_convergence_calls_candidates(ctx, &candidates) {
             Ok(proven) => proven,
             Err(detail) => {
                 return convergence_unresolved(params, &format!("{detail} (coverage_unknown)"));
@@ -1832,22 +1841,26 @@ fn render_convergence(
                 .encode_compact();
                 body.push_str(&format!("   - hydrate_source: `{handle}`\n"));
             }
-            for ((source, witness), edge_kinds) in sources
+            for (((source, witness), edge_kinds), edge_directions) in sources
                 .iter()
                 .zip(&candidate.witnesses)
                 .zip(&candidate.witness_edge_kinds)
+                .zip(&candidate.witness_edge_directions)
             {
                 body.push_str(&format!(
                     "   - witness `{source}`: {}\n",
-                    render_typed_convergence_path(witness, edge_kinds)
+                    render_typed_convergence_path(witness, edge_kinds, edge_directions)
                 ));
             }
-            if let (Some(onward), Some(edge_kinds)) =
-                (&candidate.onward, &candidate.onward_edge_kinds)
+            if let (Some(onward), Some(edge_kinds), Some(edge_directions)) = (
+                &candidate.onward,
+                &candidate.onward_edge_kinds,
+                &candidate.onward_edge_directions,
+            )
             {
                 body.push_str(&format!(
                     "   - onward_before: {}\n",
-                    render_typed_convergence_path(onward, edge_kinds)
+                    render_typed_convergence_path(onward, edge_kinds, edge_directions)
                 ));
             }
             body.push('\n');
@@ -1868,13 +1881,28 @@ fn render_convergence(
     }
 }
 
-fn render_typed_convergence_path(nodes: &[String], edge_kinds: &[EdgeKind]) -> String {
+fn render_typed_convergence_path(
+    nodes: &[String],
+    edge_kinds: &[EdgeKind],
+    edge_directions: &[ConvergenceHopDirection],
+) -> String {
     let Some(first) = nodes.first() else {
         return String::new();
     };
     let mut rendered = first.clone();
-    for (kind, node) in edge_kinds.iter().zip(nodes.iter().skip(1)) {
-        rendered.push_str(&format!(" -[{kind}]-> {node}"));
+    for ((kind, direction), node) in edge_kinds
+        .iter()
+        .zip(edge_directions)
+        .zip(nodes.iter().skip(1))
+    {
+        match direction {
+            ConvergenceHopDirection::Forward => {
+                rendered.push_str(&format!(" -[{kind}]-> {node}"));
+            }
+            ConvergenceHopDirection::Reverse => {
+                rendered.push_str(&format!(" <-[{kind}]- {node}"));
+            }
+        }
     }
     rendered
 }
@@ -10869,6 +10897,45 @@ mod tests {
         persist_report(repo, &report).unwrap();
     }
 
+    fn globally_ready_calls_jobs(
+        repo: &Path,
+        node_count: usize,
+        edge_count: usize,
+    ) -> Vec<crate::server::EnrichmentJobRecord> {
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                repo,
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(repo, &job_id, node_count, edge_count);
+        ledger.record_lsp_evidence(
+            repo,
+            &job_id,
+            crate::server::LspEvidenceCoverage {
+                readiness: crate::server::LspEvidenceReadiness::Full,
+                scope: "repo".into(),
+                declared_node_count: node_count,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: node_count,
+                elapsed_ms: 1,
+                circuit_open: false,
+                detail: None,
+                validations: vec![],
+            },
+        );
+        ledger.recent_jobs(repo, 5)
+    }
+
     fn make_search_context<'a>(
         graph_state: &'a GraphState,
         repo_root: &'a Path,
@@ -11101,50 +11168,32 @@ mod tests {
 
     #[tokio::test]
     async fn convergence_executes_discovered_qualified_selectors_as_nonempty_proof() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
         let temp = TempDir::new().unwrap();
         let request = make_scoped_method("Request", "prepare", "requests/models.py");
         let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
         let join = make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
         let boundary = make_scoped_method("HTTPAdapter", "send", "requests/adapters.py");
         let edges = vec![
-            make_edge(&request, &join, EdgeKind::Calls),
-            make_edge(&session, &join, EdgeKind::Calls),
-            make_edge(&join, &boundary, EdgeKind::Calls),
+            make_confirmed_lsp_call(&request, &join),
+            make_confirmed_lsp_call(&session, &join),
+            make_confirmed_lsp_call(&join, &boundary),
         ];
         let graph = make_graph_state_with_edges(vec![request, session, join, boundary], edges);
-        let ledger = crate::server::EnrichmentJobLedger::default();
-        let job_id = match ledger
-            .begin_job(
-                temp.path(),
-                crate::server::EnrichmentCapability::CallReferences,
-                crate::server::EnrichmentScope::Repo,
-                crate::server::EnrichmentTrigger::Explicit,
-                None,
-            )
-            .unwrap()
-        {
-            crate::server::JobStart::Started(job) => job.job_id,
-            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
-        };
-        ledger.mark_completed(temp.path(), &job_id, 4, 3);
-        ledger.record_lsp_evidence(
+        persist_complete_calls_report(
             temp.path(),
-            &job_id,
-            crate::server::LspEvidenceCoverage {
-                readiness: crate::server::LspEvidenceReadiness::Full,
-                scope: "repo".into(),
-                declared_node_count: 4,
-                max_requests: None,
-                max_duration_ms: None,
-                scheduled_requests: 4,
-                elapsed_ms: 1,
-                circuit_open: false,
-                detail: None,
-                validations: vec![],
-            },
+            &graph,
+            &[
+                "requests/models.py",
+                "requests/sessions.py",
+                "requests/adapters.py",
+            ],
         );
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
         let mut ctx = make_search_context(&graph, temp.path());
-        ctx.enrichment_jobs = ledger.recent_jobs(temp.path(), 5);
+        ctx.business_context = &admission;
+        ctx.enrichment_jobs = globally_ready_calls_jobs(temp.path(), 4, 3);
         let params = SearchParams {
             mode: Some("convergence".into()),
             nodes: Some(vec![
@@ -11165,6 +11214,119 @@ mod tests {
         assert!(rendered.contains("PreparedRequest.prepare_method"));
         assert!(rendered.contains("HTTPAdapter.send"));
         assert!(rendered.contains("hydrate_source:"));
+    }
+
+    #[tokio::test]
+    async fn global_ready_never_promotes_detected_calls_to_exact_proof() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let temp = TempDir::new().unwrap();
+        let left = make_scoped_method("Left", "start", "src/left.py");
+        let right = make_scoped_method("Right", "start", "src/right.py");
+        let join = make_scoped_method("Join", "run", "src/join.py");
+        let graph = make_graph_state_with_edges(
+            vec![left.clone(), right.clone(), join.clone()],
+            vec![
+                make_edge(&left, &join, EdgeKind::Calls),
+                make_edge(&right, &join, EdgeKind::Calls),
+            ],
+        );
+        persist_complete_calls_report(
+            temp.path(),
+            &graph,
+            &["src/left.py", "src/right.py", "src/join.py"],
+        );
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let mut ctx = make_search_context(&graph, temp.path());
+        ctx.business_context = &admission;
+        ctx.enrichment_jobs = globally_ready_calls_jobs(temp.path(), 3, 2);
+
+        let rendered = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Left.start".into(), "Right.start".into()]),
+                direction: Some("outgoing".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(1),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(rendered.contains("coverage_unknown"), "{rendered}");
+        assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn convergence_validates_and_renders_the_selected_hop_orientation() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let left = make_scoped_method("Left", "start", "src/left.py");
+        let right = make_scoped_method("Right", "start", "src/right.py");
+        let join = make_scoped_method("Join", "run", "src/join.py");
+
+        let incoming_temp = TempDir::new().unwrap();
+        let incoming_graph = make_graph_state_with_edges(
+            vec![left.clone(), right.clone(), join.clone()],
+            vec![
+                make_confirmed_lsp_call(&join, &left),
+                make_confirmed_lsp_call(&join, &right),
+            ],
+        );
+        persist_complete_calls_report(
+            incoming_temp.path(),
+            &incoming_graph,
+            &["src/left.py", "src/right.py", "src/join.py"],
+        );
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let mut incoming_ctx = make_search_context(&incoming_graph, incoming_temp.path());
+        incoming_ctx.business_context = &admission;
+        let incoming = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Left.start".into(), "Right.start".into()]),
+                direction: Some("incoming".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(1),
+                ..SearchParams::default()
+            },
+            &incoming_ctx,
+        )
+        .await;
+        assert!(incoming.contains("delivery_status: injectable_proof"), "{incoming}");
+        assert!(incoming.contains("Left.start:function <-[calls]-"), "{incoming}");
+
+        let both_temp = TempDir::new().unwrap();
+        let both_graph = make_graph_state_with_edges(
+            vec![left.clone(), right.clone(), join.clone()],
+            vec![
+                make_edge(&left, &join, EdgeKind::Calls),
+                make_confirmed_lsp_call(&join, &left),
+                make_confirmed_lsp_call(&right, &join),
+            ],
+        );
+        persist_complete_calls_report(
+            both_temp.path(),
+            &both_graph,
+            &["src/left.py", "src/right.py", "src/join.py"],
+        );
+        let mut both_ctx = make_search_context(&both_graph, both_temp.path());
+        both_ctx.business_context = &admission;
+        both_ctx.enrichment_jobs = globally_ready_calls_jobs(both_temp.path(), 3, 3);
+        let both = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Left.start".into(), "Right.start".into()]),
+                direction: Some("both".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(1),
+                ..SearchParams::default()
+            },
+            &both_ctx,
+        )
+        .await;
+        assert!(both.contains("coverage_unknown"), "{both}");
+        assert!(both.contains("delivery_status: not_injectable"), "{both}");
     }
 
     #[tokio::test]

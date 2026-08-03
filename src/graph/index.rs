@@ -83,6 +83,15 @@ pub enum ConvergenceDirection {
     Both,
 }
 
+/// Orientation of a traversed hop relative to the stored directed edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConvergenceHopDirection {
+    /// Path order follows the stored edge (`left -> right`).
+    Forward,
+    /// Path order opposes the stored edge (`left <- right`).
+    Reverse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvergenceCandidate {
     pub node_id: String,
@@ -90,9 +99,18 @@ pub struct ConvergenceCandidate {
     pub total_distance: usize,
     pub witnesses: Vec<Vec<String>>,
     pub witness_edge_kinds: Vec<Vec<EdgeKind>>,
+    pub witness_edge_directions: Vec<Vec<ConvergenceHopDirection>>,
     pub onward: Option<Vec<String>>,
     pub onward_edge_kinds: Option<Vec<EdgeKind>>,
+    pub onward_edge_directions: Option<Vec<ConvergenceHopDirection>>,
 }
+
+type BoundedConvergencePath = (
+    usize,
+    Vec<String>,
+    Vec<EdgeKind>,
+    Vec<ConvergenceHopDirection>,
+);
 
 // ---------------------------------------------------------------------------
 // GraphIndex
@@ -576,7 +594,9 @@ impl GraphIndex {
             let onward = before_id.and_then(|boundary| {
                 self.bounded_paths(&node_id, max_hops, filter, direction)
                     .get(boundary)
-                    .map(|(_, path, edge_kinds)| (path.clone(), edge_kinds.clone()))
+                    .map(|(_, path, edge_kinds, edge_directions)| {
+                        (path.clone(), edge_kinds.clone(), edge_directions.clone())
+                    })
             });
             if before_id.is_some() && onward.is_none() {
                 continue;
@@ -597,8 +617,13 @@ impl GraphIndex {
                     .iter()
                     .map(|map| map.get(&node_id).expect("intersection member").2.clone())
                     .collect(),
-                onward: onward.as_ref().map(|(path, _)| path.clone()),
-                onward_edge_kinds: onward.map(|(_, edge_kinds)| edge_kinds),
+                witness_edge_directions: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").3.clone())
+                    .collect(),
+                onward: onward.as_ref().map(|(path, _, _)| path.clone()),
+                onward_edge_kinds: onward.as_ref().map(|(_, edge_kinds, _)| edge_kinds.clone()),
+                onward_edge_directions: onward.map(|(_, _, edge_directions)| edge_directions),
             });
         }
         candidates.sort_by(|left, right| {
@@ -617,13 +642,13 @@ impl GraphIndex {
         max_hops: usize,
         edge_types: &[EdgeKind],
         direction: ConvergenceDirection,
-    ) -> BTreeMap<String, (usize, Vec<String>, Vec<EdgeKind>)> {
+    ) -> BTreeMap<String, BoundedConvergencePath> {
         let Some(&start) = self.node_lookup.get(start_id) else {
             return BTreeMap::new();
         };
         let mut result = BTreeMap::from([(
             start_id.to_string(),
-            (0, vec![start_id.to_string()], Vec::new()),
+            (0, vec![start_id.to_string()], Vec::new(), Vec::new()),
         )]);
         let mut queue = VecDeque::from([(start, 0usize)]);
         while let Some((current, depth)) = queue.pop_front() {
@@ -648,20 +673,25 @@ impl GraphIndex {
                     neighbors.push((
                         self.graph[next].id.clone(),
                         edge.weight().edge_type.clone(),
+                        match graph_direction {
+                            Direction::Outgoing => ConvergenceHopDirection::Forward,
+                            Direction::Incoming => ConvergenceHopDirection::Reverse,
+                        },
                         next,
                     ));
                 }
             }
             neighbors.sort_by(|left, right| {
-                (&left.0, &left.1).cmp(&(&right.0, &right.1))
+                (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2))
             });
             neighbors.dedup_by(|left, right| left.0 == right.0);
-            let (_, current_path, current_edge_kinds) = result
+            let (_, current_path, current_edge_kinds, current_edge_directions) = result
                 .get(&self.graph[current].id)
                 .expect("queued nodes have a path");
             let current_path = current_path.clone();
             let current_edge_kinds = current_edge_kinds.clone();
-            for (next_id, edge_kind, next) in neighbors {
+            let current_edge_directions = current_edge_directions.clone();
+            for (next_id, edge_kind, edge_direction, next) in neighbors {
                 if result.contains_key(&next_id) {
                     continue;
                 }
@@ -669,7 +699,12 @@ impl GraphIndex {
                 path.push(next_id.clone());
                 let mut path_edge_kinds = current_edge_kinds.clone();
                 path_edge_kinds.push(edge_kind);
-                result.insert(next_id, (depth + 1, path, path_edge_kinds));
+                let mut path_edge_directions = current_edge_directions.clone();
+                path_edge_directions.push(edge_direction);
+                result.insert(
+                    next_id,
+                    (depth + 1, path, path_edge_kinds, path_edge_directions),
+                );
                 queue.push_back((next, depth + 1));
             }
         }
@@ -3389,10 +3424,64 @@ mod tests {
             vec![vec![EdgeKind::Calls], vec![EdgeKind::Calls]]
         );
         assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Forward],
+                vec![ConvergenceHopDirection::Forward]
+            ]
+        );
+        assert_eq!(
             result[0].onward,
             Some(vec!["join".into(), "boundary".into()])
         );
         assert_eq!(result[0].onward_edge_kinds, Some(vec![EdgeKind::Calls]));
+        assert_eq!(
+            result[0].onward_edge_directions,
+            Some(vec![ConvergenceHopDirection::Forward])
+        );
+    }
+
+    #[test]
+    fn convergence_preserves_incoming_orientation_and_both_is_deterministic() {
+        let mut incoming = GraphIndex::new();
+        incoming.add_edge("join", "fn", "left", "fn", EdgeKind::Calls);
+        incoming.add_edge("join", "fn", "right", "fn", EdgeKind::Calls);
+        let result = incoming.convergence(
+            &["left".into(), "right".into()],
+            None,
+            1,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Incoming,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Reverse],
+                vec![ConvergenceHopDirection::Reverse]
+            ]
+        );
+
+        let mut both = GraphIndex::new();
+        both.add_edge("left", "fn", "join", "fn", EdgeKind::Calls);
+        both.add_edge("join", "fn", "left", "fn", EdgeKind::Calls);
+        both.add_edge("right", "fn", "join", "fn", EdgeKind::Calls);
+        let result = both.convergence(
+            &["left".into(), "right".into()],
+            None,
+            1,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Both,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Forward],
+                vec![ConvergenceHopDirection::Forward]
+            ],
+            "parallel opposite edges choose the stable forward traversal"
+        );
     }
 
     #[test]
