@@ -76,6 +76,22 @@ pub struct EdgeRef {
     pub edge_type: EdgeKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergenceCandidate {
+    pub node_id: String,
+    pub max_distance: usize,
+    pub total_distance: usize,
+    pub witnesses: Vec<Vec<String>>,
+    pub onward: Option<Vec<String>>,
+}
+
 // ---------------------------------------------------------------------------
 // GraphIndex
 // ---------------------------------------------------------------------------
@@ -521,6 +537,125 @@ impl GraphIndex {
             .map(|idx| sub[idx].clone())
             .collect();
         Some(result)
+    }
+
+    pub fn convergence(
+        &self,
+        source_ids: &[String],
+        before_id: Option<&str>,
+        max_hops: usize,
+        edge_types: Option<&[EdgeKind]>,
+        direction: ConvergenceDirection,
+    ) -> Vec<ConvergenceCandidate> {
+        if source_ids.len() < 2 || max_hops == 0 {
+            return Vec::new();
+        }
+        let calls_default = [EdgeKind::Calls];
+        let filter = edge_types.unwrap_or(&calls_default);
+        let maps = source_ids
+            .iter()
+            .map(|source| self.bounded_paths(source, max_hops, filter, direction))
+            .collect::<Vec<_>>();
+        if maps.iter().any(BTreeMap::is_empty) {
+            return Vec::new();
+        }
+        let mut common = maps[0]
+            .keys()
+            .filter(|id| maps[1..].iter().all(|map| map.contains_key(*id)))
+            .cloned()
+            .collect::<Vec<_>>();
+        common.sort();
+
+        let mut candidates = Vec::new();
+        for node_id in common {
+            if before_id == Some(node_id.as_str()) {
+                continue;
+            }
+            let onward = before_id.and_then(|boundary| {
+                self.bounded_paths(&node_id, max_hops, filter, direction)
+                    .get(boundary)
+                    .map(|(_, path)| path.clone())
+            });
+            if before_id.is_some() && onward.is_none() {
+                continue;
+            }
+            let distances = maps
+                .iter()
+                .map(|map| map.get(&node_id).expect("intersection member").0)
+                .collect::<Vec<_>>();
+            candidates.push(ConvergenceCandidate {
+                node_id: node_id.clone(),
+                max_distance: distances.iter().copied().max().unwrap_or(0),
+                total_distance: distances.iter().sum(),
+                witnesses: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").1.clone())
+                    .collect(),
+                onward,
+            });
+        }
+        candidates.sort_by(|left, right| {
+            (left.max_distance, left.total_distance, &left.node_id).cmp(&(
+                right.max_distance,
+                right.total_distance,
+                &right.node_id,
+            ))
+        });
+        candidates
+    }
+
+    fn bounded_paths(
+        &self,
+        start_id: &str,
+        max_hops: usize,
+        edge_types: &[EdgeKind],
+        direction: ConvergenceDirection,
+    ) -> BTreeMap<String, (usize, Vec<String>)> {
+        let Some(&start) = self.node_lookup.get(start_id) else {
+            return BTreeMap::new();
+        };
+        let mut result = BTreeMap::from([(start_id.to_string(), (0, vec![start_id.to_string()]))]);
+        let mut queue = VecDeque::from([(start, 0usize)]);
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            let directions: &[Direction] = match direction {
+                ConvergenceDirection::Outgoing => &[Direction::Outgoing],
+                ConvergenceDirection::Incoming => &[Direction::Incoming],
+                ConvergenceDirection::Both => &[Direction::Outgoing, Direction::Incoming],
+            };
+            let mut neighbors = Vec::new();
+            for graph_direction in directions {
+                for edge in self.graph.edges_directed(current, *graph_direction) {
+                    if !edge_types.contains(&edge.weight().edge_type) {
+                        continue;
+                    }
+                    let next = match graph_direction {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    neighbors.push((self.graph[next].id.clone(), next));
+                }
+            }
+            neighbors.sort_by(|left, right| left.0.cmp(&right.0));
+            neighbors.dedup_by(|left, right| left.0 == right.0);
+            let current_path = result
+                .get(&self.graph[current].id)
+                .expect("queued nodes have a path")
+                .1
+                .clone();
+            for (next_id, next) in neighbors {
+                if result.contains_key(&next_id) {
+                    continue;
+                }
+                let mut path = current_path.clone();
+                path.push(next_id.clone());
+                result.insert(next_id, (depth + 1, path));
+                queue.push_back((next, depth + 1));
+            }
+        }
+        result
     }
 
     /// Compute edge-type weighted PageRank importance scores.
@@ -3209,6 +3344,101 @@ mod tests {
     fn test_shortest_path_nonexistent_node() {
         let index = GraphIndex::new();
         assert!(index.shortest_path("ghost1", "ghost2", None).is_none());
+    }
+
+    #[test]
+    fn convergence_diamond_returns_ranked_witnesses_and_boundary_path() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("join", "fn", "boundary", "fn", EdgeKind::Calls);
+
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            Some("boundary"),
+            3,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert!(result.iter().all(|candidate| candidate.node_id != "boundary"));
+        assert_eq!(result[0].max_distance, 1);
+        assert_eq!(result[0].total_distance, 2);
+        assert_eq!(result[0].witnesses[0], vec!["left", "join"]);
+        assert_eq!(result[0].witnesses[1], vec!["right", "join"]);
+        assert_eq!(
+            result[0].onward,
+            Some(vec!["join".into(), "boundary".into()])
+        );
+    }
+
+    #[test]
+    fn convergence_is_cycle_safe_and_uses_stable_id_for_distance_ties() {
+        let mut index = GraphIndex::new();
+        for source in ["left", "right"] {
+            index.add_edge(source, "fn", "z_join", "fn", EdgeKind::Calls);
+            index.add_edge(source, "fn", "a_join", "fn", EdgeKind::Calls);
+        }
+        index.add_edge("a_join", "fn", "left", "fn", EdgeKind::Calls);
+
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            None,
+            3,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "a_join");
+        assert_eq!(result[1].node_id, "z_join");
+    }
+
+    #[test]
+    fn convergence_honors_edge_filter_depth_and_boundary_route() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "l1", "fn", EdgeKind::Calls);
+        index.add_edge("l1", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "join", "fn", EdgeKind::DependsOn);
+        index.add_edge("join", "fn", "boundary", "fn", EdgeKind::Calls);
+        for source in ["left", "right"] {
+            index.add_edge(source, "fn", "dead_join", "fn", EdgeKind::Calls);
+        }
+
+        assert!(
+            index
+                .convergence(
+                    &["left".into(), "right".into()],
+                    None,
+                    1,
+                    Some(&[EdgeKind::Calls, EdgeKind::DependsOn]),
+                    ConvergenceDirection::Outgoing,
+                )
+                .iter()
+                .all(|candidate| candidate.node_id != "join")
+        );
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            Some("boundary"),
+            3,
+            Some(&[EdgeKind::Calls, EdgeKind::DependsOn]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert!(result.iter().all(|candidate| candidate.node_id != "dead_join"));
+    }
+
+    #[test]
+    fn convergence_returns_empty_for_missing_or_disconnected_sources() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "b", "fn", EdgeKind::Calls);
+        assert!(index.convergence(
+            &["left".into(), "missing".into()], None, 2, None,
+            ConvergenceDirection::Outgoing,
+        ).is_empty());
+        assert!(index.convergence(
+            &["left".into(), "right".into()], None, 2, None,
+            ConvergenceDirection::Outgoing,
+        ).is_empty());
     }
 
     #[test]

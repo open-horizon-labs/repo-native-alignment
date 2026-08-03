@@ -504,6 +504,18 @@ fn collect_nodes(
 
             let mut metadata = BTreeMap::new();
 
+            let identity_name = if node_kind == NodeKind::Function {
+                parent_scope
+                    .as_ref()
+                    .map(|(scope_name, _)| format!("{scope_name}.{name}"))
+                    .unwrap_or_else(|| name.clone())
+            } else {
+                name.clone()
+            };
+            if identity_name != name {
+                metadata.insert("lexical_name".to_string(), name.clone());
+            }
+
             // Parent scope.
             if let Some((scope_name, scope_kind)) = parent_scope {
                 metadata.insert("parent_scope".to_string(), scope_name.clone());
@@ -765,7 +777,7 @@ fn collect_nodes(
             let node_id = NodeId {
                 root: String::new(),
                 file: path.to_path_buf(),
-                name: name.clone(),
+                name: identity_name.clone(),
                 kind: node_kind.clone(),
             };
 
@@ -795,7 +807,7 @@ fn collect_nodes(
                     let fn_id = NodeId {
                         root: String::new(),
                         file: path.to_path_buf(),
-                        name: name.clone(),
+                        name: identity_name.clone(),
                         kind: NodeKind::Function,
                     };
                     // Parameter types
@@ -899,7 +911,7 @@ fn collect_nodes(
                     to: NodeId {
                         root: String::new(),
                         file: path.to_path_buf(),
-                        name: name.clone(),
+                        name: identity_name.clone(),
                         kind: node_kind.clone(),
                     },
                     kind: edge_kind,
@@ -2390,30 +2402,53 @@ fn detect_same_file_calls(
         return Vec::new();
     }
 
-    // Build a set of function names defined in this file for O(1) lookup.
-    let file_fns: std::collections::HashSet<&str> = nodes
+    let mut file_fns = std::collections::BTreeMap::<String, Vec<(NodeId, Option<String>)>>::new();
+    let mut fn_by_line = std::collections::HashMap::<usize, (NodeId, Option<String>)>::new();
+    for function in nodes
         .iter()
-        .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
-        .map(|n| n.id.name.as_str())
-        .collect();
+        .filter(|node| node.id.kind == NodeKind::Function && node.id.file == path)
+    {
+        let lexical = function
+            .metadata
+            .get("lexical_name")
+            .cloned()
+            .unwrap_or_else(|| function.id.name.clone());
+        let scope = function.metadata.get("parent_scope").cloned();
+        file_fns
+            .entry(lexical)
+            .or_default()
+            .push((function.id.clone(), scope.clone()));
+        fn_by_line.insert(function.line_start, (function.id.clone(), scope));
+    }
+    for candidates in file_fns.values_mut() {
+        candidates.sort_by(|left, right| left.0.to_stable_id().cmp(&right.0.to_stable_id()));
+    }
 
     if file_fns.is_empty() {
         return Vec::new();
     }
 
     let mut edges = Vec::new();
-    collect_calls(root, path, source, config, &file_fns, &None, &mut edges);
+    collect_calls(
+        root,
+        source,
+        config,
+        &file_fns,
+        &fn_by_line,
+        &None,
+        &mut edges,
+    );
     edges
 }
 
 /// Recursive walk that collects Calls edges for same-file function calls.
 fn collect_calls(
     node: tree_sitter::Node,
-    path: &Path,
     source: &[u8],
     config: &LangConfig,
-    file_fns: &std::collections::HashSet<&str>,
-    enclosing_fn: &Option<String>,
+    file_fns: &std::collections::BTreeMap<String, Vec<(NodeId, Option<String>)>>,
+    fn_by_line: &std::collections::HashMap<usize, (NodeId, Option<String>)>,
+    enclosing_fn: &Option<(NodeId, Option<String>)>,
     edges: &mut Vec<Edge>,
 ) {
     let kind = node.kind();
@@ -2424,9 +2459,7 @@ fn collect_calls(
         .iter()
         .any(|(ts_kind, nk)| *ts_kind == kind && *nk == NodeKind::Function);
     let new_enclosing = if is_fn_def {
-        node.child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok())
-            .map(|s| s.to_string())
+        fn_by_line.get(&(node.start_position().row + 1)).cloned()
     } else {
         None
     };
@@ -2437,7 +2470,7 @@ fn collect_calls(
     };
 
     // If we're inside a function, check for call expressions.
-    if let Some(caller_name) = enclosing
+    if let Some((caller_id, caller_scope)) = enclosing
         && let Some((call_kind, name_field)) = config.call_expr_kinds
         && kind == call_kind
     {
@@ -2457,25 +2490,30 @@ fn collect_calls(
                     && let Ok(callee_name) = callee_node.utf8_text(source)
                 {
                     let callee_name = callee_name.trim();
-                    if file_fns.contains(callee_name) && callee_name != caller_name {
+                    if let Some(candidates) = file_fns.get(callee_name) {
+                        let same_scope = candidates
+                            .iter()
+                            .filter(|(_, scope)| scope == caller_scope)
+                            .collect::<Vec<_>>();
+                        let resolved = if same_scope.len() == 1 {
+                            Some(same_scope[0].0.clone())
+                        } else if candidates.len() == 1 {
+                            Some(candidates[0].0.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(callee_id) = resolved
+                            && callee_id != *caller_id
+                        {
                         edges.push(Edge {
-                            from: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: caller_name.to_string(),
-                                kind: NodeKind::Function,
-                            },
-                            to: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: callee_name.to_string(),
-                                kind: NodeKind::Function,
-                            },
+                            from: caller_id.clone(),
+                            to: callee_id,
                             kind: EdgeKind::Calls,
                             source: ExtractionSource::TreeSitter,
                             confidence: Confidence::Detected,
                             evidence: Vec::new(),
                         });
+                        }
                     }
                 }
             }
@@ -2485,7 +2523,7 @@ fn collect_calls(
     // Recurse into children, passing the (possibly updated) enclosing context.
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_calls(child, path, source, config, file_fns, enclosing, edges);
+            collect_calls(child, source, config, file_fns, fn_by_line, enclosing, edges);
         }
     }
 }
@@ -2854,7 +2892,7 @@ pub fn hello() {}
         assert!(
             defines_edges.iter().any(|e| e.from.name == "Foo"
                 && e.from.kind == NodeKind::Struct
-                && e.to.name == "do_thing"
+                && e.to.name == "Foo.do_thing"
                 && e.to.kind == NodeKind::Function),
             "Should have Defines edge from Foo:struct to do_thing method, got: {:?}",
             defines_edges
@@ -2896,7 +2934,7 @@ pub fn hello() {}
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
         assert!(
-            depends_on_edges.iter().any(|e| e.from.name == "do_thing"
+            depends_on_edges.iter().any(|e| e.from.name == "Foo.do_thing"
                 && e.from.kind == NodeKind::Function
                 && e.to.name == "Bar"
                 && e.to.kind == NodeKind::Struct),
@@ -3332,7 +3370,11 @@ class Handler {
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(std::path::Path::new("Test.java"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Handler.handle")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // Java tree-sitter doesn't emit else_clause; if_statement + for_statement = 2 branches → cc = 3
         assert_eq!(cc, 3, "if + for = 2 branches + 1 base = 3, got {}", cc);
@@ -3717,7 +3759,11 @@ def handle():
     pass
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handle")
+            .unwrap();
         assert_eq!(
             handle.metadata.get("decorators").map(|s| s.as_str()),
             Some("@app.route(\"/api\")"),
@@ -3736,7 +3782,11 @@ def handle():
     pass
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handle")
+            .unwrap();
         let decorators = handle
             .metadata
             .get("decorators")
@@ -3868,7 +3918,11 @@ public class UserController {
 }
 "#;
         let result = ext.run(Path::new("UserController.java"), code).unwrap();
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserController.handle")
+            .unwrap();
         assert_eq!(
             handle.metadata.get("decorators").map(|s| s.as_str()),
             Some("@Override"),
@@ -3892,7 +3946,7 @@ public class UserController {
         let func = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "getUsers")
+            .find(|n| n.id.name == "UserController.getUsers")
             .unwrap();
         let decorators = func
             .metadata
@@ -3994,13 +4048,21 @@ def plain():
     pass
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handle")
+            .unwrap();
         assert!(
             handle.metadata.get("decorators").is_some(),
             "handle should have decorators"
         );
 
-        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        let plain = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "plain")
+            .unwrap();
         assert!(
             plain.metadata.get("decorators").is_none(),
             "Undecorated plain() should NOT inherit decorators from handle(), got: {:?}",
@@ -4073,13 +4135,21 @@ public class UserController {
 }
 "#;
         let result = ext.run(Path::new("UserController.java"), code).unwrap();
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserController.handle")
+            .unwrap();
         assert!(
             handle.metadata.get("decorators").is_some(),
             "handle should have @Override"
         );
 
-        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        let plain = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserController.plain")
+            .unwrap();
         assert!(
             plain.metadata.get("decorators").is_none(),
             "plain() should NOT inherit @Override from handle(), got: {:?}",
@@ -4382,7 +4452,7 @@ public class UserController {
         let method = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "identity")
+            .find(|n| n.id.name == "Util.identity")
             .unwrap();
         let tp = method
             .metadata
@@ -5250,7 +5320,7 @@ class PaymentProcessor:
                 .any(|node| node.id.name == "application/json"),
             "ordinary Python literals must remain searchable synthetic Const nodes"
         );
-        for symbol_name in ["PaymentProcessor", "process"] {
+        for symbol_name in ["PaymentProcessor", "PaymentProcessor.process"] {
             let symbol = result
                 .nodes
                 .iter()
@@ -5959,7 +6029,7 @@ class ItemController {
             "should emit 1 Implements edge for NestJS @Post, got edges: {:?}",
             implements
         );
-        assert_eq!(implements[0].to.name, "create");
+        assert_eq!(implements[0].to.name, "ItemController.create");
     }
 
     /// Multiple route handlers in the same file each get their own Implements edge.
@@ -6498,6 +6568,71 @@ fn recurse(n: i32) -> i32 {
                 .map(|e| format!("{} -> {}", e.from.name, e.to.name))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn python_methods_use_owner_qualified_stable_identities() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+class Request:
+    def prepare(self):
+        return 1
+
+class Session:
+    def prepare(self):
+        return 2
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("requests/models.py"), code)
+            .unwrap();
+        let functions = result
+            .nodes
+            .iter()
+            .filter(|node| node.id.kind == NodeKind::Function)
+            .collect::<Vec<_>>();
+        assert!(functions.iter().any(|node| {
+            node.id.name == "Request.prepare"
+                && node.metadata.get("lexical_name").map(String::as_str) == Some("prepare")
+        }));
+        assert!(functions.iter().any(|node| {
+            node.id.name == "Session.prepare"
+                && node.metadata.get("lexical_name").map(String::as_str) == Some("prepare")
+        }));
+        assert_ne!(functions[0].stable_id(), functions[1].stable_id());
+    }
+
+    #[test]
+    fn same_file_calls_remap_duplicate_method_names_within_their_owner_scope() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+class Request:
+    def prepare(self):
+        return finish()
+
+    def finish(self):
+        return 1
+
+class Session:
+    def prepare(self):
+        return finish()
+
+    def finish(self):
+        return 2
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("requests/models.py"), code)
+            .unwrap();
+        let calls = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls)
+            .map(|edge| (edge.from.name.as_str(), edge.to.name.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(calls.contains(&("Request.prepare", "Request.finish")));
+        assert!(calls.contains(&("Session.prepare", "Session.finish")));
+        assert!(!calls.contains(&("Request.prepare", "Session.finish")));
+        assert!(!calls.contains(&("Session.prepare", "Request.finish")));
     }
 
     // -----------------------------------------------------------------------

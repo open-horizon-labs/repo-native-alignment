@@ -1419,13 +1419,13 @@ interface Service {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find interface method serve");
 
         let stop = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.stop" && n.id.kind == NodeKind::Function);
         assert!(stop.is_some(), "Should find interface method stop");
 
         // Methods should have parent_scope pointing to the interface
@@ -1464,7 +1464,7 @@ class MyService {
         let create = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.create" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             create.metadata.get("is_static").map(|s| s.as_str()),
@@ -1475,7 +1475,7 @@ class MyService {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.serve" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             serve.metadata.get("is_static").map(|s| s.as_str()),
@@ -1486,7 +1486,7 @@ class MyService {
         let count = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.count" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             count.metadata.get("is_static").map(|s| s.as_str()),

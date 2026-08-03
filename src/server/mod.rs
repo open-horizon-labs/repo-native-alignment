@@ -527,6 +527,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             tools: vec![
                 OutcomeProgress::tool(),
                 Search::tool(),
+                Convergence::tool(),
                 ListRoots::tool(),
                 RepoMap::tool(),
             ],
@@ -579,6 +580,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search" => {
                 let args: Search = parse_args(params.arguments)?;
                 self.handle_search(args).await
+            }
+
+            "convergence" => {
+                let args: Convergence = parse_args(params.arguments)?;
+                self.handle_search(args.into()).await
             }
 
             "list_roots" => {

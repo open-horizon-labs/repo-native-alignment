@@ -215,7 +215,7 @@ public class MyService {
         let create = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Create" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.Create" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             create.metadata.get("is_static").map(|s| s.as_str()),
@@ -226,7 +226,7 @@ public class MyService {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Serve" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.Serve" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             serve.metadata.get("is_static").map(|s| s.as_str()),
@@ -237,7 +237,7 @@ public class MyService {
         let count = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Count" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.Count" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             count.metadata.get("is_static").map(|s| s.as_str()),
@@ -260,7 +260,7 @@ public class Foo {
         let ctor = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.Foo" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             ctor.metadata.get("is_static").map(|s| s.as_str()),

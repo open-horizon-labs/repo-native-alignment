@@ -16,7 +16,7 @@ use crate::embed::{
     ObservedSearchOutcome, ScoreAdjustment, ScoreNormalization, SearchFilters, SearchMode,
     SearchOutcome, SearchResult, SearchScoreProvenance, TestResultPolicy,
 };
-use crate::graph::index::GraphIndex;
+use crate::graph::index::{ConvergenceDirection, GraphIndex};
 use crate::graph::{Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
@@ -128,6 +128,18 @@ fn validate_named_values(
 }
 
 fn validate_search_experience(params: &SearchParams) -> Result<(), String> {
+    let traversal_mode = params.normalized_mode();
+    if params.before.is_some() && traversal_mode != Some("convergence") {
+        return Err("before requires mode=convergence".into());
+    }
+    if traversal_mode == Some("convergence") {
+        if params.context_mode.is_some() {
+            return Err("mode=convergence cannot be combined with context_mode".into());
+        }
+        if params.depth.or(params.hops).unwrap_or(3) > 32 {
+            return Err("convergence depth cannot exceed 32".into());
+        }
+    }
     if let Some(projection) = params.projection.as_deref().map(str::trim)
         && !matches!(projection, "agent" | "evidence")
     {
@@ -1124,7 +1136,10 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
                 .is_some_and(|node| !node.trim().is_empty())
             || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
             || params.target_subsystem.is_some());
-    if legacy_dispatch && let Some(controls) = legacy_product_controls(params) {
+    if legacy_dispatch
+        && params.normalized_mode() != Some("convergence")
+        && let Some(controls) = legacy_product_controls(params)
+    {
         return format!(
             "Invalid search context: product controls ({controls}) cannot be combined with legacy node/nodes/traversal/target_subsystem dispatch. Remove those controls or use flat/task context search."
         );
@@ -1197,6 +1212,7 @@ fn normalize_product_context_controls(params: &SearchParams) -> SearchParams {
     normalized.context_roles = normalize_list(&params.context_roles);
     normalized.context_facets = normalize_list(&params.context_facets);
     normalized.edge_types = normalize_list(&params.edge_types);
+    normalized.before = normalize_scalar(&params.before);
     normalized
 }
 
@@ -1217,6 +1233,10 @@ async fn legacy_search_dispatch(params: &SearchParams, ctx: &SearchContext<'_>) 
     } else {
         false
     };
+
+    if params.normalized_mode() == Some("convergence") {
+        return search_convergence(params, ctx);
+    }
 
     if let Some(ref node_ids) = params.nodes {
         let node_ids: Vec<&str> = node_ids
@@ -1269,6 +1289,437 @@ async fn legacy_search_dispatch(params: &SearchParams, ctx: &SearchContext<'_>) 
             semantic_index_available,
         )
         .await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectorBinding {
+    Resolved(String),
+    Ambiguous(Vec<String>),
+    Missing,
+}
+
+fn bind_convergence_selector(raw: &str, graph: &GraphState) -> SelectorBinding {
+    let selector = raw.trim();
+    if selector.is_empty() {
+        return SelectorBinding::Missing;
+    }
+    let index = graph.node_index_map();
+    if index.contains_key(selector) {
+        return SelectorBinding::Resolved(selector.to_string());
+    }
+    let mut root_stripped = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let stable = node.stable_id();
+            stable
+                .split_once(':')
+                .is_some_and(|(_, suffix)| suffix == selector)
+                .then_some(stable)
+        })
+        .collect::<Vec<_>>();
+    root_stripped.sort();
+    root_stripped.dedup();
+    match root_stripped.len() {
+        1 => return SelectorBinding::Resolved(root_stripped.remove(0)),
+        2.. => return SelectorBinding::Ambiguous(root_stripped),
+        _ => {}
+    }
+
+    let qualified = selector.replace("::", ".");
+    let mut matches = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            let canonical = node.id.name.replace("::", ".");
+            canonical == qualified
+                || node
+                    .metadata
+                    .get("parent_scope")
+                    .zip(node.metadata.get("lexical_name"))
+                    .is_some_and(|(owner, lexical)| {
+                        format!("{owner}.{lexical}").replace("::", ".") == qualified
+                    })
+        })
+        .map(Node::stable_id)
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() && !selector.contains(':') && !selector.contains('.') {
+        matches = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.metadata
+                    .get("lexical_name")
+                    .map(String::as_str)
+                    .unwrap_or_else(|| node.id.name.rsplit(['.', ':']).next().unwrap_or(&node.id.name))
+                    == selector
+            })
+            .map(Node::stable_id)
+            .collect();
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => SelectorBinding::Missing,
+        1 => SelectorBinding::Resolved(matches.remove(0)),
+        _ => SelectorBinding::Ambiguous(matches),
+    }
+}
+
+fn convergence_calls_coverage_ready(ctx: &SearchContext<'_>) -> bool {
+    if ctx
+        .lsp_status
+        .is_some_and(|status| status.call_reference_readiness().state == CapabilityReadinessState::Ready)
+    {
+        return true;
+    }
+    ctx.enrichment_jobs.iter().any(|job| {
+        job.capability == EnrichmentCapability::CallReferences
+            && job.scope == EnrichmentScope::Repo
+            && job.state == EnrichmentJobState::Completed
+            && job.failure.is_none()
+            && job
+                .lsp_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.readiness.as_str() == "full")
+    })
+}
+
+fn scoped_convergence_calls_candidates(
+    ctx: &SearchContext<'_>,
+    candidates: &[crate::graph::index::ConvergenceCandidate],
+    direction: ConvergenceDirection,
+) -> Result<Vec<crate::graph::index::ConvergenceCandidate>, String> {
+    let report = crate::lsp_completeness::load_report(ctx.repo_root)
+        .map_err(|error| format!("full LSP report unavailable: {error}"))?;
+    let expected = crate::lsp_completeness::current_report_identity(
+        ctx.repo_root,
+        ctx.business_context.mode(),
+    )
+    .map_err(|error| format!("current LSP report identity unavailable: {error}"))?;
+    if !report.compatibility_violations(&expected).is_empty() {
+        return Err("LSP report identity or digest does not match the current checkout".to_string());
+    }
+    let current_graph_digest = crate::lsp_completeness::graph_snapshot_digest(
+        &ctx.graph_state.nodes,
+        &ctx.graph_state.edges,
+    );
+    if report.graph_snapshot_digest != current_graph_digest {
+        return Err("LSP report graph snapshot digest does not match the delivered graph".to_string());
+    }
+
+    let node_index = ctx.graph_state.node_index_map();
+    let edge_is_exact = |left: &str, right: &str| {
+        ctx.graph_state.edges.iter().any(|edge| {
+            if edge.kind != EdgeKind::Calls
+                || edge.source != ExtractionSource::Lsp
+                || edge.confidence != crate::graph::Confidence::Confirmed
+            {
+                return false;
+            }
+            let from = edge.from.to_stable_id();
+            let to = edge.to.to_stable_id();
+            match direction {
+                ConvergenceDirection::Outgoing => from == left && to == right,
+                ConvergenceDirection::Incoming => from == right && to == left,
+                ConvergenceDirection::Both => {
+                    (from == left && to == right) || (from == right && to == left)
+                }
+            }
+        })
+    };
+
+    let mut proven = Vec::new();
+    for candidate in candidates {
+        let paths = candidate
+            .witnesses
+            .iter()
+            .chain(candidate.onward.iter())
+            .collect::<Vec<_>>();
+        let all_hops_exact = paths.iter().all(|path| {
+            path.windows(2)
+                .all(|pair| edge_is_exact(&pair[0], &pair[1]))
+        });
+        if !all_hops_exact {
+            continue;
+        }
+        let relevant_files = paths
+            .iter()
+            .flat_map(|path| path.iter())
+            .filter_map(|id| node_index.get(id).map(|index| &ctx.graph_state.nodes[*index]))
+            .map(|node| node.id.file.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        let every_node_bound = paths
+            .iter()
+            .flat_map(|path| path.iter())
+            .all(|id| node_index.contains_key(id));
+        if !every_node_bound
+            || report
+                .call_hierarchy_paths_covered(relevant_files.iter().map(String::as_str))
+                .is_err()
+        {
+            continue;
+        }
+        proven.push(candidate.clone());
+    }
+    if proven.is_empty() {
+        Err("no candidate has complete relevant-file evidence and exact persisted LSP Calls hops"
+            .to_string())
+    } else {
+        Ok(proven)
+    }
+}
+
+fn bounded_ambiguous_ids(ids: &[String]) -> String {
+    const MAX_IDS: usize = 8;
+    let mut rendered = ids
+        .iter()
+        .take(MAX_IDS)
+        .map(|id| format!("`{id}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ids.len() > MAX_IDS {
+        rendered.push_str(&format!(", … {} more", ids.len() - MAX_IDS));
+    }
+    rendered
+}
+
+fn convergence_unresolved(params: &SearchParams, detail: &str) -> String {
+    let max_bytes = params.max_output_bytes.unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
+    let max_tokens = params.max_output_tokens.unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
+    let mut detail = detail.to_string();
+    loop {
+        let body = format!(
+            "## Convergence unresolved\n\n- delivery_status: not_injectable\n- injected_context: false\n- proof_records: 0\n- delivered_handles: 0\n- detail: {detail}\n- lexical_fallback: disabled\n"
+        );
+        let rendered = convergence_accounted(body);
+        if rendered.len() <= max_bytes
+            && rendered.chars().count().saturating_add(3) / 4 <= max_tokens
+        {
+            return rendered;
+        }
+        if detail.pop().is_none() {
+            return rendered;
+        }
+    }
+}
+
+fn search_convergence(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    let selectors = params.nodes.as_deref().unwrap_or_default();
+    if selectors.len() < 2 {
+        return convergence_unresolved(params, "at least two source selectors are required");
+    }
+    let mut sources = Vec::new();
+    let mut bindings = Vec::new();
+    let mut failures = Vec::new();
+    for selector in selectors {
+        match bind_convergence_selector(selector, ctx.graph_state) {
+            SelectorBinding::Resolved(id) => {
+                bindings.push((selector.trim().to_string(), id.clone()));
+                if !sources.contains(&id) {
+                    sources.push(id);
+                }
+            }
+            SelectorBinding::Ambiguous(ids) => failures.push(format!(
+                "ambiguous `{}` => [{}]",
+                selector.trim(),
+                bounded_ambiguous_ids(&ids)
+            )),
+            SelectorBinding::Missing => failures.push(format!("unresolved `{}`", selector.trim())),
+        }
+    }
+    let before = params.before.as_deref().and_then(|selector| {
+        match bind_convergence_selector(selector, ctx.graph_state) {
+            SelectorBinding::Resolved(id) => {
+                bindings.push((selector.trim().to_string(), id.clone()));
+                Some(id)
+            }
+            SelectorBinding::Ambiguous(ids) => {
+                failures.push(format!(
+                    "ambiguous `{}` => [{}]",
+                    selector.trim(),
+                    bounded_ambiguous_ids(&ids)
+                ));
+                None
+            }
+            SelectorBinding::Missing => {
+                failures.push(format!("unresolved `{}`", selector.trim()));
+                None
+            }
+        }
+    });
+    if !failures.is_empty() {
+        failures.sort();
+        return convergence_unresolved(params, &failures.join("; "));
+    }
+    if sources.len() < 2 {
+        return convergence_unresolved(
+            params,
+            "source selectors resolved to fewer than two distinct nodes",
+        );
+    }
+
+    let direction = match params.direction.as_deref().unwrap_or("outgoing") {
+        "outgoing" => ConvergenceDirection::Outgoing,
+        "incoming" => ConvergenceDirection::Incoming,
+        "both" => ConvergenceDirection::Both,
+        other => {
+            return convergence_unresolved(params, &format!("unsupported direction `{other}`"));
+        }
+    };
+    let edge_filter = match params.edge_types.as_deref() {
+        Some(labels) => {
+            let mut parsed = Vec::new();
+            for label in labels {
+                let Some(kind) = parse_edge_kind(label) else {
+                    return convergence_unresolved(
+                        params,
+                        &format!("unsupported edge type `{label}`"),
+                    );
+                };
+                parsed.push(kind);
+            }
+            Some(parsed)
+        }
+        None => Some(vec![EdgeKind::Calls]),
+    };
+    let uses_calls = edge_filter
+        .as_deref()
+        .is_some_and(|kinds| kinds.contains(&EdgeKind::Calls));
+    let depth = params.depth.or(params.hops).unwrap_or(3).clamp(1, 32) as usize;
+    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let mut candidates = ctx.graph_state.index.convergence(
+        &sources,
+        before.as_deref(),
+        depth,
+        edge_filter.as_deref(),
+        direction,
+    );
+    if candidates.is_empty() {
+        if uses_calls && !convergence_calls_coverage_ready(ctx) {
+            return convergence_unresolved(
+                params,
+                "no-path cannot be concluded without complete outgoing Calls coverage for every expanded frontier node (coverage_unknown)",
+            );
+        }
+        return convergence_unresolved(
+            params,
+            "no structural convergence witness exists within the requested bound",
+        );
+    }
+    if uses_calls && !convergence_calls_coverage_ready(ctx) {
+        candidates = match scoped_convergence_calls_candidates(ctx, &candidates, direction) {
+            Ok(proven) => proven,
+            Err(detail) => {
+                return convergence_unresolved(
+                    params,
+                    &format!("{detail} (coverage_unknown)"),
+                );
+            }
+        };
+    }
+    render_convergence(
+        params,
+        ctx,
+        &bindings,
+        &sources,
+        before.as_deref(),
+        &candidates[..candidates.len().min(limit)],
+        depth,
+    )
+}
+
+fn render_convergence(
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+    bindings: &[(String, String)],
+    sources: &[String],
+    before: Option<&str>,
+    candidates: &[crate::graph::index::ConvergenceCandidate],
+    depth: usize,
+) -> String {
+    let max_bytes = params.max_output_bytes.unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
+    let max_tokens = params.max_output_tokens.unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
+    let mut retained = candidates.len();
+    loop {
+        let mut body = String::from(
+            "# RNA structural convergence\n\n- delivery_status: injectable_proof\n- injected_context: true\n- semantics: structural proof, not an edit-location verdict\n",
+        );
+        body.push_str(&format!("- depth: {depth}\n- bindings:\n"));
+        for (selector, id) in bindings {
+            body.push_str(&format!("  - `{selector}` => `{id}`\n"));
+        }
+        if let Some(boundary) = before {
+            body.push_str(&format!("- resolved_before: `{boundary}`\n"));
+        }
+        body.push_str("\n## Ranked convergence proofs\n\n");
+        for (rank, candidate) in candidates.iter().take(retained).enumerate() {
+            body.push_str(&format!(
+                "{}. `{}` — max_distance={} total_distance={}\n",
+                rank + 1,
+                candidate.node_id,
+                candidate.max_distance,
+                candidate.total_distance
+            ));
+            if let Some(node) = ctx.graph_state.node_by_stable_id(
+                &candidate.node_id,
+                ctx.graph_state.node_index_map(),
+            ) && node.line_start > 0 && node.line_end >= node.line_start {
+                let handle = HydrationHandle::source(
+                    candidate.node_id.clone(),
+                    ProjectionSourceSpan {
+                        root: node.id.root.clone(),
+                        path: node.id.file.to_string_lossy().into_owned(),
+                        start_line: node.line_start as u32,
+                        end_line: node.line_end as u32,
+                    },
+                ).encode_compact();
+                body.push_str(&format!("   - hydrate_source: `{handle}`\n"));
+            }
+            for (source, witness) in sources.iter().zip(&candidate.witnesses) {
+                body.push_str(&format!(
+                    "   - witness `{source}`: {}\n",
+                    witness.join(" → ")
+                ));
+            }
+            if let Some(onward) = &candidate.onward {
+                body.push_str(&format!("   - onward_before: {}\n", onward.join(" → ")));
+            }
+            body.push('\n');
+        }
+        let rendered = convergence_accounted(body);
+        let chars = rendered.chars().count();
+        if rendered.len() <= max_bytes && chars.saturating_add(3) / 4 <= max_tokens {
+            return rendered;
+        }
+        if retained > 1 {
+            retained -= 1;
+        } else {
+            return convergence_unresolved(
+                params,
+                "render budget cannot retain one complete witness proof",
+            );
+        }
+    }
+}
+
+fn convergence_accounted(body: String) -> String {
+    let mut bytes = body.len();
+    let mut chars = body.chars().count();
+    loop {
+        let footer = format!(
+            "## Render accounting\n\n- total: bytes={bytes} chars={chars} estimated_tokens={}\n- estimate: unicode_chars_div_4_ceiling\n",
+            chars.saturating_add(3) / 4
+        );
+        let next_bytes = body.len() + footer.len();
+        let next_chars = body.chars().count() + footer.chars().count();
+        if (next_bytes, next_chars) == (bytes, chars) {
+            return body + &footer;
+        }
+        bytes = next_bytes;
+        chars = next_chars;
     }
 }
 
@@ -10079,6 +10530,54 @@ mod tests {
         }
     }
 
+    fn make_confirmed_lsp_call(from: &Node, to: &Node) -> crate::graph::Edge {
+        crate::graph::Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::Lsp,
+            confidence: crate::graph::Confidence::Confirmed,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn calls_coverage_file(path: &str) -> crate::lsp_completeness::FileCoverageRecord {
+        use crate::lsp_completeness::{
+            AdvertisedCapability, ExpectedResultKind, FileCoverageRecord, FileRole,
+            FileTerminalStatus, PersistedResults, RequestAttempt, RequestOutcome, ServerIdentity,
+        };
+        FileCoverageRecord {
+            path: path.to_string(),
+            role: FileRole::Source,
+            language: Some("python".to_string()),
+            expected_server: Some(ServerIdentity {
+                name: "fixture-ls".to_string(),
+                version: Some("1.0.0".to_string()),
+                executable_digest: Some("fixture-digest".to_string()),
+            }),
+            advertised_capabilities: vec![AdvertisedCapability {
+                name: "callHierarchyProvider".to_string(),
+                supported: true,
+            }],
+            requests_attempted: vec![RequestAttempt {
+                method: "textDocument/prepareCallHierarchy+callHierarchy/*".to_string(),
+                outcome: RequestOutcome::Completed,
+                result_count: Some(1),
+                duration_ms: Some(1),
+                detail: None,
+            }],
+            expected_results: BTreeSet::from([ExpectedResultKind::CallHierarchy]),
+            expected_result_ids: BTreeSet::new(),
+            persisted_results: PersistedResults {
+                call_hierarchy_edges: 1,
+                provenance: BTreeSet::from(["fixture-call".to_string()]),
+                ..PersistedResults::default()
+            },
+            terminal_status: FileTerminalStatus::Processed { result_count: 1 },
+            exclusion: None,
+        }
+    }
+
     fn make_search_context<'a>(
         graph_state: &'a GraphState,
         repo_root: &'a Path,
@@ -10097,6 +10596,428 @@ mod tests {
             enrichment_jobs: Vec::new(),
             business_context: &BUSINESS_CONTEXT,
         }
+    }
+
+    fn make_scoped_method(owner: &str, method: &str, file: &str) -> Node {
+        let mut node = make_node(
+            &format!("{owner}.{method}"),
+            NodeKind::Function,
+            file,
+        );
+        node.metadata
+            .insert("parent_scope".into(), owner.to_string());
+        node.metadata
+            .insert("lexical_name".into(), method.to_string());
+        node.line_start = 1;
+        node
+    }
+
+    #[test]
+    fn convergence_binding_resolves_owner_qualified_names_and_sorts_bare_ambiguity() {
+        let request = make_scoped_method("Request", "prepare", "requests/models.py");
+        let session = make_scoped_method("Session", "prepare", "requests/sessions.py");
+        let graph = make_graph_state(vec![session.clone(), request.clone()]);
+
+        assert_eq!(
+            bind_convergence_selector("Request.prepare", &graph),
+            SelectorBinding::Resolved(request.stable_id())
+        );
+        assert_eq!(
+            bind_convergence_selector("Session::prepare", &graph),
+            SelectorBinding::Resolved(session.stable_id())
+        );
+        let SelectorBinding::Ambiguous(ids) = bind_convergence_selector("prepare", &graph) else {
+            panic!("bare duplicate method name must be explicitly ambiguous");
+        };
+        let mut expected = vec![request.stable_id(), session.stable_id()];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn convergence_binding_adversarial_matrix_fails_closed_without_fuzzy_matching() {
+        let mut alpha = make_scoped_method("Request", "prepare", "requests/models.py");
+        alpha.id.root = "alpha".into();
+        let mut beta = alpha.clone();
+        beta.id.root = "beta".into();
+        let mut unique = make_scoped_method(
+            "Session",
+            "prepare_request",
+            "requests/sessions.py",
+        );
+        unique.id.root = "alpha".into();
+        let graph = make_graph_state(vec![beta.clone(), unique.clone(), alpha.clone()]);
+        let root_stripped = alpha
+            .stable_id()
+            .split_once(':')
+            .unwrap()
+            .1
+            .to_string();
+
+        assert_eq!(
+            bind_convergence_selector(&alpha.stable_id(), &graph),
+            SelectorBinding::Resolved(alpha.stable_id()),
+            "full stable IDs retain exact-match precedence"
+        );
+        assert_eq!(
+            bind_convergence_selector(&unique.stable_id(), &graph),
+            SelectorBinding::Resolved(unique.stable_id()),
+            "stable-ID callers remain backward compatible"
+        );
+        let mut duplicate_ids = vec![alpha.stable_id(), beta.stable_id()];
+        duplicate_ids.sort();
+        assert_eq!(
+            bind_convergence_selector(&root_stripped, &graph),
+            SelectorBinding::Ambiguous(duplicate_ids.clone())
+        );
+        assert_eq!(
+            bind_convergence_selector("Request.prepare", &graph),
+            SelectorBinding::Ambiguous(duplicate_ids)
+        );
+        assert_eq!(
+            bind_convergence_selector("prepare_request", &graph),
+            SelectorBinding::Resolved(unique.stable_id())
+        );
+        for fuzzy_or_missing in [
+            "request.prepare",
+            "Request.prep",
+            "def prepare(self)",
+            "Missing.prepare",
+        ] {
+            assert_eq!(
+                bind_convergence_selector(fuzzy_or_missing, &graph),
+                SelectorBinding::Missing,
+                "selector {fuzzy_or_missing:?} must not use case, substring, signature, or terminal fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn convergence_executes_discovered_qualified_selectors_as_nonempty_proof() {
+        let temp = TempDir::new().unwrap();
+        let request = make_scoped_method("Request", "prepare", "requests/models.py");
+        let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+        let join = make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
+        let boundary = make_scoped_method("HTTPAdapter", "send", "requests/adapters.py");
+        let edges = vec![
+            make_edge(&request, &join, EdgeKind::Calls),
+            make_edge(&session, &join, EdgeKind::Calls),
+            make_edge(&join, &boundary, EdgeKind::Calls),
+        ];
+        let graph = make_graph_state_with_edges(
+            vec![request, session, join, boundary],
+            edges,
+        );
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                temp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(temp.path(), &job_id, 4, 3);
+        ledger.record_lsp_evidence(
+            temp.path(),
+            &job_id,
+            crate::server::LspEvidenceCoverage {
+                readiness: crate::server::LspEvidenceReadiness::Full,
+                scope: "repo".into(),
+                declared_node_count: 4,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 4,
+                elapsed_ms: 1,
+                circuit_open: false,
+                detail: None,
+                validations: vec![],
+            },
+        );
+        let mut ctx = make_search_context(&graph, temp.path());
+        ctx.enrichment_jobs = ledger.recent_jobs(temp.path(), 5);
+        let params = SearchParams {
+            mode: Some("convergence".into()),
+            nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+            before: Some("HTTPAdapter.send".into()),
+            direction: Some("outgoing".into()),
+            edge_types: Some(vec!["calls".into()]),
+            depth: Some(4),
+            ..SearchParams::default()
+        };
+
+        let rendered = search(&params, &ctx).await;
+        assert!(rendered.contains("delivery_status: injectable_proof"));
+        assert!(rendered.contains("injected_context: true"));
+        assert!(rendered.contains("Request.prepare"));
+        assert!(rendered.contains("PreparedRequest.prepare_method"));
+        assert!(rendered.contains("HTTPAdapter.send"));
+        assert!(rendered.contains("hydrate_source:"));
+    }
+
+    #[tokio::test]
+    async fn convergence_failure_states_never_inject_or_deliver_handles() {
+        let temp = TempDir::new().unwrap();
+        let request = make_scoped_method("Request", "prepare", "requests/models.py");
+        let session = make_scoped_method("Session", "prepare", "requests/sessions.py");
+        let graph = make_graph_state(vec![request, session]);
+        let ctx = make_search_context(&graph, temp.path());
+
+        let ambiguous = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["prepare".into(), "Session.prepare".into()]),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(ambiguous.contains("ambiguous `prepare`"));
+        assert!(ambiguous.contains("injected_context: false"));
+        assert!(ambiguous.contains("proof_records: 0"));
+        assert!(ambiguous.contains("delivered_handles: 0"));
+        assert!(!ambiguous.contains("hydrate_source:"));
+
+        let coverage_unknown = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Request.prepare".into(), "Session.prepare".into()]),
+                edge_types: Some(vec!["calls".into()]),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(coverage_unknown.contains("coverage_unknown"));
+        assert!(coverage_unknown.contains("delivery_status: not_injectable"));
+        assert!(coverage_unknown.contains("injected_context: false"));
+        assert!(coverage_unknown.contains("proof_records: 0"));
+        assert!(coverage_unknown.contains("delivered_handles: 0"));
+        assert!(!coverage_unknown.contains("hydrate_source:"));
+    }
+
+    #[tokio::test]
+    async fn convergence_rejects_semantically_downstream_but_call_unreachable_boundary() {
+        let temp = TempDir::new().unwrap();
+        let request = make_scoped_method("Request", "prepare", "requests/models.py");
+        let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+        let prepared = make_scoped_method(
+            "PreparedRequest",
+            "prepare",
+            "requests/models.py",
+        );
+        let adapter = make_scoped_method("HTTPAdapter", "send", "requests/adapters.py");
+        let graph = make_graph_state_with_edges(
+            vec![request.clone(), session.clone(), prepared.clone(), adapter],
+            vec![
+                make_edge(&request, &prepared, EdgeKind::Calls),
+                make_edge(&session, &prepared, EdgeKind::Calls),
+            ],
+        );
+        let ledger = crate::server::EnrichmentJobLedger::default();
+        let job_id = match ledger
+            .begin_job(
+                temp.path(),
+                crate::server::EnrichmentCapability::CallReferences,
+                crate::server::EnrichmentScope::Repo,
+                crate::server::EnrichmentTrigger::Explicit,
+                None,
+            )
+            .unwrap()
+        {
+            crate::server::JobStart::Started(job) => job.job_id,
+            crate::server::JobStart::Joined { existing_job_id } => existing_job_id,
+        };
+        ledger.mark_completed(temp.path(), &job_id, 4, 2);
+        ledger.record_lsp_evidence(
+            temp.path(),
+            &job_id,
+            crate::server::LspEvidenceCoverage {
+                readiness: crate::server::LspEvidenceReadiness::Full,
+                scope: "repo".into(),
+                declared_node_count: 4,
+                max_requests: None,
+                max_duration_ms: None,
+                scheduled_requests: 4,
+                elapsed_ms: 1,
+                circuit_open: false,
+                detail: None,
+                validations: vec![],
+            },
+        );
+        let mut ctx = make_search_context(&graph, temp.path());
+        ctx.enrichment_jobs = ledger.recent_jobs(temp.path(), 5);
+
+        let rendered = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+                before: Some("HTTPAdapter.send".into()),
+                direction: Some("outgoing".into()),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(6),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(rendered.contains("no structural convergence witness"), "{rendered}");
+        assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+        assert!(rendered.contains("injected_context: false"), "{rendered}");
+        assert!(rendered.contains("proof_records: 0"), "{rendered}");
+        assert!(rendered.contains("delivered_handles: 0"), "{rendered}");
+        assert!(!rendered.contains("hydrate_source:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn convergence_digest_mismatch_remains_coverage_unknown() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+        use crate::lsp_completeness::{
+            LspCompletenessReport, LspEvidenceDisposition, LspFileEvidence,
+            current_report_identity, persist_report,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let request = make_scoped_method("Request", "prepare", "requests/models.py");
+        let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+        let join = make_scoped_method(
+            "PreparedRequest",
+            "prepare_method",
+            "requests/models.py",
+        );
+        let edges = vec![
+            make_confirmed_lsp_call(&request, &join),
+            make_confirmed_lsp_call(&session, &join),
+        ];
+        let graph = make_graph_state_with_edges(
+            vec![request, session, join],
+            edges,
+        );
+        let identity = current_report_identity(temp.path(), BusinessContextMode::Disabled).unwrap();
+        let files = vec![
+            calls_coverage_file("requests/models.py"),
+            calls_coverage_file("requests/sessions.py"),
+        ];
+        let mut report = LspCompletenessReport::new_bound(
+            identity.clone(),
+            files,
+            &graph.nodes,
+            &graph.edges,
+        );
+        report.evidence = report
+            .files
+            .iter()
+            .map(|file| LspFileEvidence {
+                path: file.path.clone(),
+                disposition: LspEvidenceDisposition::Executed,
+                generation: identity.enrichment_generation.clone(),
+                blob: "a".repeat(40),
+                partition_signature: "b".repeat(64),
+                input_hashes: vec!["fixture-input".to_string()],
+                operations: vec!["call_hierarchy".to_string()],
+                result_ids: Vec::new(),
+                result_producers: Vec::new(),
+                base_archive_sha256: None,
+                base_report_digest: None,
+            })
+            .collect();
+        report.graph_snapshot_digest = "stale-graph-digest".to_string();
+        report.finalize();
+        persist_report(temp.path(), &report).unwrap();
+
+        let admission = BusinessContextAdmission::new(BusinessContextMode::Disabled);
+        let mut ctx = make_search_context(&graph, temp.path());
+        ctx.business_context = &admission;
+        let rendered = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+                edge_types: Some(vec!["calls".into()]),
+                depth: Some(3),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(rendered.contains("graph snapshot digest"), "{rendered}");
+        assert!(rendered.contains("coverage_unknown"), "{rendered}");
+        assert!(rendered.contains("injected_context: false"), "{rendered}");
+        assert!(!rendered.contains("hydrate_source:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn convergence_duplicate_sources_and_bad_boundaries_are_bounded_noninjectable_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let mut nodes = (0..40)
+            .map(|index| {
+                let mut node = make_scoped_method("Request", "prepare", "requests/models.py");
+                node.id.root = format!("root-{index:02}");
+                node
+            })
+            .collect::<Vec<_>>();
+        let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
+        let prepared = make_scoped_method(
+            "PreparedRequest",
+            "prepare_method",
+            "requests/models.py",
+        );
+        nodes.push(session.clone());
+        nodes.push(prepared.clone());
+        let graph = make_graph_state(nodes);
+        let ctx = make_search_context(&graph, temp.path());
+
+        let duplicate = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec![session.stable_id(), session.stable_id()]),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(duplicate.contains("fewer than two distinct nodes"));
+
+        let ambiguous_before = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec![session.stable_id(), prepared.stable_id()]),
+                before: Some("Request.prepare".into()),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(ambiguous_before.contains("ambiguous `Request.prepare`"));
+        assert!(ambiguous_before.contains("injected_context: false"));
+
+        let bounded = search(
+            &SearchParams {
+                mode: Some("convergence".into()),
+                nodes: Some(vec!["zzz".into(), "Request.prepare".into()]),
+                before: Some("aaa".into()),
+                max_output_bytes: Some(1_500),
+                max_output_tokens: Some(375),
+                ..SearchParams::default()
+            },
+            &ctx,
+        )
+        .await;
+        assert!(bounded.len() <= 1_500);
+        assert!(bounded.contains("… 32 more"));
+        assert!(bounded.contains("unresolved `zzz`"));
+        let ambiguous_at = bounded.find("ambiguous `Request.prepare`").unwrap();
+        let before_at = bounded.find("unresolved `aaa`").unwrap();
+        let source_at = bounded.find("unresolved `zzz`").unwrap();
+        assert!(ambiguous_at < before_at && before_at < source_at);
+        assert!(bounded.contains("injected_context: false"));
+        assert!(!bounded.contains("hydrate_source:"));
     }
 
     async fn profile_exact_traversal_shape(label: &str, node_count: usize, edge_count: usize) {
