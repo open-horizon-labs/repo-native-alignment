@@ -180,8 +180,7 @@ fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
         !record.symbol.declared_metadata.is_empty()
             || record.symbol.extraction_source.is_some()
             || (record.selection.reason.len() > 32
-                && !(task_intent
-                    && compact_task_reason(&record.selection.reason)))
+                && !(task_intent && compact_task_reason(&record.selection.reason)))
     }) else {
         return false;
     };
@@ -274,11 +273,7 @@ fn visible_record_text(plan: &ProjectionPlan, record: &ProjectedRecord) -> Strin
     text
 }
 
-fn obligation_is_visible(
-    obligation: &str,
-    record: &ProjectedRecord,
-    visible_text: &str,
-) -> bool {
+fn obligation_is_visible(obligation: &str, record: &ProjectedRecord, visible_text: &str) -> bool {
     if obligation == "validation:task-relevant-tests" {
         return record.selection.role == Some(ContextRole::Test)
             && matches!(record.symbol.kind.as_str(), "function" | "method");
@@ -287,7 +282,26 @@ fn obligation_is_visible(
     !terms.is_empty()
         && terms
             .iter()
-            .all(|term| text_contains_identifier_term(visible_text, term))
+            .all(|term| obligation_term_is_visible(visible_text, term))
+}
+
+fn obligation_term_is_visible(text: &str, term: &str) -> bool {
+    let Some(state) = term.strip_prefix("state.") else {
+        return text_contains_identifier_term(text, term);
+    };
+    text.lines().any(|line| {
+        let line = line.to_lowercase();
+        let Some((left, right)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim();
+        left.ends_with(&format!(".{state}"))
+            || (left.ends_with(state)
+                && (right.contains("**")
+                    || right.contains(".get(")
+                    || right.contains(" | ")
+                    || right.contains(" or ")))
+    })
 }
 
 fn obligation_terms(obligation: &str) -> Vec<&str> {
@@ -333,12 +347,22 @@ fn camel_segments(value: &str) -> Vec<String> {
                     .get(index + 1)
                     .is_some_and(|next| next.is_lowercase()));
         if boundary {
-            segments.push(characters[start..index].iter().collect::<String>().to_lowercase());
+            segments.push(
+                characters[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .to_lowercase(),
+            );
             start = index;
         }
     }
     if start < characters.len() {
-        segments.push(characters[start..].iter().collect::<String>().to_lowercase());
+        segments.push(
+            characters[start..]
+                .iter()
+                .collect::<String>()
+                .to_lowercase(),
+        );
     }
     segments
 }
@@ -599,9 +623,11 @@ fn refresh_compact_task_obligation_visibility(plan: &mut ProjectionPlan) {
 }
 
 fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
-    let Some(index) = plan.spans.iter().rposition(|span| {
-        !span.text.is_empty() && !span_requires_visible_proof_body(plan, span)
-    }) else {
+    let Some(index) = plan
+        .spans
+        .iter()
+        .rposition(|span| !span.text.is_empty() && !span_requires_visible_proof_body(plan, span))
+    else {
         return false;
     };
     let span = &plan.spans[index];
@@ -1041,6 +1067,22 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[test]
+    fn proof_state_term_requires_visible_effective_assignment() {
+        assert!(!obligation_term_is_visible(
+            "def generate(**overrides): return overrides",
+            "state.overrides"
+        ));
+        assert!(obligation_term_is_visible(
+            "overrides = {**annotation_overrides, **overrides}",
+            "state.overrides"
+        ));
+        assert!(obligation_term_is_visible(
+            "fn.overrides = effective_overrides",
+            "state.overrides"
+        ));
+    }
+
     fn plan(projection: SearchProjection) -> ProjectionPlan {
         let source = SourceSpan {
             root: "repo".into(),
@@ -1440,14 +1482,18 @@ mod tests {
         assert!(rendered.text.len() <= 6_000);
         assert_eq!(rendered.plan.records.len(), 8);
         assert!(rendered.plan.candidate_audit.is_empty());
-        assert!(rendered
-            .plan
-            .records
-            .iter()
-            .any(|record| record.evidence == SelectionEvidence::default()));
-        assert!(rendered
-            .text
-            .contains("selected record audit detail omitted"));
+        assert!(
+            rendered
+                .plan
+                .records
+                .iter()
+                .any(|record| record.evidence == SelectionEvidence::default())
+        );
+        assert!(
+            rendered
+                .text
+                .contains("selected record audit detail omitted")
+        );
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
@@ -1636,7 +1682,6 @@ mod tests {
                 DegradationStep::Omissions,
             ]
         );
-
     }
 
     #[test]
@@ -1729,7 +1774,11 @@ mod tests {
         assert!(rendered.text.contains(
             "obligations_visible=concept:annotated,concept:notrequired,concept:override,structure:EditableSource:annotated+notrequired+override"
         ));
-        assert!(!rendered.text.contains("unrelated setup line\nunrelated setup line"));
+        assert!(
+            !rendered
+                .text
+                .contains("unrelated setup line\nunrelated setup line")
+        );
         assert_eq!(
             rendered.plan.spans[0].representation,
             BodyRepresentation::Truncated

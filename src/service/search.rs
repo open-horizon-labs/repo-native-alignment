@@ -1560,16 +1560,13 @@ fn scoped_convergence_calls_candidates(
             .iter()
             .zip(&candidate.witness_edge_kinds)
             .zip(&candidate.witness_edge_directions)
-            .map(|((path, edge_kinds), edge_directions)| {
-                (path, edge_kinds, edge_directions)
-            })
+            .map(|((path, edge_kinds), edge_directions)| (path, edge_kinds, edge_directions))
             .collect::<Vec<_>>();
         if let (Some(onward), Some(edge_kinds), Some(edge_directions)) = (
             &candidate.onward,
             &candidate.onward_edge_kinds,
             &candidate.onward_edge_directions,
-        )
-        {
+        ) {
             paths.push((onward, edge_kinds, edge_directions));
         }
         let all_hops_exact = paths.iter().all(|(path, edge_kinds, edge_directions)| {
@@ -1579,8 +1576,7 @@ fn scoped_convergence_calls_candidates(
                     .windows(2)
                     .zip(edge_kinds.iter().zip(edge_directions.iter()))
                     .all(|(pair, (kind, direction))| {
-                        *kind != EdgeKind::Calls
-                            || edge_is_exact(&pair[0], &pair[1], *direction)
+                        *kind != EdgeKind::Calls || edge_is_exact(&pair[0], &pair[1], *direction)
                     })
         });
         if !all_hops_exact {
@@ -1856,8 +1852,7 @@ fn render_convergence(
                 &candidate.onward,
                 &candidate.onward_edge_kinds,
                 &candidate.onward_edge_directions,
-            )
-            {
+            ) {
                 body.push_str(&format!(
                     "   - onward_before: {}\n",
                     render_typed_convergence_path(onward, edge_kinds, edge_directions)
@@ -2280,85 +2275,84 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
         SearchIntent::Discover
     };
     let request = projection_request(params, intent);
-    let (mut records, mut relationships, mut capabilities, mut omissions, mut candidate_audit) =
-        if params.context_mode.as_deref() == Some("task") {
-            match task_records(params, ctx, &edge_index).await {
-                Ok(output) => (
-                    output.records,
-                    output.relationships,
-                    output.capabilities,
-                    output.omissions,
-                    output.candidate_audit,
-                ),
-                Err(error) => return format!("Task context selection failed: {error}."),
+    if params.context_mode.as_deref() == Some("task") {
+        return match task_records(params, ctx, &edge_index).await {
+            Ok(output) => {
+                output
+                    .certified_response
+                    .expect("task selection must return its certified final render")
+                    .text
             }
-        } else {
-            let (fused, capabilities, product_score_audit) =
-                match projected_fused_candidates(params, ctx, &edge_index).await {
-                    Ok(result) => result,
-                    Err(error) => return format!("Search projection failed: {error}."),
-                };
-            let selected_limit = params.limit.unwrap_or(10);
-            let records = fused
-                .iter()
-                .take(selected_limit)
-                .enumerate()
-                .filter_map(|(rank, fused)| {
-                    find_node(ctx.graph_state, &fused.stable_id).map(|node| {
-                        let mut selected = selected_from_fused(
-                            node,
-                            fused,
-                            rank,
-                            SelectionPlacement::default(),
-                            params.query.as_deref(),
-                            ctx.repo_root,
-                        );
-                        append_selected_product_score_audit(
-                            &mut selected,
-                            product_score_audit.get(&fused.stable_id).map(Vec::as_slice),
-                            params.query.as_deref().unwrap_or_default(),
-                            ctx.repo_root,
-                        );
-                        selected
-                    })
-                })
-                .collect::<Vec<_>>();
-            let selected_ids = records
-                .iter()
-                .map(|record| record.identity.node_id.as_str())
-                .collect::<BTreeSet<_>>();
-            let candidate_audit = fused
-                .iter()
-                .enumerate()
-                .filter_map(|(rank, fused)| {
-                    let node = find_node(ctx.graph_state, &fused.stable_id)?;
-                    let selected = selected_ids.contains(fused.stable_id.as_str());
-                    let mut audit = candidate_audit_from_fused(
+            Err(error) => format!("Task context selection failed: {error}."),
+        };
+    }
+    let (mut records, mut relationships, mut capabilities, mut omissions, mut candidate_audit) = {
+        let (fused, capabilities, product_score_audit) =
+            match projected_fused_candidates(params, ctx, &edge_index).await {
+                Ok(result) => result,
+                Err(error) => return format!("Search projection failed: {error}."),
+            };
+        let selected_limit = params.limit.unwrap_or(10);
+        let records = fused
+            .iter()
+            .take(selected_limit)
+            .enumerate()
+            .filter_map(|(rank, fused)| {
+                find_node(ctx.graph_state, &fused.stable_id).map(|node| {
+                    let mut selected = selected_from_fused(
                         node,
                         fused,
                         rank,
-                        selected,
-                        if selected {
-                            "selected within requested result limit"
-                        } else {
-                            "omitted after bounded candidate fusion by requested result limit"
-                        },
+                        SelectionPlacement::default(),
+                        params.query.as_deref(),
+                        ctx.repo_root,
                     );
-                    append_product_score_audit(
-                        &mut audit.evidence,
+                    append_selected_product_score_audit(
+                        &mut selected,
                         product_score_audit.get(&fused.stable_id).map(Vec::as_slice),
+                        params.query.as_deref().unwrap_or_default(),
+                        ctx.repo_root,
                     );
-                    Some(audit)
+                    selected
                 })
-                .collect();
-            (
-                records,
-                Vec::new(),
-                capabilities,
-                Vec::new(),
-                candidate_audit,
-            )
-        };
+            })
+            .collect::<Vec<_>>();
+        let selected_ids = records
+            .iter()
+            .map(|record| record.identity.node_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let candidate_audit: Vec<CandidateAudit> = fused
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, fused)| {
+                let node = find_node(ctx.graph_state, &fused.stable_id)?;
+                let selected = selected_ids.contains(fused.stable_id.as_str());
+                let mut audit = candidate_audit_from_fused(
+                    node,
+                    fused,
+                    rank,
+                    selected,
+                    if selected {
+                        "selected within requested result limit"
+                    } else {
+                        "omitted after bounded candidate fusion by requested result limit"
+                    },
+                );
+                append_product_score_audit(
+                    &mut audit.evidence,
+                    product_score_audit.get(&fused.stable_id).map(Vec::as_slice),
+                );
+                Some(audit)
+            })
+            .collect();
+        (
+            records,
+            Vec::new(),
+            capabilities,
+            Vec::new(),
+            candidate_audit,
+        )
+    };
     if params.context_mode.is_none() {
         let (mut non_code, non_code_capabilities, mut non_code_audit) =
             projected_non_code_records(params, ctx, records.len()).await;
@@ -3083,6 +3077,7 @@ const TASK_ROLE_SUPPLEMENT_LIMIT: usize = 4;
 const TASK_GRAPH_CANDIDATE_LIMIT: usize = 4;
 const TASK_GRAPH_TRAVERSAL_LIMIT: usize = 16;
 const TASK_PROOF_RESERVE_LIMIT: usize = 4;
+const TASK_PROOF_CANDIDATE_POOL_LIMIT: usize = 8;
 const TASK_PROOF_TRAVERSAL_LIMIT: usize = 128;
 const TASK_PROOF_FILE_SIBLING_LIMIT: usize = 64;
 const TASK_PROOF_MAX_DEPTH: u32 = 4;
@@ -3094,6 +3089,7 @@ struct TaskAdapterOutput {
     capabilities: Vec<CapabilityStatus>,
     omissions: Vec<ProjectionOmission>,
     candidate_audit: Vec<CandidateAudit>,
+    certified_response: Option<RenderedResponse>,
 }
 
 struct TaskAssembly {
@@ -3655,6 +3651,31 @@ async fn task_records(
         );
         bundles.insert(id.clone(), records);
     }
+    // Focus obligation-bearing state transitions before any singleton or
+    // bundle cost is measured. The exact render oracle must price the same
+    // source span that final delivery will use.
+    for (id, candidate) in &typed {
+        if !candidate
+            .obligations
+            .iter()
+            .any(|obligation| obligation.starts_with("concept:"))
+        {
+            continue;
+        }
+        let Some(node) = candidate_nodes.get(id).copied() else {
+            continue;
+        };
+        let focus = task_effective_state_focus(node, &task_query_terms(base_query))
+            .or_else(|| task_default_sentinel_focus(node));
+        let Some(focus) = focus else {
+            continue;
+        };
+        if let Some(records) = bundles.get_mut(id) {
+            for record in records {
+                record.focused_span = Some(focus.clone());
+            }
+        }
+    }
 
     let mut policy = TaskSelectionPolicy::default();
     // The bounded renderer is the feasibility oracle for the caller's exact
@@ -3745,29 +3766,6 @@ async fn task_records(
         .iter()
         .map(|selected| selected.evidence_id.clone())
         .collect::<Vec<_>>();
-    for id in &selected_ids {
-        let Some(candidate) = typed.get(id) else {
-            continue;
-        };
-        if !candidate
-            .obligations
-            .iter()
-            .any(|obligation| obligation.starts_with("concept:"))
-        {
-            continue;
-        }
-        let Some(node) = candidate_nodes.get(id).copied() else {
-            continue;
-        };
-        let Some(focus) = task_default_sentinel_focus(node) else {
-            continue;
-        };
-        if let Some(records) = bundles.get_mut(id) {
-            for record in records {
-                record.focused_span = Some(focus.clone());
-            }
-        }
-    }
     let precovered_query_concepts = selected_ids
         .iter()
         .filter_map(|id| typed.get(id))
@@ -3782,10 +3780,9 @@ async fn task_records(
         params.query.as_deref().unwrap_or_default(),
         &precovered_query_concepts,
     );
+    let mut prepared_proofs = Vec::new();
     for proof in proof_candidates {
-        if selected_ids.len() >= task_context::MAX_SELECTION_CANDIDATES
-            || selected_ids.contains(&proof.id)
-        {
+        if selected_ids.contains(&proof.id) {
             continue;
         }
         let Some(node) = candidate_nodes.get(&proof.id).copied() else {
@@ -3796,6 +3793,10 @@ async fn task_records(
         };
         let projected_role = projection_role_for_task(proof.role);
         let fused = single_channel_fused(&proof.id, EvidenceChannel::Graph, ScoreKind::GraphHops);
+        let retained_focus = bundles
+            .get(&proof.id)
+            .and_then(|records| records.first())
+            .and_then(|record| record.focused_span.clone());
         let assembly = TaskAssembly {
             fused: fused.clone(),
             roles: BTreeSet::from([proof.role]),
@@ -3808,7 +3809,7 @@ async fn task_records(
                 proof.anchor, proof.depth, proof.evidence
             ),
         };
-        let selected = selected_from_fused(
+        let mut selected = selected_from_fused(
             node,
             &fused,
             0,
@@ -3820,6 +3821,9 @@ async fn task_records(
             params.query.as_deref(),
             ctx.repo_root,
         );
+        if retained_focus.is_some() {
+            selected.focused_span = retained_focus;
+        }
         let candidate = TaskEvidenceCandidate {
             evidence_id: proof.id.clone(),
             roles: assembly.roles.clone(),
@@ -3839,52 +3843,44 @@ async fn task_records(
         assemblies.insert(proof.id.clone(), assembly);
         bundles.insert(proof.id.clone(), vec![selected]);
         typed.insert(proof.id.clone(), candidate);
-        let mut trial = selected_ids.clone();
-        trial.push(proof.id.clone());
-        match rendered_task_bundle_response(
-            params,
-            &reader,
-            &trial,
-            &bundles,
-            &typed,
-            &assemblies,
-            &candidate_nodes,
-            &product_score_audit,
-            &base_output,
-            &policy.required_roles,
-            &default_task_capabilities,
-            edge_index,
-        ) {
-            Ok(response) if rendered_proof_visible(&response, &proof.id, &proof.obligation) => {
-                selected_ids = trial;
-            }
-            Ok(_) => {
-                bundles.remove(&proof.id);
-                typed.remove(&proof.id);
-                assemblies.remove(&proof.id);
-                base_output.omissions.push(ProjectionOmission {
-                    record_id: Some(proof.id),
-                    source: Some(source),
-                    code: OmissionCode::RenderBudget,
-                    detail: "bounded proof reserve rejected because its certified terms were absent from the final rendered signature/body".into(),
-                });
-            }
-            Err(reason) => {
-                bundles.remove(&proof.id);
-                typed.remove(&proof.id);
-                assemblies.remove(&proof.id);
-                base_output.omissions.push(ProjectionOmission {
-                    record_id: Some(proof.id),
-                    source: Some(source),
-                    code: OmissionCode::RenderBudget,
-                    detail: format!(
-                        "bounded typed proof reserve omitted after exact render fitting: {reason}"
-                    ),
-                });
+        prepared_proofs.push(proof);
+    }
+
+    let reserve_slots = task_context::MAX_SELECTION_CANDIDATES
+        .saturating_sub(selected_ids.len())
+        .min(TASK_PROOF_RESERVE_LIMIT);
+    if reserve_slots > 0 && !prepared_proofs.is_empty() {
+        let query_terms = task_query_terms(params.query.as_deref().unwrap_or_default());
+        let chosen_reserve =
+            select_bounded_task_proof_subset(&prepared_proofs, reserve_slots, |included| {
+                let mut trial = selected_ids.clone();
+                trial.extend(included.iter().map(|proof| proof.id.clone()));
+                let response = rendered_task_bundle_response(
+                    params,
+                    &reader,
+                    &trial,
+                    &bundles,
+                    &typed,
+                    &assemblies,
+                    &candidate_nodes,
+                    &product_score_audit,
+                    &base_output,
+                    &policy.required_roles,
+                    &default_task_capabilities,
+                    edge_index,
+                )
+                .ok()?;
+                let score =
+                    task_proof_subset_score(&response, included, &candidate_nodes, &query_terms);
+                Some(score)
+            });
+        if let Some(chosen_reserve) = chosen_reserve {
+            for id in chosen_reserve {
+                selected_ids.push(id);
             }
         }
     }
-    let output = materialize_task_output(
+    let mut output = materialize_task_output(
         &selected_ids,
         &bundles,
         &typed,
@@ -3894,6 +3890,20 @@ async fn task_records(
         &base_output,
         &policy.required_roles,
     );
+    output.certified_response = Some(rendered_task_bundle_response(
+        params,
+        &reader,
+        &selected_ids,
+        &bundles,
+        &typed,
+        &assemblies,
+        &candidate_nodes,
+        &product_score_audit,
+        &base_output,
+        &policy.required_roles,
+        &default_task_capabilities,
+        edge_index,
+    )?);
     Ok(output)
 }
 
@@ -3916,7 +3926,236 @@ fn rendered_proof_visible(response: &RenderedResponse, record_id: &str, obligati
     terms
         .split('+')
         .filter(|term| !term.is_empty())
-        .all(|term| delivered.contains(term))
+        .all(|term| {
+            if let Some(state) = term.strip_prefix("state.") {
+                task_state_assignment_visible(&delivered, state)
+            } else {
+                delivered.contains(term)
+            }
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskProofSubsetScore {
+    actionable_test_visible: bool,
+    high_quality_terms: BTreeSet<String>,
+    visible_proofs: usize,
+    rank_sum: u64,
+    rendered_bytes: usize,
+    ids: Vec<String>,
+}
+
+impl TaskProofSubsetScore {
+    fn better_than(&self, other: &Self) -> bool {
+        self.actionable_test_visible
+            .cmp(&other.actionable_test_visible)
+            .then_with(|| {
+                self.high_quality_terms
+                    .len()
+                    .cmp(&other.high_quality_terms.len())
+            })
+            .then_with(|| other.rank_sum.cmp(&self.rank_sum))
+            .then_with(|| other.rendered_bytes.cmp(&self.rendered_bytes))
+            .then_with(|| other.ids.len().cmp(&self.ids.len()))
+            .then_with(|| self.visible_proofs.cmp(&other.visible_proofs))
+            .then_with(|| other.ids.cmp(&self.ids))
+            .is_gt()
+    }
+}
+
+fn select_bounded_task_proof_subset<F>(
+    candidates: &[TaskProofReserveCandidate],
+    limit: usize,
+    mut evaluate: F,
+) -> Option<Vec<String>>
+where
+    F: FnMut(&[&TaskProofReserveCandidate]) -> Option<TaskProofSubsetScore>,
+{
+    debug_assert!(candidates.len() <= TASK_PROOF_CANDIDATE_POOL_LIMIT);
+    let mut best: Option<(TaskProofSubsetScore, Vec<String>)> = None;
+    for mask in 0..(1usize << candidates.len()) {
+        if mask.count_ones() as usize > limit {
+            continue;
+        }
+        let included = candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1usize << index) != 0)
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        let Some(score) = evaluate(&included) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(current, _)| score.better_than(current))
+        {
+            best = Some((
+                score,
+                included
+                    .iter()
+                    .map(|candidate| candidate.id.clone())
+                    .collect(),
+            ));
+        }
+    }
+    best.map(|(_, ids)| ids)
+}
+
+fn task_proof_subset_score(
+    response: &RenderedResponse,
+    included: &[&TaskProofReserveCandidate],
+    candidate_nodes: &BTreeMap<String, &Node>,
+    query_terms: &BTreeSet<String>,
+) -> TaskProofSubsetScore {
+    let mut high_quality_terms =
+        rendered_high_quality_terms(response, candidate_nodes, query_terms);
+    let mut visible_proofs = 0usize;
+    for proof in included {
+        if !rendered_proof_visible(response, &proof.id, &proof.obligation) {
+            continue;
+        }
+        visible_proofs += 1;
+        if candidate_nodes.get(&proof.id).is_some_and(|node| {
+            default_role(node) != ProjectionRole::Test
+                || task_is_test_entrypoint(node) && task_test_has_actionable_assertion(node)
+                || task_has_compound_query_expression(
+                    &rendered_record_text(response, &proof.id),
+                    query_terms,
+                )
+        }) {
+            high_quality_terms.extend(proof_obligation_terms(&proof.obligation));
+        }
+    }
+    let mut ids = included
+        .iter()
+        .map(|proof| proof.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    TaskProofSubsetScore {
+        actionable_test_visible: response.plan.spans.iter().any(|span| {
+            rendered_text_has_assertion(&span.text.to_lowercase())
+                && span
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.selection.role == Some(ProjectionRole::Test))
+        }),
+        high_quality_terms,
+        visible_proofs,
+        rank_sum: included.iter().map(|proof| u64::from(proof.rank)).sum(),
+        rendered_bytes: response.accounting.total.utf8_bytes,
+        ids,
+    }
+}
+
+fn rendered_high_quality_terms(
+    response: &RenderedResponse,
+    candidate_nodes: &BTreeMap<String, &Node>,
+    query_terms: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut covered = BTreeSet::new();
+    for record in &response.plan.records {
+        let Some(node) = candidate_nodes.get(&record.identity.node_id).copied() else {
+            continue;
+        };
+        let delivered = rendered_record_text(response, &record.identity.node_id);
+        let actionable_test = record.selection.role == Some(ProjectionRole::Test)
+            && rendered_text_has_assertion(&delivered);
+        let production = record.selection.role != Some(ProjectionRole::Test)
+            && matches!(
+                node.id.kind,
+                NodeKind::Function | NodeKind::Struct | NodeKind::Enum
+            );
+        let compound = task_has_compound_query_expression(&delivered, query_terms);
+        if !(actionable_test || production || compound) {
+            continue;
+        }
+        let terms = task_text_terms(&format!("{} {delivered}", record.symbol.signature));
+        covered.extend(query_terms.intersection(&terms).cloned());
+        if production {
+            covered.extend(
+                task_operation_carriers(&record.symbol.name)
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            for term in query_terms {
+                for state in [term.clone(), format!("{term}s")] {
+                    if task_state_assignment_visible(&delivered, &state) {
+                        covered.insert(format!("state.{state}"));
+                    }
+                }
+            }
+        }
+    }
+    covered
+}
+
+fn rendered_record_text(response: &RenderedResponse, record_id: &str) -> String {
+    response
+        .plan
+        .spans
+        .iter()
+        .filter(|span| {
+            span.mappings
+                .iter()
+                .any(|mapping| mapping.record_id == record_id)
+        })
+        .map(|span| span.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
+}
+
+fn proof_obligation_terms(obligation: &str) -> BTreeSet<String> {
+    obligation
+        .strip_prefix("proof:")
+        .into_iter()
+        .flat_map(|terms| terms.split('+'))
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn task_has_compound_query_expression(body: &str, query_terms: &BTreeSet<String>) -> bool {
+    body.lines().any(|line| {
+        line.contains('[')
+            && line.contains(']')
+            && query_terms
+                .intersection(&task_text_terms(line))
+                .take(2)
+                .count()
+                >= 2
+    })
+}
+
+fn rendered_text_has_assertion(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("assert ")
+            || line.starts_with("assert(")
+            || line.contains(" expect(")
+            || line.starts_with("expect(")
+            || line.contains(".should")
+            || line.contains("raises(")
+            || line.contains("panic!")
+    })
+}
+
+fn task_state_assignment_visible(text: &str, state: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.to_lowercase();
+        let Some((left, right)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim();
+        let member_assignment = left.ends_with(&format!(".{state}"));
+        let merge_assignment = left.ends_with(state)
+            && (right.contains("**")
+                || right.contains(".get(")
+                || right.contains(" | ")
+                || right.contains(" or "));
+        member_assignment || merge_assignment
+    })
 }
 
 fn task_candidate_quality(node: &Node, assembly: &TaskAssembly, query: &str) -> EvidenceQuality {
@@ -4026,12 +4265,26 @@ fn task_candidate_obligations(
         .collect::<Vec<_>>()
         .join("+");
     if !matched.is_empty() {
+        let requested_carriers = task_operation_carriers(query);
         for role in &assembly.roles {
             for carrier in task_operation_carriers(&node.id.name) {
-                obligations.insert(format!("carrier:{role:?}:{matched}:{carrier}"));
+                if *role == TaskRole::EditableSource || requested_carriers.contains(carrier) {
+                    obligations.insert(format!("carrier:{role:?}:{matched}:{carrier}"));
+                }
             }
         }
         obligations.extend(task_default_sentinel_obligations(&node.body));
+        let effective_merge_terms =
+            task_effective_merge_proof_terms(&node.body, &task_query_terms(query));
+        if !effective_merge_terms.is_empty() {
+            obligations.insert(format!(
+                "proof:{}",
+                effective_merge_terms
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ));
+        }
     }
     obligations
 }
@@ -4058,6 +4311,54 @@ fn task_default_sentinel_focus(node: &Node) -> Option<ProjectionSourceSpan> {
             .and_then(|(_, rhs)| rhs.split('"').next())
             .is_some_and(|sentinel| sentinel.split(|ch: char| !ch.is_alphanumeric()).count() >= 2)
     })?;
+    let line = source
+        .start_line
+        .saturating_add(u32::try_from(offset).ok()?);
+    Some(ProjectionSourceSpan {
+        root: source.root,
+        path: source.path,
+        start_line: line.saturating_sub(3).max(1),
+        end_line: line.saturating_add(8).min(source.end_line),
+    })
+}
+
+fn task_effective_state_focus(
+    node: &Node,
+    query_terms: &BTreeSet<String>,
+) -> Option<ProjectionSourceSpan> {
+    let source = node_source_span(node)?;
+    let states = query_terms
+        .iter()
+        .flat_map(|term| [term.clone(), format!("{term}s")])
+        .collect::<BTreeSet<_>>();
+    // A concrete member assignment is the strongest proof that the effective
+    // state is exposed to downstream consumers. Prefer it even when an
+    // earlier local merge also exists; other selected records can carry the
+    // merge while this record preserves the public state seam.
+    let member_offset = node.body.lines().position(|line| {
+        let line = line.to_lowercase();
+        let Some((left, _)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim();
+        states
+            .iter()
+            .any(|state| left.ends_with(&format!(".{state}")))
+    });
+    let merge_offset = node.body.lines().position(|line| {
+        let line = line.to_lowercase();
+        let Some((left, right)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim();
+        !left.contains('.')
+            && states.iter().any(|state| left.ends_with(state))
+            && (right.contains("**")
+                || right.contains(".get(")
+                || right.contains(" | ")
+                || right.contains(" or "))
+    });
+    let offset = member_offset.or(merge_offset)?;
     let line = source
         .start_line
         .saturating_add(u32::try_from(offset).ok()?);
@@ -4175,11 +4476,10 @@ fn task_proof_reserve_candidates(
     candidate_nodes: &BTreeMap<String, &Node>,
     edge_index: &ProjectedEdgeIndex<'_>,
     query: &str,
-    precovered_query_concepts: &BTreeSet<String>,
+    _precovered_query_concepts: &BTreeSet<String>,
 ) -> Vec<TaskProofReserveCandidate> {
     let query_terms = task_query_terms(query);
     let reserved_ids = selected_ids.iter().cloned().collect::<BTreeSet<_>>();
-    let mut reserved_obligations = BTreeSet::new();
     let mut test_nodes_by_file = BTreeMap::<String, Vec<String>>::new();
     for (id, node) in candidate_nodes {
         if default_role(node) == ProjectionRole::Test {
@@ -4288,7 +4588,7 @@ fn task_proof_reserve_candidates(
                 "{} {} {}",
                 node.id.name, node.signature, node.body
             ));
-            if !task_is_test_entrypoint(node)
+            if !(task_is_test_entrypoint(node) && task_test_has_actionable_assertion(node))
                 && query_terms.intersection(&all_terms).count() >= 2
                 && node
                     .body
@@ -4317,11 +4617,12 @@ fn task_proof_reserve_candidates(
             role,
             obligation,
             proof_terms,
+            production_dependency,
             compound_fixture,
             asserting_test,
             member_assertion,
             typed_state_affinity,
-        )) = task_proof_candidate(node, &query_terms, direct_anchor.is_some())
+        )) = task_proof_candidate(node, &query_terms, direct_anchor.is_some(), depth)
         else {
             continue;
         };
@@ -4331,6 +4632,7 @@ fn task_proof_reserve_candidates(
         ));
         let query_affinity = query_terms.intersection(&all_terms).count();
         candidates.push((
+            usize::from(production_dependency),
             usize::from(compound_fixture),
             if compound_fixture { query_affinity } else { 0 },
             if compound_fixture { node.body.len() } else { 0 },
@@ -4349,26 +4651,28 @@ fn task_proof_reserve_candidates(
     }
     candidates.sort_by(|left, right| {
         right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| right.3.cmp(&left.3))
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.cmp(&left.0))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
             .then_with(|| right.4.cmp(&left.4))
             .then_with(|| right.5.cmp(&left.5))
             .then_with(|| right.6.cmp(&left.6))
             .then_with(|| right.7.cmp(&left.7))
-            .then_with(|| left.8.cmp(&right.8))
+            .then_with(|| right.8.cmp(&left.8))
             .then_with(|| left.9.cmp(&right.9))
+            .then_with(|| left.10.cmp(&right.10))
     });
-    let mut reserved = Vec::new();
-    let mut covered_fixture_terms = precovered_query_concepts.clone();
-    let mut covered_member_terms = BTreeSet::new();
-    let mut covered_assertion_terms = precovered_query_concepts.clone();
-    let mut admitted_compound_fixture = false;
-    let mut admitted_compound_assertion = false;
-    for (
-        compound,
+    candidates
+        .into_iter()
+        .take(TASK_PROOF_CANDIDATE_POOL_LIMIT)
+        .enumerate()
+        .map(|(
+            index,
+            (
+        production,
+        _compound,
         _,
         _,
         direct,
@@ -4382,49 +4686,26 @@ fn task_proof_reserve_candidates(
         role,
         obligation,
         proof_terms,
-    ) in candidates
-    {
-        if reserved.len() == TASK_PROOF_RESERVE_LIMIT || reserved_obligations.contains(&obligation)
-        {
-            continue;
-        }
-        let coverage = if compound != 0 {
-            &mut covered_fixture_terms
-        } else if member != 0 {
-            &mut covered_member_terms
-        } else {
-            &mut covered_assertion_terms
-        };
-        let force_compound_fixture = compound != 0 && !admitted_compound_fixture;
-        let force_compound_assertion =
-            compound == 0 && member == 0 && proof_terms.len() >= 2 && !admitted_compound_assertion;
-        if !force_compound_fixture
-            && !force_compound_assertion
-            && proof_terms.iter().all(|term| coverage.contains(term))
-        {
-            continue;
-        }
-        admitted_compound_fixture |= compound != 0;
-        admitted_compound_assertion |= compound == 0 && member == 0 && proof_terms.len() >= 2;
-        reserved_obligations.insert(obligation.clone());
-        coverage.extend(proof_terms.iter().cloned());
-        let rank = u32::try_from(reserved.len() + 1).unwrap_or(u32::MAX);
-        reserved.push(TaskProofReserveCandidate {
+            ),
+        )| {
+            let rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            TaskProofReserveCandidate {
             anchor,
             id,
             role,
             obligation,
             evidence: format!(
-                "bounded proof terms={} direct_anchor={} member_assertion={}",
+                "bounded proof terms={} production_dependency={} direct_anchor={} member_assertion={}",
                 proof_terms.join("+"),
+                production != 0,
                 direct != 0,
                 member != 0
             ),
             depth,
             rank,
-        });
-    }
-    reserved
+            }
+        })
+        .collect()
 }
 
 fn task_proof_direct_relation(
@@ -4462,33 +4743,83 @@ fn task_proof_edge_kind(kind: &EdgeKind) -> bool {
     )
 }
 
-type TaskProofCandidate = (TaskRole, String, Vec<String>, bool, bool, bool, usize);
+type TaskProofCandidate = (TaskRole, String, Vec<String>, bool, bool, bool, bool, usize);
 
 fn task_proof_candidate(
     node: &Node,
     query_terms: &BTreeSet<String>,
     direct_anchor: bool,
+    depth: u32,
 ) -> Option<TaskProofCandidate> {
-    if default_role(node) != ProjectionRole::Test || node.line_end <= node.line_start {
+    if node.line_end <= node.line_start {
         return None;
     }
-    let asserting_test = task_is_test_entrypoint(node) && task_test_has_actionable_assertion(node);
     let all_terms = task_text_terms(&format!(
         "{} {} {}",
         node.id.name, node.signature, node.body
     ));
     let query_matches = query_terms
-        .intersection(&all_terms)
+        .iter()
+        .filter(|term| {
+            all_terms.contains(term.as_str())
+                || all_terms.contains(&format!("{term}s"))
+                || term
+                    .strip_suffix('s')
+                    .is_some_and(|singular| all_terms.contains(singular))
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let compound_fixture = !task_is_test_entrypoint(node)
-        && node
-            .body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count()
-            >= 3
-        && query_matches.len() >= 2;
+    let body_lines = node
+        .body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let operation_carriers = task_operation_carriers(&node.id.name);
+    let production_state_terms =
+        task_typed_state_terms(&format!("{} {}", node.signature, node.body));
+    let production_dependency = default_role(node) == ProjectionRole::EditableSource
+        && node.id.kind == NodeKind::Function
+        && body_lines >= 3
+        && !query_matches.is_empty()
+        && !operation_carriers.is_empty()
+        && (direct_anchor
+            || (depth <= 2
+                && (query_matches.len() >= 2
+                    || operation_carriers.len() >= 2
+                    || !production_state_terms.is_empty())));
+    if production_dependency {
+        let effective_state_terms = task_effective_state_proof_terms(&node.body, query_terms);
+        let mut proof_terms = if effective_state_terms.is_empty() {
+            let mut terms = query_matches;
+            terms.extend(operation_carriers.into_iter().map(str::to_string));
+            terms.extend(production_state_terms.into_iter().take(2));
+            terms
+        } else {
+            // An effective merge or member assignment is independently
+            // actionable API/state evidence. Keep its obligation minimal so
+            // focused rendering does not falsely claim distant concepts from
+            // the same large body.
+            effective_state_terms.into_iter().collect()
+        };
+        proof_terms.sort();
+        proof_terms.dedup();
+        return Some((
+            TaskRole::DirectDependency,
+            format!("proof:{}", proof_terms.join("+")),
+            proof_terms,
+            true,
+            false,
+            false,
+            false,
+            0,
+        ));
+    }
+
+    if default_role(node) != ProjectionRole::Test {
+        return None;
+    }
+    let asserting_test = task_is_test_entrypoint(node) && task_test_has_actionable_assertion(node);
+    let compound_fixture = !asserting_test && body_lines >= 3 && query_matches.len() >= 2;
     let body_lower = node.body.to_lowercase();
     let member_assertion = asserting_test
         && body_lower.lines().any(|line| {
@@ -4534,11 +4865,51 @@ fn task_proof_candidate(
         role,
         obligation,
         proof_terms,
+        false,
         compound_fixture,
         asserting_test,
         member_assertion,
         typed_state_terms.len(),
     ))
+}
+
+fn task_effective_state_proof_terms(
+    body: &str,
+    query_terms: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let body = body.to_lowercase();
+    query_terms
+        .iter()
+        .flat_map(|term| [term.clone(), format!("{term}s")])
+        .filter(|state| task_state_assignment_visible(&body, state))
+        .map(|state| format!("state.{state}"))
+        .collect()
+}
+
+fn task_effective_merge_proof_terms(
+    body: &str,
+    query_terms: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let body = body.to_lowercase();
+    query_terms
+        .iter()
+        .flat_map(|term| [term.clone(), format!("{term}s")])
+        .filter(|state| {
+            body.lines().any(|line| {
+                let Some((left, right)) = line.split_once('=') else {
+                    return false;
+                };
+                let left = left.trim();
+                !left.contains('.')
+                    && left.ends_with(state)
+                    && (right.contains("**")
+                        || right.contains(".get(")
+                        || right.contains(" | ")
+                        || right.contains(" or "))
+            })
+        })
+        .map(|state| format!("state.{state}"))
+        .collect()
 }
 
 fn task_typed_state_terms(text: &str) -> Vec<String> {
@@ -11254,7 +11625,10 @@ mod tests {
         )
         .await;
         assert!(rendered.contains("coverage_unknown"), "{rendered}");
-        assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+        assert!(
+            rendered.contains("delivery_status: not_injectable"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -11293,8 +11667,14 @@ mod tests {
             &incoming_ctx,
         )
         .await;
-        assert!(incoming.contains("delivery_status: injectable_proof"), "{incoming}");
-        assert!(incoming.contains("Left.start:function <-[calls]-"), "{incoming}");
+        assert!(
+            incoming.contains("delivery_status: injectable_proof"),
+            "{incoming}"
+        );
+        assert!(
+            incoming.contains("Left.start:function <-[calls]-"),
+            "{incoming}"
+        );
 
         let both_temp = TempDir::new().unwrap();
         let both_graph = make_graph_state_with_edges(
@@ -16098,7 +16478,17 @@ mod tests {
                 && capability.state == CapabilityState::Ready
         }));
 
+        let certified = output
+            .certified_response
+            .as_ref()
+            .expect("task selection must retain its exact certified final render")
+            .text
+            .clone();
         let rendered = projected_search(&params, &ctx).await;
+        assert_eq!(
+            rendered, certified,
+            "no omission, diagnostic, metadata, or capability mutation may occur after the final render oracle"
+        );
         assert!(rendered.contains(&module_id), "output was:\n{rendered}");
         assert!(
             rendered.contains("task_exact_reference_resolution: ready"),
@@ -16743,6 +17133,288 @@ mod tests {
     }
 
     #[test]
+    fn bounded_proof_subset_is_exact_and_order_independent_with_distractors() {
+        let candidate = |id: &str, rank: u32| TaskProofReserveCandidate {
+            anchor: "anchor".into(),
+            id: id.into(),
+            role: if id == "actionable_test" {
+                TaskRole::Test
+            } else {
+                TaskRole::DirectDependency
+            },
+            obligation: format!("proof:{id}"),
+            evidence: "fixture".into(),
+            depth: 1,
+            rank,
+        };
+        let candidates = vec![
+            candidate("attrs_generation", 1),
+            candidate("typeddict_generation", 2),
+            candidate("actionable_test", 3),
+            candidate("effective_overrides", 4),
+            candidate("punctuation", 5),
+            candidate("tiny_span", 6),
+            candidate("unrelated_neighbor", 7),
+            candidate("body_dropped", 8),
+        ];
+        let select = |ordered: &[TaskProofReserveCandidate]| {
+            select_bounded_task_proof_subset(ordered, 4, |included| {
+                let ids = included
+                    .iter()
+                    .map(|candidate| candidate.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let authoritative_terms = ids
+                    .iter()
+                    .filter(|id| {
+                        matches!(
+                            **id,
+                            "attrs_generation" | "typeddict_generation" | "effective_overrides"
+                        )
+                    })
+                    .map(|id| (*id).to_string())
+                    .collect::<BTreeSet<_>>();
+                let visible_proofs =
+                    authoritative_terms.len() + usize::from(ids.contains("actionable_test"));
+                Some(TaskProofSubsetScore {
+                    actionable_test_visible: ids.contains("actionable_test"),
+                    high_quality_terms: authoritative_terms.clone(),
+                    visible_proofs,
+                    rank_sum: included
+                        .iter()
+                        .map(|candidate| u64::from(candidate.rank))
+                        .sum(),
+                    rendered_bytes: 1_000 + included.len() * 100,
+                    ids: ids.into_iter().map(str::to_string).collect(),
+                })
+            })
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        };
+        let expected = BTreeSet::from([
+            "actionable_test".to_string(),
+            "attrs_generation".to_string(),
+            "effective_overrides".to_string(),
+            "typeddict_generation".to_string(),
+        ]);
+        assert_eq!(select(&candidates), expected);
+        let mut reversed = candidates;
+        reversed.reverse();
+        assert_eq!(select(&reversed), expected);
+    }
+
+    #[test]
+    fn semantic_selected_packet_recovers_bounded_production_contracts() {
+        fn proof_node(name: &str, path: &str, kind: NodeKind, body: &str) -> Node {
+            let mut node = make_node(name, kind, path);
+            node.language = "python".into();
+            node.signature = body.lines().next().unwrap_or_default().into();
+            node.body = body.into();
+            node.line_start = 1;
+            node.line_end = body.lines().count().max(2);
+            node
+        }
+
+        // Preserve the five identities delivered by the semantic-enabled CI
+        // artifact. They satisfy nominal roles and query nouns, but not the
+        // production delivery contract on their own.
+        let namedtuple = proof_node(
+            "namedtuple_dict_structure_factory",
+            "src/cattrs/cols.py",
+            NodeKind::Function,
+            "def namedtuple_dict_structure_factory():\n    overrides = override\n    return make_dict_structure_fn_from_attrs(overrides)\n",
+        );
+        let attribute_override = proof_node(
+            "AttributeOverride",
+            "src/cattrs/gen/_consts.py",
+            NodeKind::Struct,
+            "class AttributeOverride:\n    rename: str\n    omit: bool\n",
+        );
+        let typeddict_import = proof_node(
+            "typeddicts_import",
+            "src/cattrs/gen/typeddicts.py",
+            NodeKind::Import,
+            "from compat import NotRequired, Annotated\n",
+        );
+        let mut selected_test = proof_node(
+            "test_int_override",
+            "tests/test_typeddicts.py",
+            NodeKind::Function,
+            "def test_int_override():\n    result = structure(TypedDict)\n    assert result == override\n",
+        );
+        selected_test
+            .metadata
+            .insert("is_test".into(), "true".into());
+        let mut selected_fixture = proof_node(
+            "annotated_int_attributes",
+            "tests/typeddicts.py",
+            NodeKind::Function,
+            "def annotated_int_attributes():\n    value = NotRequired[Annotated[int, override]]\n    return value\n",
+        );
+        selected_fixture
+            .metadata
+            .insert("is_test".into(), "true".into());
+
+        let attrs_internal = proof_node(
+            "make_dict_structure_fn_from_attrs",
+            "src/cattrs/gen/__init__.py",
+            NodeKind::Function,
+            "def make_dict_structure_fn_from_attrs(attrs, overrides):\n    overrides = {**annotation_overrides, **overrides}\n    fields = apply_override(attrs, overrides)\n    res = build_structure(fields)\n    res.overrides = overrides\n    return res\n",
+        );
+        let attrs_public = proof_node(
+            "make_dict_structure_fn",
+            "src/cattrs/gen/__init__.py",
+            NodeKind::Function,
+            "def make_dict_structure_fn(cl, **overrides):\n    \"\"\"Generate for an attrs class or dataclass.\"\"\"\n    return make_dict_structure_fn_from_attrs(cl, overrides)\n",
+        );
+        let typeddict_generation = proof_node(
+            "make_dict_structure_fn",
+            "src/cattrs/gen/typeddicts.py",
+            NodeKind::Function,
+            "def make_dict_structure_fn(cl, **overrides):\n    annots = get_notrequired_base(Annotated, NotRequired, TypedDict)\n    override = overrides.get('field', annotation_override)\n    return build_structure(annots, override)\n",
+        );
+        let unrelated = proof_node(
+            "render_override_neighbor",
+            "src/noise.py",
+            NodeKind::Function,
+            "def render_override_neighbor():\n    value = override\n    return value\n",
+        );
+
+        let edges = vec![
+            make_edge(&namedtuple, &attrs_internal, EdgeKind::Calls),
+            make_edge(&attrs_public, &attrs_internal, EdgeKind::Calls),
+            make_edge(
+                &typeddict_import,
+                &typeddict_generation,
+                EdgeKind::References,
+            ),
+            make_edge(&attribute_override, &unrelated, EdgeKind::Defines),
+        ];
+        let graph = make_graph_state_with_edges(
+            vec![
+                namedtuple,
+                attribute_override,
+                typeddict_import,
+                selected_test,
+                selected_fixture,
+                attrs_internal,
+                attrs_public,
+                typeddict_generation,
+                unrelated,
+            ],
+            edges,
+        );
+        let edge_index = ProjectedEdgeIndex::new(&graph);
+        let candidate_nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (node.stable_id(), node))
+            .collect::<BTreeMap<_, _>>();
+        let selected_ids = [
+            "namedtuple_dict_structure_factory",
+            "AttributeOverride",
+            "typeddicts_import",
+            "test_int_override",
+            "annotated_int_attributes",
+        ]
+        .into_iter()
+        .map(|name| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id.name == name)
+                .unwrap()
+                .stable_id()
+        })
+        .collect::<Vec<_>>();
+        let query = "Annotated override NotRequired TypedDict NamedTuple";
+        let reserved = task_proof_reserve_candidates(
+            &selected_ids,
+            &candidate_nodes,
+            &edge_index,
+            query,
+            &task_query_terms(query),
+        );
+        let reserved_names = reserved
+            .iter()
+            .filter_map(|candidate| candidate_nodes.get(&candidate.id))
+            .map(|node| node.id.name.as_str())
+            .collect::<Vec<_>>();
+
+        let selected_without_compound = selected_ids
+            .iter()
+            .filter(|id| !id.contains("annotated_int_attributes"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let recovered_without_compound = task_proof_reserve_candidates(
+            &selected_without_compound,
+            &candidate_nodes,
+            &edge_index,
+            query,
+            &task_query_terms(query),
+        );
+        assert!(
+            recovered_without_compound.iter().any(|candidate| {
+                candidate_nodes[&candidate.id].id.name == "annotated_int_attributes"
+            }),
+            "the final reserve must recover the compound NotRequired[Annotated[...]] fixture"
+        );
+        let reserved_paths = reserved
+            .iter()
+            .filter_map(|candidate| candidate_nodes.get(&candidate.id))
+            .map(|node| format!("{}:{}", node.id.file.display(), node.id.name))
+            .collect::<Vec<_>>();
+
+        assert!(reserved_names.contains(&"make_dict_structure_fn_from_attrs"));
+        assert_eq!(
+            reserved_names
+                .iter()
+                .filter(|name| **name == "make_dict_structure_fn")
+                .count(),
+            2,
+            "both attrs/dataclass and TypedDict production seams must survive: {reserved_paths:?}"
+        );
+        assert!(!reserved_names.contains(&"render_override_neighbor"));
+        assert!(reserved.len() <= TASK_PROOF_CANDIDATE_POOL_LIMIT);
+        for path in ["src/cattrs/gen/__init__.py", "src/cattrs/gen/typeddicts.py"] {
+            assert!(
+                reserved.iter().any(|candidate| {
+                    candidate_nodes[&candidate.id]
+                        .id
+                        .file
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        == path
+                        && candidate.obligation.contains("state.override")
+                }),
+                "effective override exposure/merge must be certified for {path}: {reserved_paths:?}",
+            );
+        }
+        let bounded_packet = selected_ids
+            .iter()
+            .chain(reserved.iter().map(|candidate| &candidate.id))
+            .filter_map(|id| candidate_nodes.get(id))
+            .map(|node| node.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for evidence in [
+            "AttributeOverride",
+            "namedtuple_dict_structure_factory",
+            "attrs class or dataclass",
+            "NotRequired",
+            "TypedDict",
+            "{**annotation_overrides, **overrides}",
+            "res.overrides =",
+            "assert result == override",
+        ] {
+            assert!(
+                bounded_packet.contains(evidence),
+                "bounded final identities omit actionable evidence {evidence:?}:\n{bounded_packet}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_compound_fixture_is_preferred_to_redundant_wrapper_evidence() {
         let query_terms = task_query_terms("Annotated override NotRequired TypedDict NamedTuple");
         let mut literal = make_node(
@@ -16764,10 +17436,10 @@ mod tests {
         );
         wrapper.line_end = 35;
 
-        let (_, _, literal_terms, literal_compound, ..) =
-            task_proof_candidate(&literal, &query_terms, false).unwrap();
-        let (_, _, wrapper_terms, wrapper_compound, ..) =
-            task_proof_candidate(&wrapper, &query_terms, true).unwrap();
+        let (_, _, literal_terms, _, literal_compound, ..) =
+            task_proof_candidate(&literal, &query_terms, false, 1).unwrap();
+        let (_, _, wrapper_terms, _, wrapper_compound, ..) =
+            task_proof_candidate(&wrapper, &query_terms, true, 1).unwrap();
         assert!(literal_compound && wrapper_compound);
         assert!(literal.body.len() < wrapper.body.len());
         assert!(literal_terms.contains(&"annotated".into()));
@@ -16791,6 +17463,29 @@ mod tests {
             task_default_sentinel_obligations(&node.body),
             BTreeSet::from(["state:from+converter".to_string()])
         );
+    }
+
+    #[test]
+    fn effective_merge_focus_precedes_unrelated_default_sentinel() {
+        let mut node = make_node("generate", NodeKind::Function, "src/gen.py");
+        node.line_start = 100;
+        node.line_end = 140;
+        node.body = "def generate(**kwargs):\n    override = metadata_override or kwargs.get('field')\n    if mode == \"from_converter\":\n        mode = converter.mode\n    return override\n".into();
+        let focus = task_effective_state_focus(&node, &task_query_terms("override metadata"))
+            .expect("effective merge focus");
+        assert!(focus.start_line <= 101 && focus.end_line >= 101);
+        assert!(focus.end_line < 120);
+    }
+
+    #[test]
+    fn effective_member_exposure_focus_precedes_local_merge() {
+        let mut node = make_node("generate", NodeKind::Function, "src/gen.py");
+        node.line_start = 100;
+        node.line_end = 140;
+        node.body = "def generate(**kwargs):\n    override = metadata_override or kwargs.get('field')\n    result = compile()\n    result.overrides = kwargs\n    return result\n".into();
+        let focus = task_effective_state_focus(&node, &task_query_terms("override metadata"))
+            .expect("effective member exposure focus");
+        assert!(focus.start_line <= 103 && focus.end_line >= 103);
     }
 
     #[test]
