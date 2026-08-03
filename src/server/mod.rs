@@ -509,6 +509,97 @@ fn build_context_preamble_for_mode(
     (!preamble.is_empty()).then_some(preamble)
 }
 
+impl RnaHandler {
+    /// Dispatch a tool request through the same response-composition seam used by MCP.
+    ///
+    /// Kept independent of the runtime handle so boundary behavior can be regression-tested
+    /// without substituting a fake transport.
+    async fn dispatch_call_tool_request(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResult, CallToolError> {
+        let root = &self.repo_root;
+
+        let preamble = if !self
+            .context_injected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(ctx) = build_context_preamble_for_mode(root, self.business_context.mode()) {
+                tracing::info!("Injecting business context preamble on first tool call");
+                Some(ctx)
+            } else {
+                self.context_injected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        } else {
+            None
+        };
+
+        if params.name != "list_roots"
+            && let Some(building_msg) = self.cold_start_building_message()
+        {
+            return Ok(helpers::text_result(building_msg));
+        }
+
+        let mut context_injection_eligible = true;
+        let mut result = match params.name.as_str() {
+            "outcome_progress" => {
+                let args: OutcomeProgress = parse_args(params.arguments)?;
+                self.handle_outcome_progress(args).await
+            }
+            "search" => {
+                let args: Search = parse_args(params.arguments)?;
+                match self.handle_search_delivery(args).await {
+                    Ok(delivery) => {
+                        context_injection_eligible = delivery.context_injection_eligible;
+                        Ok(delivery.result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "convergence" => {
+                let args: Convergence = parse_args(params.arguments)?;
+                match self.handle_search_delivery(args.into()).await {
+                    Ok(delivery) => {
+                        context_injection_eligible = delivery.context_injection_eligible;
+                        Ok(delivery.result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "list_roots" => {
+                let _args: ListRoots = parse_args(params.arguments)?;
+                self.handle_list_roots().await
+            }
+            "repo_map" => {
+                let args: RepoMap = parse_args(params.arguments)?;
+                self.handle_repo_map(args).await
+            }
+            _ => Err(CallToolError::unknown_tool(&params.name)),
+        };
+
+        if context_injection_eligible
+            && let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
+            && self
+                .context_injected
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            tool_result
+                .content
+                .insert(0, TextContent::new(preamble, None, None).into());
+        }
+
+        result
+    }
+}
+
 #[async_trait]
 impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     /// Called after the MCP client sends the `initialized` notification.
@@ -541,91 +632,27 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         params: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> Result<CallToolResult, CallToolError> {
-        let root = &self.repo_root;
-
-        // Build business context preamble on first tool call (deferred store).
-        // We load() first to check whether injection already happened, build
-        // the preamble eagerly, then only store(true) after successfully
-        // inserting it into the response — avoiding a false-positive flag if
-        // the tool call itself errors before we can prepend.
-        let preamble = if !self
-            .context_injected
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            if let Some(ctx) = build_context_preamble_for_mode(root, self.business_context.mode()) {
-                tracing::info!("Injecting business context preamble on first tool call");
-                Some(ctx)
-            } else {
-                // Empty or policy-disabled preamble — mark as injected so we don't retry.
-                self.context_injected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                None
-            }
-        } else {
-            None
-        };
-
-        if params.name != "list_roots"
-            && let Some(building_msg) = self.cold_start_building_message()
-        {
-            return Ok(helpers::text_result(building_msg));
-        }
-
-        let mut result = match params.name.as_str() {
-            "outcome_progress" => {
-                let args: OutcomeProgress = parse_args(params.arguments)?;
-                self.handle_outcome_progress(args).await
-            }
-
-            "search" => {
-                let args: Search = parse_args(params.arguments)?;
-                self.handle_search(args).await
-            }
-
-            "convergence" => {
-                let args: Convergence = parse_args(params.arguments)?;
-                self.handle_search(args.into()).await
-            }
-
-            "list_roots" => {
-                let _args: ListRoots = parse_args(params.arguments)?;
-                self.handle_list_roots().await
-            }
-
-            "repo_map" => {
-                let args: RepoMap = parse_args(params.arguments)?;
-                self.handle_repo_map(args).await
-            }
-
-            _ => Err(CallToolError::unknown_tool(&params.name)),
-        };
-
-        // Prepend business context preamble to first successful tool result.
-        // Only mark as injected after the insert succeeds (compare_exchange
-        // guards against concurrent tool calls both injecting).
-        if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
-            && self
-                .context_injected
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            tool_result
-                .content
-                .insert(0, TextContent::new(preamble, None, None).into());
-        }
-
-        result
+        self.dispatch_call_tool_request(params).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call_tool_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                rust_mcp_sdk::schema::ContentBlock::TextContent(content) => {
+                    Some(content.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn disabled_mode_suppresses_automatic_business_context_preamble() {
@@ -650,6 +677,84 @@ mod tests {
                 crate::business_context::BusinessContextMode::Disabled,
             ),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_convergence_does_not_inject_or_consume_first_call_context() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/outcomes")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn present_symbol() {}\n").unwrap();
+        std::fs::write(
+            root.join(".oh/outcomes/context.md"),
+            "---\ntitle: Context fixture\nstatus: active\n---\nunique deferred context marker\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
+            ..RnaHandler::default()
+        };
+        let graph = handler
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .unwrap();
+        handler.install_cached_graph(graph);
+
+        let unresolved = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "convergence".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "nodes": ["Missing.one", "Missing.two"],
+                        "direction": "outgoing",
+                        "edge_types": ["calls"],
+                        "depth": 3
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let unresolved_text = call_tool_text(&unresolved);
+        assert!(unresolved_text.contains("injected_context: false"));
+        assert!(
+            unresolved_text.contains("unresolved `Missing.one`")
+                && unresolved_text.contains("unresolved `Missing.two`")
+                && unresolved_text.contains("lexical_fallback: disabled"),
+            "unexpected unresolved response: {unresolved_text}"
+        );
+        assert!(!unresolved_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let eligible = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "list_roots".into(),
+                meta: None,
+                task: None,
+                arguments: Some(serde_json::Map::new()),
+            })
+            .await
+            .unwrap();
+        let eligible_text = call_tool_text(&eligible);
+        assert!(eligible_text.contains("Business Context"));
+        assert!(
+            handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

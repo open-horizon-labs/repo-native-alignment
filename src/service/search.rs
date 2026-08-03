@@ -49,9 +49,9 @@ use model::{
     BodyPolicy, CandidateAudit, CandidateDisposition, CapabilityState, CapabilityStatus,
     ContextRole as ProjectionRole, EvidenceProvenance, HydrationHandle, HydrationKind,
     OmissionCode, ProjectedRelationship, ProjectionBudget, ProjectionInput, ProjectionOmission,
-    ProjectionRequest, RecordIdentity, RenderedResponse, RetrievalLane as ProjectionLane, SearchIntent,
-    SearchProjection, SelectedRecord, SelectionChannel, SelectionEvidence, SelectionSummary,
-    SourceSpan as ProjectionSourceSpan, SymbolSummary,
+    ProjectionRequest, RecordIdentity, RenderedResponse, RetrievalLane as ProjectionLane,
+    SearchIntent, SearchProjection, SelectedRecord, SelectionChannel, SelectionEvidence,
+    SelectionSummary, SourceSpan as ProjectionSourceSpan, SymbolSummary,
 };
 use task_context::{
     ContextRole as TaskRole, EvidenceCandidate as TaskEvidenceCandidate, EvidenceQuality,
@@ -1085,20 +1085,41 @@ fn format_enrichment_jobs(ctx: &SearchContext<'_>) -> String {
     lines.join("\n")
 }
 
+/// A rendered search response plus its semantic eligibility for the server's
+/// one-time business-context preamble.
+pub struct SearchDelivery {
+    pub markdown: String,
+    pub context_injection_eligible: bool,
+}
+
+impl SearchDelivery {
+    fn eligible(markdown: String) -> Self {
+        Self {
+            markdown,
+            context_injection_eligible: true,
+        }
+    }
+}
+
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    search_delivery(params, ctx).await.markdown
+}
+
+/// Unified search entry point with delivery semantics for MCP response composition.
+pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> SearchDelivery {
     if let Err(reason) = validate_search_experience(params) {
-        return format!("Invalid search context: {reason}.");
+        return SearchDelivery::eligible(format!("Invalid search context: {reason}."));
     }
     let strict_semantic = strict_semantic_requested(params);
     if strict_semantic && let Err(reason) = strict_semantic_preflight(params, ctx).await {
-        return strict_semantic_failure(reason);
+        return SearchDelivery::eligible(strict_semantic_failure(reason));
     }
 
     // The frozen #779 path deliberately bypasses every new product policy and
     // keeps the established selection, ordering, and renderer byte-for-byte.
     if strict_semantic {
-        return legacy_search_dispatch(params, ctx).await;
+        return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
 
     let normalized_params = normalize_product_context_controls(params);
@@ -1111,10 +1132,12 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
             || params.nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
             || params.target_subsystem.is_some()
         {
-            return "Invalid search context: hydration cannot be combined with legacy nodes/traversal/target_subsystem dispatch."
-                .to_string();
+            return SearchDelivery::eligible(
+                "Invalid search context: hydration cannot be combined with legacy nodes/traversal/target_subsystem dispatch."
+                    .to_string(),
+            );
         }
-        return hydrate_from_handle(node, params, ctx).await;
+        return SearchDelivery::eligible(hydrate_from_handle(node, params, ctx).await);
     }
 
     if params.line.is_some()
@@ -1123,9 +1146,11 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     {
         let params = params.clone();
         let repo_root = ctx.repo_root.to_path_buf();
-        return tokio::task::spawn_blocking(move || source_span(&params, &repo_root))
-            .await
-            .unwrap_or_else(|error| format!("Source span lookup task failed: {error}."));
+        return SearchDelivery::eligible(
+            tokio::task::spawn_blocking(move || source_span(&params, &repo_root))
+                .await
+                .unwrap_or_else(|error| format!("Source span lookup task failed: {error}.")),
+        );
     }
 
     let legacy_dispatch = params.context_mode.is_none()
@@ -1140,19 +1165,22 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         && params.normalized_mode() != Some("convergence")
         && let Some(controls) = legacy_product_controls(params)
     {
-        return format!(
+        return SearchDelivery::eligible(format!(
             "Invalid search context: product controls ({controls}) cannot be combined with legacy node/nodes/traversal/target_subsystem dispatch. Remove those controls or use flat/task context search."
-        );
+        ));
     }
 
     // Traversal and batch rendering retain their established contracts until
     // typed projection adapters exist. In particular, never reinterpret a
     // node/mode request as a flat product search.
     if legacy_dispatch {
-        return legacy_search_dispatch(params, ctx).await;
+        if params.normalized_mode() == Some("convergence") {
+            return search_convergence(params, ctx).into_search_delivery();
+        }
+        return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
 
-    projected_search(params, ctx).await
+    SearchDelivery::eligible(projected_search(params, ctx).await)
 }
 
 /// Return the stable names of product-only controls that legacy dispatch
@@ -1234,10 +1262,6 @@ async fn legacy_search_dispatch(params: &SearchParams, ctx: &SearchContext<'_>) 
         false
     };
 
-    if params.normalized_mode() == Some("convergence") {
-        return search_convergence(params, ctx);
-    }
-
     if let Some(ref node_ids) = params.nodes {
         let node_ids: Vec<&str> = node_ids
             .iter()
@@ -1299,6 +1323,23 @@ enum SelectorBinding {
     Missing,
 }
 
+enum ConvergenceDelivery {
+    Injectable(String),
+    NotInjectable(String),
+}
+
+impl ConvergenceDelivery {
+    fn into_search_delivery(self) -> SearchDelivery {
+        match self {
+            Self::Injectable(markdown) => SearchDelivery::eligible(markdown),
+            Self::NotInjectable(markdown) => SearchDelivery {
+                markdown,
+                context_injection_eligible: false,
+            },
+        }
+    }
+}
+
 fn bind_convergence_selector(raw: &str, graph: &GraphState) -> SelectorBinding {
     let selector = raw.trim();
     if selector.is_empty() {
@@ -1353,7 +1394,13 @@ fn bind_convergence_selector(raw: &str, graph: &GraphState) -> SelectorBinding {
                 node.metadata
                     .get("lexical_name")
                     .map(String::as_str)
-                    .unwrap_or_else(|| node.id.name.rsplit(['.', ':']).next().unwrap_or(&node.id.name))
+                    .unwrap_or_else(|| {
+                        node.id
+                            .name
+                            .rsplit(['.', ':'])
+                            .next()
+                            .unwrap_or(&node.id.name)
+                    })
                     == selector
             })
             .map(Node::stable_id)
@@ -1369,10 +1416,9 @@ fn bind_convergence_selector(raw: &str, graph: &GraphState) -> SelectorBinding {
 }
 
 fn convergence_calls_coverage_ready(ctx: &SearchContext<'_>) -> bool {
-    if ctx
-        .lsp_status
-        .is_some_and(|status| status.call_reference_readiness().state == CapabilityReadinessState::Ready)
-    {
+    if ctx.lsp_status.is_some_and(|status| {
+        status.call_reference_readiness().state == CapabilityReadinessState::Ready
+    }) {
         return true;
     }
     ctx.enrichment_jobs.iter().any(|job| {
@@ -1400,14 +1446,18 @@ fn scoped_convergence_calls_candidates(
     )
     .map_err(|error| format!("current LSP report identity unavailable: {error}"))?;
     if !report.compatibility_violations(&expected).is_empty() {
-        return Err("LSP report identity or digest does not match the current checkout".to_string());
+        return Err(
+            "LSP report identity or digest does not match the current checkout".to_string(),
+        );
     }
     let current_graph_digest = crate::lsp_completeness::graph_snapshot_digest(
         &ctx.graph_state.nodes,
         &ctx.graph_state.edges,
     );
     if report.graph_snapshot_digest != current_graph_digest {
-        return Err("LSP report graph snapshot digest does not match the delivered graph".to_string());
+        return Err(
+            "LSP report graph snapshot digest does not match the delivered graph".to_string(),
+        );
     }
 
     let node_index = ctx.graph_state.node_index_map();
@@ -1448,7 +1498,11 @@ fn scoped_convergence_calls_candidates(
         let relevant_files = paths
             .iter()
             .flat_map(|path| path.iter())
-            .filter_map(|id| node_index.get(id).map(|index| &ctx.graph_state.nodes[*index]))
+            .filter_map(|id| {
+                node_index
+                    .get(id)
+                    .map(|index| &ctx.graph_state.nodes[*index])
+            })
             .map(|node| node.id.file.to_string_lossy().into_owned())
             .collect::<BTreeSet<_>>();
         let every_node_bound = paths
@@ -1465,8 +1519,10 @@ fn scoped_convergence_calls_candidates(
         proven.push(candidate.clone());
     }
     if proven.is_empty() {
-        Err("no candidate has complete relevant-file evidence and exact persisted LSP Calls hops"
-            .to_string())
+        Err(
+            "no candidate has complete relevant-file evidence and exact persisted LSP Calls hops"
+                .to_string(),
+        )
     } else {
         Ok(proven)
     }
@@ -1486,9 +1542,13 @@ fn bounded_ambiguous_ids(ids: &[String]) -> String {
     rendered
 }
 
-fn convergence_unresolved(params: &SearchParams, detail: &str) -> String {
-    let max_bytes = params.max_output_bytes.unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
-    let max_tokens = params.max_output_tokens.unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
+fn convergence_unresolved(params: &SearchParams, detail: &str) -> ConvergenceDelivery {
+    let max_bytes = params
+        .max_output_bytes
+        .unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
+    let max_tokens = params
+        .max_output_tokens
+        .unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
     let mut detail = detail.to_string();
     loop {
         let body = format!(
@@ -1498,15 +1558,15 @@ fn convergence_unresolved(params: &SearchParams, detail: &str) -> String {
         if rendered.len() <= max_bytes
             && rendered.chars().count().saturating_add(3) / 4 <= max_tokens
         {
-            return rendered;
+            return ConvergenceDelivery::NotInjectable(rendered);
         }
         if detail.pop().is_none() {
-            return rendered;
+            return ConvergenceDelivery::NotInjectable(rendered);
         }
     }
 }
 
-fn search_convergence(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+fn search_convergence(params: &SearchParams, ctx: &SearchContext<'_>) -> ConvergenceDelivery {
     let selectors = params.nodes.as_deref().unwrap_or_default();
     if selectors.len() < 2 {
         return convergence_unresolved(params, "at least two source selectors are required");
@@ -1613,10 +1673,7 @@ fn search_convergence(params: &SearchParams, ctx: &SearchContext<'_>) -> String 
         candidates = match scoped_convergence_calls_candidates(ctx, &candidates, direction) {
             Ok(proven) => proven,
             Err(detail) => {
-                return convergence_unresolved(
-                    params,
-                    &format!("{detail} (coverage_unknown)"),
-                );
+                return convergence_unresolved(params, &format!("{detail} (coverage_unknown)"));
             }
         };
     }
@@ -1639,9 +1696,13 @@ fn render_convergence(
     before: Option<&str>,
     candidates: &[crate::graph::index::ConvergenceCandidate],
     depth: usize,
-) -> String {
-    let max_bytes = params.max_output_bytes.unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
-    let max_tokens = params.max_output_tokens.unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
+) -> ConvergenceDelivery {
+    let max_bytes = params
+        .max_output_bytes
+        .unwrap_or(MAX_PROJECTED_OUTPUT_BYTES);
+    let max_tokens = params
+        .max_output_tokens
+        .unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
     let mut retained = candidates.len();
     loop {
         let mut body = String::from(
@@ -1663,10 +1724,12 @@ fn render_convergence(
                 candidate.max_distance,
                 candidate.total_distance
             ));
-            if let Some(node) = ctx.graph_state.node_by_stable_id(
-                &candidate.node_id,
-                ctx.graph_state.node_index_map(),
-            ) && node.line_start > 0 && node.line_end >= node.line_start {
+            if let Some(node) = ctx
+                .graph_state
+                .node_by_stable_id(&candidate.node_id, ctx.graph_state.node_index_map())
+                && node.line_start > 0
+                && node.line_end >= node.line_start
+            {
                 let handle = HydrationHandle::source(
                     candidate.node_id.clone(),
                     ProjectionSourceSpan {
@@ -1675,7 +1738,8 @@ fn render_convergence(
                         start_line: node.line_start as u32,
                         end_line: node.line_end as u32,
                     },
-                ).encode_compact();
+                )
+                .encode_compact();
                 body.push_str(&format!("   - hydrate_source: `{handle}`\n"));
             }
             for (source, witness) in sources.iter().zip(&candidate.witnesses) {
@@ -1692,7 +1756,7 @@ fn render_convergence(
         let rendered = convergence_accounted(body);
         let chars = rendered.chars().count();
         if rendered.len() <= max_bytes && chars.saturating_add(3) / 4 <= max_tokens {
-            return rendered;
+            return ConvergenceDelivery::Injectable(rendered);
         }
         if retained > 1 {
             retained -= 1;
@@ -3073,12 +3137,8 @@ async fn task_records(
                 rejected += 1;
                 continue;
             };
-            let quality = task_candidate_quality_for_roles(
-                node,
-                &BTreeSet::from([role]),
-                false,
-                base_query,
-            );
+            let quality =
+                task_candidate_quality_for_roles(node, &BTreeSet::from([role]), false, base_query);
             if quality != EvidenceQuality::Actionable {
                 rejected += 1;
                 let audit_rank = output.candidate_audit.len();
@@ -3197,9 +3257,10 @@ async fn task_records(
                     .then_with(|| right.1.cmp(&left.1))
                     .then_with(|| left.2.cmp(&right.2))
             });
-            for (_, _, id, role_evidence) in supplements.into_iter().take(
-                (TASK_LANE_CANDIDATE_LIMIT - eligible).min(TASK_ROLE_SUPPLEMENT_LIMIT),
-            ) {
+            for (_, _, id, role_evidence) in supplements
+                .into_iter()
+                .take((TASK_LANE_CANDIDATE_LIMIT - eligible).min(TASK_ROLE_SUPPLEMENT_LIMIT))
+            {
                 eligible += 1;
                 merge_task_assembly(
                     &mut assemblies,
@@ -3547,12 +3608,22 @@ async fn task_records(
         .map(|selected| selected.evidence_id.clone())
         .collect::<Vec<_>>();
     for id in &selected_ids {
-        let Some(candidate) = typed.get(id) else { continue; };
-        if !candidate.obligations.iter().any(|obligation| obligation.starts_with("concept:")) {
+        let Some(candidate) = typed.get(id) else {
+            continue;
+        };
+        if !candidate
+            .obligations
+            .iter()
+            .any(|obligation| obligation.starts_with("concept:"))
+        {
             continue;
         }
-        let Some(node) = candidate_nodes.get(id).copied() else { continue; };
-        let Some(focus) = task_default_sentinel_focus(node) else { continue; };
+        let Some(node) = candidate_nodes.get(id).copied() else {
+            continue;
+        };
+        let Some(focus) = task_default_sentinel_focus(node) else {
+            continue;
+        };
         if let Some(records) = bundles.get_mut(id) {
             for record in records {
                 record.focused_span = Some(focus.clone());
@@ -3586,11 +3657,7 @@ async fn task_records(
             continue;
         };
         let projected_role = projection_role_for_task(proof.role);
-        let fused = single_channel_fused(
-            &proof.id,
-            EvidenceChannel::Graph,
-            ScoreKind::GraphHops,
-        );
+        let fused = single_channel_fused(&proof.id, EvidenceChannel::Graph, ScoreKind::GraphHops);
         let assembly = TaskAssembly {
             fused: fused.clone(),
             roles: BTreeSet::from([proof.role]),
@@ -3698,7 +3765,11 @@ fn rendered_proof_visible(response: &RenderedResponse, record_id: &str, obligati
     };
     let mut delivered = String::new();
     for span in &response.plan.spans {
-        if span.mappings.iter().any(|mapping| mapping.record_id == record_id) {
+        if span
+            .mappings
+            .iter()
+            .any(|mapping| mapping.record_id == record_id)
+        {
             delivered.push('\n');
             delivered.push_str(&span.text);
         }
@@ -3763,9 +3834,8 @@ fn task_candidate_quality_for_roles(
     let graph_corroborated_test = roles.contains(&TaskRole::Test)
         && crate::ranking::is_test_function(node)
         && task_test_has_actionable_assertion(node);
-    let unrelated_graph_neighbor = graph_only
-        && affinity_count < required_graph_affinity
-        && !graph_corroborated_test;
+    let unrelated_graph_neighbor =
+        graph_only && affinity_count < required_graph_affinity && !graph_corroborated_test;
     let generic_test = roles.contains(&TaskRole::Test)
         && (!crate::ranking::is_test_function(node) || !task_test_has_actionable_assertion(node));
     if unrelated_graph_neighbor || generic_test {
@@ -3850,7 +3920,9 @@ fn task_default_sentinel_focus(node: &Node) -> Option<ProjectionSourceSpan> {
             .and_then(|(_, rhs)| rhs.split('"').next())
             .is_some_and(|sentinel| sentinel.split(|ch: char| !ch.is_alphanumeric()).count() >= 2)
     })?;
-    let line = source.start_line.saturating_add(u32::try_from(offset).ok()?);
+    let line = source
+        .start_line
+        .saturating_add(u32::try_from(offset).ok()?);
     Some(ProjectionSourceSpan {
         root: source.root,
         path: source.path,
@@ -3908,8 +3980,8 @@ fn task_obligations_for_text(
 
 fn task_query_terms(query: &str) -> BTreeSet<String> {
     const TASK_QUERY_STOPWORDS: &[&str] = &[
-        "add", "and", "any", "are", "can", "change", "fix", "for", "from", "has", "into",
-        "not", "that", "the", "this", "update", "use", "when", "with",
+        "add", "and", "any", "are", "can", "change", "fix", "for", "from", "has", "into", "not",
+        "that", "the", "this", "update", "use", "when", "with",
     ];
     query
         .split(|ch: char| !ch.is_alphanumeric())
@@ -4074,26 +4146,51 @@ fn task_proof_reserve_candidates(
             if reserved_ids.contains(id) {
                 continue;
             }
-            let all_terms = task_text_terms(&format!("{} {} {}", node.id.name, node.signature, node.body));
+            let all_terms = task_text_terms(&format!(
+                "{} {} {}",
+                node.id.name, node.signature, node.body
+            ));
             if !task_is_test_entrypoint(node)
                 && query_terms.intersection(&all_terms).count() >= 2
-                && node.body.lines().filter(|line| !line.trim().is_empty()).count() >= 3
+                && node
+                    .body
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count()
+                    >= 3
             {
-                discovered.entry(id.clone()).or_insert((TASK_PROOF_MAX_DEPTH + 1, anchor.clone()));
+                discovered
+                    .entry(id.clone())
+                    .or_insert((TASK_PROOF_MAX_DEPTH + 1, anchor.clone()));
             }
         }
     }
 
     let mut candidates = Vec::new();
     for (id, (depth, discovered_anchor)) in discovered {
-        let Some(node) = candidate_nodes.get(&id).copied() else { continue; };
-        let direct_anchor = production_anchors.iter().find(|anchor| {
-            task_proof_direct_relation(anchor, &id, edge_index)
-        }).cloned();
-        let Some((role, obligation, proof_terms, compound_fixture, asserting_test, member_assertion, typed_state_affinity)) =
-            task_proof_candidate(node, &query_terms, direct_anchor.is_some())
-        else { continue; };
-        let all_terms = task_text_terms(&format!("{} {} {}", node.id.name, node.signature, node.body));
+        let Some(node) = candidate_nodes.get(&id).copied() else {
+            continue;
+        };
+        let direct_anchor = production_anchors
+            .iter()
+            .find(|anchor| task_proof_direct_relation(anchor, &id, edge_index))
+            .cloned();
+        let Some((
+            role,
+            obligation,
+            proof_terms,
+            compound_fixture,
+            asserting_test,
+            member_assertion,
+            typed_state_affinity,
+        )) = task_proof_candidate(node, &query_terms, direct_anchor.is_some())
+        else {
+            continue;
+        };
+        let all_terms = task_text_terms(&format!(
+            "{} {} {}",
+            node.id.name, node.signature, node.body
+        ));
         let query_affinity = query_terms.intersection(&all_terms).count();
         candidates.push((
             usize::from(compound_fixture),
@@ -4113,7 +4210,9 @@ fn task_proof_reserve_candidates(
         ));
     }
     candidates.sort_by(|left, right| {
-        right.0.cmp(&left.0)
+        right
+            .0
+            .cmp(&left.0)
             .then_with(|| right.1.cmp(&left.1))
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| right.3.cmp(&left.3))
@@ -4130,8 +4229,25 @@ fn task_proof_reserve_candidates(
     let mut covered_assertion_terms = precovered_query_concepts.clone();
     let mut admitted_compound_fixture = false;
     let mut admitted_compound_assertion = false;
-    for (compound, _, _, direct, member, _, _, _, depth, id, anchor, role, obligation, proof_terms) in candidates {
-        if reserved.len() == TASK_PROOF_RESERVE_LIMIT || reserved_obligations.contains(&obligation) {
+    for (
+        compound,
+        _,
+        _,
+        direct,
+        member,
+        _,
+        _,
+        _,
+        depth,
+        id,
+        anchor,
+        role,
+        obligation,
+        proof_terms,
+    ) in candidates
+    {
+        if reserved.len() == TASK_PROOF_RESERVE_LIMIT || reserved_obligations.contains(&obligation)
+        {
             continue;
         }
         let coverage = if compound != 0 {
@@ -4142,10 +4258,8 @@ fn task_proof_reserve_candidates(
             &mut covered_assertion_terms
         };
         let force_compound_fixture = compound != 0 && !admitted_compound_fixture;
-        let force_compound_assertion = compound == 0
-            && member == 0
-            && proof_terms.len() >= 2
-            && !admitted_compound_assertion;
+        let force_compound_assertion =
+            compound == 0 && member == 0 && proof_terms.len() >= 2 && !admitted_compound_assertion;
         if !force_compound_fixture
             && !force_compound_assertion
             && proof_terms.iter().all(|term| coverage.contains(term))
@@ -4164,7 +4278,9 @@ fn task_proof_reserve_candidates(
             obligation,
             evidence: format!(
                 "bounded proof terms={} direct_anchor={} member_assertion={}",
-                proof_terms.join("+"), direct != 0, member != 0
+                proof_terms.join("+"),
+                direct != 0,
+                member != 0
             ),
             depth,
             rank,
@@ -4173,16 +4289,25 @@ fn task_proof_reserve_candidates(
     reserved
 }
 
-fn task_proof_direct_relation(anchor: &str, candidate: &str, edge_index: &ProjectedEdgeIndex<'_>) -> bool {
-    edge_index.outgoing(anchor).iter().any(|edge| {
-        edge.to.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind)
-    }) || edge_index.incoming(anchor).iter().any(|edge| {
-        edge.from.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind)
-    })
+fn task_proof_direct_relation(
+    anchor: &str,
+    candidate: &str,
+    edge_index: &ProjectedEdgeIndex<'_>,
+) -> bool {
+    edge_index
+        .outgoing(anchor)
+        .iter()
+        .any(|edge| edge.to.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind))
+        || edge_index.incoming(anchor).iter().any(|edge| {
+            edge.from.to_stable_id() == candidate && task_proof_direct_edge_kind(&edge.kind)
+        })
 }
 
 fn task_proof_direct_edge_kind(kind: &EdgeKind) -> bool {
-    matches!(kind, EdgeKind::Calls | EdgeKind::ReferencedBy | EdgeKind::References | EdgeKind::TestedBy)
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::ReferencedBy | EdgeKind::References | EdgeKind::TestedBy
+    )
 }
 
 fn task_proof_edge_kind(kind: &EdgeKind) -> bool {
@@ -4209,8 +4334,7 @@ fn task_proof_candidate(
     if default_role(node) != ProjectionRole::Test || node.line_end <= node.line_start {
         return None;
     }
-    let asserting_test = task_is_test_entrypoint(node)
-        && task_test_has_actionable_assertion(node);
+    let asserting_test = task_is_test_entrypoint(node) && task_test_has_actionable_assertion(node);
     let all_terms = task_text_terms(&format!(
         "{} {} {}",
         node.id.name, node.signature, node.body
@@ -4220,30 +4344,38 @@ fn task_proof_candidate(
         .cloned()
         .collect::<Vec<_>>();
     let compound_fixture = !task_is_test_entrypoint(node)
-        && node.body.lines().filter(|line| !line.trim().is_empty()).count() >= 3
+        && node
+            .body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            >= 3
         && query_matches.len() >= 2;
     let body_lower = node.body.to_lowercase();
     let member_assertion = asserting_test
         && body_lower.lines().any(|line| {
             line.contains("assert")
                 && query_terms.iter().any(|term| {
-                    line.contains(&format!(".{term}"))
-                        || line.contains(&format!(".{term}s"))
+                    line.contains(&format!(".{term}")) || line.contains(&format!(".{term}s"))
                 })
         });
     let typed_state_terms = task_typed_state_terms(&format!("{} {}", node.signature, node.body));
     let state_transition_assertion = asserting_test
         && direct_anchor
         && !typed_state_terms.is_empty()
-        && body_lower.lines().any(|line| line.contains("assert") && line.contains("=="));
-    if !compound_fixture && !(asserting_test && direct_anchor && (member_assertion || !query_matches.is_empty() || state_transition_assertion)) {
+        && body_lower
+            .lines()
+            .any(|line| line.contains("assert") && line.contains("=="));
+    if !compound_fixture
+        && !(asserting_test
+            && direct_anchor
+            && (member_assertion || !query_matches.is_empty() || state_transition_assertion))
+    {
         return None;
     }
 
     let mut proof_terms = query_matches;
-    if member_assertion
-        && let Some(state_term) = typed_state_terms.first()
-    {
+    if member_assertion && let Some(state_term) = typed_state_terms.first() {
         proof_terms.push(state_term.clone());
     }
     if proof_terms.is_empty() {
@@ -4277,8 +4409,18 @@ fn task_typed_state_terms(text: &str) -> Vec<String> {
         .filter(|term| {
             term.len() >= 6
                 && [
-                    "class", "classes", "dataclass", "dataclasses", "struct", "structs",
-                    "record", "records", "model", "models", "type", "types",
+                    "class",
+                    "classes",
+                    "dataclass",
+                    "dataclasses",
+                    "struct",
+                    "structs",
+                    "record",
+                    "records",
+                    "model",
+                    "models",
+                    "type",
+                    "types",
                 ]
                 .iter()
                 .any(|concept| term.ends_with(concept))
@@ -4298,8 +4440,10 @@ fn task_is_test_entrypoint(node: &Node) -> bool {
         || normalized.starts_with("test_")
         || normalized.starts_with("test::")
         || node.metadata.iter().any(|(key, value)| {
-            matches!(key.as_str(), "test_entrypoint" | "test_attribute" | "is_test_case")
-                && value.eq_ignore_ascii_case("true")
+            matches!(
+                key.as_str(),
+                "test_entrypoint" | "test_attribute" | "is_test_case"
+            ) && value.eq_ignore_ascii_case("true")
         })
 }
 
@@ -10601,11 +10745,7 @@ mod tests {
     }
 
     fn make_scoped_method(owner: &str, method: &str, file: &str) -> Node {
-        let mut node = make_node(
-            &format!("{owner}.{method}"),
-            NodeKind::Function,
-            file,
-        );
+        let mut node = make_node(&format!("{owner}.{method}"), NodeKind::Function, file);
         node.metadata
             .insert("parent_scope".into(), owner.to_string());
         node.metadata
@@ -10642,19 +10782,10 @@ mod tests {
         alpha.id.root = "alpha".into();
         let mut beta = alpha.clone();
         beta.id.root = "beta".into();
-        let mut unique = make_scoped_method(
-            "Session",
-            "prepare_request",
-            "requests/sessions.py",
-        );
+        let mut unique = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
         unique.id.root = "alpha".into();
         let graph = make_graph_state(vec![beta.clone(), unique.clone(), alpha.clone()]);
-        let root_stripped = alpha
-            .stable_id()
-            .split_once(':')
-            .unwrap()
-            .1
-            .to_string();
+        let root_stripped = alpha.stable_id().split_once(':').unwrap().1.to_string();
 
         assert_eq!(
             bind_convergence_selector(&alpha.stable_id(), &graph),
@@ -10706,10 +10837,7 @@ mod tests {
             make_edge(&session, &join, EdgeKind::Calls),
             make_edge(&join, &boundary, EdgeKind::Calls),
         ];
-        let graph = make_graph_state_with_edges(
-            vec![request, session, join, boundary],
-            edges,
-        );
+        let graph = make_graph_state_with_edges(vec![request, session, join, boundary], edges);
         let ledger = crate::server::EnrichmentJobLedger::default();
         let job_id = match ledger
             .begin_job(
@@ -10745,7 +10873,10 @@ mod tests {
         ctx.enrichment_jobs = ledger.recent_jobs(temp.path(), 5);
         let params = SearchParams {
             mode: Some("convergence".into()),
-            nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+            nodes: Some(vec![
+                "Request.prepare".into(),
+                "Session.prepare_request".into(),
+            ]),
             before: Some("HTTPAdapter.send".into()),
             direction: Some("outgoing".into()),
             edge_types: Some(vec!["calls".into()]),
@@ -10808,11 +10939,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let request = make_scoped_method("Request", "prepare", "requests/models.py");
         let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
-        let prepared = make_scoped_method(
-            "PreparedRequest",
-            "prepare",
-            "requests/models.py",
-        );
+        let prepared = make_scoped_method("PreparedRequest", "prepare", "requests/models.py");
         let adapter = make_scoped_method("HTTPAdapter", "send", "requests/adapters.py");
         let graph = make_graph_state_with_edges(
             vec![request.clone(), session.clone(), prepared.clone(), adapter],
@@ -10858,7 +10985,10 @@ mod tests {
         let rendered = search(
             &SearchParams {
                 mode: Some("convergence".into()),
-                nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+                nodes: Some(vec![
+                    "Request.prepare".into(),
+                    "Session.prepare_request".into(),
+                ]),
                 before: Some("HTTPAdapter.send".into()),
                 direction: Some("outgoing".into()),
                 edge_types: Some(vec!["calls".into()]),
@@ -10869,8 +10999,14 @@ mod tests {
         )
         .await;
 
-        assert!(rendered.contains("no structural convergence witness"), "{rendered}");
-        assert!(rendered.contains("delivery_status: not_injectable"), "{rendered}");
+        assert!(
+            rendered.contains("no structural convergence witness"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("delivery_status: not_injectable"),
+            "{rendered}"
+        );
         assert!(rendered.contains("injected_context: false"), "{rendered}");
         assert!(rendered.contains("proof_records: 0"), "{rendered}");
         assert!(rendered.contains("delivered_handles: 0"), "{rendered}");
@@ -10888,30 +11024,19 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let request = make_scoped_method("Request", "prepare", "requests/models.py");
         let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
-        let join = make_scoped_method(
-            "PreparedRequest",
-            "prepare_method",
-            "requests/models.py",
-        );
+        let join = make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
         let edges = vec![
             make_confirmed_lsp_call(&request, &join),
             make_confirmed_lsp_call(&session, &join),
         ];
-        let graph = make_graph_state_with_edges(
-            vec![request, session, join],
-            edges,
-        );
+        let graph = make_graph_state_with_edges(vec![request, session, join], edges);
         let identity = current_report_identity(temp.path(), BusinessContextMode::Disabled).unwrap();
         let files = vec![
             calls_coverage_file("requests/models.py"),
             calls_coverage_file("requests/sessions.py"),
         ];
-        let mut report = LspCompletenessReport::new_bound(
-            identity.clone(),
-            files,
-            &graph.nodes,
-            &graph.edges,
-        );
+        let mut report =
+            LspCompletenessReport::new_bound(identity.clone(), files, &graph.nodes, &graph.edges);
         report.evidence = report
             .files
             .iter()
@@ -10939,7 +11064,10 @@ mod tests {
         let rendered = search(
             &SearchParams {
                 mode: Some("convergence".into()),
-                nodes: Some(vec!["Request.prepare".into(), "Session.prepare_request".into()]),
+                nodes: Some(vec![
+                    "Request.prepare".into(),
+                    "Session.prepare_request".into(),
+                ]),
                 edge_types: Some(vec!["calls".into()]),
                 depth: Some(3),
                 ..SearchParams::default()
@@ -10955,7 +11083,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convergence_duplicate_sources_and_bad_boundaries_are_bounded_noninjectable_diagnostics() {
+    async fn convergence_duplicate_sources_and_bad_boundaries_are_bounded_noninjectable_diagnostics()
+     {
         let temp = TempDir::new().unwrap();
         let mut nodes = (0..40)
             .map(|index| {
@@ -10965,11 +11094,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let session = make_scoped_method("Session", "prepare_request", "requests/sessions.py");
-        let prepared = make_scoped_method(
-            "PreparedRequest",
-            "prepare_method",
-            "requests/models.py",
-        );
+        let prepared =
+            make_scoped_method("PreparedRequest", "prepare_method", "requests/models.py");
         nodes.push(session.clone());
         nodes.push(prepared.clone());
         let graph = make_graph_state(nodes);
@@ -15884,10 +16010,18 @@ mod tests {
                 record.identity.node_id == expected
                     && record.selection.role == Some(ProjectionRole::EditableSource)
             }));
-            assert!(output.records.iter().any(|record| {
-                record.identity.node_id == expected_test
-                    && record.selection.role == Some(ProjectionRole::Test)
-            }), "missing expected test {expected_test}; records={:?}", output.records.iter().map(|record| (&record.identity.node_id, record.selection.role)).collect::<Vec<_>>());
+            assert!(
+                output.records.iter().any(|record| {
+                    record.identity.node_id == expected_test
+                        && record.selection.role == Some(ProjectionRole::Test)
+                }),
+                "missing expected test {expected_test}; records={:?}",
+                output
+                    .records
+                    .iter()
+                    .map(|record| (&record.identity.node_id, record.selection.role))
+                    .collect::<Vec<_>>()
+            );
 
             let flat_params = SearchParams {
                 query: task_params.query.clone(),
@@ -16018,8 +16152,7 @@ mod tests {
         substring_neighbor.body = "def other_standard_address(): return decorator".into();
         substring_neighbor.line_start = 1;
         substring_neighbor.line_end = 1;
-        let mut substring_assembly =
-            assembly(&substring_neighbor, TaskRole::DirectDependency);
+        let mut substring_assembly = assembly(&substring_neighbor, TaskRole::DirectDependency);
         substring_assembly.reason = "typed graph Calls dependency".into();
         assert_eq!(
             task_candidate_quality(
@@ -16133,7 +16266,11 @@ mod tests {
         assert!(literal.body.len() < wrapper.body.len());
         assert!(literal_terms.contains(&"annotated".into()));
         assert!(literal_terms.contains(&"notrequired".into()));
-        assert!(wrapper_terms.iter().any(|term| literal_terms.contains(term)));
+        assert!(
+            wrapper_terms
+                .iter()
+                .any(|term| literal_terms.contains(term))
+        );
     }
 
     #[test]
@@ -16173,7 +16310,9 @@ mod tests {
                     },
                     selection: SelectionSummary {
                         channel: SelectionChannel::Graph,
-                        reason: "quality=actionable; obligations=proof:innerdataclass+outerdataclass".into(),
+                        reason:
+                            "quality=actionable; obligations=proof:innerdataclass+outerdataclass"
+                                .into(),
                         role: Some(ProjectionRole::Test),
                         lane: Some(ProjectionLane::Tests),
                     },
@@ -16774,9 +16913,11 @@ mod tests {
         let graph = make_graph_state_with_edges(nodes, edges);
         let edge_index = ProjectedEdgeIndex::new(&graph);
         let ctx = make_search_context(&graph, repository.path());
-        let changed_line = line_of("return legacy_search_dispatch(params, ctx).await;");
+        let changed_line = line_of(
+            "return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);",
+        );
         let proposal = format!(
-            "diff --git a/src/service/search.rs b/src/service/search.rs\n--- a/src/service/search.rs\n+++ b/src/service/search.rs\n@@ -{changed_line},1 +{changed_line},1 @@\n-        return legacy_search_dispatch(params, ctx).await;\n+        return projected_search(params, ctx).await;\n"
+            "diff --git a/src/service/search.rs b/src/service/search.rs\n--- a/src/service/search.rs\n+++ b/src/service/search.rs\n@@ -{changed_line},1 +{changed_line},1 @@\n-        return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);\n+        return SearchDelivery::eligible(projected_search(params, ctx).await);\n"
         );
         let card = projected_graph_delta(
             &SearchParams {
