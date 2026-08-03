@@ -21,7 +21,11 @@ pub use graph::{GraphParams, StatsResult, graph_query, stats};
 pub use progress::{OutcomeProgressContext, OutcomeProgressParams, outcome_progress};
 pub use repomap::{RepoMapContext, RepoMapParams, repo_map};
 pub use roots::{list_roots, list_roots_from_slugs, list_roots_from_slugs_read_only};
+#[cfg(test)]
 pub use search::search;
+pub use search::{search_delivery, search_result};
+
+pub const CONVERGENCE_GUIDANCE: &str = "Convergence requires two or more explicitly bound source `nodes`, optional downstream `before`, and `direction`, `edge_types`, and `depth`; discover readable symbols and verify that any boundary is reachable under the same direction and edge filter, bind them through convergence resolution, then execute the returned stable IDs. Ambiguous, unresolved, coverage-unknown, unreachable-boundary, or empty-proof results never inject context and never fall back to lexical search.";
 
 /// Interface-agnostic search parameters.
 ///
@@ -51,6 +55,7 @@ pub struct SearchParams {
     pub synthetic: Option<bool>,
     pub compact: bool,
     pub nodes: Option<Vec<String>>,
+    pub before: Option<String>,
     pub search_mode: Option<String>,
     pub rerank: bool,
     pub include_artifacts: bool,
@@ -105,6 +110,7 @@ impl Default for SearchParams {
             synthetic: None,
             compact: false,
             nodes: None,
+            before: None,
             search_mode: None,
             rerank: false,
             // Default to true to match MCP tool defaults (`default_true()` on the
@@ -190,6 +196,7 @@ impl SearchParams {
             synthetic: args.synthetic,
             compact: args.compact.unwrap_or(false),
             nodes: non_empty_string_vec(&args.nodes),
+            before: non_blank_optional(&args.before),
             search_mode: non_blank_optional(&args.search_mode),
             rerank: args.rerank.unwrap_or(true),
             include_artifacts: args.include_artifacts.unwrap_or(true),
@@ -323,6 +330,37 @@ mod tests {
             params.nodes,
             Some(vec!["repo:src/lib.rs:thing:function".to_string()])
         );
+    }
+
+    #[test]
+    fn from_mcp_search_preserves_the_convergence_contract() {
+        let search: Search = serde_json::from_value(json!({
+            "mode": " convergence ",
+            "nodes": [" Request.prepare ", " Session.prepare_request "],
+            "before": " PreparedRequest.prepare_method ",
+            "direction": " outgoing ",
+            "edge_types": [" calls "],
+            "depth": 6,
+            "max_output_bytes": 12000,
+            "max_output_tokens": 3000
+        }))
+        .unwrap();
+        let params = SearchParams::from_mcp_search(&search);
+
+        assert_eq!(params.mode.as_deref(), Some("convergence"));
+        assert_eq!(
+            params.nodes,
+            Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
+        );
+        assert_eq!(
+            params.before.as_deref(),
+            Some("PreparedRequest.prepare_method")
+        );
+        assert_eq!(params.direction.as_deref(), Some("outgoing"));
+        assert_eq!(params.edge_types, Some(vec!["calls".into()]));
+        assert_eq!(params.depth, Some(6));
+        assert_eq!(params.max_output_bytes, Some(12_000));
+        assert_eq!(params.max_output_tokens, Some(3_000));
     }
 
     #[test]

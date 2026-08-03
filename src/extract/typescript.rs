@@ -629,6 +629,7 @@ fn collect_ts_specials(
                     };
 
                     let mut metadata = BTreeMap::new();
+                    let mut identity_name = name_str.clone();
                     metadata.insert(
                         "name_col".to_string(),
                         name_node.start_position().column.to_string(),
@@ -646,23 +647,26 @@ fn collect_ts_specials(
                         && let Ok(class_name) = class_name_node.utf8_text(source)
                     {
                         metadata.insert("parent_scope".to_string(), class_name.to_string());
+                        metadata.insert("parent_scope_kind".to_string(), "class".to_string());
+                        metadata.insert("lexical_name".to_string(), name_str.clone());
+                        identity_name = format!("{class_name}.{name_str}");
                         emit_class_defines_edge(
                             path,
                             class_name,
-                            &name_str,
+                            &identity_name,
                             NodeKind::Function,
                             edges,
                         );
                     }
 
                     // Emit DependsOn edges for parameter/return types
-                    emit_ts_type_edges(path, &name_str, value_n, source, edges);
+                    emit_ts_type_edges(path, &identity_name, value_n, source, edges);
 
                     nodes.push(Node {
                         id: NodeId {
                             root: String::new(),
                             file: path.to_path_buf(),
-                            name: name_str,
+                            name: identity_name,
                             kind: NodeKind::Function,
                         },
                         language: "typescript".to_string(),
@@ -996,14 +1000,14 @@ class Foo {
         let handler = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.handler" && n.id.kind == NodeKind::Function)
             .expect("Should find handler as Function");
         assert_eq!(handler.id.kind, NodeKind::Function);
 
         let on_click = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "onClick" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.onClick" && n.id.kind == NodeKind::Function)
             .expect("Should find onClick as Function");
         assert_eq!(on_click.id.kind, NodeKind::Function);
     }
@@ -1088,7 +1092,7 @@ class Foo {
                 e.kind == EdgeKind::Defines
                     && e.from.name == "Foo"
                     && e.from.kind == NodeKind::Struct
-                    && e.to.name == "handler"
+                    && e.to.name == "Foo.handler"
                     && e.to.kind == NodeKind::Function
             })
             .collect();
@@ -1113,7 +1117,7 @@ class Foo {
         let handler = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.handler" && n.id.kind == NodeKind::Function)
             .expect("Should find handler as Function");
         assert!(
             handler.signature.contains("function"),
@@ -1125,6 +1129,38 @@ class Foo {
             "function_expression class property should NOT have '=>' in signature, got: {}",
             handler.signature
         );
+    }
+
+    #[test]
+    fn class_function_properties_with_same_lexical_name_keep_owner_identity() {
+        let result = TypeScriptExtractor::new()
+            .extract(
+                Path::new("src/app.ts"),
+                "class Alpha { run = (x: Input): Output => x; }\nclass Beta { run = (x: Input): Output => x; }",
+            )
+            .unwrap();
+        for owner in ["Alpha", "Beta"] {
+            let identity = format!("{owner}.run");
+            let node = result
+                .nodes
+                .iter()
+                .find(|node| node.id.kind == NodeKind::Function && node.id.name == identity)
+                .unwrap_or_else(|| panic!("missing {identity}"));
+            assert_eq!(
+                node.metadata.get("lexical_name").map(String::as_str),
+                Some("run")
+            );
+            assert!(result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Defines
+                    && edge.from.name == owner
+                    && edge.to.name == identity
+            }));
+            assert!(result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::DependsOn
+                    && edge.from.name == identity
+                    && edge.to.name == "Input"
+            }));
+        }
     }
 
     // --- Defines edge tests for imports, consts, type aliases (#168) ---
@@ -1419,13 +1455,13 @@ interface Service {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find interface method serve");
 
         let stop = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.stop" && n.id.kind == NodeKind::Function);
         assert!(stop.is_some(), "Should find interface method stop");
 
         // Methods should have parent_scope pointing to the interface
@@ -1464,7 +1500,7 @@ class MyService {
         let create = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.create" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             create.metadata.get("is_static").map(|s| s.as_str()),
@@ -1475,7 +1511,7 @@ class MyService {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.serve" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             serve.metadata.get("is_static").map(|s| s.as_str()),
@@ -1486,7 +1522,7 @@ class MyService {
         let count = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.count" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             count.metadata.get("is_static").map(|s| s.as_str()),

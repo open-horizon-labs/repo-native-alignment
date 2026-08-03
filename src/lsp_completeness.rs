@@ -661,6 +661,63 @@ impl LspCompletenessReport {
         violations.dedup();
         violations
     }
+
+    /// Validate durable Calls coverage only for files that participate in a
+    /// concrete structural witness. Unrelated unsupported files deliberately
+    /// do not poison an existential proof.
+    pub fn call_hierarchy_paths_covered<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> std::result::Result<(), String> {
+        let requested = paths
+            .into_iter()
+            .map(normalize_repo_relative_path)
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(|error| format!("invalid witness path: {error}"))?;
+        for path in requested {
+            let Some(file) = self.files.iter().find(|file| file.path == path) else {
+                return Err(format!("relevant file `{path}` is absent from the LSP report"));
+            };
+            if !file.role.is_included() || !file.terminal_status.is_processed() {
+                return Err(format!(
+                    "relevant file `{path}` has incomplete LSP status `{}`",
+                    file.terminal_status.as_str()
+                ));
+            }
+            if !file.expected_results.contains(&ExpectedResultKind::CallHierarchy) {
+                return Err(format!(
+                    "relevant file `{path}` does not declare CallHierarchy coverage"
+                ));
+            }
+            if !file.requests_attempted.iter().any(|attempt| {
+                attempt.outcome == RequestOutcome::Completed
+                    && attempt.method.to_ascii_lowercase().contains("callhierarchy")
+            }) {
+                return Err(format!(
+                    "relevant file `{path}` has no completed CallHierarchy request"
+                ));
+            }
+            let current = self
+                .evidence
+                .iter()
+                .filter(|evidence| {
+                    evidence.path == path
+                        && evidence.generation == self.identity.enrichment_generation
+                })
+                .collect::<Vec<_>>();
+            if current.len() != 1
+                || !current[0]
+                    .operations
+                    .iter()
+                    .any(|operation| operation == "call_hierarchy")
+            {
+                return Err(format!(
+                    "relevant file `{path}` lacks unique current-generation CallHierarchy evidence"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn graph_snapshot_digest(nodes: &[Node], edges: &[Edge]) -> String {
@@ -3540,10 +3597,25 @@ fn checkout_identity(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
         return Ok(format!(
             "{}+worktree:{}",
             target,
-            content_tree_digest(repo_root, paths)?
+            checkout_content_tree_digest(repo_root, paths)?
         ));
     }
-    Ok(format!("tree:{}", content_tree_digest(repo_root, paths)?))
+    Ok(format!(
+        "tree:{}",
+        checkout_content_tree_digest(repo_root, paths)?
+    ))
+}
+
+fn checkout_content_tree_digest(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
+    let source_paths = paths
+        .iter()
+        .filter(|path| {
+            path.as_path() != Path::new(".oh/.cache")
+                && !path.starts_with(Path::new(".oh/.cache"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    content_tree_digest(repo_root, &source_paths)
 }
 
 fn repository_at_root(repo_root: &Path) -> Option<git2::Repository> {
@@ -4380,6 +4452,65 @@ mod tests {
         )
     }
 
+    fn calls_covered(path: &str) -> FileCoverageRecord {
+        let mut file = included(
+            path,
+            FileTerminalStatus::Processed { result_count: 1 },
+        );
+        file.expected_results.insert(ExpectedResultKind::CallHierarchy);
+        file.requests_attempted.push(RequestAttempt {
+            method: "textDocument/prepareCallHierarchy+callHierarchy/*".to_string(),
+            outcome: RequestOutcome::Completed,
+            result_count: Some(1),
+            duration_ms: Some(1),
+            detail: None,
+        });
+        file
+    }
+
+    #[test]
+    fn scoped_calls_coverage_ignores_unrelated_unsupported_extensions() {
+        let mut unrelated = included(
+            "ext/requests-logo.ai",
+            FileTerminalStatus::UnsupportedExtension {
+                detail: "no language server".to_string(),
+            },
+        );
+        unrelated.language = None;
+        unrelated.expected_server = None;
+        let mut report = report(vec![calls_covered("requests/models.py"), unrelated]);
+        report
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.path == "requests/models.py")
+            .unwrap()
+            .operations
+            .push("call_hierarchy".to_string());
+        report.finalize();
+
+        assert!(!report.is_ready(), "the aggregate report remains degraded");
+        assert!(
+            report
+                .call_hierarchy_paths_covered(["requests/models.py"])
+                .is_ok(),
+            "an irrelevant unsupported extension must not poison an exact Python witness"
+        );
+    }
+
+    #[test]
+    fn scoped_calls_coverage_rejects_missing_relevant_python_evidence() {
+        let mut report = report(vec![calls_covered("requests/models.py")]);
+        report.evidence.clear();
+        report.finalize();
+
+        assert!(
+            report
+                .call_hierarchy_paths_covered(["requests/models.py"])
+                .unwrap_err()
+                .contains("lacks unique current-generation")
+        );
+    }
+
     fn inherited_evidence(path: &str, result_ids: Vec<String>) -> LspFileEvidence {
         LspFileEvidence {
             path: path.to_string(),
@@ -5212,8 +5343,13 @@ mod tests {
         let repository = git2::Repository::init(root.path()).unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/a.py"), "VALUE = 1\n").unwrap();
+        std::fs::create_dir_all(root.path().join(".oh/.cache/lance")).unwrap();
+        std::fs::write(root.path().join(".oh/.cache/lance/schema_version"), "24\n").unwrap();
         let mut index = repository.index().unwrap();
         index.add_path(Path::new("src/a.py")).unwrap();
+        index
+            .add_path(Path::new(".oh/.cache/lance/schema_version"))
+            .unwrap();
         index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repository.find_tree(tree_id).unwrap();
@@ -5223,19 +5359,21 @@ mod tests {
             .unwrap();
         drop(tree);
 
-        std::fs::create_dir_all(root.path().join(".oh/.cache/lance")).unwrap();
-        std::fs::write(root.path().join(".oh/.cache/lance/schema_version"), "24\n").unwrap();
         let paths = inventory_paths(root.path()).unwrap();
         assert_eq!(
             checkout_identity(root.path(), &paths).unwrap(),
             commit.to_string()
         );
 
-        std::fs::write(root.path().join("untracked.txt"), "real worktree change\n").unwrap();
-        assert!(
-            checkout_identity(root.path(), &paths)
-                .unwrap()
-                .starts_with(&format!("{commit}+worktree:"))
+        std::fs::write(root.path().join("src/a.py"), "VALUE = 2\n").unwrap();
+        let dirty_identity = checkout_identity(root.path(), &paths).unwrap();
+        assert!(dirty_identity.starts_with(&format!("{commit}+worktree:")));
+
+        std::fs::write(root.path().join(".oh/.cache/lance/schema_version"), "26\n").unwrap();
+        assert_eq!(
+            checkout_identity(root.path(), &paths).unwrap(),
+            dirty_identity,
+            "tracked RNA cache mutations must not stale the source checkout identity"
         );
     }
 

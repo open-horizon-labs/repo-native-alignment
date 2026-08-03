@@ -16,6 +16,56 @@ The evidence projection changes presentation, not qualification. A caller can
 therefore inspect why a result was selected without paying for that audit data
 in every agent prompt.
 
+## Rendered delivery budget
+
+Byte and token limits apply to the complete self-accounted response, including
+headers, metadata, bodies, relationships, omissions, and the accounting footer.
+Selection and rendering use the same bounded fitter. When optional
+server-owned detail does not fit, RNA degrades it deterministically: capability
+diagnostics, candidate audit, capability-list detail, and then the omission
+list, which collapses into one entry reporting `omitted_detail_count` while
+retaining one compact hydration handle. It next degrades per-record evidence
+and metadata, relationship detail/rows, task bodies to obligation excerpts,
+remaining source bodies, and finally the lowest-ranked flat-search tail.
+New degradation omissions re-enter the same ladder and are compacted before
+later evidence-bearing stages. Task-selected records are
+protected because a role or task obligation is covered only when its actionable
+carrier remains in the final fitted packet.
+
+Every retained record whose detail can be omitted keeps a stable
+`rna-h2` version-2 source or evidence handle. V2 is a compact, checksummed,
+self-describing encoding; the hydration endpoint continues to accept existing
+V1 handles. Budgets below the compact header/result/handle/accounting envelope
+still fail with a typed `BudgetTooSmall` error rather than returning an empty or
+misleading success.
+
+Convergence diagnostics obey the same complete byte/token caps. When even the
+smallest self-accounted noninjectable diagnostic cannot fit, the service
+returns a typed `BudgetTooSmall` delivery error and the MCP adapter exposes it
+as a tool error; it never emits an over-budget diagnostic or consumes the
+one-time business-context preamble.
+
+Structural convergence witnesses render the selected edge kind on every hop.
+When a request allows mixed relationships, scoped LSP completeness is required
+only for hops actually selected as `Calls`; other requested kinds such as
+`DependsOn` retain their own graph provenance and are not misclassified as
+call-hierarchy evidence. Parallel eligible edges are resolved deterministically.
+
+The minimum envelope is measured, not a repository-wide magic number because
+stable identity and path lengths vary. For a request with candidates it is the
+exact final `RenderCost` of the fully degraded fixed scaffold plus the
+lowest-cost actionable record identity, compact obligation certificate,
+source handle, and self-accounting footer. The bounded fitter computes that
+same value during admission; if neither caller limit can hold it,
+`BudgetTooSmall.minimum` reports the final byte/token cost of that irreducible
+plan. Tests freeze this definition and the degradation order rather than one
+incidental global byte count.
+
+Generic query-concept and query-affine structural-profile obligations apply to
+every language. Structural profiles distinguish independently useful evidence
+branches by role and matched query concepts, without embedding repository- or
+language-specific vocabulary in the selector.
+
 ## Ranking evidence
 
 Product search combines channels only after deterministic within-channel
@@ -139,8 +189,11 @@ and graph-impact lanes. Exact hits, ambiguities, and misses remain distinct.
 Callers may request bounded `context_roles`, `context_facets`, graph edge types
 and hops, a body policy, and a render budget. Unknown roles/facets and values
 above the service's hard limits fail closed. Selection maximizes newly covered
-roles per marginal rendered cost; one span may satisfy several roles without
-duplicating its source.
+roles and generic task obligations per marginal final-packet cost; one
+actionable record or span may satisfy several obligations without duplicating
+its source. Punctuation-only constants are rejected, while incomplete spans,
+unrelated graph neighbors, and generic tests cannot satisfy coverage merely by
+carrying a nominal role.
 
 Example CLI request:
 

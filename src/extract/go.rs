@@ -468,15 +468,18 @@ fn extract_interface_methods(
 
             let method_body = child.utf8_text(source).unwrap_or("").to_string();
             let signature = method_body.lines().next().unwrap_or("").to_string();
+            let identity_name = format!("{interface_name}.{method_name}");
 
             let mut metadata = BTreeMap::new();
             metadata.insert("parent_scope".to_string(), interface_name.to_string());
+            metadata.insert("parent_scope_kind".to_string(), "trait".to_string());
+            metadata.insert("lexical_name".to_string(), method_name.clone());
 
             nodes.push(Node {
                 id: NodeId {
                     root: String::new(),
                     file: path.to_path_buf(),
-                    name: method_name.clone(),
+                    name: identity_name.clone(),
                     kind: NodeKind::Function,
                 },
                 language: "go".to_string(),
@@ -499,7 +502,7 @@ fn extract_interface_methods(
                 to: NodeId {
                     root: String::new(),
                     file: path.to_path_buf(),
-                    name: method_name,
+                    name: identity_name,
                     kind: NodeKind::Function,
                 },
                 kind: EdgeKind::Defines,
@@ -1176,13 +1179,13 @@ type Reader interface {
         let read = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Read" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Reader.Read" && n.id.kind == NodeKind::Function);
         assert!(read.is_some(), "Should find interface method Read");
 
         let close = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Close" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Reader.Close" && n.id.kind == NodeKind::Function);
         assert!(close.is_some(), "Should find interface method Close");
 
         // Methods should have parent_scope pointing to the interface
@@ -1196,6 +1199,10 @@ type Reader interface {
             Some(&"Reader".to_string()),
             "Close should have parent_scope = Reader"
         );
+        assert_eq!(
+            read.unwrap().metadata.get("lexical_name"),
+            Some(&"Read".to_string())
+        );
 
         // Should produce Defines edges from interface to methods
         let defines_edges: Vec<_> = result
@@ -1204,12 +1211,43 @@ type Reader interface {
             .filter(|e| e.kind == EdgeKind::Defines && e.from.name == "Reader")
             .collect();
         assert!(
-            defines_edges.iter().any(|e| e.to.name == "Read"),
+            defines_edges.iter().any(|e| e.to.name == "Reader.Read"),
             "Should have Defines edge Reader -> Read"
         );
         assert!(
-            defines_edges.iter().any(|e| e.to.name == "Close"),
+            defines_edges.iter().any(|e| e.to.name == "Reader.Close"),
             "Should have Defines edge Reader -> Close"
         );
+    }
+
+    #[test]
+    fn interface_methods_with_same_lexical_name_keep_owner_identity() {
+        let result = GoExtractor::new()
+            .extract(
+                Path::new("main.go"),
+                "package main\n\ntype Reader interface { Read([]byte) error }\ntype Auditor interface { Read([]byte) error }\n",
+            )
+            .unwrap();
+        let method_names = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.id.kind == NodeKind::Function
+                    && node.metadata.get("lexical_name").map(String::as_str) == Some("Read")
+            })
+            .map(|node| node.id.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(method_names.contains(&"Reader.Read"));
+        assert!(method_names.contains(&"Auditor.Read"));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Defines
+                && edge.from.name == "Reader"
+                && edge.to.name == "Reader.Read"
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Defines
+                && edge.from.name == "Auditor"
+                && edge.to.name == "Auditor.Read"
+        }));
     }
 }

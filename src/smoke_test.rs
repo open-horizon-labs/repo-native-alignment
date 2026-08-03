@@ -2004,7 +2004,9 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         ..Default::default()
     };
 
-    let output = crate::service::search(&params, &ctx).await;
+    let output = crate::service::search_result(&params, &ctx)
+        .await
+        .unwrap_or_else(|error| error.to_string());
     let output_len = output.len();
     let max_chars = 50_000;
 

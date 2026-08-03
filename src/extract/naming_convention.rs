@@ -46,6 +46,13 @@
 //! touched in an incremental scan.
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
+
+fn node_lexical_name(node: &Node) -> &str {
+    node.metadata
+        .get("lexical_name")
+        .map(String::as_str)
+        .unwrap_or(node.id.name.as_str())
+}
 use crate::ranking::is_test_function;
 use aho_corasick::{AhoCorasick, MatchKind};
 
@@ -81,7 +88,7 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // Short names ("new", "get", "run", …) produce too many false positives.
     let prod_indexed: Vec<&Node> = prod_fns
         .iter()
-        .filter(|n| n.id.name.len() >= 4)
+        .filter(|n| node_lexical_name(n).len() >= 4)
         .copied()
         .collect();
 
@@ -104,7 +111,7 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // `ascii_case_insensitive` replaces the previous to_lowercase() allocations
     // and is correct for function names, which are always ASCII across all
     // supported languages.
-    let patterns: Vec<&str> = prod_indexed.iter().map(|n| n.id.name.as_str()).collect();
+    let patterns: Vec<&str> = prod_indexed.iter().map(|n| node_lexical_name(n)).collect();
     let ac = AhoCorasick::builder()
         .ascii_case_insensitive(true)
         .match_kind(MatchKind::LeftmostLongest)
@@ -120,7 +127,7 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // TestedBy edge per (test_fn, prod_fn) pair — consistent with the previous
         // str::contains behavior.
         let mut seen_patterns = std::collections::HashSet::new();
-        for mat in ac.find_iter(&test_fn.id.name) {
+        for mat in ac.find_iter(node_lexical_name(test_fn)) {
             let pattern_idx = mat.pattern().as_usize();
             if !seen_patterns.insert(pattern_idx) {
                 continue; // already emitted an edge for this (test_fn, prod_fn) pair
@@ -209,6 +216,27 @@ mod tests {
         assert_eq!(edges[0].to.name, "process_payment");
         assert_eq!(edges[0].kind, EdgeKind::TestedBy);
         assert_eq!(edges[0].source, ExtractionSource::TreeSitter);
+    }
+
+    #[test]
+    fn scoped_functions_match_lexically_and_emit_canonical_tested_by_edge() {
+        let mut production = make_fn("Processor.process", false);
+        production
+            .metadata
+            .insert("lexical_name".into(), "process".into());
+        production
+            .metadata
+            .insert("parent_scope".into(), "Processor".into());
+        let mut test = make_fn("ProcessorTests.test_process", true);
+        test.metadata
+            .insert("lexical_name".into(), "test_process".into());
+        test.metadata
+            .insert("parent_scope".into(), "ProcessorTests".into());
+
+        let edges = tested_by_pass(&[production.clone(), test.clone()]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, test.id);
+        assert_eq!(edges[0].to, production.id);
     }
 
     #[test]

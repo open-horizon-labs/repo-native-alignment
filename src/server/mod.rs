@@ -509,44 +509,17 @@ fn build_context_preamble_for_mode(
     (!preamble.is_empty()).then_some(preamble)
 }
 
-#[async_trait]
-impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
-    /// Called after the MCP client sends the `initialized` notification.
-    /// Spawns a background task to pre-warm the graph so the first tool
-    /// call doesn't block on a full extraction pipeline.
-    async fn on_initialized(&self, _runtime: Arc<dyn McpServer>) {
-        self.start_prewarm();
-    }
-
-    async fn handle_list_tools_request(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<ListToolsResult, RpcError> {
-        Ok(ListToolsResult {
-            tools: vec![
-                OutcomeProgress::tool(),
-                Search::tool(),
-                ListRoots::tool(),
-                RepoMap::tool(),
-            ],
-            meta: None,
-            next_cursor: None,
-        })
-    }
-
-    async fn handle_call_tool_request(
+impl RnaHandler {
+    /// Dispatch a tool request through the same response-composition seam used by MCP.
+    ///
+    /// Kept independent of the runtime handle so boundary behavior can be regression-tested
+    /// without substituting a fake transport.
+    async fn dispatch_call_tool_request(
         &self,
         params: CallToolRequestParams,
-        _runtime: Arc<dyn McpServer>,
     ) -> Result<CallToolResult, CallToolError> {
         let root = &self.repo_root;
 
-        // Build business context preamble on first tool call (deferred store).
-        // We load() first to check whether injection already happened, build
-        // the preamble eagerly, then only store(true) after successfully
-        // inserting it into the response — avoiding a false-positive flag if
-        // the tool call itself errors before we can prepend.
         let preamble = if !self
             .context_injected
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -555,7 +528,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 tracing::info!("Injecting business context preamble on first tool call");
                 Some(ctx)
             } else {
-                // Empty or policy-disabled preamble — mark as injected so we don't retry.
                 self.context_injected
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 None
@@ -570,34 +542,45 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             return Ok(helpers::text_result(building_msg));
         }
 
+        let mut context_injection_eligible = true;
         let mut result = match params.name.as_str() {
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
                 self.handle_outcome_progress(args).await
             }
-
             "search" => {
                 let args: Search = parse_args(params.arguments)?;
-                self.handle_search(args).await
+                match self.handle_search_delivery(args).await {
+                    Ok(delivery) => {
+                        context_injection_eligible = delivery.context_injection_eligible;
+                        Ok(delivery.result)
+                    }
+                    Err(error) => Err(error),
+                }
             }
-
+            "convergence" => {
+                let args: Convergence = parse_args(params.arguments)?;
+                match self.handle_search_delivery(args.into()).await {
+                    Ok(delivery) => {
+                        context_injection_eligible = delivery.context_injection_eligible;
+                        Ok(delivery.result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             "list_roots" => {
                 let _args: ListRoots = parse_args(params.arguments)?;
                 self.handle_list_roots().await
             }
-
             "repo_map" => {
                 let args: RepoMap = parse_args(params.arguments)?;
                 self.handle_repo_map(args).await
             }
-
             _ => Err(CallToolError::unknown_tool(&params.name)),
         };
 
-        // Prepend business context preamble to first successful tool result.
-        // Only mark as injected after the insert succeeds (compare_exchange
-        // guards against concurrent tool calls both injecting).
-        if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
+        if context_injection_eligible
+            && let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
             && self
                 .context_injected
                 .compare_exchange(
@@ -617,9 +600,59 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     }
 }
 
+#[async_trait]
+impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
+    /// Called after the MCP client sends the `initialized` notification.
+    /// Spawns a background task to pre-warm the graph so the first tool
+    /// call doesn't block on a full extraction pipeline.
+    async fn on_initialized(&self, _runtime: Arc<dyn McpServer>) {
+        self.start_prewarm();
+    }
+
+    async fn handle_list_tools_request(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ListToolsResult, RpcError> {
+        Ok(ListToolsResult {
+            tools: vec![
+                OutcomeProgress::tool(),
+                Search::tool(),
+                Convergence::tool(),
+                ListRoots::tool(),
+                RepoMap::tool(),
+            ],
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn handle_call_tool_request(
+        &self,
+        params: CallToolRequestParams,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<CallToolResult, CallToolError> {
+        self.dispatch_call_tool_request(params).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call_tool_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                rust_mcp_sdk::schema::ContentBlock::TextContent(content) => {
+                    Some(content.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn disabled_mode_suppresses_automatic_business_context_preamble() {
@@ -644,6 +677,271 @@ mod tests {
                 crate::business_context::BusinessContextMode::Disabled,
             ),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn search_delivery_errors_do_not_inject_or_consume_first_call_context() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/outcomes")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn present_symbol() {}\n").unwrap();
+        std::fs::write(
+            root.join(".oh/outcomes/context.md"),
+            "---\ntitle: Context fixture\nstatus: active\n---\nunique deferred context marker\n",
+        )
+        .unwrap();
+
+        let emitter = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Disabled),
+            ..RnaHandler::default()
+        };
+        let emitter_graph = emitter
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .unwrap();
+        emitter.install_cached_graph(emitter_graph);
+        let emitted = emitter
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "search".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "query": "present_symbol",
+                        "include_artifacts": false,
+                        "include_markdown": false
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let emitted_text = call_tool_text(&emitted);
+        let hydration_handle = emitted_text
+            .split_whitespace()
+            .map(|token| token.trim_matches(|character| matches!(character, '`' | ',' | ')')))
+            .find(|token| token.starts_with("rna-h2:"))
+            .expect("real CallTool search must emit a compact hydration handle")
+            .to_string();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
+            ..RnaHandler::default()
+        };
+        let graph = handler
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .unwrap();
+        handler.install_cached_graph(graph);
+
+        let compatible_search_bypass = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "search".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "mode": "convergence",
+                        "file": "src/lib.rs",
+                        "line": 1
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let compatible_text = call_tool_text(&compatible_search_bypass);
+        assert!(compatible_text.contains("at least two source selectors are required"));
+        assert!(!compatible_text.contains("present_symbol"));
+        assert!(!compatible_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let invalid = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "convergence".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "nodes": ["Missing.one", "Missing.two"],
+                        "direction": "outgoing",
+                        "edge_types": ["calls"],
+                        "depth": 3,
+                        "max_output_bytes": 0
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let invalid_text = call_tool_text(&invalid);
+        assert!(invalid_text.starts_with("Invalid search context:"));
+        assert!(!invalid_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let graph_delta_proposal = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn present_symbol() {}\n+pub fn present_symbol() { eprintln!(\"changed\"); }\n";
+        for budget_key in ["max_output_bytes", "max_output_tokens"] {
+            for mut arguments in [
+                serde_json::json!({"node": hydration_handle}),
+                serde_json::json!({
+                    "context_mode": "graph-delta-beta",
+                    "proposal": graph_delta_proposal,
+                    "include_artifacts": false,
+                    "include_markdown": false
+                }),
+            ] {
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(budget_key.into(), serde_json::json!(1));
+                let error = handler
+                    .dispatch_call_tool_request(CallToolRequestParams {
+                        name: "search".into(),
+                        meta: None,
+                        task: None,
+                        arguments: arguments.as_object().cloned(),
+                    })
+                    .await
+                    .expect_err("infeasible hydration/graph-delta budget must be a tool error");
+                assert!(format!("{error:?}").contains("BudgetTooSmall"));
+                assert!(
+                    !handler
+                        .context_injected
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "tiny-budget hydration/graph-delta error must defer first-call context"
+                );
+            }
+        }
+
+        for context_mode in [None, Some("task")] {
+            for budget_key in ["max_output_bytes", "max_output_tokens"] {
+                let mut arguments = serde_json::json!({
+                    "query": "change present_symbol behavior and add a regression test"
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+                if let Some(context_mode) = context_mode {
+                    arguments.insert("context_mode".into(), serde_json::json!(context_mode));
+                }
+                arguments.insert(budget_key.into(), serde_json::json!(1));
+                let error = handler
+                    .dispatch_call_tool_request(CallToolRequestParams {
+                        name: "search".into(),
+                        meta: None,
+                        task: None,
+                        arguments: Some(arguments),
+                    })
+                    .await
+                    .expect_err("infeasible task/flat budget must be a tool error");
+                assert!(format!("{error:?}").contains("BudgetTooSmall"));
+                assert!(
+                    !handler
+                        .context_injected
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "tiny-budget task/flat error must defer first-call business context"
+                );
+            }
+        }
+
+        for budget_key in ["max_output_bytes", "max_output_tokens"] {
+            let mut arguments = serde_json::json!({
+                "nodes": ["Missing.one", "Missing.two"],
+                "direction": "outgoing",
+                "edge_types": ["calls"],
+                "depth": 3
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            arguments.insert(budget_key.into(), serde_json::json!(1));
+            let error = handler
+                .dispatch_call_tool_request(CallToolRequestParams {
+                    name: "convergence".into(),
+                    meta: None,
+                    task: None,
+                    arguments: Some(arguments),
+                })
+                .await
+                .expect_err("infeasible convergence budget must be a tool error");
+            assert!(format!("{error:?}").contains("BudgetTooSmall"));
+            assert!(
+                !handler
+                    .context_injected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "tiny-budget error must defer first-call business context"
+            );
+        }
+
+        let unresolved = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "convergence".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "nodes": ["Missing.one", "Missing.two"],
+                        "direction": "outgoing",
+                        "edge_types": ["calls"],
+                        "depth": 3
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let unresolved_text = call_tool_text(&unresolved);
+        assert!(unresolved_text.contains("injected_context: false"));
+        assert!(
+            unresolved_text.contains("unresolved `Missing.one`")
+                && unresolved_text.contains("unresolved `Missing.two`")
+                && unresolved_text.contains("lexical_fallback: disabled"),
+            "unexpected unresolved response: {unresolved_text}"
+        );
+        assert!(!unresolved_text.contains("Business Context"));
+        assert!(
+            !handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let eligible = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "list_roots".into(),
+                meta: None,
+                task: None,
+                arguments: Some(serde_json::Map::new()),
+            })
+            .await
+            .unwrap();
+        let eligible_text = call_tool_text(&eligible);
+        assert!(eligible_text.contains("Business Context"));
+        assert!(
+            handler
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

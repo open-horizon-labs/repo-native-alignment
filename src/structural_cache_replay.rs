@@ -1055,7 +1055,7 @@ mod tests {
             producer_commit: "d".repeat(40),
             package_version: "0.2.10".to_string(),
             binary_sha256: "a".repeat(64),
-            graph_schema_version: 25,
+            graph_schema_version: 26,
             graph_schema_signature: "b".repeat(64),
             completeness_schema_version: 6,
             work_item_schema_version: 4,

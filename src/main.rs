@@ -244,6 +244,8 @@ struct SearchArgs {
     compact: bool,
     #[arg(long)]
     nodes: Option<String>,
+    #[arg(long, help = repo_native_alignment::service::CONVERGENCE_GUIDANCE)]
+    before: Option<String>,
     #[arg(long)]
     search_mode: Option<String>,
     #[arg(
@@ -1532,6 +1534,7 @@ async fn async_main() -> anyhow::Result<()> {
                     .nodes
                     .as_ref()
                     .map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+                before: args.before.clone(),
                 search_mode: args.search_mode.clone(),
                 rerank: args.rerank,
                 include_artifacts: args.include_artifacts,
@@ -1593,7 +1596,13 @@ async fn async_main() -> anyhow::Result<()> {
                 },
                 business_context: &business_context,
             };
-            println!("{}", service::search(&params, &ctx).await);
+            match service::search_result(&params, &ctx).await {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         Some(Commands::Graph(args)) => {
@@ -1970,6 +1979,63 @@ mod tests {
             panic!("expected search command");
         };
         assert!(args.verbose);
+    }
+
+    #[test]
+    fn search_cli_preserves_the_shared_convergence_contract() {
+        let cli = Cli::try_parse_from([
+            "repo-native-alignment",
+            "search",
+            "--mode",
+            "convergence",
+            "--nodes",
+            "Request.prepare,Session.prepare_request",
+            "--before",
+            "PreparedRequest.prepare_method",
+            "--direction",
+            "outgoing",
+            "--edge-types",
+            "calls",
+            "--depth",
+            "6",
+            "--max-output-bytes",
+            "12000",
+            "--max-output-tokens",
+            "3000",
+        ])
+        .expect("convergence CLI should parse");
+        let Some(Commands::Search(args)) = cli.command else {
+            panic!("expected search command");
+        };
+        let params = SearchParams {
+            mode: args.mode,
+            nodes: args
+                .nodes
+                .map(|nodes| nodes.split(',').map(|node| node.trim().to_string()).collect()),
+            before: args.before,
+            direction: args.direction,
+            edge_types: args
+                .edge_types
+                .map(|edges| edges.split(',').map(|edge| edge.trim().to_string()).collect()),
+            depth: args.depth,
+            max_output_bytes: args.max_output_bytes,
+            max_output_tokens: args.max_output_tokens,
+            ..SearchParams::default()
+        };
+        assert_eq!(params.mode.as_deref(), Some("convergence"));
+        assert_eq!(
+            params.nodes,
+            Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
+        );
+        assert_eq!(
+            params.before.as_deref(),
+            Some("PreparedRequest.prepare_method")
+        );
+        assert_eq!(params.direction.as_deref(), Some("outgoing"));
+        assert_eq!(params.edge_types, Some(vec!["calls".into()]));
+        assert_eq!(params.depth, Some(6));
+        assert_eq!(params.max_output_bytes, Some(12_000));
+        assert_eq!(params.max_output_tokens, Some(3_000));
     }
 
     #[test]

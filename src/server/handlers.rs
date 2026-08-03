@@ -33,6 +33,20 @@ use crate::service::{
     SearchParams,
 };
 
+pub(crate) struct SearchToolDelivery {
+    pub result: CallToolResult,
+    pub context_injection_eligible: bool,
+}
+
+impl SearchToolDelivery {
+    fn text(markdown: String, context_injection_eligible: bool) -> Self {
+        Self {
+            result: text_result(markdown),
+            context_injection_eligible,
+        }
+    }
+}
+
 use super::RnaHandler;
 use super::ScanEnrichmentOptions;
 use super::helpers::text_result;
@@ -169,11 +183,20 @@ impl RnaHandler {
         (requested_canonical != server_canonical).then_some(repo)
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_search(
         &self,
         args: Search,
     ) -> Result<CallToolResult, CallToolError> {
+        Ok(self.handle_search_delivery(args).await?.result)
+    }
+
+    pub(crate) async fn handle_search_delivery(
+        &self,
+        args: Search,
+    ) -> Result<SearchToolDelivery, CallToolError> {
         let params = SearchParams::from_mcp_search(&args);
+        let convergence_requested = params.normalized_mode() == Some("convergence");
         if params.include_body
             && params.node.is_none()
             && params
@@ -182,8 +205,9 @@ impl RnaHandler {
                 .map(|nodes| nodes.is_empty())
                 .unwrap_or(true)
         {
-            return Ok(text_result(
+            return Ok(SearchToolDelivery::text(
                 "include_body requires `node` or `nodes` parameter".into(),
+                !convergence_requested,
             ));
         }
 
@@ -191,13 +215,16 @@ impl RnaHandler {
         // Semantic search is skipped (no embed_index for external repos).
         if let Some(repo) = Self::external_repo_arg(args.repo.as_deref(), &self.repo_root) {
             if self.cache_only {
-                return Ok(text_result(
+                return Ok(SearchToolDelivery::text(
                     "cache-only runtime serves only its admitted repository cache".into(),
+                    !convergence_requested,
                 ));
             }
             let (external_graph, repo_path) = match self.load_external_graph(repo).await {
                 Ok(pair) => pair,
-                Err(e) => return Ok(text_result(e)),
+                Err(e) => {
+                    return Ok(SearchToolDelivery::text(e, !convergence_requested));
+                }
             };
             // No root filter: show all nodes from the external repo's graph.
             let ctx = SearchContext {
@@ -215,8 +242,14 @@ impl RnaHandler {
                 ),
                 business_context: &self.business_context,
             };
-            let markdown = crate::service::search(&params, &ctx).await;
-            return Ok(text_result(markdown));
+            let delivery = crate::service::search_delivery(&params, &ctx).await;
+            if let Some(error) = delivery.error {
+                return Err(CallToolError::from_message(error.to_string()));
+            }
+            return Ok(SearchToolDelivery::text(
+                delivery.markdown,
+                delivery.context_injection_eligible,
+            ));
         }
 
         let root_discovery_started = std::time::Instant::now();
@@ -233,7 +266,12 @@ impl RnaHandler {
         );
         let graph_state = match self.get_graph().await {
             Ok(g) => g,
-            Err(e) => return Ok(text_result(format!("Graph error: {}", e))),
+            Err(e) => {
+                return Ok(SearchToolDelivery::text(
+                    format!("Graph error: {}", e),
+                    !convergence_requested,
+                ));
+            }
         };
         let embed_guard = self.embed_index.load();
         let embed_index = embed_guard.as_ref().as_ref();
@@ -252,13 +290,19 @@ impl RnaHandler {
             ),
             business_context: &self.business_context,
         };
-        let mut markdown = crate::service::search(&params, &ctx).await;
-        if self.graph_build_status.is_building() {
-            markdown.push_str(
+        let mut delivery = crate::service::search_delivery(&params, &ctx).await;
+        if let Some(error) = delivery.error {
+            return Err(CallToolError::from_message(error.to_string()));
+        }
+        if self.graph_build_status.is_building() && !convergence_requested {
+            delivery.markdown.push_str(
                 "\n\n_Index updating in background — results reflect last complete scan._",
             );
         }
-        Ok(text_result(markdown))
+        Ok(SearchToolDelivery::text(
+            delivery.markdown,
+            delivery.context_injection_eligible,
+        ))
     }
 
     pub(crate) async fn handle_outcome_progress(

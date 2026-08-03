@@ -211,13 +211,13 @@ public interface Service {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find interface method serve");
 
         let get_name = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "getName" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.getName" && n.id.kind == NodeKind::Function);
         assert!(get_name.is_some(), "Should find interface method getName");
 
         // Methods should have parent_scope pointing to the interface
@@ -258,7 +258,7 @@ public class MyService {
         let create = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.create" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             create.metadata.get("is_static").map(|s| s.as_str()),
@@ -269,7 +269,7 @@ public class MyService {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.serve" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             serve.metadata.get("is_static").map(|s| s.as_str()),
@@ -280,7 +280,7 @@ public class MyService {
         let count = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.count" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             count.metadata.get("is_static").map(|s| s.as_str()),
@@ -304,7 +304,7 @@ public class Foo {
         let ctor = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.Foo" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             ctor.metadata.get("is_static").map(|s| s.as_str()),

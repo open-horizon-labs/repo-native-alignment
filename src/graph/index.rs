@@ -76,6 +76,42 @@ pub struct EdgeRef {
     pub edge_type: EdgeKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+/// Orientation of a traversed hop relative to the stored directed edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConvergenceHopDirection {
+    /// Path order follows the stored edge (`left -> right`).
+    Forward,
+    /// Path order opposes the stored edge (`left <- right`).
+    Reverse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergenceCandidate {
+    pub node_id: String,
+    pub max_distance: usize,
+    pub total_distance: usize,
+    pub witnesses: Vec<Vec<String>>,
+    pub witness_edge_kinds: Vec<Vec<EdgeKind>>,
+    pub witness_edge_directions: Vec<Vec<ConvergenceHopDirection>>,
+    pub onward: Option<Vec<String>>,
+    pub onward_edge_kinds: Option<Vec<EdgeKind>>,
+    pub onward_edge_directions: Option<Vec<ConvergenceHopDirection>>,
+}
+
+type BoundedConvergencePath = (
+    usize,
+    Vec<String>,
+    Vec<EdgeKind>,
+    Vec<ConvergenceHopDirection>,
+);
+
 // ---------------------------------------------------------------------------
 // GraphIndex
 // ---------------------------------------------------------------------------
@@ -521,6 +557,158 @@ impl GraphIndex {
             .map(|idx| sub[idx].clone())
             .collect();
         Some(result)
+    }
+
+    pub fn convergence(
+        &self,
+        source_ids: &[String],
+        before_id: Option<&str>,
+        max_hops: usize,
+        edge_types: Option<&[EdgeKind]>,
+        direction: ConvergenceDirection,
+    ) -> Vec<ConvergenceCandidate> {
+        if source_ids.len() < 2 || max_hops == 0 {
+            return Vec::new();
+        }
+        let calls_default = [EdgeKind::Calls];
+        let filter = edge_types.unwrap_or(&calls_default);
+        let maps = source_ids
+            .iter()
+            .map(|source| self.bounded_paths(source, max_hops, filter, direction))
+            .collect::<Vec<_>>();
+        if maps.iter().any(BTreeMap::is_empty) {
+            return Vec::new();
+        }
+        let mut common = maps[0]
+            .keys()
+            .filter(|id| maps[1..].iter().all(|map| map.contains_key(*id)))
+            .cloned()
+            .collect::<Vec<_>>();
+        common.sort();
+
+        let mut candidates = Vec::new();
+        for node_id in common {
+            if before_id == Some(node_id.as_str()) {
+                continue;
+            }
+            let onward = before_id.and_then(|boundary| {
+                self.bounded_paths(&node_id, max_hops, filter, direction)
+                    .get(boundary)
+                    .map(|(_, path, edge_kinds, edge_directions)| {
+                        (path.clone(), edge_kinds.clone(), edge_directions.clone())
+                    })
+            });
+            if before_id.is_some() && onward.is_none() {
+                continue;
+            }
+            let distances = maps
+                .iter()
+                .map(|map| map.get(&node_id).expect("intersection member").0)
+                .collect::<Vec<_>>();
+            candidates.push(ConvergenceCandidate {
+                node_id: node_id.clone(),
+                max_distance: distances.iter().copied().max().unwrap_or(0),
+                total_distance: distances.iter().sum(),
+                witnesses: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").1.clone())
+                    .collect(),
+                witness_edge_kinds: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").2.clone())
+                    .collect(),
+                witness_edge_directions: maps
+                    .iter()
+                    .map(|map| map.get(&node_id).expect("intersection member").3.clone())
+                    .collect(),
+                onward: onward.as_ref().map(|(path, _, _)| path.clone()),
+                onward_edge_kinds: onward.as_ref().map(|(_, edge_kinds, _)| edge_kinds.clone()),
+                onward_edge_directions: onward.map(|(_, _, edge_directions)| edge_directions),
+            });
+        }
+        candidates.sort_by(|left, right| {
+            (left.max_distance, left.total_distance, &left.node_id).cmp(&(
+                right.max_distance,
+                right.total_distance,
+                &right.node_id,
+            ))
+        });
+        candidates
+    }
+
+    fn bounded_paths(
+        &self,
+        start_id: &str,
+        max_hops: usize,
+        edge_types: &[EdgeKind],
+        direction: ConvergenceDirection,
+    ) -> BTreeMap<String, BoundedConvergencePath> {
+        let Some(&start) = self.node_lookup.get(start_id) else {
+            return BTreeMap::new();
+        };
+        let mut result = BTreeMap::from([(
+            start_id.to_string(),
+            (0, vec![start_id.to_string()], Vec::new(), Vec::new()),
+        )]);
+        let mut queue = VecDeque::from([(start, 0usize)]);
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            let directions: &[Direction] = match direction {
+                ConvergenceDirection::Outgoing => &[Direction::Outgoing],
+                ConvergenceDirection::Incoming => &[Direction::Incoming],
+                ConvergenceDirection::Both => &[Direction::Outgoing, Direction::Incoming],
+            };
+            let mut neighbors = Vec::new();
+            for graph_direction in directions {
+                for edge in self.graph.edges_directed(current, *graph_direction) {
+                    if !edge_types.contains(&edge.weight().edge_type) {
+                        continue;
+                    }
+                    let next = match graph_direction {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    neighbors.push((
+                        self.graph[next].id.clone(),
+                        edge.weight().edge_type.clone(),
+                        match graph_direction {
+                            Direction::Outgoing => ConvergenceHopDirection::Forward,
+                            Direction::Incoming => ConvergenceHopDirection::Reverse,
+                        },
+                        next,
+                    ));
+                }
+            }
+            neighbors.sort_by(|left, right| {
+                (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2))
+            });
+            neighbors.dedup_by(|left, right| left.0 == right.0);
+            let (_, current_path, current_edge_kinds, current_edge_directions) = result
+                .get(&self.graph[current].id)
+                .expect("queued nodes have a path");
+            let current_path = current_path.clone();
+            let current_edge_kinds = current_edge_kinds.clone();
+            let current_edge_directions = current_edge_directions.clone();
+            for (next_id, edge_kind, edge_direction, next) in neighbors {
+                if result.contains_key(&next_id) {
+                    continue;
+                }
+                let mut path = current_path.clone();
+                path.push(next_id.clone());
+                let mut path_edge_kinds = current_edge_kinds.clone();
+                path_edge_kinds.push(edge_kind);
+                let mut path_edge_directions = current_edge_directions.clone();
+                path_edge_directions.push(edge_direction);
+                result.insert(
+                    next_id,
+                    (depth + 1, path, path_edge_kinds, path_edge_directions),
+                );
+                queue.push_back((next, depth + 1));
+            }
+        }
+        result
     }
 
     /// Compute edge-type weighted PageRank importance scores.
@@ -3209,6 +3397,171 @@ mod tests {
     fn test_shortest_path_nonexistent_node() {
         let index = GraphIndex::new();
         assert!(index.shortest_path("ghost1", "ghost2", None).is_none());
+    }
+
+    #[test]
+    fn convergence_diamond_returns_ranked_witnesses_and_boundary_path() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("join", "fn", "boundary", "fn", EdgeKind::Calls);
+
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            Some("boundary"),
+            3,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert!(result.iter().all(|candidate| candidate.node_id != "boundary"));
+        assert_eq!(result[0].max_distance, 1);
+        assert_eq!(result[0].total_distance, 2);
+        assert_eq!(result[0].witnesses[0], vec!["left", "join"]);
+        assert_eq!(result[0].witnesses[1], vec!["right", "join"]);
+        assert_eq!(
+            result[0].witness_edge_kinds,
+            vec![vec![EdgeKind::Calls], vec![EdgeKind::Calls]]
+        );
+        assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Forward],
+                vec![ConvergenceHopDirection::Forward]
+            ]
+        );
+        assert_eq!(
+            result[0].onward,
+            Some(vec!["join".into(), "boundary".into()])
+        );
+        assert_eq!(result[0].onward_edge_kinds, Some(vec![EdgeKind::Calls]));
+        assert_eq!(
+            result[0].onward_edge_directions,
+            Some(vec![ConvergenceHopDirection::Forward])
+        );
+    }
+
+    #[test]
+    fn convergence_preserves_incoming_orientation_and_both_is_deterministic() {
+        let mut incoming = GraphIndex::new();
+        incoming.add_edge("join", "fn", "left", "fn", EdgeKind::Calls);
+        incoming.add_edge("join", "fn", "right", "fn", EdgeKind::Calls);
+        let result = incoming.convergence(
+            &["left".into(), "right".into()],
+            None,
+            1,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Incoming,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Reverse],
+                vec![ConvergenceHopDirection::Reverse]
+            ]
+        );
+
+        let mut both = GraphIndex::new();
+        both.add_edge("left", "fn", "join", "fn", EdgeKind::Calls);
+        both.add_edge("join", "fn", "left", "fn", EdgeKind::Calls);
+        both.add_edge("right", "fn", "join", "fn", EdgeKind::Calls);
+        let result = both.convergence(
+            &["left".into(), "right".into()],
+            None,
+            1,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Both,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert_eq!(
+            result[0].witness_edge_directions,
+            vec![
+                vec![ConvergenceHopDirection::Forward],
+                vec![ConvergenceHopDirection::Forward]
+            ],
+            "parallel opposite edges choose the stable forward traversal"
+        );
+    }
+
+    #[test]
+    fn convergence_is_cycle_safe_and_uses_stable_id_for_distance_ties() {
+        let mut index = GraphIndex::new();
+        for source in ["left", "right"] {
+            index.add_edge(source, "fn", "z_join", "fn", EdgeKind::Calls);
+            index.add_edge(source, "fn", "a_join", "fn", EdgeKind::Calls);
+        }
+        index.add_edge("a_join", "fn", "left", "fn", EdgeKind::Calls);
+
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            None,
+            3,
+            Some(&[EdgeKind::Calls]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "a_join");
+        assert_eq!(result[1].node_id, "z_join");
+    }
+
+    #[test]
+    fn convergence_honors_edge_filter_depth_and_boundary_route() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "l1", "fn", EdgeKind::Calls);
+        index.add_edge("l1", "fn", "join", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "join", "fn", EdgeKind::DependsOn);
+        index.add_edge("join", "fn", "boundary", "fn", EdgeKind::Calls);
+        for source in ["left", "right"] {
+            index.add_edge(source, "fn", "dead_join", "fn", EdgeKind::Calls);
+        }
+
+        assert!(
+            index
+                .convergence(
+                    &["left".into(), "right".into()],
+                    None,
+                    1,
+                    Some(&[EdgeKind::Calls, EdgeKind::DependsOn]),
+                    ConvergenceDirection::Outgoing,
+                )
+                .iter()
+                .all(|candidate| candidate.node_id != "join")
+        );
+        let result = index.convergence(
+            &["left".into(), "right".into()],
+            Some("boundary"),
+            3,
+            Some(&[EdgeKind::Calls, EdgeKind::DependsOn]),
+            ConvergenceDirection::Outgoing,
+        );
+        assert_eq!(result[0].node_id, "join");
+        assert!(result.iter().all(|candidate| candidate.node_id != "dead_join"));
+        assert_eq!(
+            result[0].witness_edge_kinds,
+            vec![
+                vec![EdgeKind::Calls, EdgeKind::Calls],
+                vec![EdgeKind::DependsOn]
+            ]
+        );
+        assert_eq!(
+            result[0].onward_edge_kinds,
+            Some(vec![EdgeKind::Calls])
+        );
+    }
+
+    #[test]
+    fn convergence_returns_empty_for_missing_or_disconnected_sources() {
+        let mut index = GraphIndex::new();
+        index.add_edge("left", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("right", "fn", "b", "fn", EdgeKind::Calls);
+        assert!(index.convergence(
+            &["left".into(), "missing".into()], None, 2, None,
+            ConvergenceDirection::Outgoing,
+        ).is_empty());
+        assert!(index.convergence(
+            &["left".into(), "right".into()], None, 2, None,
+            ConvergenceDirection::Outgoing,
+        ).is_empty());
     }
 
     #[test]

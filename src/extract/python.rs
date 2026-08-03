@@ -173,8 +173,8 @@ class Config:
         let names: Vec<&str> = result.nodes.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"hello"), "Should find function hello");
         assert!(names.contains(&"Config"), "Should find class Config");
-        assert!(names.contains(&"__init__"), "Should find __init__ method");
-        assert!(names.contains(&"validate"), "Should find validate method");
+        assert!(names.contains(&"Config.__init__"), "Should find __init__ method");
+        assert!(names.contains(&"Config.validate"), "Should find validate method");
     }
 
     #[test]
@@ -293,7 +293,7 @@ class MyService:
         let instance = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "instance_method" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.instance_method" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             instance.metadata.get("is_static").map(|s| s.as_str()),
@@ -304,7 +304,7 @@ class MyService:
         let from_config = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "from_config" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.from_config" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             from_config.metadata.get("is_static").map(|s| s.as_str()),
@@ -315,7 +315,7 @@ class MyService:
         let utility = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "utility" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "MyService.utility" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             utility.metadata.get("is_static").map(|s| s.as_str()),

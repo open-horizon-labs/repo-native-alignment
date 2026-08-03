@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 25; // persist exact structured edge endpoint identities
+pub const SCHEMA_VERSION: u32 = 26; // owner-qualified scoped symbol identities
 
 /// Arrow schema for the `symbols` table.
 ///

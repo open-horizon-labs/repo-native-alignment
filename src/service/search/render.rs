@@ -1,12 +1,14 @@
 //! Canonical agent/evidence rendering with self-inclusive cost accounting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::model::*;
 use super::projection::utf8_prefix;
 
 const ESTIMATE_NAME: &str = "unicode_chars_div_4_ceiling";
+const TASK_OBLIGATION_EXCERPT_BYTES: usize = 1_024;
+const TASK_OBLIGATION_CONTEXT_LINES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RenderError {
@@ -31,15 +33,60 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradationStep {
+    CapabilityDiagnostics,
+    CandidateAudit,
+    CapabilityList,
+    Omissions,
+    RecordEvidence,
+    RecordMetadata,
+    RelationshipDetails,
+    Relationship,
+    TaskObligationExcerpt,
+    Body,
+    FlatTail,
+}
+
+fn degrade_once(plan: &mut ProjectionPlan, cost: &RenderCost) -> Option<DegradationStep> {
+    if compact_capability_diagnostics(plan) {
+        Some(DegradationStep::CapabilityDiagnostics)
+    } else if compact_candidate_audit(plan) {
+        Some(DegradationStep::CandidateAudit)
+    } else if compact_capability_list(plan) {
+        Some(DegradationStep::CapabilityList)
+    } else if compact_omissions(plan) {
+        Some(DegradationStep::Omissions)
+    } else if shrink_last_record_evidence(plan) {
+        Some(DegradationStep::RecordEvidence)
+    } else if compact_record_metadata(plan) {
+        Some(DegradationStep::RecordMetadata)
+    } else if compact_relationship_details(plan) {
+        Some(DegradationStep::RelationshipDetails)
+    } else if shrink_last_relationship(plan) {
+        Some(DegradationStep::Relationship)
+    } else if compact_last_task_body_to_obligation_excerpt(plan) {
+        Some(DegradationStep::TaskObligationExcerpt)
+    } else if shrink_last_body(plan, cost) {
+        Some(DegradationStep::Body)
+    } else if drop_last_flat_record(plan) {
+        Some(DegradationStep::FlatTail)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedResponse, RenderError> {
     let mut plan = plan.clone();
+    // Every degradation step below is monotonic.  The generous bound is only
+    // a guard against programming errors; it is not part of admission policy.
     let attempts = plan
         .spans
         .len()
-        .saturating_mul(2)
-        .saturating_add(plan.candidate_audit.len())
-        .saturating_add(plan.records.len())
-        .saturating_add(1);
+        .saturating_mul(3)
+        .saturating_add(plan.records.len().saturating_mul(5))
+        .saturating_add(plan.relationships.len().saturating_mul(2))
+        .saturating_add(32);
     for _ in 0..attempts {
         let (text, accounting) = render_once(&plan)?;
         if within_budget(&accounting.total, &plan.request.budget) {
@@ -49,10 +96,7 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
                 plan,
             });
         }
-        if !shrink_last_body(&mut plan, &accounting.total)
-            && !shrink_last_candidate_audit(&mut plan)
-            && !shrink_last_record_evidence(&mut plan)
-        {
+        if degrade_once(&mut plan, &accounting.total).is_none() {
             return Err(RenderError::BudgetTooSmall {
                 minimum: accounting.total,
             });
@@ -61,47 +105,372 @@ pub(crate) fn render_projection(plan: &ProjectionPlan) -> Result<RenderedRespons
     Err(RenderError::AccountingDidNotConverge)
 }
 
-fn shrink_last_candidate_audit(plan: &mut ProjectionPlan) -> bool {
-    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.len() <= 1 {
+fn compact_capability_diagnostics(plan: &mut ProjectionPlan) -> bool {
+    if plan
+        .capabilities
+        .iter()
+        .any(|capability| !capability.detail.is_empty())
+    {
+        for capability in &mut plan.capabilities {
+            capability.detail.clear();
+        }
+        add_compact_degradation(
+            plan,
+            "capability diagnostics omitted; hydrate or retry with a larger budget",
+        );
+        return true;
+    }
+    false
+}
+
+fn compact_capability_list(plan: &mut ProjectionPlan) -> bool {
+    // Graph-delta capability names are part of that projection's delivery
+    // contract, not diagnostics. Preserve their states after details and
+    // duplicate candidate audit have been compacted.
+    if plan
+        .records
+        .iter()
+        .any(|record| record.selection.role == Some(ContextRole::ProposalDelta))
+    {
         return false;
     }
-    plan.candidate_audit.pop();
-    let detail = "candidate audit truncated to satisfy the final rendered budget; retry with a larger budget for the complete audit";
-    if !plan.omissions.iter().any(|omission| {
-        omission.record_id.is_none()
-            && omission.source.is_none()
-            && omission.code == OmissionCode::RenderBudget
-            && omission.detail == detail
-    }) {
-        plan.omissions.push(ProjectionOmission {
+    if plan.capabilities.len() <= 1 {
+        return false;
+    }
+    let degraded = plan
+        .capabilities
+        .iter()
+        .filter(|item| item.state != CapabilityState::Ready)
+        .count();
+    let total = plan.capabilities.len();
+    plan.capabilities = vec![CapabilityStatus {
+        capability: "delivery_capabilities".into(),
+        state: if degraded == 0 {
+            CapabilityState::Ready
+        } else {
+            CapabilityState::Degraded
+        },
+        detail: String::new(),
+    }];
+    add_compact_degradation(
+        plan,
+        &format!("capability list compacted; total={total} degraded={degraded}"),
+    );
+    true
+}
+
+fn compact_candidate_audit(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.projection != SearchProjection::Evidence || plan.candidate_audit.is_empty() {
+        return false;
+    }
+    let count = plan.candidate_audit.len();
+    plan.candidate_audit.clear();
+    add_compact_degradation(
+        plan,
+        &format!(
+            "candidate audit omitted; count={count}; selected identities and hydration handles retained"
+        ),
+    );
+    true
+}
+
+fn compact_record_metadata(plan: &mut ProjectionPlan) -> bool {
+    let task_intent = plan.request.intent == SearchIntent::Implement;
+    let Some(index) = plan.records.iter().rposition(|record| {
+        !record.symbol.declared_metadata.is_empty()
+            || record.symbol.extraction_source.is_some()
+            || (record.selection.reason.len() > 32
+                && !(task_intent && compact_task_reason(&record.selection.reason)))
+    }) else {
+        return false;
+    };
+    let compact_reason = task_intent.then(|| compact_task_selection_reason(plan, index));
+    let record = &mut plan.records[index];
+    record.symbol.declared_metadata.clear();
+    record.symbol.extraction_source = None;
+    if record.selection.reason.len() > 32 {
+        record.selection.reason = if task_intent {
+            compact_reason.expect("task reason was computed before the mutable borrow")
+        } else {
+            "selected; hydrate for detail".into()
+        };
+    }
+    true
+}
+
+fn compact_task_reason(reason: &str) -> bool {
+    reason.starts_with("quality=")
+        && (reason.contains("; obligations_visible=") || reason.contains("; obligations="))
+}
+
+fn compact_task_selection_reason(plan: &ProjectionPlan, record_index: usize) -> String {
+    let record = &plan.records[record_index];
+    let reason = &record.selection.reason;
+    let quality = reason
+        .find("quality=")
+        .map(|start| {
+            reason[start..]
+                .split(';')
+                .next()
+                .unwrap_or("quality=actionable")
+        })
+        .unwrap_or("quality=actionable");
+    let obligations = task_obligations_from_reason(reason);
+    let visible_text = visible_record_text(plan, record);
+    let (visible, hydrate): (Vec<_>, Vec<_>) = obligations
+        .into_iter()
+        .partition(|obligation| obligation_is_visible(obligation, record, &visible_text));
+    format!(
+        "{quality}; obligations_visible={}; obligations_hydrate={}",
+        obligation_list(&visible),
+        obligation_list(&hydrate)
+    )
+}
+
+fn obligation_list(obligations: &[String]) -> String {
+    if obligations.is_empty() {
+        "none".into()
+    } else {
+        obligations.join(",")
+    }
+}
+
+fn task_obligations_from_reason(reason: &str) -> BTreeSet<String> {
+    let mut obligations = BTreeSet::new();
+    for marker in [
+        "obligations=",
+        "obligations_visible=",
+        "obligations_hydrate=",
+    ] {
+        let Some(start) = reason.find(marker) else {
+            continue;
+        };
+        let value = &reason[start + marker.len()..];
+        let value = value.split(';').next().unwrap_or(value);
+        obligations.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != "none")
+                .filter(|value| !value.starts_with("branch:"))
+                .map(str::to_string),
+        );
+    }
+    obligations
+}
+
+fn visible_record_text(plan: &ProjectionPlan, record: &ProjectedRecord) -> String {
+    let mut text = record.symbol.signature.clone();
+    for span in &plan.spans {
+        if span.mappings.iter().any(|mapping| {
+            mapping.selection_rank == record.selection_rank
+                && mapping.record_id == record.identity.node_id
+        }) {
+            text.push('\n');
+            text.push_str(&span.text);
+        }
+    }
+    text
+}
+
+fn obligation_is_visible(obligation: &str, record: &ProjectedRecord, visible_text: &str) -> bool {
+    if obligation == "validation:task-relevant-tests" {
+        return record.selection.role == Some(ContextRole::Test)
+            && matches!(record.symbol.kind.as_str(), "function" | "method");
+    }
+    let terms = obligation_terms(obligation);
+    !terms.is_empty()
+        && terms
+            .iter()
+            .all(|term| obligation_term_is_visible(visible_text, term))
+}
+
+fn obligation_term_is_visible(text: &str, term: &str) -> bool {
+    let Some(state) = term.strip_prefix("state.") else {
+        return text_contains_identifier_term(text, term);
+    };
+    text.lines().any(|line| {
+        let line = line.to_lowercase();
+        let Some((left, right)) = line.split_once('=') else {
+            return false;
+        };
+        let left = left.trim();
+        left.ends_with(&format!(".{state}"))
+            || (left.ends_with(state)
+                && (right.contains("**")
+                    || right.contains(".get(")
+                    || right.contains(" | ")
+                    || right.contains(" or ")))
+    })
+}
+
+fn obligation_terms(obligation: &str) -> Vec<&str> {
+    if let Some(term) = obligation.strip_prefix("concept:") {
+        return vec![term];
+    }
+    if let Some(terms) = obligation.strip_prefix("proof:") {
+        return terms.split('+').filter(|term| !term.is_empty()).collect();
+    }
+    if let Some(terms) = obligation.strip_prefix("state:") {
+        return terms.split('+').filter(|term| !term.is_empty()).collect();
+    }
+    obligation
+        .strip_prefix("structure:")
+        .and_then(|rest| rest.rsplit_once(':').map(|(_, terms)| terms))
+        .map(|terms| terms.split('+').filter(|term| !term.is_empty()).collect())
+        .or_else(|| {
+            obligation
+                .strip_prefix("carrier:")
+                .and_then(|rest| rest.rsplit_once(':').map(|(_, carrier)| vec![carrier]))
+        })
+        .unwrap_or_default()
+}
+
+fn text_contains_identifier_term(text: &str, term: &str) -> bool {
+    let term = term.to_lowercase();
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|chunk| !chunk.is_empty())
+        .any(|chunk| {
+            let lower = chunk.to_lowercase();
+            lower == term || camel_segments(chunk).iter().any(|segment| segment == &term)
+        })
+}
+
+fn camel_segments(value: &str) -> Vec<String> {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for index in 1..characters.len() {
+        let boundary = characters[index].is_uppercase()
+            && (characters[index - 1].is_lowercase()
+                || characters
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_lowercase()));
+        if boundary {
+            segments.push(
+                characters[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .to_lowercase(),
+            );
+            start = index;
+        }
+    }
+    if start < characters.len() {
+        segments.push(
+            characters[start..]
+                .iter()
+                .collect::<String>()
+                .to_lowercase(),
+        );
+    }
+    segments
+}
+
+fn compact_relationship_details(plan: &mut ProjectionPlan) -> bool {
+    let Some(relationship) = plan
+        .relationships
+        .iter_mut()
+        .rev()
+        .find(|edge| !edge.reason.is_empty())
+    else {
+        return false;
+    };
+    relationship.reason.clear();
+    true
+}
+
+fn shrink_last_relationship(plan: &mut ProjectionPlan) -> bool {
+    if plan.relationships.is_empty() {
+        return false;
+    }
+    plan.relationships.pop();
+    add_compact_degradation(
+        plan,
+        "lower-value relationship detail omitted; retained records remain hydratable",
+    );
+    true
+}
+
+fn drop_last_flat_record(plan: &mut ProjectionPlan) -> bool {
+    // Task packets protect selected evidence units: selection coverage is only
+    // truthful if every selected task identity survives fitting. Flat search
+    // has no such obligation certificate and may shed its lowest-ranked tail.
+    if plan.request.intent == SearchIntent::Implement || plan.records.len() <= 1 {
+        return false;
+    }
+    let removed = plan.records.pop().expect("non-empty record list");
+    let id = removed.identity.node_id.clone();
+    let source = removed.identity.source.clone();
+    let hydration = removed
+        .source_handle
+        .as_ref()
+        .or(removed.evidence_handle.as_ref())
+        .map(HydrationHandle::encode_compact);
+    for span in &mut plan.spans {
+        span.mappings.retain(|mapping| mapping.record_id != id);
+    }
+    plan.spans.retain(|span| !span.mappings.is_empty());
+    plan.omissions.push(ProjectionOmission {
+        record_id: Some(id),
+        source,
+        code: OmissionCode::RenderBudget,
+        detail: hydration.map_or_else(
+            || "lower-ranked record omitted; no stable hydration handle was available".into(),
+            |handle| format!("lower-ranked record omitted; hydrate={handle}"),
+        ),
+    });
+    true
+}
+
+fn compact_omissions(plan: &mut ProjectionPlan) -> bool {
+    if plan.omissions.len() <= 1 {
+        return false;
+    }
+    let count = plan.omissions.len();
+    let retained_hydration = plan
+        .omissions
+        .iter()
+        .find(|omission| omission.detail.contains("hydrate=rna-h2:"))
+        .cloned();
+    plan.omissions = vec![retained_hydration.map_or_else(
+        || ProjectionOmission {
             record_id: None,
             source: None,
             code: OmissionCode::RenderBudget,
-            detail: detail.to_string(),
-        });
-        plan.omissions.sort_by(|a, b| {
-            a.record_id
-                .cmp(&b.record_id)
-                .then_with(|| a.source.cmp(&b.source))
-                .then_with(|| a.code.cmp(&b.code))
-                .then_with(|| a.detail.cmp(&b.detail))
-        });
-    }
+            detail: format!("delivery metadata compacted; omitted_detail_count={count}"),
+        },
+        |mut omission| {
+            omission.detail = format!("{}; omitted_detail_count={count}", omission.detail);
+            omission
+        },
+    )];
     true
+}
+
+fn add_compact_degradation(plan: &mut ProjectionPlan, detail: &str) {
+    if plan
+        .omissions
+        .iter()
+        .any(|item| item.record_id.is_none() && item.source.is_none() && item.detail == detail)
+    {
+        return;
+    }
+    plan.omissions.push(ProjectionOmission {
+        record_id: None,
+        source: None,
+        code: OmissionCode::RenderBudget,
+        detail: detail.to_string(),
+    });
 }
 
 fn shrink_last_record_evidence(plan: &mut ProjectionPlan) -> bool {
     if plan.request.projection != SearchProjection::Evidence {
         return false;
     }
-    let Some(record) = plan
-        .records
-        .iter_mut()
-        .rev()
-        .find(|record| {
-            record.evidence != SelectionEvidence::default() && record.evidence_handle.is_some()
-        })
-    else {
+    let Some(record) = plan.records.iter_mut().rev().find(|record| {
+        record.evidence != SelectionEvidence::default() && record.evidence_handle.is_some()
+    }) else {
         return false;
     };
     let record_id = record.identity.node_id.clone();
@@ -138,8 +507,127 @@ fn within_budget(cost: &RenderCost, budget: &ProjectionBudget) -> bool {
             .is_none_or(|limit| cost.estimated_tokens <= limit)
 }
 
+fn compact_last_task_body_to_obligation_excerpt(plan: &mut ProjectionPlan) -> bool {
+    if plan.request.intent != SearchIntent::Implement {
+        return false;
+    }
+    let Some((index, excerpt)) = plan
+        .spans
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, span)| {
+            !span.text.is_empty() && span.representation != BodyRepresentation::Truncated
+        })
+        .find_map(|(index, span)| obligation_excerpt(span).map(|excerpt| (index, excerpt)))
+    else {
+        return false;
+    };
+
+    let mut affected = Vec::new();
+    {
+        let span = &mut plan.spans[index];
+        span.text = excerpt;
+        span.representation = BodyRepresentation::Truncated;
+        for mapping in &mut span.mappings {
+            mapping.coverage = SpanCoverage::Partial;
+            affected.push(mapping.clone());
+        }
+    }
+    let snapshot = plan.spans[index].clone();
+    update_records(plan, &snapshot, BodyRepresentation::Truncated, false);
+    for mapping in affected {
+        add_budget_omission(
+            plan,
+            &mapping,
+            "body reduced to a bounded obligation-carrier excerpt; hydrate source for complete context",
+        );
+    }
+    refresh_compact_task_obligation_visibility(plan);
+    true
+}
+
+fn obligation_excerpt(span: &ProjectedSpan) -> Option<String> {
+    let terms = span
+        .mappings
+        .iter()
+        .flat_map(|mapping| task_obligations_from_reason(&mapping.selection.reason))
+        .flat_map(|obligation| {
+            obligation_terms(&obligation)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    if terms.is_empty() {
+        return None;
+    }
+
+    let lines = span.text.lines().collect::<Vec<_>>();
+    let mut retained = BTreeSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        if terms
+            .iter()
+            .any(|term| text_contains_identifier_term(line, term))
+        {
+            let start = index.saturating_sub(TASK_OBLIGATION_CONTEXT_LINES);
+            let end = (index + TASK_OBLIGATION_CONTEXT_LINES + 1).min(lines.len());
+            retained.extend(start..end);
+        }
+    }
+    if retained.is_empty() {
+        return None;
+    }
+
+    let mut excerpt = String::new();
+    let mut previous = None;
+    for index in retained {
+        if previous.is_some_and(|previous| index > previous + 1)
+            && !push_excerpt_piece(&mut excerpt, "…\n")
+        {
+            break;
+        }
+        let mut line = lines[index].to_string();
+        line.push('\n');
+        if !push_excerpt_piece(&mut excerpt, &line) {
+            break;
+        }
+        previous = Some(index);
+    }
+    if excerpt.is_empty() || excerpt.len() >= span.text.len() {
+        None
+    } else {
+        Some(excerpt)
+    }
+}
+
+fn push_excerpt_piece(excerpt: &mut String, piece: &str) -> bool {
+    if excerpt.len().saturating_add(piece.len()) > TASK_OBLIGATION_EXCERPT_BYTES {
+        return false;
+    }
+    excerpt.push_str(piece);
+    true
+}
+
+fn refresh_compact_task_obligation_visibility(plan: &mut ProjectionPlan) {
+    let updates = plan
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| compact_task_reason(&record.selection.reason))
+        .map(|(index, _)| (index, compact_task_selection_reason(plan, index)))
+        .collect::<Vec<_>>();
+    for (index, reason) in updates {
+        plan.records[index].selection.reason = reason;
+    }
+}
+
 fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
-    let Some(index) = plan.spans.iter().rposition(|span| !span.text.is_empty()) else {
+    let Some(index) = plan
+        .spans
+        .iter()
+        .rposition(|span| !span.text.is_empty() && !span_requires_visible_proof_body(plan, span))
+    else {
         return false;
     };
     let span = &plan.spans[index];
@@ -190,7 +678,22 @@ fn shrink_last_body(plan: &mut ProjectionPlan, cost: &RenderCost) -> bool {
             );
         }
     }
+    refresh_compact_task_obligation_visibility(plan);
     true
+}
+
+fn span_requires_visible_proof_body(plan: &ProjectionPlan, span: &ProjectedSpan) -> bool {
+    span.mappings.iter().any(|mapping| {
+        let Some(record) = plan.records.iter().find(|record| {
+            record.selection_rank == mapping.selection_rank
+                && record.identity.node_id == mapping.record_id
+        }) else {
+            return false;
+        };
+        task_obligations_from_reason(&record.selection.reason)
+            .into_iter()
+            .any(|obligation| obligation.starts_with("proof:"))
+    })
 }
 
 fn update_records(
@@ -368,13 +871,13 @@ fn render_metadata(plan: &ProjectionPlan) -> String {
         if let Some(handle) = &record.source_handle {
             output.push_str(&format!(
                 "   - hydrate_source: {}\n",
-                inline_code(&handle.encode())
+                inline_code(&handle.encode_compact())
             ));
         }
         if let Some(handle) = &record.evidence_handle {
             output.push_str(&format!(
                 "   - hydrate_evidence: {}\n",
-                inline_code(&handle.encode())
+                inline_code(&handle.encode_compact())
             ));
         }
         if plan.request.projection == SearchProjection::Evidence {
@@ -472,7 +975,7 @@ fn render_bodies(plan: &ProjectionPlan) -> String {
         ));
         output.push_str(&format!(
             "- hydrate: {}\n",
-            inline_code(&span.hydration.encode())
+            inline_code(&span.hydration.encode_compact())
         ));
         for mapping in &span.mappings {
             output.push_str(&format!(
@@ -562,6 +1065,23 @@ fn safe_fence(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn proof_state_term_requires_visible_effective_assignment() {
+        assert!(!obligation_term_is_visible(
+            "def generate(**overrides): return overrides",
+            "state.overrides"
+        ));
+        assert!(obligation_term_is_visible(
+            "overrides = {**annotation_overrides, **overrides}",
+            "state.overrides"
+        ));
+        assert!(obligation_term_is_visible(
+            "fn.overrides = effective_overrides",
+            "state.overrides"
+        ));
+    }
 
     fn plan(projection: SearchProjection) -> ProjectionPlan {
         let source = SourceSpan {
@@ -854,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_budget_deterministically_trims_candidate_audit_after_bodies() {
+    fn evidence_budget_deterministically_compacts_candidate_audit_before_bodies() {
         let mut input = plan(SearchProjection::Evidence);
         input.request.budget.max_rendered_bytes = Some(4_096);
         input.candidate_audit = (1..=200)
@@ -881,10 +1401,61 @@ mod tests {
         let rendered = render_projection(&input).unwrap();
 
         assert!(rendered.text.len() <= 4_096);
-        assert!(rendered.text.contains("## Candidate audit"));
-        assert!(rendered.text.contains("candidate audit truncated"));
-        assert!(!rendered.plan.candidate_audit.is_empty());
-        assert!(rendered.plan.candidate_audit.len() < 100);
+        assert!(!rendered.text.contains("## Candidate audit"));
+        assert!(rendered.text.contains("candidate audit omitted"));
+        assert!(rendered.plan.candidate_audit.is_empty());
+        assert_eq!(rendered.plan.spans.len(), 1);
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn graph_delta_budget_preserves_capability_states_before_duplicate_audit() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.budget.max_rendered_bytes = Some(4_096);
+        input.records[0].selection.role = Some(ContextRole::ProposalDelta);
+        input.capabilities = [
+            "graph_delta_proposal_parsing",
+            "graph_delta_live_graph_inference",
+            "graph_delta_route_analysis",
+            "graph_delta_card_coverage",
+            "graph_delta_changed_files",
+            "graph_delta_affected_locus_checklist",
+            "proposal_overlay_persistence",
+        ]
+        .into_iter()
+        .map(|capability| CapabilityStatus {
+            capability: capability.into(),
+            state: CapabilityState::Ready,
+            detail: "verbose graph-delta diagnostic detail ".repeat(20),
+        })
+        .collect();
+        input.candidate_audit = (1..=100)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank:02}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "duplicate graph-delta candidate audit ".repeat(10),
+                evidence: SelectionEvidence::default(),
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.accounting.total.utf8_bytes <= 4_096);
+        assert!(rendered.plan.candidate_audit.is_empty());
+        assert!(!rendered.text.contains("delivery_capabilities"));
+        for capability in &input.capabilities {
+            assert!(
+                rendered
+                    .text
+                    .contains(&format!("{}: ready", capability.capability)),
+                "missing capability {}",
+                capability.capability
+            );
+        }
         assert_eq!(rendered, render_projection(&input).unwrap());
     }
 
@@ -910,7 +1481,7 @@ mod tests {
 
         assert!(rendered.text.len() <= 6_000);
         assert_eq!(rendered.plan.records.len(), 8);
-        assert_eq!(rendered.plan.candidate_audit.len(), 1);
+        assert!(rendered.plan.candidate_audit.is_empty());
         assert!(
             rendered
                 .plan
@@ -935,5 +1506,379 @@ mod tests {
 
         assert!(!rendered.text.contains("hydrate_evidence:"));
         assert!(rendered.text.contains("hydrate_source:"));
+    }
+
+    #[test]
+    fn flat_non_body_metadata_degrades_below_five_thousand_tokens() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.body_policy = BodyPolicy::SignatureOnly;
+        input.request.budget.max_estimated_tokens = Some(5_000);
+        input.spans.clear();
+        input.records = (0..120)
+            .map(|rank| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("record-{rank:03}");
+                record.symbol.name = format!("symbol_{rank:03}");
+                record.symbol.declared_metadata.insert(
+                    "verbose".into(),
+                    "server-owned diagnostic metadata ".repeat(30),
+                );
+                record
+                    .evidence
+                    .diagnostics
+                    .insert("ranking".into(), "complete ranking diagnostics ".repeat(30));
+                record
+            })
+            .collect();
+        input.candidate_audit = (0..120)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("audit-{rank:03}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "verbose audit reason ".repeat(30),
+                evidence: SelectionEvidence::default(),
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+        assert!(rendered.accounting.total.estimated_tokens <= 5_000);
+        assert!(!rendered.plan.records.is_empty());
+        assert!(rendered.plan.records.len() < 120);
+        assert!(rendered.plan.records[0].source_handle.is_some());
+        assert!(
+            rendered
+                .plan
+                .omissions
+                .iter()
+                .any(|omission| omission.detail.contains("hydrate=rna-h2:")),
+            "an omitted flat-tail record must retain a compact hydration handle"
+        );
+        assert!(rendered.text.contains("hydrate=rna-h2:"));
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn flat_record_reason_compaction_reaches_a_terminal_marker() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Discover;
+        input.records[0].selection.reason = "ordinary search ranking diagnostics ".repeat(10);
+        input.records[0].symbol.declared_metadata.clear();
+        input.records[0].symbol.extraction_source = None;
+
+        assert!(compact_record_metadata(&mut input));
+        assert_eq!(
+            input.records[0].selection.reason,
+            "selected; hydrate for detail"
+        );
+        assert!(
+            !compact_record_metadata(&mut input),
+            "the compact marker must not remain eligible for another pass"
+        );
+    }
+
+    #[test]
+    fn task_fixed_sections_degrade_below_twenty_four_thousand_bytes() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.request.budget.max_rendered_bytes = Some(24_000);
+        input.spans.clear();
+        input.records = (0..12)
+            .map(|rank| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("task-record-{rank:02}");
+                record.symbol.name = format!("actionable_task_symbol_{rank:02}");
+                record.selection.reason = format!(
+                    "retrieval detail {}; quality=actionable; obligations={{concept:task-{rank:02}}}",
+                    "server-owned ".repeat(20)
+                );
+                record
+            })
+            .collect();
+        input.capabilities = (0..200)
+            .map(|rank| CapabilityStatus {
+                capability: format!("task_lane_{rank:03}"),
+                state: CapabilityState::Ready,
+                detail: "server-owned lane diagnostics ".repeat(20),
+            })
+            .collect();
+        input.candidate_audit = (0..200)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank:03}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "server-owned candidate diagnostics ".repeat(20),
+                evidence: SelectionEvidence::default(),
+            })
+            .collect();
+
+        let rendered = render_projection(&input).unwrap();
+        assert!(rendered.accounting.total.utf8_bytes <= 24_000);
+        assert_eq!(
+            rendered.plan.records.len(),
+            12,
+            "task evidence is protected"
+        );
+        assert!(rendered.plan.records[0].source_handle.is_some());
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn degradation_ladder_order_is_explicit_and_deterministic() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.capabilities.push(CapabilityStatus {
+            capability: "semantic".into(),
+            state: CapabilityState::Ready,
+            detail: "verbose capability detail".into(),
+        });
+        input.omissions.extend([
+            ProjectionOmission {
+                record_id: Some("omitted-a".into()),
+                source: None,
+                code: OmissionCode::RenderBudget,
+                detail: "first omitted detail".into(),
+            },
+            ProjectionOmission {
+                record_id: Some("omitted-b".into()),
+                source: None,
+                code: OmissionCode::RenderBudget,
+                detail: "second omitted detail".into(),
+            },
+        ]);
+        input.records[0]
+            .symbol
+            .declared_metadata
+            .insert("verbose".into(), "metadata".into());
+        input.relationships.push(ProjectedRelationship {
+            from: "node".into(),
+            kind: "depends_on".into(),
+            to: "dependency".into(),
+            reason: "verbose relationship detail".into(),
+        });
+
+        let cost = RenderCost::default();
+        let steps = (0..10)
+            .map(|_| degrade_once(&mut input, &cost).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            vec![
+                DegradationStep::CapabilityDiagnostics,
+                DegradationStep::CandidateAudit,
+                DegradationStep::CapabilityList,
+                DegradationStep::Omissions,
+                DegradationStep::RecordEvidence,
+                DegradationStep::Omissions,
+                DegradationStep::RecordMetadata,
+                DegradationStep::RelationshipDetails,
+                DegradationStep::Relationship,
+                DegradationStep::Omissions,
+            ]
+        );
+    }
+
+    #[test]
+    fn task_metadata_compaction_progresses_to_later_degradation_stages() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.request.budget.max_rendered_bytes = Some(2_500);
+        input.records[0].selection.reason = super::super::task_record_selection_reason(
+            &"verbose retrieval detail ".repeat(30),
+            "coverage per exact rendered cost",
+            &super::super::task_context::EvidenceQuality::Actionable,
+            &BTreeSet::from([
+                "concept:override".to_string(),
+                "structure:EditableSource:override".to_string(),
+            ]),
+        );
+        input.relationships.push(ProjectedRelationship {
+            from: input.records[0].identity.node_id.clone(),
+            kind: "depends_on".into(),
+            to: "node:dependency".into(),
+            reason: "verbose relationship detail ".repeat(40),
+        });
+        input.spans[0].text = "task source body ".repeat(500);
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.accounting.total.utf8_bytes <= 2_500);
+        assert_eq!(rendered.plan.records.len(), 1);
+        assert_eq!(
+            rendered.plan.records[0].selection.reason,
+            "quality=actionable; obligations_visible=none; obligations_hydrate=concept:override,structure:EditableSource:override"
+        );
+        assert!(
+            rendered.plan.relationships.is_empty()
+                || rendered.plan.relationships[0].reason.is_empty()
+        );
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn task_metadata_compaction_retains_the_producer_obligation_floor() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.records[0].selection.role = Some(ContextRole::Test);
+        input.records[0].symbol.kind = "function".into();
+        input.records[0].symbol.signature = "fn test_override()".into();
+        input.records[0].selection.reason = "retrieval; coverage; quality=actionable; obligations=concept:override,structure:Test:override,validation:task-relevant-tests".into();
+
+        assert_eq!(
+            compact_task_selection_reason(&input, 0),
+            "quality=actionable; obligations_visible=concept:override,structure:Test:override,validation:task-relevant-tests; obligations_hydrate=none"
+        );
+    }
+
+    #[test]
+    fn task_obligation_carrier_excerpt_is_bounded_visible_and_deterministic() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.request.body_policy = BodyPolicy::FocusedSpan;
+        input.request.budget.max_rendered_bytes = Some(5_000);
+        input.candidate_audit = (0..80)
+            .map(|rank| CandidateAudit {
+                candidate_rank: rank,
+                identity: RecordIdentity {
+                    node_id: format!("candidate-{rank}"),
+                    source: None,
+                },
+                disposition: CandidateDisposition::Omitted,
+                reason: "server-owned candidate diagnostics ".repeat(20),
+                evidence: SelectionEvidence::default(),
+            })
+            .collect();
+        let reason = "retrieval; coverage; quality=actionable; obligations=concept:annotated,concept:notrequired,concept:override,structure:EditableSource:annotated+notrequired+override";
+        input.records[0].selection.reason = reason.into();
+        input.records[0].symbol.signature = "fn generate_mapping()".into();
+        input.spans[0].mappings[0].selection.reason = reason.into();
+        input.spans[0].text = format!(
+            "{}\nif explicit_override is not None {{\n    return explicit_override; // explicit precedence\n}}\n{}\nif is_notrequired(annotation) {{\n    annotation = unwrap_notrequired(annotation);\n}}\nif is_annotated(annotation) {{\n    effective.overrides = annotation_override(annotation);\n}}\n{}",
+            "unrelated setup line\n".repeat(300),
+            "unrelated middle line\n".repeat(300),
+            "unrelated tail line\n".repeat(300),
+        );
+
+        let rendered = render_projection(&input).unwrap();
+
+        assert!(rendered.accounting.total.utf8_bytes <= 5_000);
+        assert!(rendered.text.contains("explicit precedence"));
+        assert!(rendered.text.contains("unwrap_notrequired"));
+        assert!(rendered.text.contains("effective.overrides"));
+        assert!(rendered.text.contains(
+            "obligations_visible=concept:annotated,concept:notrequired,concept:override,structure:EditableSource:annotated+notrequired+override"
+        ));
+        assert!(
+            !rendered
+                .text
+                .contains("unrelated setup line\nunrelated setup line")
+        );
+        assert_eq!(
+            rendered.plan.spans[0].representation,
+            BodyRepresentation::Truncated
+        );
+        assert!(rendered.plan.records[0].source_handle.is_some());
+        assert_eq!(rendered, render_projection(&input).unwrap());
+    }
+
+    #[test]
+    fn compact_task_obligations_distinguish_visible_from_hydration_only() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.spans.clear();
+        input.records[0].symbol.signature = "fn unrelated()".into();
+        input.records[0].selection.reason =
+            "retrieval; quality=actionable; obligations=concept:override".into();
+
+        assert_eq!(
+            compact_task_selection_reason(&input, 0),
+            "quality=actionable; obligations_visible=none; obligations_hydrate=concept:override"
+        );
+    }
+
+    #[test]
+    fn cattrs_fixture_packet_retains_every_actionable_obligation() {
+        let mut input = plan(SearchProjection::Evidence);
+        input.request.intent = SearchIntent::Implement;
+        input.request.body_policy = BodyPolicy::SignatureOnly;
+        input.request.budget.max_estimated_tokens = Some(6_000);
+        input.spans.clear();
+        let fixtures = [
+            (
+                "cattrs/gen/_override.py",
+                "AttributeOverride",
+                "class AttributeOverride: ...",
+            ),
+            (
+                "cattrs/gen/_generics.py",
+                "make_dict_structure_fn",
+                "generate attrs and dataclass structure hooks",
+            ),
+            (
+                "cattrs/gen/typeddicts.py",
+                "make_typeddict_fn",
+                "NotRequired[Annotated[T, metadata]]",
+            ),
+            (
+                "cattrs/gen/tuples.py",
+                "make_namedtuple_fn",
+                "dict-style NamedTuple generation",
+            ),
+            (
+                "cattrs/converters.py",
+                "effective_overrides",
+                "explicit precedence; effective .overrides",
+            ),
+            (
+                "tests/test_generics.py",
+                "test_override_generation",
+                "assert override TypedDict NamedTuple generation",
+            ),
+        ];
+        input.records = fixtures
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (path, name, signature))| {
+                let mut record = input.records[0].clone();
+                record.selection_rank = rank;
+                record.identity.node_id = format!("cattrs:{path}:{name}");
+                record.identity.source = Some(SourceSpan {
+                    root: "cattrs".into(),
+                    path: path.into(),
+                    start_line: 1,
+                    end_line: 8,
+                });
+                record.symbol.name = name.into();
+                record.symbol.signature = signature.into();
+                record.selection.role = Some(if path.starts_with("tests/") {
+                    ContextRole::Test
+                } else {
+                    ContextRole::EditableSource
+                });
+                record
+            })
+            .collect();
+        let rendered = render_projection(&input).unwrap();
+        assert!(rendered.accounting.total.estimated_tokens <= 6_000);
+        assert_eq!(rendered.plan.records.len(), fixtures.len());
+        for needle in [
+            "AttributeOverride",
+            "attrs and dataclass",
+            "NotRequired[Annotated",
+            "dict-style NamedTuple",
+            "effective .overrides",
+            "test_override_generation",
+        ] {
+            assert!(
+                rendered.text.contains(needle),
+                "missing actionable evidence {needle}"
+            );
+        }
     }
 }

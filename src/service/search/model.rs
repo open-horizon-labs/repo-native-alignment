@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_enum {
@@ -166,6 +167,10 @@ pub(crate) struct HydrationHandle {
 }
 
 impl HydrationHandle {
+    pub(crate) fn is_encoded(value: &str) -> bool {
+        value.starts_with("rna-hydrate-v1:") || value.starts_with("rna-h2:")
+    }
+
     pub(crate) fn source(record_id: impl Into<String>, source: SourceSpan) -> Self {
         Self {
             kind: HydrationKind::Source,
@@ -204,7 +209,37 @@ impl HydrationHandle {
         format!("{payload}:{}", &checksum.as_str()[..16])
     }
 
+    /// Compact, self-describing form used in rendered packets. Unlike a
+    /// process-local alias this remains independently resolvable after a
+    /// restart; URL-safe base64 avoids the v1 hex expansion.
+    pub(crate) fn encode_compact(&self) -> String {
+        let (root, path, start, end) = self.source.as_ref().map_or_else(
+            || (String::new(), String::new(), 0, 0),
+            |span| {
+                (
+                    span.root.clone(),
+                    span.path.clone(),
+                    span.start_line,
+                    span.end_line,
+                )
+            },
+        );
+        let payload = serde_json::to_vec(&(self.record_id.as_str(), root, path, start, end))
+            .expect("hydration tuple serialization is infallible");
+        let encoded = URL_SAFE_NO_PAD.encode(payload);
+        let kind = match self.kind {
+            HydrationKind::Source => "s",
+            HydrationKind::Evidence => "e",
+        };
+        let prefix = format!("rna-h2:{kind}:{encoded}");
+        let checksum = blake3::hash(prefix.as_bytes()).to_hex();
+        format!("{prefix}:{}", &checksum.as_str()[..16])
+    }
+
     pub(crate) fn decode(value: &str) -> Result<Self, String> {
+        if value.starts_with("rna-h2:") {
+            return Self::decode_compact(value);
+        }
         let parts: Vec<_> = value.split(':').collect();
         if parts.len() != 8 || parts[0] != "rna-hydrate-v1" {
             return Err("invalid hydration handle shape".to_string());
@@ -239,6 +274,49 @@ impl HydrationHandle {
             None
         } else {
             return Err("evidence handle unexpectedly contains a source span".to_string());
+        };
+        Ok(Self {
+            kind,
+            record_id,
+            source,
+        })
+    }
+
+    fn decode_compact(value: &str) -> Result<Self, String> {
+        let parts = value.split(':').collect::<Vec<_>>();
+        if parts.len() != 4 || parts[0] != "rna-h2" {
+            return Err("invalid compact hydration handle shape".into());
+        }
+        let prefix = parts[..3].join(":");
+        let expected = blake3::hash(prefix.as_bytes()).to_hex();
+        if parts[3] != &expected.as_str()[..16] {
+            return Err("hydration handle checksum mismatch".into());
+        }
+        let kind = match parts[1] {
+            "s" => HydrationKind::Source,
+            "e" => HydrationKind::Evidence,
+            _ => return Err("invalid hydration handle kind".into()),
+        };
+        let bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|_| "invalid compact hydration payload")?;
+        let (record_id, root, path, start_line, end_line): (String, String, String, u32, u32) =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid compact hydration tuple")?;
+        let source = if kind == HydrationKind::Source {
+            let span = SourceSpan {
+                root,
+                path,
+                start_line,
+                end_line,
+            };
+            if !span.is_valid() {
+                return Err("invalid hydration source span".into());
+            }
+            Some(span)
+        } else if root.is_empty() && path.is_empty() && start_line == 0 && end_line == 0 {
+            None
+        } else {
+            return Err("evidence handle unexpectedly contains a source span".into());
         };
         Ok(Self {
             kind,
@@ -481,6 +559,12 @@ mod tests {
         );
         assert_eq!(HydrationHandle::decode(&handle.encode()).unwrap(), handle);
         assert_eq!(handle.encode(), handle.encode());
+        assert_eq!(
+            HydrationHandle::decode(&handle.encode_compact()).unwrap(),
+            handle
+        );
+        assert_eq!(handle.encode_compact(), handle.encode_compact());
+        assert!(handle.encode_compact().len() < handle.encode().len());
     }
 
     #[test]
@@ -500,6 +584,10 @@ mod tests {
     fn evidence_handles_cannot_smuggle_a_source() {
         let handle = HydrationHandle::evidence("node");
         assert_eq!(HydrationHandle::decode(&handle.encode()).unwrap(), handle);
+        assert_eq!(
+            HydrationHandle::decode(&handle.encode_compact()).unwrap(),
+            handle
+        );
     }
 
     #[test]

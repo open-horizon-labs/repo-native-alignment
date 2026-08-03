@@ -327,8 +327,16 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             continue;
         }
 
+        // Match with the source-level member name while retaining the canonical
+        // owner-qualified NodeId on emitted edges.
+        let lexical_name = node
+            .metadata
+            .get("lexical_name")
+            .map(String::as_str)
+            .unwrap_or(node.id.name.as_str());
+
         // Strategy 1: operation_id match (primary).
-        let op_id_key = normalize_operation_id(&node.id.name);
+        let op_id_key = normalize_operation_id(lexical_name);
         if let Some(ep_ids) = endpoint_by_op_id.get(&op_id_key) {
             // Skip ambiguous matches: if multiple ApiEndpoint nodes share the same
             // normalized operation_id (e.g. two services in a monorepo both define
@@ -358,7 +366,7 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // Infer the HTTP method from the SDK function name prefix (camelCase convention
         // used by @hey-api/openapi-ts: getXxx, postXxx, deleteXxx, etc.).
         // This lets us disambiguate GET /users from POST /users on the same line.
-        let inferred_method = infer_method_from_sdk_fn_name(&node.id.name);
+        let inferred_method = infer_method_from_sdk_fn_name(lexical_name);
 
         let file_line_key = (node.id.root.clone(), node.id.file.clone(), node.line_start);
         if let Some(url_paths) = url_consts_by_root_file_line.get(&file_line_key) {
@@ -636,6 +644,21 @@ mod tests {
     }
 
     #[test]
+    fn class_sdk_method_matches_operation_id_and_retains_canonical_endpoint() {
+        let mut sdk = make_sdk_fn("ApiClient.listUsers", "src/api/sdk.gen.ts");
+        sdk.metadata
+            .insert("lexical_name".into(), "listUsers".into());
+        sdk.metadata
+            .insert("parent_scope".into(), "ApiClient".into());
+        let endpoint = make_api_endpoint("GET /users", "listUsers", "openapi/api.yaml");
+        let edges = openapi_sdk_link_pass(&[sdk.clone(), endpoint.clone()]);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, sdk.id);
+        assert_eq!(edges[0].to, endpoint.id);
+    }
+
+    #[test]
     fn test_snake_case_sdk_matches_camel_op_id() {
         // Python-generated SDK uses snake_case; spec uses camelCase
         let nodes = vec![
@@ -848,6 +871,31 @@ mod tests {
         assert_eq!(e.kind, EdgeKind::Implements);
         assert_eq!(e.from.name, "getWorkspacesIdExpertunities");
         assert_eq!(e.to.name, "GET /workspaces/{id}/expertunities");
+    }
+
+    #[test]
+    fn class_sdk_method_uses_lexical_name_for_http_verb_inference() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let mut sdk = make_sdk_fn_at_line("ApiClient.getUsers", sdk_file, 10);
+        sdk.metadata
+            .insert("lexical_name".into(), "getUsers".into());
+        sdk.metadata
+            .insert("parent_scope".into(), "ApiClient".into());
+        let endpoint = make_api_endpoint_with_path(
+            "GET /users",
+            "",
+            "/users",
+            "openapi/api.yaml",
+        );
+        let edges = openapi_sdk_link_pass(&[
+            sdk.clone(),
+            make_url_const("/users", sdk_file, 10),
+            endpoint.clone(),
+        ]);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, sdk.id);
+        assert_eq!(edges[0].to, endpoint.id);
     }
 
     /// URL co-location: path parameter styles should compare equal after normalisation.

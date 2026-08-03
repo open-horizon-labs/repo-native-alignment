@@ -113,9 +113,9 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Ordinary search defaults to the concise `agent` projection; request `projection: evidence` for channel ranks, normalized contributions, tie-breaks, omissions, and diagnostics. Bound the complete rendered response with `max_output_bytes` or `max_output_tokens`; bound source separately with `max_body_bytes` and `max_total_body_bytes`; choose an explicit `body_policy` (complete/focused_span/signature_only/minified/none). Set `context_mode: task` for bounded role-aware implementation context, or opt into the non-mutating `graph-delta-beta` mode with a proposal. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path). Use `compact: true` to save tokens, `rerank: true` for natural-language queries, and subsystem/depth/limit filters to constrain selection."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Ordinary search defaults to the concise `agent` projection; request `projection: evidence` for audit detail. Graph modes include neighbors/impact/reachable/tests_for/cycles/path/convergence. For convergence: discover readable source symbols and verify that any downstream boundary is reachable under the same direction and edge filter; then call mode=\"convergence\" with two or more source `nodes`, optional `before`, plus `direction`, `edge_types`, and `depth`. Omit `repo` for the server's configured repository; repository names mentioned in a task are not `repo` values, and any explicit value must be an absolute path. RNA binds selectors to exact stable IDs or returns sorted ambiguity/unresolved status; only a coverage-ready nonempty witness proof is injectable. Example: mode=\"convergence\", nodes=[\"Request.prepare\",\"Session.prepare_request\"], before=\"PreparedRequest.prepare_method\", direction=\"outgoing\", edge_types=[\"calls\"], depth=6. Bound responses with max_output_bytes/max_output_tokens and source with body limits."
 )]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Search {
     /// Search query (name, keyword, or natural language)
@@ -124,7 +124,7 @@ pub struct Search {
     /// Stable node ID from previous results
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Traversal mode; omit/null/blank => flat. Trims whitespace. Values: neighbors, impact, reachable, tests_for, cycles, path.
+    /// Traversal mode; values include convergence. Discover, bind readable selectors, then execute returned stable IDs; no lexical fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.
@@ -134,17 +134,19 @@ pub struct Search {
         skip_serializing_if = "Option::is_none"
     )]
     pub hops: Option<u32>,
-    /// Multi-level neighbors traversal depth for neighbors mode (default: 1). Walk edges N levels deep, accumulating and deduplicating results per level. Only applies to neighbors mode; ignored for impact/reachable (use hops for those).
+    /// Traversal depth for neighbors and convergence. For convergence this bounds each
+    /// source witness and the optional onward boundary witness. Impact/reachable use hops.
     #[serde(
         default,
         deserialize_with = "deserialize_option_u32_tolerant",
         skip_serializing_if = "Option::is_none"
     )]
     pub depth: Option<u32>,
-    /// Neighbors direction: "outgoing" (default), "incoming", "both"
+    /// Graph traversal direction: "outgoing" (default), "incoming", or "both".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
-    /// Edge filter: calls, depends_on, implements, defines, etc.
+    /// Graph edge filter: calls, depends_on, implements, defines, etc. Convergence uses
+    /// calls by default when this field is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_types: Option<Vec<String>>,
     /// Symbol kind: function, struct, trait, enum, type_alias, module, etc.
@@ -198,9 +200,14 @@ pub struct Search {
     /// Compact output: signature + location only (~25x fewer tokens)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact: Option<bool>,
-    /// Batch-retrieve multiple node IDs in one call
+    /// Batch-retrieve node IDs, or provide two or more explicitly bound source selectors
+    /// when mode="convergence".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
+    /// Optional downstream boundary for convergence; it must be reachable from a retained
+    /// candidate under the requested direction and edge filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
     /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict requires sealed artifacts, forbids fallback, and forces reranking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
@@ -222,7 +229,9 @@ pub struct Search {
     /// Cross-subsystem query: show only neighbors in this target subsystem. Use with mode="neighbors" to find edges between subsystems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_subsystem: Option<String>,
-    /// Repo path to query (e.g. worktree path); defaults to server repo
+    /// Absolute repo/worktree path to query. Omit this field for the server's configured
+    /// repository. Do not copy a repository name from the task into this field; relative
+    /// paths and names are rejected because MCP has no caller CWD context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Include function body in results (default: false)
@@ -282,6 +291,65 @@ pub struct Search {
     pub proposal: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "convergence",
+    description = "Find a coverage-ready Calls witness shared by two or more source symbols. First use search to discover exact stable IDs or unambiguous qualified symbols and to verify the optional downstream boundary is reachable under the same direction and edge filter. This operation rejects unresolved or ambiguous selectors and returns no injectable context without a nonempty proof. Example: nodes=[\"Request.prepare\",\"Session.prepare_request\"], before=\"PreparedRequest.prepare_method\", direction=\"outgoing\", edge_types=[\"calls\"], depth=6."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Convergence {
+    /// Two or more exact stable IDs or unambiguous qualified source symbols discovered by search.
+    pub nodes: Vec<String>,
+    /// Graph traversal direction: "outgoing", "incoming", or "both".
+    pub direction: String,
+    /// Graph edge filter. Use ["calls"] for executable call convergence.
+    pub edge_types: Vec<String>,
+    /// Maximum depth for each source witness and the optional onward boundary witness.
+    #[serde(deserialize_with = "deserialize_u32_tolerant")]
+    pub depth: u32,
+    /// Optional downstream boundary reachable from a retained candidate under the same direction and edge filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Maximum final rendered UTF-8 bytes (bounded by the service hard limit).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_bytes: Option<u32>,
+    /// Maximum estimated rendered tokens (an estimate, never provider usage).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<u32>,
+    /// Maximum number of retained convergence candidates.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit: Option<u32>,
+}
+
+impl From<Convergence> for Search {
+    fn from(args: Convergence) -> Self {
+        Self {
+            mode: Some("convergence".to_string()),
+            nodes: Some(args.nodes),
+            direction: Some(args.direction),
+            edge_types: Some(args.edge_types),
+            depth: Some(args.depth),
+            before: args.before,
+            max_output_bytes: args.max_output_bytes,
+            max_output_tokens: args.max_output_tokens,
+            limit: args.limit,
+            ..Self::default()
+        }
+    }
+}
+
 fn default_true() -> Option<bool> {
     Some(true)
 }
@@ -323,6 +391,60 @@ mod tests {
 
     fn parse_search(v: serde_json::Value) -> Result<Search, serde_json::Error> {
         serde_json::from_value(v)
+    }
+
+    fn parse_convergence(v: serde_json::Value) -> Result<Convergence, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn convergence_schema_requires_the_executable_contract_and_omits_repo() {
+        let schema = Convergence::json_schema();
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("convergence schema required fields");
+        for field in ["nodes", "direction", "edge_types", "depth"] {
+            assert!(
+                required.iter().any(|value| value == field),
+                "missing required field {field}: {schema:?}"
+            );
+        }
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("convergence schema properties");
+        assert!(!properties.contains_key("repo"));
+        assert!(properties.contains_key("before"));
+    }
+
+    #[test]
+    fn convergence_rejects_unknown_fields_and_preserves_exact_selectors() {
+        let parsed = parse_convergence(json!({
+            "nodes": ["Request.prepare", "Session.prepare_request"],
+            "before": "PreparedRequest.prepare_method",
+            "direction": "outgoing",
+            "edge_types": ["calls"],
+            "depth": 6
+        }))
+        .unwrap();
+        let search: Search = parsed.into();
+        assert_eq!(search.mode.as_deref(), Some("convergence"));
+        assert_eq!(
+            search.nodes,
+            Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
+        );
+        assert_eq!(search.before.as_deref(), Some("PreparedRequest.prepare_method"));
+
+        let error = parse_convergence(json!({
+            "nodes": ["Request.prepare", "Session.prepare_request"],
+            "direction": "outgoing",
+            "edge_types": ["calls"],
+            "depth": 6,
+            "repo": "requests"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `repo`"));
     }
 
     #[test]
@@ -802,7 +924,7 @@ mod tests {
             // Search
             "Search query (name, keyword, or natural language)",
             "Stable node ID from previous results",
-            r#"Traversal mode; omit/null/blank => flat. Trims whitespace. Values: neighbors, impact, reachable, tests_for, cycles, path."#,
+            "Traversal mode; values include convergence. Discover, bind readable selectors, then execute returned stable IDs; no lexical fallback.",
             "Max traversal depth (default: 1 neighbors, 3 impact/reachable)",
             r#"Neighbors direction: "outgoing" (default), "incoming", "both""#,
             "Edge filter: calls, depends_on, implements, defines, etc.",
@@ -815,6 +937,7 @@ mod tests {
             "Filter synthetic (inferred) constants: true=only, false=exclude",
             "Compact output: signature + location only (~25x fewer tokens)",
             "Batch-retrieve multiple node IDs in one call",
+            "Optional downstream boundary for convergence; bind explicitly before execution.",
             search_mode_description,
             "Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false",
             "Search .oh/ artifacts and commits (default: true)",
@@ -1070,4 +1193,5 @@ mod tests {
         assert_eq!(s.depth, Some(2));
         assert_eq!(s.min_complexity, Some(5));
     }
+
 }

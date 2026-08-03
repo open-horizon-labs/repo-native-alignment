@@ -457,8 +457,13 @@ fn enrich_test_paths(
             && n.language == "rust"
             && n.metadata.get("is_test").map(|v| v.as_str()) == Some("true")
         {
+            let lexical_name = n
+                .metadata
+                .get("lexical_name")
+                .cloned()
+                .unwrap_or_else(|| n.id.name.clone());
             by_name_line
-                .entry((n.id.name.clone(), n.line_start))
+                .entry((lexical_name, n.line_start))
                 .or_default()
                 .push(i);
         }
@@ -543,7 +548,12 @@ fn enrich_test_paths_walk(
                         segments.push(scope.to_string());
                     }
                 }
-                segments.push(nodes[idx].id.name.clone());
+                let lexical_name = nodes[idx]
+                    .metadata
+                    .get("lexical_name")
+                    .cloned()
+                    .unwrap_or_else(|| nodes[idx].id.name.clone());
+                segments.push(lexical_name);
                 nodes[idx]
                     .metadata
                     .insert(TEST_PATH_KEY.to_string(), segments.join("::"));
@@ -935,7 +945,7 @@ impl Display for Foo {
         let method = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "method")
+            .find(|n| n.id.name == "Foo.method")
             .expect("Should find method");
         assert_eq!(
             method.metadata.get("parent_scope"),
@@ -1433,13 +1443,13 @@ pub trait Service {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find trait method serve");
 
         let stop = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Service.stop" && n.id.kind == NodeKind::Function);
         assert!(stop.is_some(), "Should find trait method stop");
 
         // Methods should have parent_scope pointing to the trait
@@ -1461,11 +1471,11 @@ pub trait Service {
             .filter(|e| e.kind == EdgeKind::Defines && e.from.name == "Service")
             .collect();
         assert!(
-            defines_edges.iter().any(|e| e.to.name == "serve"),
+            defines_edges.iter().any(|e| e.to.name == "Service.serve"),
             "Should have Defines edge Service -> serve"
         );
         assert!(
-            defines_edges.iter().any(|e| e.to.name == "stop"),
+            defines_edges.iter().any(|e| e.to.name == "Service.stop"),
             "Should have Defines edge Service -> stop"
         );
     }
@@ -1487,13 +1497,13 @@ pub trait Handler {
         let handle = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "handle" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Handler.handle" && n.id.kind == NodeKind::Function);
         assert!(handle.is_some(), "Should find signature-only method handle");
 
         let name_fn = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "name" && n.id.kind == NodeKind::Function);
+            .find(|n| n.id.name == "Handler.name" && n.id.kind == NodeKind::Function);
         assert!(name_fn.is_some(), "Should find default method name");
 
         // Both should have parent_scope = Handler
@@ -1530,7 +1540,12 @@ impl Service for MyService {
         let serves: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .filter(|n| {
+                matches!(
+                    n.id.name.as_str(),
+                    "Service.serve" | "Service for MyService.serve"
+                ) && n.id.kind == NodeKind::Function
+            })
             .collect();
         assert_eq!(
             serves.len(),
@@ -1576,7 +1591,7 @@ impl Foo {
         let new_fn = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "new" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.new" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             new_fn.metadata.get("is_static").map(|s| s.as_str()),
@@ -1588,7 +1603,7 @@ impl Foo {
         let instance = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "instance" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.instance" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             instance.metadata.get("is_static").map(|s| s.as_str()),
@@ -1600,7 +1615,7 @@ impl Foo {
         let instance_mut = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "instance_mut" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.instance_mut" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             instance_mut.metadata.get("is_static").map(|s| s.as_str()),
@@ -1612,7 +1627,7 @@ impl Foo {
         let associated = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "associated" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Foo.associated" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             associated.metadata.get("is_static").map(|s| s.as_str()),
@@ -1652,7 +1667,7 @@ pub trait Service {
         let serve = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Service.serve" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             serve.metadata.get("is_static").map(|s| s.as_str()),
@@ -1663,7 +1678,7 @@ pub trait Service {
         let create = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Service.create" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             create.metadata.get("is_static").map(|s| s.as_str()),
@@ -1794,7 +1809,7 @@ impl Builder {
         let build = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "build" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Builder.build" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             build.metadata.get("is_static").map(|s| s.as_str()),
@@ -1805,7 +1820,7 @@ impl Builder {
         let consume = result
             .nodes
             .iter()
-            .find(|n| n.id.name == "consume" && n.id.kind == NodeKind::Function)
+            .find(|n| n.id.name == "Builder.consume" && n.id.kind == NodeKind::Function)
             .unwrap();
         assert_eq!(
             consume.metadata.get("is_static").map(|s| s.as_str()),
@@ -1835,7 +1850,10 @@ impl Display for Foo {
         let fmts: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.name == "fmt" && n.id.kind == NodeKind::Function)
+            .filter(|n| {
+                matches!(n.id.name.as_str(), "Display.fmt" | "Display for Foo.fmt")
+                    && n.id.kind == NodeKind::Function
+            })
             .collect();
         assert_eq!(fmts.len(), 2, "Should find 2 fmt methods");
         for f in &fmts {
@@ -1930,6 +1948,33 @@ mod tests {
             test.metadata.get("test_path").map(|s| s.as_str()),
             Some("extract::event_bus::tests::test_depth_first_ordering")
         );
+    }
+
+    #[test]
+    fn test_enrich_test_paths_qualifies_owner_once_for_associated_test() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct Worker;
+
+impl Worker {
+    #[test]
+    fn verifies() {}
+}
+"#;
+        let result = extractor.extract(Path::new("src/worker.rs"), code).unwrap();
+        let test = result
+            .nodes
+            .iter()
+            .find(|node| node.id.name == "Worker.verifies")
+            .expect("associated test should use canonical owner-qualified identity");
+        assert_eq!(
+            test.metadata.get("test_path").map(String::as_str),
+            Some("worker::Worker::verifies")
+        );
+        assert!(!test
+            .metadata
+            .get("test_path")
+            .is_some_and(|path| path.contains("Worker::Worker")));
     }
 
     #[test]
