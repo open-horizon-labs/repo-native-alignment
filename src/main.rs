@@ -1596,7 +1596,13 @@ async fn async_main() -> anyhow::Result<()> {
                 },
                 business_context: &business_context,
             };
-            println!("{}", service::search(&params, &ctx).await);
+            match service::search_result(&params, &ctx).await {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         Some(Commands::Graph(args)) => {

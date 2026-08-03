@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_convergence_does_not_inject_or_consume_first_call_context() {
+    async fn search_delivery_errors_do_not_inject_or_consume_first_call_context() {
         use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
 
         let repo = tempfile::tempdir().unwrap();
@@ -762,6 +762,37 @@ mod tests {
                 .context_injected
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+
+        for context_mode in [None, Some("task")] {
+            for budget_key in ["max_output_bytes", "max_output_tokens"] {
+                let mut arguments = serde_json::json!({
+                    "query": "change present_symbol behavior and add a regression test"
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+                if let Some(context_mode) = context_mode {
+                    arguments.insert("context_mode".into(), serde_json::json!(context_mode));
+                }
+                arguments.insert(budget_key.into(), serde_json::json!(1));
+                let error = handler
+                    .dispatch_call_tool_request(CallToolRequestParams {
+                        name: "search".into(),
+                        meta: None,
+                        task: None,
+                        arguments: Some(arguments),
+                    })
+                    .await
+                    .expect_err("infeasible task/flat budget must be a tool error");
+                assert!(format!("{error:?}").contains("BudgetTooSmall"));
+                assert!(
+                    !handler
+                        .context_injected
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "tiny-budget task/flat error must defer first-call business context"
+                );
+            }
+        }
 
         for budget_key in ["max_output_bytes", "max_output_tokens"] {
             let mut arguments = serde_json::json!({

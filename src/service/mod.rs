@@ -21,7 +21,9 @@ pub use graph::{GraphParams, StatsResult, graph_query, stats};
 pub use progress::{OutcomeProgressContext, OutcomeProgressParams, outcome_progress};
 pub use repomap::{RepoMapContext, RepoMapParams, repo_map};
 pub use roots::{list_roots, list_roots_from_slugs, list_roots_from_slugs_read_only};
-pub use search::{search, search_delivery};
+#[cfg(test)]
+pub use search::search;
+pub use search::{search_delivery, search_result};
 
 pub const CONVERGENCE_GUIDANCE: &str = "Convergence requires two or more explicitly bound source `nodes`, optional downstream `before`, and `direction`, `edge_types`, and `depth`; discover readable symbols and verify that any boundary is reachable under the same direction and edge filter, bind them through convergence resolution, then execute the returned stable IDs. Ambiguous, unresolved, coverage-unknown, unreachable-boundary, or empty-proof results never inject context and never fall back to lexical search.";
 

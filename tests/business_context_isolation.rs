@@ -280,7 +280,7 @@ async fn disabled_live_markdown_search_excludes_dot_oh_only() {
         business_context: &business_context,
     };
 
-    let result = service::search(&params, &ctx).await;
+    let result = service::search_result(&params, &ctx).await.unwrap();
 
     assert!(
         result.contains("README.md"),
@@ -332,7 +332,7 @@ async fn disabled_live_markdown_preserves_repo_under_dot_oh_ancestor() {
         business_context: &business_context,
     };
 
-    let result = service::search(&params, &ctx).await;
+    let result = service::search_result(&params, &ctx).await.unwrap();
 
     assert!(
         result.contains("README.md"),

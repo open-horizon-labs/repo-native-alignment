@@ -3,6 +3,59 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
+fn task_and_flat_infeasible_render_budgets_exit_nonzero_without_stdout() {
+    let tmp = TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(tmp.path().join("src")).expect("create src dir");
+    std::fs::write(
+        tmp.path().join("src/lib.rs"),
+        "pub fn actionable() -> bool { true }\n",
+    )
+    .expect("write source fixture");
+    let repo = tmp.path().to_str().expect("utf-8 temp path");
+    let prepared = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"))
+        .args(["scan", "--extract-only", "--repo", repo])
+        .output()
+        .expect("prepare search cache");
+    assert!(
+        prepared.status.success(),
+        "fixture scan failed:\n{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+
+    for context_mode in [None, Some("task")] {
+        for budget_flag in ["--max-output-bytes", "--max-output-tokens"] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_repo-native-alignment"));
+            command.args([
+                "search",
+                "change actionable behavior and add a regression test",
+                "--repo",
+                repo,
+                budget_flag,
+                "1",
+            ]);
+            if let Some(context_mode) = context_mode {
+                command.args(["--context-mode", context_mode]);
+            }
+            let output = command.output().expect("run bounded search");
+            assert!(
+                !output.status.success(),
+                "infeasible {context_mode:?} {budget_flag} search must fail"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "infeasible search must not emit oversized stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("BudgetTooSmall"),
+                "typed error missing from stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn foreground_full_scan_lsp_failure_exits_nonzero() {
     if Command::new("rust-analyzer")
         .arg("--version")
@@ -112,14 +165,16 @@ fn foreground_full_scan_lsp_failure_exits_nonzero() {
         .output()
         .expect("run cache-only scan in fresh process");
     let restarted_stderr = String::from_utf8_lossy(&restarted.stderr);
-    assert!(restarted.status.success(), "cache-only scan failed:\n{restarted_stderr}");
+    assert!(
+        restarted.status.success(),
+        "cache-only scan failed:\n{restarted_stderr}"
+    );
     assert!(
         restarted_stderr.contains("call_references: degraded"),
         "cache-only summary lost durable degraded readiness:\n{restarted_stderr}"
     );
     assert!(
-        restarted_stderr.contains("forced no-progress")
-            || restarted_stderr.contains("no progress"),
+        restarted_stderr.contains("forced no-progress") || restarted_stderr.contains("no progress"),
         "cache-only summary lost durable abort diagnostic:\n{restarted_stderr}"
     );
 }

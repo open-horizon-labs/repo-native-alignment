@@ -39,7 +39,7 @@ use crate::server::state::GraphState;
 use crate::server::{RnaHandler, ScanEnrichmentOptions};
 use crate::service::{
     RepoMapContext, RepoMapParams, SearchContext, SearchParams, list_roots_from_slugs, repo_map,
-    search,
+    search_result,
 };
 
 // ─── Viewer HTML (inline so the binary is self-contained) ────────────────────
@@ -245,7 +245,9 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 enrichment_jobs: Vec::new(),
                 business_context: &state.business_context,
             };
-            Ok(search(&params, &ctx).await)
+            search_result(&params, &ctx)
+                .await
+                .map_err(|error| error.to_string())
         }
 
         "list_roots" => {

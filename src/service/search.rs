@@ -1099,6 +1099,7 @@ pub enum SearchDeliveryError {
         minimum_bytes: usize,
         minimum_tokens: usize,
     },
+    RenderFailed(String),
 }
 
 impl std::fmt::Display for SearchDeliveryError {
@@ -1109,8 +1110,23 @@ impl std::fmt::Display for SearchDeliveryError {
                 minimum_tokens,
             } => write!(
                 f,
-                "BudgetTooSmall: convergence response requires at least {minimum_bytes} bytes and {minimum_tokens} estimated tokens"
+                "BudgetTooSmall: response requires at least {minimum_bytes} bytes and {minimum_tokens} estimated tokens"
             ),
+            Self::RenderFailed(message) => write!(f, "RenderFailed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SearchDeliveryError {}
+
+impl From<render::RenderError> for SearchDeliveryError {
+    fn from(error: render::RenderError) -> Self {
+        match error {
+            render::RenderError::BudgetTooSmall { minimum } => Self::BudgetTooSmall {
+                minimum_bytes: minimum.utf8_bytes,
+                minimum_tokens: minimum.estimated_tokens,
+            },
+            render::RenderError::AccountingDidNotConverge => Self::RenderFailed(error.to_string()),
         }
     }
 }
@@ -1145,11 +1161,23 @@ impl SearchDelivery {
 }
 
 /// Unified search entry point. Returns formatted markdown.
-pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+pub async fn search_result(
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Result<String, SearchDeliveryError> {
     let delivery = search_delivery(params, ctx).await;
-    delivery
-        .error
-        .map_or(delivery.markdown, |error| error.to_string())
+    match delivery.error {
+        Some(error) => Err(error),
+        None => Ok(delivery.markdown),
+    }
+}
+
+/// Test compatibility wrapper for assertions that intentionally inspect text.
+#[cfg(test)]
+pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    search_result(params, ctx)
+        .await
+        .unwrap_or_else(|error| error.to_string())
 }
 
 /// Unified search entry point with delivery semantics for MCP response composition.
@@ -1236,7 +1264,14 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
         return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
 
-    SearchDelivery::eligible(projected_search(params, ctx).await)
+    match projected_search_delivery(params, ctx).await {
+        Ok(markdown) => SearchDelivery::eligible(markdown),
+        Err(error) => SearchDelivery {
+            markdown: String::new(),
+            context_injection_eligible: false,
+            error: Some(error),
+        },
+    }
 }
 
 /// Return the stable names of product-only controls that legacy dispatch
@@ -2264,10 +2299,13 @@ fn selected_for_hydration(
     }
 }
 
-async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+async fn projected_search_delivery(
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Result<String, SearchDeliveryError> {
     let edge_index = ProjectedEdgeIndex::new(ctx.graph_state);
     if params.context_mode.as_deref() == Some("graph-delta-beta") {
-        return projected_graph_delta(params, ctx, &edge_index).await;
+        return Ok(projected_graph_delta(params, ctx, &edge_index).await);
     }
     let intent = if params.context_mode.as_deref() == Some("task") {
         SearchIntent::Implement
@@ -2277,20 +2315,21 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
     let request = projection_request(params, intent);
     if params.context_mode.as_deref() == Some("task") {
         return match task_records(params, ctx, &edge_index).await {
-            Ok(output) => {
-                output
-                    .certified_response
-                    .expect("task selection must return its certified final render")
-                    .text
+            Ok(output) => Ok(output
+                .certified_response
+                .expect("task selection must return its certified final render")
+                .text),
+            Err(TaskAdapterError::Selection(error)) => {
+                Ok(format!("Task context selection failed: {error}."))
             }
-            Err(error) => format!("Task context selection failed: {error}."),
+            Err(TaskAdapterError::Render(error)) => Err(error.into()),
         };
     }
     let (mut records, mut relationships, mut capabilities, mut omissions, mut candidate_audit) = {
         let (fused, capabilities, product_score_audit) =
             match projected_fused_candidates(params, ctx, &edge_index).await {
                 Ok(result) => result,
-                Err(error) => return format!("Search projection failed: {error}."),
+                Err(error) => return Ok(format!("Search projection failed: {error}.")),
             };
         let selected_limit = params.limit.unwrap_or(10);
         let records = fused
@@ -2393,7 +2432,7 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
             .cmp(&right.candidate_rank)
             .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
     });
-    render_projected_input(
+    match render_projected_input_result(
         request,
         ProjectionInput {
             records,
@@ -2404,7 +2443,20 @@ async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> Str
         },
         params,
         ctx,
-    )
+    ) {
+        Ok(markdown) => Ok(markdown),
+        Err(ProjectionRenderFailure::Source(error)) => {
+            Ok(format!("Search source projection unavailable: {error}."))
+        }
+        Err(ProjectionRenderFailure::Render(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+async fn projected_search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    projected_search_delivery(params, ctx)
+        .await
+        .unwrap_or_else(|error| error.to_string())
 }
 
 async fn projected_non_code_records(
@@ -3102,11 +3154,29 @@ struct TaskAssembly {
     reason: String,
 }
 
+#[derive(Debug)]
+enum TaskAdapterError {
+    Selection(String),
+    Render(render::RenderError),
+}
+
+impl From<String> for TaskAdapterError {
+    fn from(error: String) -> Self {
+        Self::Selection(error)
+    }
+}
+
+impl From<render::RenderError> for TaskAdapterError {
+    fn from(error: render::RenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
 async fn task_records(
     params: &SearchParams,
     ctx: &SearchContext<'_>,
     edge_index: &ProjectedEdgeIndex<'_>,
-) -> Result<TaskAdapterOutput, String> {
+) -> Result<TaskAdapterOutput, TaskAdapterError> {
     let task = task_context::parse_task(params.query.as_deref().unwrap_or_default())
         .map_err(|error| error.to_string())?;
     let candidate_nodes: BTreeMap<_, _> = ctx
@@ -3578,7 +3648,8 @@ async fn task_records(
             "task adapter produced {} candidates; limit is {}",
             assemblies.len(),
             task_context::MAX_SELECTION_CANDIDATES
-        ));
+        )
+        .into());
     }
     let reader = projection_source_reader(params, ctx.repo_root)?;
     let mut bundles = BTreeMap::<String, Vec<SelectedRecord>>::new();
@@ -3697,6 +3768,24 @@ async fn task_records(
         default_capabilities(ctx, request.projection, params.verbose).await;
     let mut base_output = output;
     let infeasible_cost = policy.rendered_budget.saturating_add(1);
+
+    // Establish caller-budget feasibility before the scalar selection model.
+    // Otherwise its deliberately out-of-band sentinel can collapse a typed
+    // renderer failure into BundleCostExceedsBudget text.
+    rendered_task_bundle_response(
+        params,
+        &reader,
+        &[],
+        &bundles,
+        &typed,
+        &assemblies,
+        &candidate_nodes,
+        &product_score_audit,
+        &base_output,
+        &policy.required_roles,
+        &default_task_capabilities,
+        edge_index,
+    )?;
 
     // A record-level cap is evaluated in the same currency as selection: the
     // canonical final task response with that identity selected and every
@@ -5549,6 +5638,7 @@ fn rendered_task_bundle_cost(
         edge_index,
     )
     .map(|response| response.accounting.total.utf8_bytes.max(1))
+    .map_err(|error| format!("task candidate cost projection failed: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5565,7 +5655,7 @@ fn rendered_task_bundle_response(
     required_roles: &BTreeSet<TaskRole>,
     default_task_capabilities: &[CapabilityStatus],
     edge_index: &ProjectedEdgeIndex<'_>,
-) -> Result<RenderedResponse, String> {
+) -> Result<RenderedResponse, render::RenderError> {
     let mut output = materialize_task_output(
         selected_ids,
         bundles,
@@ -5620,7 +5710,6 @@ fn rendered_task_bundle_response(
         reader,
     );
     render::render_projection(&plan)
-        .map_err(|error| format!("task candidate cost projection failed: {error}"))
 }
 
 fn candidate_audit_from_fused(
@@ -7349,20 +7438,38 @@ fn safe_graph_delta_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
+enum ProjectionRenderFailure {
+    Source(String),
+    Render(render::RenderError),
+}
+
+fn render_projected_input_result(
+    request: ProjectionRequest,
+    input: ProjectionInput,
+    params: &SearchParams,
+    ctx: &SearchContext<'_>,
+) -> Result<String, ProjectionRenderFailure> {
+    let reader =
+        projection_source_reader(params, ctx.repo_root).map_err(ProjectionRenderFailure::Source)?;
+    let plan = projection::plan_projection(request, input, &reader);
+    render::render_projection(&plan)
+        .map(|response| response.text)
+        .map_err(ProjectionRenderFailure::Render)
+}
+
 fn render_projected_input(
     request: ProjectionRequest,
     input: ProjectionInput,
     params: &SearchParams,
     ctx: &SearchContext<'_>,
 ) -> String {
-    let reader = match projection_source_reader(params, ctx.repo_root) {
-        Ok(reader) => reader,
-        Err(error) => return format!("Search source projection unavailable: {error}."),
-    };
-    let plan = projection::plan_projection(request, input, &reader);
-    render::render_projection(&plan)
-        .map(|response| response.text)
-        .unwrap_or_else(|error| format!("Search render failed: {error}."))
+    match render_projected_input_result(request, input, params, ctx) {
+        Ok(markdown) => markdown,
+        Err(ProjectionRenderFailure::Source(error)) => {
+            format!("Search source projection unavailable: {error}.")
+        }
+        Err(ProjectionRenderFailure::Render(error)) => format!("Search render failed: {error}."),
+    }
 }
 
 async fn projected_fused_candidates(
@@ -11508,6 +11615,49 @@ mod tests {
                     minimum_tokens: _
                 })
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_and_flat_infeasible_budgets_are_typed_and_not_injectable() {
+        let temp = TempDir::new().unwrap();
+        let graph = make_graph_state(vec![make_node(
+            "actionable",
+            NodeKind::Function,
+            "src/lib.rs",
+        )]);
+        let ctx = make_search_context(&graph, temp.path());
+
+        for context_mode in [None, Some("task")] {
+            for (max_output_bytes, max_output_tokens) in [(Some(1), None), (None, Some(1))] {
+                let delivery = search_delivery(
+                    &SearchParams {
+                        query: Some("change actionable behavior and add a regression test".into()),
+                        context_mode: context_mode.map(str::to_string),
+                        max_output_bytes,
+                        max_output_tokens,
+                        include_artifacts: false,
+                        include_markdown: false,
+                        ..Default::default()
+                    },
+                    &ctx,
+                )
+                .await;
+                assert!(
+                    delivery.markdown.is_empty(),
+                    "mode={context_mode:?} bytes={max_output_bytes:?} tokens={max_output_tokens:?} markdown={:?} error={:?}",
+                    delivery.markdown,
+                    delivery.error
+                );
+                assert!(!delivery.context_injection_eligible);
+                assert!(matches!(
+                    delivery.error,
+                    Some(SearchDeliveryError::BudgetTooSmall {
+                        minimum_bytes: _,
+                        minimum_tokens: _
+                    })
+                ));
+            }
         }
     }
 
