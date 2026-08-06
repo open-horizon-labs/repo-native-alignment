@@ -1,6 +1,6 @@
 ---
 name: record
-description: Record a business artifact (.oh/ metis, signal, guardrail, or outcome update). Use when capturing learnings, measurements, constraints, or updating outcome status.
+description: Create or update a repo-native business artifact in .oh/, including outcomes, objectives, capabilities, signals, guardrails, metis, and ADRs. Use when preserving S&T lineage, learnings, measurements, constraints, or outcome status.
 ---
 
 # Record Business Artifact
@@ -9,7 +9,7 @@ Write a structured markdown file to `.oh/` with YAML frontmatter. Use the templa
 
 ## Arguments
 
-`$ARGUMENTS` should be: `<type> <slug> [options]`
+`$ARGUMENTS` should be: `<type> <slug> [options]`, where type is `outcome`, `objective`, `capability`, `signal`, `guardrail`, `metis`, or `adr`.
 
 Example: `/rna-mcp:record metis protocol-mismatch-hangs`
 
@@ -59,17 +59,78 @@ outcome: <related-outcome-id>
 <body — rationale for this constraint>
 ```
 
-### Outcome (update existing)
+### Outcome (create or update)
 
-Edit the existing file at `.oh/outcomes/<slug>.md` — update `status`, `mechanism`, or `files` in the frontmatter.
+Write to `.oh/outcomes/<slug>.md`. If it exists, merge updates without discarding body context.
+
+```markdown
+---
+id: <slug>
+kind: outcome
+status: proposed|active|paused|achieved|abandoned
+s_and_t_step: <step-id-or-null>
+owner: <role-or-null>
+review_trigger: "<when to reassess>"
+files: []
+---
+
+# <Title>
+
+## Desired behavior change
+<who does what differently>
+
+## Mechanism
+<causal hypothesis>
+
+## Feedback
+<observable signal and timeframe>
+```
+
+### Objective or capability (create or update)
+
+Objectives and capabilities are outcome-family artifacts stored in `.oh/outcomes/<slug>.md` so existing RNA discovery and `outcome_progress` can find them. `kind` preserves the distinction. Require a canonical parent outcome before creating one; use the existing `outcome` frontmatter key so RNA emits the structural reference.
+
+```markdown
+---
+id: <slug>
+kind: objective|capability
+status: proposed|active|paused|achieved|abandoned
+outcome: <parent-outcome-id>
+s_and_t_step: <step-id>
+parent_step: <parent-step-id-or-root>
+sufficiency_group: <group-id-or-null>
+owner: <role-or-null>
+review_trigger: "<when to reassess>"
+files: []
+---
+
+# <Title>
+
+## Statement
+<objective to achieve or capability to establish>
+
+## Why it matters
+<necessity relative to the parent outcome>
+
+## Enables
+<downstream objective, capability, or tactic>
+
+## Acceptance signal
+<observable evidence this branch is ready or achieved>
+```
+
+Do not encode a tactic as a capability merely to make it durable. A capability describes an ability that will exist; a tactic describes the chosen way to establish or use it.
 
 ## Process
 
-1. Parse `$ARGUMENTS` to determine type and slug
-2. Check if the file already exists — if so, confirm before overwriting (metis/signal/guardrail) or merge updates (outcome)
-3. Read one existing artifact of the same type for frontmatter format reference
-4. Write the file using the Write tool
-5. Confirm: "Recorded <type> at `.oh/<subdir>/<slug>.md`"
+1. Parse `$ARGUMENTS` to determine type and slug.
+2. Resolve the path. `outcome`, `objective`, and `capability` all use `.oh/outcomes/<slug>.md`.
+3. For `objective` or `capability`, verify the parent `.oh/outcomes/<outcome-id>.md` exists. Stop and ask for the canonical parent rather than inventing one.
+4. Check whether the target exists. Confirm before replacing metis/signal/guardrail prose; merge outcome-family frontmatter and body updates.
+5. Read one existing artifact of the same type or outcome family for local format reference.
+6. Preserve supplied S&T lineage exactly: `s_and_t_step`, `parent_step`, `sufficiency_group`, `owner`, and `review_trigger`. Do not infer selected status from a candidate tactic.
+7. Write the file using the Write tool.
+8. Confirm: "Recorded <type> at `.oh/<subdir>/<slug>.md`".
 
 ## Slug Rules
 
