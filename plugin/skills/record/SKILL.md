@@ -13,6 +13,12 @@ Write a structured markdown file to `.oh/` with YAML frontmatter. Use the templa
 
 Example: `/rna-mcp:record metis protocol-mismatch-hangs`.
 
+## JIT References
+
+For `outcome`, `objective`, or `capability`, or whenever the input includes S&T lineage,
+load [references/open-horizons-outcome-family.md](references/open-horizons-outcome-family.md).
+It contains the outcome-family templates and lineage rules.
+
 ## Templates
 
 ### Metis (learning)
@@ -59,67 +65,12 @@ outcome: <related-outcome-id>
 <body — rationale for this constraint>
 ```
 
-### Outcome (create or update)
+### Outcome family
 
-Write to `.oh/outcomes/<slug>.md`. If it exists, merge updates without discarding body context.
-
-```markdown
----
-id: <slug>
-kind: outcome
-status: proposed|active|paused|achieved|abandoned
-s_and_t_step: <step-id-or-null>
-owner: <role-or-null>
-review_trigger: "<when to reassess>"
-files: []
----
-
-# <Title>
-
-## Desired behavior change
-<who does what differently>
-
-## Mechanism
-<causal hypothesis>
-
-## Feedback
-<observable signal and timeframe>
-```
-
-### Objective or capability (create or update)
-
-Store objectives and capabilities in `.oh/outcomes/<slug>.md` so RNA discovery and `outcome_progress` can find them. The `kind` field distinguishes the artifact type. Require a canonical parent outcome, referenced by the existing `outcome` frontmatter key.
-
-```markdown
----
-id: <slug>
-kind: objective|capability
-status: proposed|active|paused|achieved|abandoned
-outcome: <parent-outcome-id>
-s_and_t_step: <step-id>
-parent_step: <parent-step-id-or-root>
-sufficiency_group: <group-id-or-null>
-owner: <role-or-null>
-review_trigger: "<when to reassess>"
-files: []
----
-
-# <Title>
-
-## Statement
-<objective to achieve or capability to establish>
-
-## Why it matters
-<necessity relative to the parent outcome>
-
-## Enables
-<downstream objective, capability, or tactic>
-
-## Acceptance signal
-<observable evidence this branch is ready or achieved>
-```
-
-Do not encode a tactic as a capability merely to make it durable. A capability describes an ability that will exist; a tactic describes the chosen way to establish or use it.
+`outcome`, `objective`, and `capability` use `.oh/outcomes/<slug>.md`.
+Load the outcome-family reference before creating or updating one.
+Require a canonical parent outcome for objectives and capabilities.
+Copy supplied S&T lineage exactly; candidate tactics are not selected work.
 
 ## Process
 
