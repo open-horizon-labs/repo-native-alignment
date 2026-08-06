@@ -1,6 +1,6 @@
 ---
 name: record
-description: Record a business artifact (.oh/ metis, signal, guardrail, or outcome update). Use when capturing learnings, measurements, constraints, or updating outcome status.
+description: Create or update repo-native outcomes, objectives, capabilities, signals, guardrails, metis, and ADRs. Use to preserve S&T lineage or record learning, measurements, constraints, and outcome status.
 ---
 
 # Record Business Artifact
@@ -9,9 +9,15 @@ Write a structured markdown file to `.oh/` with YAML frontmatter. Use the templa
 
 ## Arguments
 
-`$ARGUMENTS` should be: `<type> <slug> [options]`
+`$ARGUMENTS` should be: `<type> <slug> [options]`, where type is `outcome`, `objective`, `capability`, `signal`, `guardrail`, `metis`, or `adr`.
 
-Example: `/rna-mcp:record metis protocol-mismatch-hangs`
+Example: `/rna-mcp:record metis protocol-mismatch-hangs`.
+
+## JIT References
+
+For `outcome`, `objective`, or `capability`, or whenever the input includes S&T lineage,
+load [references/open-horizons-outcome-family.md](references/open-horizons-outcome-family.md).
+It contains the outcome-family templates and lineage rules.
 
 ## Templates
 
@@ -59,23 +65,29 @@ outcome: <related-outcome-id>
 <body — rationale for this constraint>
 ```
 
-### Outcome (update existing)
+### Outcome family
 
-Edit the existing file at `.oh/outcomes/<slug>.md` — update `status`, `mechanism`, or `files` in the frontmatter.
+`outcome`, `objective`, and `capability` use `.oh/outcomes/<slug>.md`.
+Load the outcome-family reference before creating or updating one.
+Require a canonical parent outcome for objectives and capabilities.
+Copy supplied S&T lineage exactly; candidate tactics are not selected work.
 
 ## Process
 
-1. Parse `$ARGUMENTS` to determine type and slug
-2. Check if the file already exists — if so, confirm before overwriting (metis/signal/guardrail) or merge updates (outcome)
-3. Read one existing artifact of the same type for frontmatter format reference
-4. Write the file using the Write tool
-5. Confirm: "Recorded <type> at `.oh/<subdir>/<slug>.md`"
+1. Parse `$ARGUMENTS` to determine type and slug.
+2. Resolve the path. `outcome`, `objective`, and `capability` all use `.oh/outcomes/<slug>.md`.
+3. For `objective` or `capability`, verify the parent `.oh/outcomes/<outcome-id>.md` exists. Stop and ask for the canonical parent rather than inventing one.
+4. Check whether the target exists. Confirm before replacing metis/signal/guardrail prose; merge outcome-family frontmatter and body updates.
+5. Read one existing artifact of the same type or outcome family for local format reference.
+6. Copy supplied S&T lineage exactly: `s_and_t_step`, `parent_step`, `sufficiency_group`, `owner`, and `review_trigger`. A candidate tactic is not selected work.
+7. Write the file using the Write tool.
+8. Confirm: "Recorded <type> at `.oh/<subdir>/<slug>.md`".
 
 ## Slug Rules
 
-- Lowercase, alphanumeric + hyphens only
-- No path separators (`/`, `\`, `..`)
-- Example: `protocol-mismatch-hangs`, `agent-scoping-accuracy`
+- Use lowercase letters, numbers, and hyphens only.
+- Reject path separators (`/`, `\`, `..`).
+- Examples: `protocol-mismatch-hangs`, `agent-scoping-accuracy`.
 
 
 ## ADRs (architecture decisions)
@@ -112,8 +124,8 @@ validate:
 ```
 
 ### ADR rules
-- Prefer `cargo_tests` over every other check type whenever the claim can be expressed as a normal test
-- Use built-in `audits` for code-shape constraints that are not honest test cases
-- Use direct executable references only — no opaque evidence IDs
-- If a validation does not exist yet, leave it out and call out the missing check explicitly in the ADR body or follow-up work
-- After creating or updating an ADR, run `/rna-mcp:adr-sync` so frontmatter, compile/check output, and missing-check reporting stay aligned
+- Prefer `cargo_tests` when a normal test can express the claim.
+- Use built-in `audits` for code-shape constraints that are not honest test cases.
+- Use direct executable references, not opaque evidence IDs.
+- If validation does not exist, omit it and name the missing check in the ADR body or follow-up work.
+- After creating or updating an ADR, run `/rna-mcp:adr-sync` to align frontmatter, compile/check output, and missing-check reporting.
