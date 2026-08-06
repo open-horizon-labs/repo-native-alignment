@@ -1,6 +1,6 @@
 ---
 name: record
-description: Create or update a repo-native business artifact in .oh/, including outcomes, objectives, capabilities, signals, guardrails, metis, and ADRs. Use when preserving S&T lineage, learnings, measurements, constraints, or outcome status.
+description: Create or update repo-native outcomes, objectives, capabilities, signals, guardrails, metis, and ADRs. Use to preserve S&T lineage or record learning, measurements, constraints, and outcome status.
 ---
 
 # Record Business Artifact
@@ -11,7 +11,7 @@ Write a structured markdown file to `.oh/` with YAML frontmatter. Use the templa
 
 `$ARGUMENTS` should be: `<type> <slug> [options]`, where type is `outcome`, `objective`, `capability`, `signal`, `guardrail`, `metis`, or `adr`.
 
-Example: `/rna-mcp:record metis protocol-mismatch-hangs`
+Example: `/rna-mcp:record metis protocol-mismatch-hangs`.
 
 ## Templates
 
@@ -88,7 +88,7 @@ files: []
 
 ### Objective or capability (create or update)
 
-Objectives and capabilities are outcome-family artifacts stored in `.oh/outcomes/<slug>.md` so existing RNA discovery and `outcome_progress` can find them. `kind` preserves the distinction. Require a canonical parent outcome before creating one; use the existing `outcome` frontmatter key so RNA emits the structural reference.
+Store objectives and capabilities in `.oh/outcomes/<slug>.md` so RNA discovery and `outcome_progress` can find them. The `kind` field distinguishes the artifact type. Require a canonical parent outcome, referenced by the existing `outcome` frontmatter key.
 
 ```markdown
 ---
@@ -128,15 +128,15 @@ Do not encode a tactic as a capability merely to make it durable. A capability d
 3. For `objective` or `capability`, verify the parent `.oh/outcomes/<outcome-id>.md` exists. Stop and ask for the canonical parent rather than inventing one.
 4. Check whether the target exists. Confirm before replacing metis/signal/guardrail prose; merge outcome-family frontmatter and body updates.
 5. Read one existing artifact of the same type or outcome family for local format reference.
-6. Preserve supplied S&T lineage exactly: `s_and_t_step`, `parent_step`, `sufficiency_group`, `owner`, and `review_trigger`. Do not infer selected status from a candidate tactic.
+6. Copy supplied S&T lineage exactly: `s_and_t_step`, `parent_step`, `sufficiency_group`, `owner`, and `review_trigger`. A candidate tactic is not selected work.
 7. Write the file using the Write tool.
 8. Confirm: "Recorded <type> at `.oh/<subdir>/<slug>.md`".
 
 ## Slug Rules
 
-- Lowercase, alphanumeric + hyphens only
-- No path separators (`/`, `\`, `..`)
-- Example: `protocol-mismatch-hangs`, `agent-scoping-accuracy`
+- Use lowercase letters, numbers, and hyphens only.
+- Reject path separators (`/`, `\`, `..`).
+- Examples: `protocol-mismatch-hangs`, `agent-scoping-accuracy`.
 
 
 ## ADRs (architecture decisions)
@@ -173,8 +173,8 @@ validate:
 ```
 
 ### ADR rules
-- Prefer `cargo_tests` over every other check type whenever the claim can be expressed as a normal test
-- Use built-in `audits` for code-shape constraints that are not honest test cases
-- Use direct executable references only — no opaque evidence IDs
-- If a validation does not exist yet, leave it out and call out the missing check explicitly in the ADR body or follow-up work
-- After creating or updating an ADR, run `/rna-mcp:adr-sync` so frontmatter, compile/check output, and missing-check reporting stay aligned
+- Prefer `cargo_tests` when a normal test can express the claim.
+- Use built-in `audits` for code-shape constraints that are not honest test cases.
+- Use direct executable references, not opaque evidence IDs.
+- If validation does not exist, omit it and name the missing check in the ADR body or follow-up work.
+- After creating or updating an ADR, run `/rna-mcp:adr-sync` to align frontmatter, compile/check output, and missing-check reporting.
