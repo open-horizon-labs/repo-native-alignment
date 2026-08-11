@@ -2,6 +2,10 @@
 
 Status: **COMPLETE**. Canonical cells: **720/720**; officially evaluated: **720/720**.
 
+Additive bounded T_PD follow-up and matched native-default control repair:
+**40/40 cells complete and officially evaluated**. Total observations
+published in this report: **760**.
+
 This is the single reader-facing report for all 36 conditions on the same 20
 frozen cases: A, T, and T2 on Claude Sonnet 5, GPT-5.6 Luna, Claude Haiku 4.5,
 and GPT-5.3 Codex Spark, each without an added strategy and with the published
@@ -13,6 +17,11 @@ canonical cell is officially evaluated; the generated unified detail section
 reports success, time, ordinary and cached input, cache writes, output, cost
 availability, quality, and tool counts by tool type for every case and
 condition.
+
+The same report also includes the additive Sonnet-only bounded
+progressive-disclosure population run (`T_PD`) and its matched native-default
+control repair (`A_prime`): 20 treatment episodes and 20 fresh controls. Both
+are outside the 36-condition factorial and do not rewrite any of its 720 cells.
 
 The Sonnet/Luna T2 extension executed 42 paid provider episodes: 40 canonical
 cells plus two superseded attempts affected by the documented projection-parser
@@ -60,6 +69,16 @@ not model output. For example, Sonnet plan-first T/T2 output falls 12.9%/16.5%
 while total tokens rise 13.6%/3.2%. These are descriptive single-run paired
 results over 20 deliberately selected cases; no pooled population effect or
 prompt-strategy causality is claimed.
+
+The corrected bounded-manifest comparison sharpens the paper claim. Relative
+to a matched native-default control, deterministic RNA preprocessing changes
+the work trajectory: T_PD produces one net resolved case, 10.8% fewer model
+tool calls, and 5.5% less output. It does **not** establish general efficiency
+superiority: total input, cost, and end-to-end time are higher, and their
+leave-one-case-out effects are unstable. The defensible result is a mechanism
+and product-shape finding—bounded modeled repository context can replace some
+interactive repository work and may improve a patch—but not the originally
+hypothesized 40% token reduction.
 
 ## Why helpful context still increased billed input
 
@@ -258,12 +277,150 @@ This remains a one-case mechanism check, not a population-effect estimate, so
 artifacts bound by
 [`prompt-replay-analysis-evidence-manifest.json`](prompt-replay-analysis-evidence-manifest.json).
 
+## Bounded progressive-disclosure population run
+
+The Sonnet population follow-up tests the public-facing bounded-context shape
+across all 20 frozen cases. `T_PD` prepends a deterministic hybrid/reranked RNA
+search response containing only complete records within 8 KiB, retains stable
+IDs for optional caller-selected expansion, injects no graph dump or automatic
+root, and leaves ordinary repository and test tools available.
+
+An audit found that the initially reused canonical A controls had run with a
+replacement `--system-prompt-file`, while T_PD retained Claude Code's native
+default system prompt and appended RNA guidance with
+`--append-system-prompt-file`. That prompt-channel mismatch invalidates the
+large legacy A/T_PD efficiency contrast as a causal estimate. The repair adds
+20 fresh `A_prime` controls using the exact T_PD CLI command and init surface,
+with only the RNA append flag/value removed. Existing T_PD episodes were not
+rerun. The user task is otherwise the standard A prompt. All 20 command and
+init-surface parity checks passed.
+
+Under this corrected comparison, **A_prime resolves 16/20 and T_PD resolves
+17/20**. Nineteen verdicts match; rank 6 is the only discordance and favors
+T_PD. This is a descriptive +1 resolved case (+5 percentage points), not an
+inferential efficacy result: the exact paired test has only one discordance.
+The two-sided exact McNemar p-value is 1.0.
+T_PD uses **10.8% fewer model tool calls** and **5.5% fewer output tokens**, but
+uses **3.1% more total input** and costs **5.6% more**. Model wall time is 1.6%
+lower; after adding issue-specific RNA retrieval, end-to-end time is 21.1%
+higher. Each episode cost is cross-checked against the sum of its per-model
+receipt costs.
+
+### Aggregate and sensitivity
+
+| Arm | Resolved | Model time | RNA retrieval | End-to-end | Direct input | Cache write | Cache read | Total input | Output | Cost | Tools | Tool types |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A_prime | 16/20 | 2368.3s | — | 2368.3s | 21,063 | 377,774 | 9,791,397 | 10,190,234 | 116,538 | $6.971358 | 408 | Bash=220, Edit=75, Glob=1, Grep=43, Read=65, Write=4 |
+| T_PD | 17/20 | 2330.4s | 537.5s | 2867.9s | 83,054 | 438,590 | 9,981,777 | 10,503,421 | 110,173 | $7.359478 | 364 | Bash=223, Edit=64, Glob=1, Grep=19, Read=53, Write=4 |
+| T_PD vs A_prime | +1 resolved | -1.6% | — | +21.1% | +294.3% | +16.1% | +1.9% | +3.1% | -5.5% | +5.6% | -10.8% | — |
+
+The paired-case medians are model time -15.0%, end-to-end time +35.0%, total
+input +6.0%, output -5.3%, cost +7.4%, and tools -11.4%. Directionally, T_PD
+is lower in 11/20 cases for model time, 6/20 for end-to-end time, 9/20 for
+total input, 11/20 for output, 10/20 for cost, and 12/20 for tools.
+
+The 8 KiB manifest creates the expected direct-input overhead (+294.3%), but
+the corrected controls show no aggregate cache-read reduction: cache reads
+rise 1.9% and total input rises 3.1%. Output and tool use fall, so T_PD's
+trajectory is somewhat shorter in action count without producing a stable
+billed-input or cost reduction.
+
+Leave-one-rank-out sensitivity shows the single-episode variance directly.
+Depending on the omitted rank, total-input change ranges from -7.2% to +12.9%,
+cost from -1.9% to +12.7%, and model time from -26.1% to +6.8%. Rank 3 is the
+principal unfavorable T_PD trajectory; rank 5 is the principal unfavorable
+A_prime trajectory. Only the tool-count reduction keeps the same aggregate
+direction in every leave-one-out cohort (-17.8% to -4.8%). End-to-end time is
+usually slower and ranges from -3.8% to +32.9%.
+
+Rank 12 is a disclosed cache-attachment exception. Its retained title-only semantic/reranked response was byte- and hash-verified and projected through the same 8 KiB complete-record contract after the title-plus-512 query returned no records. The later strict gate rejected the cache attachment for a symlinked reranker overlay and missing LSP-completeness receipt, not retrieval failure. Its treatment prompt, completed transcript, patch, and fresh stock evaluator verdict are independently bound; the patch exactly reproduced the previously successful fix.
+
+The pre-injected RNA result visibly guided the first repository action in 18/20
+transcripts. No T_PD transcript made a follow-up RNA call; this does not
+invalidate the tested context-efficacy mechanism because the modeled
+representation was already present before the first model turn. The
+deterministic exposure is reported separately and is not counted among model
+tool calls. Full repository extraction, embeddings, reranker setup, and LSP
+enrichment are reusable preprocessing and are not charged as per-issue model
+latency.
+
+All 20 admitted A_prime episodes completed without timeout, permission denial,
+harness failure, foreign-case contamination, or large duplicated tool-output
+dump. Nineteen separate CLI invocations exhausted their internal HTTP 529
+retries before any Sonnet episode output, tool call, or patch; they are retained
+as provider-failure provenance and excluded from the experimental dataset.
+Their receipts report $0.023380 total Haiku helper-model cost, separately from
+the $6.971358 admitted A_prime cohort. The four A_prime misses are genuine
+stock-evaluator patch failures. On the sole efficacy discordance, rank 6,
+A_prime patched the template filter and failed the lazy-object regression;
+T_PD eventually patched the lazy proxy and resolved the case.
+
+### Per-case A_prime/T_PD details
+
+`Model / RNA / E2E` is seconds. `Direct / write / read` splits provider input accounting; `total / output` reports cumulative input and generated output. A_prime has no issue-specific RNA retrieval.
+
+| Rank | Arm | Verdict | Model / RNA / E2E | Direct / write / read input | Total input / output | Cost | Tools by type |
+|---:|---|---|---:|---:|---:|---:|---|
+| 1 | A_prime | RESOLVED | 53.3 / 0.0 / 53.3 | 770 / 19,831 / 131,558 | 152,159 / 2,038 | $0.189639 | 8 (Bash=4, Edit=1, Grep=1, Read=2) |
+| 1 | T_PD | RESOLVED | 35.3 / 41.5 / 76.8 | 4,184 / 12,815 / 162,165 | 179,164 / 1,548 | $0.152786 | 7 (Bash=5, Edit=1, Read=1) |
+| 2 | A_prime | RESOLVED | 216.0 / 0.0 / 216.0 | 674 / 23,587 / 722,426 | 746,687 / 8,761 | $0.490303 | 30 (Bash=16, Edit=4, Grep=2, Read=8) |
+| 2 | T_PD | RESOLVED | 36.4 / 34.1 / 70.5 | 3,647 / 13,457 / 201,007 | 218,111 / 2,248 | $0.178261 | 9 (Bash=5, Edit=1, Grep=2, Read=1) |
+| 3 | A_prime | RESOLVED | 95.3 / 0.0 / 95.3 | 757 / 15,114 / 294,595 | 310,466 / 4,292 | $0.244109 | 14 (Bash=11, Edit=1, Read=2) |
+| 3 | T_PD | RESOLVED | 651.5 / 29.6 / 681.0 | 4,522 / 32,522 / 1,300,151 | 1,337,195 / 11,304 | $0.759233 | 40 (Bash=34, Edit=2, Read=4) |
+| 4 | A_prime | RESOLVED | 96.8 / 0.0 / 96.8 | 1,855 / 20,902 / 481,528 | 504,285 / 7,482 | $0.383873 | 21 (Bash=11, Edit=6, Read=4) |
+| 4 | T_PD | RESOLVED | 124.1 / 31.4 / 155.5 | 4,881 / 29,251 / 768,498 | 802,630 / 9,145 | $0.548029 | 26 (Bash=10, Edit=5, Grep=3, Read=8) |
+| 5 | A_prime | RESOLVED | 342.7 / 0.0 / 342.7 | 1,459 / 34,855 / 1,583,352 | 1,619,666 / 15,855 | $0.923496 | 53 (Bash=32, Edit=12, Read=9) |
+| 5 | T_PD | RESOLVED | 167.2 / 10.3 / 177.5 | 4,388 / 30,186 / 790,255 | 824,829 / 7,976 | $0.542178 | 26 (Bash=16, Edit=7, Read=3) |
+| 6 | A_prime | UNRESOLVED | 81.1 / 0.0 / 81.1 | 646 / 15,874 / 382,241 | 398,761 / 5,980 | $0.300192 | 19 (Bash=8, Edit=5, Grep=4, Read=2) |
+| 6 | T_PD | RESOLVED | 180.6 / 30.6 / 211.1 | 3,683 / 32,865 / 893,165 | 929,713 / 10,622 | $0.628126 | 30 (Bash=18, Edit=5, Grep=3, Read=4) |
+| 7 | A_prime | RESOLVED | 389.3 / 0.0 / 389.3 | 1,342 / 36,975 / 1,244,818 | 1,283,135 / 10,144 | $0.748807 | 39 (Bash=35, Edit=3, Read=1) |
+| 7 | T_PD | RESOLVED | 221.5 / 17.1 / 238.6 | 4,466 / 53,294 / 1,226,928 | 1,284,688 / 13,431 | $0.893757 | 35 (Bash=26, Edit=6, Read=3) |
+| 8 | A_prime | RESOLVED | 54.4 / 0.0 / 54.4 | 688 / 11,536 / 327,477 | 339,701 / 3,708 | $0.223663 | 18 (Bash=7, Edit=4, Grep=4, Read=3) |
+| 8 | T_PD | RESOLVED | 85.5 / 42.0 / 127.5 | 3,780 / 19,107 / 492,537 | 515,424 / 5,065 | $0.342052 | 20 (Bash=9, Edit=5, Grep=4, Read=2) |
+| 9 | A_prime | RESOLVED | 48.9 / 0.0 / 48.9 | 815 / 12,416 / 256,549 | 269,780 / 2,825 | $0.194551 | 14 (Bash=6, Edit=2, Grep=5, Read=1) |
+| 9 | T_PD | RESOLVED | 28.1 / 36.2 / 64.3 | 3,902 / 13,878 / 126,618 | 144,398 / 1,740 | $0.151053 | 6 (Bash=2, Edit=2, Read=2) |
+| 10 | A_prime | RESOLVED | 145.0 / 0.0 / 145.0 | 2,130 / 31,031 / 660,038 | 693,199 / 9,649 | $0.530958 | 23 (Bash=9, Edit=6, Grep=2, Read=6) |
+| 10 | T_PD | RESOLVED | 77.2 / 32.9 / 110.0 | 5,237 / 22,851 / 443,346 | 471,434 / 4,714 | $0.345925 | 16 (Bash=8, Edit=5, Read=3) |
+| 11 | A_prime | RESOLVED | 181.1 / 0.0 / 181.1 | 931 / 11,624 / 164,219 | 176,774 / 2,137 | $0.151846 | 9 (Bash=5, Edit=1, Grep=2, Read=1) |
+| 11 | T_PD | RESOLVED | 80.6 / 37.0 / 117.6 | 3,912 / 11,697 / 148,666 | 164,275 / 1,758 | $0.144896 | 7 (Bash=4, Edit=1, Grep=1, Read=1) |
+| 12 | A_prime | RESOLVED | 134.1 / 0.0 / 134.1 | 1,426 / 18,632 / 536,384 | 556,442 / 6,334 | $0.369057 | 25 (Bash=18, Edit=2, Grep=2, Read=3) |
+| 12 | T_PD | RESOLVED | 99.1 / 2.9 / 102.0 | 3,917 / 31,276 / 587,095 | 622,288 / 5,816 | $0.454791 | 24 (Bash=18, Edit=2, Grep=2, Read=2) |
+| 13 | A_prime | UNRESOLVED | 53.3 / 0.0 / 53.3 | 815 / 9,907 / 238,965 | 249,687 / 3,939 | $0.190882 | 14 (Bash=4, Edit=2, Grep=7, Read=1) |
+| 13 | T_PD | UNRESOLVED | 42.2 / 39.8 / 82.0 | 4,309 / 12,253 / 193,075 | 209,637 / 2,554 | $0.173899 | 9 (Bash=4, Edit=2, Grep=1, Read=2) |
+| 14 | A_prime | RESOLVED | 50.6 / 0.0 / 50.6 | 703 / 9,180 / 241,677 | 251,560 / 3,071 | $0.174251 | 14 (Bash=5, Edit=2, Grep=4, Read=2, Write=1) |
+| 14 | T_PD | RESOLVED | 53.1 / 9.3 / 62.4 | 3,796 / 14,121 / 324,649 | 342,566 / 3,400 | $0.236831 | 15 (Bash=8, Edit=2, Glob=1, Grep=1, Read=2, Write=1) |
+| 15 | A_prime | RESOLVED | 42.8 / 0.0 / 42.8 | 797 / 9,554 / 182,315 | 192,666 / 3,275 | $0.161795 | 10 (Bash=3, Edit=2, Read=5) |
+| 15 | T_PD | RESOLVED | 68.2 / 9.7 / 77.9 | 4,028 / 18,049 / 287,199 | 309,276 / 3,511 | $0.251025 | 11 (Bash=7, Edit=2, Read=2) |
+| 16 | A_prime | UNRESOLVED | 97.2 / 0.0 / 97.2 | 784 / 26,026 / 695,460 | 722,270 / 6,662 | $0.465410 | 27 (Bash=15, Edit=4, Grep=3, Read=4, Write=1) |
+| 16 | T_PD | UNRESOLVED | 104.8 / 30.1 / 134.9 | 3,876 / 23,089 / 594,978 | 621,943 / 6,496 | $0.418259 | 23 (Bash=17, Edit=3, Read=2, Write=1) |
+| 17 | A_prime | RESOLVED | 84.4 / 0.0 / 84.4 | 658 / 15,562 / 351,906 | 368,126 / 6,035 | $0.290039 | 17 (Bash=10, Edit=4, Grep=2, Read=1) |
+| 17 | T_PD | RESOLVED | 88.7 / 33.2 / 121.9 | 3,654 / 19,978 / 447,287 | 470,919 / 6,764 | $0.359074 | 18 (Bash=12, Edit=3, Read=3) |
+| 18 | A_prime | UNRESOLVED | 103.4 / 0.0 / 103.4 | 706 / 28,762 / 719,669 | 749,137 / 7,591 | $0.503000 | 28 (Bash=10, Edit=6, Grep=4, Read=7, Write=1) |
+| 18 | T_PD | UNRESOLVED | 72.6 / 31.7 / 104.3 | 3,671 / 16,366 / 388,230 | 408,267 / 4,700 | $0.288748 | 17 (Bash=7, Edit=3, Grep=2, Read=4, Write=1) |
+| 19 | A_prime | RESOLVED | 17.1 / 0.0 / 17.1 | 1,080 / 5,572 / 67,498 | 74,150 / 889 | $0.067906 | 4 (Bash=1, Edit=1, Grep=1, Read=1) |
+| 19 | T_PD | RESOLVED | 39.9 / 28.5 / 68.3 | 4,120 / 12,570 / 196,577 | 213,267 / 2,302 | $0.172843 | 9 (Bash=5, Edit=2, Read=2) |
+| 20 | A_prime | RESOLVED | 81.4 / 0.0 / 81.4 | 2,027 / 20,834 / 508,722 | 531,583 / 5,871 | $0.367581 | 21 (Bash=10, Edit=7, Glob=1, Read=2, Write=1) |
+| 20 | T_PD | RESOLVED | 74.1 / 9.7 / 83.8 | 5,081 / 18,965 / 409,351 | 433,397 / 5,079 | $0.317709 | 16 (Bash=8, Edit=5, Read=2, Write=1) |
+
+The corrected path-free machine ledger is
+[`native-default-control-repair-results.json`](native-default-control-repair-results.json).
+Its 122 A_prime source and provider-failure artifacts are content-bound by
+[`native-default-control-repair-evidence-manifest.json`](native-default-control-repair-evidence-manifest.json).
+The unchanged T_PD cells remain bound by
+[`bounded-progressive-disclosure-evidence-manifest.json`](bounded-progressive-disclosure-evidence-manifest.json).
+For ranks 6, 16, and 18, that manifest binds the exact original T_PD prefix of
+an append-only preprocessing log; later diagnostic calls remain in the source
+file but are not attributed to T_PD.
+The earlier [`bounded-progressive-disclosure-results.json`](bounded-progressive-disclosure-results.json)
+is retained as an immutable historical ledger, but its legacy A/T_PD
+efficiency contrast is superseded by A_prime/T_PD.
+
 ## Compact progressive-disclosure pilot: preference did not trigger expansion
 
 The later D/E pilot tested the product-shape question raised by the canonical
 prefix-replay analysis on three deliberately selected Sonnet cases (ranks 6,
 16, and 18). This is a post-hoc mechanism diagnostic, not a population
-estimate, and no scale run or RNA default change followed.
+estimate, and no D/E expansion-arm scale run or RNA default change followed.
 
 D replaced the earlier 8 KiB treatment prefix with a 4 KiB complete-record
 manifest containing stable node IDs. It exposed bounded focused search and

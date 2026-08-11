@@ -34,6 +34,13 @@ conditions and 720 cells. This factorial extension was frozen before its first
 provider call, but it remains a post-hoc extension of the issue836 study rather
 than a retroactive preregistration.
 
+The bounded progressive-disclosure population follow-up adds 20 Sonnet T_PD
+episodes. A later prompt-channel audit adds 20 fresh native-default controls
+(`A_prime`) matched to T_PD's runner contract. These 40 cells are reported in
+the same reader-facing report but remain outside the frozen
+36-condition/720-cell factorial. The package therefore contains 760 officially
+evaluated cells without retroactively changing the canonical matrix.
+
 The original issue preregistration described 40 Sonnet episodes under a
 mandatory first-traversal harness. Operational testing exposed material
 harness defects and model/runtime incompatibilities. The final 20×4 analysis
@@ -465,6 +472,91 @@ terminal patch, and stock SWE-bench evaluation. All four cells passed. The
 same request-level replay formula above was then applied to the matched pair;
 no post-hoc cell filtering or scale execution followed.
 
+### Twenty-case bounded progressive-disclosure treatment
+
+The population follow-up (`T_PD`, also called condition B during design) runs
+the frozen Sonnet ranks 1–20. T_PD contributes exactly 20 paid treatment
+episodes: the 19
+strict-qualified episodes completed in the original population attempt plus
+the previously missing rank-12 episode. Every treatment patch was evaluated
+with stock SWE-bench 4.1.0 using the canonical per-instance image tag.
+
+The first analysis reused canonical Sonnet A controls. A later audit found a
+material prompt-channel mismatch: those A episodes used a replacement
+`--system-prompt-file`, while T_PD kept Claude Code's native tuned system
+prompt and added RNA guidance through `--append-system-prompt-file`.
+Consequently, the old A/T_PD efficiency contrast is retained only as
+historical provenance and is not used for causal interpretation.
+
+The repair condition, `A_prime`, contributes 20 fresh paid controls. For each
+rank, A_prime uses the exact T_PD Claude CLI command, pinned CLI version,
+model, effort, tools, MCP configuration, permissions, plugins, and init
+surface after removing only `--append-system-prompt-file` and its RNA guidance
+path. Session IDs are necessarily fresh. A_prime receives the standard
+SWE-bench user task; T_PD receives that task plus the declared bounded RNA
+payload. All 20 per-rank command-parity and init-surface checks passed before
+admission. T_PD was not rerun, so the repaired comparison remains temporally
+separated and does not eliminate provider/model sampling variance.
+
+The control is the standard SWE-bench task with ordinary repository, edit, and
+test tools. T_PD keeps that task and tool surface, and adds only:
+
+1. a developer instruction explaining that RNA is a preferred repository
+   representation and that the worked search result should guide initial
+   localization; and
+2. one prepended, verbatim `rna_tool_search(<deterministic query>)` call and
+   result containing as many **complete** hybrid-search/rerank records as fit
+   within an 8,192-byte consumer-side ceiling.
+
+Records retain stable node IDs for optional caller-selected expansion. The
+initial payload includes no automatic traversal root or graph dump; ordinary
+repository tools remain available. The deterministic query is the issue title
+plus its normalized first 512 characters. If that query returns no admissible
+records, the predeclared fallback is the title alone. Rank 12 used that
+fallback because its title-plus-512 query returned no records; the title-only
+query returned 11 complete, relevant records within 8,188 visible bytes.
+
+Nineteen inputs passed the later strict cache-qualification gate. Rank 12 uses
+an earlier retained semantic-and-reranked title-only capture whose raw bytes
+and projected bytes are hash-bound. The later gate rejected its cache
+attachment because the reranker model overlay was symlinked and the cache
+lacked a strict LSP-completeness receipt—not because retrieval failed. Rank 12
+therefore constitutes a disclosed cache-attachment exception under the same
+model-visible 8 KiB contract, not a post-hoc treatment change. Its completed
+episode binds the corrected V2 input manifest exactly.
+
+Admission requires prompt and developer-instruction hashes, a completed
+provider transcript with no timeout, transcript-derived tool recount, terminal
+patch, and patch-hash-bound official verdict. Preprocessing exposure is
+reported separately and is not counted as a model tool call. The model need
+not issue a follow-up RNA call: the tested hypothesis is that the already
+injected modeled representation reduces subsequent repository work. All 20
+T_PD transcripts made zero follow-up RNA calls.
+
+A_prime admission additionally requires successful completion, a non-empty
+terminal patch, zero provider retries in the admitted receipt, exact
+command/init parity with the paired T_PD episode after treatment-append
+removal, and a stock evaluator verdict. Nineteen CLI invocations exhausted
+their internal HTTP 529 overload retries before any Sonnet episode output,
+tool call, or patch; they are quarantined as provider-failure provenance and
+are not experimental episodes. Their receipts report small Haiku helper-model
+usage totaling $0.023380, which is disclosed separately from admitted-episode
+cost. No completed Sonnet output or patch was discarded.
+
+The RNA preprocessing logs are append-only operational files. Later D/E
+diagnostic preflights appended calls to the rank 6, 16, and 18 files after the
+T_PD prompts had already been frozen. The evidence manifest therefore binds
+the original T_PD log prefix by exact byte count and SHA for those three
+ranks; later lines remain provenance but are not attributed to T_PD.
+
+Model wall time, issue-specific RNA retrieval time, and their sum are reported
+separately. Full repository extraction, embedding, reranking-model setup, and
+LSP enrichment are excluded from per-issue latency because they are reusable
+repository preprocessing. No RNA source, public default, producer, reranker,
+case order, or cohort changed during this population run. The corrected
+A_prime/T_PD comparison is the primary bounded-population analysis; the
+legacy reused-A contrast is explicitly superseded.
+
 ### Three-case D/E compact progressive-disclosure diagnostic
 
 After the matched A6/T6 gate, a separate Sonnet-only diagnostic tested whether
@@ -504,8 +596,10 @@ terminal patch, transcript/tool recount, an official patch-hash-bound verdict,
 and explicit accounting of direct, cache-write, cache-read, output, cost, and
 tools by type. All six D/E cells passed those gates. Neither transcript invoked
 the RNA wrapper, so the observed treatment is compact pre-injected context;
-interactive expansion remains untested. No scale run or RNA default change was
-authorized from this diagnostic.
+interactive expansion remains untested. No D/E expansion-arm scale run or RNA
+default change was authorized from this diagnostic; the separate T_PD
+population run above tests bounded pre-injected context, not interactive
+expansion.
 
 ## Model runtimes
 

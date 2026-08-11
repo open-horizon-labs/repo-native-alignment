@@ -1,0 +1,1222 @@
+{
+  "artifact_count": 202,
+  "artifacts": [
+    {
+      "bytes": 135952,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/sonnet-a-vs-t-pd-report-v10.json",
+      "role": "source unified V10 report",
+      "sha256": "31f50615cdecbd8938fbac7b89932750100a27f7d12b461f85f5a74e44e79bf4"
+    },
+    {
+      "bytes": 2256,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/build_report_v10.py",
+      "role": "source V10 provenance-correction builder",
+      "sha256": "a7c0e8e4638d4daaa242f2251455c809236a9fbbc0fc02ad6304727530d1cf4c"
+    },
+    {
+      "bytes": 6918,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-01-sympy__sympy-23534/A/episode-receipt.json",
+      "role": "rank 01 A episode receipt",
+      "sha256": "3c603a7d3cbb3a3fbe10b896d41d15762adf995265e781e00c1de39453f84e1d"
+    },
+    {
+      "bytes": 7291,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/T/episode-receipt.json",
+      "role": "rank 01 T_PD episode receipt",
+      "sha256": "7330f7b01d85004172093be27789cf8fcbc579ea7eb801317e34d9e8d6c2af29"
+    },
+    {
+      "bytes": 3857,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/c06255eaef8ca89770b80a6cf94cd001ea198badb7a923ba2ddce55abf5217a3/evaluation-receipt.json",
+      "role": "rank 01 T_PD official evaluation receipt",
+      "sha256": "3dd028cf82e47b27ea7bf62afb3d15cada146253e9f7702c3185d024ee316661"
+    },
+    {
+      "bytes": 18063,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-01-sympy__sympy-23534/inputs-manifest.json",
+      "role": "rank 01 T_PD input manifest",
+      "sha256": "b9c69d558e2e0aebddcaba5c583189bcef235cde754262727dbd0d29bb29ad33"
+    },
+    {
+      "bytes": 77857,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/T/claude.stream.jsonl",
+      "role": "rank 01 T_PD provider transcript",
+      "sha256": "d1d40b8b49e818b85e6a7050e358e13e2f5d9605afcebac5c1d36a69af3eadbd"
+    },
+    {
+      "bytes": 395,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/T/terminal.patch",
+      "role": "rank 01 T_PD terminal patch",
+      "sha256": "c06255eaef8ca89770b80a6cf94cd001ea198badb7a923ba2ddce55abf5217a3"
+    },
+    {
+      "bytes": 9501,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/T/user-prompt.bin",
+      "role": "rank 01 T_PD runner prompt",
+      "sha256": "2377ab381a347ee8a139d112dbbecb88bacfeaefdb95af3bcfc457ffab0bb4d8"
+    },
+    {
+      "bytes": 1048,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank01-attempt-001/rank-01-sympy__sympy-23534/T/treatment-system.bin",
+      "role": "rank 01 T_PD runner developer instructions",
+      "sha256": "45b6fa0f7cd4e0fd6a383db8316d8019febdd980b39c4185fe4fae75cbb7889f"
+    },
+    {
+      "bytes": 976,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-01-sympy__sympy-23534/rna-calls.jsonl",
+      "role": "rank 01 T_PD RNA preprocessing log",
+      "sha256": "2cd8c948daa7b7fcc3867dd7110168a47391939126bd1cdcf231c01de4b9fbfd"
+    },
+    {
+      "bytes": 8056,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-01-sympy__sympy-23534/initial-rna.stdout",
+      "role": "rank 01 T_PD bounded RNA result",
+      "sha256": "fed29a3cbb7ae360224f2a59e28eb48555fea7622780a5bb7edfbb94df17efb4"
+    },
+    {
+      "bytes": 6925,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-02-django__django-11179/A/episode-receipt.json",
+      "role": "rank 02 A episode receipt",
+      "sha256": "7865926ceceef232461dd48330f2286c49fe4c90959f283998f44e7adb4a722e"
+    },
+    {
+      "bytes": 7278,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-02-django__django-11179/T/episode-receipt.json",
+      "role": "rank 02 T_PD episode receipt",
+      "sha256": "6c725b6b93d27fa36ac0d0cb309acdfd500b275adb8a986df1e3447b803932ed"
+    },
+    {
+      "bytes": 3889,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-02-05-attempt-001/rank-02-django__django-11179/52a936062d4e0490c8e66edf4bf0ec09a350d7d34447d36ce2949b5bb0afb301/evaluation-receipt.json",
+      "role": "rank 02 T_PD official evaluation receipt",
+      "sha256": "30b1b852c82db3a31b98774a8c4a61e930b834671c16a181d456b0a5679ec641"
+    },
+    {
+      "bytes": 17410,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-02-django__django-11179/inputs-manifest.json",
+      "role": "rank 02 T_PD input manifest",
+      "sha256": "d48814c81a8640142940b7ccbd60eee34dfc36d5e2b0433137a314dd55c6aea5"
+    },
+    {
+      "bytes": 69638,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-02-django__django-11179/T/claude.stream.jsonl",
+      "role": "rank 02 T_PD provider transcript",
+      "sha256": "8fa38ee4f59afe5fa87c1d5d4719181214f97a345eff2017be275089da999c36"
+    },
+    {
+      "bytes": 608,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-02-django__django-11179/T/terminal.patch",
+      "role": "rank 02 T_PD terminal patch",
+      "sha256": "52a936062d4e0490c8e66edf4bf0ec09a350d7d34447d36ce2949b5bb0afb301"
+    },
+    {
+      "bytes": 8568,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-02-django__django-11179/T/user-prompt.bin",
+      "role": "rank 02 T_PD runner prompt",
+      "sha256": "fb46df9f83e09e6ef925d7adbc9f4b6aa818d48b81dc01e8020539f783927067"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-02-django__django-11179/T/treatment-system.bin",
+      "role": "rank 02 T_PD runner developer instructions",
+      "sha256": "847d1e0826c4ab25edbb2e57432360e374f4344af08eeda774c17c7348f0c232"
+    },
+    {
+      "bytes": 655,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-02-django__django-11179/rna-calls.jsonl",
+      "role": "rank 02 T_PD RNA preprocessing log",
+      "sha256": "e4562d3fa1685513e117d274083e66aac838c566bd7b114c28b006df430847f1"
+    },
+    {
+      "bytes": 7888,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-02-django__django-11179/initial-rna.stdout",
+      "role": "rank 02 T_PD bounded RNA result",
+      "sha256": "2e179798f37117bd8721cc080e9b1aede60f75b2e9ddbd62b2e83c88c3684cc0"
+    },
+    {
+      "bytes": 6900,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-03-sympy__sympy-13757/A/episode-receipt.json",
+      "role": "rank 03 A episode receipt",
+      "sha256": "ebbdf76661ac13be24672108969e14c53fb1db6a4d119d3765a72b250e201faa"
+    },
+    {
+      "bytes": 7264,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-03-sympy__sympy-13757/T/episode-receipt.json",
+      "role": "rank 03 T_PD episode receipt",
+      "sha256": "14191c1646699bc4ac2a57df454968daf828ee16cbb9b0e2185bd48d5cb7efb7"
+    },
+    {
+      "bytes": 3907,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-03-sympy__sympy-13757/7f55a9a422ac8655dcb1279266882139aa430f7af1b3c16b7d81f17a92efd4ff/evaluation-receipt.json",
+      "role": "rank 03 T_PD official evaluation receipt",
+      "sha256": "393fc6d4b4b994b64cf8f4cb442e44b30f9dc4e72ea8b39c3da0d9071052a2bb"
+    },
+    {
+      "bytes": 17628,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-03-sympy__sympy-13757/inputs-manifest.json",
+      "role": "rank 03 T_PD input manifest",
+      "sha256": "37593eca7fc2b2f9f81e3a1065afe6fc6511949d1da32edfd652f7e619bfbe29"
+    },
+    {
+      "bytes": 409573,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-03-sympy__sympy-13757/T/claude.stream.jsonl",
+      "role": "rank 03 T_PD provider transcript",
+      "sha256": "4af006fb587aa0cff74dea18f78e017370d946eeae65eb4d4f02255ec6993dfd"
+    },
+    {
+      "bytes": 797,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-03-sympy__sympy-13757/T/terminal.patch",
+      "role": "rank 03 T_PD terminal patch",
+      "sha256": "7f55a9a422ac8655dcb1279266882139aa430f7af1b3c16b7d81f17a92efd4ff"
+    },
+    {
+      "bytes": 9051,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-03-sympy__sympy-13757/T/user-prompt.bin",
+      "role": "rank 03 T_PD runner prompt",
+      "sha256": "93ef363f787f39867d94b2a77b5409c0023fd81c8264f479f414444fe48a7733"
+    },
+    {
+      "bytes": 1048,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-03-sympy__sympy-13757/T/treatment-system.bin",
+      "role": "rank 03 T_PD runner developer instructions",
+      "sha256": "3b950171618e2bae3fc2446bf5c483900c76e04e869ecc314b3ca08b7852af4a"
+    },
+    {
+      "bytes": 773,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-03-sympy__sympy-13757/rna-calls.jsonl",
+      "role": "rank 03 T_PD RNA preprocessing log",
+      "sha256": "3563c589ce83e2dd2ecff3be8564b84c5ee380b4f2378abc8b3f9a43a69af9f5"
+    },
+    {
+      "bytes": 8114,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-03-sympy__sympy-13757/initial-rna.stdout",
+      "role": "rank 03 T_PD bounded RNA result",
+      "sha256": "3768e6f9566c81869f552bf56e6291fa66973be4933c0fd4812342e92cc8f8f7"
+    },
+    {
+      "bytes": 6927,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-04-django__django-13033/A/episode-receipt.json",
+      "role": "rank 04 A episode receipt",
+      "sha256": "3199dee78957eb2e7bb8a4ace80ebbaf9601456b28a21c9f24ac2bbd704bfbcc"
+    },
+    {
+      "bytes": 7230,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-04-django__django-13033/T/episode-receipt.json",
+      "role": "rank 04 T_PD episode receipt",
+      "sha256": "8c34a3b28b26151a202c12196149b6319555e1c1a1f54d963cbee71b79ecb27a"
+    },
+    {
+      "bytes": 3757,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-pilot-attempt-001/rank-04-django__django-13033/561d118da20d048335d5e534175dbf78227a6e6fe74e236d8d482bcf664634bf/evaluation-receipt.json",
+      "role": "rank 04 T_PD official evaluation receipt",
+      "sha256": "60037b3bcb0b6d581dcae008d7bd0c2c1b2d38a50a1bdeaa791239b0b1b38986"
+    },
+    {
+      "bytes": 72849,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-04-django__django-13033/inputs-manifest.json",
+      "role": "rank 04 T_PD input manifest",
+      "sha256": "c574a526e8794443cd9a93957d2406ad2bc72194a723073e47c988e4ff76c19e"
+    },
+    {
+      "bytes": 285254,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-04-django__django-13033/T/claude.stream.jsonl",
+      "role": "rank 04 T_PD provider transcript",
+      "sha256": "7a93380518184cb6a44a3b82180561a7ff2f00ceb33f8d9cf13ede3b567a687e"
+    },
+    {
+      "bytes": 3056,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-04-django__django-13033/T/terminal.patch",
+      "role": "rank 04 T_PD terminal patch",
+      "sha256": "561d118da20d048335d5e534175dbf78227a6e6fe74e236d8d482bcf664634bf"
+    },
+    {
+      "bytes": 12531,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-04-django__django-13033/T/user-prompt.bin",
+      "role": "rank 04 T_PD runner prompt",
+      "sha256": "12cb4fc591871b67a5b68724295188919c135fac10360a67627f651fe2846901"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-04-django__django-13033/T/treatment-system.bin",
+      "role": "rank 04 T_PD runner developer instructions",
+      "sha256": "5ae10107eba042c623ce12205c9209ef63f06c60d3078e6488eb3271eefcb202"
+    },
+    {
+      "bytes": 974,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-04-django__django-13033/rna-calls.jsonl",
+      "role": "rank 04 T_PD RNA preprocessing log",
+      "sha256": "c1e452314758fb3cf611a1e891fd6349775f89933ad4fd67c914d8aed73c06bd"
+    },
+    {
+      "bytes": 8084,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-04-django__django-13033/initial-rna.stdout",
+      "role": "rank 04 T_PD bounded RNA result",
+      "sha256": "5fa4456692788dfb78c373da6160f2a339a31acfc1645ad835ffc08efda287b7"
+    },
+    {
+      "bytes": 6932,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-05-pydata__xarray-4075/A/episode-receipt.json",
+      "role": "rank 05 A episode receipt",
+      "sha256": "da5a4a160e3fcc84d2dcbf0358eda0dc1ae35d97bbc6cfa005279786124442af"
+    },
+    {
+      "bytes": 7295,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-05-pydata__xarray-4075/T/episode-receipt.json",
+      "role": "rank 05 T_PD episode receipt",
+      "sha256": "26e6533bcb83670e239f0f9b42d337d4725a39019b264264cf9ab46628684a03"
+    },
+    {
+      "bytes": 3838,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-02-05-attempt-001/rank-05-pydata__xarray-4075/b89ba02d96f358deee85b73d7e634a560aa6323aca83d061e62a37474f3e9c2a/evaluation-receipt.json",
+      "role": "rank 05 T_PD official evaluation receipt",
+      "sha256": "e00649e1d8394ad65ff374e2081c97cb628d32c3e3dcc91d2585d84eafb08009"
+    },
+    {
+      "bytes": 17990,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-05-pydata__xarray-4075/inputs-manifest.json",
+      "role": "rank 05 T_PD input manifest",
+      "sha256": "b4103171fd6674a4c003ff263c9002be4ffaccae3257024a74c08ce77ca3312f"
+    },
+    {
+      "bytes": 601951,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-05-pydata__xarray-4075/T/claude.stream.jsonl",
+      "role": "rank 05 T_PD provider transcript",
+      "sha256": "b08a76bf0395680ae237d0b8072d013c3f0adb2d3a6c13b0d1f9f42adfce595c"
+    },
+    {
+      "bytes": 1959,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-05-pydata__xarray-4075/T/terminal.patch",
+      "role": "rank 05 T_PD terminal patch",
+      "sha256": "b89ba02d96f358deee85b73d7e634a560aa6323aca83d061e62a37474f3e9c2a"
+    },
+    {
+      "bytes": 10828,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-05-pydata__xarray-4075/T/user-prompt.bin",
+      "role": "rank 05 T_PD runner prompt",
+      "sha256": "586dbd326464247f19e0aaa1571da337a0f7153b213ee114be25fc1bc0bef2ee"
+    },
+    {
+      "bytes": 1050,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-05-pydata__xarray-4075/T/treatment-system.bin",
+      "role": "rank 05 T_PD runner developer instructions",
+      "sha256": "aea4dcd6c09109e8f770507062f7c8a49df828b215bcf9083a417b83849a2275"
+    },
+    {
+      "bytes": 940,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-05-pydata__xarray-4075/rna-calls.jsonl",
+      "role": "rank 05 T_PD RNA preprocessing log",
+      "sha256": "37658bffaf17f53000accda539645a0aca8c62e05221c0a4d8c252346c9facdf"
+    },
+    {
+      "bytes": 7872,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-05-pydata__xarray-4075/initial-rna.stdout",
+      "role": "rank 05 T_PD bounded RNA result",
+      "sha256": "12b9f0d8416625a924c4e6a9c4127244a545ca6355399f3656108d480ef70975"
+    },
+    {
+      "bytes": 6940,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-06-django__django-13794/A/episode-receipt.json",
+      "role": "rank 06 A episode receipt",
+      "sha256": "9cae318e5a7c46103b7907d7af60d5690e4e3b41cac782f900f1aa5333d1e4a6"
+    },
+    {
+      "bytes": 7305,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-06-django__django-13794/T/episode-receipt.json",
+      "role": "rank 06 T_PD episode receipt",
+      "sha256": "1e347421cd15180b72c2b2e58b71ffd25868d4399709ac553aa09cba489a9c98"
+    },
+    {
+      "bytes": 3933,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-06-django__django-13794/c81bf7aeb545fb2b3d9b6dca555e54a5f79ebc5b07266e162b29492b9e4bc254/evaluation-receipt.json",
+      "role": "rank 06 T_PD official evaluation receipt",
+      "sha256": "139e121bf9c4f20c318edea8fa49dcda3ad8de5d8ed2466865e8c5d9f6d53e58"
+    },
+    {
+      "bytes": 17534,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-06-django__django-13794/inputs-manifest.json",
+      "role": "rank 06 T_PD input manifest",
+      "sha256": "a6d4fc762d2dbef2ca613c5bde566721235d17b4793e5953bdf71fdaef1d47b1"
+    },
+    {
+      "bytes": 372696,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-06-django__django-13794/T/claude.stream.jsonl",
+      "role": "rank 06 T_PD provider transcript",
+      "sha256": "53471cf9e56f73d17f259d3f4c3757c0c46fb474837aa2d90e33969f196e8a99"
+    },
+    {
+      "bytes": 1531,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-06-django__django-13794/T/terminal.patch",
+      "role": "rank 06 T_PD terminal patch",
+      "sha256": "c81bf7aeb545fb2b3d9b6dca555e54a5f79ebc5b07266e162b29492b9e4bc254"
+    },
+    {
+      "bytes": 8856,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-06-django__django-13794/T/user-prompt.bin",
+      "role": "rank 06 T_PD runner prompt",
+      "sha256": "1d47833c5c56295c3d903450454ecbff56b6d920dcfbdb86b58e332d97f11f6d"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-06-django__django-13794/T/treatment-system.bin",
+      "role": "rank 06 T_PD runner developer instructions",
+      "sha256": "760d172a99d20f0a347b5f41f5c939372ded0ab5c5b3bef11763f88c1d43125c"
+    },
+    {
+      "bytes": 681,
+      "content_scope": "prefix",
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-06-django__django-13794/rna-calls.jsonl",
+      "role": "rank 06 T_PD RNA preprocessing log",
+      "sha256": "db426f4ac84a203ffa053a5bb00bfdd586bf307e1c78d7f25f79eb959d6e69c0"
+    },
+    {
+      "bytes": 8126,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-06-django__django-13794/initial-rna.stdout",
+      "role": "rank 06 T_PD bounded RNA result",
+      "sha256": "1d80647a4b91e78d52ffffda0ac0af0224aac5c6f1815a24f111fc1312da218d"
+    },
+    {
+      "bytes": 7022,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-07-matplotlib__matplotlib-24026/A/episode-receipt.json",
+      "role": "rank 07 A episode receipt",
+      "sha256": "216e3557e3ddc689ef58666c0d0a47a7bc1e0de8eadf55a85d9f775b8cc87c07"
+    },
+    {
+      "bytes": 7315,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/T/episode-receipt.json",
+      "role": "rank 07 T_PD episode receipt",
+      "sha256": "540e7091c95e886aba60a564a79816111a37a70beaff6936380f79f88801b5fe"
+    },
+    {
+      "bytes": 3836,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/d873c1402d6995c93f9e302e968d81fe62949667656e3374189b8a941c44d8ed/evaluation-receipt.json",
+      "role": "rank 07 T_PD official evaluation receipt",
+      "sha256": "51ffff8300b90c511202e37ba5e9bdeabf2a0949ff63d67dd08d4d3fcc39dd14"
+    },
+    {
+      "bytes": 18320,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-07-matplotlib__matplotlib-24026/inputs-manifest.json",
+      "role": "rank 07 T_PD input manifest",
+      "sha256": "4a399387763b015400c67bc329c46a76713f3c225c69afaa798dbbc0ae7763e5"
+    },
+    {
+      "bytes": 1070574,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/T/claude.stream.jsonl",
+      "role": "rank 07 T_PD provider transcript",
+      "sha256": "0e4da32d0539097492426ae4762f7317d913cff3421c280748e265645f005fe7"
+    },
+    {
+      "bytes": 2264,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/T/terminal.patch",
+      "role": "rank 07 T_PD terminal patch",
+      "sha256": "d873c1402d6995c93f9e302e968d81fe62949667656e3374189b8a941c44d8ed"
+    },
+    {
+      "bytes": 10962,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/T/user-prompt.bin",
+      "role": "rank 07 T_PD runner prompt",
+      "sha256": "354c2a0f2afc776304a95f218849d0246731d04eac12b6f8f060f65cda999536"
+    },
+    {
+      "bytes": 1068,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-07-matplotlib__matplotlib-24026/T/treatment-system.bin",
+      "role": "rank 07 T_PD runner developer instructions",
+      "sha256": "0bfa6b416427c93dc0eaf40bd88b85dbcb22fdbb160e748ccafb14759d985991"
+    },
+    {
+      "bytes": 928,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-07-matplotlib__matplotlib-24026/rna-calls.jsonl",
+      "role": "rank 07 T_PD RNA preprocessing log",
+      "sha256": "7e819809a3335bb51504f539122a958b33d7e3bbe84653f3b4b70db9b0c737cf"
+    },
+    {
+      "bytes": 8160,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-07-matplotlib__matplotlib-24026/initial-rna.stdout",
+      "role": "rank 07 T_PD bounded RNA result",
+      "sha256": "879d0a3c968fff1d2b00e3dfb7ebb08047b48be0cd34344c7628fc02b15d8a35"
+    },
+    {
+      "bytes": 6935,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-08-django__django-11163/A/episode-receipt.json",
+      "role": "rank 08 A episode receipt",
+      "sha256": "0b2dd08ee604075368cad696dbf8c11022a2f69f685a9eb3a6a23181f4b645bb"
+    },
+    {
+      "bytes": 7281,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-08-django__django-11163/T/episode-receipt.json",
+      "role": "rank 08 T_PD episode receipt",
+      "sha256": "0bb6209e5545a6bf6b9f196542255a23ef20e92b8c51a9e6f602e362f12c3132"
+    },
+    {
+      "bytes": 3932,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-08-django__django-11163/29b7e0b55d2eebf795b7c3119af55336979ffea4226b36694a382c40409589f5/evaluation-receipt.json",
+      "role": "rank 08 T_PD official evaluation receipt",
+      "sha256": "221c732c1223eb9b8efb5b3170e867a46f835835357716261dca9d0a7618cf9f"
+    },
+    {
+      "bytes": 19588,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-08-django__django-11163/inputs-manifest.json",
+      "role": "rank 08 T_PD input manifest",
+      "sha256": "482ca15e9a34ab8ba3dc9c0ca9da34d7f85ee2a5ac297ea18fd7edfb0610c0eb"
+    },
+    {
+      "bytes": 520737,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-08-django__django-11163/T/claude.stream.jsonl",
+      "role": "rank 08 T_PD provider transcript",
+      "sha256": "ae0b8d19e8898c63a58588bdc227bceca3bcd4b69bf7a2ac84ae589d2d915c6d"
+    },
+    {
+      "bytes": 1105,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-08-django__django-11163/T/terminal.patch",
+      "role": "rank 08 T_PD terminal patch",
+      "sha256": "29b7e0b55d2eebf795b7c3119af55336979ffea4226b36694a382c40409589f5"
+    },
+    {
+      "bytes": 9031,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-08-django__django-11163/T/user-prompt.bin",
+      "role": "rank 08 T_PD runner prompt",
+      "sha256": "94525c9e45783d098893f35a31e4a944aff4122d6421bddcfd0a3cd8dd43b2f8"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-08-django__django-11163/T/treatment-system.bin",
+      "role": "rank 08 T_PD runner developer instructions",
+      "sha256": "683601b2fea5f239e46e07a2baaeecb33d91ca674283d2f104518f7420ccc040"
+    },
+    {
+      "bytes": 785,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-08-django__django-11163/rna-calls.jsonl",
+      "role": "rank 08 T_PD RNA preprocessing log",
+      "sha256": "b19bdb789cefaa6ebd486f678161e3258b0c31e7949331460514b4c62ac789a1"
+    },
+    {
+      "bytes": 8097,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-08-django__django-11163/initial-rna.stdout",
+      "role": "rank 08 T_PD bounded RNA result",
+      "sha256": "f455893cde1103bc94f35eff957c549c2ed9381cd4a57aa3b7705d2d6beadf66"
+    },
+    {
+      "bytes": 6939,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-09-django__django-16612/A/episode-receipt.json",
+      "role": "rank 09 A episode receipt",
+      "sha256": "88132b175d8311ea899c8453a8ff6692dab60618678a49a5384ea7a7bc287179"
+    },
+    {
+      "bytes": 7281,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-09-django__django-16612/T/episode-receipt.json",
+      "role": "rank 09 T_PD episode receipt",
+      "sha256": "485e6a98ac8f2ebed449474e542ded92cc98ebb3be59db4ed4b78986748cc70b"
+    },
+    {
+      "bytes": 3931,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-09-django__django-16612/6803fa80f41b00f4612257af8357da7047f46184b432344016879b7084c6a006/evaluation-receipt.json",
+      "role": "rank 09 T_PD official evaluation receipt",
+      "sha256": "7ee20bdc8f5a2c8b27eefa61e8bb36c2f61085d7d578d43342d220775f98c852"
+    },
+    {
+      "bytes": 20456,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-09-django__django-16612/inputs-manifest.json",
+      "role": "rank 09 T_PD input manifest",
+      "sha256": "ec5d539434ebf502297b89f8ef00ecfcc4fe18e4e23019bd0d43decac70fcdd8"
+    },
+    {
+      "bytes": 449517,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-09-django__django-16612/T/claude.stream.jsonl",
+      "role": "rank 09 T_PD provider transcript",
+      "sha256": "305f3e6f113ac8e05f2aa92c3bd67bd3bb98ad2267480c805e981cbf5058b8de"
+    },
+    {
+      "bytes": 2068,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-09-django__django-16612/T/terminal.patch",
+      "role": "rank 09 T_PD terminal patch",
+      "sha256": "6803fa80f41b00f4612257af8357da7047f46184b432344016879b7084c6a006"
+    },
+    {
+      "bytes": 9364,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-09-django__django-16612/T/user-prompt.bin",
+      "role": "rank 09 T_PD runner prompt",
+      "sha256": "145494436f4206ed26c30bcb9c9cdb44ace65fa4d71f748fde3b2f3bc8c59bad"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-09-django__django-16612/T/treatment-system.bin",
+      "role": "rank 09 T_PD runner developer instructions",
+      "sha256": "e3f3fd53d1420ef87113cd9730c860a6b48a27f9af104b0527aaa08cad53c4ac"
+    },
+    {
+      "bytes": 961,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-09-django__django-16612/rna-calls.jsonl",
+      "role": "rank 09 T_PD RNA preprocessing log",
+      "sha256": "8e9d142f6fab7a6f7075aee04a3be2fedf0a81f4290d6cd928d0812c152521c1"
+    },
+    {
+      "bytes": 7939,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-09-django__django-16612/initial-rna.stdout",
+      "role": "rank 09 T_PD bounded RNA result",
+      "sha256": "5e1fd36afaec89f913a9900a4e7995593ebd0bad752f16d548c3708f3951f969"
+    },
+    {
+      "bytes": 6908,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-10-django__django-11551/A/episode-receipt.json",
+      "role": "rank 10 A episode receipt",
+      "sha256": "b9fb6e8b90a5b39b5e3cd3e298e7bb8bd8cab40ea693d3e876bb5dd88c6ab72a"
+    },
+    {
+      "bytes": 7307,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank10-attempt-001/rank-10-django__django-11551/T/episode-receipt.json",
+      "role": "rank 10 T_PD episode receipt",
+      "sha256": "57a2e303d2f5f4e8bc104a829c76191ddd8247c45debbc80f429be9d771c040b"
+    },
+    {
+      "bytes": 3838,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-restored-rank10-attempt-001/rank-10-django__django-11551/0d8bd6039ed1d4586ea0056602a9c01ef7cae96c4c6258ce8d5f51ce4847bec3/evaluation-receipt.json",
+      "role": "rank 10 T_PD official evaluation receipt",
+      "sha256": "043150f789245ce48c391b61b44009cd1cc2c537d4f3e5545f73af5ea1fd7365"
+    },
+    {
+      "bytes": 18160,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-10-django__django-11551/inputs-manifest.json",
+      "role": "rank 10 T_PD input manifest",
+      "sha256": "9314df3718003e2f1f3610294ac2253d7b9b0a21dd4b48c675e6c6533452afe5"
+    },
+    {
+      "bytes": 344465,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank10-attempt-001/rank-10-django__django-11551/T/claude.stream.jsonl",
+      "role": "rank 10 T_PD provider transcript",
+      "sha256": "14042fe8d2e9e07f7580c59b04dafacd758feb74bb6af950266a52174c4f29ba"
+    },
+    {
+      "bytes": 4208,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank10-attempt-001/rank-10-django__django-11551/T/terminal.patch",
+      "role": "rank 10 T_PD terminal patch",
+      "sha256": "0d8bd6039ed1d4586ea0056602a9c01ef7cae96c4c6258ce8d5f51ce4847bec3"
+    },
+    {
+      "bytes": 14110,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank10-attempt-001/rank-10-django__django-11551/T/user-prompt.bin",
+      "role": "rank 10 T_PD runner prompt",
+      "sha256": "aeab54ed659e71d72f36cb48f28bee13d97bd0e53b37b42c98f674a30d5bd143"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank10-attempt-001/rank-10-django__django-11551/T/treatment-system.bin",
+      "role": "rank 10 T_PD runner developer instructions",
+      "sha256": "afddd7fdc7d17783db0b80e36bb48f17785fccb6f8618df0f54a5ce2b64eb245"
+    },
+    {
+      "bytes": 949,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-10-django__django-11551/rna-calls.jsonl",
+      "role": "rank 10 T_PD RNA preprocessing log",
+      "sha256": "48d787c737f1582f966ffe384d334b3db8c02b5461f412d0111670e7af9024ab"
+    },
+    {
+      "bytes": 8005,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-10-django__django-11551/initial-rna.stdout",
+      "role": "rank 10 T_PD bounded RNA result",
+      "sha256": "534fda03c65c2bedba544a5c3a147e9637eebdb6ca1a96b6b5012315540ece81"
+    },
+    {
+      "bytes": 6916,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-11-django__django-13658/A/episode-receipt.json",
+      "role": "rank 11 A episode receipt",
+      "sha256": "1c94a7caedfb0e3f101175cb762f4190c86c7f51f22c71f00233be21a8414521"
+    },
+    {
+      "bytes": 7297,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-11-django__django-13658/T/episode-receipt.json",
+      "role": "rank 11 T_PD episode receipt",
+      "sha256": "9d842aefbfce63bc5c2d145a752fcb553a508386a6cc7298ee2a86111f791c7f"
+    },
+    {
+      "bytes": 3931,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-11-django__django-13658/cef615bcfaa29896765deaced9d2704751d3d2d2737bf514216bc228db4db1dd/evaluation-receipt.json",
+      "role": "rank 11 T_PD official evaluation receipt",
+      "sha256": "112620c95c4fcaba452cd9e2fcf4d3d6c71d437cd772182f3397d6572f5079bd"
+    },
+    {
+      "bytes": 26977,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-11-django__django-13658/inputs-manifest.json",
+      "role": "rank 11 T_PD input manifest",
+      "sha256": "9ed3b76ba9a673c6df0209a0872b37e2b9eb17e932a913190f58c850e9e93f75"
+    },
+    {
+      "bytes": 63114,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-11-django__django-13658/T/claude.stream.jsonl",
+      "role": "rank 11 T_PD provider transcript",
+      "sha256": "ff7ff330e01087ef913a35eb709aa3d43017f242bcb552272c56762dd6229742"
+    },
+    {
+      "bytes": 890,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-11-django__django-13658/T/terminal.patch",
+      "role": "rank 11 T_PD terminal patch",
+      "sha256": "cef615bcfaa29896765deaced9d2704751d3d2d2737bf514216bc228db4db1dd"
+    },
+    {
+      "bytes": 10099,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-11-django__django-13658/T/user-prompt.bin",
+      "role": "rank 11 T_PD runner prompt",
+      "sha256": "ed0c2279f8210c1b5580559eaa7422e1d3c44119990721c72a6232734a2fbaad"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-11-django__django-13658/T/treatment-system.bin",
+      "role": "rank 11 T_PD runner developer instructions",
+      "sha256": "30976da70cd54630effb4fa3ce70767cd78a4a781dbea58dab8ca97227349888"
+    },
+    {
+      "bytes": 989,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-11-django__django-13658/rna-calls.jsonl",
+      "role": "rank 11 T_PD RNA preprocessing log",
+      "sha256": "b94205733dd0336781280d06996745a170291528838db35a257be75569cc7987"
+    },
+    {
+      "bytes": 8129,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-11-django__django-13658/initial-rna.stdout",
+      "role": "rank 11 T_PD bounded RNA result",
+      "sha256": "662da3b0ff4dfeac0fdced8b973ee1bbd6ecd328cc2adc147ebff63543a6e59c"
+    },
+    {
+      "bytes": 6895,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-12-psf__requests-1724/A/episode-receipt.json",
+      "role": "rank 12 A episode receipt",
+      "sha256": "7ca82691231dca378acd69a040a6cb41b4e1e9b8beeadcbb7bbbd898ce247ba3"
+    },
+    {
+      "bytes": 7194,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/model-attempt-001/rank-12-psf__requests-1724/T/episode-receipt.json",
+      "role": "rank 12 T_PD episode receipt",
+      "sha256": "390ac7e9cd37d82c706f860ed3fac1b37104edb87183853678f6215ab271ff37"
+    },
+    {
+      "bytes": 3742,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/official-evaluation-attempt-001/rank-12-psf__requests-1724/63b438b41c949e25861b12527e77ce6bac28eee33a416c96d7264b746cc29180/evaluation-receipt.json",
+      "role": "rank 12 T_PD official evaluation receipt",
+      "sha256": "b30fc580d3d5ff66a4589cb00f43496359c38c06a8d13482fc4496675998cb1f"
+    },
+    {
+      "bytes": 22442,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/prepared/rank-12-psf__requests-1724/inputs-manifest-v2.json",
+      "role": "rank 12 T_PD input manifest",
+      "sha256": "bb03b6cd2849e72b24ca7c27be8349a3ed079a81cf38675f462aeaf1a4dea745"
+    },
+    {
+      "bytes": 160997,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/model-attempt-001/rank-12-psf__requests-1724/T/claude.stream.jsonl",
+      "role": "rank 12 T_PD provider transcript",
+      "sha256": "1a284e596ce81baa51d66f19d5160fed3f26da1c34526460ba405c2209d4775d"
+    },
+    {
+      "bytes": 530,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/model-attempt-001/rank-12-psf__requests-1724/T/terminal.patch",
+      "role": "rank 12 T_PD terminal patch",
+      "sha256": "63b438b41c949e25861b12527e77ce6bac28eee33a416c96d7264b746cc29180"
+    },
+    {
+      "bytes": 10873,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/model-attempt-001/rank-12-psf__requests-1724/T/user-prompt.bin",
+      "role": "rank 12 T_PD runner prompt",
+      "sha256": "2b4f0bc575ff32b1c0cd925e28a8dd0c0ef51e145eda8c2b6fe836d4b34422a1"
+    },
+    {
+      "bytes": 1062,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/model-attempt-001/rank-12-psf__requests-1724/T/treatment-system.bin",
+      "role": "rank 12 T_PD runner developer instructions",
+      "sha256": "b9ca7632da5201797d64cf3129a607fb87e4062c72dc2be4c04af92c75b7b593"
+    },
+    {
+      "bytes": 776,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/prepared/rank-12-psf__requests-1724/rna-calls.jsonl",
+      "role": "rank 12 T_PD RNA preprocessing log",
+      "sha256": "cb77168dd15d3b4d348d85d851b10f36cfb99b45b0ae15a8b0dcb3ceff9b341b"
+    },
+    {
+      "bytes": 8188,
+      "path": "bounded-public-api-progressive-sonnet-rank12-attempt-001/prepared/rank-12-psf__requests-1724/initial-rna.stdout",
+      "role": "rank 12 T_PD bounded RNA result",
+      "sha256": "5cf6df8d65867eaa526f40982321bd3bbbe233b2977a27f6910c925c66ce94b7"
+    },
+    {
+      "bytes": 6901,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-13-sympy__sympy-18763/A/episode-receipt.json",
+      "role": "rank 13 A episode receipt",
+      "sha256": "13b7c5a380609b5ded23c6a6adeb024c9e97d2b1c843c2b8afc05285260a6ad6"
+    },
+    {
+      "bytes": 7193,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-13-sympy__sympy-18763/T/episode-receipt.json",
+      "role": "rank 13 T_PD episode receipt",
+      "sha256": "ba6ae13d457b14882bfbb79e718d529efba9d7f3e0ca95535811f48e9a20a520"
+    },
+    {
+      "bytes": 3740,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-pilot-attempt-001/rank-13-sympy__sympy-18763/19d267e7db844f65902741c960753400b3102dd015409de43e4ad954f31869ed/evaluation-receipt.json",
+      "role": "rank 13 T_PD official evaluation receipt",
+      "sha256": "727a188a0e299a86271454ecbc5b99320db77b1803cb0ee7f58e8fb5a7d8763f"
+    },
+    {
+      "bytes": 17874,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-13-sympy__sympy-18763/inputs-manifest.json",
+      "role": "rank 13 T_PD input manifest",
+      "sha256": "e2b0ca36b5473069d798341bd773155fd9bb0fdd41937fd65c5eef16dcb1b8fd"
+    },
+    {
+      "bytes": 262315,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-13-sympy__sympy-18763/T/claude.stream.jsonl",
+      "role": "rank 13 T_PD provider transcript",
+      "sha256": "a83292fd58eefe9a3fe8ba65eb63da72315d47e9a82999ddf951a3dc3f03e918"
+    },
+    {
+      "bytes": 1064,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-13-sympy__sympy-18763/T/terminal.patch",
+      "role": "rank 13 T_PD terminal patch",
+      "sha256": "19d267e7db844f65902741c960753400b3102dd015409de43e4ad954f31869ed"
+    },
+    {
+      "bytes": 9226,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-13-sympy__sympy-18763/T/user-prompt.bin",
+      "role": "rank 13 T_PD runner prompt",
+      "sha256": "88d79de44b042b67bf508d97a365a19e9ee1ba3d3b6e0e44ecd5103a00064246"
+    },
+    {
+      "bytes": 1048,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-pilot-attempt-001/rank-13-sympy__sympy-18763/T/treatment-system.bin",
+      "role": "rank 13 T_PD runner developer instructions",
+      "sha256": "9d1cf42fef7be8b463fdd653f60d96512805107b3b819d6ea876597a456983ce"
+    },
+    {
+      "bytes": 927,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-13-sympy__sympy-18763/rna-calls.jsonl",
+      "role": "rank 13 T_PD RNA preprocessing log",
+      "sha256": "71b173c2ac21fe054c8436000d6ab545b36538a6bce4fec7fe543bcf1dad03fd"
+    },
+    {
+      "bytes": 7989,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-13-sympy__sympy-18763/initial-rna.stdout",
+      "role": "rank 13 T_PD bounded RNA result",
+      "sha256": "f05e04123969dc44d7c3e500891b09a5cd6c288fe5352215123f0cfc2a8b9b5b"
+    },
+    {
+      "bytes": 8731,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-14-pytest-dev__pytest-7982/A/episode-receipt.json",
+      "role": "rank 14 A episode receipt",
+      "sha256": "be9792313bbba84bdebbb3fdb748fa984f1d926d0679c9070c55bb43cb800392"
+    },
+    {
+      "bytes": 9470,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/T/episode-receipt.json",
+      "role": "rank 14 T_PD episode receipt",
+      "sha256": "1bb2731fc344abb6e94df8db1b63bdf41ed33bf3f5552c9f32b81190b604fd66"
+    },
+    {
+      "bytes": 3892,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/6079c050374e717a953e2b2aad8cd6bdfa1aba22b8db6a4237f82d197c9304ac/evaluation-receipt.json",
+      "role": "rank 14 T_PD official evaluation receipt",
+      "sha256": "f66a16cd832998c0941b0f712b484bb21b4485275f50d9a91c322ea43d98405c"
+    },
+    {
+      "bytes": 19802,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-14-pytest-dev__pytest-7982/inputs-manifest.json",
+      "role": "rank 14 T_PD input manifest",
+      "sha256": "18feb0b12ea9cd5a1e4c61fc7e2ea0462a15edff0e0659d96c96e431a0ba4d9e"
+    },
+    {
+      "bytes": 135150,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/T/claude.stream.jsonl",
+      "role": "rank 14 T_PD provider transcript",
+      "sha256": "edc0802900bed05ae491b01f2a619969ec240022b5f44f1c22c594edbfd42edb"
+    },
+    {
+      "bytes": 1184,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/T/terminal.patch",
+      "role": "rank 14 T_PD terminal patch",
+      "sha256": "6079c050374e717a953e2b2aad8cd6bdfa1aba22b8db6a4237f82d197c9304ac"
+    },
+    {
+      "bytes": 9035,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/T/user-prompt.bin",
+      "role": "rank 14 T_PD runner prompt",
+      "sha256": "6f9437da3ee651310d94aa509c0fffa1982f2b6bc490680cd7052ec550d09241"
+    },
+    {
+      "bytes": 1058,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-14-pytest-dev__pytest-7982/T/treatment-system.bin",
+      "role": "rank 14 T_PD runner developer instructions",
+      "sha256": "1106ee6fc87a16626fb1b3bfe2747c2c21cce7e802486a0b2480143efe5eff04"
+    },
+    {
+      "bytes": 817,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-14-pytest-dev__pytest-7982/rna-calls.jsonl",
+      "role": "rank 14 T_PD RNA preprocessing log",
+      "sha256": "31a0c1e15c42f360bbe3bde56e91027aacfc825e10c3648cbd31376fbbb8dd83"
+    },
+    {
+      "bytes": 8023,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-14-pytest-dev__pytest-7982/initial-rna.stdout",
+      "role": "rank 14 T_PD bounded RNA result",
+      "sha256": "1a6e65054f5ca56972b07acefec5fe6537faf8fb676ef2d17e95763c43e33d7f"
+    },
+    {
+      "bytes": 8748,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-15-pytest-dev__pytest-7432/A/episode-receipt.json",
+      "role": "rank 15 A episode receipt",
+      "sha256": "028e42efae126a580a0a03b4f6652c33906372959fec47d63db5b72e66dbe7c2"
+    },
+    {
+      "bytes": 9336,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-15-pytest-dev__pytest-7432/T/episode-receipt.json",
+      "role": "rank 15 T_PD episode receipt",
+      "sha256": "6749cc4a6afe4431ca69f0e218e7cf9509e065c893a8aef4c4a87df14f75cf57"
+    },
+    {
+      "bytes": 3960,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-03-06-08-09-11-15-attempt-001/rank-15-pytest-dev__pytest-7432/cd10496af362f1baed8536e0966efeaa7959cacd9e6d9e0cbf36fa4f4a4473f9/evaluation-receipt.json",
+      "role": "rank 15 T_PD official evaluation receipt",
+      "sha256": "a7a29105e456db96b2e6c5f9367298c38225796d74a889a7604287751e8e1ec7"
+    },
+    {
+      "bytes": 18229,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-15-pytest-dev__pytest-7432/inputs-manifest.json",
+      "role": "rank 15 T_PD input manifest",
+      "sha256": "f9ace1e6d8288d338cb770daed3cdc5336aa40bdd5d460b65b7456cac0d8cc4b"
+    },
+    {
+      "bytes": 106058,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-15-pytest-dev__pytest-7432/T/claude.stream.jsonl",
+      "role": "rank 15 T_PD provider transcript",
+      "sha256": "1636c10f7f99da0f6f8981e2325a74536903dc46bc82c1fd221daf0b63002f13"
+    },
+    {
+      "bytes": 484,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-15-pytest-dev__pytest-7432/T/terminal.patch",
+      "role": "rank 15 T_PD terminal patch",
+      "sha256": "cd10496af362f1baed8536e0966efeaa7959cacd9e6d9e0cbf36fa4f4a4473f9"
+    },
+    {
+      "bytes": 9637,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-15-pytest-dev__pytest-7432/T/user-prompt.bin",
+      "role": "rank 15 T_PD runner prompt",
+      "sha256": "ce91339f23d7e4ef7f708e56dc34546834f7ce0bec2f236ace0fa63e7f27cda2"
+    },
+    {
+      "bytes": 1058,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-15-pytest-dev__pytest-7432/T/treatment-system.bin",
+      "role": "rank 15 T_PD runner developer instructions",
+      "sha256": "9b0349eb5e3afd78fbd8fbd199cb55fd9b4ab864557f3cf59f731d5d7792c6d8"
+    },
+    {
+      "bytes": 950,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-15-pytest-dev__pytest-7432/rna-calls.jsonl",
+      "role": "rank 15 T_PD RNA preprocessing log",
+      "sha256": "9aae3dfacec4c3e7c87a9e356f7fe3ba3500aa4374d36ce3a3218cf60da7cc3b"
+    },
+    {
+      "bytes": 8171,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-15-pytest-dev__pytest-7432/initial-rna.stdout",
+      "role": "rank 15 T_PD bounded RNA result",
+      "sha256": "5f54f1ae0077be9b04c71430706acbb4257ff2f8f26809ff751d6ecce9dadd5d"
+    },
+    {
+      "bytes": 6950,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-16-django__django-12193/A/episode-receipt.json",
+      "role": "rank 16 A episode receipt",
+      "sha256": "a84d111fca636038dde387ce8c96b1fb357b57a296e94cc1b2702adbcc2f2bfa"
+    },
+    {
+      "bytes": 7288,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-16-django__django-12193/T/episode-receipt.json",
+      "role": "rank 16 T_PD episode receipt",
+      "sha256": "45dca0a5f81f5e2fa4f948fcbb8d242827d41965ff462e677652b700a2f8e1c6"
+    },
+    {
+      "bytes": 3894,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-16-18-19-20-attempt-001/rank-16-django__django-12193/3d0e216d4c011fbad0eee8fb666ab5d7906fc32966ff871f0e23da1eb0f0d3f1/evaluation-receipt.json",
+      "role": "rank 16 T_PD official evaluation receipt",
+      "sha256": "152a33940fea3774bfe75db37cfddafbdb27d9827bec22f33c4bafd52472f3d3"
+    },
+    {
+      "bytes": 90092,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-16-django__django-12193/inputs-manifest.json",
+      "role": "rank 16 T_PD input manifest",
+      "sha256": "b567f52fdb26a6ed4342cb40510194aaeb83db904a8832dc7299e67265c137f3"
+    },
+    {
+      "bytes": 217504,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-16-django__django-12193/T/claude.stream.jsonl",
+      "role": "rank 16 T_PD provider transcript",
+      "sha256": "d5db80215bd2ed61cb58a67b76caa27f8a2cf3b12988c16eb9e0a931d79fd129"
+    },
+    {
+      "bytes": 1383,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-16-django__django-12193/T/terminal.patch",
+      "role": "rank 16 T_PD terminal patch",
+      "sha256": "3d0e216d4c011fbad0eee8fb666ab5d7906fc32966ff871f0e23da1eb0f0d3f1"
+    },
+    {
+      "bytes": 9542,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-16-django__django-12193/T/user-prompt.bin",
+      "role": "rank 16 T_PD runner prompt",
+      "sha256": "1911783e7cb80147b1b9da834d059328f98e6c2992b2bc104141b0aec68500a9"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-16-django__django-12193/T/treatment-system.bin",
+      "role": "rank 16 T_PD runner developer instructions",
+      "sha256": "2d1b1cf9447518761d2c2eb8613365b0357d319940bfe4ddd1746579dce0d3be"
+    },
+    {
+      "bytes": 976,
+      "content_scope": "prefix",
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-16-django__django-12193/rna-calls.jsonl",
+      "role": "rank 16 T_PD RNA preprocessing log",
+      "sha256": "e8f44b3b8bb7b3b6e476ed77ecf61c2090551cc8764cf11d6f68cde6c9fb5705"
+    },
+    {
+      "bytes": 8049,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-16-django__django-12193/initial-rna.stdout",
+      "role": "rank 16 T_PD bounded RNA result",
+      "sha256": "e097602c47c771c08b0903d0a19e237e2e5fa6581c244e51779d99d4fb333218"
+    },
+    {
+      "bytes": 6866,
+      "path": "sonnet-canonical-a17-attempt-001/rank-17-django__django-16485/A/episode-receipt.json",
+      "role": "rank 17 A episode receipt",
+      "sha256": "d0993016fac0e4b905e94e1687e449e0d10e29804893a633c9301c8f74f21c82"
+    },
+    {
+      "bytes": 7329,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-17-django__django-16485/T/episode-receipt.json",
+      "role": "rank 17 T_PD episode receipt",
+      "sha256": "ff95c3e44db4a9b59f5c658ed3221983b04a546fd194caba8cbfe8e3bb852a93"
+    },
+    {
+      "bytes": 3861,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-restored-rank14-17-attempt-001/rank-17-django__django-16485/b979a443c208bc0ff71dc64c68af32c15c8459aca7bc1eae0c1f500d756ae133/evaluation-receipt.json",
+      "role": "rank 17 T_PD official evaluation receipt",
+      "sha256": "a35c48d597dbbc30013dde6801d44dea2476e908c5bf1ddd0c5319cc0aefbfe2"
+    },
+    {
+      "bytes": 19188,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-17-django__django-16485/inputs-manifest.json",
+      "role": "rank 17 T_PD input manifest",
+      "sha256": "758da2784f8dc61e783ae1877867d0f3b1b15400a07ee43f5ed79237c5483277"
+    },
+    {
+      "bytes": 169482,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-17-django__django-16485/T/claude.stream.jsonl",
+      "role": "rank 17 T_PD provider transcript",
+      "sha256": "11a2d156b6d67dde45b1ecd6ee2508b2a9a2a399d9ba44246fbf1d4e05ae49ae"
+    },
+    {
+      "bytes": 1502,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-17-django__django-16485/T/terminal.patch",
+      "role": "rank 17 T_PD terminal patch",
+      "sha256": "b979a443c208bc0ff71dc64c68af32c15c8459aca7bc1eae0c1f500d756ae133"
+    },
+    {
+      "bytes": 8650,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-17-django__django-16485/T/user-prompt.bin",
+      "role": "rank 17 T_PD runner prompt",
+      "sha256": "2903badc6764bb1ad402cb14fd27bc9044bbe79f5aead72b3e727549b45dd820"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-restored-rank14-17-attempt-001/rank-17-django__django-16485/T/treatment-system.bin",
+      "role": "rank 17 T_PD runner developer instructions",
+      "sha256": "48442df0ba20d868c8ff3e7857eb30c188802790061a9a675ecff69e32ed5f8b"
+    },
+    {
+      "bytes": 620,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-17-django__django-16485/rna-calls.jsonl",
+      "role": "rank 17 T_PD RNA preprocessing log",
+      "sha256": "cf5f3197b0378ca64e0ff22f051387a1ce19e99ef355f80dc4005867d4e0c484"
+    },
+    {
+      "bytes": 8042,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-17-django__django-16485/initial-rna.stdout",
+      "role": "rank 17 T_PD bounded RNA result",
+      "sha256": "578090f33f0d59f03c6a44a120ff688b1e542020a93eb6f7d6b04458748dbced"
+    },
+    {
+      "bytes": 6946,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-18-django__django-16877/A/episode-receipt.json",
+      "role": "rank 18 A episode receipt",
+      "sha256": "3be6aca54049c03c05bbb75abae0f7f07e6d122eceacb08b41a53b8cb1166b75"
+    },
+    {
+      "bytes": 7303,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-18-django__django-16877/T/episode-receipt.json",
+      "role": "rank 18 T_PD episode receipt",
+      "sha256": "fbdb7eda794994aa1056e73a19da693dcc08d16e34b381bac94e1906d932c5e2"
+    },
+    {
+      "bytes": 3893,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-16-18-19-20-attempt-001/rank-18-django__django-16877/0062a65540c2af7b7bf8fa8a3c41a216b5d4db004ca28a7bcda58b89507f72b7/evaluation-receipt.json",
+      "role": "rank 18 T_PD official evaluation receipt",
+      "sha256": "5131831c2acb7ce2bc36ed4a292c625a301f7e21c28a68d7cdbb54470b0820f0"
+    },
+    {
+      "bytes": 17754,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-18-django__django-16877/inputs-manifest.json",
+      "role": "rank 18 T_PD input manifest",
+      "sha256": "273cd34bda0d72585d0bdf2642e77e3377b6952f5629ccac34a1bf7da21f74b2"
+    },
+    {
+      "bytes": 211681,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-18-django__django-16877/T/claude.stream.jsonl",
+      "role": "rank 18 T_PD provider transcript",
+      "sha256": "1fbd9a1cf5311d3c6a0c682501572f9430386758e7968d3deb3232dfaf2250d7"
+    },
+    {
+      "bytes": 1942,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-18-django__django-16877/T/terminal.patch",
+      "role": "rank 18 T_PD terminal patch",
+      "sha256": "0062a65540c2af7b7bf8fa8a3c41a216b5d4db004ca28a7bcda58b89507f72b7"
+    },
+    {
+      "bytes": 8971,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-18-django__django-16877/T/user-prompt.bin",
+      "role": "rank 18 T_PD runner prompt",
+      "sha256": "9a5323c6110e8ab3594d7bb677e640e413657b6aa44e10d472e09bdd5698e0fb"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-18-django__django-16877/T/treatment-system.bin",
+      "role": "rank 18 T_PD runner developer instructions",
+      "sha256": "9b241c3a27ecd35d9b619530bedab776e5b50cb3361f98cdb63f601d2f7b2a82"
+    },
+    {
+      "bytes": 810,
+      "content_scope": "prefix",
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-18-django__django-16877/rna-calls.jsonl",
+      "role": "rank 18 T_PD RNA preprocessing log",
+      "sha256": "84b8a0bd13b99567b163851840737d496a18968539a20e34dd13af5959570029"
+    },
+    {
+      "bytes": 7985,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-18-django__django-16877/initial-rna.stdout",
+      "role": "rank 18 T_PD bounded RNA result",
+      "sha256": "a908e48882714a3f9f9404480623330d2041e84187073f8006db7e54f44d4510"
+    },
+    {
+      "bytes": 6940,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-19-django__django-11451/A/episode-receipt.json",
+      "role": "rank 19 A episode receipt",
+      "sha256": "e7a601f1dd6bd1987cef062b850ffb03629244ccf9e9cfda18c5d3bd6383ec13"
+    },
+    {
+      "bytes": 7283,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-19-django__django-11451/T/episode-receipt.json",
+      "role": "rank 19 T_PD episode receipt",
+      "sha256": "20742a3bb4de94e7b98a8f87018b7f4c58677727d09b04e9bbdba40dc13f0f48"
+    },
+    {
+      "bytes": 3891,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-16-18-19-20-attempt-001/rank-19-django__django-11451/447be02bc98e8fa9cdd46c239b8a0580cc80d3e2f8602d53a8f8f6165f837b47/evaluation-receipt.json",
+      "role": "rank 19 T_PD official evaluation receipt",
+      "sha256": "c7042ea0216ca2cf57219467ec42f652018e01ca11273b4c63bc37d5a8743642"
+    },
+    {
+      "bytes": 26887,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-19-django__django-11451/inputs-manifest.json",
+      "role": "rank 19 T_PD input manifest",
+      "sha256": "5bfd35a7b1118431aa4634a3987beaff73a4798a9ee98d380de8265355a8c2cd"
+    },
+    {
+      "bytes": 89827,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-19-django__django-11451/T/claude.stream.jsonl",
+      "role": "rank 19 T_PD provider transcript",
+      "sha256": "53c5155bff67212d78b790aca2920d156815f90b071733a7ef72fb867bc3f91b"
+    },
+    {
+      "bytes": 1580,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-19-django__django-11451/T/terminal.patch",
+      "role": "rank 19 T_PD terminal patch",
+      "sha256": "447be02bc98e8fa9cdd46c239b8a0580cc80d3e2f8602d53a8f8f6165f837b47"
+    },
+    {
+      "bytes": 10936,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-19-django__django-11451/T/user-prompt.bin",
+      "role": "rank 19 T_PD runner prompt",
+      "sha256": "23f1ed7863fcc1314162a62aeba61e0aa52b013a1a06bc1b579ccdcf462c9be9"
+    },
+    {
+      "bytes": 1052,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-19-django__django-11451/T/treatment-system.bin",
+      "role": "rank 19 T_PD runner developer instructions",
+      "sha256": "4ad0a185220d5aca43f596a1faf2bf57c3f1d6cd1b944424c170bb228f8d6476"
+    },
+    {
+      "bytes": 970,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-19-django__django-11451/rna-calls.jsonl",
+      "role": "rank 19 T_PD RNA preprocessing log",
+      "sha256": "f2c51b0499f46d5173a202a1089622b5fea8604b512b4ef81145279ac0ca0aa3"
+    },
+    {
+      "bytes": 8158,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-19-django__django-11451/initial-rna.stdout",
+      "role": "rank 19 T_PD bounded RNA result",
+      "sha256": "4f195527e9dd34c41ac7220c480d853e53717ce693c5f378106e6cbee7e53b6f"
+    },
+    {
+      "bytes": 8739,
+      "path": "sonnet-canonical-pairs-attempt-001/runs/rank-20-pytest-dev__pytest-7205/A/episode-receipt.json",
+      "role": "rank 20 A episode receipt",
+      "sha256": "b86b9a4ad36737cc4e06d5a815cb9bd34d453505d635fa2499b2815877a416eb"
+    },
+    {
+      "bytes": 9347,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-20-pytest-dev__pytest-7205/T/episode-receipt.json",
+      "role": "rank 20 T_PD episode receipt",
+      "sha256": "27763c28402363728451085af72a4b7a33fdcf5cbe5f67367b0e86d79d14482d"
+    },
+    {
+      "bytes": 3922,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/official-evaluation-scale-batch-16-18-19-20-attempt-001/rank-20-pytest-dev__pytest-7205/c05d2cd329bfdd8513daa155123f043746efb28209e02031d452b2cd81d84269/evaluation-receipt.json",
+      "role": "rank 20 T_PD official evaluation receipt",
+      "sha256": "02c90e23c10531fa43eb2740aaa08bcafa2297b52718e861fcc11b62602cbb97"
+    },
+    {
+      "bytes": 19998,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-20-pytest-dev__pytest-7205/inputs-manifest.json",
+      "role": "rank 20 T_PD input manifest",
+      "sha256": "1953e66d83d8367d8121c5968804e098c7901ec682defefa606e2680451a46ad"
+    },
+    {
+      "bytes": 111367,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-20-pytest-dev__pytest-7205/T/claude.stream.jsonl",
+      "role": "rank 20 T_PD provider transcript",
+      "sha256": "145e88272ae45732d311a68eae2dffe6b47c9d33ff819b4cd9b44d6b27aa9781"
+    },
+    {
+      "bytes": 1938,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-20-pytest-dev__pytest-7205/T/terminal.patch",
+      "role": "rank 20 T_PD terminal patch",
+      "sha256": "c05d2cd329bfdd8513daa155123f043746efb28209e02031d452b2cd81d84269"
+    },
+    {
+      "bytes": 13023,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-20-pytest-dev__pytest-7205/T/user-prompt.bin",
+      "role": "rank 20 T_PD runner prompt",
+      "sha256": "b036a3de30ca5b8777dfe2e66d19bfbde3cce9a7e3b3c7f8568d22a77f60647c"
+    },
+    {
+      "bytes": 1058,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/model-scale-ready12-attempt-001/rank-20-pytest-dev__pytest-7205/T/treatment-system.bin",
+      "role": "rank 20 T_PD runner developer instructions",
+      "sha256": "28d614aab8c1c16aab484640f3fc2ad8beafcbcf8d8a9cff6184646c92847c1f"
+    },
+    {
+      "bytes": 944,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-20-pytest-dev__pytest-7205/rna-calls.jsonl",
+      "role": "rank 20 T_PD RNA preprocessing log",
+      "sha256": "e0515500d42aaad6ec8227d878b2f2b94cf426bbb77b2caf9b04ca155926120a"
+    },
+    {
+      "bytes": 8069,
+      "path": "bounded-public-api-progressive-sonnet-attempt-001/prepared/rank-20-pytest-dev__pytest-7205/initial-rna.stdout",
+      "role": "rank 20 T_PD bounded RNA result",
+      "sha256": "ad99fa883819cde4eb5d14a205fa2b97c3532f3118b77ce2f38bf6634fda9d02"
+    }
+  ],
+  "evidence_root_environment": "ISSUE836_EVIDENCE_ROOT",
+  "schema_version": "issue836-bounded-progressive-disclosure-evidence-manifest-v1"
+}
