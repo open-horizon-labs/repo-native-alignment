@@ -52,9 +52,84 @@ use super::ScanEnrichmentOptions;
 use super::helpers::text_result;
 use super::state::GraphState;
 use super::store::{load_graph_from_lance, persist_graph_to_lance};
-use super::tools::{OutcomeProgress, RepoMap, Search};
+use super::tools::{OutcomeProgress, RepoMap, ResolveReferences, Search};
 
 impl RnaHandler {
+    pub(crate) async fn handle_resolve_references(
+        &self,
+        args: ResolveReferences,
+    ) -> Result<CallToolResult, CallToolError> {
+        use crate::oh_reference::{
+            AdvisoryResolver, OhReferenceKind, OpenHorizonsReferenceConfig,
+            ReqwestReferenceTransport, collect_reference_declarations,
+            preflight_explicit_references, resolve_declarations,
+        };
+
+        let repo_root = match Self::non_blank_arg(args.repo.as_deref()) {
+            Some(repo) => {
+                let path = PathBuf::from(repo);
+                if !path.is_absolute() {
+                    return Err(CallToolError::from_message(
+                        "resolve_references repo must be an absolute path".to_string(),
+                    ));
+                }
+                path.canonicalize().map_err(|error| {
+                    CallToolError::from_message(format!(
+                        "cannot resolve repository path {repo:?}: {error}"
+                    ))
+                })?
+            }
+            None => self
+                .repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| self.repo_root.clone()),
+        };
+        let server_root = self
+            .repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_root.clone());
+        if self.cache_only && repo_root != server_root {
+            return Ok(text_result(
+                "cache-only runtime serves only its admitted repository cache".into(),
+            ));
+        }
+        let explicit_kind = args
+            .expected_kind
+            .as_deref()
+            .map(|value| {
+                OhReferenceKind::parse(value).ok_or_else(|| {
+                    CallToolError::from_message(format!(
+                        "unsupported expected_kind {value:?}; expected context, endeavor, metis, guardrail, dive_pack, or log"
+                    ))
+                })
+            })
+            .transpose()?;
+        let discovery = if args.references.as_ref().is_none_or(Vec::is_empty) {
+            collect_reference_declarations(&repo_root).map_err(|error| {
+                CallToolError::from_message(format!(
+                    "cannot discover OH reference declarations: {error:#}"
+                ))
+            })?
+        } else {
+            preflight_explicit_references(args.references.unwrap_or_default(), explicit_kind)
+        };
+        let config = OpenHorizonsReferenceConfig::load(&repo_root);
+        let offline = args.offline.unwrap_or(false) || self.cache_only;
+        let resolver = AdvisoryResolver::new(
+            ReqwestReferenceTransport::default(),
+            std::env::var(crate::oh_reference::DEFAULT_RESOLVER_URL_ENV).ok(),
+            std::env::var(crate::oh_reference::DEFAULT_API_KEY_ENV).ok(),
+            &repo_root,
+            std::time::Duration::from_secs(
+                args.cache_ttl_seconds.unwrap_or(config.cache_ttl_seconds),
+            ),
+        );
+        let output = resolve_declarations(&resolver, discovery, explicit_kind, offline).await;
+        serde_json::to_string_pretty(&output)
+            .map(text_result)
+            .map_err(|error| CallToolError::from_message(error.to_string()))
+    }
+
     fn search_enrichment_jobs(
         &self,
         repo_root: &std::path::Path,

@@ -108,6 +108,30 @@ pub struct OutcomeProgress {
     pub repo: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "resolve_references",
+    description = "Advisory-resolve canonical Open Horizons oh://v1 references using the existing API-key environment. Omit references to discover local rna.relationships target.uri declarations. This sends only identity + expected kind, never graph/source/embeddings/outbox, and never gates local workflows."
+)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveReferences {
+    /// Canonical oh://v1 references. Omit or pass [] to discover declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<String>>,
+    /// Expected entity kind for explicit references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_kind: Option<String>,
+    /// Use only cache evidence matching the configured endpoint/API key; never contact OH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+    /// Override cache freshness qualification in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+    /// Absolute repository/worktree path; defaults to the server repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
 // ── Unified search tool ─────────────────────────────────────────────
 // Unified search tool combining flat symbol search and graph traversal.
 
@@ -432,9 +456,15 @@ mod tests {
         assert_eq!(search.mode.as_deref(), Some("convergence"));
         assert_eq!(
             search.nodes,
-            Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
+            Some(vec![
+                "Request.prepare".into(),
+                "Session.prepare_request".into()
+            ])
         );
-        assert_eq!(search.before.as_deref(), Some("PreparedRequest.prepare_method"));
+        assert_eq!(
+            search.before.as_deref(),
+            Some("PreparedRequest.prepare_method")
+        );
 
         let error = parse_convergence(json!({
             "nodes": ["Request.prepare", "Session.prepare_request"],
@@ -1193,5 +1223,4 @@ mod tests {
         assert_eq!(s.depth, Some(2));
         assert_eq!(s.min_complexity, Some(5));
     }
-
 }

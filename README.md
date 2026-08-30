@@ -221,6 +221,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase), durable Pass 1 queue snapshots (pending, in-flight, completed, failed, skipped, exhausted, resumed/retried counts, phase counts, oldest work, and bounded actionable exhaustion samples) from `.oh/.cache/lsp_pass1_work_items.json`, and recent OperationReport history from `.oh/.cache/operation_reports.json`. Interrupted queues resume only eligible work: completed output and skipped state are carried forward only when the node input fingerprint is unchanged. OperationReports persist the same queue snapshot for post-run inspection. Includes LSP servers available to install for each root's detected languages. |
+| `resolve_references` | Explicitly advisory-resolve local `oh://v1` declarations using authorized identity-only access, with freshness-qualified offline cache fallback. Never synchronizes repository or OH graphs. |
 
 Markdown is source-addressable beyond headings: body nodes for paragraphs, blockquotes,
 links, footnotes, tables, images, code fences, and HTML directives carry stable structural
@@ -234,6 +235,12 @@ persistence and MCP traversal. Evidence is revalidated against current Markdown
 body nodes on load; edited or missing evidence is downgraded from confirmed.
 Frontmatter-only relationships remain detected candidates until a body-backed
 rule supplies valid evidence.
+
+Local-knowledge targets may also use canonical `oh://v1/...` identities. RNA
+keeps these as local advisory reference edges and resolves them only when
+`resolve-references` is explicitly run; normal scanning never contacts Open
+Horizons. See [Advisory Open Horizons references](docs/advisory-oh-references.md)
+for syntax, states, freshness, and redaction guarantees.
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root.
 

@@ -50,6 +50,8 @@ enum Commands {
     Setup(SetupArgs),
     Test(TestArgs),
     Scan(ScanArgs),
+    /// Advisory-resolve stable Open Horizons references without synchronizing graphs.
+    ResolveReferences(ResolveReferencesArgs),
     /// Verify persisted per-file LSP completeness before benchmark/model access.
     LspReadiness(LspReadinessArgs),
     /// Print the exact producer/schema and target-tree identity used for
@@ -72,6 +74,28 @@ enum Commands {
     Adr(AdrArgs),
     /// Open an interactive graph visualizer in the browser
     Open(OpenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ResolveReferencesArgs {
+    /// Canonical oh://v1 reference. Repeat to resolve explicit references; omit
+    /// to discover `rna.relationships[].target.uri` declarations in Markdown.
+    references: Vec<String>,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Expected OH entity kind for explicit references.
+    #[arg(long)]
+    expected_kind: Option<String>,
+    /// Exact authorized resolver endpoint. Overrides OPEN_HORIZONS_RESOLVER_URL.
+    #[arg(long)]
+    resolver_url: Option<String>,
+    /// Resolve only from the cache matching the configured endpoint/API key;
+    /// never contact OH.
+    #[arg(long)]
+    offline: bool,
+    /// Override cache freshness qualification in seconds.
+    #[arg(long)]
+    cache_ttl_seconds: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -854,6 +878,51 @@ async fn async_main() -> anyhow::Result<()> {
             init_tracing("info", log_path.as_deref());
             let passed = smoke_test::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
+        }
+        Some(Commands::ResolveReferences(args)) => {
+            init_tracing("warn", log_path.as_deref());
+            use repo_native_alignment::oh_reference::{
+                AdvisoryResolver, OhReferenceKind, OpenHorizonsReferenceConfig,
+                ReqwestReferenceTransport, collect_reference_declarations,
+                preflight_explicit_references, resolve_declarations,
+            };
+
+            let repo_root = args.repo.canonicalize()?;
+            let config = OpenHorizonsReferenceConfig::load(&repo_root);
+            let explicit_kind = args
+                .expected_kind
+                .as_deref()
+                .map(|value| {
+                    OhReferenceKind::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unsupported --expected-kind {value:?}; expected one of context, endeavor, metis, guardrail, dive_pack, log"
+                        )
+                    })
+                })
+                .transpose()?;
+            let discovery = if args.references.is_empty() {
+                collect_reference_declarations(&repo_root)?
+            } else {
+                preflight_explicit_references(args.references, explicit_kind)
+            };
+            let api_key =
+                std::env::var(repo_native_alignment::oh_reference::DEFAULT_API_KEY_ENV).ok();
+            let endpoint = args.resolver_url.or_else(|| {
+                std::env::var(repo_native_alignment::oh_reference::DEFAULT_RESOLVER_URL_ENV).ok()
+            });
+            let resolver = AdvisoryResolver::new(
+                ReqwestReferenceTransport::default(),
+                endpoint,
+                api_key,
+                &repo_root,
+                std::time::Duration::from_secs(
+                    args.cache_ttl_seconds.unwrap_or(config.cache_ttl_seconds),
+                ),
+            );
+            let output =
+                resolve_declarations(&resolver, discovery, explicit_kind, args.offline).await;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Ok(());
         }
         Some(Commands::StructuralCacheIdentity(args)) => {
             let repo_root = args.repo.canonicalize()?;
@@ -1897,6 +1966,37 @@ mod tests {
         .unwrap();
         assert!(cache_only.cache_only);
         assert_eq!(cache_only.transport, "http");
+    }
+
+    #[test]
+    fn resolve_references_cli_uses_bounded_preflight_before_uri_parsing() {
+        let raw_secret = "raw-secret".repeat(1_000);
+        let mut arguments = vec![
+            "repo-native-alignment".to_string(),
+            "resolve-references".to_string(),
+            raw_secret.clone(),
+        ];
+        arguments.extend(
+            (0..300).map(|index| format!("oh://v1/context/context-cli-{index}")),
+        );
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let Commands::ResolveReferences(args) = cli.command.unwrap() else {
+            panic!("expected resolve-references command");
+        };
+        let discovery = repo_native_alignment::oh_reference::preflight_explicit_references(
+            args.references,
+            None,
+        );
+        assert_eq!(
+            discovery.declarations.len(),
+            repo_native_alignment::oh_reference::MAX_REFERENCE_DECLARATIONS
+        );
+        assert!(discovery.truncated);
+        let output = serde_json::to_string(&discovery).unwrap();
+        assert!(!output.contains(&raw_secret));
+        assert!(output.contains("oversize_reference"));
+        assert!(output.contains("declaration_limit"));
+        assert!(output.len() < 64 * 1024);
     }
 
     #[test]

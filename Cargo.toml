@@ -88,6 +88,12 @@ serde_yaml = "0.9"
 toml = "0.8"
 base64 = "0.22"
 
+# Narrow, read-only Open Horizons reference resolution. The client sends only
+# a canonical oh:// identity and optional expected kind; it never sends graph
+# records, source, embeddings, or outbox data.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+dirs = "6"
+
 # Optional FTS types for embedding-backed hybrid search (FullTextSearchQuery)
 lance-index = { version = "8.0", optional = true }
 
@@ -118,6 +124,9 @@ gray_matter = "0.3.2"
 # Multi-pattern substring search (tested_by_pass naming-convention pass)
 aho-corasick = "1"
 tree-sitter-gdscript = "6.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

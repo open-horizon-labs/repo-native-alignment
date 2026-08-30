@@ -1,0 +1,71 @@
+[
+  {
+    "name": "rename-preserves-stable-identity",
+    "reference": "oh://v1/endeavor/endeavor-1",
+    "expected_kind": "endeavor",
+    "status": 200,
+    "body": { "contract_version": "v1", "outcome": "resolved", "reference": "oh://v1/endeavor/endeavor-1", "kind": "endeavor", "lifecycle": "active", "version": 2 },
+    "expected_state": "confirmed"
+  },
+  {
+    "name": "archive-is-retired",
+    "reference": "oh://v1/context/context-1",
+    "expected_kind": "context",
+    "status": 200,
+    "body": { "contract_version": "v1", "outcome": "retired", "reference": "oh://v1/context/context-1", "kind": "context", "lifecycle": "retired", "version": 3 },
+    "expected_state": "retired"
+  },
+  {
+    "name": "delete-is-unresolved",
+    "reference": "oh://v1/metis/metis-1",
+    "expected_kind": "metis",
+    "status": 404,
+    "body": { "outcome": "not_found_or_unauthorized" },
+    "expected_state": "unresolved"
+  },
+  {
+    "name": "wrong-kind-is-local-type-mismatch",
+    "reference": "oh://v1/guardrail/guardrail-1",
+    "expected_kind": "metis",
+    "status": 200,
+    "body": { "contract_version": "v1", "outcome": "resolved", "reference": "oh://v1/guardrail/guardrail-1", "kind": "guardrail", "lifecycle": "active", "version": 1 },
+    "expected_state": "type_mismatch"
+  },
+  {
+    "name": "invalid-api-key-is-unauthorized",
+    "reference": "oh://v1/log/log-1",
+    "expected_kind": "log",
+    "status": 401,
+    "body": { "error": "Authentication required" },
+    "expected_state": "unauthorized"
+  },
+  {
+    "name": "endpoint-failure-is-unavailable",
+    "reference": "oh://v1/dive_pack/pack-1",
+    "expected_kind": "dive_pack",
+    "status": 503,
+    "body": { "outcome": "unavailable" },
+    "expected_state": "unavailable"
+  },
+  {
+    "name": "fresh-cache-remains-useful-offline",
+    "mode": "offline_fresh",
+    "reference": "oh://v1/context/context-offline",
+    "expected_kind": "context",
+    "expected_state": "confirmed"
+  },
+  {
+    "name": "expired-cache-is-explicitly-stale-offline",
+    "mode": "offline_stale",
+    "reference": "oh://v1/endeavor/endeavor-stale",
+    "expected_kind": "endeavor",
+    "expected_state": "stale"
+  },
+  {
+    "name": "transport-level-endpoint-failure-is-unavailable",
+    "mode": "transport_error",
+    "reference": "oh://v1/guardrail/guardrail-offline",
+    "expected_kind": "guardrail",
+    "expected_state": "unavailable"
+  }
+]
