@@ -1162,6 +1162,7 @@ struct LocalKnowledgeTarget {
     uri: Option<String>,
 }
 
+/// Emits local knowledge nodes and advisory relationship candidates from frontmatter.
 fn emit_local_knowledge_graph(
     path: &Path,
     content: &str,
@@ -1233,6 +1234,9 @@ fn emit_local_knowledge_graph(
             let Ok(reference) = crate::oh_reference::OhReference::parse(uri.trim()) else {
                 continue;
             };
+            if relationship.target.kind.trim() != reference.kind.as_str() {
+                continue;
+            }
             (
                 NodeId {
                     root: String::new(),
@@ -1690,6 +1694,32 @@ The reference is advisory.
             .expect("existing local reference edge");
         assert_eq!(local.to.name, "claim.local-target");
         assert_eq!(local.to.file, PathBuf::from(".oh/knowledge/local.md"));
+    }
+
+    #[test]
+    fn test_markdown_local_knowledge_rejects_oh_uri_kind_mismatch() {
+        let extractor = MarkdownExtractor::new();
+        let content = r#"---
+rna:
+  kind: claim
+  id: claim.local
+  relationships:
+    - kind: informs
+      target:
+        kind: claim
+        uri: oh://v1/endeavor/endeavor%3Ashared%3A1
+---
+
+# Local claim
+"#;
+        let result = extractor
+            .extract(Path::new(".oh/knowledge/source.md"), content)
+            .unwrap();
+
+        assert!(
+            result.edges.is_empty(),
+            "a declaration whose target kind disagrees with its URI must not emit an edge"
+        );
     }
 
     #[tokio::test]

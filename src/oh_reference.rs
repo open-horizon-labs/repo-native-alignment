@@ -60,6 +60,7 @@ pub enum OhReferenceKind {
 }
 
 impl OhReferenceKind {
+    /// Returns the canonical URI/frontmatter spelling for this entity kind.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Context => "context",
@@ -71,6 +72,7 @@ impl OhReferenceKind {
         }
     }
 
+    /// Parses a canonical URI/frontmatter kind without accepting aliases.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "context" => Some(Self::Context),
@@ -98,6 +100,7 @@ pub struct OhReference {
 }
 
 impl OhReference {
+    /// Parses and canonicalizes an `oh://v1/<kind>/<id>` reference.
     pub fn parse(value: &str) -> Result<Self> {
         let remainder = value
             .strip_prefix("oh://v1/")
@@ -135,6 +138,7 @@ impl OhReference {
     }
 }
 
+/// Percent-decodes one URI path segment and rejects malformed UTF-8.
 fn percent_decode(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -156,6 +160,7 @@ fn percent_decode(value: &str) -> Result<String> {
     String::from_utf8(decoded).context("OH reference identifier is not UTF-8")
 }
 
+/// Converts one ASCII hexadecimal digit to its numeric value.
 fn hex(byte: u8) -> Result<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -165,6 +170,7 @@ fn hex(byte: u8) -> Result<u8> {
     }
 }
 
+/// Encodes an OH identifier using the producer's URI component rules.
 fn percent_encode(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
@@ -219,6 +225,7 @@ pub struct AdvisoryResolution {
 }
 
 impl AdvisoryResolution {
+    /// Builds a result that contains no cached or network-derived metadata.
     fn state_only(reference: impl Into<String>, state: AdvisoryState) -> Self {
         Self {
             reference: reference.into(),
@@ -264,6 +271,7 @@ impl Default for ResolutionCache {
 }
 
 impl ResolutionCache {
+    /// Loads and validates a private, size-bounded cache file.
     fn load(path: &Path) -> Result<Self> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -294,6 +302,7 @@ impl ResolutionCache {
         Ok(cache)
     }
 
+    /// Removes the oldest entries until the cache satisfies its hard bound.
     fn prune_to_limit(&mut self) {
         if self.entries.len() <= MAX_CACHE_ENTRIES {
             return;
@@ -312,6 +321,7 @@ impl ResolutionCache {
         }
     }
 
+    /// Atomically persists a private cache after enforcing its entry bound.
     fn persist(&mut self, path: &Path) -> Result<()> {
         self.prune_to_limit();
         let parent = path
@@ -358,6 +368,7 @@ impl ResolutionCache {
     }
 }
 
+/// Rejects symlinks, non-files, foreign owners, and permissive Unix modes.
 fn validate_private_regular_file(metadata: &fs::Metadata) -> Result<()> {
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         bail!("OH reference cache must be a regular non-symlink file");
@@ -371,12 +382,14 @@ fn validate_private_regular_file(metadata: &fs::Metadata) -> Result<()> {
 }
 
 #[cfg(unix)]
+/// Returns the effective Unix user ID used for cache ownership checks.
 fn current_effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     unsafe { libc::geteuid() }
 }
 
 #[cfg(unix)]
+/// Enforces current-user ownership and user-only cache permissions.
 fn validate_unix_owner_and_mode(owner: u32, mode: u32, effective_uid: u32) -> Result<()> {
     if owner != effective_uid {
         bail!("OH reference cache is not owned by the current user");
@@ -387,6 +400,7 @@ fn validate_unix_owner_and_mode(owner: u32, mode: u32, effective_uid: u32) -> Re
     Ok(())
 }
 
+/// Creates or verifies the non-symlink, user-private cache directory.
 fn secure_cache_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     let metadata =
@@ -411,6 +425,7 @@ struct CacheLock {
 }
 
 impl CacheLock {
+    /// Acquires the cross-process cache lock within a bounded wait.
     async fn acquire(cache_path: &Path) -> Result<Self> {
         let parent = cache_path
             .parent()
@@ -468,6 +483,7 @@ pub struct TransportResponse {
 
 #[async_trait]
 pub trait ReferenceTransport: Send + Sync {
+    /// Resolves one canonical identity without sending repository content.
     async fn resolve(
         &self,
         endpoint: &str,
@@ -483,6 +499,7 @@ pub struct ReqwestReferenceTransport {
 }
 
 impl Default for ReqwestReferenceTransport {
+    /// Builds the bounded, no-redirect HTTP client used for identity lookup.
     fn default() -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -506,6 +523,7 @@ struct ResolverRequest<'a> {
 
 #[async_trait]
 impl ReferenceTransport for ReqwestReferenceTransport {
+    /// Sends the minimal resolver request and bounds the response body.
     async fn resolve(
         &self,
         endpoint: &str,
@@ -553,6 +571,7 @@ impl ReferenceTransport for ReqwestReferenceTransport {
     }
 }
 
+/// Checks the retained API-key shape without logging or persisting it.
 fn validate_api_key(api_key: &str) -> Result<()> {
     if !api_key.starts_with("ak_") || api_key.chars().any(char::is_whitespace) {
         bail!("Open Horizons API key is not a valid existing ak_ credential");
@@ -560,6 +579,7 @@ fn validate_api_key(api_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates resolver URL syntax and the HTTPS-or-loopback transport rule.
 fn validated_resolver_url(endpoint: &str) -> Result<reqwest::Url> {
     let endpoint = reqwest::Url::parse(endpoint).context("invalid OH resolver URL")?;
     if !matches!(endpoint.scheme(), "http" | "https")
@@ -570,14 +590,25 @@ fn validated_resolver_url(endpoint: &str) -> Result<reqwest::Url> {
     {
         bail!("OH resolver URL must be an http(s) URL without credentials, query, or fragment");
     }
-    if endpoint.scheme() != "https"
-        && !matches!(endpoint.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
-    {
+    if endpoint.scheme() != "https" && !resolver_host_is_loopback(&endpoint) {
         bail!("OH resolver URL must use HTTPS except on loopback");
     }
     Ok(endpoint)
 }
 
+/// Recognizes loopback URL hosts without depending on their serialized form.
+///
+/// In particular, `Url::host_str()` retains brackets around IPv6 literals,
+/// while `Url::host()` exposes the parsed address for a reliable `::1` check.
+fn resolver_host_is_loopback(endpoint: &reqwest::Url) -> bool {
+    endpoint.host().is_some_and(|host| match host {
+        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    })
+}
+
+/// Produces the stable endpoint identity used to isolate authorized caches.
 fn normalized_resolver_endpoint(endpoint: &str) -> Result<String> {
     let mut endpoint = validated_resolver_url(endpoint)?;
     if endpoint.path() != "/" {
@@ -587,10 +618,12 @@ fn normalized_resolver_endpoint(endpoint: &str) -> Result<String> {
     Ok(endpoint.to_string())
 }
 
+/// Returns a lowercase SHA-256 digest for cache namespace derivation.
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Derives a repo-, authority-, credential-, and user-isolated cache path.
 fn authorized_cache_path(
     repo_root: &Path,
     endpoint: Option<&str>,
@@ -630,6 +663,7 @@ pub struct AdvisoryResolver<T> {
 }
 
 impl<T: ReferenceTransport> AdvisoryResolver<T> {
+    /// Constructs a resolver using the platform user-cache directory.
     pub fn new(
         transport: T,
         endpoint: Option<String>,
@@ -640,6 +674,7 @@ impl<T: ReferenceTransport> AdvisoryResolver<T> {
         Self::new_with_cache_base(transport, endpoint, api_key, repo_root, cache_ttl, None)
     }
 
+    /// Constructs a resolver with an explicit cache base for isolated tests.
     fn new_with_cache_base(
         transport: T,
         endpoint: Option<String>,
@@ -665,6 +700,7 @@ impl<T: ReferenceTransport> AdvisoryResolver<T> {
         }
     }
 
+    /// Resolves one identity using the current wall-clock timestamp.
     pub async fn resolve(
         &self,
         uri: &str,
@@ -675,6 +711,7 @@ impl<T: ReferenceTransport> AdvisoryResolver<T> {
             .await
     }
 
+    /// Resolves one identity at a supplied timestamp for deterministic policy tests.
     async fn resolve_at(
         &self,
         uri: &str,
@@ -803,6 +840,7 @@ impl<T: ReferenceTransport> AdvisoryResolver<T> {
     }
 }
 
+/// Removes authorization-sensitive cached data after an access denial.
 fn evict_cached_reference(cache: &mut ResolutionCache, path: &Path, reference: &str) {
     if cache.entries.remove(reference).is_none() {
         return;
@@ -831,6 +869,7 @@ struct ResolverSuccess {
     version: u64,
 }
 
+/// Validates a successful resolver projection against the requested identity.
 fn parse_success(
     requested: &OhReference,
     body: &[u8],
@@ -870,6 +909,7 @@ fn parse_success(
     ))
 }
 
+/// Projects a cached record into a fresh, stale, or type-mismatch advisory result.
 fn cached_resolution(
     cache: &ResolutionCache,
     reference: &OhReference,
@@ -898,6 +938,7 @@ fn cached_resolution(
     })
 }
 
+/// Returns the current Unix timestamp, saturating pre-epoch clocks to zero.
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -919,11 +960,13 @@ impl Default for OpenHorizonsReferenceConfig {
     }
 }
 
+/// Supplies the serde/default cache freshness interval.
 const fn default_cache_ttl_seconds() -> u64 {
     DEFAULT_CACHE_TTL_SECONDS
 }
 
 impl OpenHorizonsReferenceConfig {
+    /// Loads optional repository configuration and falls back safely on errors.
     pub fn load(repo_root: &Path) -> Self {
         let path = repo_root.join(".oh/config.toml");
         let Ok(content) = fs::read_to_string(&path) else {
@@ -1074,6 +1117,7 @@ pub async fn resolve_declarations<T: ReferenceTransport>(
     .await
 }
 
+/// Executes a deduplicated batch while preserving per-declaration results.
 async fn resolve_declarations_with_deadline<T: ReferenceTransport>(
     resolver: &AdvisoryResolver<T>,
     declarations: Vec<ReferenceDeclaration>,
@@ -1344,12 +1388,14 @@ pub fn collect_reference_declarations(repo_root: &Path) -> Result<ReferenceDisco
     })
 }
 
+/// Appends a bounded discovery issue without allowing diagnostic floods.
 fn push_issue(issues: &mut Vec<AdvisoryIssue>, issue: AdvisoryIssue) {
     if issues.len() < MAX_DISCOVERY_ISSUES {
         issues.push(issue);
     }
 }
 
+/// Extracts a leading YAML frontmatter block without parsing document bodies.
 fn frontmatter_yaml(content: &str) -> Option<&str> {
     let trimmed = content.trim_start();
     let after = trimmed
@@ -1459,6 +1505,16 @@ mod tests {
             "lifecycle": lifecycle,
             "version": version,
         })
+    }
+
+    #[test]
+    fn resolver_url_allows_ipv4_and_ipv6_loopback_http_only() {
+        assert!(validated_resolver_url("http://localhost:8080/resolve").is_ok());
+        assert!(validated_resolver_url("http://127.0.0.1:8080/resolve").is_ok());
+        assert!(validated_resolver_url("http://[::1]:8080/resolve").is_ok());
+        assert!(validated_resolver_url("http://192.0.2.1:8080/resolve").is_err());
+        assert!(validated_resolver_url("http://[2001:db8::1]:8080/resolve").is_err());
+        assert!(validated_resolver_url("https://resolver.example/resolve").is_ok());
     }
 
     fn resolver(

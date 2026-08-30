@@ -881,46 +881,18 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::ResolveReferences(args)) => {
             init_tracing("warn", log_path.as_deref());
-            use repo_native_alignment::oh_reference::{
-                AdvisoryResolver, OhReferenceKind, OpenHorizonsReferenceConfig,
-                ReqwestReferenceTransport, collect_reference_declarations,
-                preflight_explicit_references, resolve_declarations,
-            };
-
             let repo_root = args.repo.canonicalize()?;
-            let config = OpenHorizonsReferenceConfig::load(&repo_root);
-            let explicit_kind = args
-                .expected_kind
-                .as_deref()
-                .map(|value| {
-                    OhReferenceKind::parse(value).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unsupported --expected-kind {value:?}; expected one of context, endeavor, metis, guardrail, dive_pack, log"
-                        )
-                    })
-                })
-                .transpose()?;
-            let discovery = if args.references.is_empty() {
-                collect_reference_declarations(&repo_root)?
-            } else {
-                preflight_explicit_references(args.references, explicit_kind)
-            };
-            let api_key =
-                std::env::var(repo_native_alignment::oh_reference::DEFAULT_API_KEY_ENV).ok();
-            let endpoint = args.resolver_url.or_else(|| {
-                std::env::var(repo_native_alignment::oh_reference::DEFAULT_RESOLVER_URL_ENV).ok()
-            });
-            let resolver = AdvisoryResolver::new(
-                ReqwestReferenceTransport::default(),
-                endpoint,
-                api_key,
-                &repo_root,
-                std::time::Duration::from_secs(
-                    args.cache_ttl_seconds.unwrap_or(config.cache_ttl_seconds),
-                ),
-            );
-            let output =
-                resolve_declarations(&resolver, discovery, explicit_kind, args.offline).await;
+            let output = repo_native_alignment::service::resolve_references(
+                repo_native_alignment::service::ResolveReferencesParams {
+                    repo_root,
+                    references: args.references,
+                    expected_kind: args.expected_kind,
+                    resolver_url: args.resolver_url,
+                    offline: args.offline,
+                    cache_ttl_seconds: args.cache_ttl_seconds,
+                },
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&output)?);
             return Ok(());
         }

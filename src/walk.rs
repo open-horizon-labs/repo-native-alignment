@@ -60,10 +60,12 @@ pub fn is_worktree_with_own_cache(dir: &Path) -> bool {
     cache_path.is_dir()
 }
 
+/// Walks all matching repository files through gitignore-aware traversal.
 fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     git2_walk_with_limit(repo_root, extensions, usize::MAX)
 }
 
+/// Walks matching git-visible files without materializing more than `limit`.
 fn git2_walk_with_limit(
     repo_root: &Path,
     extensions: &[&str],
@@ -81,6 +83,7 @@ fn git2_walk_with_limit(
     Ok(files)
 }
 
+/// Recurses through one directory using gitignore and symlink boundaries.
 fn walk_dir_git2(
     repo: &git2::Repository,
     dir: &Path,
@@ -147,10 +150,12 @@ fn walk_dir_git2(
     Ok(())
 }
 
+/// Walks all matching files using the fail-safe non-git traversal.
 fn basic_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     basic_walk_with_limit(repo_root, extensions, usize::MAX)
 }
 
+/// Walks matching files with basic exclusions and a hard result bound.
 fn basic_walk_with_limit(
     repo_root: &Path,
     extensions: &[&str],
@@ -162,6 +167,7 @@ fn basic_walk_with_limit(
     Ok(files)
 }
 
+/// Recurses through one directory without following symlinks or build caches.
 fn walk_dir_basic(
     dir: &Path,
     extensions: &[&str],

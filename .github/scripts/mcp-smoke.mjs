@@ -290,6 +290,7 @@ try {
     "search",
     "list_roots",
     "repo_map",
+    "resolve_references",
   ]);
   const seen = new Set(tools.map((t) => t.name));
   for (const name of requiredTools) {
@@ -335,6 +336,31 @@ try {
       contractTerm,
     );
   }
+
+  const resolveResult = await client.callTool({
+    name: "resolve_references",
+    arguments: {
+      repo: repoPath,
+      references: ["oh://v1/context/context-1"],
+      offline: true,
+    },
+  });
+  const resolveText = extractText(resolveResult);
+  assertEqual(
+    "offline resolve_references succeeds through MCP",
+    resolveResult.isError === true,
+    false,
+  );
+  assertContains(
+    "offline resolve_references returns the requested identity",
+    resolveText,
+    "oh://v1/context/context-1",
+  );
+  assertContains(
+    "offline resolve_references reports advisory unavailability",
+    resolveText,
+    '"state": "unavailable"',
+  );
 
   // ── 2. search (with artifacts) ──────────────────────────────────────────
   console.log("\n── search (artifacts) ──");
