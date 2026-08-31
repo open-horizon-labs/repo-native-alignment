@@ -5,7 +5,8 @@
 //! makes it available in both CLI and MCP.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::embed::EmbeddingIndex;
 use crate::server::{EmbeddingStatus, EnrichmentJobRecord, GraphState, LspEnrichmentStatus};
@@ -24,6 +25,68 @@ pub use roots::{list_roots, list_roots_from_slugs, list_roots_from_slugs_read_on
 #[cfg(test)]
 pub use search::search;
 pub use search::{search_delivery, search_result};
+
+/// Interface-neutral inputs for advisory Open Horizons reference resolution.
+#[derive(Clone, Debug, Default)]
+pub struct ResolveReferencesParams {
+    /// Canonical repository root used for declaration discovery and cache isolation.
+    pub repo_root: PathBuf,
+    /// Explicit canonical references; an empty list discovers repository declarations.
+    pub references: Vec<String>,
+    /// Optional expected kind applied to every explicit reference.
+    pub expected_kind: Option<String>,
+    /// Optional resolver endpoint override; otherwise the environment is consulted.
+    pub resolver_url: Option<String>,
+    /// Whether resolution must avoid network access.
+    pub offline: bool,
+    /// Optional cache freshness override in seconds.
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Resolves Open Horizons references using the shared CLI/MCP policy.
+///
+/// This seam owns declaration discovery, kind validation, configuration,
+/// credential lookup, resolver construction, cache freshness, and resolution
+/// so transport adapters cannot drift. Only canonical reference identity and
+/// expected kind can leave the process; graph/source/embedding data never do.
+pub async fn resolve_references(
+    params: ResolveReferencesParams,
+) -> anyhow::Result<crate::oh_reference::ResolutionBatch> {
+    use crate::oh_reference::{
+        AdvisoryResolver, OhReferenceKind, OpenHorizonsReferenceConfig, ReqwestReferenceTransport,
+        collect_reference_declarations, preflight_explicit_references, resolve_declarations,
+    };
+
+    let explicit_kind = params
+        .expected_kind
+        .as_deref()
+        .map(|value| {
+            OhReferenceKind::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported expected kind {value:?}; expected context, endeavor, metis, guardrail, dive_pack, or log"
+                )
+            })
+        })
+        .transpose()?;
+    let discovery = if params.references.is_empty() {
+        collect_reference_declarations(&params.repo_root)?
+    } else {
+        preflight_explicit_references(params.references, explicit_kind)
+    };
+    let config = OpenHorizonsReferenceConfig::load(&params.repo_root);
+    let endpoint = params
+        .resolver_url
+        .or_else(|| std::env::var(crate::oh_reference::DEFAULT_RESOLVER_URL_ENV).ok());
+    let api_key = std::env::var(crate::oh_reference::DEFAULT_API_KEY_ENV).ok();
+    let resolver = AdvisoryResolver::new(
+        ReqwestReferenceTransport::default(),
+        endpoint,
+        api_key,
+        &params.repo_root,
+        Duration::from_secs(params.cache_ttl_seconds.unwrap_or(config.cache_ttl_seconds)),
+    );
+    Ok(resolve_declarations(&resolver, discovery, explicit_kind, params.offline).await)
+}
 
 pub const CONVERGENCE_GUIDANCE: &str = "Convergence requires two or more explicitly bound source `nodes`, optional downstream `before`, and `direction`, `edge_types`, and `depth`; discover readable symbols and verify that any boundary is reachable under the same direction and edge filter, bind them through convergence resolution, then execute the returned stable IDs. Ambiguous, unresolved, coverage-unknown, unreachable-boundary, or empty-proof results never inject context and never fall back to lexical search.";
 
@@ -226,6 +289,46 @@ mod tests {
     use super::*;
     use crate::server::tools::Search;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn shared_reference_service_resolves_explicit_offline_input_advisorially() {
+        let repo = tempfile::tempdir().unwrap();
+        let output = resolve_references(ResolveReferencesParams {
+            repo_root: repo.path().to_path_buf(),
+            references: vec!["oh://v1/context/context-service".to_string()],
+            expected_kind: Some("context".to_string()),
+            offline: true,
+            ..ResolveReferencesParams::default()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(output.resolutions.len(), 1);
+        assert_eq!(
+            output.resolutions[0].resolution.state,
+            crate::oh_reference::AdvisoryState::Unavailable
+        );
+        assert_eq!(
+            output.resolutions[0].resolution.reference,
+            "oh://v1/context/context-service"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_reference_service_rejects_an_unsupported_expected_kind() {
+        let repo = tempfile::tempdir().unwrap();
+        let error = resolve_references(ResolveReferencesParams {
+            repo_root: repo.path().to_path_buf(),
+            references: vec!["oh://v1/context/context-service".to_string()],
+            expected_kind: Some("claim".to_string()),
+            offline: true,
+            ..ResolveReferencesParams::default()
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported expected kind"));
+    }
 
     #[test]
     fn from_mcp_search_treats_blank_mode_as_absent() {

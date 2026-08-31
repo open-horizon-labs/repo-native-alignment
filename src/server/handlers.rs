@@ -29,8 +29,8 @@ use crate::embed::SearchMode;
 use crate::graph::EdgeKind;
 use crate::graph::index::GraphIndex;
 use crate::service::{
-    OutcomeProgressContext, OutcomeProgressParams, RepoMapContext, RepoMapParams, SearchContext,
-    SearchParams,
+    OutcomeProgressContext, OutcomeProgressParams, RepoMapContext, RepoMapParams,
+    ResolveReferencesParams, SearchContext, SearchParams,
 };
 
 pub(crate) struct SearchToolDelivery {
@@ -52,9 +52,58 @@ use super::ScanEnrichmentOptions;
 use super::helpers::text_result;
 use super::state::GraphState;
 use super::store::{load_graph_from_lance, persist_graph_to_lance};
-use super::tools::{OutcomeProgress, RepoMap, Search};
+use super::tools::{OutcomeProgress, RepoMap, ResolveReferences, Search};
 
 impl RnaHandler {
+    /// Adapts MCP inputs to the shared advisory reference-resolution service.
+    pub(crate) async fn handle_resolve_references(
+        &self,
+        args: ResolveReferences,
+    ) -> Result<CallToolResult, CallToolError> {
+        let repo_root = match Self::non_blank_arg(args.repo.as_deref()) {
+            Some(repo) => {
+                let path = PathBuf::from(repo);
+                if !path.is_absolute() {
+                    return Err(CallToolError::from_message(
+                        "resolve_references repo must be an absolute path".to_string(),
+                    ));
+                }
+                path.canonicalize().map_err(|error| {
+                    CallToolError::from_message(format!(
+                        "cannot resolve repository path {repo:?}: {error}"
+                    ))
+                })?
+            }
+            None => self
+                .repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| self.repo_root.clone()),
+        };
+        let server_root = self
+            .repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_root.clone());
+        if self.cache_only && repo_root != server_root {
+            return Ok(text_result(
+                "cache-only runtime serves only its admitted repository cache".into(),
+            ));
+        }
+        let offline = args.offline.unwrap_or(false) || self.cache_only;
+        let output = crate::service::resolve_references(ResolveReferencesParams {
+            repo_root,
+            references: args.references.unwrap_or_default(),
+            expected_kind: args.expected_kind,
+            resolver_url: None,
+            offline,
+            cache_ttl_seconds: args.cache_ttl_seconds,
+        })
+        .await
+        .map_err(|error| CallToolError::from_message(format!("{error:#}")))?;
+        serde_json::to_string_pretty(&output)
+            .map(text_result)
+            .map_err(|error| CallToolError::from_message(error.to_string()))
+    }
+
     fn search_enrichment_jobs(
         &self,
         repo_root: &std::path::Path,

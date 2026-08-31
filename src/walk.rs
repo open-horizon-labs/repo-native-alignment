@@ -15,6 +15,27 @@ pub fn walk_repo_files(repo_root: &Path, extensions: &[&str]) -> Result<Vec<Path
     }
 }
 
+/// Bounded variant for explicit advisory operations. It visits at most
+/// `limit + 1` matching files so callers can report truncation without first
+/// materializing an unbounded repository inventory.
+pub fn walk_repo_files_bounded(
+    repo_root: &Path,
+    extensions: &[&str],
+    limit: usize,
+) -> Result<(Vec<PathBuf>, bool)> {
+    let probe_limit = limit.saturating_add(1);
+    let mut files = match git2_walk_with_limit(repo_root, extensions, probe_limit) {
+        Ok(files) => files,
+        Err(error) => {
+            tracing::warn!("git2 walk failed, falling back to basic walk: {error}");
+            basic_walk_with_limit(repo_root, extensions, probe_limit)?
+        }
+    };
+    let truncated = files.len() > limit;
+    files.truncate(limit);
+    Ok((files, truncated))
+}
+
 /// Returns `true` if `dir` is a git worktree that maintains its own RNA cache.
 ///
 /// A directory is considered an independently-indexed worktree when both:
@@ -39,7 +60,17 @@ pub fn is_worktree_with_own_cache(dir: &Path) -> bool {
     cache_path.is_dir()
 }
 
+/// Walks all matching repository files through gitignore-aware traversal.
 fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    git2_walk_with_limit(repo_root, extensions, usize::MAX)
+}
+
+/// Walks matching git-visible files without materializing more than `limit`.
+fn git2_walk_with_limit(
+    repo_root: &Path,
+    extensions: &[&str],
+    limit: usize,
+) -> Result<Vec<PathBuf>> {
     let repo = git2::Repository::discover(repo_root)?;
     let workdir = repo
         .workdir()
@@ -47,24 +78,36 @@ fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
         .canonicalize()
         .unwrap_or_else(|_| repo.workdir().expect("checked workdir").to_path_buf());
     let mut files = Vec::new();
-    walk_dir_git2(&repo, repo_root, &workdir, extensions, &mut files)?;
+    walk_dir_git2(&repo, repo_root, &workdir, extensions, &mut files, limit)?;
     files.sort();
     Ok(files)
 }
 
+/// Recurses through one directory using gitignore and symlink boundaries.
 fn walk_dir_git2(
     repo: &git2::Repository,
     dir: &Path,
     git_root: &Path,
     extensions: &[&str],
     files: &mut Vec<PathBuf>,
+    limit: usize,
 ) -> Result<()> {
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
+        if files.len() >= limit {
+            break;
+        }
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+
+        // Never follow repository entries through symlinks. In particular, a
+        // tracked directory symlink must not let advisory discovery escape the
+        // repository and read external Markdown.
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
 
         // Always skip .git
         if name_str == ".git" {
@@ -96,7 +139,7 @@ fn walk_dir_git2(
                 tracing::info!("skipping worktree {}: has own RNA cache", path.display());
                 continue;
             }
-            walk_dir_git2(repo, &path, git_root, extensions, files)?;
+            walk_dir_git2(repo, &path, git_root, extensions, files, limit)?;
         } else if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
@@ -107,16 +150,35 @@ fn walk_dir_git2(
     Ok(())
 }
 
+/// Walks all matching files using the fail-safe non-git traversal.
 fn basic_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    basic_walk_with_limit(repo_root, extensions, usize::MAX)
+}
+
+/// Walks matching files with basic exclusions and a hard result bound.
+fn basic_walk_with_limit(
+    repo_root: &Path,
+    extensions: &[&str],
+    limit: usize,
+) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    walk_dir_basic(repo_root, extensions, &mut files)?;
+    walk_dir_basic(repo_root, extensions, &mut files, limit)?;
     files.sort();
     Ok(files)
 }
 
-fn walk_dir_basic(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> Result<()> {
+/// Recurses through one directory without following symlinks or build caches.
+fn walk_dir_basic(
+    dir: &Path,
+    extensions: &[&str],
+    files: &mut Vec<PathBuf>,
+    limit: usize,
+) -> Result<()> {
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
+        if files.len() >= limit {
+            break;
+        }
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
@@ -142,7 +204,7 @@ fn walk_dir_basic(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
                 tracing::info!("skipping worktree {}: has own RNA cache", path.display());
                 continue;
             }
-            walk_dir_basic(&path, extensions, files)?;
+            walk_dir_basic(&path, extensions, files, limit)?;
         } else if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))

@@ -108,12 +108,36 @@ pub struct OutcomeProgress {
     pub repo: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "resolve_references",
+    description = "Advisory-resolve canonical Open Horizons oh://v1 references using the existing API-key environment. Omit references to discover local rna.relationships target.uri declarations. This sends only identity + expected kind, never graph/source/embeddings/outbox, and never gates local workflows."
+)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveReferences {
+    /// Canonical oh://v1 references. Omit or pass [] to discover declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<String>>,
+    /// Expected entity kind for explicit references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_kind: Option<String>,
+    /// Use only cache evidence matching the configured endpoint/API key; never contact OH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+    /// Override cache freshness qualification in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+    /// Absolute repository/worktree path; defaults to the server repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
 // ── Unified search tool ─────────────────────────────────────────────
 // Unified search tool combining flat symbol search and graph traversal.
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Ordinary search defaults to the concise `agent` projection; request `projection: evidence` for audit detail. Graph modes include neighbors/impact/reachable/tests_for/cycles/path/convergence. For convergence: discover readable source symbols and verify that any downstream boundary is reachable under the same direction and edge filter; then call mode=\"convergence\" with two or more source `nodes`, optional `before`, plus `direction`, `edge_types`, and `depth`. Omit `repo` for the server's configured repository; repository names mentioned in a task are not `repo` values, and any explicit value must be an absolute path. RNA binds selectors to exact stable IDs or returns sorted ambiguity/unresolved status; only a coverage-ready nonempty witness proof is injectable. Example: mode=\"convergence\", nodes=[\"Request.prepare\",\"Session.prepare_request\"], before=\"PreparedRequest.prepare_method\", direction=\"outgoing\", edge_types=[\"calls\"], depth=6. Bound responses with max_output_bytes/max_output_tokens and source with body limits."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Ordinary search defaults to the concise `agent` projection; request `projection: evidence` for audit detail. Opt into bounded role-based context with `context_mode: task` or experimental `context_mode: graph-delta-beta`. Graph modes include neighbors/impact/reachable/tests_for/cycles/path/convergence. For convergence: discover readable source symbols and verify that any downstream boundary is reachable under the same direction and edge filter; then call mode=\"convergence\" with two or more source `nodes`, optional `before`, plus `direction`, `edge_types`, and `depth`. Omit `repo` for the server's configured repository; repository names mentioned in a task are not `repo` values, and any explicit value must be an absolute path. RNA binds selectors to exact stable IDs or returns sorted ambiguity/unresolved status; only a coverage-ready nonempty witness proof is injectable. Example: mode=\"convergence\", nodes=[\"Request.prepare\",\"Session.prepare_request\"], before=\"PreparedRequest.prepare_method\", direction=\"outgoing\", edge_types=[\"calls\"], depth=6. Bound responses with max_output_bytes/max_output_tokens and source with body limits."
 )]
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -432,9 +456,15 @@ mod tests {
         assert_eq!(search.mode.as_deref(), Some("convergence"));
         assert_eq!(
             search.nodes,
-            Some(vec!["Request.prepare".into(), "Session.prepare_request".into()])
+            Some(vec![
+                "Request.prepare".into(),
+                "Session.prepare_request".into()
+            ])
         );
-        assert_eq!(search.before.as_deref(), Some("PreparedRequest.prepare_method"));
+        assert_eq!(
+            search.before.as_deref(),
+            Some("PreparedRequest.prepare_method")
+        );
 
         let error = parse_convergence(json!({
             "nodes": ["Request.prepare", "Session.prepare_request"],
@@ -1193,5 +1223,4 @@ mod tests {
         assert_eq!(s.depth, Some(2));
         assert_eq!(s.min_complexity, Some(5));
     }
-
 }

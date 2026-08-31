@@ -1156,8 +1156,13 @@ struct LocalKnowledgeTarget {
     name: Option<String>,
     #[serde(default)]
     file: Option<String>,
+    /// Stable authorized Open Horizons identity. Mutually exclusive with the
+    /// existing local `id`/`name` + optional `file` target form.
+    #[serde(default)]
+    uri: Option<String>,
 }
 
+/// Emits local knowledge nodes and advisory relationship candidates from frontmatter.
 fn emit_local_knowledge_graph(
     path: &Path,
     content: &str,
@@ -1215,42 +1220,76 @@ fn emit_local_knowledge_graph(
         if relationship.target.kind.trim().is_empty() {
             continue;
         }
-        let Some(target_id) = relationship
-            .target
-            .id
-            .as_deref()
-            .or(relationship.target.name.as_deref())
-            .map(str::trim)
-        else {
-            continue;
-        };
-        if target_id.is_empty() {
-            continue;
-        }
-
-        let target_file = match relationship.target.file.as_deref() {
-            Some(declared_file) => {
-                let declared_file = declared_file.trim();
-                if declared_file.is_empty() {
-                    continue;
-                }
-                let declared_file = Path::new(declared_file);
-                if declared_file.is_absolute() {
-                    continue;
-                }
-                let normalized = normalize_path(declared_file);
-                if matches!(
-                    normalized.components().next(),
-                    Some(std::path::Component::ParentDir)
-                ) {
-                    continue;
-                }
-                normalized
+        let (target_node, rule_id) = if let Some(uri) = relationship.target.uri.as_deref() {
+            // Cloud identity remains a local placeholder target. Resolution is
+            // an explicit advisory operation; extraction never performs I/O.
+            // Keeping the URI as the stable node name preserves rename/archive
+            // identity without synchronizing either system's graph.
+            if relationship.target.id.is_some()
+                || relationship.target.name.is_some()
+                || relationship.target.file.is_some()
+            {
+                continue;
             }
-            None => path.to_path_buf(),
+            let Ok(reference) = crate::oh_reference::OhReference::parse(uri.trim()) else {
+                continue;
+            };
+            if relationship.target.kind.trim() != reference.kind.as_str() {
+                continue;
+            }
+            (
+                NodeId {
+                    root: String::new(),
+                    file: PathBuf::from(".oh/external/open-horizons-v1"),
+                    name: reference.uri,
+                    kind: NodeKind::Other(reference.kind.as_str().to_string()),
+                },
+                "frontmatter-oh-reference-candidate@1",
+            )
+        } else {
+            let Some(target_id) = relationship
+                .target
+                .id
+                .as_deref()
+                .or(relationship.target.name.as_deref())
+                .map(str::trim)
+            else {
+                continue;
+            };
+            if target_id.is_empty() {
+                continue;
+            }
+
+            let target_file = match relationship.target.file.as_deref() {
+                Some(declared_file) => {
+                    let declared_file = declared_file.trim();
+                    if declared_file.is_empty() {
+                        continue;
+                    }
+                    let declared_file = Path::new(declared_file);
+                    if declared_file.is_absolute() {
+                        continue;
+                    }
+                    let normalized = normalize_path(declared_file);
+                    if matches!(
+                        normalized.components().next(),
+                        Some(std::path::Component::ParentDir)
+                    ) {
+                        continue;
+                    }
+                    normalized
+                }
+                None => path.to_path_buf(),
+            };
+            (
+                local_knowledge_node_id(
+                    &target_file,
+                    relationship.target.kind.trim(),
+                    target_id,
+                ),
+                "frontmatter-candidate@1",
+            )
         };
-        let target_node =
-            local_knowledge_node_id(&target_file, relationship.target.kind.trim(), target_id);
         // Frontmatter nominates a candidate but is never relationship truth.
         // #715's pack rules may attach validated body evidence later.
         let confidence = Confidence::Detected;
@@ -1264,7 +1303,7 @@ fn emit_local_knowledge_graph(
                 selectors: Vec::new(),
                 extractor_id: MARKDOWN_EXTRACTOR_ID.into(),
                 pack_id: None,
-                rule_id: "frontmatter-candidate@1".into(),
+                rule_id: rule_id.into(),
                 confidence: Confidence::Detected,
                 validation_status: ValidationStatus::Invalid,
                 diagnostics: vec![EvidenceDiagnostic {
@@ -1599,6 +1638,87 @@ When a measure becomes a target, it ceases to be a good measure.
         assert!(
             !edges_by_kind.contains_key("escapes_repo"),
             "repo-local relationship targets must not escape the repository"
+        );
+    }
+
+    #[test]
+    fn test_markdown_local_knowledge_supports_oh_uri_without_changing_local_targets() {
+        let extractor = MarkdownExtractor::new();
+        let content = r#"---
+rna:
+  kind: claim
+  id: claim.local
+  relationships:
+    - kind: informs
+      target:
+        kind: endeavor
+        uri: oh://v1/endeavor/endeavor%3Ashared%3A1
+    - kind: supports
+      target:
+        kind: claim
+        id: claim.local-target
+        file: .oh/knowledge/local.md
+---
+
+# Local claim
+
+The reference is advisory.
+"#;
+        let result = extractor
+            .extract(Path::new(".oh/knowledge/source.md"), content)
+            .unwrap();
+
+        let external = result
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Other("informs".into()))
+            .expect("OH reference edge");
+        assert_eq!(
+            external.to.name,
+            "oh://v1/endeavor/endeavor%3Ashared%3A1"
+        );
+        assert_eq!(
+            external.to.file,
+            PathBuf::from(".oh/external/open-horizons-v1")
+        );
+        assert!(matches!(&external.to.kind, NodeKind::Other(kind) if kind == "endeavor"));
+        assert_eq!(
+            external.evidence[0].rule_id,
+            "frontmatter-oh-reference-candidate@1"
+        );
+
+        let local = result
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Other("supports".into()))
+            .expect("existing local reference edge");
+        assert_eq!(local.to.name, "claim.local-target");
+        assert_eq!(local.to.file, PathBuf::from(".oh/knowledge/local.md"));
+    }
+
+    #[test]
+    fn test_markdown_local_knowledge_rejects_oh_uri_kind_mismatch() {
+        let extractor = MarkdownExtractor::new();
+        let content = r#"---
+rna:
+  kind: claim
+  id: claim.local
+  relationships:
+    - kind: informs
+      target:
+        kind: claim
+        uri: oh://v1/endeavor/endeavor%3Ashared%3A1
+---
+
+# Local claim
+"#;
+        let result = extractor
+            .extract(Path::new(".oh/knowledge/source.md"), content)
+            .unwrap();
+
+        assert!(
+            result.edges.is_empty(),
+            "a declaration whose target kind disagrees with its URI must not emit an edge"
         );
     }
 

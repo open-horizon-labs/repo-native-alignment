@@ -537,6 +537,7 @@ impl RnaHandler {
         };
 
         if params.name != "list_roots"
+            && params.name != "resolve_references"
             && let Some(building_msg) = self.cold_start_building_message()
         {
             return Ok(helpers::text_result(building_msg));
@@ -575,6 +576,10 @@ impl RnaHandler {
             "repo_map" => {
                 let args: RepoMap = parse_args(params.arguments)?;
                 self.handle_repo_map(args).await
+            }
+            "resolve_references" => {
+                let args: ResolveReferences = parse_args(params.arguments)?;
+                self.handle_resolve_references(args).await
             }
             _ => Err(CallToolError::unknown_tool(&params.name)),
         };
@@ -621,6 +626,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 Convergence::tool(),
                 ListRoots::tool(),
                 RepoMap::tool(),
+                ResolveReferences::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -678,6 +684,79 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_references_is_graph_independent_and_offline_non_blocking() {
+        let repo = tempfile::tempdir().unwrap();
+        let handler = RnaHandler {
+            repo_root: repo.path().to_path_buf(),
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        // Deliberately do not build/install a graph. The advisory reference
+        // tool must remain available during cold start and offline use.
+        let result = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "resolve_references".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "references": ["oh://v1/context/context-1"],
+                        "offline": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let text = call_tool_text(&result);
+        assert!(text.contains("\"state\": \"unavailable\""), "{text}");
+        assert!(text.contains("oh://v1/context/context-1"), "{text}");
+        assert!(!text.contains("Index is building"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn resolve_references_mcp_preflight_bounds_count_and_raw_values() {
+        let repo = tempfile::tempdir().unwrap();
+        let handler = RnaHandler {
+            repo_root: repo.path().to_path_buf(),
+            business_context: crate::business_context::BusinessContextAdmission::new(
+                crate::business_context::BusinessContextMode::Disabled,
+            ),
+            ..RnaHandler::default()
+        };
+        let raw_secret = "mcp-raw-secret".repeat(1_000);
+        let mut references = vec![raw_secret.clone()];
+        references.extend((0..300).map(|index| format!("oh://v1/context/context-mcp-{index}")));
+        let result = handler
+            .dispatch_call_tool_request(CallToolRequestParams {
+                name: "resolve_references".into(),
+                meta: None,
+                task: None,
+                arguments: Some(
+                    serde_json::json!({
+                        "references": references,
+                        "offline": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            })
+            .await
+            .unwrap();
+        let text = call_tool_text(&result);
+        assert!(!text.contains(&raw_secret));
+        assert!(text.contains("oversize_reference"), "{text}");
+        assert!(text.contains("declaration_limit"), "{text}");
+        assert!(text.contains("\"truncated\": true"), "{text}");
+        assert!(text.len() < 128 * 1024, "{}", text.len());
     }
 
     #[tokio::test]
