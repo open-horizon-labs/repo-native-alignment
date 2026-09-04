@@ -1,3 +1,8 @@
+---
+ship_pr: 866
+issue: 865
+---
+
 ## Ship Pipeline — PR #866
 **Started:** 2026-09-04
 
@@ -26,6 +31,9 @@ Fixed configured reindex execution, added runtime diagnostics through embedding 
 
 ### Step 4: Regression Oracle
 Added a real temporary-repository configuration test covering backend, CUDA ordinal, fallback, and batch parsing; removed the misleading empty CUDA validation branch. Existing full no-default tests pass; embedding-feature test execution remains blocked by host OpenSSL prerequisites.
+
+### Step 10b: Final comment sweep (in progress)
+CodeRabbit findings verified. Fixed stale session wording, added session frontmatter, made configuration I/O fail closed, bounded CUDA ordinal conversion, and moved embedding runtime rendering into the shared roots service. Identity/reuse and NUC execution evidence remain under final review; no CUDA execution claim is made.
 
 ### Step 7a: Manual verification
 Full no-default tests and default compile passed. `nvidia-smi` sees an RTX 3060 Ti, but no CUDA/cuDNN runtime libraries or `nvcc` are available; this is hardware presence only, not execution evidence. Embedding-feature build and MCP smoke are blocked by missing OpenSSL development files and local MCP SDK package respectively.

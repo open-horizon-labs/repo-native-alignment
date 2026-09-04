@@ -947,8 +947,10 @@ fn new_model_with_config(
     if config.backend == EmbeddingBackend::Cuda {
         #[cfg(feature = "cuda")]
         {
+            let device_id = i32::try_from(config.cuda_device)
+                .context("CUDA device ordinal exceeds the supported i32 range")?;
             let provider = ort::execution_providers::CUDA::default()
-                .with_device_id(config.cuda_device as i32)
+                .with_device_id(device_id)
                 .build()
                 .error_on_failure();
             let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)

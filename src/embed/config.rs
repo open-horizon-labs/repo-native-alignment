@@ -64,9 +64,9 @@ impl Default for EmbeddingConfig {
 
 impl EmbeddingConfig {
     pub fn from_repo(repo_root: &Path) -> Result<Self> {
-        let mut config: Self = std::fs::read_to_string(repo_root.join(".oh/config.toml"))
-            .ok()
-            .map(|content| {
+        let path = repo_root.join(".oh/config.toml");
+        let mut config: Self = match std::fs::read_to_string(&path) {
+            Ok(content) => {
                 let value: toml::Value =
                     toml::from_str(&content).context("invalid .oh/config.toml")?;
                 let table = value
@@ -75,10 +75,11 @@ impl EmbeddingConfig {
                     .unwrap_or(toml::Value::Table(Default::default()));
                 table
                     .try_into()
-                    .context("invalid [embeddings] configuration")
-            })
-            .transpose()?
-            .unwrap_or_default();
+                    .context("invalid [embeddings] configuration")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => return Err(error).with_context(|| format!("failed to read {}", path.display())),
+        };
         config.apply_environment()?;
         config.validate()?;
         Ok(config)
@@ -113,6 +114,9 @@ impl EmbeddingConfig {
     pub fn validate(&self) -> Result<()> {
         if self.batch_size == Some(0) {
             bail!("embedding batch_size must be greater than zero");
+        }
+        if self.cuda_device > i32::MAX as usize {
+            bail!("embedding cuda_device {} exceeds the supported i32 range", self.cuda_device);
         }
         Ok(())
     }

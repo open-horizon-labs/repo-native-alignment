@@ -413,6 +413,7 @@ fn list_roots_from_slugs_with_report_recovery(
         total,
         lines.join("\n")
     );
+    out.push_str(&embedding_runtime_line(repo_root));
     out.push_str(&crate::extract::lsp::work_items::render_queue_snapshots_markdown(repo_root, 3));
     if recover_stale_reports {
         out.push_str(
@@ -426,6 +427,37 @@ fn list_roots_from_slugs_with_report_recovery(
         );
     }
     out
+}
+
+#[cfg(feature = "embeddings")]
+fn embedding_runtime_line(repo_root: &Path) -> String {
+    match crate::embed::config::EmbeddingConfig::from_repo(repo_root) {
+        Ok(config) => {
+            let observed = crate::embed::generation::load_current_generation(repo_root)
+                .ok()
+                .flatten()
+                .map(|(_, manifest, _, _)| {
+                    format!(
+                        "effective_backend={} provider={} device_index={}",
+                        manifest.device_attestation.observed_device,
+                        manifest.device_attestation.backend,
+                        manifest.device_attestation.device_index.map_or_else(|| "none".to_string(), |n| n.to_string()),
+                    )
+                })
+                .unwrap_or_else(|| "effective_backend=not_attested".to_string());
+            format!(
+                "\n\n### Embedding runtime\n\n- requested_backend={} cuda_device={} fallback={} batch_size={} {}",
+                config.backend, config.cuda_device, config.fallback,
+                config.batch_size.map_or_else(|| "adaptive".to_string(), |n| n.to_string()), observed,
+            )
+        }
+        Err(error) => format!("\n\n### Embedding runtime\n\n- configuration_error={error}"),
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn embedding_runtime_line(_repo_root: &Path) -> String {
+    String::new()
 }
 
 /// Returns true if the given LSP server binary is relevant for any of the languages present in a root.
