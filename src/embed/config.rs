@@ -114,8 +114,6 @@ impl EmbeddingConfig {
         if self.batch_size == Some(0) {
             bail!("embedding batch_size must be greater than zero");
         }
-        if self.backend == EmbeddingBackend::Cuda && self.fallback == FallbackPolicy::Cpu { /* explicit CUDA is always strict */
-        }
         Ok(())
     }
 
@@ -176,5 +174,21 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn repository_configuration_controls_backend_device_fallback_and_batch() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".oh")).unwrap();
+        std::fs::write(
+            repo.path().join(".oh/config.toml"),
+            "[embeddings]\nbackend = 'cuda'\ncuda_device = 1\nfallback = 'error'\nbatch_size = 32\n",
+        )
+        .unwrap();
+        let config = EmbeddingConfig::from_repo(repo.path()).unwrap();
+        assert_eq!(config.backend, EmbeddingBackend::Cuda);
+        assert_eq!(config.cuda_device, 1);
+        assert_eq!(config.fallback, FallbackPolicy::Error);
+        assert_eq!(config.batch_size, Some(32));
     }
 }

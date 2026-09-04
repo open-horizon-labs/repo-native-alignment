@@ -22,3 +22,6 @@ PR #866 / issue #865, branch `865-cuda-embeddings`, head `c5462e5`. Worktree ind
 
 ### Step 3: Fix
 Fixed configured reindex execution, added runtime diagnostics through embedding status, operation reports, search, and list_roots, corrected semantic-bundle type inference, and declared the `cuda` RustSec reachability scope. Default-feature compile and full no-default test suite pass. Embeddings-feature compile is blocked on host OpenSSL development libraries; no CUDA execution claim is made.
+
+### Step 4: Regression Oracle
+Added a real temporary-repository configuration test covering backend, CUDA ordinal, fallback, and batch parsing; removed the misleading empty CUDA validation branch. Existing full no-default tests pass; embedding-feature test execution remains blocked by host OpenSSL prerequisites.
