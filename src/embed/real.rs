@@ -1116,27 +1116,6 @@ pub fn require_metal_device() -> Result<DeviceAttestation> {
     }
 }
 
-fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
-    if require_metal {
-        return require_metal_device();
-    }
-    #[cfg(feature = "metal")]
-    if let Ok(attestation) = require_metal_device() {
-        return Ok(DeviceAttestation {
-            required_device: "any".to_string(),
-            ..attestation
-        });
-    }
-    let executable = std::env::current_exe().context("failed to resolve running RNA artifact")?;
-    Ok(DeviceAttestation {
-        required_device: "any".to_string(),
-        observed_device: "cpu".to_string(),
-        backend: "candle-cpu".to_string(),
-        device_index: None,
-        artifact_sha256: generation::sha256_file(&executable)?,
-    })
-}
-
 async fn embed_texts_with_config(
     texts: Vec<String>,
     config: &EmbeddingConfig,
@@ -2772,6 +2751,25 @@ impl EmbeddingIndex {
                 .map(|contract| contract.structural_graph_snapshot_digest.clone())
                 .unwrap_or_else(|| target_graph_digest.clone())
         };
+        // Resolve the encoder before identity/reuse planning. Otherwise an
+        // `auto` identity can match a prior generation and reuse vectors
+        // without ever proving which provider would execute this generation.
+        let (resolved_model, resolved_attestation) =
+            new_model_with_config(&self.embedding_config, require_metal)?;
+        flags.insert(
+            "effective_backend".to_string(),
+            resolved_attestation.observed_device.clone(),
+        );
+        flags.insert(
+            "effective_provider".to_string(),
+            resolved_attestation.backend.clone(),
+        );
+        flags.insert(
+            "effective_device_index".to_string(),
+            resolved_attestation
+                .device_index
+                .map_or_else(|| "none".to_string(), |n| n.to_string()),
+        );
         let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
         if require_metal && !generation::semantic_asset_seeding() {
             generation::verify_runtime_encoder_assets()?;
@@ -2904,11 +2902,9 @@ impl EmbeddingIndex {
             purged_rows = purged_row_count,
             "EmbeddingIndex: value-addressed vector plan"
         );
-        let mut device_attestation = attest_available_device(require_metal)?;
+        let mut device_attestation = resolved_attestation;
         if !encoder_inputs.is_empty() {
-            let (mut model, observed_attestation) =
-                new_model_with_config(&self.embedding_config, require_metal)?;
-            device_attestation = observed_attestation;
+            let mut model = resolved_model;
             const ENCODE_BATCH_SIZE: usize = 2048;
             for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
