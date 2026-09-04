@@ -13,7 +13,9 @@ use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
-use crate::embed::config::{EmbeddingBackend, EmbeddingConfig, FallbackPolicy};
+use crate::embed::config::{EmbeddingBackend, EmbeddingConfig};
+#[cfg(feature = "cuda")]
+use crate::embed::config::FallbackPolicy;
 use crate::embed::generation::{
     self, CoverageManifest, CoverageRow, DeviceAttestation, GenerationManifest,
     SemanticBuildContract, SemanticIdentity, SemanticVerificationReceipt,
@@ -1133,9 +1135,13 @@ fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
     })
 }
 
-async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    let mut model = new_model()?;
-    embed_texts_with_model(&mut model, texts, None).await
+async fn embed_texts_with_config(
+    texts: Vec<String>,
+    config: &EmbeddingConfig,
+    require_metal: bool,
+) -> Result<Vec<Vec<f32>>> {
+    let (mut model, _) = new_model_with_config(config, require_metal)?;
+    embed_texts_with_model(&mut model, texts, config.batch_size).await
 }
 
 /// Embed texts using a pre-loaded model. Avoids repeated model initialization
@@ -1786,6 +1792,33 @@ impl SearchResult {
 }
 
 impl EmbeddingIndex {
+    /// Render the requested and observed execution contract for agent-facing
+    /// readiness and operation diagnostics.
+    pub fn runtime_diagnostic(&self) -> String {
+        let config = format!(
+            "requested_backend={} cuda_device={} fallback={} batch_size={}",
+            self.embedding_config.backend,
+            self.embedding_config.cuda_device,
+            self.embedding_config.fallback,
+            self.embedding_config
+                .batch_size
+                .map_or_else(|| "adaptive".to_string(), |n| n.to_string()),
+        );
+        match self.active_generation_manifest() {
+            Some(manifest) => format!(
+                "{} effective_backend={} provider={} device_index={}",
+                config,
+                manifest.device_attestation.observed_device,
+                manifest.device_attestation.backend,
+                manifest
+                    .device_attestation
+                    .device_index
+                    .map_or_else(|| "none".to_string(), |n| n.to_string()),
+            ),
+            None => format!("{} effective_backend=not_attested", config),
+        }
+    }
+
     /// Create or open the currently published immutable semantic generation.
     pub async fn new(repo_root: &Path) -> Result<Self> {
         let require_metal = sealed_semantic_bundle_build();
@@ -2472,7 +2505,8 @@ impl EmbeddingIndex {
         let count = texts.len();
         // Save IDs before they're moved into Arrow arrays — needed for delete-before-add.
         let ids_for_delete: Vec<String> = ids.clone();
-        let embeddings = embed_texts(texts).await?;
+        let embeddings =
+            embed_texts_with_config(texts, &self.embedding_config, self.require_metal).await?;
         let dim = embeddings[0].len();
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
 

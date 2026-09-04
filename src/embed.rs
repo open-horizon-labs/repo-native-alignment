@@ -229,6 +229,10 @@ pub struct EmbeddingIndex;
 
 #[cfg(not(feature = "embeddings"))]
 impl EmbeddingIndex {
+    pub fn runtime_diagnostic(&self) -> String {
+        "requested_backend=unavailable effective_backend=unavailable (built without embeddings feature)".to_string()
+    }
+
     pub async fn new(_repo_root: &Path) -> Result<Self> {
         Ok(Self)
     }

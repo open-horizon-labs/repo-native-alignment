@@ -390,6 +390,7 @@ pub struct EmbeddingStatus {
     completed_count: std::sync::atomic::AtomicUsize,
     last_error: std::sync::Mutex<Option<String>>,
     verified_generation: std::sync::Mutex<Option<SemanticGenerationReadiness>>,
+    runtime_diagnostic: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for EmbeddingStatus {
@@ -401,11 +402,20 @@ impl Default for EmbeddingStatus {
             completed_count: std::sync::atomic::AtomicUsize::new(0),
             last_error: std::sync::Mutex::new(None),
             verified_generation: std::sync::Mutex::new(None),
+            runtime_diagnostic: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl EmbeddingStatus {
+    pub fn set_runtime_diagnostic(&self, diagnostic: impl Into<String>) {
+        *self.runtime_diagnostic.lock().unwrap() = Some(diagnostic.into());
+    }
+
+    pub fn runtime_diagnostic(&self) -> Option<String> {
+        self.runtime_diagnostic.lock().unwrap().clone()
+    }
+
     /// Mark embedding as building with a known total.
     pub fn set_building(&self, total: usize) {
         self.total
@@ -488,7 +498,7 @@ impl EmbeddingStatus {
         semantic_index_available: bool,
     ) -> CapabilityReadiness {
         let verified_generation = self.verified_generation.lock().unwrap().clone();
-        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+        let mut readiness = match self.state.load(std::sync::atomic::Ordering::Acquire) {
             0 if semantic_index_available
                 && sealed_semantic_bundle_build()
                 && verified_generation.is_none() =>
@@ -604,7 +614,11 @@ impl EmbeddingStatus {
                 CapabilityReadinessState::Unavailable,
                 "embedding status is unknown",
             ),
+        };
+        if let Some(runtime) = self.runtime_diagnostic() {
+            readiness.detail = format!("{}; runtime: {}", readiness.detail, runtime);
         }
+        readiness
     }
 
     pub fn footer_segment(&self) -> Option<String> {

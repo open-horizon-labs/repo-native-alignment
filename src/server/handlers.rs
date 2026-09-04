@@ -324,6 +324,9 @@ impl RnaHandler {
         };
         let embed_guard = self.embed_index.load();
         let embed_index = embed_guard.as_ref().as_ref();
+        if let Some(index) = embed_index {
+            self.embed_status.set_runtime_diagnostic(index.runtime_diagnostic());
+        }
         let ctx = SearchContext {
             graph_state: &graph_state,
             embed_index,
@@ -436,7 +439,7 @@ impl RnaHandler {
         let stats_guard = self.scan_stats.read().ok();
         let scan_stats_ref = stats_guard.as_deref();
 
-        let markdown = if self.cache_only {
+        let mut markdown = if self.cache_only {
             crate::service::list_roots_from_slugs_read_only(
                 &self.repo_root,
                 &active_slugs,
@@ -453,6 +456,12 @@ impl RnaHandler {
                 scan_stats_ref,
             )
         };
+        if let Some(index) = self.embed_index.load().as_ref().as_ref() {
+            self.embed_status.set_runtime_diagnostic(index.runtime_diagnostic());
+        }
+        if let Some(runtime) = self.embed_status.runtime_diagnostic() {
+            markdown.push_str(&format!("\n\n### Embedding runtime\n\n- {}", runtime));
+        }
         Ok(text_result(markdown))
     }
 

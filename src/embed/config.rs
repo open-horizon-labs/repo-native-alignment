@@ -64,7 +64,7 @@ impl Default for EmbeddingConfig {
 
 impl EmbeddingConfig {
     pub fn from_repo(repo_root: &Path) -> Result<Self> {
-        let mut config = std::fs::read_to_string(repo_root.join(".oh/config.toml"))
+        let mut config: Self = std::fs::read_to_string(repo_root.join(".oh/config.toml"))
             .ok()
             .map(|content| {
                 let value: toml::Value =
