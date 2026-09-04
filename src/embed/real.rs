@@ -13,6 +13,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
+use crate::embed::config::{EmbeddingBackend, EmbeddingConfig, FallbackPolicy};
 use crate::embed::generation::{
     self, CoverageManifest, CoverageRow, DeviceAttestation, GenerationManifest,
     SemanticBuildContract, SemanticIdentity, SemanticVerificationReceipt,
@@ -901,29 +902,117 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
-    new_model_with_policy(false).map(|(model, _)| model)
+enum EncoderModel {
+    Candle(metal_candle::embeddings::EmbeddingModel),
+    #[cfg(feature = "cuda")]
+    Cuda(fastembed::TextEmbedding),
 }
 
-fn new_model_with_policy(
+fn new_model() -> Result<EncoderModel> {
+    new_model_with_config(&EmbeddingConfig::default(), false).map(|(model, _)| model)
+}
+
+fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
+    let config = EmbeddingConfig::default();
+    new_model_with_config(&config, require_metal)
+}
+
+fn new_model_with_config(
+    config: &EmbeddingConfig,
     require_metal: bool,
-) -> Result<(metal_candle::embeddings::EmbeddingModel, DeviceAttestation)> {
+) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
-    #[cfg(feature = "metal")]
-    let device = match candle_core::Device::new_metal(0) {
-        Ok(device) => device,
-        Err(error) if require_metal => {
-            anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
+    #[cfg(feature = "cuda")]
+    if config.backend == EmbeddingBackend::Auto && !require_metal {
+        let mut cuda_config = config.clone();
+        cuda_config.backend = EmbeddingBackend::Cuda;
+        match new_model_with_config(&cuda_config, false) {
+            Ok(result) => return Ok(result),
+            Err(error) if config.fallback == FallbackPolicy::Error => {
+                anyhow::bail!(
+                    "auto embedding backend could not initialize CUDA and fallback=error: {error}"
+                )
+            }
+            Err(error) => tracing::warn!(
+                "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
+            ),
         }
-        Err(_) => {
-            tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
-            candle_core::Device::Cpu
+    }
+
+    let require_metal = require_metal || config.backend == EmbeddingBackend::Metal;
+
+    if config.backend == EmbeddingBackend::Cuda {
+        #[cfg(feature = "cuda")]
+        {
+            let provider = ort::execution_providers::CUDA::default()
+                .with_device_id(config.cuda_device as i32)
+                .build()
+                .error_on_failure();
+            let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+                .with_execution_providers(vec![provider]);
+            let mut model = fastembed::TextEmbedding::try_new(options).map_err(|error| {
+                anyhow::anyhow!(
+                    "CUDA embedding provider/device initialization failed (device {}): {error}",
+                    config.cuda_device
+                )
+            })?;
+            let probe = model
+                .embed(["rna cuda provider probe"], Some(1))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "CUDA embedding provider probe failed on device {}: {error}",
+                        config.cuda_device
+                    )
+                })?;
+            if probe.len() != 1 || probe[0].len() != EMBEDDING_DIMENSION {
+                anyhow::bail!(
+                    "CUDA embedding probe returned unexpected shape; expected [1, {}]",
+                    EMBEDDING_DIMENSION
+                );
+            }
+            let artifact_sha256 = generation::sha256_file(
+                &std::env::current_exe().context("failed to resolve running RNA artifact")?,
+            )?;
+            let attestation = DeviceAttestation {
+                required_device: "cuda".into(),
+                observed_device: "cuda".into(),
+                backend: "onnxruntime-cuda".into(),
+                device_index: Some(config.cuda_device),
+                artifact_sha256,
+            };
+            tracing::info!(
+                "EmbeddingIndex: MiniLM-L6-v2 ready on CUDA device {} (dim={}) in {:?}",
+                config.cuda_device,
+                EMBEDDING_DIMENSION,
+                start.elapsed()
+            );
+            return Ok((EncoderModel::Cuda(model), attestation));
+        }
+        #[cfg(not(feature = "cuda"))]
+        anyhow::bail!(
+            "CUDA embedding requested but this artifact was built without the `cuda` feature (rebuild with --features cuda)"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    let device = if config.backend == EmbeddingBackend::Cpu {
+        candle_core::Device::Cpu
+    } else {
+        match candle_core::Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) if require_metal => {
+                anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
+            }
+            Err(_) => {
+                tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+                candle_core::Device::Cpu
+            }
         }
     };
     #[cfg(not(feature = "metal"))]
     let device = {
-        if require_metal {
+        if require_metal || config.backend == EmbeddingBackend::Metal {
             anyhow::bail!(
                 "strict embedding execution requires an artifact built with the `metal` feature"
             );
@@ -982,7 +1071,7 @@ fn new_model_with_policy(
                 m.dimension(),
                 start.elapsed()
             );
-            Ok((m, attestation))
+            Ok((EncoderModel::Candle(m), attestation))
         }
         Err(err) => {
             tracing::warn!(
@@ -1045,15 +1134,16 @@ fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
 }
 
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    let model = new_model()?;
-    embed_texts_with_model(&model, texts).await
+    let mut model = new_model()?;
+    embed_texts_with_model(&mut model, texts, None).await
 }
 
 /// Embed texts using a pre-loaded model. Avoids repeated model initialization
 /// when called in a loop (e.g., streaming batch writes in index_all_inner).
 async fn embed_texts_with_model(
-    model: &metal_candle::embeddings::EmbeddingModel,
+    model: &mut EncoderModel,
     texts: Vec<String>,
+    configured_batch_size: Option<usize>,
 ) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
     if total == 0 {
@@ -1074,7 +1164,7 @@ async fn embed_texts_with_model(
     let mut all_embeddings = Vec::with_capacity(total);
     let mut processed = 0usize;
     let mut batch_idx = 0usize;
-    let mut current_batch_size = BATCH_FLOOR;
+    let mut current_batch_size = configured_batch_size.unwrap_or(BATCH_FLOOR);
     let mut rolling_avg: Option<f64> = None;
     const EMA_ALPHA: f64 = 0.3;
 
@@ -1084,12 +1174,20 @@ async fn embed_texts_with_model(
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
-        let tensor = model
-            .encode(&refs)
-            .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
-        let batch_embeddings: Vec<Vec<f32>> = tensor
-            .to_vec2::<f32>()
-            .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
+        let batch_embeddings = match model {
+            EncoderModel::Candle(model) => {
+                let tensor = model
+                    .encode(&refs)
+                    .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?;
+                tensor
+                    .to_vec2::<f32>()
+                    .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {e}"))?
+            }
+            #[cfg(feature = "cuda")]
+            EncoderModel::Cuda(model) => model
+                .embed(&batch, Some(bs))
+                .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?,
+        };
 
         let elapsed_secs = batch_start.elapsed().as_secs_f64();
         let per_item = elapsed_secs / bs as f64;
@@ -1100,12 +1198,14 @@ async fn embed_texts_with_model(
                 // First batch: seed the rolling average
                 rolling_avg = Some(per_item);
                 // Grow for next batch
-                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                current_batch_size = configured_batch_size
+                    .unwrap_or_else(|| (current_batch_size * 2).min(BATCH_CEILING));
             }
             Some(avg) => {
                 if per_item > BACKOFF_THRESHOLD * avg {
                     // Latency spike — halve batch size
-                    current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    current_batch_size = configured_batch_size
+                        .unwrap_or_else(|| (current_batch_size / 2).max(BATCH_FLOOR));
                     tracing::debug!(
                         "EmbeddingIndex: backoff batch_size -> {} (per_item {:.4}s > {:.4}s threshold)",
                         current_batch_size,
@@ -1114,7 +1214,8 @@ async fn embed_texts_with_model(
                     );
                 } else {
                     // Steady — grow batch size
-                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                    current_batch_size = configured_batch_size
+                        .unwrap_or_else(|| (current_batch_size * 2).min(BATCH_CEILING));
                 }
                 // Update EMA
                 rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
@@ -1156,8 +1257,9 @@ pub struct EmbeddingIndex {
     table_name: String,
     repo_root: Arc<PathBuf>,
     require_metal: bool,
+    embedding_config: EmbeddingConfig,
     resident_query_runtime: bool,
-    query_model: Arc<tokio::sync::Mutex<Option<metal_candle::embeddings::EmbeddingModel>>>,
+    query_model: Arc<tokio::sync::Mutex<Option<EncoderModel>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
@@ -1763,6 +1865,12 @@ impl EmbeddingIndex {
         require_metal: bool,
         purpose: GenerationOpenPurpose,
     ) -> Result<Self> {
+        let embedding_config = EmbeddingConfig::from_repo(repo_root)?;
+        if require_metal && embedding_config.backend == EmbeddingBackend::Cuda {
+            anyhow::bail!(
+                "sealed Metal semantic artifacts cannot be served with CUDA configuration"
+            );
+        }
         let expected_asset_digests = if require_metal && !generation::semantic_asset_seeding() {
             let digests = generation::runtime_asset_digests()?;
             let verification_started = std::time::Instant::now();
@@ -1849,6 +1957,7 @@ impl EmbeddingIndex {
             table_name: "artifacts".to_string(),
             repo_root: Arc::new(repo_root.to_path_buf()),
             require_metal,
+            embedding_config,
             resident_query_runtime: purpose == GenerationOpenPurpose::ResidentServing,
             query_model: Arc::new(tokio::sync::Mutex::new(None)),
             _unpublished_scratch: unpublished_scratch,
@@ -1874,7 +1983,7 @@ impl EmbeddingIndex {
 
     async fn initialized_query_model(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<metal_candle::embeddings::EmbeddingModel>>> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<EncoderModel>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
         tracing::info!(
@@ -1884,7 +1993,7 @@ impl EmbeddingIndex {
         );
         if model.is_none() {
             let init_started = std::time::Instant::now();
-            let (loaded, _) = new_model_with_policy(self.require_metal)?;
+            let (loaded, _) = new_model_with_config(&self.embedding_config, self.require_metal)?;
             *model = Some(loaded);
             tracing::info!(
                 target: "rna_query_timing",
@@ -1905,12 +2014,13 @@ impl EmbeddingIndex {
     }
 
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let model = self.initialized_query_model().await?;
+        let mut model = self.initialized_query_model().await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
-                model.as_ref().expect("query model initialized above"),
+                model.as_mut().expect("query model initialized above"),
                 vec![query.to_string()],
+                self.embedding_config.batch_size,
             )
             .await?,
         )?;
@@ -2560,6 +2670,9 @@ impl EmbeddingIndex {
         );
         flags.insert("pr_merge_limit".to_string(), PR_MERGE_LIMIT.to_string());
         flags.insert("require_metal".to_string(), require_metal.to_string());
+        for (name, value) in self.embedding_config.identity_flags() {
+            flags.insert(name.to_string(), value);
+        }
         flags.insert("target_graph_authoritative".to_string(), "true".to_string());
         flags.insert("rerank_required".to_string(), require_metal.to_string());
         flags.insert(
@@ -2757,13 +2870,15 @@ impl EmbeddingIndex {
         );
         let mut device_attestation = attest_available_device(require_metal)?;
         if !encoder_inputs.is_empty() {
-            let (model, observed_attestation) = new_model_with_policy(require_metal)?;
+            let (mut model, observed_attestation) =
+                new_model_with_config(&self.embedding_config, require_metal)?;
             device_attestation = observed_attestation;
             const ENCODE_BATCH_SIZE: usize = 2048;
             for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
-                    &model,
+                    &mut model,
                     batch.iter().map(|input| input.text.to_string()).collect(),
+                    self.embedding_config.batch_size,
                 )
                 .await?;
                 if output.len() != batch.len() {
@@ -3270,7 +3385,7 @@ impl EmbeddingIndex {
 
             // Load model once and reuse across all write batches to avoid
             // repeated heavyweight model initialization.
-            let model = new_model()?;
+            let mut model = new_model()?;
             let mut remaining = to_embed;
             let mut batch_idx = 0usize;
 
@@ -3280,7 +3395,7 @@ impl EmbeddingIndex {
 
                 let batch_texts: Vec<String> =
                     batch_candidates.iter().map(|c| c.text.clone()).collect();
-                let embeddings = embed_texts_with_model(&model, batch_texts).await?;
+                let embeddings = embed_texts_with_model(&mut model, batch_texts, None).await?;
 
                 if embeddings.is_empty() {
                     continue;

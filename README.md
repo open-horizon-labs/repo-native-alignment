@@ -105,7 +105,26 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 
 Release and user-facing verification should use successful GitHub Actions/release artifacts, not a local source build.
 
-Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
+Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal`; for Linux CUDA: `cargo install --locked --path . --features cuda` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
+
+Embedding execution is configured under `[embeddings]` in `.oh/config.toml`:
+
+```toml
+[embeddings]
+backend = "auto"       # auto, cpu, cuda, or metal
+cuda_device = 0
+fallback = "cpu"       # auto fallback policy: cpu or error
+# batch_size = 32       # omit for adaptive batching
+```
+
+`auto` tries CUDA first in a CUDA-enabled build, then preserves the existing
+Metal/CPU selection. `backend = "cuda"` is strict: missing CUDA/cuDNN runtime
+libraries, an unavailable ordinal, provider registration failure, or a failed
+probe aborts indexing/query initialization and never falls back to CPU. The
+equivalent overrides are `RNA_EMBEDDING_BACKEND`, `RNA_CUDA_DEVICE`,
+`RNA_EMBEDDING_FALLBACK`, and `RNA_EMBEDDING_BATCH_SIZE`. CUDA builds use the
+ONNX Runtime CUDA 12 execution provider and require compatible CUDA 12 and
+cuDNN 9 runtime libraries; RNA does not install them.
 
 **Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 

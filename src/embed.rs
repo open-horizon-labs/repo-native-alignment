@@ -2,6 +2,9 @@
 #[path = "embed/real.rs"]
 mod real;
 
+#[cfg(feature = "embeddings")]
+pub mod config;
+
 #[path = "embed/generation.rs"]
 pub mod generation;
 
