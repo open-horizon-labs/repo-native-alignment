@@ -11,7 +11,7 @@ permissions:
 jobs:
   # M4-optimized build first — warms sccache for M1 baseline
   build-fast:
-    runs-on: namespace-profile-tahoe
+    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -35,9 +35,11 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
       - name: Cache Rust
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
@@ -62,7 +64,7 @@ jobs:
   # M1 baseline after M4 (shares sccache for same target triple)
   build-m1:
     needs: build-fast
-    runs-on: namespace-profile-tahoe
+    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -80,8 +82,10 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
@@ -102,7 +106,7 @@ jobs:
 
   # Linux builds in parallel with M4 (no shared cache across architectures)
   build-linux:
-    runs-on: namespace-profile-cached
+    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -120,8 +124,10 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust
+        if: ${{ !contains(runner.labels, 'self-hosted') }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
