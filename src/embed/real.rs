@@ -922,21 +922,10 @@ fn new_model_with_config(
             cuda_config.backend = EmbeddingBackend::Cuda;
             match new_model_with_config(&cuda_config, false) {
                 Ok(result) => return Ok(result),
-                Err(error) if config.fallback == FallbackPolicy::Error => {
-                    anyhow::bail!(
-                        "auto embedding backend could not initialize CUDA and fallback=error forbids fallback: {error}"
-                    );
-                }
                 Err(error) => tracing::warn!(
                     "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
                 ),
             }
-        }
-        #[cfg(not(feature = "cuda"))]
-        if config.fallback == FallbackPolicy::Error {
-            anyhow::bail!(
-                "auto embedding backend requires CUDA support, but this artifact was built without the `cuda` feature and fallback=error forbids fallback"
-            );
         }
     }
 
