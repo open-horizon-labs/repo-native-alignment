@@ -13,9 +13,8 @@ use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
-use crate::embed::config::{EmbeddingBackend, EmbeddingConfig};
-#[cfg(feature = "cuda")]
 use crate::embed::config::FallbackPolicy;
+use crate::embed::config::{EmbeddingBackend, EmbeddingConfig};
 use crate::embed::generation::{
     self, CoverageManifest, CoverageRow, DeviceAttestation, GenerationManifest,
     SemanticBuildContract, SemanticIdentity, SemanticVerificationReceipt,
@@ -925,6 +924,13 @@ fn new_model_with_config(
 ) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
+    #[cfg(not(feature = "cuda"))]
+    if config.backend == EmbeddingBackend::Auto && config.fallback == FallbackPolicy::Error {
+        anyhow::bail!(
+            "auto embedding backend with fallback=error requires an artifact built with the `cuda` feature (rebuild with --features cuda)"
+        );
+    }
+
     #[cfg(feature = "cuda")]
     if config.backend == EmbeddingBackend::Auto && !require_metal {
         let mut cuda_config = config.clone();
@@ -975,6 +981,7 @@ fn new_model_with_config(
                     EMBEDDING_DIMENSION
                 );
             }
+            cuda_runtime_probe(config.cuda_device)?;
             let artifact_sha256 = generation::sha256_file(
                 &std::env::current_exe().context("failed to resolve running RNA artifact")?,
             )?;
@@ -1086,6 +1093,70 @@ fn new_model_with_config(
             Err(err)
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_runtime_probe(device_index: usize) -> Result<()> {
+    use std::collections::HashMap;
+
+    fn find_model(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_model(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("model.onnx")
+                && path.to_string_lossy().contains("all-MiniLM-L6-v2")
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    let cache_dir = std::env::var_os("FASTEMBED_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
+    let model_path = find_model(&cache_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "CUDA runtime probe could not locate the downloaded MiniLM ONNX model under {}",
+            cache_dir.display()
+        )
+    })?;
+    let device_id = i32::try_from(device_index)
+        .context("CUDA device ordinal exceeds the supported i32 range")?;
+    let provider = ort::execution_providers::CUDA::default()
+        .with_device_id(device_id)
+        .build()
+        .error_on_failure();
+    let mut session = ort::session::Session::builder()?
+        .with_execution_providers([provider])
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_disable_cpu_fallback()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .commit_from_file(&model_path)?;
+
+    let mut inputs = HashMap::new();
+    for input in session.inputs() {
+        let values = vec![1_i64; 8];
+        let tensor = ort::value::Tensor::from_array((vec![1_usize, 8], values))?.upcast();
+        inputs.insert(input.name().to_string(), tensor);
+    }
+    if inputs.is_empty() {
+        anyhow::bail!("CUDA runtime probe model has no inputs");
+    }
+    let outputs = session.run(inputs)?;
+    anyhow::ensure!(
+        outputs.len() > 0,
+        "CUDA runtime probe produced no ONNX outputs"
+    );
+    tracing::info!(
+        "CUDA runtime probe executed MiniLM with CPU EP fallback disabled on device {}",
+        device_index
+    );
+    Ok(())
 }
 
 /// Fail closed unless the exact running artifact can initialize Candle Metal device 0.
@@ -1313,6 +1384,64 @@ fn validate_generation_graph_evidence(
         anyhow::bail!(
             "semantic generation structural snapshot does not match the current persisted graph/report"
         );
+    }
+    Ok(())
+}
+
+fn validate_serving_generation_identity(
+    config: &EmbeddingConfig,
+    manifest: &GenerationManifest,
+) -> Result<()> {
+    let flags = &manifest.semantic_identity.flags;
+    let observed_device = manifest.device_attestation.observed_device.as_str();
+    let provider = manifest.device_attestation.backend.as_str();
+    let effective_backend = flags
+        .get("effective_backend")
+        .map(String::as_str)
+        .unwrap_or("");
+    let effective_provider = flags
+        .get("effective_provider")
+        .map(String::as_str)
+        .unwrap_or("");
+    let effective_device = flags
+        .get("effective_device_index")
+        .map(String::as_str)
+        .unwrap_or("");
+    anyhow::ensure!(
+        effective_backend == observed_device
+            && effective_provider == provider
+            && effective_device
+                == manifest
+                    .device_attestation
+                    .device_index
+                    .map_or("none".to_string(), |index| index.to_string()),
+        "semantic generation effective backend/provider/device identity does not match its attestation"
+    );
+
+    match config.backend {
+        EmbeddingBackend::Cuda => anyhow::ensure!(
+            observed_device == "cuda"
+                && provider == "onnxruntime-cuda"
+                && manifest.device_attestation.device_index == Some(config.cuda_device),
+            "active semantic generation requires CUDA device {} but records device={} provider={} index={:?}",
+            config.cuda_device,
+            observed_device,
+            provider,
+            manifest.device_attestation.device_index
+        ),
+        EmbeddingBackend::Cpu => anyhow::ensure!(
+            observed_device == "cpu" && provider == "candle-cpu",
+            "active semantic generation requires CPU but records device={} provider={}",
+            observed_device,
+            provider
+        ),
+        EmbeddingBackend::Metal => anyhow::ensure!(
+            observed_device == "metal" && provider == "candle-metal",
+            "active semantic generation requires Metal but records device={} provider={}",
+            observed_device,
+            provider
+        ),
+        EmbeddingBackend::Auto => {}
     }
     Ok(())
 }
@@ -1905,6 +2034,12 @@ impl EmbeddingIndex {
         };
         let (db_path, active_manifest, unpublished_scratch) = match current {
             Some((_, manifest, _, _)) => {
+                if matches!(
+                    purpose,
+                    GenerationOpenPurpose::Serving | GenerationOpenPurpose::ResidentServing
+                ) {
+                    validate_serving_generation_identity(&embedding_config, &manifest)?;
+                }
                 if require_metal {
                     let executable = std::env::current_exe()
                         .context("failed to resolve running RNA artifact")?;
@@ -4109,8 +4244,14 @@ mod tests {
         rank_search_results, required_string_column, requires_active_generation_graph_validation,
         requires_sealed_query_validation, retain_reusable_vector, retrieval_score,
         single_query_embedding, truncate_chars, validate_canonical_vector_mapping,
-        validated_retrieval_score_column, verify_materialized_rows,
+        validate_serving_generation_identity, validated_retrieval_score_column,
+        verify_materialized_rows,
     };
+    #[cfg(not(feature = "cuda"))]
+    use crate::embed::config::FallbackPolicy;
+    use crate::embed::config::{EmbeddingBackend, EmbeddingConfig};
+    use crate::embed::generation;
+    use crate::embed::generation::{DeviceAttestation, GenerationManifest, SemanticIdentity};
 
     #[test]
     fn sealed_handle_validates_explicit_semantic_mode() {
@@ -6330,5 +6471,96 @@ mod tests {
             text.chars().count() <= 500,
             "markdown section should be truncated to 500 chars"
         );
+    }
+
+    fn identity_for_serving_test(flags: BTreeMap<String, String>) -> SemanticIdentity {
+        let digest = |byte: u8| format!("{byte:02x}").repeat(32);
+        SemanticIdentity {
+            model: "model".to_string(),
+            tokenizer: "tokenizer".to_string(),
+            model_files_digest: digest(70),
+            model_sha256: digest(71),
+            tokenizer_sha256: digest(72),
+            reranker_files_digest: digest(73),
+            preprocessing_version: "preprocessing".to_string(),
+            artifact_sha256: digest(1),
+            schema_signature: generation::SEMANTIC_SCHEMA_SIGNATURE.to_string(),
+            dimension: EMBEDDING_DIMENSION,
+            flags,
+        }
+    }
+
+    fn manifest_for_serving_test(
+        observed_device: &str,
+        provider: &str,
+        device_index: Option<usize>,
+    ) -> GenerationManifest {
+        let effective_device = device_index.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let identity = identity_for_serving_test(BTreeMap::from([
+            ("effective_backend".to_string(), observed_device.to_string()),
+            ("effective_provider".to_string(), provider.to_string()),
+            ("effective_device_index".to_string(), effective_device),
+        ]));
+        GenerationManifest {
+            schema_version: generation::GENERATION_SCHEMA_VERSION,
+            generation_digest: "generation".to_string(),
+            semantic_identity: identity,
+            semantic_identity_digest: "identity".to_string(),
+            canonical_input_digest: "input".to_string(),
+            target_graph_digest: "target".to_string(),
+            structural_graph_snapshot_digest: "snapshot".to_string(),
+            row_count: 0,
+            coverage_digest: "coverage".to_string(),
+            lance_tree_digest: "lance".to_string(),
+            reused_vector_count: 0,
+            encoded_vector_count: 0,
+            prior_generation_digest: None,
+            created_by_artifact_sha256: "artifact".to_string(),
+            device_attestation: DeviceAttestation {
+                required_device: "any".to_string(),
+                observed_device: observed_device.to_string(),
+                backend: provider.to_string(),
+                device_index,
+                artifact_sha256: "artifact".to_string(),
+            },
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn auto_error_requires_compiled_cuda_backend() {
+        let config = EmbeddingConfig {
+            fallback: FallbackPolicy::Error,
+            ..Default::default()
+        };
+        let error = match super::new_model_with_config(&config, false) {
+            Ok(_) => panic!("auto + fallback=error unexpectedly initialized"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("built with the `cuda` feature"));
+    }
+
+    #[test]
+    fn serving_rejects_cuda_generation_on_wrong_device() {
+        let manifest = manifest_for_serving_test("cuda", "onnxruntime-cuda", Some(1));
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            cuda_device: 0,
+            ..Default::default()
+        };
+        let error = validate_serving_generation_identity(&config, &manifest).unwrap_err();
+        assert!(error.to_string().contains("requires CUDA device 0"));
+    }
+
+    #[test]
+    fn serving_rejects_attestation_flag_mismatch() {
+        let mut manifest = manifest_for_serving_test("cuda", "onnxruntime-cuda", Some(0));
+        manifest
+            .semantic_identity
+            .flags
+            .insert("effective_provider".to_string(), "candle-cpu".to_string());
+        let error = validate_serving_generation_identity(&EmbeddingConfig::default(), &manifest)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match its attestation"));
     }
 }
