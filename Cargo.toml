@@ -73,7 +73,7 @@ candle-core = { version = "0.9", optional = true }
 fastembed = { version = "5", optional = true }
 # Direct ORT ownership is intentional: fastembed's `cuda` feature enables its
 # Candle CUDA models, not the ONNX Runtime CUDA execution provider used here.
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["cuda"], optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["cuda", "copy-dylibs"], optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
