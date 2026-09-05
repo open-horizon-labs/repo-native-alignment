@@ -738,7 +738,7 @@ try {
   assertContains(
     "MCP search delivers per-file LSP completeness readiness",
     depthSearchText,
-    "benchmark per-file LSP completeness",
+    "per-file LSP completeness",
   );
 
   // ── 8. negative test: unknown tool ──────────────────────────────────────

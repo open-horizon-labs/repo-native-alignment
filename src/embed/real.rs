@@ -343,9 +343,9 @@ fn rank_search_results(results: &mut [SearchResult]) {
     results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
 }
 
-/// Sealed handles must validate graph/current-pointer and runtime asset identity
+/// Strict handles must validate graph/current-pointer and runtime asset identity
 /// for every query, regardless of the explicitly requested retrieval mode.
-fn requires_sealed_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
+fn requires_strict_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
     require_metal
 }
 
@@ -1718,7 +1718,7 @@ impl EmbeddingIndex {
         Ok(Some(index))
     }
 
-    /// Open the semantic index with the #786 fail-closed execution policy.
+    /// Open the semantic index with a fail-closed execution policy.
     /// Building or querying through this handle never falls back from Metal to CPU.
     pub async fn new_strict(repo_root: &Path) -> Result<Self> {
         require_metal_device()?;
@@ -2157,7 +2157,7 @@ impl EmbeddingIndex {
     }
 
     /// Build a semantic generation under an explicit structural/scan contract.
-    /// The sealed #786 artifact uses the same path automatically from `new()`.
+    /// This is the explicit entry point for strict semantic generation.
     pub async fn index_all_with_symbols_strict(
         &self,
         repo_root: &Path,
@@ -2181,7 +2181,7 @@ impl EmbeddingIndex {
     }
 
     /// Reconcile one complete semantic generation against the exact freshly
-    /// reopened persisted graph. Sealed builds require this API so readiness
+    /// reopened persisted graph. Strict builds require this API so readiness
     /// is revalidated against both nodes and edges at the semantic commit seam.
     pub async fn index_all_with_persisted_graph_and_business_context(
         &self,
@@ -3509,7 +3509,7 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
-        if requires_sealed_query_validation(self.require_metal, mode) {
+        if requires_strict_query_validation(self.require_metal, mode) {
             return self
                 .search_with_filters_strict(query, artifact_types, limit, mode, filters)
                 .await;
@@ -3538,7 +3538,7 @@ impl EmbeddingIndex {
         filters: &SearchFilters,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        if requires_sealed_query_validation(self.require_metal, mode) {
+        if requires_strict_query_validation(self.require_metal, mode) {
             return self
                 .search_with_filters_strict_observed(query, artifact_types, limit, mode, filters)
                 .await;
@@ -3555,7 +3555,7 @@ impl EmbeddingIndex {
         .await
     }
 
-    /// Strict semantic search used by the sealed #786 artifact.
+    /// Strict semantic search with runtime asset validation.
     /// Metal, the requested search mode, every result schema, and hybrid FTS
     /// must succeed exactly; no vector-only or partial-batch fallback is allowed.
     pub async fn search_with_filters_strict(
@@ -3914,15 +3914,15 @@ mod tests {
         node_embedding_kind, node_embedding_text, node_embedding_title, node_scalar_filters,
         product_retrieval_score_kind, publish_generation_after_final_validation,
         rank_search_results, required_string_column, requires_active_generation_graph_validation,
-        requires_sealed_query_validation, retain_reusable_vector, retrieval_score,
+        requires_strict_query_validation, retain_reusable_vector, retrieval_score,
         single_query_embedding, truncate_chars, validate_canonical_vector_mapping,
         validated_retrieval_score_column, verify_materialized_rows,
     };
 
     #[test]
-    fn sealed_handle_validates_explicit_semantic_mode() {
-        assert!(requires_sealed_query_validation(true, SearchMode::Semantic));
-        assert!(!requires_sealed_query_validation(
+    fn strict_handle_validates_explicit_semantic_mode() {
+        assert!(requires_strict_query_validation(true, SearchMode::Semantic));
+        assert!(!requires_strict_query_validation(
             false,
             SearchMode::Semantic
         ));

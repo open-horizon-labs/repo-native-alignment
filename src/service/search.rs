@@ -903,7 +903,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
     let repo_root = ctx.repo_root;
     let report = crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH;
     if !repo_root.join(report).is_file() {
-        return "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
+        return "\n- **per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
     }
 
     match crate::lsp_completeness::load_runtime_summary(
@@ -914,7 +914,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
     ) {
         Ok(summary) => {
             format!(
-                "\n- **benchmark per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
+                "\n- **per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
                 if summary.ready {
                     "ready"
                 } else {
@@ -928,7 +928,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
             )
         }
         Err(_) => format!(
-            "\n- **benchmark per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
+            "\n- **per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
         ),
     }
 }
@@ -1147,8 +1147,8 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
         return SearchDelivery::eligible(strict_semantic_failure(reason));
     }
 
-    // The frozen #779 path deliberately bypasses every new product policy and
-    // keeps the established selection, ordering, and renderer byte-for-byte.
+    // Explicit strict mode bypasses product ranking policy and preserves its
+    // fail-closed selection, ordering, and renderer contract.
     if strict_semantic {
         return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
@@ -9581,9 +9581,8 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
 
     // Detect path/name split query (e.g. "auth/handlers/validate" → path="auth/handlers", name="validate").
     // When present, embed search uses only the name part; name-matching filters by both.
-    // Strict semantic qualification binds the model input to the caller's exact
-    // query bytes. The interactive path/name shorthand is useful for ordinary
-    // search, but must never rewrite a sealed benchmark query.
+    // Strict semantic mode binds the model input to the caller's exact query
+    // bytes, so the interactive path/name shorthand must not rewrite it.
     let path_name = parse_path_name_query_for_search(query_str, strict_semantic);
     let (path_filter_lower, name_filter_lower): (Option<String>, Option<String>) =
         if let Some((p, n)) = path_name {
@@ -16310,7 +16309,7 @@ mod tests {
         let mut ctx = make_search_context(&graph_state, &repo_root);
         ctx.business_context = &DISABLED_BUSINESS_CONTEXT;
         let rendered = format_lsp_completeness(&ctx, &graph_state);
-        assert!(rendered.contains("benchmark per-file LSP completeness**: partial/degraded"));
+        assert!(rendered.contains("per-file LSP completeness**: partial/degraded"));
         assert!(rendered.contains("1 included / 1 total files"));
         assert!(rendered.contains("1 report violation(s)"));
         assert!(rendered.contains(crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH));

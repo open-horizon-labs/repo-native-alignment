@@ -429,22 +429,6 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
             ]
         )
     },
-    builtin_lsp!(
-        "plaintext",
-        "rna-cohort-language-server",
-        &["--language", "plaintext"],
-        &[
-            "txt",
-            "eopc04_iau2000",
-            "finals2000a",
-            "lesser",
-            "license",
-            "old",
-            "pil",
-            "python",
-            "wx"
-        ]
-    ),
     BuiltinLspDescriptor {
         compile_command_overrides: &[LspCompileCommandOverride {
             suffix: ".h.in",
@@ -630,79 +614,7 @@ static BUILTIN_LSP_DESCRIPTORS: &[BuiltinLspDescriptor] = &[
         ]
     ),
     builtin_lsp!("dockerfile", "docker-langserver", &["--stdio"], &["<none>"]),
-    builtin_lsp!(
-        "batch",
-        "rna-cohort-language-server",
-        &["--language", "batch"],
-        &["bat", "bat_t", "cmd"]
-    ),
     builtin_lsp!("graphviz", "dot-language-server", &["--stdio"], &["dot"]),
-    builtin_lsp!(
-        "plantuml",
-        "rna-cohort-language-server",
-        &["--language", "plantuml"],
-        &["puml"]
-    ),
-    builtin_lsp!(
-        "roff",
-        "rna-cohort-language-server",
-        &["--language", "roff"],
-        &["1"]
-    ),
-    builtin_lsp!(
-        "autolev",
-        "rna-cohort-language-server",
-        &["--language", "autolev"],
-        &["al"]
-    ),
-    builtin_lsp!(
-        "antlr",
-        "rna-cohort-language-server",
-        &["--language", "antlr"],
-        &["g4"]
-    ),
-    builtin_lsp!(
-        "lex",
-        "rna-cohort-language-server",
-        &["--language", "lex"],
-        &["l"]
-    ),
-    builtin_lsp!(
-        "emacs-lisp",
-        "rna-cohort-language-server",
-        &["--language", "emacs-lisp"],
-        &["el"]
-    ),
-    builtin_lsp!(
-        "scheme",
-        "rna-cohort-language-server",
-        &["--language", "scheme"],
-        &["scm"]
-    ),
-    builtin_lsp!(
-        "autotools",
-        "rna-cohort-language-server",
-        &["--language", "autotools"],
-        &["ac", "am"]
-    ),
-    builtin_lsp!(
-        "powershell",
-        "rna-cohort-language-server",
-        &["--language", "powershell"],
-        &["ps1"]
-    ),
-    builtin_lsp!(
-        "starlark",
-        "rna-cohort-language-server",
-        &["--language", "starlark"],
-        &["star"]
-    ),
-    builtin_lsp!(
-        "cohort-text",
-        "rna-cohort-language-server",
-        &["--language", "cohort-text"],
-        &[]
-    ),
     BuiltinLspDescriptor {
         partition_influence_patterns: &[".terraform.lock.hcl", ".terraformrc", "terraform.rc"],
         ..builtin_lsp!("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"])
@@ -806,11 +718,7 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
             },
         )
     } else if extension == "new_t" {
-        Some(if filename.contains("bat") {
-            "batch"
-        } else {
-            "config"
-        })
+        Some("config")
     } else {
         None
     };
@@ -839,8 +747,6 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
             "codeowners" | "procfile" | "pylintrc" | "matplotlibrc"
         ) {
         "config"
-    } else if crate::lsp_completeness::is_plaintext_document_path(path) {
-        "plaintext"
     } else if matches!(
         filename.as_str(),
         "diagnose_imports"
@@ -853,8 +759,6 @@ pub(crate) fn builtin_lsp_descriptor_for_path(
             | "tm_sympy"
     ) {
         "python"
-    } else if extension.is_empty() {
-        "cohort-text"
     } else {
         return None;
     };
@@ -1001,7 +905,7 @@ pub struct LspEnricher {
     /// Arguments to pass to the server (e.g., ["--stdio"]).
     server_args: Vec<String>,
     /// Full scans validate every included descriptor-matched file. Scoped
-    /// changed-node enrichment disables this cohort-wide sweep.
+    /// changed-node enrichment disables this repository-wide sweep.
     file_readiness: bool,
     /// Optional exact target-file set for incremental qualification.
     file_readiness_filter: Option<Arc<HashSet<PathBuf>>>,
@@ -1938,7 +1842,7 @@ impl LspEnricher {
 
     /// Pick a deterministic didOpen file from the nodes admitted to this invocation.
     ///
-    /// The current admitted cohort already carries dirty-root and node-scope filtering,
+    /// The current admitted file set already carries dirty-root and node-scope filtering,
     /// so selecting from it cannot warm up an excluded or unrelated file.
     fn find_warmup_file(&self, repo_root: &Path, matching_nodes: &[&Node]) -> Option<PathBuf> {
         let startup_root = self
@@ -4597,11 +4501,6 @@ mod tests {
             lsp_language_id("cython", Path::new("astropy/io/ascii/cparser.pyx")),
             "cython"
         );
-        assert_eq!(
-            lsp_language_id("cohort-text", Path::new("cextern/wcslib/THANKS")),
-            "cohort-text"
-        );
-
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("CHANGES");
         std::fs::write(&path, [b'l', b'e', b'g', b'a', b'c', b'y', 0xff]).unwrap();
@@ -4610,7 +4509,7 @@ mod tests {
     }
 
     #[test]
-    fn issue825_js_template_descriptor_and_language_id() {
+    fn javascript_template_descriptor_and_language_id() {
         let path = Path::new("sphinx/themes/basic/static/documentation_options.js_t");
         assert_eq!(lsp_language_id("typescript", path), "javascript");
         assert_eq!(
@@ -5475,7 +5374,7 @@ mod tests {
                 .file_name()
                 .unwrap(),
             "z.json",
-            "warm-up must come from the invocation's admitted cohort"
+            "warm-up must come from the invocation's admitted file set"
         );
     }
 

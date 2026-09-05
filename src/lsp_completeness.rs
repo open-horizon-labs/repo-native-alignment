@@ -1,4 +1,4 @@
-//! Deterministic, fail-closed evidence for benchmark LSP completeness.
+//! Deterministic, fail-closed evidence for repository LSP completeness.
 //!
 //! It models the per-file contract, builds and persists canonical reports from
 //! existing scan evidence, and evaluates readiness so scanners, CLI, and MCP
@@ -2845,7 +2845,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         return excluded(
             FileRole::ExcludedGenerated,
             ExclusionReasonCode::ConfiguredPolicy,
-            "RNA business/cache artifacts are outside the frozen benchmark checkout input",
+            "RNA business/cache artifacts are outside the repository source inventory",
         );
     }
     if components.iter().any(|component| {
@@ -2918,14 +2918,14 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         return excluded(
             FileRole::ExcludedData,
             ExclusionReasonCode::NonLanguageData,
-            "frozen-cohort path is a generated graph output fixture",
+            "path is a generated graph output fixture",
         );
     }
     if filename == "not_utf8.sample" {
         return excluded(
             FileRole::ExcludedData,
             ExclusionReasonCode::NonLanguageData,
-            "frozen-cohort path is a deliberate non-UTF-8 encoding fixture",
+            "path is a deliberate non-UTF-8 encoding fixture",
         );
     }
     if extension == "txt" {
@@ -2971,7 +2971,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             return excluded(
                 FileRole::ExcludedData,
                 ExclusionReasonCode::NonLanguageData,
-                "suffix is used by the cohort as a deliberate non-language test fixture",
+                "suffix identifies a deliberate non-language test fixture",
             );
         }
         if extension.is_empty()
@@ -2983,7 +2983,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             return excluded(
                 FileRole::ExcludedData,
                 ExclusionReasonCode::NonLanguageData,
-                "extensionless frozen-cohort path is a deliberate test sentinel payload",
+                "extensionless path is a deliberate test sentinel payload",
             );
         }
         return (FileRole::Test, None);
@@ -3154,18 +3154,6 @@ fn is_project_document_filename(filename: &str) -> bool {
     ]
     .iter()
     .any(|prefix| filename.starts_with(prefix))
-}
-
-pub(crate) fn is_plaintext_document_path(path: &Path) -> bool {
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
-        || is_project_document_filename(&filename)
 }
 
 fn is_known_test_fixture_extension(extension: &str) -> bool {

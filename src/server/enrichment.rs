@@ -203,9 +203,9 @@ fn should_continue_lsp_enrichment(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingReconciliationMode {
     /// Reconcile the complete freshly reopened graph and require graph-aware
-    /// readiness. This is mandatory for repo scope and sealed generations.
+    /// readiness. This is mandatory for repo scope and strict generations.
     AuthoritativePersistedGraph,
-    /// Reconcile a complete immutable generation without imposing the sealed
+    /// Reconcile a complete immutable generation without imposing the strict
     /// full-LSP contract on an ordinary scoped request.
     OrdinaryImmutableGeneration,
     /// Preserve the legacy targeted in-place update for an ordinary mutable
@@ -1246,7 +1246,7 @@ impl RnaHandler {
             // The graph builder starts background LSP immediately before this
             // task. Wait for that structural producer to reach a terminal state,
             // then reopen its persisted output. Embedding an earlier in-memory
-            // snapshot would recreate the pre-#786 graph/vector race.
+            // snapshot would recreate the graph/vector publication race.
             let wait_started = std::time::Instant::now();
             let wait_budget = LspBudget::from_env().max_duration;
             loop {

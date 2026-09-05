@@ -1028,7 +1028,7 @@ send({
     }
 
     #[test]
-    fn path_to_uri_percent_encodes_cohort_special_paths() {
+    fn path_to_uri_percent_encodes_special_paths() {
         let cases = [
             (
                 "tests/template_tests/templates/ssi include with spaces.html",
