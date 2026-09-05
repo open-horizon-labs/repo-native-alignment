@@ -280,8 +280,8 @@ repo-native-alignment \
 
 `--cache-only` admits the existing graph and semantic generation without scanning,
 enrichment, downloads, or cache mutation. It fails closed when the graph cache, its
-business-context marker, a published semantic generation, or the sealed offline bundle
-is absent or incompatible. Startup fully verifies the admitted graph, semantic
+business-context marker, or a published semantic generation is absent or incompatible.
+Startup fully verifies the admitted graph, semantic
 generation, encoder tree, and reranker tree, then eagerly loads both models before the
 server accepts requests. The graph, LanceDB connection, encoder, and reranker
 remain resident for the process lifetime; request handling does not re-hash those
@@ -363,7 +363,6 @@ Declare intentionally related repos in `.oh/config.toml`:
 
 ```toml
 [scanner]
-exclude = ["benchmark/"]
 
 [lsp]
 # Minimum severity to store as diagnostic nodes.
@@ -461,6 +460,5 @@ MIT — see [LICENSE](LICENSE).
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning, dirty-slugs optimization
 - [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
-- [One-instance SWE-bench RNA harness](docs/swebench-rna-one.md) — isolated Verified task, real MCP executor, official evaluator, and auditable token/cost ledger
 - [ADR Index](docs/ADRs/README.md) — architecture decisions and executable validation references
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration

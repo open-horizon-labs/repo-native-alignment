@@ -306,65 +306,17 @@ fn validate_search_experience(params: &SearchParams) -> Result<(), String> {
     Ok(())
 }
 
-fn sealed_semantic_bundle() -> bool {
-    cfg!(feature = "swebench-semantic-bundle")
-        && option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
-}
-
-const fn use_verified_reranker_loader(
-    strict_semantic: bool,
-    sealed_bundle: bool,
-    asset_seeding: bool,
-) -> bool {
-    strict_semantic || (sealed_bundle && !asset_seeding)
-}
-
-fn semantic_asset_seeding() -> bool {
-    std::env::var("RNA_SEMANTIC_ASSET_SEEDING").as_deref() == Ok("1")
-}
-
 fn strict_semantic_requested(params: &SearchParams) -> bool {
-    // CI asset acquisition is deliberately non-qualifying. The embedding
-    // layer refuses publication in this mode; service search must likewise
-    // never emit the strict READY sentinel for its discarded seed state.
-    if semantic_asset_seeding() {
-        return false;
-    }
-    let explicit = params
+    params
         .search_mode
         .as_deref()
-        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case(STRICT_SEMANTIC_MODE));
-    // The frozen #779 packet generator and the artifact's offline qualification
-    // probe predate `search_mode=strict`, so eligible bare queries from a sealed
-    // bundle must retain implicit strict behavior. Explicit product-context
-    // controls opt into the separate non-strict projection pipeline.
-    let sealed_bundle_default = sealed_semantic_bundle() && implicit_strict_request(params);
-    explicit || sealed_bundle_default
-}
-
-fn implicit_strict_request(params: &SearchParams) -> bool {
-    legacy_product_controls(params).is_none()
-        && params.context_mode.is_none()
-        && params.normalized_mode().is_none()
-        && params
-            .query
-            .as_deref()
-            .is_some_and(|query| !query.trim().is_empty())
-        && params
-            .node
-            .as_deref()
-            .is_none_or(|node| node.trim().is_empty())
-        && params.nodes.as_ref().is_none_or(|nodes| nodes.is_empty())
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case(STRICT_SEMANTIC_MODE))
 }
 
 fn strict_semantic_failure(reason: &str) -> String {
     format!(
         "Strict semantic qualification FAILED: `{reason}`. No lexical, graph, vector-only, CPU, or original-order fallback results were returned."
     )
-}
-
-fn candle_metal_fast_math_enabled() -> bool {
-    std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").as_deref() == Ok("1")
 }
 
 async fn strict_semantic_preflight(
@@ -397,15 +349,7 @@ async fn strict_semantic_preflight(
         let mode = mode.trim();
         !mode.eq_ignore_ascii_case("hybrid") && !mode.eq_ignore_ascii_case(STRICT_SEMANTIC_MODE)
     }) {
-        return Err("sealed bundle requires hybrid retrieval");
-    }
-    if !sealed_semantic_bundle() {
-        return Err("binary is not the sealed CI SWE-bench semantic bundle");
-    }
-    if option_env!("RNA_METAL_KERNEL_PROFILE") != Some("release-fast-math")
-        || !candle_metal_fast_math_enabled()
-    {
-        return Err("release Metal kernel optimization is not active");
+        return Err("strict mode requires hybrid retrieval");
     }
     let Some(index) = ctx.embed_index else {
         return Err("embedding index is not attached");
@@ -959,7 +903,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
     let repo_root = ctx.repo_root;
     let report = crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH;
     if !repo_root.join(report).is_file() {
-        return "\n- **benchmark per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
+        return "\n- **per-file LSP completeness**: unavailable — no persisted report; run a full LSP scan".to_string();
     }
 
     match crate::lsp_completeness::load_runtime_summary(
@@ -970,7 +914,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
     ) {
         Ok(summary) => {
             format!(
-                "\n- **benchmark per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
+                "\n- **per-file LSP completeness**: {} — {} included / {} total files; {} excluded; {} report violation(s); digest={}; full diagnostics: `{report}`",
                 if summary.ready {
                     "ready"
                 } else {
@@ -984,7 +928,7 @@ fn format_lsp_completeness(ctx: &SearchContext<'_>, graph_state: &GraphState) ->
             )
         }
         Err(_) => format!(
-            "\n- **benchmark per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
+            "\n- **per-file LSP completeness**: persisted, status unverified — bounded summary missing or invalid; full diagnostics: `{report}`"
         ),
     }
 }
@@ -1203,8 +1147,8 @@ pub async fn search_delivery(params: &SearchParams, ctx: &SearchContext<'_>) -> 
         return SearchDelivery::eligible(strict_semantic_failure(reason));
     }
 
-    // The frozen #779 path deliberately bypasses every new product policy and
-    // keeps the established selection, ordering, and renderer byte-for-byte.
+    // Explicit strict mode bypasses product ranking policy and preserves its
+    // fail-closed selection, ordering, and renderer contract.
     if strict_semantic {
         return SearchDelivery::eligible(legacy_search_dispatch(params, ctx).await);
     }
@@ -9637,9 +9581,8 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
 
     // Detect path/name split query (e.g. "auth/handlers/validate" → path="auth/handlers", name="validate").
     // When present, embed search uses only the name part; name-matching filters by both.
-    // Strict semantic qualification binds the model input to the caller's exact
-    // query bytes. The interactive path/name shorthand is useful for ordinary
-    // search, but must never rewrite a sealed benchmark query.
+    // Strict semantic mode binds the model input to the caller's exact query
+    // bytes, so the interactive path/name shorthand must not rewrite it.
     let path_name = parse_path_name_query_for_search(query_str, strict_semantic);
     let (path_filter_lower, name_filter_lower): (Option<String>, Option<String>) =
         if let Some((p, n)) = path_name {
@@ -10098,11 +10041,7 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
         // executor during ONNX model inference (and possible first-time
         // model download/initialization).
         let query_owned = query_str.to_string();
-        let verified_reranker = use_verified_reranker_loader(
-            strict_semantic,
-            sealed_semantic_bundle(),
-            semantic_asset_seeding(),
-        );
+        let verified_reranker = strict_semantic;
         let resident_reranker = strict_semantic
             && ctx
                 .embed_index
@@ -14479,75 +14418,6 @@ mod tests {
         };
         assert!(strict_semantic_requested(&strict));
     }
-
-    #[test]
-    fn sealed_implicit_strict_preserves_qualification_and_excludes_product_controls() {
-        let frozen = SearchParams {
-            query: Some("registered frozen query".into()),
-            search_mode: Some("hybrid".into()),
-            rerank: true,
-            limit: Some(20),
-            include_artifacts: false,
-            include_markdown: true,
-            compact: true,
-            ..Default::default()
-        };
-        assert!(implicit_strict_request(&frozen));
-
-        let offline_probe = SearchParams {
-            query: Some("function returns value".into()),
-            limit: Some(10),
-            compact: true,
-            ..Default::default()
-        };
-        assert!(implicit_strict_request(&offline_probe));
-
-        for product in [
-            SearchParams {
-                projection: Some("agent".into()),
-                ..frozen.clone()
-            },
-            SearchParams {
-                context_mode: Some("task".into()),
-                ..frozen.clone()
-            },
-            SearchParams {
-                body_policy: Some("signature_only".into()),
-                ..frozen.clone()
-            },
-        ] {
-            assert!(
-                !implicit_strict_request(&product),
-                "product controls must never enter the frozen implicit strict path"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn strict_semantic_search_rejects_an_unsealed_binary_without_fallback() {
-        let gs = make_graph_state(vec![make_node(
-            "auth_handler",
-            NodeKind::Function,
-            "src/auth.rs",
-        )]);
-        let repo_root = PathBuf::from("/tmp/test");
-        let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams {
-            query: Some("auth".into()),
-            search_mode: Some("strict".into()),
-            rerank: false,
-            include_artifacts: false,
-            include_markdown: false,
-            ..Default::default()
-        };
-
-        let result = search(&params, &ctx).await;
-        assert!(result.contains("Strict semantic qualification FAILED"));
-        assert!(result.contains("binary is not the sealed CI SWE-bench semantic bundle"));
-        assert!(!result.contains("auth_handler"));
-        assert!(result.contains("No lexical, graph, vector-only, CPU"));
-    }
-
     #[tokio::test]
     async fn strict_semantic_search_accepts_only_flat_code_queries() {
         let gs = make_graph_state(vec![make_node("target", NodeKind::Function, "src/lib.rs")]);
@@ -16439,7 +16309,7 @@ mod tests {
         let mut ctx = make_search_context(&graph_state, &repo_root);
         ctx.business_context = &DISABLED_BUSINESS_CONTEXT;
         let rendered = format_lsp_completeness(&ctx, &graph_state);
-        assert!(rendered.contains("benchmark per-file LSP completeness**: partial/degraded"));
+        assert!(rendered.contains("per-file LSP completeness**: partial/degraded"));
         assert!(rendered.contains("1 included / 1 total files"));
         assert!(rendered.contains("1 report violation(s)"));
         assert!(rendered.contains(crate::lsp_completeness::LSP_COMPLETENESS_REPORT_PATH));
@@ -19053,16 +18923,6 @@ mod tests {
                 .starts_with("graph-delta:v1:proposal:")
         );
     }
-
-    #[test]
-    fn acceptance_delivery_sealed_product_queries_use_verified_reranker_loader() {
-        assert!(!use_verified_reranker_loader(false, false, false));
-        assert!(use_verified_reranker_loader(true, false, false));
-        assert!(use_verified_reranker_loader(false, true, false));
-        assert!(use_verified_reranker_loader(true, true, false));
-        assert!(!use_verified_reranker_loader(false, true, true));
-    }
-
     #[test]
     fn acceptance_remediation_source_backed_behavior_contrasts_cover_all_typed_classes_and_loci() {
         let mut proposed = SourceBehaviorProfile::default();

@@ -1,7 +1,7 @@
 //! Verifier-owned structural-cache identity and incremental reuse planning.
 //!
-//! The portable archive is created and safely transported by the frozen-cohort
-//! qualifier. This module is the producer-side trust boundary: it publishes
+//! The portable archive can be created once and safely transported. This module
+//! is the producer-side trust boundary: it publishes
 //! the exact binary/schema identity, verifies an injected authorization against
 //! the current Git tree and descriptor partitions, and computes the graph
 //! impact closure that must be executed before inherited evidence is admitted.

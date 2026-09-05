@@ -12,7 +12,6 @@ v1 (published with v0.1.9) tested on a single 25K-line Rust codebase with N=5 an
 - **Cross-encoder reranking** — improves NL query precision (reduces prompt asymmetry)
 - **Short ID resolution** — seamless graph traversal from search results
 
-The field has also moved: ContextBench, FeatureBench, Multi-SWE-bench, and the harness engineering research all provide new evaluation frameworks.
 
 ## Strategic framing
 
@@ -27,7 +26,6 @@ Same model + different harness = wildly different results. Can Boluk showed a 10
 | Finding | Source | RNA implication |
 |---------|--------|-----------------|
 | Graph+embed beats embed-only by 43% | CodeRAG (arXiv 2504.10046) | RNA's hybrid approach is validated |
-| Graph-integrated LLM: +12.33% SWE-bench Lite | Code Graph Model (arXiv 2505.16901) | Structural code understanding works |
 | Active exploration beats passive dumps (F1: 0.676 vs 0.457) | Theory of Code Space (arXiv 2603.00601) | Query-based MCP > static context injection |
 | Context rot at every length increment | Chroma (2025) | Less context, more precise = better |
 | 97.1% of MCP tool descriptions have quality defects | arXiv 2602.14878 | Tool description quality matters |
@@ -52,7 +50,6 @@ ContextBench's "bitter lesson" finding is the strongest counter-argument to RNA:
 | **ContextBench** | Context retrieval precision/recall | Graph queries return structural context that keyword search misses | ContextBench's bitter lesson — marginal gains possible |
 | **RepoBench-R** | Cross-file retrieval accuracy | RNA's dependency edges identify cross-file relationships | Embed-only baselines may be competitive on simple lookups |
 | **DependEval** | Dependency understanding (construction, recognition, multi-file edit) | RNA literally builds the dependency graph | May be "too easy" — RNA has the answer directly |
-| **Multi-SWE-bench** | Multi-language repo-level issue resolution | Tree-sitter + LSP across languages | LSP quality varies by language |
 
 ### RNA-specific benchmark (custom, v2)
 
@@ -161,7 +158,6 @@ N=15 per condition minimum. At N=15, a 0.5-point quality difference on a 5-point
 
 ## Relationship to external benchmarks
 
-For **FeatureBench**, **ContextBench**, and **Multi-SWE-bench**: integrate RNA as an MCP server available to the agent harness. Measure with RNA vs without RNA on the standard task sets. This produces directly comparable results against the published leaderboards.
 
 The custom RNA-specific benchmark (above) tests capabilities the external benchmarks don't cover: subsystem reasoning, cross-subsystem impact, token efficiency from scoping.
 
@@ -182,12 +178,10 @@ The custom RNA-specific benchmark (above) tests capabilities the external benchm
 - [FeatureBench](https://arxiv.org/abs/2602.10975) — 11% solve rate, massive headroom (ICLR 2026)
 - [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/) — 22-point harness swing vs 1-point model swap
 - [CodeRAG](https://arxiv.org/html/2504.10046v1) — Graph+embed beats embed-only by 43%
-- [Code Graph Model](https://arxiv.org/abs/2505.16901) — +12.33% SWE-bench Lite with graph-integrated LLM
 - [Theory of Code Space](https://arxiv.org/html/2603.00601v3) — Active exploration beats passive dumps
 - [Chroma Context Rot](https://research.trychroma.com/context-rot) — Degradation at every context length
 - [ETH AGENTS.md Study](https://arxiv.org/html/2602.11988v1) — Static context files hurt performance
 - [RANGER](https://arxiv.org/abs/2509.25257) — Graph+embed retrieval for repo-level code
 - [MCP Tool Description Smells](https://arxiv.org/html/2602.14878) — 97.1% of tools have quality defects
-- [Multi-SWE-bench](https://arxiv.org/abs/2504.02605) — multi-language SWE benchmark
 - [DependEval](https://aclanthology.org/2025.findings-acl.373/) — Dependency understanding benchmark
 - [Advanced Context Engineering](https://github.com/humanlayer/advanced-context-engineering-for-coding-agents) — Frequent Intentional Compaction

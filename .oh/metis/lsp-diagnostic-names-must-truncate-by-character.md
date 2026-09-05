@@ -8,7 +8,6 @@ tags:
   - lsp
   - diagnostics
   - utf-8
-  - swe-bench
 ---
 
 # LSP diagnostic names must truncate by character

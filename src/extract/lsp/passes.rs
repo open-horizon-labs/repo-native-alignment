@@ -3371,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn issue825_document_symbol_prep_does_not_age_zero_edge_watchdog() {
+    fn document_symbol_prep_does_not_age_zero_edge_watchdog() {
         assert!(!should_abort_zero_edge_pass(
             0,
             0,

@@ -232,7 +232,7 @@ pub struct Search {
     /// candidate under the requested direction and edge filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
-    /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict requires sealed artifacts, forbids fallback, and forces reranking.
+    /// Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict validates runtime assets, forbids fallback, and forces reranking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
     /// Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false
@@ -942,7 +942,7 @@ mod tests {
             .expect("emitted search_mode schema description");
         assert_eq!(
             search_mode_description,
-            r#"Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict requires sealed artifacts, forbids fallback, and forces reranking."#,
+            r#"Ranking: "hybrid" (default), "keyword", "semantic", or "strict"; strict validates runtime assets, forbids fallback, and forces reranking."#,
         );
 
         // All parameter doc comments from tools.rs, extracted as string literals.
