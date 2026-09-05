@@ -487,16 +487,6 @@ impl EmbeddingStatus {
     ) -> CapabilityReadiness {
         let verified_generation = self.verified_generation.lock().unwrap().clone();
         let mut readiness = match self.state.load(std::sync::atomic::Ordering::Acquire) {
-            0 if semantic_index_available
-                && sealed_semantic_bundle_build()
-                && verified_generation.is_none() =>
-            {
-                CapabilityReadiness::new(
-                    "embeddings / semantic search",
-                    CapabilityReadinessState::Failed,
-                    "sealed semantic index is queryable but lacks verifier-clean generation coverage",
-                )
-            }
             0 if semantic_index_available => CapabilityReadiness::new(
                 "embeddings / semantic search",
                 CapabilityReadinessState::Ready,
