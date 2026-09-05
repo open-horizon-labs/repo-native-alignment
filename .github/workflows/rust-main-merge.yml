@@ -33,10 +33,6 @@ jobs:
               - '.github/workflows/**'
               - '.github/scripts/**'
               - '.github/fixtures/**'
-              - 'scripts/swebench_rna_one.py'
-              - 'scripts/swebench_rna_mcp_proxy.py'
-              - 'scripts/swebench_context_packets.py'
-              - 'scripts/swebench_combined_cache.py'
               - 'scripts/tests/**'
               - 'security/rustsec-policy.json'
 
@@ -198,13 +194,6 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --no-default-features
 
-      - name: SWE-bench Python fixture tests
-        if: needs.changes.outputs.rust == 'true'
-        run: |
-          python3 -m unittest \
-            scripts.tests.test_swebench_rna_one \
-            scripts.tests.test_swebench_context_packets \
-            scripts.tests.test_swebench_combined_cache
 
   smoke:
     needs: changes

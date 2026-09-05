@@ -139,12 +139,6 @@ struct LspReadinessArgs {
     /// Emit the complete machine-readable report and compatibility result.
     #[arg(long)]
     json: bool,
-    /// Frozen N=70 case manifest. Each case binds instance/repository/base commit to a report.
-    #[arg(long)]
-    cohort_manifest: Option<PathBuf>,
-    /// Destination for the deterministic aggregate manifest.
-    #[arg(long, requires = "cohort_manifest")]
-    aggregate_output: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1241,36 +1235,6 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::LspReadiness(args)) => {
             init_tracing("warn", log_path.as_deref());
-            if let Some(cohort_manifest) = args.cohort_manifest.as_deref() {
-                let aggregate =
-                    repo_native_alignment::lsp_completeness::load_frozen_cohort_aggregate(
-                        cohort_manifest,
-                    )?;
-                let output = args.aggregate_output.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--aggregate-output is required with --cohort-manifest")
-                })?;
-                repo_native_alignment::lsp_completeness::persist_aggregate_report(
-                    output, &aggregate,
-                )?;
-                if args.json {
-                    println!("{}", serde_json::to_string_pretty(&aggregate)?);
-                } else {
-                    println!(
-                        "LSP aggregate readiness: {} ({}/{} ready, {} unique instances, {} files, digest={})",
-                        if aggregate.is_ready() {
-                            "READY"
-                        } else {
-                            "BLOCKED"
-                        },
-                        aggregate.counts.ready_checkouts,
-                        aggregate.counts.checkouts,
-                        aggregate.counts.unique_instances,
-                        aggregate.counts.files,
-                        aggregate.digest,
-                    );
-                }
-                std::process::exit(if aggregate.is_ready() { 0 } else { 2 });
-            }
             let repo_root = args.repo.canonicalize()?;
             let graph = server::load_graph_from_lance(&repo_root).await?;
             let check = repo_native_alignment::lsp_completeness::load_readiness_check_with_graph(
@@ -2109,9 +2073,8 @@ mod tests {
         assert_eq!(params.max_output_bytes, Some(12_000));
         assert_eq!(params.max_output_tokens, Some(3_000));
     }
-
     #[test]
-    fn lsp_readiness_cli_exposes_checkout_and_aggregate_modes() {
+    fn lsp_readiness_cli_exposes_checkout_mode() {
         let checkout = Cli::try_parse_from([
             "repo-native-alignment",
             "--business-context",
@@ -2128,28 +2091,6 @@ mod tests {
         assert_eq!(checkout.business_context, BusinessContextMode::Disabled);
         assert_eq!(args.repo, PathBuf::from("/tmp/checkout"));
         assert!(args.json);
-        assert!(args.cohort_manifest.is_none());
-
-        let aggregate = Cli::try_parse_from([
-            "repo-native-alignment",
-            "lsp-readiness",
-            "--cohort-manifest",
-            "/tmp/frozen-cohort.json",
-            "--aggregate-output",
-            "/tmp/aggregate.json",
-        ])
-        .expect("aggregate readiness CLI should parse");
-        let Some(Commands::LspReadiness(args)) = aggregate.command else {
-            panic!("expected lsp-readiness command");
-        };
-        assert_eq!(
-            args.cohort_manifest,
-            Some(PathBuf::from("/tmp/frozen-cohort.json"))
-        );
-        assert_eq!(
-            args.aggregate_output,
-            Some(PathBuf::from("/tmp/aggregate.json"))
-        );
     }
 
     #[test]

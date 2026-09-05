@@ -1086,7 +1086,7 @@ export const API_KEY = "secret";
     }
 
     #[test]
-    fn issue825_jinja_javascript_template_is_addressable() {
+    fn jinja_javascript_template_is_addressable() {
         let extractor = JavaScriptExtractor::new();
         assert!(extractor.extensions().contains(&"js_t"));
 
