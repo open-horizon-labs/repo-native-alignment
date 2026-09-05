@@ -931,6 +931,14 @@ fn new_model() -> Result<EncoderModel> {
 fn new_model_with_policy(_require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
     let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+    let ort_path = std::env::var_os("ORT_DYLIB_PATH").ok_or_else(|| {
+        anyhow::anyhow!(
+            "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
+        )
+    })?;
+    ort::init_from(&ort_path)
+        .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
+        .commit();
     let provider = ort::ep::OpenVINO::default()
         .with_device_type("GPU.0")
         .build();
@@ -6235,5 +6243,16 @@ mod tests {
             text.chars().count() <= 500,
             "markdown section should be truncated to 500 chars"
         );
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn openvino_gpu_embedding_probe_uses_intel_gpu_zero() {
+        let (mut model, attestation) = super::new_model_with_policy(false).unwrap();
+        let embeddings = model.encode(&["Intel Arc OpenVINO embedding probe"]).unwrap();
+        assert_eq!(attestation.backend, "onnxruntime-openvino");
+        assert_eq!(attestation.observed_device, "GPU.0");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), EMBEDDING_DIMENSION);
     }
 }
