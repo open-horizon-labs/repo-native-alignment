@@ -2902,7 +2902,7 @@ impl EmbeddingIndex {
             purged_rows = purged_row_count,
             "EmbeddingIndex: value-addressed vector plan"
         );
-        let mut device_attestation = resolved_attestation;
+        let device_attestation = resolved_attestation;
         if !encoder_inputs.is_empty() {
             let mut model = resolved_model;
             const ENCODE_BATCH_SIZE: usize = 2048;
