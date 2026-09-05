@@ -4214,19 +4214,16 @@ mod tests {
             GenerationOpenPurpose::Serving,
             true,
             false,
-            true,
         ));
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::ResidentServing,
             true,
             false,
-            true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Reconciliation,
             true,
             false,
-            true,
         ));
 
         // The exemption is not a general strict-open bypass.
@@ -4234,18 +4231,15 @@ mod tests {
             GenerationOpenPurpose::Serving,
             true,
             true,
-            true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             false,
             false,
-            true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             true,
-            false,
             false,
         ));
     }
