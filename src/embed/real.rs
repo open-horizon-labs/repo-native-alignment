@@ -928,9 +928,14 @@ fn new_model() -> Result<EncoderModel> {
 }
 
 #[cfg(feature = "openvino")]
-fn new_model_with_policy(_require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
+fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
     let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+    if require_metal {
+        anyhow::bail!(
+            "strict Metal embedding execution is incompatible with the `openvino` feature; build with `metal` instead"
+        );
+    }
     let ort_path = std::env::var_os("ORT_DYLIB_PATH").ok_or_else(|| {
         anyhow::anyhow!(
             "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
@@ -944,11 +949,29 @@ fn new_model_with_policy(_require_metal: bool) -> Result<(EncoderModel, DeviceAt
     }
     let provider = ort::ep::OpenVINO::default()
         .with_device_type("GPU.0")
-        .build();
+        .build()
+        .error_on_failure();
     let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
         .with_execution_providers(vec![provider]);
-    let model = fastembed::TextEmbedding::try_new(options)
+    let mut model = fastembed::TextEmbedding::try_new(options)
         .map_err(|e| anyhow::anyhow!("failed to load OpenVINO embedding model: {e}"))?;
+    let probe = model
+        .embed(&["RNA Intel Arc OpenVINO embedding readiness probe"], None)
+        .map_err(|e| anyhow::anyhow!("OpenVINO embedding probe failed: {e}"))?;
+    let vector = probe
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("OpenVINO embedding probe returned no vectors"))?;
+    if probe.len() != 1 || vector.len() != EMBEDDING_DIMENSION {
+        anyhow::bail!(
+            "OpenVINO embedding probe returned shape [{}, {}], expected [1, {}]",
+            probe.len(),
+            vector.len(),
+            EMBEDDING_DIMENSION
+        );
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("OpenVINO embedding probe returned a non-finite value");
+    }
     let artifact = std::env::current_exe().context("failed to resolve running RNA artifact")?;
     let attestation = DeviceAttestation {
         required_device: "openvino-gpu".to_string(),
