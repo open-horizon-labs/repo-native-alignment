@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   build-semantic-bundle:
-    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

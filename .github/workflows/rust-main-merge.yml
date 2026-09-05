@@ -84,7 +84,7 @@ jobs:
 
   lint:
     needs: changes
-    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
     timeout-minutes: 15
     steps:
       - name: Skip (no Rust changes)
@@ -155,7 +155,7 @@ jobs:
 
   test:
     needs: changes
-    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
     timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -209,7 +209,7 @@ jobs:
   smoke:
     needs: changes
     if: needs.changes.outputs.rust == 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
     timeout-minutes: 20
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -281,7 +281,7 @@ jobs:
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.LOCAL_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
