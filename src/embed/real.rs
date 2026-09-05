@@ -915,15 +915,28 @@ fn new_model_with_config(
 ) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
-    #[cfg(feature = "cuda")]
     if config.backend == EmbeddingBackend::Auto && !require_metal {
-        let mut cuda_config = config.clone();
-        cuda_config.backend = EmbeddingBackend::Cuda;
-        match new_model_with_config(&cuda_config, false) {
-            Ok(result) => return Ok(result),
-            Err(error) => tracing::warn!(
-                "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
-            ),
+        #[cfg(feature = "cuda")]
+        {
+            let mut cuda_config = config.clone();
+            cuda_config.backend = EmbeddingBackend::Cuda;
+            match new_model_with_config(&cuda_config, false) {
+                Ok(result) => return Ok(result),
+                Err(error) if config.fallback == FallbackPolicy::Error => {
+                    anyhow::bail!(
+                        "auto embedding backend could not initialize CUDA and fallback=error forbids fallback: {error}"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
+                ),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        if config.fallback == FallbackPolicy::Error {
+            anyhow::bail!(
+                "auto embedding backend requires CUDA support, but this artifact was built without the `cuda` feature and fallback=error forbids fallback"
+            );
         }
     }
 
@@ -1323,6 +1336,18 @@ fn validate_serving_generation_identity(
     manifest: &GenerationManifest,
 ) -> Result<()> {
     let flags = &manifest.semantic_identity.flags;
+    for (name, expected) in config.identity_flags() {
+        if let Some(actual) = flags.get(name) {
+            anyhow::ensure!(
+                actual == &expected,
+                "active semantic generation configuration {}={} does not match current {}={}",
+                name,
+                actual,
+                name,
+                expected
+            );
+        }
+    }
     let observed_device = manifest.device_attestation.observed_device.as_str();
     let provider = manifest.device_attestation.backend.as_str();
     let effective_backend = flags
@@ -1383,9 +1408,7 @@ fn generation_business_context_mode(
         .semantic_identity
         .flags
         .get("business_context_mode")
-        .ok_or_else(|| {
-            anyhow::anyhow!("semantic generation omits business_context_mode identity")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("semantic generation omits business_context_mode identity"))?
         .parse()
         .context("semantic generation has an invalid business_context_mode identity")
 }
@@ -6416,6 +6439,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "cuda"))]
     #[test]
     fn auto_error_does_not_require_compiled_cuda_backend() {
         let config = EmbeddingConfig {
