@@ -11,6 +11,7 @@ if (!serverPath || !repoPath) {
   console.error("Usage: node .github/scripts/mcp-smoke.mjs <server-path> <repo-path>");
   process.exit(2);
 }
+const absoluteRepoPath = path.resolve(repoPath);
 
 const workItemLedgerPath = path.join(
   repoPath,
@@ -340,7 +341,7 @@ try {
   const resolveResult = await client.callTool({
     name: "resolve_references",
     arguments: {
-      repo: repoPath,
+      repo: absoluteRepoPath,
       references: ["oh://v1/context/context-1"],
       offline: true,
     },
