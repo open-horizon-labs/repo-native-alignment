@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   build-semantic-bundle:
-    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
+    runs-on: ${{ vars.LOCAL_MACOS_SEMANTIC_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -98,14 +98,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace caches
-        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+        if: ${{ vars.LOCAL_MACOS_SEMANTIC_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
         shell: bash
         run: |
           set -euo pipefail
           nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
       - name: Cache Cargo downloads
-        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+        if: ${{ vars.LOCAL_MACOS_SEMANTIC_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: |
