@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "openvino")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -902,7 +904,7 @@ fn node_scalar_filters(
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[cfg(feature = "openvino")]
-static ORT_INITIALIZED: OnceLock<()> = OnceLock::new();
+static ORT_INITIALIZED: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
 
 enum EncoderModel {
     #[cfg(feature = "openvino")]
@@ -944,16 +946,30 @@ fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAtt
             "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
         )
     })?;
-    if ORT_INITIALIZED.get().is_none() {
-        let initialized = ort::init_from(&ort_path)
-            .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
-            .commit();
-        if !initialized {
-            anyhow::bail!(
-                "ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied"
-            );
-        }
-        let _ = ORT_INITIALIZED.set(());
+    let ort_path = PathBuf::from(ort_path).canonicalize().map_err(|error| {
+        anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {error}")
+    })?;
+    // ORT state belongs to the process, including a failed initialization.
+    // Retain failures so retries cannot enter partially initialized ORT state.
+    let initialized_path = ORT_INITIALIZED
+        .get_or_init(|| {
+            let initialized = ort::init_from(&ort_path)
+                .map_err(|e| format!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
+                .commit();
+            if !initialized {
+                return Err(
+                    "ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied"
+                        .to_string(),
+                );
+            }
+            Ok(ort_path.clone())
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if initialized_path != &ort_path {
+        anyhow::bail!(
+            "ORT_DYLIB_PATH changed after initialization; restart RNA to change runtimes"
+        );
     }
     let provider = ort::ep::OpenVINO::default()
         .with_device_type("GPU.0")
@@ -996,9 +1012,7 @@ fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAtt
 }
 
 #[cfg(not(feature = "openvino"))]
-fn new_model_with_policy(
-    require_metal: bool,
-) -> Result<(EncoderModel, DeviceAttestation)> {
+fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
@@ -1125,21 +1139,22 @@ fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
     }
     #[cfg(not(feature = "openvino"))]
     {
-    #[cfg(feature = "metal")]
-    if let Ok(attestation) = require_metal_device() {
-        return Ok(DeviceAttestation {
+        #[cfg(feature = "metal")]
+        if let Ok(attestation) = require_metal_device() {
+            return Ok(DeviceAttestation {
+                required_device: "any".to_string(),
+                ..attestation
+            });
+        }
+        let executable =
+            std::env::current_exe().context("failed to resolve running RNA artifact")?;
+        Ok(DeviceAttestation {
             required_device: "any".to_string(),
-            ..attestation
-        });
-    }
-    let executable = std::env::current_exe().context("failed to resolve running RNA artifact")?;
-    Ok(DeviceAttestation {
-        required_device: "any".to_string(),
-        observed_device: "cpu".to_string(),
-        backend: "candle-cpu".to_string(),
-        device_index: None,
-        artifact_sha256: generation::sha256_file(&executable)?,
-    })
+            observed_device: "cpu".to_string(),
+            backend: "candle-cpu".to_string(),
+            device_index: None,
+            artifact_sha256: generation::sha256_file(&executable)?,
+        })
     }
 }
 
@@ -6281,14 +6296,68 @@ mod tests {
 
     #[cfg(feature = "openvino")]
     #[test]
+    #[ignore = "requires an OpenVINO-enabled ORT runtime, Intel Arc GPU.0 and model assets"]
     fn openvino_gpu_embedding_probe_uses_intel_gpu_zero() {
         let (mut model, attestation) = super::new_model_with_policy(false).unwrap();
-        let embeddings = model.encode(&["Intel Arc OpenVINO embedding probe"]).unwrap();
+        let embeddings = model
+            .encode(&["Intel Arc OpenVINO embedding probe"])
+            .unwrap();
         let (_, second_attestation) = super::new_model_with_policy(false).unwrap();
         assert_eq!(attestation.backend, "onnxruntime-openvino");
         assert_eq!(attestation.observed_device, "GPU.0");
         assert_eq!(second_attestation.backend, "onnxruntime-openvino");
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), EMBEDDING_DIMENSION);
+        assert!(embeddings[0].iter().all(|value| value.is_finite()));
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn openvino_missing_runtime_fails_within_deadline() {
+        const CHILD: &str = "RNA_TEST_OPENVINO_MISSING_RUNTIME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // ORT owns process-global state. Use a fresh process and exercise a
+            // second failure too: retries must return an error without touching
+            // partially initialized ORT state.
+            for _ in 0..2 {
+                let error = match super::new_model_with_policy(false) {
+                    Ok(_) => panic!("missing runtime unexpectedly initialized"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains("failed to load ONNX Runtime"),
+                    "{error:#}"
+                );
+            }
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let invalid = scratch.path().join("invalid-onnxruntime.so");
+        std::fs::write(&invalid, b"not a shared library").unwrap();
+        for runtime in [scratch.path().join("missing-onnxruntime.so"), invalid] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "embed::real::tests::openvino_missing_runtime_fails_within_deadline",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ORT_DYLIB_PATH", runtime)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "missing-runtime child failed: {status}");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("missing-runtime initialization exceeded 10 seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }

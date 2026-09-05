@@ -70,8 +70,8 @@ metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", rev 
 candle-core = { version = "0.9", optional = true }
 
 # Optional cross-encoder reranking (ONNX runtime, CPU inference)
-fastembed = { version = "5", optional = true }
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["openvino", "load-dynamic"], optional = true }
+fastembed = { version = "5.17.4", optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["openvino", "load-dynamic"], optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
