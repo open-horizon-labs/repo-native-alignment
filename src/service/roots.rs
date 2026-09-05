@@ -433,18 +433,19 @@ fn list_roots_from_slugs_with_report_recovery(
 fn embedding_runtime_line(repo_root: &Path) -> String {
     match crate::embed::config::EmbeddingConfig::from_repo(repo_root) {
         Ok(config) => {
-            let observed = crate::embed::generation::load_current_generation(repo_root)
-                .ok()
-                .flatten()
-                .map(|(_, manifest, _, _)| {
-                    format!(
-                        "effective_backend={} provider={} device_index={}",
-                        manifest.device_attestation.observed_device,
-                        manifest.device_attestation.backend,
-                        manifest.device_attestation.device_index.map_or_else(|| "none".to_string(), |n| n.to_string()),
-                    )
-                })
-                .unwrap_or_else(|| "effective_backend=not_attested".to_string());
+            let observed = match crate::embed::generation::load_current_generation(repo_root) {
+                Ok(Some((_, manifest, _, _))) => format!(
+                    "effective_backend={} provider={} device_index={}",
+                    manifest.device_attestation.observed_device,
+                    manifest.device_attestation.backend,
+                    manifest
+                        .device_attestation
+                        .device_index
+                        .map_or_else(|| "none".to_string(), |n| n.to_string()),
+                ),
+                Ok(None) => "effective_backend=not_attested".to_string(),
+                Err(error) => format!("effective_backend=not_attested attestation_error={error}"),
+            };
             format!(
                 "\n\n### Embedding runtime\n\n- requested_backend={} cuda_device={} fallback={} batch_size={} {}",
                 config.backend, config.cuda_device, config.fallback,
@@ -457,7 +458,7 @@ fn embedding_runtime_line(repo_root: &Path) -> String {
 
 #[cfg(not(feature = "embeddings"))]
 fn embedding_runtime_line(_repo_root: &Path) -> String {
-    String::new()
+    "\n\n### Embedding runtime\n\n- availability=unavailable (RNA was built without embeddings support)".to_string()
 }
 
 /// Returns true if the given LSP server binary is relevant for any of the languages present in a root.
@@ -543,6 +544,10 @@ mod tests {
             "should produce a roots header"
         );
         assert!(result.contains("root(s)"), "should report root count");
+        assert!(
+            result.contains("### Embedding runtime"),
+            "should report embedding availability"
+        );
     }
 
     #[test]

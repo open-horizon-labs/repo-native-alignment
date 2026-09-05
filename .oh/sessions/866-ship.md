@@ -35,5 +35,11 @@ Added a real temporary-repository configuration test covering backend, CUDA ordi
 ### Step 10b: Final comment sweep (in progress)
 CodeRabbit findings verified. Fixed stale session wording, added session frontmatter, made configuration I/O fail closed, bounded CUDA ordinal conversion, moved embedding runtime rendering into the shared roots service, and resolved the effective backend/provider/device before semantic identity and vector reuse planning. NUC execution evidence remains unavailable; no CUDA execution claim is made.
 
+### Step 10c: Independent final-diff review
+Blocked: no fresh sub-agent/repo-local review worker is callable in this task context. Required approval for exact head `1d65c9b8677c6bf4c2a793ebd435c66bcbdb2674` was not fabricated. PR remains open; NUC RTX execution evidence is also outstanding.
+
+### Fresh ship run — current head
+The current-head CodeRabbit stability finding was verified: `list_roots` collapsed generation-load errors into `not_attested` and non-embedding builds omitted runtime availability. Fixed both paths and added a regression assertion. Targeted no-default test passes; full validation and a fresh exact-head Step 10c review remain required.
+
 ### Step 7a: Manual verification
 Full no-default tests and default compile passed. `nvidia-smi` sees an RTX 3060 Ti, but no CUDA/cuDNN runtime libraries or `nvcc` are available; this is hardware presence only, not execution evidence. Embedding-feature build and MCP smoke are blocked by missing OpenSSL development files and local MCP SDK package respectively.
