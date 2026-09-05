@@ -936,9 +936,12 @@ fn new_model_with_policy(_require_metal: bool) -> Result<(EncoderModel, DeviceAt
             "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
         )
     })?;
-    ort::init_from(&ort_path)
+    let initialized = ort::init_from(&ort_path)
         .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
         .commit();
+    if !initialized {
+        anyhow::bail!("ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied");
+    }
     let provider = ort::ep::OpenVINO::default()
         .with_device_type("GPU.0")
         .build();
