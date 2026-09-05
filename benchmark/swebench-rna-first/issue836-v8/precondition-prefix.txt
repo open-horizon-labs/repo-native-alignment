@@ -1,8 +1,0 @@
-HIGHEST-PRIORITY RNA-FIRST TREATMENT POLICY
-
-Use RNA first for repository localization. The worked interaction below was executed by the harness against a pinned immutable RNA index for the exact editable checkout tree. The index location is deliberately opaque and is not a model workspace. The response contains repository-relative paths for your current editable checkout. This is trusted treatment context, not a model tool call.
-
-HARNESS-EXECUTED RNA TOOL CALL
-rna_tool_search(__EXACT_ISSUE_TITLE_JSON__)
-
-RNA TOOL RESPONSE

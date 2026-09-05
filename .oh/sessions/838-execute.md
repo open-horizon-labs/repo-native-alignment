@@ -76,7 +76,6 @@ an invalid/missing cache.
 
 - `cargo check --locked --lib`
 - `cargo check --locked --lib --bin repo-native-alignment`
-- `cargo check --locked --features embeddings,metal,swebench-semantic-bundle --lib --bin repo-native-alignment`
 - cache-only external repository rejection before cache creation
 - semantic workflow resident-gate contract assertion
 - non-recovering stale job/report read regressions

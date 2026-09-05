@@ -239,13 +239,7 @@ fn generation_requires_metal(manifest: &crate::embed::generation::GenerationMani
 fn active_generation_execution_policy(
     manifest: Option<&crate::embed::generation::GenerationManifest>,
 ) -> Option<bool> {
-    if option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1") {
-        // A sealed binary remains authoritative even before its first
-        // generation exists; it may never enter the mutable targeted path.
-        Some(true)
-    } else {
-        manifest.map(generation_requires_metal)
-    }
+    manifest.map(generation_requires_metal)
 }
 
 /// Project a post-persistence semantic verification error into both observable

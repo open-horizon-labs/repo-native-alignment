@@ -4587,47 +4587,6 @@ mod tests {
         ));
         assert!(!command_exists_on_path("which", Some(bin.as_os_str())));
     }
-
-    #[test]
-    fn frozen_cohort_descriptor_commands_match_locked_launchers() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("benchmark/swebench-act-context/lsp-toolchain/descriptor-inventory.json");
-        let inventory: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
-        )
-        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-        let servers = inventory["servers"]
-            .as_array()
-            .expect("descriptor inventory servers must be an array");
-        assert_eq!(servers.len(), 32, "frozen cohort language count drifted");
-
-        for profile in servers {
-            let languages = profile["languages"]
-                .as_array()
-                .expect("descriptor languages must be an array");
-            assert_eq!(languages.len(), 1, "each frozen profile owns one language");
-            let language = languages[0]
-                .as_str()
-                .expect("descriptor language must be a string");
-            let command = profile["command"]
-                .as_str()
-                .expect("descriptor command must be a string");
-            let args = profile["args"]
-                .as_array()
-                .expect("descriptor args must be an array")
-                .iter()
-                .map(|arg| arg.as_str().expect("descriptor arg must be a string"))
-                .collect::<Vec<_>>();
-            let descriptor = builtin_lsp_descriptors()
-                .iter()
-                .find(|descriptor| descriptor.language == language)
-                .unwrap_or_else(|| panic!("missing {language} descriptor"));
-            assert_eq!(descriptor.command, command);
-            assert_eq!(descriptor.args, args.as_slice());
-        }
-    }
-
     #[test]
     fn inventory_language_ids_and_legacy_text_seed_mandatory_files() {
         assert_eq!(

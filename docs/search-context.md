@@ -234,10 +234,3 @@ existing source span or a proposal line. Unsupported, ambiguous, binary,
 traversal-containing, oversized, or incomplete inputs fail closed. Missing
 optional graph/LSP/semantic evidence is instead reported as a degraded
 capability; it is never presented as proof that no impact exists.
-
-## Strict semantic qualification
-
-The sealed SWE-bench strict path keeps its frozen qualification, ordering,
-rendering, protocol, and packet bytes. Product projections, calibrated fusion,
-task context, and graph-delta are separate opt-in/non-strict paths and do not
-retroactively change frozen benchmark evidence.
