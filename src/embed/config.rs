@@ -4,6 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Precision of persisted embedding vectors and the production encoder.
+pub const EMBEDDING_PRECISION: &str = "f32";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbeddingBackend {
@@ -126,7 +129,7 @@ impl EmbeddingConfig {
         Ok(())
     }
 
-    pub fn identity_flags(&self) -> [(&'static str, String); 5] {
+    pub fn identity_flags(&self) -> [(&'static str, String); 6] {
         [
             ("embedding_backend", self.backend.to_string()),
             ("cuda_device", self.cuda_device.to_string()),
@@ -137,6 +140,7 @@ impl EmbeddingConfig {
                     .map_or_else(|| "adaptive".into(), |n| n.to_string()),
             ),
             ("embedding_provider_contract", "onnxruntime-cuda-v1".into()),
+            ("embedding_precision", EMBEDDING_PRECISION.into()),
         ]
     }
 }

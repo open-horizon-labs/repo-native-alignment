@@ -435,21 +435,32 @@ fn embedding_runtime_line(repo_root: &Path) -> String {
         Ok(config) => {
             let observed = match crate::embed::generation::load_current_generation(repo_root) {
                 Ok(Some((_, manifest, _, _))) => format!(
-                    "effective_backend={} provider={} device_index={}",
+                    "effective_backend={} provider={} device_index={} precision={}",
                     manifest.device_attestation.observed_device,
                     manifest.device_attestation.backend,
                     manifest
                         .device_attestation
                         .device_index
                         .map_or_else(|| "none".to_string(), |n| n.to_string()),
+                    manifest
+                        .semantic_identity
+                        .flags
+                        .get("embedding_precision")
+                        .map_or("unknown", String::as_str),
                 ),
                 Ok(None) => "effective_backend=not_attested".to_string(),
                 Err(error) => format!("effective_backend=not_attested attestation_error={error}"),
             };
             format!(
-                "\n\n### Embedding runtime\n\n- requested_backend={} cuda_device={} fallback={} batch_size={} {}",
-                config.backend, config.cuda_device, config.fallback,
-                config.batch_size.map_or_else(|| "adaptive".to_string(), |n| n.to_string()), observed,
+                "\n\n### Embedding runtime\n\n- requested_backend={} cuda_device={} fallback={} batch_size={} precision={} {}",
+                config.backend,
+                config.cuda_device,
+                config.fallback,
+                config
+                    .batch_size
+                    .map_or_else(|| "adaptive".to_string(), |n| n.to_string()),
+                crate::embed::config::EMBEDDING_PRECISION,
+                observed,
             )
         }
         Err(error) => format!("\n\n### Embedding runtime\n\n- configuration_error={error}"),

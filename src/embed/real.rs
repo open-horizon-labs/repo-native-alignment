@@ -1326,16 +1326,17 @@ fn validate_serving_generation_identity(
 ) -> Result<()> {
     let flags = &manifest.semantic_identity.flags;
     for (name, expected) in config.identity_flags() {
-        if let Some(actual) = flags.get(name) {
-            anyhow::ensure!(
-                actual == &expected,
-                "active semantic generation configuration {}={} does not match current {}={}",
-                name,
-                actual,
-                name,
-                expected
-            );
-        }
+        let actual = flags.get(name).ok_or_else(|| {
+            anyhow::anyhow!("active semantic generation is missing required identity flag {name}")
+        })?;
+        anyhow::ensure!(
+            actual == &expected,
+            "active semantic generation configuration {}={} does not match current {}={}",
+            name,
+            actual,
+            name,
+            expected
+        );
     }
     let observed_device = manifest.device_attestation.observed_device.as_str();
     let provider = manifest.device_attestation.backend.as_str();
@@ -1848,17 +1849,18 @@ impl EmbeddingIndex {
     /// readiness and operation diagnostics.
     pub fn runtime_diagnostic(&self) -> String {
         let config = format!(
-            "requested_backend={} cuda_device={} fallback={} batch_size={}",
+            "requested_backend={} cuda_device={} fallback={} batch_size={} precision={}",
             self.embedding_config.backend,
             self.embedding_config.cuda_device,
             self.embedding_config.fallback,
             self.embedding_config
                 .batch_size
                 .map_or_else(|| "adaptive".to_string(), |n| n.to_string()),
+            crate::embed::config::EMBEDDING_PRECISION,
         );
         match self.active_generation_manifest() {
             Some(manifest) => format!(
-                "{} effective_backend={} provider={} device_index={}",
+                "{} effective_backend={} provider={} device_index={} precision={}",
                 config,
                 manifest.device_attestation.observed_device,
                 manifest.device_attestation.backend,
@@ -1866,6 +1868,11 @@ impl EmbeddingIndex {
                     .device_attestation
                     .device_index
                     .map_or_else(|| "none".to_string(), |n| n.to_string()),
+                manifest
+                    .semantic_identity
+                    .flags
+                    .get("embedding_precision")
+                    .map_or("unknown", String::as_str),
             ),
             None => format!("{} effective_backend=not_attested", config),
         }
@@ -6392,11 +6399,17 @@ mod tests {
         device_index: Option<usize>,
     ) -> GenerationManifest {
         let effective_device = device_index.map_or_else(|| "none".to_string(), |n| n.to_string());
-        let identity = identity_for_serving_test(BTreeMap::from([
+        let mut flags = BTreeMap::from([
             ("effective_backend".to_string(), observed_device.to_string()),
             ("effective_provider".to_string(), provider.to_string()),
             ("effective_device_index".to_string(), effective_device),
-        ]));
+        ]);
+        flags.extend(
+            EmbeddingConfig::default()
+                .identity_flags()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
+        let identity = identity_for_serving_test(flags);
         GenerationManifest {
             schema_version: generation::GENERATION_SCHEMA_VERSION,
             generation_digest: "generation".to_string(),
@@ -6464,6 +6477,13 @@ mod tests {
             cuda_device: 0,
             ..Default::default()
         };
+        let mut manifest = manifest;
+        for (name, value) in config.identity_flags() {
+            manifest
+                .semantic_identity
+                .flags
+                .insert(name.to_string(), value);
+        }
         let error = validate_serving_generation_identity(&config, &manifest).unwrap_err();
         assert!(error.to_string().contains("requires CUDA device 0"));
     }
@@ -6478,5 +6498,20 @@ mod tests {
         let error = validate_serving_generation_identity(&EmbeddingConfig::default(), &manifest)
             .unwrap_err();
         assert!(error.to_string().contains("does not match its attestation"));
+    }
+
+    #[test]
+    fn serving_rejects_missing_required_identity_flags() {
+        for (missing, _) in EmbeddingConfig::default().identity_flags() {
+            let mut manifest = manifest_for_serving_test("cpu", "candle-cpu", None);
+            manifest.semantic_identity.flags.remove(missing);
+            let error =
+                validate_serving_generation_identity(&EmbeddingConfig::default(), &manifest)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("missing required identity flag"),
+                "missing {missing} must fail closed: {error}"
+            );
+        }
     }
 }

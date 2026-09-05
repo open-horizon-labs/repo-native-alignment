@@ -127,6 +127,8 @@ equivalent overrides are `RNA_EMBEDDING_BACKEND`, `RNA_CUDA_DEVICE`,
 `RNA_EMBEDDING_FALLBACK`, and `RNA_EMBEDDING_BATCH_SIZE`. CUDA builds use the
 ONNX Runtime CUDA 12 execution provider and require compatible CUDA 12 and
 cuDNN 9 runtime libraries; RNA does not install them.
+All persisted vectors currently use `f32` precision; precision is included in
+semantic generation identity and runtime diagnostics.
 
 **Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 
