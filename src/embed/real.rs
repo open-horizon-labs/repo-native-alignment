@@ -3,7 +3,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -901,6 +901,9 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(feature = "openvino")]
+static ORT_INITIALIZED: OnceLock<()> = OnceLock::new();
+
 enum EncoderModel {
     #[cfg(feature = "openvino")]
     OpenVino(fastembed::TextEmbedding),
@@ -941,11 +944,16 @@ fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAtt
             "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
         )
     })?;
-    let initialized = ort::init_from(&ort_path)
-        .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
-        .commit();
-    if !initialized {
-        anyhow::bail!("ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied");
+    if ORT_INITIALIZED.get().is_none() {
+        let initialized = ort::init_from(&ort_path)
+            .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
+            .commit();
+        if !initialized {
+            anyhow::bail!(
+                "ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied"
+            );
+        }
+        let _ = ORT_INITIALIZED.set(());
     }
     let provider = ort::ep::OpenVINO::default()
         .with_device_type("GPU.0")
@@ -6276,8 +6284,10 @@ mod tests {
     fn openvino_gpu_embedding_probe_uses_intel_gpu_zero() {
         let (mut model, attestation) = super::new_model_with_policy(false).unwrap();
         let embeddings = model.encode(&["Intel Arc OpenVINO embedding probe"]).unwrap();
+        let (_, second_attestation) = super::new_model_with_policy(false).unwrap();
         assert_eq!(attestation.backend, "onnxruntime-openvino");
         assert_eq!(attestation.observed_device, "GPU.0");
+        assert_eq!(second_attestation.backend, "onnxruntime-openvino");
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), EMBEDDING_DIMENSION);
     }
