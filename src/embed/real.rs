@@ -6439,6 +6439,23 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA runtime and downloads the production embedding model"]
+    fn production_fastembed_cuda_session_is_attested_after_inference() {
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackend::Cuda,
+            ..Default::default()
+        };
+        let (model, attestation) = super::new_model_with_config(&config, false)
+            .expect("production fastembed CUDA session should initialize and embed");
+        assert!(matches!(model, super::EncoderModel::Cuda(_)));
+        assert_eq!(attestation.required_device, "cuda");
+        assert_eq!(attestation.observed_device, "cuda");
+        assert_eq!(attestation.backend, "onnxruntime-cuda");
+        assert_eq!(attestation.device_index, Some(config.cuda_device));
+    }
+
     #[test]
     fn serving_rejects_cuda_generation_on_wrong_device() {
         let manifest = manifest_for_serving_test("cuda", "onnxruntime-cuda", Some(1));

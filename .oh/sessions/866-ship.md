@@ -25,6 +25,7 @@ PR #866 / issue #865, branch `865-cuda-embeddings`, head `c5462e5`. Worktree ind
 | 2026-09-04 | skipped | `gh pr diff --stat` is unsupported by installed GitHub CLI; used supported diff/status queries instead. |
 | 2026-09-04 | skipped | Worktree copy of `.oh/metis/computed-but-not-delivered.md` is absent; the repository instruction and PR Step 1 copy supplied the applicable guidance. |
 | 2026-09-04 | skipped | MCP smoke script could not start because local `@modelcontextprotocol/sdk` dependency is not installed; exact-head CI MCP smoke remains required. |
+| 2026-09-05 | skipped | Mandatory RNA scan could not run because the `repo-native-alignment` CLI is not installed or exposed in this session; source inspection proceeded only after recording this fallback. |
 
 ### Step 3: Fix
 Fixed configured reindex execution, added runtime diagnostics through embedding status, operation reports, search, and list_roots, corrected semantic-bundle type inference, and declared the `cuda` RustSec reachability scope. Default-feature compile and full no-default test suite pass. Embeddings-feature compile is blocked on host OpenSSL development libraries; no CUDA execution claim is made.
@@ -43,3 +44,19 @@ The current-head CodeRabbit stability finding was verified: `list_roots` collaps
 
 ### Step 7a: Manual verification
 Full no-default tests and default compile passed. `nvidia-smi` sees an RTX 3060 Ti, but no CUDA/cuDNN runtime libraries or `nvcc` are available; this is hardware presence only, not execution evidence. Embedding-feature build and MCP smoke are blocked by missing OpenSSL development files and local MCP SDK package respectively.
+
+### Resume after conflict resolution
+Post-conflict review began at requested head `e869bcf66e367d5557a7e406f3892cafcc7b391a`. A concurrent regression-test commit advanced the branch to `96256327076158f41b850c4e1fb25856f840b2db`; all subsequent exact-head gates must use that SHA. Step 1 was re-posted as ADJUST with three concrete findings. Step 2 is blocked because no fresh sub-agent/repo-local review worker is callable in this session; no approval was fabricated.
+
+### Step 10c remediation evidence
+
+Fresh Step 10c findings are addressed on exact head `282527b`: auto with
+`fallback=error` exhausts CUDA and Metal before rejecting CPU; explicit CUDA
+remains strict; CUDA identity is created only after the retained production
+fastembed TextEmbedding session performs a real embedding probe. The
+CUDA-feature production-session test passed on the NUC RTX 3060 Ti after
+installing missing disposable CUDA runtime libraries. The real MCP TypeScript
+client smoke passed against the exact-head binary and disposable fixture,
+including readiness/status via `list_roots`. CI lint, test, audit, Analyze,
+changes, checklist, and CodeRabbit checks are green; smoke/build-release remain
+skipped by workflow policy.
