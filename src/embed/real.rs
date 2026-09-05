@@ -913,23 +913,11 @@ fn new_model() -> Result<EncoderModel> {
     new_model_with_config(&EmbeddingConfig::default(), false).map(|(model, _)| model)
 }
 
-fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
-    let config = EmbeddingConfig::default();
-    new_model_with_config(&config, require_metal)
-}
-
 fn new_model_with_config(
     config: &EmbeddingConfig,
     require_metal: bool,
 ) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
-
-    #[cfg(not(feature = "cuda"))]
-    if config.backend == EmbeddingBackend::Auto && config.fallback == FallbackPolicy::Error {
-        anyhow::bail!(
-            "auto embedding backend with fallback=error requires an artifact built with the `cuda` feature (rebuild with --features cuda)"
-        );
-    }
 
     #[cfg(feature = "cuda")]
     if config.backend == EmbeddingBackend::Auto && !require_metal {
@@ -937,11 +925,6 @@ fn new_model_with_config(
         cuda_config.backend = EmbeddingBackend::Cuda;
         match new_model_with_config(&cuda_config, false) {
             Ok(result) => return Ok(result),
-            Err(error) if config.fallback == FallbackPolicy::Error => {
-                anyhow::bail!(
-                    "auto embedding backend could not initialize CUDA and fallback=error: {error}"
-                )
-            }
             Err(error) => tracing::warn!(
                 "CUDA unavailable for auto embedding backend; falling back according to policy: {error}"
             ),
@@ -981,7 +964,16 @@ fn new_model_with_config(
                     EMBEDDING_DIMENSION
                 );
             }
-            cuda_runtime_probe(config.cuda_device)?;
+            // This is the production encoder used by indexing and query.  Do
+            // not attest a separate raw ORT session: a successful inference
+            // through this exact fastembed session is the execution proof
+            // available at this abstraction boundary.  Provider registration
+            // uses error_on_failure(), so a CUDA provider initialization
+            // failure cannot be mistaken for verified CUDA execution.
+            anyhow::ensure!(
+                probe.iter().flatten().all(|value| value.is_finite()),
+                "CUDA production embedding returned non-finite values"
+            );
             let artifact_sha256 = generation::sha256_file(
                 &std::env::current_exe().context("failed to resolve running RNA artifact")?,
             )?;
@@ -1043,6 +1035,14 @@ fn new_model_with_config(
     if require_metal && !observed_metal {
         anyhow::bail!("strict embedding execution forbids Metal-to-CPU fallback");
     }
+    if config.backend == EmbeddingBackend::Auto
+        && config.fallback == FallbackPolicy::Error
+        && !observed_metal
+    {
+        anyhow::bail!(
+            "auto embedding backend could not initialize CUDA or Metal and fallback=error forbids CPU"
+        );
+    }
     let artifact_sha256 = generation::sha256_file(
         &std::env::current_exe().context("failed to resolve running RNA artifact")?,
     )?;
@@ -1093,70 +1093,6 @@ fn new_model_with_config(
             Err(err)
         }
     }
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_runtime_probe(device_index: usize) -> Result<()> {
-    use std::collections::HashMap;
-
-    fn find_model(root: &std::path::Path) -> Option<std::path::PathBuf> {
-        let entries = std::fs::read_dir(root).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_model(&path) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("model.onnx")
-                && path.to_string_lossy().contains("all-MiniLM-L6-v2")
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
-
-    let cache_dir = std::env::var_os("FASTEMBED_CACHE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
-    let model_path = find_model(&cache_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "CUDA runtime probe could not locate the downloaded MiniLM ONNX model under {}",
-            cache_dir.display()
-        )
-    })?;
-    let device_id = i32::try_from(device_index)
-        .context("CUDA device ordinal exceeds the supported i32 range")?;
-    let provider = ort::execution_providers::CUDA::default()
-        .with_device_id(device_id)
-        .build()
-        .error_on_failure();
-    let mut session = ort::session::Session::builder()?
-        .with_execution_providers([provider])
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .with_disable_cpu_fallback()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .commit_from_file(&model_path)?;
-
-    let mut inputs = HashMap::new();
-    for input in session.inputs() {
-        let values = vec![1_i64; 8];
-        let tensor = ort::value::Tensor::from_array((vec![1_usize, 8], values))?.upcast();
-        inputs.insert(input.name().to_string(), tensor);
-    }
-    if inputs.is_empty() {
-        anyhow::bail!("CUDA runtime probe model has no inputs");
-    }
-    let outputs = session.run(inputs)?;
-    anyhow::ensure!(
-        outputs.len() > 0,
-        "CUDA runtime probe produced no ONNX outputs"
-    );
-    tracing::info!(
-        "CUDA runtime probe executed MiniLM with CPU EP fallback disabled on device {}",
-        device_index
-    );
-    Ok(())
 }
 
 /// Fail closed unless the exact running artifact can initialize Candle Metal device 0.
@@ -6526,9 +6462,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "cuda"))]
     #[test]
-    fn auto_error_requires_compiled_cuda_backend() {
+    fn auto_error_does_not_require_compiled_cuda_backend() {
         let config = EmbeddingConfig {
             fallback: FallbackPolicy::Error,
             ..Default::default()
@@ -6537,7 +6472,10 @@ mod tests {
             Ok(_) => panic!("auto + fallback=error unexpectedly initialized"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("built with the `cuda` feature"));
+        assert!(
+            error.to_string().contains("CUDA") || error.to_string().contains("Metal"),
+            "error should report exhausted accelerator attempts: {error}"
+        );
     }
 
     #[test]

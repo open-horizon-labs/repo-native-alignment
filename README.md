@@ -117,10 +117,12 @@ fallback = "cpu"       # auto fallback policy: cpu or error
 # batch_size = 32       # omit for adaptive batching
 ```
 
-`auto` tries CUDA first in a CUDA-enabled build, then preserves the existing
-Metal/CPU selection. `backend = "cuda"` is strict: missing CUDA/cuDNN runtime
-libraries, an unavailable ordinal, provider registration failure, or a failed
-probe aborts indexing/query initialization and never falls back to CPU. The
+`auto` tries CUDA first in a CUDA-enabled build, then Metal, then CPU when
+`fallback = "cpu"` (the default). With `fallback = "error"`, it tries CUDA
+and Metal but fails if neither accelerator is usable; it never silently uses
+CPU. `backend = "cuda"` is strict: missing CUDA/cuDNN runtime libraries, an
+unavailable ordinal, provider registration failure, or failed production
+inference aborts indexing/query initialization and never falls back to CPU. The
 equivalent overrides are `RNA_EMBEDDING_BACKEND`, `RNA_CUDA_DEVICE`,
 `RNA_EMBEDDING_FALLBACK`, and `RNA_EMBEDDING_BATCH_SIZE`. CUDA builds use the
 ONNX Runtime CUDA 12 execution provider and require compatible CUDA 12 and

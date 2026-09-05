@@ -78,7 +78,9 @@ impl EmbeddingConfig {
                     .context("invalid [embeddings] configuration")?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(error) => return Err(error).with_context(|| format!("failed to read {}", path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
         };
         config.apply_environment()?;
         config.validate()?;
@@ -116,7 +118,10 @@ impl EmbeddingConfig {
             bail!("embedding batch_size must be greater than zero");
         }
         if self.cuda_device > i32::MAX as usize {
-            bail!("embedding cuda_device {} exceeds the supported i32 range", self.cuda_device);
+            bail!(
+                "embedding cuda_device {} exceeds the supported i32 range",
+                self.cuda_device
+            );
         }
         Ok(())
     }
