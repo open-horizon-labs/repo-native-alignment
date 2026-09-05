@@ -108,23 +108,12 @@ impl SemanticIdentity {
     }
 }
 
-pub fn semantic_asset_seeding() -> bool {
-    std::env::var("RNA_SEMANTIC_ASSET_SEEDING").as_deref() == Ok("1")
-}
-
-pub fn sealed_semantic_bundle_build() -> bool {
-    option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
-}
-
 pub fn runtime_asset_digests() -> Result<(String, String, String, String)> {
     fn value(name: &str, fallback_label: &str) -> Result<String> {
         match std::env::var(name) {
             Ok(value) => {
                 require_sha256(name, &value)?;
                 Ok(value)
-            }
-            Err(_) if sealed_semantic_bundle_build() && !semantic_asset_seeding() => {
-                bail!("sealed semantic bundle requires runtime identity `{name}`")
             }
             Err(_) => Ok(sha256_bytes(fallback_label.as_bytes())),
         }
@@ -150,21 +139,20 @@ pub fn runtime_asset_digests() -> Result<(String, String, String, String)> {
     ))
 }
 
-/// Verify that the encoder cache selected at runtime is byte-for-byte the
-/// regular-file tree sealed by the semantic bundle manifest. Environment
-/// digests are trust anchors, not evidence by themselves: the actual HF_HOME
-/// tree and the uniquely named snapshot assets must match before use.
+/// Verify that the encoder cache selected at runtime matches the configured
+/// asset digests. Environment digests are trust anchors, so the actual HF_HOME
+/// tree and uniquely named snapshot assets must match before use.
 pub fn verify_runtime_encoder_assets() -> Result<(String, String, String)> {
     let (expected_tree, expected_model, expected_tokenizer, _) = runtime_asset_digests()?;
     let root = std::env::var("HF_HOME")
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("sealed semantic bundle requires HF_HOME"))?;
+        .ok_or_else(|| anyhow::anyhow!("runtime asset verification requires HF_HOME"))?;
     let entries = verified_tree_entries(&root)?;
     let observed_tree = sha256_bytes(&canonical_json_bytes(&entries)?);
     if observed_tree != expected_tree {
-        bail!("encoder cache tree digest does not match the sealed manifest");
+        bail!("encoder cache tree digest does not match the configured asset identity");
     }
 
     let unique_snapshot_asset = |name: &str| -> Result<&TreeEntry> {
@@ -186,10 +174,10 @@ pub fn verify_runtime_encoder_assets() -> Result<(String, String, String)> {
     let model = unique_snapshot_asset("model.safetensors")?;
     let tokenizer = unique_snapshot_asset("tokenizer.json")?;
     if model.sha256 != expected_model {
-        bail!("encoder model.safetensors digest does not match the sealed manifest");
+        bail!("encoder model.safetensors digest does not match the configured asset identity");
     }
     if tokenizer.sha256 != expected_tokenizer {
-        bail!("encoder tokenizer.json digest does not match the sealed manifest");
+        bail!("encoder tokenizer.json digest does not match the configured asset identity");
     }
     if entries.iter().any(|entry| {
         entry.path.split('/').any(|part| part == "snapshots")

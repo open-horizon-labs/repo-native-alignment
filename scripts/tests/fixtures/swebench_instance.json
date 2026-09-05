@@ -1,8 +1,0 @@
-{
-  "base_commit": "0123456789abcdef0123456789abcdef01234567",
-  "dataset_revision": "fixture-revision",
-  "hints_text": "",
-  "instance_id": "fixture__repo-1",
-  "problem_statement": "Change the fixture greeting without consulting upstream history.",
-  "repo": "fixture/repo"
-}

@@ -209,9 +209,9 @@ fn should_continue_lsp_enrichment(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingReconciliationMode {
     /// Reconcile the complete freshly reopened graph and require graph-aware
-    /// readiness. This is mandatory for repo scope and sealed generations.
+    /// readiness. This is mandatory for repo scope and strict generations.
     AuthoritativePersistedGraph,
-    /// Reconcile a complete immutable generation without imposing the sealed
+    /// Reconcile a complete immutable generation without imposing the strict
     /// full-LSP contract on an ordinary scoped request.
     OrdinaryImmutableGeneration,
     /// Preserve the legacy targeted in-place update for an ordinary mutable
@@ -245,13 +245,7 @@ fn generation_requires_metal(manifest: &crate::embed::generation::GenerationMani
 fn active_generation_execution_policy(
     manifest: Option<&crate::embed::generation::GenerationManifest>,
 ) -> Option<bool> {
-    if option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1") {
-        // A sealed binary remains authoritative even before its first
-        // generation exists; it may never enter the mutable targeted path.
-        Some(true)
-    } else {
-        manifest.map(generation_requires_metal)
-    }
+    manifest.map(generation_requires_metal)
 }
 
 /// Project a post-persistence semantic verification error into both observable
@@ -1258,7 +1252,7 @@ impl RnaHandler {
             // The graph builder starts background LSP immediately before this
             // task. Wait for that structural producer to reach a terminal state,
             // then reopen its persisted output. Embedding an earlier in-memory
-            // snapshot would recreate the pre-#786 graph/vector race.
+            // snapshot would recreate the graph/vector publication race.
             let wait_started = std::time::Instant::now();
             let wait_budget = LspBudget::from_env().max_duration;
             loop {

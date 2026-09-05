@@ -373,10 +373,6 @@ impl SemanticGenerationReadiness {
     }
 }
 
-fn sealed_semantic_bundle_build() -> bool {
-    option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
-}
-
 /// Tracks embedding build progress so the search footer can show
 /// `embedding... (N/M)` during build and just the count when done.
 pub struct EmbeddingStatus {
@@ -437,9 +433,6 @@ impl EmbeddingStatus {
     pub fn set_complete(&self, count: usize) {
         self.completed_count
             .store(count, std::sync::atomic::Ordering::Release);
-        if sealed_semantic_bundle_build() {
-            *self.verified_generation.lock().unwrap() = None;
-        }
         self.state.store(2, std::sync::atomic::Ordering::Release);
     }
 
@@ -460,11 +453,6 @@ impl EmbeddingStatus {
         &self,
         index: &crate::embed::EmbeddingIndex,
     ) -> anyhow::Result<()> {
-        if sealed_semantic_bundle_build() {
-            anyhow::bail!(
-                "sealed semantic readiness requires the current persisted graph and completeness report"
-            );
-        }
         let (manifest, verification) = index.verified_generation_evidence()?.ok_or_else(|| {
             anyhow::anyhow!("semantic index has no published verified generation")
         })?;
@@ -554,16 +542,7 @@ impl EmbeddingStatus {
                 let count = self
                     .completed_count
                     .load(std::sync::atomic::Ordering::Acquire);
-                if semantic_index_available
-                    && sealed_semantic_bundle_build()
-                    && verified_generation.is_none()
-                {
-                    CapabilityReadiness::new(
-                        "embeddings / semantic search",
-                        CapabilityReadinessState::Failed,
-                        "embedding work completed without verifier-clean immutable generation evidence",
-                    )
-                } else if semantic_index_available {
+                if semantic_index_available {
                     CapabilityReadiness::new(
                         "embeddings / semantic search",
                         CapabilityReadinessState::Ready,

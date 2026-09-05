@@ -345,9 +345,9 @@ fn rank_search_results(results: &mut [SearchResult]) {
     results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
 }
 
-/// Sealed handles must validate graph/current-pointer and runtime asset identity
+/// Strict handles must validate graph/current-pointer and runtime asset identity
 /// for every query, regardless of the explicitly requested retrieval mode.
-fn requires_sealed_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
+fn requires_strict_query_validation(require_metal: bool, _mode: SearchMode) -> bool {
     require_metal
 }
 
@@ -443,10 +443,6 @@ impl Drop for UnpublishedScratchRoot {
             );
         }
     }
-}
-
-fn sealed_semantic_bundle_build() -> bool {
-    option_env!("RNA_SEMANTIC_BUNDLE_BUILD") == Some("1")
 }
 
 /// Maximum character budget for code embedding text.
@@ -1271,14 +1267,12 @@ enum GenerationOpenPurpose {
 fn requires_active_generation_graph_validation(
     purpose: GenerationOpenPurpose,
     require_metal: bool,
-    asset_seeding: bool,
     has_active_generation: bool,
 ) -> bool {
     matches!(
         purpose,
         GenerationOpenPurpose::Serving | GenerationOpenPurpose::ResidentServing
     ) && require_metal
-        && !asset_seeding
         && has_active_generation
 }
 
@@ -1390,10 +1384,10 @@ fn generation_business_context_mode(
         .flags
         .get("business_context_mode")
         .ok_or_else(|| {
-            anyhow::anyhow!("sealed semantic generation omits business_context_mode identity")
+            anyhow::anyhow!("semantic generation omits business_context_mode identity")
         })?
         .parse()
-        .context("sealed semantic generation has an invalid business_context_mode identity")
+        .context("semantic generation has an invalid business_context_mode identity")
 }
 
 /// Result of a semantic search — either results or "not ready yet."
@@ -1867,11 +1861,7 @@ impl EmbeddingIndex {
 
     /// Create or open the currently published immutable semantic generation.
     pub async fn new(repo_root: &Path) -> Result<Self> {
-        let require_metal = sealed_semantic_bundle_build();
-        if require_metal {
-            require_metal_device()?;
-        }
-        Self::new_with_policy(repo_root, require_metal, GenerationOpenPurpose::Serving).await
+        Self::new_with_policy(repo_root, false, GenerationOpenPurpose::Serving).await
     }
 
     /// Open only a published generation. Missing state stays missing and never
@@ -1884,15 +1874,11 @@ impl EmbeddingIndex {
     }
 
     /// Open an existing semantic generation without permitting model downloads.
-    /// The sealed bundle contract proves every encoder and reranker asset first.
+    /// Configured asset digests prove the encoder and reranker inputs first.
     pub async fn open_existing_offline(repo_root: &Path) -> Result<Option<Self>> {
         if generation::load_current_generation(repo_root)?.is_none() {
             return Ok(None);
         }
-        anyhow::ensure!(
-            generation::sealed_semantic_bundle_build(),
-            "cache-only semantic serving requires a sealed semantic bundle artifact"
-        );
         let admission_started = std::time::Instant::now();
         let index =
             Self::new_with_policy(repo_root, true, GenerationOpenPurpose::ResidentServing).await?;
@@ -1913,7 +1899,7 @@ impl EmbeddingIndex {
         Ok(Some(index))
     }
 
-    /// Open the semantic index with the #786 fail-closed execution policy.
+    /// Open the semantic index with a fail-closed execution policy.
     /// Building or querying through this handle never falls back from Metal to CPU.
     pub async fn new_strict(repo_root: &Path) -> Result<Self> {
         require_metal_device()?;
@@ -1922,21 +1908,12 @@ impl EmbeddingIndex {
 
     /// Open a verified prior generation only for immutable generation rebuilding.
     ///
-    /// This preserves the strict artifact, model, tokenizer, reranker, and Metal
-    /// identity checks below. It deliberately defers only the active generation's
+    /// This preserves immutable generation identity checks. It deliberately defers
+    /// only the active generation's
     /// graph-readiness check because reconciliation binds and validates the newly
     /// published generation against the freshly reopened target graph.
     pub(crate) async fn new_for_reconciliation(repo_root: &Path) -> Result<Self> {
-        let require_metal = sealed_semantic_bundle_build();
-        if require_metal {
-            require_metal_device()?;
-        }
-        Self::new_with_policy(
-            repo_root,
-            require_metal,
-            GenerationOpenPurpose::Reconciliation,
-        )
-        .await
+        Self::new_with_policy(repo_root, false, GenerationOpenPurpose::Reconciliation).await
     }
 
     async fn new_with_policy(
@@ -1950,7 +1927,7 @@ impl EmbeddingIndex {
                 "sealed Metal semantic artifacts cannot be served with CUDA configuration"
             );
         }
-        let expected_asset_digests = if require_metal && !generation::semantic_asset_seeding() {
+        let expected_asset_digests = if require_metal {
             let digests = generation::runtime_asset_digests()?;
             let verification_started = std::time::Instant::now();
             generation::verify_runtime_encoder_assets()?;
@@ -1963,11 +1940,7 @@ impl EmbeddingIndex {
         } else {
             None
         };
-        let current = if generation::semantic_asset_seeding() {
-            None
-        } else {
-            generation::load_current_generation(repo_root)?
-        };
+        let current = generation::load_current_generation(repo_root)?;
         let (db_path, active_manifest, unpublished_scratch) = match current {
             Some((_, manifest, _, _)) => {
                 if matches!(
@@ -1986,7 +1959,7 @@ impl EmbeddingIndex {
                         || manifest.device_attestation.backend != "candle-metal"
                     {
                         anyhow::bail!(
-                            "sealed semantic bundle refuses a generation from a different artifact or device policy"
+                            "strict semantic mode refuses a generation from a different artifact or device policy"
                         );
                     }
                     let (model_files, model, tokenizer, reranker) = expected_asset_digests
@@ -1998,7 +1971,7 @@ impl EmbeddingIndex {
                         || &manifest.semantic_identity.reranker_files_digest != reranker
                     {
                         anyhow::bail!(
-                            "sealed semantic bundle refuses a generation with different model/tokenizer/reranker assets"
+                            "strict semantic mode refuses a generation with different model/tokenizer/reranker assets"
                         );
                     }
                 }
@@ -2050,7 +2023,6 @@ impl EmbeddingIndex {
         if requires_active_generation_graph_validation(
             purpose,
             require_metal,
-            generation::semantic_asset_seeding(),
             index.active_generation_manifest().is_some(),
         ) {
             index.validate_active_generation_graph().await?;
@@ -2380,7 +2352,7 @@ impl EmbeddingIndex {
     }
 
     /// Build a semantic generation under an explicit structural/scan contract.
-    /// The sealed #786 artifact uses the same path automatically from `new()`.
+    /// This is the explicit entry point for strict semantic generation.
     pub async fn index_all_with_symbols_strict(
         &self,
         repo_root: &Path,
@@ -2404,7 +2376,7 @@ impl EmbeddingIndex {
     }
 
     /// Reconcile one complete semantic generation against the exact freshly
-    /// reopened persisted graph. Sealed builds require this API so readiness
+    /// reopened persisted graph. Strict builds require this API so readiness
     /// is revalidated against both nodes and edges at the semantic commit seam.
     pub async fn index_all_with_persisted_graph_and_business_context(
         &self,
@@ -2735,7 +2707,7 @@ impl EmbeddingIndex {
             .as_ref()
             .map_or(self.require_metal, |contract| contract.require_metal);
         if self.require_metal && !require_metal {
-            anyhow::bail!("sealed semantic bundle cannot relax its Metal execution policy");
+            anyhow::bail!("strict semantic mode cannot relax its Metal execution policy");
         }
 
         let mut flags = contract
@@ -2761,13 +2733,7 @@ impl EmbeddingIndex {
         }
         flags.insert("target_graph_authoritative".to_string(), "true".to_string());
         flags.insert("rerank_required".to_string(), require_metal.to_string());
-        flags.insert(
-            "asset_seeding".to_string(),
-            generation::semantic_asset_seeding().to_string(),
-        );
-        let structural_graph_snapshot_digest = if !generation::semantic_asset_seeding()
-            && let Some(persisted_edges) = persisted_edges
-        {
+        let structural_graph_snapshot_digest = if let Some(persisted_edges) = persisted_edges {
             let readiness = crate::lsp_completeness::load_readiness_check_with_graph(
                 repo_root,
                 business_context.mode(),
@@ -2812,9 +2778,9 @@ impl EmbeddingIndex {
                 );
             }
             readiness.report.graph_snapshot_digest
-        } else if require_metal && !generation::semantic_asset_seeding() {
+        } else if require_metal {
             anyhow::bail!(
-                "sealed semantic generation requires freshly reopened persisted nodes and edges"
+                "strict semantic generation requires freshly reopened persisted nodes and edges"
             )
         } else {
             contract
@@ -2842,7 +2808,7 @@ impl EmbeddingIndex {
                 .map_or_else(|| "none".to_string(), |n| n.to_string()),
         );
         let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
-        if require_metal && !generation::semantic_asset_seeding() {
+        if require_metal {
             generation::verify_runtime_encoder_assets()?;
         }
         let identity_digest = identity.digest()?;
@@ -3013,18 +2979,12 @@ impl EmbeddingIndex {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        if require_metal && !generation::semantic_asset_seeding() {
+        if require_metal {
             // Re-hash immediately after encoder inference (or verified vector
             // reuse) so a cache mutation cannot be hidden by the identity read
             // performed before model initialization.
             generation::verify_runtime_encoder_assets()?;
         }
-        if generation::semantic_asset_seeding() {
-            anyhow::bail!(
-                "SEMANTIC_ASSET_SEEDING_COMPLETE: encoder assets acquired; publication and READY are forbidden"
-            );
-        }
-
         let staging_root = generation::new_staging_root(repo_root, &generation_digest)?;
         let lance_root = staging_root.join("lance");
         std::fs::create_dir_all(&lance_root)?;
@@ -3767,7 +3727,7 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
-        if requires_sealed_query_validation(self.require_metal, mode) {
+        if requires_strict_query_validation(self.require_metal, mode) {
             return self
                 .search_with_filters_strict(query, artifact_types, limit, mode, filters)
                 .await;
@@ -3796,7 +3756,7 @@ impl EmbeddingIndex {
         filters: &SearchFilters,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        if requires_sealed_query_validation(self.require_metal, mode) {
+        if requires_strict_query_validation(self.require_metal, mode) {
             return self
                 .search_with_filters_strict_observed(query, artifact_types, limit, mode, filters)
                 .await;
@@ -3813,7 +3773,7 @@ impl EmbeddingIndex {
         .await
     }
 
-    /// Strict semantic search used by the sealed #786 artifact.
+    /// Strict semantic search with runtime asset validation.
     /// Metal, the requested search mode, every result schema, and hybrid FTS
     /// must succeed exactly; no vector-only or partial-batch fallback is allowed.
     pub async fn search_with_filters_strict(
@@ -3838,9 +3798,6 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<ObservedSearchOutcome> {
-        if generation::semantic_asset_seeding() {
-            anyhow::bail!("strict semantic search is forbidden during asset seeding");
-        }
         if self.resident_query_runtime {
             let reuse_started = std::time::Instant::now();
             tracing::info!(
@@ -3910,9 +3867,6 @@ impl EmbeddingIndex {
         strict: bool,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        if strict && generation::semantic_asset_seeding() {
-            anyhow::bail!("strict semantic search is forbidden during asset seeding");
-        }
         let table = match self.db().open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
@@ -4178,7 +4132,7 @@ mod tests {
         node_embedding_kind, node_embedding_text, node_embedding_title, node_scalar_filters,
         product_retrieval_score_kind, publish_generation_after_final_validation,
         rank_search_results, required_string_column, requires_active_generation_graph_validation,
-        requires_sealed_query_validation, retain_reusable_vector, retrieval_score,
+        requires_strict_query_validation, retain_reusable_vector, retrieval_score,
         single_query_embedding, truncate_chars, validate_canonical_vector_mapping,
         validate_serving_generation_identity, validated_retrieval_score_column,
         verify_materialized_rows,
@@ -4190,9 +4144,9 @@ mod tests {
     use crate::embed::generation::{DeviceAttestation, GenerationManifest, SemanticIdentity};
 
     #[test]
-    fn sealed_handle_validates_explicit_semantic_mode() {
-        assert!(requires_sealed_query_validation(true, SearchMode::Semantic));
-        assert!(!requires_sealed_query_validation(
+    fn strict_handle_validates_explicit_semantic_mode() {
+        assert!(requires_strict_query_validation(true, SearchMode::Semantic));
+        assert!(!requires_strict_query_validation(
             false,
             SearchMode::Semantic
         ));

@@ -1,4 +1,4 @@
-//! Deterministic, fail-closed evidence for benchmark LSP completeness.
+//! Deterministic, fail-closed evidence for repository LSP completeness.
 //!
 //! It models the per-file contract, builds and persists canonical reports from
 //! existing scan evidence, and evaluates readiness so scanners, CLI, and MCP
@@ -37,13 +37,7 @@ const MAX_LSP_COMPLETENESS_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_LSP_COMPLETENESS_SUMMARY_COMMIT_BYTES: usize = 2 * 1024;
 const LSP_COMPLETENESS_PUBLICATION_LOCK_PATH: &str = ".oh/.cache/lsp_completeness.publication.lock";
 static PERSIST_REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-pub const FROZEN_SWEBENCH_COHORT_SIZE: u64 = 70;
-const INVENTORY_POLICY_VERSION: &str = "swebench-file-inventory-v3";
-const FROZEN_POPULATION_JSON: &[u8] =
-    include_bytes!("../benchmark/swebench-act-context/population.json");
-const FROZEN_PROTOCOL_LOCK_JSON: &[u8] =
-    include_bytes!("../benchmark/swebench-act-context/protocol.lock.json");
-const FROZEN_POPULATION_PATH: &str = "benchmark/swebench-act-context/population.json";
+const INVENTORY_POLICY_VERSION: &str = "rna-file-inventory-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -1182,272 +1176,6 @@ pub fn normalize_repo_relative_path(path: &str) -> Result<String, String> {
     Ok(components.join("/"))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AggregateCounts {
-    pub checkouts: u64,
-    pub unique_instances: u64,
-    pub ready_checkouts: u64,
-    pub files: u64,
-    #[serde(default)]
-    pub by_extension: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub by_role: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub by_status: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AggregateCheckout {
-    pub instance_id: String,
-    pub repository: String,
-    pub base_commit: String,
-    pub checkout_sha: String,
-    pub report_digest: String,
-    pub ready: bool,
-    pub file_count: u64,
-    pub violation_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AggregateCompletenessReport {
-    pub schema_version: u32,
-    /// SHA-256 from the checked-in protocol lock for the frozen population.
-    pub cohort_digest: String,
-    pub checkouts: Vec<AggregateCheckout>,
-    pub counts: AggregateCounts,
-    pub digest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FrozenCohortCase {
-    pub instance_id: String,
-    pub repository: String,
-    pub base_commit: String,
-    pub report_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FrozenCohortManifest {
-    pub schema_version: u32,
-    pub cases: Vec<FrozenCohortCase>,
-}
-
-impl AggregateCompletenessReport {
-    fn from_frozen_cases(
-        cases: &[(FrozenCohortCase, LspCompletenessReport)],
-        cohort_digest: String,
-    ) -> Self {
-        let mut checkouts = Vec::with_capacity(cases.len());
-        let mut counts = AggregateCounts {
-            checkouts: cases.len() as u64,
-            ..AggregateCounts::default()
-        };
-
-        for (case, report) in cases {
-            let ready = report.is_ready()
-                && report.integrity_violations().is_empty()
-                && report.identity.context_mode == "disabled"
-                && report.identity.checkout_sha == case.base_commit
-                && report.identity.repository == case.repository;
-            if ready {
-                counts.ready_checkouts += 1;
-            }
-            counts.files += report.summary.total_files;
-            merge_counts(&mut counts.by_extension, &report.summary.by_extension);
-            merge_counts(&mut counts.by_role, &report.summary.by_role);
-            merge_counts(&mut counts.by_status, &report.summary.by_status);
-            checkouts.push(AggregateCheckout {
-                instance_id: case.instance_id.clone(),
-                repository: case.repository.clone(),
-                base_commit: case.base_commit.clone(),
-                checkout_sha: report.identity.checkout_sha.clone(),
-                report_digest: report.digest.clone(),
-                ready,
-                file_count: report.summary.total_files,
-                violation_count: report.violations.len() as u64,
-            });
-        }
-        checkouts.sort();
-        counts.unique_instances = checkouts
-            .iter()
-            .map(|checkout| checkout.instance_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len() as u64;
-
-        let mut aggregate = Self {
-            schema_version: LSP_COMPLETENESS_SCHEMA_VERSION,
-            cohort_digest,
-            checkouts,
-            counts,
-            digest: String::new(),
-        };
-        aggregate.digest = aggregate.compute_digest();
-        aggregate
-    }
-
-    pub fn compute_digest(&self) -> String {
-        #[derive(Serialize)]
-        struct DigestPayload<'a> {
-            schema_version: u32,
-            cohort_digest: &'a str,
-            checkouts: &'a [AggregateCheckout],
-            counts: &'a AggregateCounts,
-        }
-        let bytes = serde_json::to_vec(&DigestPayload {
-            schema_version: self.schema_version,
-            cohort_digest: &self.cohort_digest,
-            checkouts: &self.checkouts,
-            counts: &self.counts,
-        })
-        .expect("aggregate completeness serialization cannot fail");
-        blake3::hash(&bytes).to_hex().to_string()
-    }
-
-    pub fn is_ready(&self) -> bool {
-        let Ok((expected_digest, expected_cases)) = canonical_frozen_cohort() else {
-            return false;
-        };
-        let actual_cases = self
-            .checkouts
-            .iter()
-            .map(|checkout| {
-                (
-                    checkout.instance_id.clone(),
-                    checkout.repository.clone(),
-                    checkout.base_commit.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        self.cohort_digest == expected_digest
-            && actual_cases == expected_cases
-            && self.counts.checkouts == FROZEN_SWEBENCH_COHORT_SIZE
-            && self.counts.unique_instances == FROZEN_SWEBENCH_COHORT_SIZE
-            && self.counts.ready_checkouts == FROZEN_SWEBENCH_COHORT_SIZE
-            && self.checkouts.iter().all(|checkout| checkout.ready)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CanonicalPopulation {
-    instances: Vec<CanonicalPopulationCase>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CanonicalPopulationCase {
-    instance_id: String,
-    repo: String,
-    base_commit: String,
-    included: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProtocolLock {
-    files: Vec<ProtocolLockEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProtocolLockEntry {
-    path: String,
-    sha256: String,
-}
-
-type CanonicalCohortIdentity = (String, String, String);
-
-fn canonical_frozen_cohort() -> Result<(String, BTreeSet<CanonicalCohortIdentity>)> {
-    let lock: ProtocolLock = serde_json::from_slice(FROZEN_PROTOCOL_LOCK_JSON)
-        .context("checked-in SWE-bench protocol lock is invalid")?;
-    let locked_digest = lock
-        .files
-        .iter()
-        .find(|entry| entry.path == FROZEN_POPULATION_PATH)
-        .map(|entry| entry.sha256.as_str())
-        .context("protocol lock does not seal the frozen SWE-bench population")?;
-    let computed_digest = format!("{:x}", Sha256::digest(FROZEN_POPULATION_JSON));
-    if computed_digest != locked_digest {
-        anyhow::bail!(
-            "checked-in frozen SWE-bench population digest does not match protocol.lock.json"
-        );
-    }
-    let population: CanonicalPopulation = serde_json::from_slice(FROZEN_POPULATION_JSON)
-        .context("checked-in frozen SWE-bench population is invalid")?;
-    let cases = population
-        .instances
-        .into_iter()
-        .filter(|case| case.included)
-        .map(|case| (case.instance_id, case.repo, case.base_commit))
-        .collect::<BTreeSet<_>>();
-    if cases.len() as u64 != FROZEN_SWEBENCH_COHORT_SIZE {
-        anyhow::bail!(
-            "checked-in frozen SWE-bench population has {} included identities, expected {}",
-            cases.len(),
-            FROZEN_SWEBENCH_COHORT_SIZE
-        );
-    }
-    Ok((locked_digest.to_string(), cases))
-}
-
-pub fn load_frozen_cohort_aggregate(path: &Path) -> Result<AggregateCompletenessReport> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read frozen cohort manifest {}", path.display()))?;
-    let mut manifest: FrozenCohortManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid frozen cohort manifest {}", path.display()))?;
-    if manifest.schema_version != LSP_COMPLETENESS_SCHEMA_VERSION {
-        anyhow::bail!(
-            "frozen cohort schema {} does not match {}",
-            manifest.schema_version,
-            LSP_COMPLETENESS_SCHEMA_VERSION
-        );
-    }
-    manifest.cases.sort();
-    let (cohort_digest, canonical_cases) = canonical_frozen_cohort()?;
-    let supplied_cases = manifest
-        .cases
-        .iter()
-        .map(|case| {
-            (
-                case.instance_id.clone(),
-                case.repository.clone(),
-                case.base_commit.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if manifest.cases.len() as u64 != FROZEN_SWEBENCH_COHORT_SIZE
-        || supplied_cases != canonical_cases
-    {
-        anyhow::bail!(
-            "cohort manifest identities do not exactly match the locked N={} SWE-bench population",
-            FROZEN_SWEBENCH_COHORT_SIZE
-        );
-    }
-    let base = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let cases = manifest
-        .cases
-        .into_iter()
-        .map(|case| {
-            let report_path = if case.report_path.is_absolute() {
-                case.report_path.clone()
-            } else {
-                base.join(&case.report_path)
-            };
-            let report = load_report_path(&report_path)?;
-            Ok((case, report))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(AggregateCompletenessReport::from_frozen_cases(
-        &cases,
-        cohort_digest,
-    ))
-}
-
-fn merge_counts(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, u64>) {
-    for (key, value) in source {
-        *target.entry(key.clone()).or_default() += value;
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadinessCheck {
     pub report: LspCompletenessReport,
@@ -2153,40 +1881,6 @@ pub fn load_report_path(path: &Path) -> Result<LspCompletenessReport> {
     serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid LSP completeness report at {}", path.display()))
 }
-
-pub fn persist_aggregate_report(
-    path: &Path,
-    aggregate: &AggregateCompletenessReport,
-) -> Result<()> {
-    let parent = aggregate_output_parent(path);
-    fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".lsp_completeness_aggregate.json.tmp-{}",
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)?;
-    file.write_all(&serde_json::to_vec_pretty(aggregate)?)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temp, path).with_context(|| {
-        format!(
-            "failed to atomically replace aggregate LSP report {}",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn aggregate_output_parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
 pub fn current_report_identity(
     repo_root: &Path,
     context_mode: BusinessContextMode,
@@ -3151,7 +2845,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         return excluded(
             FileRole::ExcludedGenerated,
             ExclusionReasonCode::ConfiguredPolicy,
-            "RNA business/cache artifacts are outside the frozen benchmark checkout input",
+            "RNA business/cache artifacts are outside the repository source inventory",
         );
     }
     if components.iter().any(|component| {
@@ -3224,14 +2918,14 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
         return excluded(
             FileRole::ExcludedData,
             ExclusionReasonCode::NonLanguageData,
-            "frozen-cohort path is a generated graph output fixture",
+            "path is a generated graph output fixture",
         );
     }
     if filename == "not_utf8.sample" {
         return excluded(
             FileRole::ExcludedData,
             ExclusionReasonCode::NonLanguageData,
-            "frozen-cohort path is a deliberate non-UTF-8 encoding fixture",
+            "path is a deliberate non-UTF-8 encoding fixture",
         );
     }
     if extension == "txt" {
@@ -3277,7 +2971,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             return excluded(
                 FileRole::ExcludedData,
                 ExclusionReasonCode::NonLanguageData,
-                "suffix is used by the cohort as a deliberate non-language test fixture",
+                "suffix identifies a deliberate non-language test fixture",
             );
         }
         if extension.is_empty()
@@ -3289,7 +2983,7 @@ fn classify_file(path: &Path, absolute: &Path) -> (FileRole, Option<ExclusionRea
             return excluded(
                 FileRole::ExcludedData,
                 ExclusionReasonCode::NonLanguageData,
-                "extensionless frozen-cohort path is a deliberate test sentinel payload",
+                "extensionless path is a deliberate test sentinel payload",
             );
         }
         return (FileRole::Test, None);
@@ -3460,18 +3154,6 @@ fn is_project_document_filename(filename: &str) -> bool {
     ]
     .iter()
     .any(|prefix| filename.starts_with(prefix))
-}
-
-pub(crate) fn is_plaintext_document_path(path: &Path) -> bool {
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
-        || is_project_document_filename(&filename)
 }
 
 fn is_known_test_fixture_extension(extension: &str) -> bool {
@@ -4534,24 +4216,6 @@ mod tests {
             base_report_digest: Some("base-report".to_string()),
         }
     }
-
-    fn cohort_case(
-        ordinal: usize,
-        mut report: LspCompletenessReport,
-    ) -> (FrozenCohortCase, LspCompletenessReport) {
-        report.identity.repository = "owner/repo".to_string();
-        report.finalize();
-        (
-            FrozenCohortCase {
-                instance_id: format!("instance-{ordinal:02}"),
-                repository: "owner/repo".to_string(),
-                base_commit: report.identity.checkout_sha.clone(),
-                report_path: PathBuf::from(format!("report-{ordinal:02}.json")),
-            },
-            report,
-        )
-    }
-
     #[test]
     fn stable_ordering_and_digest_ignore_input_order() {
         let a = included(
@@ -5387,41 +5051,6 @@ mod tests {
             "src/a.py"
         );
     }
-
-    #[test]
-    fn aggregate_counts_and_digest_are_deterministic() {
-        let first = report(vec![included(
-            "src/a.py",
-            FileTerminalStatus::Processed { result_count: 0 },
-        )]);
-        let mut second = report(vec![included(
-            "docs/index.md",
-            FileTerminalStatus::TimedOut {
-                detail: "timeout".to_string(),
-            },
-        )]);
-        second.identity.checkout_sha = "def456".to_string();
-        second.finalize();
-
-        let left = AggregateCompletenessReport::from_frozen_cases(
-            &[
-                cohort_case(1, second.clone()),
-                cohort_case(0, first.clone()),
-            ],
-            "fixture-cohort".to_string(),
-        );
-        let right = AggregateCompletenessReport::from_frozen_cases(
-            &[cohort_case(0, first), cohort_case(1, second)],
-            "fixture-cohort".to_string(),
-        );
-        assert_eq!(left, right);
-        assert_eq!(left.counts.checkouts, 2);
-        assert_eq!(left.counts.unique_instances, 2);
-        assert_eq!(left.counts.ready_checkouts, 1);
-        assert_eq!(left.counts.by_extension.get("py"), Some(&1));
-        assert_eq!(left.counts.by_extension.get("md"), Some(&1));
-    }
-
     #[test]
     fn processed_files_require_capability_and_request_evidence() {
         let mut file = included(
@@ -6565,80 +6194,5 @@ mod tests {
         let status =
             terminal_status_for_file("src/a.py", &[&completed], &[], true, &server(), &[job], &[]);
         assert!(matches!(status, FileTerminalStatus::Crashed { .. }));
-    }
-
-    #[test]
-    fn relative_aggregate_output_uses_current_directory() {
-        assert_eq!(
-            aggregate_output_parent(Path::new("aggregate.json")),
-            Path::new(".")
-        );
-    }
-
-    #[test]
-    fn aggregate_gate_requires_exact_frozen_population() {
-        let (cohort_digest, identities) = canonical_frozen_cohort().unwrap();
-        let cases = identities
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, (instance_id, repository, base_commit))| {
-                let mut ready = report(vec![included(
-                    "src/a.py",
-                    FileTerminalStatus::Processed { result_count: 0 },
-                )]);
-                ready.identity.checkout_sha = base_commit.clone();
-                ready.identity.repository = repository.clone();
-                ready.finalize();
-                (
-                    FrozenCohortCase {
-                        instance_id,
-                        repository,
-                        base_commit,
-                        report_path: PathBuf::from(format!("report-{ordinal:02}.json")),
-                    },
-                    ready,
-                )
-            })
-            .collect::<Vec<_>>();
-        let seventy = AggregateCompletenessReport::from_frozen_cases(&cases, cohort_digest.clone());
-        assert!(seventy.is_ready());
-        let sixty_nine =
-            AggregateCompletenessReport::from_frozen_cases(&cases[..69], cohort_digest.clone());
-        assert!(!sixty_nine.is_ready());
-
-        let duplicated = AggregateCompletenessReport::from_frozen_cases(
-            &vec![cases[0].clone(); 70],
-            cohort_digest.clone(),
-        );
-        assert!(!duplicated.is_ready());
-
-        let invented = (0..70)
-            .map(|ordinal| {
-                let mut ready = report(vec![included(
-                    "src/a.py",
-                    FileTerminalStatus::Processed { result_count: 0 },
-                )]);
-                ready.identity.checkout_sha = "reused-base".to_string();
-                cohort_case(ordinal, ready)
-            })
-            .collect::<Vec<_>>();
-        let invented = AggregateCompletenessReport::from_frozen_cases(&invented, cohort_digest);
-        assert!(!invented.is_ready());
-    }
-
-    #[test]
-    fn aggregate_gate_rejects_business_context_enabled_reports() {
-        let mut enabled = report(vec![included(
-            "src/a.py",
-            FileTerminalStatus::Processed { result_count: 0 },
-        )]);
-        enabled.identity.context_mode = "enabled".to_string();
-        enabled.finalize();
-        let aggregate = AggregateCompletenessReport::from_frozen_cases(
-            &[cohort_case(0, enabled)],
-            "fixture-cohort".to_string(),
-        );
-        assert_eq!(aggregate.counts.ready_checkouts, 0);
-        assert!(!aggregate.is_ready());
     }
 }

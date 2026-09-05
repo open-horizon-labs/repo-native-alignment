@@ -91,9 +91,8 @@ makes ranking invariant to positive rescaling of a scorer while allowing strong
 exact or graph evidence to promote a candidate without letting weak graph
 evidence dominate a substantially better semantic match. Separate FTS and
 vector lanes are not claimed when the backend supplies only opaque hybrid RRF.
-The sealed strict-semantic qualification path remains isolated: it accepts only
-its frozen hybrid candidate set and reranker permutation and never gains a
-product-search fallback.
+Explicit strict semantic mode remains isolated: it accepts only its hybrid
+candidate set and reranker permutation and never gains a product-search fallback.
 
 ### Fusion seam inventory
 
@@ -113,7 +112,7 @@ independently, unioned before truncation, and fused exactly once.
 | graph traversal | typed relation, directness, and bounded hop count | graph lane ordered by directness/hops, then stable identity |
 | task selector | role/facet coverage and final rendered cost | post-fusion maximum-coverage admission; not a relevance score |
 | artifacts, commits, Markdown | exact/lexical or semantic document order | delivered through the same projection, or explicitly reported unavailable |
-| strict semantic qualification | frozen hybrid candidate order plus reranker permutation | isolated legacy contract; no product lane, supplement, or fallback is introduced |
+| strict semantic qualification | hybrid candidate order plus reranker permutation | isolated strict contract; no product lane, supplement, or fallback is introduced |
 
 Evidence output records the actual producer used. For example, a hybrid request
 that executes a vector fallback retains a native cosine distance and is labeled
@@ -138,10 +137,9 @@ fixtures. No unexecuted query is presented as measured performance.
 | Graph entry: impact from `projected_graph_delta` | The audited formula admitted million-point adjacent semantic gaps while graph bonuses remained below one hundred thousand, so direct graph evidence could not promote by one semantic position. | Graph directness/hops contributes through the same rank fusion. `graph_only_evidence_promotes_while_weak_graph_does_not_overwhelm_semantic` proves both legitimate promotion and weak-graph restraint. |
 | Mixed task: change `projected_graph_delta` and verify its test | A flat top-k could spend the body budget on a giant generic semantic record and omit a named test or state/API obligation. | Fusion establishes comparable candidates first; task selection then admits distinct exact, editable, test, state/API, analogue, dependency, and impact roles by coverage per rendered cost. Exact misses, ambiguities, and role omissions remain explicit. |
 
-The table describes non-strict product search only. The sealed #779 strict
-semantic path still consumes its frozen hybrid candidate order and reranker
-permutation without lexical, graph, vector-only, CPU, or original-order
-fallback.
+The table describes non-strict product search only. Explicit strict semantic
+mode consumes its hybrid candidate order and reranker permutation without
+lexical, graph, vector-only, CPU, or original-order fallback.
 
 ## Rendered cost
 
@@ -177,7 +175,7 @@ to canonical capsules under `.oh/.cache/search_evidence/v1/`; the capsule binds
 the original selection, query digest, channel evidence, and current-node
 content digest. Missing, tampered, stale, oversized, or non-regular capsules
 fail closed, and hydration performs no retrieval. The cache is derived local
-state and is never part of frozen strict-semantic packets.
+state and is never part of strict-semantic responses.
 
 ## Task context (opt in)
 
@@ -234,10 +232,3 @@ existing source span or a proposal line. Unsupported, ambiguous, binary,
 traversal-containing, oversized, or incomplete inputs fail closed. Missing
 optional graph/LSP/semantic evidence is instead reported as a degraded
 capability; it is never presented as proof that no impact exists.
-
-## Strict semantic qualification
-
-The sealed SWE-bench strict path keeps its frozen qualification, ordering,
-rendering, protocol, and packet bytes. Product projections, calibrated fusion,
-task context, and graph-delta are separate opt-in/non-strict paths and do not
-retroactively change frozen benchmark evidence.
