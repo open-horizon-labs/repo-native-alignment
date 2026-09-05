@@ -98,14 +98,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace caches
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
         shell: bash
         run: |
           set -euo pipefail
           nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
       - name: Cache Cargo downloads
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: |

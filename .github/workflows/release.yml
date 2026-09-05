@@ -35,11 +35,11 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
       - name: Cache Rust
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
@@ -82,10 +82,10 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
@@ -124,10 +124,10 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_LINUX_CI_ENABLED != 'true' }}
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
       - name: Cache Rust
-        if: ${{ !contains(runner.labels, 'self-hosted') }}
+        if: ${{ vars.LOCAL_LINUX_CI_ENABLED != 'true' }}
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
