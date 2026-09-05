@@ -65,12 +65,13 @@ lancedb = "0.31"
 arrow-array = "58"
 arrow-schema = "58"
 
-# Optional local embeddings — Metal GPU on Apple Silicon, CPU fallback
+# Optional local embeddings — Metal GPU on Apple Silicon, OpenVINO on Intel, CPU fallback
 metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", rev = "9966033a92befe0d760813e3a61152271ecd2822", default-features = false, features = ["embeddings"], optional = true }
 candle-core = { version = "0.9", optional = true }
 
 # Optional cross-encoder reranking (ONNX runtime, CPU inference)
 fastembed = { version = "5", optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["openvino"], optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -133,6 +134,7 @@ default = []
 embeddings = ["dep:metal-candle", "dep:candle-core", "dep:fastembed", "dep:lance-index"]
 
 metal = ["embeddings", "candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
+openvino = ["embeddings", "dep:ort"]
 
 # Exact CI-only feature closure for the frozen SWE-bench semantic artifact.
 # `build.rs` additionally requires the sealed bundle-build environment so a

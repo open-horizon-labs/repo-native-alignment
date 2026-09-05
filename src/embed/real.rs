@@ -901,13 +901,62 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
+enum EncoderModel {
+    #[cfg(feature = "openvino")]
+    OpenVino(fastembed::TextEmbedding),
+    #[cfg(not(feature = "openvino"))]
+    Metal(metal_candle::embeddings::EmbeddingModel),
+}
+
+impl EncoderModel {
+    fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        match self {
+            #[cfg(feature = "openvino")]
+            Self::OpenVino(model) => model.embed(texts, None).map_err(anyhow::Error::from),
+            #[cfg(not(feature = "openvino"))]
+            Self::Metal(model) => model
+                .encode(texts)
+                .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?
+                .to_vec2::<f32>()
+                .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {e}")),
+        }
+    }
+}
+
+fn new_model() -> Result<EncoderModel> {
     new_model_with_policy(false).map(|(model, _)| model)
 }
 
+#[cfg(feature = "openvino")]
+fn new_model_with_policy(_require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
+    let start = std::time::Instant::now();
+    let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+    let provider = ort::ep::OpenVINO::default()
+        .with_device_type("GPU.0")
+        .build();
+    let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+        .with_execution_providers(vec![provider]);
+    let model = fastembed::TextEmbedding::try_new(options)
+        .map_err(|e| anyhow::anyhow!("failed to load OpenVINO embedding model: {e}"))?;
+    let artifact = std::env::current_exe().context("failed to resolve running RNA artifact")?;
+    let attestation = DeviceAttestation {
+        required_device: "openvino-gpu".to_string(),
+        observed_device: "GPU.0".to_string(),
+        backend: "onnxruntime-openvino".to_string(),
+        device_index: Some(0),
+        artifact_sha256: generation::sha256_file(&artifact)?,
+    };
+    tracing::info!(
+        "EmbeddingIndex: MiniLM-L6-v2 ready on Intel Arc OpenVINO GPU.0 in {:?}",
+        start.elapsed()
+    );
+    Ok((EncoderModel::OpenVino(model), attestation))
+}
+
+#[cfg(not(feature = "openvino"))]
 fn new_model_with_policy(
     require_metal: bool,
-) -> Result<(metal_candle::embeddings::EmbeddingModel, DeviceAttestation)> {
+) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
@@ -982,7 +1031,7 @@ fn new_model_with_policy(
                 m.dimension(),
                 start.elapsed()
             );
-            Ok((m, attestation))
+            Ok((EncoderModel::Metal(m), attestation))
         }
         Err(err) => {
             tracing::warn!(
@@ -1027,6 +1076,13 @@ fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
     if require_metal {
         return require_metal_device();
     }
+    #[cfg(feature = "openvino")]
+    {
+        let (_, attestation) = new_model_with_policy(false)?;
+        return Ok(attestation);
+    }
+    #[cfg(not(feature = "openvino"))]
+    {
     #[cfg(feature = "metal")]
     if let Ok(attestation) = require_metal_device() {
         return Ok(DeviceAttestation {
@@ -1042,17 +1098,18 @@ fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
         device_index: None,
         artifact_sha256: generation::sha256_file(&executable)?,
     })
+    }
 }
 
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    let model = new_model()?;
-    embed_texts_with_model(&model, texts).await
+    let mut model = new_model()?;
+    embed_texts_with_model(&mut model, texts).await
 }
 
 /// Embed texts using a pre-loaded model. Avoids repeated model initialization
 /// when called in a loop (e.g., streaming batch writes in index_all_inner).
 async fn embed_texts_with_model(
-    model: &metal_candle::embeddings::EmbeddingModel,
+    model: &mut EncoderModel,
     texts: Vec<String>,
 ) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
@@ -1084,12 +1141,7 @@ async fn embed_texts_with_model(
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
-        let tensor = model
-            .encode(&refs)
-            .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
-        let batch_embeddings: Vec<Vec<f32>> = tensor
-            .to_vec2::<f32>()
-            .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
+        let batch_embeddings = model.encode(&refs)?;
 
         let elapsed_secs = batch_start.elapsed().as_secs_f64();
         let per_item = elapsed_secs / bs as f64;
@@ -1157,7 +1209,7 @@ pub struct EmbeddingIndex {
     repo_root: Arc<PathBuf>,
     require_metal: bool,
     resident_query_runtime: bool,
-    query_model: Arc<tokio::sync::Mutex<Option<metal_candle::embeddings::EmbeddingModel>>>,
+    query_model: Arc<tokio::sync::Mutex<Option<EncoderModel>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
@@ -1874,7 +1926,7 @@ impl EmbeddingIndex {
 
     async fn initialized_query_model(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<metal_candle::embeddings::EmbeddingModel>>> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<EncoderModel>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
         tracing::info!(
@@ -1905,11 +1957,11 @@ impl EmbeddingIndex {
     }
 
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let model = self.initialized_query_model().await?;
+        let mut model = self.initialized_query_model().await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
-                model.as_ref().expect("query model initialized above"),
+                model.as_mut().expect("query model initialized above"),
                 vec![query.to_string()],
             )
             .await?,
@@ -2757,12 +2809,12 @@ impl EmbeddingIndex {
         );
         let mut device_attestation = attest_available_device(require_metal)?;
         if !encoder_inputs.is_empty() {
-            let (model, observed_attestation) = new_model_with_policy(require_metal)?;
+            let (mut model, observed_attestation) = new_model_with_policy(require_metal)?;
             device_attestation = observed_attestation;
             const ENCODE_BATCH_SIZE: usize = 2048;
             for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
-                    &model,
+                    &mut model,
                     batch.iter().map(|input| input.text.to_string()).collect(),
                 )
                 .await?;
@@ -3270,7 +3322,7 @@ impl EmbeddingIndex {
 
             // Load model once and reuse across all write batches to avoid
             // repeated heavyweight model initialization.
-            let model = new_model()?;
+            let mut model = new_model()?;
             let mut remaining = to_embed;
             let mut batch_idx = 0usize;
 
@@ -3280,7 +3332,7 @@ impl EmbeddingIndex {
 
                 let batch_texts: Vec<String> =
                     batch_candidates.iter().map(|c| c.text.clone()).collect();
-                let embeddings = embed_texts_with_model(&model, batch_texts).await?;
+                let embeddings = embed_texts_with_model(&mut model, batch_texts).await?;
 
                 if embeddings.is_empty() {
                     continue;

@@ -105,7 +105,7 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 
 Release and user-facing verification should use successful GitHub Actions/release artifacts, not a local source build.
 
-Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
+Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal`; for Intel Arc on Linux: `cargo install --locked --path . --features openvino`). The OpenVINO build pins ONNX Runtime to Intel `GPU.0`; the host must provide OpenVINO and Intel GPU permissions. Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
 
 **Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 

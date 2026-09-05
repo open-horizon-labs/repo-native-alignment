@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod adr;
 pub mod bootstrap;
 pub mod bus;
