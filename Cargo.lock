@@ -6232,6 +6232,7 @@ dependencies = [
  "lance-index",
  "lancedb",
  "libc",
+ "libloading 0.8.9",
  "lsp-types",
  "metal-candle",
  "ort",

@@ -5,6 +5,14 @@ mod real;
 #[path = "embed/generation.rs"]
 pub mod generation;
 
+#[cfg(any(feature = "embeddings", test))]
+#[path = "embed/execution.rs"]
+mod execution;
+
+#[cfg(feature = "openvino")]
+#[path = "embed/openvino.rs"]
+mod openvino;
+
 #[cfg(feature = "embeddings")]
 pub use real::*;
 

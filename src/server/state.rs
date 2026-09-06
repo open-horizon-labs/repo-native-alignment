@@ -352,6 +352,8 @@ pub struct SemanticGenerationReadiness {
     pub structural_graph_snapshot_digest: String,
     pub coverage_digest: String,
     pub row_count: usize,
+    /// Observed execution details persisted with the immutable generation.
+    pub encoder: std::collections::BTreeMap<String, String>,
 }
 
 impl SemanticGenerationReadiness {
@@ -369,6 +371,13 @@ impl SemanticGenerationReadiness {
             structural_graph_snapshot_digest: manifest.structural_graph_snapshot_digest.clone(),
             coverage_digest: manifest.coverage_digest.clone(),
             row_count: manifest.row_count,
+            encoder: manifest
+                .semantic_identity
+                .flags
+                .iter()
+                .filter(|(key, _)| key.starts_with("encoder_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
         })
     }
 }
@@ -476,7 +485,7 @@ impl EmbeddingStatus {
         semantic_index_available: bool,
     ) -> CapabilityReadiness {
         let verified_generation = self.verified_generation.lock().unwrap().clone();
-        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+        let mut readiness = match self.state.load(std::sync::atomic::Ordering::Acquire) {
             0 if semantic_index_available => CapabilityReadiness::new(
                 "embeddings / semantic search",
                 CapabilityReadinessState::Ready,
@@ -573,7 +582,29 @@ impl EmbeddingStatus {
                 CapabilityReadinessState::Unavailable,
                 "embedding status is unknown",
             ),
+        };
+        if let Some(generation) = verified_generation {
+            readiness.detail.push_str("; attestation_scope=published_generation");
+            for key in [
+                "encoder_requested_backend",
+                "encoder_provider",
+                "encoder_device",
+                "encoder_device_id",
+                "encoder_runtime_version",
+                "encoder_precision",
+                "encoder_fallback_policy",
+                "encoder_fallback_reason",
+            ] {
+                if let Some(value) = generation.encoder.get(key) {
+                    readiness.detail.push_str(&format!(
+                        "; {}={}",
+                        key.strip_prefix("encoder_").unwrap_or(key),
+                        value
+                    ));
+                }
+            }
         }
+        readiness
     }
 
     pub fn footer_segment(&self) -> Option<String> {
@@ -598,6 +629,88 @@ impl EmbeddingStatus {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod arc_readiness_tests {
+    use super::*;
+    use crate::embed::generation::*;
+
+    #[test]
+    fn openvino_execution_survives_manifest_reopen_and_mcp_readiness_rendering() {
+        for (provider, device, reason) in [
+            ("onnxruntime-openvino", "Intel Arc GPU.0", "none"),
+            ("candle-cpu", "cpu", "Intel GPU unavailable"),
+        ] {
+            let flags = [
+                ("encoder_requested_backend", "openvino"),
+                ("encoder_provider", provider),
+                ("encoder_device", device),
+                ("encoder_fallback_policy", "cpu"),
+                ("encoder_fallback_reason", reason),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+            let identity = SemanticIdentity::for_current_process(384, flags).unwrap();
+            let digest = "a".repeat(64);
+            let manifest = GenerationManifest {
+                schema_version: GENERATION_SCHEMA_VERSION,
+                generation_digest: generation_digest(&identity, &digest, &digest, &digest).unwrap(),
+                semantic_identity_digest: identity.digest().unwrap(),
+                canonical_input_digest: digest.clone(),
+                target_graph_digest: digest.clone(),
+                structural_graph_snapshot_digest: digest.clone(),
+                row_count: 1,
+                coverage_digest: digest.clone(),
+                lance_tree_digest: digest.clone(),
+                reused_vector_count: 0,
+                encoded_vector_count: 1,
+                prior_generation_digest: None,
+                created_by_artifact_sha256: identity.artifact_sha256.clone(),
+                device_attestation: DeviceAttestation {
+                    required_device: "any".into(),
+                    observed_device: device.into(),
+                    backend: provider.into(),
+                    device_index: None,
+                    artifact_sha256: identity.artifact_sha256.clone(),
+                },
+                semantic_identity: identity,
+            };
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("manifest.json");
+            std::fs::write(&path, canonical_json_bytes(&manifest).unwrap()).unwrap();
+            let reopened: GenerationManifest =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let receipt = SemanticVerificationReceipt {
+                schema_version: VERIFICATION_SCHEMA_VERSION,
+                generation_digest: reopened.generation_digest.clone(),
+                manifest_sha256: sha256_bytes(&canonical_json_bytes(&reopened).unwrap()),
+                coverage_digest: digest.clone(),
+                lance_tree_digest: digest.clone(),
+                structural_graph_snapshot_digest: digest.clone(),
+                target_graph_digest: digest,
+                row_count: 1,
+                one_to_one_coverage: true,
+                fresh_reopen_ready: true,
+            };
+            let status = EmbeddingStatus::default();
+            status.set_complete_verified(&reopened, &receipt).unwrap();
+            let rendered = status.capability_readiness(true, true).markdown_line();
+            for expected in [
+                "requested_backend=openvino",
+                &format!("provider={provider}"),
+                &format!("device={device}"),
+                "fallback_policy=cpu",
+                &format!("fallback_reason={reason}"),
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected} in {rendered}"
+                );
+            }
         }
     }
 }

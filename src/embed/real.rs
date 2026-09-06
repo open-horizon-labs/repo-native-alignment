@@ -1,9 +1,8 @@
+use super::execution::{Backend, ExecutionIdentity, Policy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "openvino")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -506,6 +505,7 @@ struct EmbeddingCandidate {
 }
 
 impl EmbeddingCandidate {
+    #[allow(clippy::too_many_arguments)] // Mirrors the persisted candidate fields.
     fn new(
         id: String,
         kind: String,
@@ -899,23 +899,25 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-#[cfg(feature = "openvino")]
-static ORT_INITIALIZED: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
+struct EncoderModel {
+    inner: EncoderBackend,
+    execution: ExecutionIdentity,
+}
 
-enum EncoderModel {
+enum EncoderBackend {
     #[cfg(feature = "openvino")]
     OpenVino(fastembed::TextEmbedding),
-    #[cfg(not(feature = "openvino"))]
     Metal(metal_candle::embeddings::EmbeddingModel),
 }
 
 impl EncoderModel {
     fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        match self {
+        match &mut self.inner {
             #[cfg(feature = "openvino")]
-            Self::OpenVino(model) => model.embed(texts, None).map_err(anyhow::Error::from),
-            #[cfg(not(feature = "openvino"))]
-            Self::Metal(model) => model
+            EncoderBackend::OpenVino(model) => {
+                model.embed(texts, None)
+            }
+            EncoderBackend::Metal(model) => model
                 .encode(texts)
                 .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?
                 .to_vec2::<f32>()
@@ -929,101 +931,108 @@ fn new_model() -> Result<EncoderModel> {
 }
 
 #[cfg(feature = "openvino")]
+fn canonical_readiness_probe() -> String {
+    let node = crate::graph::Node {
+        id: crate::graph::NodeId {
+            root: "readiness".into(),
+            file: "src/readiness.rs".into(),
+            name: "embedding_readiness".into(),
+            kind: crate::graph::NodeKind::Function,
+        },
+        language: "rust".into(),
+        signature: "fn embedding_readiness() -> bool".into(),
+        line_start: 1,
+        line_end: 1,
+        body: "fn embedding_readiness() -> bool { true }".into(),
+        metadata: BTreeMap::new(),
+        source: crate::graph::ExtractionSource::TreeSitter,
+    };
+    node_embedding_text(&node)
+}
+
 fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
-    let start = std::time::Instant::now();
-    let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
-    if require_metal {
-        anyhow::bail!(
-            "strict Metal embedding execution is incompatible with the `openvino` feature; build with `metal` instead"
-        );
+    let policy = Policy::from_env(require_metal)?;
+    match policy.backend {
+        Backend::Auto => new_candle_model(require_metal, false, policy, None),
+        Backend::Cpu => new_candle_model(false, true, policy, None),
+        Backend::OpenVino => policy.openvino_or_fallback(
+            || new_openvino_model(policy),
+            |reason| {
+                tracing::warn!(%reason, "OpenVINO unavailable; applying configured CPU fallback");
+                new_candle_model(false, true, policy, Some(&reason))
+            },
+        ),
     }
-    let ort_path = std::env::var_os("ORT_DYLIB_PATH").ok_or_else(|| {
-        anyhow::anyhow!(
-            "OpenVINO embeddings require ORT_DYLIB_PATH pointing to an OpenVINO-enabled libonnxruntime.so"
-        )
-    })?;
-    let ort_path = PathBuf::from(ort_path).canonicalize().map_err(|error| {
-        anyhow::anyhow!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {error}")
-    })?;
-    // ORT state belongs to the process, including a failed initialization.
-    // Retain failures so retries cannot enter partially initialized ORT state.
-    let initialized_path = ORT_INITIALIZED
-        .get_or_init(|| {
-            let initialized = ort::init_from(&ort_path)
-                .map_err(|e| format!("failed to load ONNX Runtime from ORT_DYLIB_PATH: {e}"))?
-                .commit();
-            if !initialized {
-                return Err(
-                    "ONNX Runtime was already initialized before ORT_DYLIB_PATH was applied"
-                        .to_string(),
-                );
-            }
-            Ok(ort_path.clone())
-        })
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    if initialized_path != &ort_path {
-        anyhow::bail!(
-            "ORT_DYLIB_PATH changed after initialization; restart RNA to change runtimes"
-        );
-    }
-    let provider = ort::ep::OpenVINO::default()
-        .with_device_type("GPU.0")
-        .build()
-        .error_on_failure();
-    let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
-        .with_execution_providers(vec![provider]);
-    let mut model = fastembed::TextEmbedding::try_new(options)
-        .map_err(|e| anyhow::anyhow!("failed to load OpenVINO embedding model: {e}"))?;
-    let probe = model
-        .embed(&["RNA Intel Arc OpenVINO embedding readiness probe"], None)
-        .map_err(|e| anyhow::anyhow!("OpenVINO embedding probe failed: {e}"))?;
-    let vector = probe
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("OpenVINO embedding probe returned no vectors"))?;
-    if probe.len() != 1 || vector.len() != EMBEDDING_DIMENSION {
-        anyhow::bail!(
-            "OpenVINO embedding probe returned shape [{}, {}], expected [1, {}]",
-            probe.len(),
-            vector.len(),
-            EMBEDDING_DIMENSION
-        );
-    }
-    if vector.iter().any(|value| !value.is_finite()) {
-        anyhow::bail!("OpenVINO embedding probe returned a non-finite value");
-    }
+}
+
+#[cfg(not(feature = "openvino"))]
+fn new_openvino_model(_policy: Policy) -> Result<(EncoderModel, DeviceAttestation)> {
+    anyhow::bail!("OpenVINO requires an artifact built with the `openvino` feature")
+}
+
+#[cfg(feature = "openvino")]
+fn new_openvino_model(policy: Policy) -> Result<(EncoderModel, DeviceAttestation)> {
+    let _guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+    let loaded = super::openvino::load(&canonical_readiness_probe())?;
     let artifact = std::env::current_exe().context("failed to resolve running RNA artifact")?;
     let attestation = DeviceAttestation {
-        required_device: "openvino-gpu".to_string(),
-        observed_device: "GPU.0".to_string(),
+        required_device: "openvino".to_string(),
+        observed_device: loaded.device,
         backend: "onnxruntime-openvino".to_string(),
         device_index: Some(0),
         artifact_sha256: generation::sha256_file(&artifact)?,
     };
-    tracing::info!(
-        "EmbeddingIndex: MiniLM-L6-v2 ready on Intel Arc OpenVINO GPU.0 in {:?}",
-        start.elapsed()
+    let mut execution = ExecutionIdentity::new(policy, &attestation, None);
+    execution.assets = Some(loaded.assets);
+    execution
+        .flags
+        .insert("encoder_runtime_digest".into(), loaded.runtime_digest);
+    execution
+        .flags
+        .insert("encoder_runtime_version".into(), loaded.version);
+    execution
+        .flags
+        .insert("encoder_device_id".into(), "GPU.0".into());
+    execution.flags.insert(
+        "encoder_precision".into(),
+        super::openvino::PRECISION.into(),
     );
-    Ok((EncoderModel::OpenVino(model), attestation))
+    tracing::info!(device = %attestation.observed_device, execution = ?execution.flags, "OpenVINO MiniLM ready");
+    Ok((
+        EncoderModel {
+            inner: EncoderBackend::OpenVino(loaded.model),
+            execution,
+        },
+        attestation,
+    ))
 }
 
-#[cfg(not(feature = "openvino"))]
-fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
+fn new_candle_model(
+    require_metal: bool,
+    force_cpu: bool,
+    policy: Policy,
+    fallback: Option<&str>,
+) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
-    let device = match candle_core::Device::new_metal(0) {
-        Ok(device) => device,
-        Err(error) if require_metal => {
-            anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
-        }
-        Err(_) => {
-            tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
-            candle_core::Device::Cpu
+    let device = if force_cpu {
+        candle_core::Device::Cpu
+    } else {
+        match candle_core::Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) if require_metal => {
+                anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
+            }
+            Err(_) => {
+                tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+                candle_core::Device::Cpu
+            }
         }
     };
     #[cfg(not(feature = "metal"))]
     let device = {
+        let _ = force_cpu;
         if require_metal {
             anyhow::bail!(
                 "strict embedding execution requires an artifact built with the `metal` feature"
@@ -1083,7 +1092,14 @@ fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAtt
                 m.dimension(),
                 start.elapsed()
             );
-            Ok((EncoderModel::Metal(m), attestation))
+            let execution = ExecutionIdentity::new(policy, &attestation, fallback);
+            Ok((
+                EncoderModel {
+                    inner: EncoderBackend::Metal(m),
+                    execution,
+                },
+                attestation,
+            ))
         }
         Err(err) => {
             tracing::warn!(
@@ -1121,36 +1137,6 @@ pub fn require_metal_device() -> Result<DeviceAttestation> {
         anyhow::bail!(
             "strict embedding execution requires an artifact built with the `metal` feature"
         )
-    }
-}
-
-fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
-    if require_metal {
-        return require_metal_device();
-    }
-    #[cfg(feature = "openvino")]
-    {
-        let (_, attestation) = new_model_with_policy(false)?;
-        return Ok(attestation);
-    }
-    #[cfg(not(feature = "openvino"))]
-    {
-        #[cfg(feature = "metal")]
-        if let Ok(attestation) = require_metal_device() {
-            return Ok(DeviceAttestation {
-                required_device: "any".to_string(),
-                ..attestation
-            });
-        }
-        let executable =
-            std::env::current_exe().context("failed to resolve running RNA artifact")?;
-        Ok(DeviceAttestation {
-            required_device: "any".to_string(),
-            observed_device: "cpu".to_string(),
-            backend: "candle-cpu".to_string(),
-            device_index: None,
-            artifact_sha256: generation::sha256_file(&executable)?,
-        })
     }
 }
 
@@ -1338,9 +1324,7 @@ fn generation_business_context_mode(
         .semantic_identity
         .flags
         .get("business_context_mode")
-        .ok_or_else(|| {
-            anyhow::anyhow!("semantic generation omits business_context_mode identity")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("semantic generation omits business_context_mode identity"))?
         .parse()
         .context("semantic generation has an invalid business_context_mode identity")
 }
@@ -1955,6 +1939,7 @@ impl EmbeddingIndex {
 
     async fn initialized_query_model(
         &self,
+        manifest: Option<&GenerationManifest>,
     ) -> Result<tokio::sync::MutexGuard<'_, Option<EncoderModel>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
@@ -1963,7 +1948,14 @@ impl EmbeddingIndex {
             phase = "query_encoder_wait",
             elapsed_ms = wait_started.elapsed().as_secs_f64() * 1000.0
         );
-        if model.is_none() {
+        let stale = match (model.as_ref(), manifest) {
+            (Some(model), Some(manifest)) => model
+                .execution
+                .validate_query(&manifest.semantic_identity)
+                .is_err(),
+            _ => false,
+        };
+        if model.is_none() || stale {
             let init_started = std::time::Instant::now();
             let (loaded, _) = new_model_with_policy(self.require_metal)?;
             *model = Some(loaded);
@@ -1973,11 +1965,19 @@ impl EmbeddingIndex {
                 elapsed_ms = init_started.elapsed().as_secs_f64() * 1000.0
             );
         }
+        if let Some(manifest) = manifest {
+            model
+                .as_ref()
+                .expect("query model initialized")
+                .execution
+                .validate_query(&manifest.semantic_identity)?;
+        }
         Ok(model)
     }
 
     async fn preload_query_model(&self) -> Result<()> {
-        drop(self.initialized_query_model().await?);
+        let manifest = self.active_generation_manifest();
+        drop(self.initialized_query_model(manifest.as_ref()).await?);
         Ok(())
     }
 
@@ -1985,8 +1985,12 @@ impl EmbeddingIndex {
         self.resident_query_runtime
     }
 
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let mut model = self.initialized_query_model().await?;
+    async fn embed_query(
+        &self,
+        query: &str,
+        manifest: Option<&GenerationManifest>,
+    ) -> Result<Vec<f32>> {
+        let mut model = self.initialized_query_model(manifest).await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
@@ -2698,7 +2702,11 @@ impl EmbeddingIndex {
                 .map(|contract| contract.structural_graph_snapshot_digest.clone())
                 .unwrap_or_else(|| target_graph_digest.clone())
         };
-        let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        // Probe before reuse and retain this instance: fallback and asset loading
+        // cannot select different execution inputs after the identity decision.
+        let (mut model, device_attestation) = new_model_with_policy(require_metal)?;
+        let mut identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        model.execution.apply(&mut identity)?;
         if require_metal {
             generation::verify_runtime_encoder_assets()?;
         }
@@ -2830,10 +2838,7 @@ impl EmbeddingIndex {
             purged_rows = purged_row_count,
             "EmbeddingIndex: value-addressed vector plan"
         );
-        let mut device_attestation = attest_available_device(require_metal)?;
         if !encoder_inputs.is_empty() {
-            let (mut model, observed_attestation) = new_model_with_policy(require_metal)?;
-            device_attestation = observed_attestation;
             const ENCODE_BATCH_SIZE: usize = 2048;
             for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
@@ -3724,6 +3729,7 @@ impl EmbeddingIndex {
         Ok(observed)
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing search filter API boundary.
     async fn search_with_filters_policy(
         &self,
         query: &str,
@@ -3748,6 +3754,7 @@ impl EmbeddingIndex {
             .outcome)
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing search filter API boundary.
     async fn search_with_filters_policy_observed(
         &self,
         query: &str,
@@ -3758,7 +3765,15 @@ impl EmbeddingIndex {
         strict: bool,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        let table = match self.db().open_table(&self.table_name).execute().await {
+        // Bind the query encoder to the same publication as the serving table.
+        let (db, manifest) = {
+            let active = self
+                .active_generation
+                .read()
+                .expect("embedding generation lock poisoned");
+            (active.db.clone(), active.manifest.clone())
+        };
+        let table = match db.open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -3820,7 +3835,7 @@ impl EmbeddingIndex {
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let mut search = table
                     .vector_search(query_embedding)
                     .context("Failed to create vector search")?
@@ -3844,7 +3859,7 @@ impl EmbeddingIndex {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
@@ -4086,39 +4101,27 @@ mod tests {
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             true,
-            false,
             true,
         ));
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::ResidentServing,
             true,
-            false,
             true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Reconciliation,
             true,
-            false,
             true,
         ));
 
-        // The exemption is not a general strict-open bypass.
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
-            true,
-            true,
-            true,
-        ));
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            false,
             false,
             true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             true,
-            false,
             false,
         ));
     }
@@ -6252,13 +6255,34 @@ mod tests {
     #[test]
     #[ignore = "requires an OpenVINO-enabled ORT runtime, Intel Arc GPU.0 and model assets"]
     fn openvino_gpu_embedding_probe_uses_intel_gpu_zero() {
+        assert_eq!(
+            super::Policy::from_env(false).unwrap().backend,
+            super::Backend::OpenVino,
+            "set RNA_EMBEDDING_BACKEND=openvino for hardware verification"
+        );
         let (mut model, attestation) = super::new_model_with_policy(false).unwrap();
-        let embeddings = model
-            .encode(&["Intel Arc OpenVINO embedding probe"])
-            .unwrap();
+        let extracted = crate::extract::ExtractorRegistry::with_builtins().extract_file(
+            std::path::Path::new("src/embed/execution.rs"),
+            include_str!("execution.rs"),
+        );
+        let node = extracted
+            .nodes
+            .iter()
+            .find(|node| node.id.kind == crate::graph::NodeKind::Function)
+            .expect("real execution source must yield a function");
+        let canonical = super::node_embedding_text(node);
+        eprintln!(
+            "Canonical production node: {} ({} bytes)",
+            node.id,
+            canonical.len()
+        );
+        let embeddings = model.encode(&[&canonical]).unwrap();
         let (_, second_attestation) = super::new_model_with_policy(false).unwrap();
         assert_eq!(attestation.backend, "onnxruntime-openvino");
-        assert_eq!(attestation.observed_device, "GPU.0");
+        assert!(attestation.observed_device.contains("Intel"));
+        assert!(attestation.observed_device.contains("Arc"));
+        assert_eq!(model.execution.flags["encoder_device_id"], "GPU.0");
+        eprintln!("OpenVINO hardware evidence: {:?}", model.execution.flags);
         assert_eq!(second_attestation.backend, "onnxruntime-openvino");
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), EMBEDDING_DIMENSION);
@@ -6279,7 +6303,7 @@ mod tests {
                     Err(error) => error,
                 };
                 assert!(
-                    error.to_string().contains("failed to load ONNX Runtime"),
+                    format!("{error:#}").contains("failed to load ONNX Runtime"),
                     "{error:#}"
                 );
             }
@@ -6296,6 +6320,8 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
+                .env("RNA_EMBEDDING_BACKEND", "openvino")
+                .env("RNA_EMBEDDING_FALLBACK", "error")
                 .env("ORT_DYLIB_PATH", runtime)
                 .spawn()
                 .unwrap();
