@@ -2215,6 +2215,73 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_applies_scoped_and_anchored_excludes_from_config() {
+        // Functional: drives the compiled matchers through a real scan with
+        // scoped, globbed, root-anchored and `*/name` patterns from config.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(
+            root,
+            ".oh/config.toml",
+            "[scanner]\nexclude = [\"gen/schema/\", \"/build-out/\", \"gen/*.json\", \"*/local.toml\", \"crates/*/schema.rs\"]\n",
+        );
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // Kept
+        create_file(root, "src/main.rs", "fn main() {}\n");
+        create_file(root, "other/schema/keep.rs", "// not under gen/\n");
+        create_file(root, "gen/sub/keep.json", "{}"); // gen/*.json is one level only
+        create_file(root, "gen/keep.rs", "// not json\n");
+        create_file(
+            root,
+            "src/build-out/keep.rs",
+            "// /build-out/ is root-anchored\n",
+        );
+        create_file(root, "a/b/local.toml", "x = 1\n"); // */local.toml is exactly one deep
+        create_file(root, "local.toml", "x = 1\n");
+        create_file(
+            root,
+            "crates/a/b/schema.rs",
+            "// too deep for crates/*/schema.rs\n",
+        );
+
+        // Excluded
+        create_file(root, "gen/schema/drop.rs", "// scoped dir\n");
+        create_file(root, "gen/schema/deep/drop.rs", "// scoped dir, nested\n");
+        create_file(root, "build-out/drop.rs", "// root-anchored dir\n");
+        create_file(root, "gen/drop.json", "{}");
+        create_file(root, "a/local.toml", "x = 1\n");
+        create_file(root, "crates/core/schema.rs", "// glob middle component\n");
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result = scanner.scan().unwrap();
+        let mut found: Vec<PathBuf> = result
+            .files_to_extract()
+            .into_iter()
+            .filter(|p| !p.starts_with(".oh"))
+            .cloned()
+            .collect();
+        found.sort();
+
+        let mut expected: Vec<PathBuf> = [
+            "src/main.rs",
+            "other/schema/keep.rs",
+            "gen/sub/keep.json",
+            "gen/keep.rs",
+            "src/build-out/keep.rs",
+            "a/b/local.toml",
+            "local.toml",
+            "crates/a/b/schema.rs",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
     fn test_project_config_applies_to_custom_excludes() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
