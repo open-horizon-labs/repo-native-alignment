@@ -1472,7 +1472,7 @@ mod tests {
                 move |msg| {
                     p.lock().unwrap().push(msg.to_string());
                 },
-                ScanEnrichmentOptions::all(),
+                ScanEnrichmentOptions::extract_only(),
             )
             .await
             .expect("first foreground pipeline should succeed");
@@ -1518,7 +1518,7 @@ mod tests {
                 move |msg| {
                     p2.lock().unwrap().push(msg.to_string());
                 },
-                ScanEnrichmentOptions::all(),
+                ScanEnrichmentOptions::extract_only(),
             )
             .await
             .expect("second foreground pipeline should succeed");
@@ -1581,8 +1581,9 @@ mod tests {
         };
 
         // First run: full rebuild, writes SCHEMA_VERSION to the version file.
+        // This test exercises structural cache invalidation, not model/LSP setup.
         let result1 = handler
-            .run_pipeline_foreground(|_| {}, ScanEnrichmentOptions::all())
+            .run_pipeline_foreground(|_| {}, ScanEnrichmentOptions::extract_only())
             .await
             .expect("first run should succeed");
         assert!(
@@ -1620,7 +1621,7 @@ mod tests {
                 move |msg| {
                     p2.lock().unwrap().push(msg.to_string());
                 },
-                ScanEnrichmentOptions::all(),
+                ScanEnrichmentOptions::extract_only(),
             )
             .await
             .expect("second run should succeed after schema version migration");
@@ -2078,6 +2079,11 @@ mod tests {
             let gs1 = handler.build_full_graph().await.unwrap();
             assert!(gs1.nodes.iter().any(|n| n.id.name == "primary_fn"));
             assert!(!gs1.nodes.iter().any(|n| n.id.name == "secondary_fn"));
+            // A real process exit stops its tasks. Dropping a handler in this
+            // test does not; drain its old-root writer before declaring roots.
+            if let Some(handle) = handler.lsp_handle.lock().await.take() {
+                let _ = handle.await;
+            }
         }
         // Handler #1 dropped here -- simulates CLI process exit.
 
@@ -2167,6 +2173,9 @@ mod tests {
                 gs3.nodes.iter().any(|n| n.id.name == "secondary_fn"),
                 "secondary_fn must still be present on third build (no regression)"
             );
+            if let Some(handle) = handler3.lsp_handle.lock().await.take() {
+                let _ = handle.await;
+            }
         }
 
         // Verify LanceDB still has secondary after the third build.

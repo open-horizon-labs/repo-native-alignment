@@ -105,7 +105,44 @@ curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/late
 
 Release and user-facing verification should use successful GitHub Actions/release artifacts, not a local source build.
 
-Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
+Prebuilt release binaries are intentionally built without local embedding/reranking support. They support extraction, graph traversal, lexical search, LSP call/reference enrichment, repo maps, and MCP delivery. Semantic search and cross-encoder reranking require a development/source build with embedding features (for Apple Silicon Metal: `cargo install --locked --path . --features metal`; for Linux CUDA: `cargo install --locked --path . --features cuda` from a checked-out repo). Do not use source builds as release verification; release verification must install the successful GitHub Actions/release artifact for the target commit.
+
+Embedding execution is configured under `[embeddings]` in `.oh/config.toml`:
+
+```toml
+[embeddings]
+backend = "auto"       # auto, cpu, cuda, or metal
+cuda_device = 0
+fallback = "cpu"       # auto fallback policy: cpu or error
+# batch_size = 32       # omit for adaptive batching
+```
+
+`auto` tries CUDA first in a CUDA-enabled build, then Metal, then CPU when
+`fallback = "cpu"` (the default). With `fallback = "error"`, it tries CUDA
+and Metal but fails if neither accelerator is usable; it never silently uses
+CPU. `backend = "cuda"` is strict: missing CUDA/cuDNN runtime libraries, an
+unavailable ordinal, provider registration failure, or failed production
+inference aborts indexing/query initialization and never falls back to CPU. The
+equivalent overrides are `RNA_EMBEDDING_BACKEND`, `RNA_CUDA_DEVICE`,
+`RNA_EMBEDDING_FALLBACK`, and `RNA_EMBEDDING_BATCH_SIZE`. CUDA builds use the
+ONNX Runtime CUDA 12 execution provider and require compatible CUDA 12 and
+cuDNN 9 runtime libraries; RNA does not install them.
+CUDA startup profiles the retained production MiniLM session and requires
+floating-point CUDA compute; only small integer shape operations may run on CPU.
+Tokenization, attention-mask mean pooling, and normalization run on the host.
+TF32 is disabled, the ORT arena is capped at 2 GiB (not a total VRAM limit), and
+CUDA batches are subdivided to at most 32 inputs. `RNA_CUDA_STRICT_NO_CPU=1`
+also disables ORT's CPU provider fallback, which may reject shape operations.
+`RNA_MODEL_CACHE_DIR` overrides the platform user cache's `rna` directory;
+`RNA_CUDA_PROFILE_DIR` overrides temporary startup-profile storage. Both overrides
+must be absolute paths. On NUC14, use `/srv/agent-data/models/rna` and
+`/srv/agent-data/work/rna/cuda-profiles`, respectively.
+Generation reuse and queries validate the loaded ONNX/tokenizer byte hashes and
+effective provider/device. Backend or asset changes require rebuilding the index.
+Diagnostics distinguish generation attestation from the resident query encoder's
+verification state and report whether auto selection fell back to CPU.
+All persisted vectors currently use `f32` precision; precision is included in
+semantic generation identity and runtime diagnostics.
 
 **Build from source for development** (requires [Rust toolchain](https://rustup.rs)):
 

@@ -324,6 +324,9 @@ impl RnaHandler {
         };
         let embed_guard = self.embed_index.load();
         let embed_index = embed_guard.as_ref().as_ref();
+        if let Some(index) = embed_index {
+            self.embed_status.set_runtime_diagnostic(index.runtime_diagnostic());
+        }
         let ctx = SearchContext {
             graph_state: &graph_state,
             embed_index,

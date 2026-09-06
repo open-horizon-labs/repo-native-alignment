@@ -7,6 +7,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      linux_embedding_backend:
+        description: Linux verification artifact backend
+        type: choice
+        options: [none, cuda]
+        default: none
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -131,7 +137,7 @@ jobs:
         with:
           components: clippy
       - name: Setup sccache
-        if: needs.changes.outputs.rust == 'true'
+        if: needs.changes.outputs.rust == 'true' && !startsWith(runner.name, 'nuc14-')
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure Namespace sccache cache
         if: needs.changes.outputs.rust == 'true' && (vars.LOCAL_LINUX_CI_ENABLED != 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository))
@@ -146,7 +152,7 @@ jobs:
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
         env:
-          RUSTC_WRAPPER: "sccache"
+          RUSTC_WRAPPER: ${{ !startsWith(runner.name, 'nuc14-') && 'sccache' || '' }}
         run: cargo clippy --no-default-features -- -D warnings
 
   test:
@@ -173,7 +179,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
-        if: needs.changes.outputs.rust == 'true'
+        if: needs.changes.outputs.rust == 'true' && !startsWith(runner.name, 'nuc14-')
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
@@ -191,7 +197,7 @@ jobs:
       - name: Run all tests (test profile, no debuginfo)
         if: needs.changes.outputs.rust == 'true'
         env:
-          RUSTC_WRAPPER: "sccache"
+          RUSTC_WRAPPER: ${{ !startsWith(runner.name, 'nuc14-') && 'sccache' || '' }}
         run: cargo test --no-default-features
 
 
@@ -199,7 +205,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'namespace-profile-cached' }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
@@ -213,6 +219,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
+        if: ${{ !startsWith(runner.name, 'nuc14-') }}
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Configure Namespace sccache cache
@@ -229,8 +236,33 @@ jobs:
 
       - name: Build release binary
         env:
-          RUSTC_WRAPPER: "sccache"
-        run: cargo build --release --no-default-features
+          RUSTC_WRAPPER: ${{ !startsWith(runner.name, 'nuc14-') && 'sccache' || '' }}
+          EMBEDDING_BACKEND: ${{ inputs.linux_embedding_backend || 'none' }}
+        run: |
+          case "$EMBEDDING_BACKEND" in
+            cuda) cargo build --locked --release --no-default-features --features cuda ;;
+            none) cargo build --locked --release --no-default-features ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Package Linux verification artifact
+        env:
+          EMBEDDING_BACKEND: ${{ inputs.linux_embedding_backend || 'none' }}
+        run: |
+          mkdir -p verification-artifact
+          cp target/release/repo-native-alignment verification-artifact/
+          if [ "$EMBEDDING_BACKEND" = cuda ]; then
+            find target/release -maxdepth 1 -name 'libonnxruntime*.so*' -exec cp -L {} verification-artifact/ \;
+          fi
+          git rev-parse HEAD > verification-artifact/source-commit.txt
+          (cd verification-artifact && find . -maxdepth 1 -type f ! -name checksums.txt -print0 | sort -z | xargs -0 sha256sum > checksums.txt)
+
+      - name: Upload Linux verification artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: repo-native-alignment-linux-x64-${{ inputs.linux_embedding_backend || 'none' }}
+          path: verification-artifact/
+          retention-days: 7
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .github/fixtures/smoke
@@ -269,7 +301,7 @@ jobs:
   # M4-optimized build runs first (this is what developers install).
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.linux_embedding_backend != 'cuda')
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'namespace-profile-tahoe' }}
     timeout-minutes: 60
     env:

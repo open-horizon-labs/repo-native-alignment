@@ -71,6 +71,12 @@ candle-core = { version = "0.9", optional = true }
 
 # Optional cross-encoder reranking (ONNX runtime, CPU inference)
 fastembed = { version = "5", optional = true }
+# Direct ORT ownership is intentional: fastembed's `cuda` feature enables its
+# Candle CUDA models, not the ONNX Runtime CUDA execution provider used here.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["cuda", "copy-dylibs"], optional = true }
+tokenizers = { version = "=0.22.2", optional = true }
+hf-hub = { version = "=0.5.0", optional = true }
+tempfile = { version = "3.26.0", optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -131,6 +137,10 @@ libc = "0.2"
 [features]
 default = []
 embeddings = ["dep:metal-candle", "dep:candle-core", "dep:fastembed", "dep:lance-index"]
+
+# Native MiniLM ONNX Runtime CUDA execution provider. This is deliberately
+# separate from fastembed/cuda, which is Candle CUDA support.
+cuda = ["embeddings", "dep:ort", "dep:tokenizers", "dep:hf-hub", "dep:tempfile"]
 
 metal = ["embeddings", "candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
 

@@ -118,6 +118,7 @@ struct PipelineReportInput {
     phases: Vec<PhaseReport>,
     related_job_ids: Vec<String>,
     business_context: crate::business_context::BusinessContextAdmission,
+    embedding_runtime: Option<String>,
 }
 
 fn build_pipeline_operation_report(
@@ -143,6 +144,11 @@ fn build_pipeline_operation_report(
     }
     let (embedding_state, embedding_detail) =
         embedding_capability_from_availability(input.enrichment, input.embeddings_attached);
+    let embedding_detail = match (embedding_detail, input.embedding_runtime) {
+        (Some(detail), Some(runtime)) => Some(format!("{detail}; runtime: {runtime}")),
+        (None, Some(runtime)) => Some(format!("runtime: {runtime}")),
+        (detail, None) => detail,
+    };
     for capability in scan_capability_reports(
         input.enrichment,
         embedding_state,
@@ -1341,6 +1347,7 @@ impl RnaHandler {
                                     .active_generation_manifest()
                                     .map_or(count, |manifest| manifest.row_count);
                                 // Atomic store -- no mutex needed
+                                embed_status.set_runtime_diagnostic(idx.runtime_diagnostic());
                                 embed_index_ref.store(Arc::new(Some(idx)));
                                 bg_jobs.mark_completed(
                                     &bg_repo_root,
@@ -1947,8 +1954,13 @@ impl RnaHandler {
             } else {
                 lsp_job_id.iter().cloned().collect::<Vec<_>>()
             };
-            self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-                .await?;
+            self.persist_foreground_lsp_completeness(
+                &[],
+                &lsp_related_job_ids,
+                scan_started_at_ms,
+                enrichment.runs_embeddings(),
+            )
+            .await?;
 
             let (embed_count, embed_time, embed_job_id) = if enrichment.runs_embeddings() {
                 let (encoded, elapsed, job_id) = self
@@ -2041,6 +2053,7 @@ impl RnaHandler {
                     phases,
                     related_job_ids,
                     business_context: self.business_context.clone(),
+                    embedding_runtime: self.embed_status.runtime_diagnostic(),
                 },
             );
 
@@ -2514,8 +2527,13 @@ impl RnaHandler {
         } else {
             incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>()
         };
-        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-            .await?;
+        self.persist_foreground_lsp_completeness(
+            &[],
+            &lsp_related_job_ids,
+            scan_started_at_ms,
+            enrichment.runs_embeddings(),
+        )
+        .await?;
 
         if enrichment.runs_lsp() && enrichment.runs_embeddings() {
             if !lsp_stage_completed {
@@ -2630,6 +2648,7 @@ impl RnaHandler {
                 phases,
                 related_job_ids,
                 business_context: self.business_context.clone(),
+                embedding_runtime: self.embed_status.runtime_diagnostic(),
             },
         );
 
@@ -3008,8 +3027,13 @@ impl RnaHandler {
         let persist_time = persist_started.elapsed();
 
         let lsp_related_job_ids = lsp_job_id.iter().cloned().collect::<Vec<_>>();
-        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-            .await?;
+        self.persist_foreground_lsp_completeness(
+            &[],
+            &lsp_related_job_ids,
+            scan_started_at_ms,
+            enrichment.runs_embeddings(),
+        )
+        .await?;
 
         if enrichment.runs_lsp() && enrichment.runs_embeddings() {
             if !lsp_stage_completed {
@@ -3117,6 +3141,7 @@ impl RnaHandler {
                 phases,
                 related_job_ids,
                 business_context: self.business_context.clone(),
+                embedding_runtime: self.embed_status.runtime_diagnostic(),
             },
         );
 
@@ -3727,13 +3752,18 @@ impl RnaHandler {
     /// not bind its vectors to the report for the graph it was about to consume.
     /// Writing the report immediately after structural persistence makes the same
     /// fresh graph snapshot authoritative for both readiness and embeddings.
+    /// Default-context embeddings need the same report; default-context scans
+    /// without embeddings retain their existing report-free behavior.
     async fn persist_foreground_lsp_completeness(
         &self,
         lsp_entries: &[crate::extract::scan_stats::LspEnrichmentEntry],
         related_job_ids: &[String],
         scan_started_at_ms: u64,
+        embeddings_requested: bool,
     ) -> anyhow::Result<()> {
-        if !self.business_context.mode().is_disabled() {
+        if !self.business_context.mode().is_disabled()
+            && !(embeddings_requested && cfg!(feature = "embeddings"))
+        {
             return Ok(());
         }
         let reopened = load_graph_from_lance(&self.repo_root)
@@ -3833,6 +3863,7 @@ impl RnaHandler {
                             &self.business_context,
                         )
                         .await?;
+                    self.embed_status.set_runtime_diagnostic(index.runtime_diagnostic());
                     self.embed_index.store(Arc::new(Some(index)));
                     anyhow::Ok(())
                 }
@@ -3933,6 +3964,8 @@ impl RnaHandler {
                     self.record_embedding_job_failure(&job_id, &error);
                     return Err(error);
                 }
+                self.embed_status
+                    .set_runtime_diagnostic(index.runtime_diagnostic());
                 self.embed_index.store(Arc::new(Some(index)));
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
@@ -4076,6 +4109,8 @@ impl RnaHandler {
                             self.embed_status.set_complete(joined_count);
                         }
                     }
+                    self.embed_status
+                        .set_runtime_diagnostic(idx.runtime_diagnostic());
                     self.embed_index.store(Arc::new(Some(idx)));
                     anyhow::Ok(())
                 }
@@ -4165,6 +4200,8 @@ impl RnaHandler {
                     self.record_embedding_job_failure(&job_id, &error);
                     return Err(error);
                 }
+                self.embed_status
+                    .set_runtime_diagnostic(idx.runtime_diagnostic());
                 self.embed_index.store(Arc::new(Some(idx)));
                 self.enrichment_jobs
                     .mark_completed(&self.repo_root, &job_id, count, count);
@@ -4456,6 +4493,7 @@ mod tests {
                 phases: Vec::new(),
                 related_job_ids: Vec::new(),
                 business_context: crate::business_context::BusinessContextAdmission::default(),
+                embedding_runtime: None,
             },
         );
 
