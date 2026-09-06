@@ -7,10 +7,10 @@
 //! values cannot change the fused result as long as its within-channel order
 //! is unchanged.
 //!
-//! The frozen strict semantic search path is intentionally not replaced by
+//! Explicit strict semantic search is intentionally not replaced by
 //! the ordinary or task policies below.  `strict_semantic_isolation` exists as
 //! a validation boundary for callers that need typed evidence: it accepts only
-//! the sealed hybrid-RRF candidate set plus its exact reranker permutation,
+//! the strict hybrid-RRF candidate set plus its exact reranker permutation,
 //! forbids every fallback channel, and preserves reranker order.
 
 use std::cmp::Ordering;
@@ -182,7 +182,7 @@ impl ChannelInput {
 
 /// Stable names for the versioned fusion policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// The strict policy is exercised as an isolation contract while the sealed
+// The strict policy is exercised as an isolation contract while the strict
 // strict service path deliberately bypasses product fusion.
 #[allow(dead_code)]
 pub(crate) enum FusionPolicyName {

@@ -1329,7 +1329,7 @@ impl RnaHandler {
 
         // `.oh/.cache/embeddings/` is the live immutable semantic-generation
         // store. Never delete it merely because the structural Lance cache is
-        // present: branch-switch and SWE-bench incremental reconciliation reuse
+        // present: branch-switch and incremental reconciliation reuse
         // those verified vectors. Semantic identity/schema validation owns any
         // required partition rebuild; migrations remain forbidden.
 
