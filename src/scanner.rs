@@ -1321,25 +1321,29 @@ impl Scanner {
 
 /// Check if a file path matches an exclude pattern.
 ///
-/// Pattern types:
+/// Unqualified patterns (no `/` except a trailing one) match at any depth:
 /// - `dirname/` — matches any path component equal to `dirname`
 /// - `prefix*/` — matches any path component starting with `prefix`
 /// - `*.ext` — matches files ending in `.ext`
 /// - `filename` — matches the exact filename (last component)
+///
+/// Patterns containing `/` are relative to the repository root and are
+/// matched component by component; `*` matches within a single component:
+/// - `gen/schema/` — matches that directory and everything beneath it
+/// - `gen/schema*/` — matches `gen/schema`, `gen/schema-v2`, ... and beneath
+/// - `gen/*.json` — matches JSON files directly inside `gen/`
+/// - `gen/config.json` — matches exactly that file
 fn is_file_excluded(pattern: &str, path: &str) -> bool {
+    if is_scoped_pattern(pattern) {
+        return scoped_pattern_matches(pattern, path);
+    }
     if let Some(suffix) = pattern.strip_prefix('*') {
         // Extension pattern: *.pyc, *.o, etc.
         return path.ends_with(suffix);
     }
     if let Some(dirname) = pattern.strip_suffix('/') {
-        if dirname.contains('/') {
-            return path == dirname || path.starts_with(&format!("{dirname}/"));
-        }
         // Unqualified directory pattern: check if any path component matches.
         return dir_component_matches(dirname, path);
-    }
-    if pattern.contains('/') {
-        return path == pattern;
     }
     // Exact filename match against last component
     if let Some(filename) = path.rsplit('/').next() {
@@ -1351,12 +1355,70 @@ fn is_file_excluded(pattern: &str, path: &str) -> bool {
 /// Check if a directory path matches an exclude pattern.
 fn is_dir_excluded(pattern: &str, dir_path: &str) -> bool {
     if let Some(dirname) = pattern.strip_suffix('/') {
-        if dirname.contains('/') {
-            return dir_path == dirname || dir_path.starts_with(&format!("{dirname}/"));
+        if is_scoped_pattern(pattern) {
+            return scoped_prefix_matches(dirname, dir_path);
         }
         return dir_component_matches(dirname, dir_path);
     }
     false
+}
+
+/// A pattern is repository-scoped when it contains a `/` other than a
+/// trailing directory marker (e.g. `gen/schema/`, `gen/*.json`).
+fn is_scoped_pattern(pattern: &str) -> bool {
+    pattern.trim_end_matches('/').contains('/')
+}
+
+/// Match a repository-scoped pattern against a file path.
+fn scoped_pattern_matches(pattern: &str, path: &str) -> bool {
+    if let Some(dirname) = pattern.strip_suffix('/') {
+        return scoped_prefix_matches(dirname, path);
+    }
+    let pattern_comps: Vec<&str> = pattern.split('/').collect();
+    let path_comps: Vec<&str> = path.split('/').collect();
+    pattern_comps.len() == path_comps.len()
+        && pattern_comps
+            .iter()
+            .zip(&path_comps)
+            .all(|(p, c)| component_matches(p, c))
+}
+
+/// Match a repository-scoped directory pattern (without its trailing `/`)
+/// as a leading prefix of `path`, component by component.
+fn scoped_prefix_matches(dirname: &str, path: &str) -> bool {
+    let pattern_comps: Vec<&str> = dirname.split('/').collect();
+    let path_comps: Vec<&str> = path.split('/').collect();
+    pattern_comps.len() <= path_comps.len()
+        && pattern_comps
+            .iter()
+            .zip(&path_comps)
+            .all(|(p, c)| component_matches(p, c))
+}
+
+/// Match one path component against a pattern component where `*` matches
+/// any run of characters (never crossing a `/`).
+fn component_matches(pattern: &str, comp: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == comp;
+    };
+    if !pattern.contains('*') {
+        return pattern == comp;
+    }
+    let Some(mut rest) = comp.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        return true;
+    };
+    for part in middle {
+        match rest.find(part) {
+            Some(idx) => rest = &rest[idx + part.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
 }
 
 /// Check if any path component matches a directory name pattern.
@@ -1508,6 +1570,57 @@ mod tests {
             "codex-rs/core/config.schema.json",
             "other/config.schema.json"
         ));
+    }
+
+    #[test]
+    fn test_scoped_dir_pattern_does_not_match_partial_component() {
+        assert!(!is_file_excluded("gen/schema/", "gen/schema-v2/a.json"));
+        assert!(!is_dir_excluded("gen/schema/", "gen/schema-v2"));
+        assert!(!is_dir_excluded("gen/schema/", "gen"));
+    }
+
+    #[test]
+    fn test_scoped_glob_patterns() {
+        // Glob inside a scoped directory pattern.
+        assert!(is_dir_excluded("codex-rs/gen*/", "codex-rs/gen"));
+        assert!(is_dir_excluded("codex-rs/gen*/", "codex-rs/generated"));
+        assert!(is_file_excluded(
+            "codex-rs/gen*/",
+            "codex-rs/generated/x/y.rs"
+        ));
+        assert!(!is_dir_excluded("codex-rs/gen*/", "other/generated"));
+        assert!(!is_dir_excluded("codex-rs/gen*/", "codex-rs/src"));
+
+        // Glob in the file component: only files directly under that dir.
+        assert!(is_file_excluded("gen/*.json", "gen/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "gen/sub/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "other/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "gen/a.rs"));
+
+        // Glob in a middle component never crosses `/`.
+        assert!(is_file_excluded(
+            "crates/*/schema.json",
+            "crates/core/schema.json"
+        ));
+        assert!(!is_file_excluded(
+            "crates/*/schema.json",
+            "crates/a/b/schema.json"
+        ));
+    }
+
+    #[test]
+    fn test_component_matches() {
+        assert!(component_matches("gen", "gen"));
+        assert!(!component_matches("gen", "generated"));
+        assert!(component_matches("gen*", "gen"));
+        assert!(component_matches("gen*", "generated"));
+        assert!(component_matches("*.json", "a.json"));
+        assert!(!component_matches("*.json", "a.jsonl"));
+        assert!(component_matches("a*b*c", "aXXbYYc"));
+        assert!(component_matches("a*b*c", "abc"));
+        assert!(!component_matches("a*b*c", "acb"));
+        assert!(component_matches("*", ""));
+        assert!(component_matches("*", "anything"));
     }
 
     #[test]
