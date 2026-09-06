@@ -111,11 +111,33 @@ fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
 /// per-file index lists are pushed in that same order, so callers that
 /// tie-break with `min_by_key` (first minimum wins) observe exactly the
 /// sequence a linear scan over the matching set produced before.
-#[derive(Debug, Default)]
+///
+/// Storage trade-off: a language-matching node appears twice, once in `nodes`
+/// (body-free, keeps `signature`/`metadata` because `node_lsp_position` and the
+/// work-item ledger read them) and once in `graph_by_file` (endpoint clone:
+/// `id`, span, `language`, `source` only, because `EndpointLookupIndex` and
+/// `file_root` read nothing else). Both copies are linear in the node count;
+/// neither carries `body`.
+#[derive(Debug)]
 pub(super) struct Pass1SymbolIndex {
     nodes: Vec<Node>,
     by_file: HashMap<PathBuf, Vec<usize>>,
     graph_by_file: HashMap<PathBuf, Vec<Node>>,
+}
+
+/// Endpoint-resolution clone: keeps only what `EndpointLookupIndex::build`,
+/// `EnclosingLineIndex::build`, and `Pass1SymbolIndex::file_root` read.
+fn endpoint_clone(node: &Node) -> Node {
+    Node {
+        id: node.id.clone(),
+        language: node.language.clone(),
+        line_start: node.line_start,
+        line_end: node.line_end,
+        signature: String::new(),
+        body: String::new(),
+        metadata: BTreeMap::new(),
+        source: node.source.clone(),
+    }
 }
 
 fn body_free_clone(node: &Node) -> Node {
@@ -149,7 +171,7 @@ impl Pass1SymbolIndex {
             graph_by_file
                 .entry(node.id.file.clone())
                 .or_default()
-                .push(body_free_clone(node));
+                .push(endpoint_clone(node));
         }
         for nodes in graph_by_file.values_mut() {
             nodes.sort_by_key(|node| node.line_end.saturating_sub(node.line_start));
@@ -162,7 +184,13 @@ impl Pass1SymbolIndex {
     }
 
     fn node(&self, index: usize) -> &Node {
-        &self.nodes[index]
+        self.nodes.get(index).unwrap_or_else(|| {
+            panic!(
+                "Pass1SymbolIndex: work item node_index {index} is out of range for {} matching nodes; \
+                 work items must be built from the same matching set as the index",
+                self.nodes.len()
+            )
+        })
     }
 
     /// Language-matching nodes in `file`, in matching-set order.
@@ -172,6 +200,17 @@ impl Pass1SymbolIndex {
             .into_iter()
             .flatten()
             .map(|&index| &self.nodes[index])
+    }
+
+    /// The `Impl` or `Struct` in `file` whose span contains `line`, narrowest
+    /// span first; equal spans resolve to the first in matching-set order.
+    /// This is the trait-implementor lookup `enrich_trait_node` performs.
+    fn implementor_at(&self, file: &Path, line: usize) -> Option<NodeId> {
+        self.nodes_in_file(file)
+            .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
+            .filter(|n| n.line_start <= line && n.line_end >= line)
+            .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
+            .map(|n| n.id.clone())
     }
 
     /// Every extracted node grouped by file, narrowest span first.
@@ -2418,13 +2457,8 @@ impl LspEnricher {
                     observation.result_count += 1;
 
                     // Per-file candidates in matching-set order, so the
-                    // first-minimum tie-break below is unchanged.
-                    let impl_id = symbol_index
-                        .nodes_in_file(&impl_path)
-                        .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
-                        .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
-                        .min_by_key(|n| n.line_end - n.line_start)
-                        .map(|n| n.id.clone());
+                    // first-minimum tie-break is unchanged.
+                    let impl_id = symbol_index.implementor_at(&impl_path, impl_line);
 
                     if let Some(implementor) = impl_id {
                         edges.push(Edge {
@@ -4078,9 +4112,16 @@ mod tests {
         let graph = index.graph_nodes_by_file();
         assert_eq!(graph.len(), 2);
         assert!(
-            graph.values().flatten().all(|node| node.body.is_empty()),
-            "graph nodes must be body-free"
+            graph.values().flatten().all(|node| node.body.is_empty()
+                && node.signature.is_empty()
+                && node.metadata.is_empty()),
+            "graph nodes are endpoint clones: no body, signature, or metadata"
         );
+        let graph_only_entry = &graph[Path::new("src/other.rs")][0];
+        assert_eq!(graph_only_entry.id, graph_only.id);
+        assert_eq!(graph_only_entry.line_start, graph_only.line_start);
+        assert_eq!(graph_only_entry.line_end, graph_only.line_end);
+        assert_eq!(graph_only_entry.source, graph_only.source);
         assert_eq!(
             index.file_root(Path::new("src/other.rs")),
             Some("repo".to_string())
@@ -4111,14 +4152,73 @@ mod tests {
         assert_eq!(index.nodes_in_file(Path::new("src/missing.rs")).count(), 0);
 
         // The trait-implementor lookup tie-breaks on the first minimum span in
-        // matching order; equal-span `a` (Impl) must win over `c` (Struct).
-        let implementor = index
-            .nodes_in_file(Path::new("src/lib.rs"))
-            .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
-            .filter(|n| n.line_start <= 5 && n.line_end >= 5)
-            .min_by_key(|n| n.line_end - n.line_start)
-            .map(|n| n.id.name.clone());
-        assert_eq!(implementor.as_deref(), Some("a"));
+        // matching order; equal-span `a` (Impl) must win over `c` (Struct), and
+        // the enclosing Function `d` is never a candidate.
+        assert_eq!(
+            index.implementor_at(Path::new("src/lib.rs"), 5),
+            Some(a.id.clone())
+        );
+        assert_eq!(
+            index.implementor_at(Path::new("src/lib.rs"), 3),
+            Some(a.id.clone())
+        );
+        assert_eq!(index.implementor_at(Path::new("src/lib.rs"), 11), None);
+        assert_eq!(index.implementor_at(Path::new("src/missing.rs"), 1), None);
+    }
+
+    #[test]
+    fn pass1_symbol_index_call_target_resolution_unique_vs_ambiguous() {
+        // Two same-named functions in one file share a `NodeId` (the ID carries
+        // no span), so the endpoint index dedups them to one unique target.
+        // This is the pre-#873 `EndpointLookupIndex` behaviour and must survive
+        // being fed endpoint clones from the shared index.
+        let first = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 1, 5);
+        let second = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 10, 15);
+        // Distinct `NodeId`s that still collide on (file, name) are the
+        // genuinely ambiguous case: here the same file is indexed under a
+        // second workspace root.
+        let mut other_root = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 20, 25);
+        other_root.id.root = "other".to_string();
+        let index = Pass1SymbolIndex::build(
+            &[&first, &second, &other_root],
+            &[first.clone(), second.clone(), other_root.clone()],
+        );
+        let endpoint_index = EndpointLookupIndex::build(index.graph_nodes_by_file());
+
+        // Ambiguous: two distinct ids -> None, so the caller falls back to the
+        // enclosing symbol at the call line.
+        assert_eq!(
+            endpoint_index.unique_function(Path::new("src/lib.rs"), "dup"),
+            None
+        );
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/lib.rs"), 12),
+            Some(second.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/lib.rs"), 22),
+            Some(other_root.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.unique_function(Path::new("src/lib.rs"), "missing"),
+            None
+        );
+
+        // Unique after dedup: identical ids collapse to a single target.
+        let deduped = Pass1SymbolIndex::build(&[&first, &second], &[first.clone(), second.clone()]);
+        let deduped_index = EndpointLookupIndex::build(deduped.graph_nodes_by_file());
+        assert_eq!(
+            deduped_index.unique_function(Path::new("src/lib.rs"), "dup"),
+            Some(first.id.clone())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "node_index 3 is out of range for 1 matching nodes")]
+    fn pass1_symbol_index_rejects_out_of_range_work_item() {
+        let only = pass1_index_node("src/lib.rs", "only", NodeKind::Function, 1, 2);
+        let index = Pass1SymbolIndex::build(&[&only], &[]);
+        let _ = index.node(3);
     }
 
     #[test]
