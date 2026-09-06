@@ -118,11 +118,25 @@ fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
 /// `id`, span, `language`, `source` only, because `EndpointLookupIndex` and
 /// `file_root` read nothing else). Both copies are linear in the node count;
 /// neither carries `body`.
-#[derive(Debug)]
 pub(super) struct Pass1SymbolIndex {
     nodes: Vec<Node>,
     by_file: HashMap<PathBuf, Vec<usize>>,
     graph_by_file: HashMap<PathBuf, Vec<Node>>,
+}
+
+impl std::fmt::Debug for Pass1SymbolIndex {
+    /// Counts only: a derived `Debug` would print every indexed node.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pass1SymbolIndex")
+            .field("matching_nodes", &self.nodes.len())
+            .field("matching_files", &self.by_file.len())
+            .field("graph_files", &self.graph_by_file.len())
+            .field(
+                "graph_nodes",
+                &self.graph_by_file.values().map(Vec::len).sum::<usize>(),
+            )
+            .finish()
+    }
 }
 
 /// Endpoint-resolution clone: keeps only what `EndpointLookupIndex::build`,
@@ -4164,6 +4178,23 @@ mod tests {
         );
         assert_eq!(index.implementor_at(Path::new("src/lib.rs"), 11), None);
         assert_eq!(index.implementor_at(Path::new("src/missing.rs"), 1), None);
+
+        // A strictly narrower Impl that comes later in matching order beats
+        // the wider, earlier `a`: narrowest span wins before order tie-breaks.
+        let inner = pass1_index_node("src/lib.rs", "inner", NodeKind::Impl, 4, 6);
+        let with_inner = Pass1SymbolIndex::build(&[&a, &b, &c, &d, &inner], &[]);
+        assert_eq!(
+            with_inner.implementor_at(Path::new("src/lib.rs"), 5),
+            Some(inner.id.clone())
+        );
+        assert_eq!(
+            with_inner.implementor_at(Path::new("src/lib.rs"), 8),
+            Some(a.id.clone())
+        );
+        assert!(
+            !format!("{with_inner:?}").contains("inner"),
+            "Debug must print counts, not nodes"
+        );
     }
 
     #[test]

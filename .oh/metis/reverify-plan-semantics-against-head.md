@@ -2,7 +2,7 @@
 id: reverify-plan-semantics-against-head
 title: "Re-verify Plan-Stage Behavioural Notes Against HEAD Before Encoding Them"
 outcome: context-assembly
-source: "PR #874 / issue #873 ship pipeline"
+source_issue: 873
 ---
 An issue's root-cause analysis and a solution-space plan are snapshots of the
 code at the moment they were written. By the time `/execute` starts, sibling
