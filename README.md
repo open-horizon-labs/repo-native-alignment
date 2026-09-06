@@ -127,6 +127,20 @@ equivalent overrides are `RNA_EMBEDDING_BACKEND`, `RNA_CUDA_DEVICE`,
 `RNA_EMBEDDING_FALLBACK`, and `RNA_EMBEDDING_BATCH_SIZE`. CUDA builds use the
 ONNX Runtime CUDA 12 execution provider and require compatible CUDA 12 and
 cuDNN 9 runtime libraries; RNA does not install them.
+CUDA startup profiles the retained production MiniLM session and requires
+floating-point CUDA compute; only small integer shape operations may run on CPU.
+Tokenization, attention-mask mean pooling, and normalization run on the host.
+TF32 is disabled, the ORT arena is capped at 2 GiB (not a total VRAM limit), and
+CUDA batches are subdivided to at most 32 inputs. `RNA_CUDA_STRICT_NO_CPU=1`
+also disables ORT's CPU provider fallback, which may reject shape operations.
+`RNA_MODEL_CACHE_DIR` overrides the platform user cache's `rna` directory;
+`RNA_CUDA_PROFILE_DIR` overrides temporary startup-profile storage. Both overrides
+must be absolute paths. On NUC14, use `/srv/agent-data/models/rna` and
+`/srv/agent-data/work/rna/cuda-profiles`, respectively.
+Generation reuse and queries validate the loaded ONNX/tokenizer byte hashes and
+effective provider/device. Backend or asset changes require rebuilding the index.
+Diagnostics distinguish generation attestation from the resident query encoder's
+verification state and report whether auto selection fell back to CPU.
 All persisted vectors currently use `f32` precision; precision is included in
 semantic generation identity and runtime diagnostics.
 

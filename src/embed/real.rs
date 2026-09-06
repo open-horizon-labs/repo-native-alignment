@@ -506,6 +506,7 @@ struct EmbeddingCandidate {
 }
 
 impl EmbeddingCandidate {
+    #[allow(clippy::too_many_arguments)] // Mirrors the persisted candidate fields.
     fn new(
         id: String,
         kind: String,
@@ -902,7 +903,73 @@ static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 enum EncoderModel {
     Candle(metal_candle::embeddings::EmbeddingModel),
     #[cfg(feature = "cuda")]
-    Cuda(fastembed::TextEmbedding),
+    Cuda(super::cuda_encoder::CudaEncoder),
+}
+
+struct QueryEncoder {
+    model: EncoderModel,
+    attestation: DeviceAttestation,
+    identity: SemanticIdentity,
+}
+
+fn encoder_identity(
+    model: &EncoderModel,
+    flags: BTreeMap<String, String>,
+) -> Result<SemanticIdentity> {
+    let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+    #[cfg(feature = "cuda")]
+    if let EncoderModel::Cuda(model) = model {
+        let assets = model.asset_identity();
+        let mut identity = identity;
+        let evidence = model.execution_evidence();
+        identity.flags.insert(
+            "cuda_tf32_disabled".into(),
+            evidence.tf32_disabled.to_string(),
+        );
+        identity.flags.insert(
+            "cuda_cpu_fallback_disabled".into(),
+            evidence.cpu_fallback_disabled.to_string(),
+        );
+        identity.flags.insert(
+            "cuda_execution_contract".into(),
+            "profiled-f32-compute-shape-only-cpu-v1:arena2g:batch-cap32".into(),
+        );
+        for (key, target) in [
+            ("model", &mut identity.model),
+            ("tokenizer", &mut identity.tokenizer),
+            ("model_files_digest", &mut identity.model_files_digest),
+            ("model_sha256", &mut identity.model_sha256),
+            ("tokenizer_sha256", &mut identity.tokenizer_sha256),
+            ("preprocessing_version", &mut identity.preprocessing_version),
+        ] {
+            *target = assets
+                .get(key)
+                .with_context(|| format!("CUDA encoder omits {key} identity"))?
+                .clone();
+        }
+        identity.validate()?;
+        return Ok(identity);
+    }
+    let _ = model;
+    Ok(identity)
+}
+
+fn validate_query_encoder(
+    attestation: &DeviceAttestation,
+    identity: &SemanticIdentity,
+    manifest: &GenerationManifest,
+) -> Result<()> {
+    anyhow::ensure!(
+        attestation.observed_device == manifest.device_attestation.observed_device
+            && attestation.backend == manifest.device_attestation.backend
+            && attestation.device_index == manifest.device_attestation.device_index,
+        "query encoder backend/provider/device differs from the active semantic generation; rebuild with the available backend"
+    );
+    anyhow::ensure!(
+        identity == &manifest.semantic_identity,
+        "query encoder model/tokenizer/runtime identity differs from the active semantic generation; rebuild required"
+    );
+    Ok(())
 }
 
 fn new_model() -> Result<EncoderModel> {
@@ -934,52 +1001,33 @@ fn new_model_with_config(
     if config.backend == EmbeddingBackend::Cuda {
         #[cfg(feature = "cuda")]
         {
-            let device_id = i32::try_from(config.cuda_device)
-                .context("CUDA device ordinal exceeds the supported i32 range")?;
-            let provider = ort::execution_providers::CUDA::default()
-                .with_device_id(device_id)
-                .build()
-                .error_on_failure();
-            let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
-                .with_execution_providers(vec![provider]);
-            let mut model = fastembed::TextEmbedding::try_new(options).map_err(|error| {
-                anyhow::anyhow!(
-                    "CUDA embedding provider/device initialization failed (device {}): {error}",
-                    config.cuda_device
-                )
-            })?;
-            let probe = model
-                .embed(["rna cuda provider probe"], Some(1))
-                .map_err(|error| {
+            let model =
+                super::cuda_encoder::CudaEncoder::new(config.cuda_device).map_err(|error| {
                     anyhow::anyhow!(
-                        "CUDA embedding provider probe failed on device {}: {error}",
+                        "CUDA embedding provider/device initialization failed (device {}): {error}",
                         config.cuda_device
                     )
                 })?;
-            if probe.len() != 1 || probe[0].len() != EMBEDDING_DIMENSION {
-                anyhow::bail!(
-                    "CUDA embedding probe returned unexpected shape; expected [1, {}]",
-                    EMBEDDING_DIMENSION
-                );
-            }
-            // This is the production encoder used by indexing and query.  Do
-            // not attest a separate raw ORT session: a successful inference
-            // through this exact fastembed session is the execution proof
-            // available at this abstraction boundary.  Provider registration
-            // uses error_on_failure(), so a CUDA provider initialization
-            // failure cannot be mistaken for verified CUDA execution.
-            anyhow::ensure!(
-                probe.iter().flatten().all(|value| value.is_finite()),
-                "CUDA production embedding returned non-finite values"
-            );
             let artifact_sha256 = generation::sha256_file(
                 &std::env::current_exe().context("failed to resolve running RNA artifact")?,
             )?;
+            let evidence = model.execution_evidence();
+            tracing::info!(
+                provider = %evidence.provider,
+                device_index = evidence.device_id,
+                precision = %evidence.precision,
+                tf32_disabled = evidence.tf32_disabled,
+                cpu_fallback_disabled = evidence.cpu_fallback_disabled,
+                cuda_operations = ?evidence.cuda_operations,
+                cpu_shape_operations = ?evidence.cpu_shape_operations,
+                profile_sha256 = %evidence.profile_sha256,
+                "production MiniLM CUDA execution verified"
+            );
             let attestation = DeviceAttestation {
                 required_device: "cuda".into(),
                 observed_device: "cuda".into(),
                 backend: "onnxruntime-cuda".into(),
-                device_index: Some(config.cuda_device),
+                device_index: Some(evidence.device_id),
                 artifact_sha256,
             };
             tracing::info!(
@@ -1177,7 +1225,7 @@ async fn embed_texts_with_model(
             }
             #[cfg(feature = "cuda")]
             EncoderModel::Cuda(model) => model
-                .embed(&batch, Some(bs))
+                .encode(batch, Some(bs))
                 .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?,
         };
 
@@ -1251,7 +1299,7 @@ pub struct EmbeddingIndex {
     require_metal: bool,
     embedding_config: EmbeddingConfig,
     resident_query_runtime: bool,
-    query_model: Arc<tokio::sync::Mutex<Option<EncoderModel>>>,
+    query_model: Arc<tokio::sync::Mutex<Option<QueryEncoder>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
@@ -1859,21 +1907,43 @@ impl EmbeddingIndex {
             crate::embed::config::EMBEDDING_PRECISION,
         );
         match self.active_generation_manifest() {
-            Some(manifest) => format!(
-                "{} effective_backend={} provider={} device_index={} precision={}",
-                config,
-                manifest.device_attestation.observed_device,
-                manifest.device_attestation.backend,
-                manifest
-                    .device_attestation
-                    .device_index
-                    .map_or_else(|| "none".to_string(), |n| n.to_string()),
-                manifest
-                    .semantic_identity
-                    .flags
-                    .get("embedding_precision")
-                    .map_or("unknown", String::as_str),
-            ),
+            Some(manifest) => {
+                let query_state = match self.query_model.try_lock() {
+                    Ok(runtime) => match runtime.as_ref() {
+                        Some(runtime)
+                            if validate_query_encoder(
+                                &runtime.attestation,
+                                &runtime.identity,
+                                &manifest,
+                            )
+                            .is_ok() =>
+                        {
+                            "verified"
+                        }
+                        Some(_) => "requires_reinitialization",
+                        None => "not_initialized",
+                    },
+                    Err(_) => "busy",
+                };
+                format!(
+                    "{} effective_backend={} provider={} device_index={} precision={} attestation_scope=generation query_encoder={} fallback_occurred={}",
+                    config,
+                    manifest.device_attestation.observed_device,
+                    manifest.device_attestation.backend,
+                    manifest
+                        .device_attestation
+                        .device_index
+                        .map_or_else(|| "none".to_string(), |n| n.to_string()),
+                    manifest
+                        .semantic_identity
+                        .flags
+                        .get("embedding_precision")
+                        .map_or("unknown", String::as_str),
+                    query_state,
+                    self.embedding_config.backend == EmbeddingBackend::Auto
+                        && manifest.device_attestation.observed_device == "cpu",
+                )
+            }
             None => format!("{} effective_backend=not_attested", config),
         }
     }
@@ -2059,7 +2129,8 @@ impl EmbeddingIndex {
 
     async fn initialized_query_model(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<EncoderModel>>> {
+        manifest: Option<&GenerationManifest>,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<QueryEncoder>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
         tracing::info!(
@@ -2067,10 +2138,29 @@ impl EmbeddingIndex {
             phase = "query_encoder_wait",
             elapsed_ms = wait_started.elapsed().as_secs_f64() * 1000.0
         );
+        if let (Some(cached), Some(manifest)) = (model.as_ref(), manifest)
+            && validate_query_encoder(&cached.attestation, &cached.identity, manifest).is_err()
+        {
+            // Publication can change providers/assets while a resident query
+            // encoder is cached. Never carry it into the new vector space.
+            *model = None;
+        }
         if model.is_none() {
             let init_started = std::time::Instant::now();
-            let (loaded, _) = new_model_with_config(&self.embedding_config, self.require_metal)?;
-            *model = Some(loaded);
+            let (loaded, attestation) =
+                new_model_with_config(&self.embedding_config, self.require_metal)?;
+            let flags = manifest
+                .map(|m| m.semantic_identity.flags.clone())
+                .unwrap_or_default();
+            let identity = encoder_identity(&loaded, flags)?;
+            if let Some(manifest) = manifest {
+                validate_query_encoder(&attestation, &identity, manifest)?;
+            }
+            *model = Some(QueryEncoder {
+                model: loaded,
+                attestation,
+                identity,
+            });
             tracing::info!(
                 target: "rna_query_timing",
                 phase = "query_encoder_initialization",
@@ -2081,7 +2171,8 @@ impl EmbeddingIndex {
     }
 
     async fn preload_query_model(&self) -> Result<()> {
-        drop(self.initialized_query_model().await?);
+        let manifest = self.active_generation_manifest();
+        drop(self.initialized_query_model(manifest.as_ref()).await?);
         Ok(())
     }
 
@@ -2089,12 +2180,16 @@ impl EmbeddingIndex {
         self.resident_query_runtime
     }
 
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let mut model = self.initialized_query_model().await?;
+    async fn embed_query(
+        &self,
+        query: &str,
+        manifest: Option<&GenerationManifest>,
+    ) -> Result<Vec<f32>> {
+        let mut model = self.initialized_query_model(manifest).await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
-                model.as_mut().expect("query model initialized above"),
+                &mut model.as_mut().expect("query model initialized above").model,
                 vec![query.to_string()],
                 self.embedding_config.batch_size,
             )
@@ -2826,7 +2921,7 @@ impl EmbeddingIndex {
                 .device_index
                 .map_or_else(|| "none".to_string(), |n| n.to_string()),
         );
-        let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        let identity = encoder_identity(&resolved_model, flags)?;
         if require_metal {
             generation::verify_runtime_encoder_assets()?;
         }
@@ -3852,6 +3947,7 @@ impl EmbeddingIndex {
         Ok(observed)
     }
 
+    #[allow(clippy::too_many_arguments)] // Preserve the existing search policy boundary.
     async fn search_with_filters_policy(
         &self,
         query: &str,
@@ -3876,6 +3972,7 @@ impl EmbeddingIndex {
             .outcome)
     }
 
+    #[allow(clippy::too_many_arguments)] // Observed counterpart of the same search boundary.
     async fn search_with_filters_policy_observed(
         &self,
         query: &str,
@@ -3886,7 +3983,16 @@ impl EmbeddingIndex {
         strict: bool,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        let table = match self.db().open_table(&self.table_name).execute().await {
+        // Pin the database and its vector-space identity in one snapshot.
+        // Publication during a query must not pair an old table with a new encoder.
+        let (db, manifest) = {
+            let active = self
+                .active_generation
+                .read()
+                .expect("embedding generation lock poisoned");
+            (active.db.clone(), active.manifest.clone())
+        };
+        let table = match db.open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -3948,7 +4054,7 @@ impl EmbeddingIndex {
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let mut search = table
                     .vector_search(query_embedding)
                     .context("Failed to create vector search")?
@@ -3972,7 +4078,7 @@ impl EmbeddingIndex {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
@@ -4156,7 +4262,7 @@ mod tests {
         validate_serving_generation_identity, validated_retrieval_score_column,
         verify_materialized_rows,
     };
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     use crate::embed::config::FallbackPolicy;
     use crate::embed::config::{EmbeddingBackend, EmbeddingConfig};
     use crate::embed::generation;
@@ -4217,38 +4323,35 @@ mod tests {
 
     #[test]
     fn stale_generation_is_rejected_for_serving_but_available_to_reconciliation() {
-        assert!(requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            true,
-            false,
-        ));
-        assert!(requires_active_generation_graph_validation(
-            GenerationOpenPurpose::ResidentServing,
-            true,
-            false,
-        ));
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Reconciliation,
-            true,
-            false,
-        ));
+        use GenerationOpenPurpose::{Reconciliation, ResidentServing, Serving};
 
-        // The exemption is not a general strict-open bypass.
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            true,
-            true,
-        ));
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            false,
-            false,
-        ));
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            true,
-            false,
-        ));
+        // Every purpose x Metal policy x active-generation combination.
+        let cases = [
+            (Serving, false, false, false),
+            (Serving, false, true, false),
+            (Serving, true, false, false),
+            (Serving, true, true, true),
+            (ResidentServing, false, false, false),
+            (ResidentServing, false, true, false),
+            (ResidentServing, true, false, false),
+            (ResidentServing, true, true, true),
+            (Reconciliation, false, false, false),
+            (Reconciliation, false, true, false),
+            (Reconciliation, true, false, false),
+            (Reconciliation, true, true, false),
+        ];
+
+        for (purpose, require_metal, has_active_generation, expected) in cases {
+            assert_eq!(
+                requires_active_generation_graph_validation(
+                    purpose,
+                    require_metal,
+                    has_active_generation,
+                ),
+                expected,
+                "purpose={purpose:?}, require_metal={require_metal}, has_active_generation={has_active_generation}",
+            );
+        }
     }
 
     #[test]
@@ -4824,6 +4927,116 @@ mod tests {
         );
     }
 
+    /// Publish synthetic embedding fixtures through the real persisted-graph
+    /// boundary. Use the production report builder to inventory these source-free
+    /// roots instead of manufacturing READY evidence. Refresh both graph and
+    /// report on every rebuild, including removals. Server scan orchestration
+    /// (including whether it invokes the report builder) is tested separately.
+    async fn index_persisted_embedding_fixture(
+        idx: &EmbeddingIndex,
+        repo_root: &std::path::Path,
+        nodes: &[crate::graph::Node],
+    ) -> usize {
+        use crate::lsp_completeness::{build_and_persist_report, load_readiness_check_with_graph};
+
+        // The production report binds to a real checkout HEAD. Keep this fixture
+        // source-free: create only an empty initial commit, never stage cache files.
+        {
+            let repo = if repo_root.join(".git").exists() {
+                git2::Repository::open(repo_root).expect("open fixture repository")
+            } else {
+                git2::Repository::init(repo_root).expect("initialize fixture repository")
+            };
+            match repo.head() {
+                Ok(head) => {
+                    head.peel_to_commit()
+                        .expect("fixture HEAD must name a commit");
+                }
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+                    ) =>
+                {
+                    assert!(
+                        repo.index().unwrap().is_empty(),
+                        "fixture must have no tracked files"
+                    );
+                    let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+                    let tree = repo.find_tree(tree_id).unwrap();
+                    let signature = git2::Signature::new(
+                        "RNA Fixture",
+                        "fixture@example.invalid",
+                        &git2::Time::new(1_700_000_000, 0),
+                    )
+                    .unwrap();
+                    repo.commit(
+                        Some("HEAD"),
+                        &signature,
+                        &signature,
+                        "Initialize empty embedding fixture",
+                        &tree,
+                        &[],
+                    )
+                    .expect("create empty fixture HEAD");
+                }
+                Err(error) => panic!("inspect fixture HEAD: {error}"),
+            }
+        }
+        let scan_started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            nodes
+                .iter()
+                .all(|node| !repo_root.join(&node.id.file).exists()),
+            "this helper's empty LSP inventory requires synthetic, source-free fixtures"
+        );
+        crate::server::persist_graph_to_lance(repo_root, nodes, &[])
+            .await
+            .expect("persist the embedding fixture graph");
+        let persisted = crate::server::load_graph_from_lance(repo_root)
+            .await
+            .expect("fresh-reopen the embedding fixture graph");
+        assert_eq!(
+            generation::target_graph_digest(&persisted.nodes).unwrap(),
+            generation::target_graph_digest(nodes).unwrap(),
+            "the persisted fixture must contain exactly this rebuild's nodes"
+        );
+        let business_context = crate::business_context::BusinessContextAdmission::default();
+        let report = build_and_persist_report(
+            repo_root,
+            business_context.mode(),
+            &persisted.nodes,
+            &persisted.edges,
+            &[],
+            &[],
+            scan_started_at_ms,
+        )
+        .expect("build readiness evidence from the actual fixture inventory");
+        assert!(
+            report.files.is_empty(),
+            "fixture unexpectedly contains source inventory"
+        );
+        let readiness = load_readiness_check_with_graph(
+            repo_root,
+            business_context.mode(),
+            &persisted.nodes,
+            &persisted.edges,
+        )
+        .unwrap();
+        assert!(readiness.ready, "{}", readiness.human_summary());
+        idx.index_all_with_persisted_graph_and_business_context(
+            repo_root,
+            &persisted.nodes,
+            &persisted.edges,
+            &business_context,
+        )
+        .await
+        .expect("publish embeddings against the fresh READY fixture graph")
+    }
+
     #[tokio::test]
     async fn has_table_returns_true_after_index_build() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
@@ -4855,10 +5068,7 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         };
-        let count = idx
-            .index_all_with_symbols(&repo_root, &[node])
-            .await
-            .unwrap();
+        let count = index_persisted_embedding_fixture(&idx, &repo_root, &[node]).await;
         assert!(count > 0, "should have indexed at least 1 item");
         // Table should now exist
         assert!(
@@ -5651,10 +5861,7 @@ mod tests {
             source: ExtractionSource::Markdown,
         };
 
-        let count = idx
-            .index_all_with_symbols(&repo_root, &[node])
-            .await
-            .unwrap();
+        let count = index_persisted_embedding_fixture(&idx, &repo_root, &[node]).await;
         assert!(count > 0, "should have indexed the .oh/ artifact node");
     }
 
@@ -5694,10 +5901,7 @@ mod tests {
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
 
         // First build: creates table
-        let count1 = idx
-            .index_all_with_symbols(&repo_root, &[node.clone()])
-            .await
-            .unwrap();
+        let count1 = index_persisted_embedding_fixture(&idx, &repo_root, &[node.clone()]).await;
         assert!(count1 > 0, "first build should index items");
         assert!(
             idx.has_table().await.unwrap(),
@@ -5705,10 +5909,7 @@ mod tests {
         );
 
         // Second build with same node: BLAKE3 hash skip means 0 newly embedded
-        let count2 = idx
-            .index_all_with_symbols(&repo_root, &[node])
-            .await
-            .unwrap();
+        let count2 = index_persisted_embedding_fixture(&idx, &repo_root, &[node]).await;
         assert_eq!(
             count2, 0,
             "second build should skip all unchanged nodes via BLAKE3 hash"
@@ -5766,18 +5967,13 @@ mod tests {
         let node_b_id = node_b.stable_id();
 
         // Build with both nodes
-        let count1 = idx
-            .index_all_with_symbols(&repo_root, &[node_a.clone(), node_b])
-            .await
-            .unwrap();
+        let count1 =
+            index_persisted_embedding_fixture(&idx, &repo_root, &[node_a.clone(), node_b]).await;
         assert!(count1 > 0);
 
         // Rebuild with only node_a -- node_b should be cleaned up.
         // count2 is 0 because node_a is unchanged (BLAKE3 hash hit).
-        let count2 = idx
-            .index_all_with_symbols(&repo_root, &[node_a])
-            .await
-            .unwrap();
+        let count2 = index_persisted_embedding_fixture(&idx, &repo_root, &[node_a]).await;
         assert_eq!(count2, 0, "node_a unchanged, should skip via BLAKE3 hash");
 
         // Verify stale row is truly gone by querying text hashes for node_b
@@ -5843,10 +6039,7 @@ mod tests {
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
 
         // First build: creates table
-        let count1 = idx
-            .index_all_with_symbols(&repo_root, &[node_v1])
-            .await
-            .unwrap();
+        let count1 = index_persisted_embedding_fixture(&idx, &repo_root, &[node_v1]).await;
         assert!(count1 > 0, "first build should index items");
         assert!(
             idx.has_table().await.unwrap(),
@@ -5855,10 +6048,7 @@ mod tests {
 
         // Second build with enriched node: body changed so BLAKE3 hash differs,
         // must re-embed. Before fix #332 this failed with merge_insert error.
-        let count2 = idx
-            .index_all_with_symbols(&repo_root, &[node_v2])
-            .await
-            .unwrap();
+        let count2 = index_persisted_embedding_fixture(&idx, &repo_root, &[node_v2]).await;
         assert!(
             count2 > 0,
             "enrichment re-embed should re-index changed node"
@@ -6205,11 +6395,6 @@ mod tests {
         );
     }
 
-    /// Adversarial: has_score_col must be detected from ANY batch, not just the first.
-    ///
-    /// When the first batch is missing required columns (and gets skipped), later
-    /// batches may have _score. has_score_col must still be true so they use the
-    /// correct scoring branch.
     // ── #599: unified node embedding helpers ──────────────────────────────
 
     fn make_test_node(
@@ -6435,7 +6620,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     #[test]
     fn auto_error_does_not_require_compiled_cuda_backend() {
         let config = EmbeddingConfig {
@@ -6453,20 +6638,63 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    #[test]
+    #[tokio::test]
     #[ignore = "requires a CUDA runtime and downloads the production embedding model"]
-    fn production_fastembed_cuda_session_is_attested_after_inference() {
+    async fn production_cuda_session_is_attested_after_inference() {
         let config = EmbeddingConfig {
             backend: EmbeddingBackend::Cuda,
             ..Default::default()
         };
-        let (model, attestation) = super::new_model_with_config(&config, false)
-            .expect("production fastembed CUDA session should initialize and embed");
-        assert!(matches!(model, super::EncoderModel::Cuda(_)));
+        let (mut model, attestation) = super::new_model_with_config(&config, false)
+            .expect("production CUDA session should initialize and embed");
+        let super::EncoderModel::Cuda(encoder) = &model else {
+            panic!("explicit CUDA returned a different encoder");
+        };
+        println!("production execution: {:?}", encoder.execution_evidence());
+        let identity = super::encoder_identity(&model, BTreeMap::new()).unwrap();
+        println!(
+            "production assets: {} {} {}",
+            identity.model, identity.model_sha256, identity.tokenizer_sha256
+        );
+        assert_eq!(identity.model, "Qdrant/all-MiniLM-L6-v2-onnx");
+        assert_eq!(identity.model_sha256.len(), 64);
+        assert_eq!(identity.tokenizer_sha256.len(), 64);
         assert_eq!(attestation.required_device, "cuda");
         assert_eq!(attestation.observed_device, "cuda");
         assert_eq!(attestation.backend, "onnxruntime-cuda");
         assert_eq!(attestation.device_index, Some(config.cuda_device));
+
+        use crate::extract::Extractor;
+        let path = std::path::Path::new("src/embed/config.rs");
+        let source =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+                .unwrap();
+        let extracted = crate::extract::rust::RustExtractor::new()
+            .extract(path, &source)
+            .unwrap();
+        let canonical_inputs: Vec<_> = extracted
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.id.kind == crate::graph::NodeKind::Function
+                    && !node.metadata.contains_key("is_test")
+            })
+            .map(super::node_embedding_text)
+            .collect();
+        assert!(!canonical_inputs.is_empty());
+        let vectors = super::embed_texts_with_model(&mut model, canonical_inputs.clone(), Some(8))
+            .await
+            .unwrap();
+        assert_eq!(vectors.len(), canonical_inputs.len());
+        for vector in &vectors {
+            assert_eq!(vector.len(), super::EMBEDDING_DIMENSION);
+            assert!(vector.iter().all(|v| v.is_finite()));
+        }
+        println!(
+            "canonical RNA source vectors: {} x {}",
+            vectors.len(),
+            super::EMBEDDING_DIMENSION
+        );
     }
 
     #[test]
@@ -6486,6 +6714,46 @@ mod tests {
         }
         let error = validate_serving_generation_identity(&config, &manifest).unwrap_err();
         assert!(error.to_string().contains("requires CUDA device 0"));
+    }
+
+    #[test]
+    fn query_encoder_rejects_provider_transitions_and_changed_assets() {
+        let cpu = manifest_for_serving_test("cpu", "candle-cpu", None);
+        let cuda = manifest_for_serving_test("cuda", "onnxruntime-cuda", Some(0));
+        for (cached, active) in [(&cpu, &cuda), (&cuda, &cpu)] {
+            assert!(
+                super::validate_query_encoder(
+                    &cached.device_attestation,
+                    &cached.semantic_identity,
+                    active,
+                )
+                .is_err()
+            );
+        }
+        super::validate_query_encoder(&cuda.device_attestation, &cuda.semantic_identity, &cuda)
+            .unwrap();
+        for field in ["model", "tokenizer", "pipeline"] {
+            let mut identity = cuda.semantic_identity.clone();
+            match field {
+                "model" => identity.model_sha256 = generation::sha256_bytes(b"changed model bytes"),
+                "tokenizer" => {
+                    identity.tokenizer_sha256 = generation::sha256_bytes(b"changed tokenizer bytes")
+                }
+                _ => identity.preprocessing_version.push_str("-changed"),
+            }
+            assert!(
+                super::validate_query_encoder(&cuda.device_attestation, &identity, &cuda).is_err()
+            );
+            assert_ne!(
+                identity.digest().unwrap(),
+                cuda.semantic_identity.digest().unwrap()
+            );
+        }
+        let mut wrong_device = cuda.device_attestation.clone();
+        wrong_device.device_index = Some(1);
+        assert!(
+            super::validate_query_encoder(&wrong_device, &cuda.semantic_identity, &cuda).is_err()
+        );
     }
 
     #[test]

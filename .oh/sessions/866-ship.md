@@ -60,3 +60,28 @@ client smoke passed against the exact-head binary and disposable fixture,
 including readiness/status via `list_roots`. CI lint, test, audit, Analyze,
 changes, checklist, and CodeRabbit checks are green; smoke/build-release remain
 skipped by workflow policy.
+
+### September 6 remediation (supersedes earlier attestation claims)
+
+The earlier finite-output fastembed probe did not establish execution placement.
+The CUDA encoder now owns and profiles the retained ORT session, observes CUDA
+output allocation, rejects CPU floating computation, and hashes the actual ONNX
+and tokenizer assets. Query initialization validates effective identity against
+the pinned generation, including provider transitions and changed asset bytes.
+
+The contradictory readiness test was replaced with exhaustive truth-table cases;
+the non-CUDA auto/error test now excludes Metal builds. Embedding test fixtures
+persist real graphs and completeness reports. Default MCP context now persists
+the report required before generation publication when embeddings are requested.
+
+Validation: full CUDA-feature suite passed (2636 library, 11 binary, 5 business
+context, 2 CLI, 1 smoke-contract tests; 6 library and 14 doc tests ignored).
+The ignored hardware test separately passed with nine canonical source inputs,
+finite 384-dimensional output and production-session CUDA kernel evidence.
+Standard CUDA Clippy with warnings denied passed. The broader all-targets Clippy
+check exposed existing test-only lint debt and is not claimed green.
+
+Development SDK MCP startup/search/root reporting was verified with business
+context disabled; default-context rerun is pending. Exact-head CI artifact,
+artifact-based MCP delivery, comment sweep and a fresh final reviewer are still
+required. No merge or release-install success is claimed by these local checks.

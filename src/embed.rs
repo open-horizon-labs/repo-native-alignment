@@ -5,6 +5,8 @@ mod real;
 #[cfg(feature = "embeddings")]
 pub mod config;
 
+#[cfg(feature = "cuda")]
+mod cuda_encoder;
 #[path = "embed/generation.rs"]
 pub mod generation;
 

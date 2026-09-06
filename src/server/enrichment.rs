@@ -1954,8 +1954,13 @@ impl RnaHandler {
             } else {
                 lsp_job_id.iter().cloned().collect::<Vec<_>>()
             };
-            self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-                .await?;
+            self.persist_foreground_lsp_completeness(
+                &[],
+                &lsp_related_job_ids,
+                scan_started_at_ms,
+                enrichment.runs_embeddings(),
+            )
+            .await?;
 
             let (embed_count, embed_time, embed_job_id) = if enrichment.runs_embeddings() {
                 let (encoded, elapsed, job_id) = self
@@ -2522,8 +2527,13 @@ impl RnaHandler {
         } else {
             incremental_lsp_job_id.iter().cloned().collect::<Vec<_>>()
         };
-        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-            .await?;
+        self.persist_foreground_lsp_completeness(
+            &[],
+            &lsp_related_job_ids,
+            scan_started_at_ms,
+            enrichment.runs_embeddings(),
+        )
+        .await?;
 
         if enrichment.runs_lsp() && enrichment.runs_embeddings() {
             if !lsp_stage_completed {
@@ -3017,8 +3027,13 @@ impl RnaHandler {
         let persist_time = persist_started.elapsed();
 
         let lsp_related_job_ids = lsp_job_id.iter().cloned().collect::<Vec<_>>();
-        self.persist_foreground_lsp_completeness(&[], &lsp_related_job_ids, scan_started_at_ms)
-            .await?;
+        self.persist_foreground_lsp_completeness(
+            &[],
+            &lsp_related_job_ids,
+            scan_started_at_ms,
+            enrichment.runs_embeddings(),
+        )
+        .await?;
 
         if enrichment.runs_lsp() && enrichment.runs_embeddings() {
             if !lsp_stage_completed {
@@ -3737,13 +3752,18 @@ impl RnaHandler {
     /// not bind its vectors to the report for the graph it was about to consume.
     /// Writing the report immediately after structural persistence makes the same
     /// fresh graph snapshot authoritative for both readiness and embeddings.
+    /// Default-context embeddings need the same report; default-context scans
+    /// without embeddings retain their existing report-free behavior.
     async fn persist_foreground_lsp_completeness(
         &self,
         lsp_entries: &[crate::extract::scan_stats::LspEnrichmentEntry],
         related_job_ids: &[String],
         scan_started_at_ms: u64,
+        embeddings_requested: bool,
     ) -> anyhow::Result<()> {
-        if !self.business_context.mode().is_disabled() {
+        if !self.business_context.mode().is_disabled()
+            && !(embeddings_requested && cfg!(feature = "embeddings"))
+        {
             return Ok(());
         }
         let reopened = load_graph_from_lance(&self.repo_root)
@@ -3944,7 +3964,8 @@ impl RnaHandler {
                     self.record_embedding_job_failure(&job_id, &error);
                     return Err(error);
                 }
-                self.embed_status.set_runtime_diagnostic(index.runtime_diagnostic());
+                self.embed_status
+                    .set_runtime_diagnostic(index.runtime_diagnostic());
                 self.embed_index.store(Arc::new(Some(index)));
                 self.enrichment_jobs.mark_completed(
                     &self.repo_root,
@@ -4179,7 +4200,8 @@ impl RnaHandler {
                     self.record_embedding_job_failure(&job_id, &error);
                     return Err(error);
                 }
-                self.embed_status.set_runtime_diagnostic(idx.runtime_diagnostic());
+                self.embed_status
+                    .set_runtime_diagnostic(idx.runtime_diagnostic());
                 self.embed_index.store(Arc::new(Some(idx)));
                 self.enrichment_jobs
                     .mark_completed(&self.repo_root, &job_id, count, count);

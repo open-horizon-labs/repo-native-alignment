@@ -435,7 +435,7 @@ fn embedding_runtime_line(repo_root: &Path) -> String {
         Ok(config) => {
             let observed = match crate::embed::generation::load_current_generation(repo_root) {
                 Ok(Some((_, manifest, _, _))) => format!(
-                    "effective_backend={} provider={} device_index={} precision={}",
+                    "effective_backend={} provider={} device_index={} precision={} attestation_scope=published_generation fallback_occurred={}",
                     manifest.device_attestation.observed_device,
                     manifest.device_attestation.backend,
                     manifest
@@ -447,6 +447,8 @@ fn embedding_runtime_line(repo_root: &Path) -> String {
                         .flags
                         .get("embedding_precision")
                         .map_or("unknown", String::as_str),
+                    config.backend == crate::embed::config::EmbeddingBackend::Auto
+                        && manifest.device_attestation.observed_device == "cpu",
                 ),
                 Ok(None) => "effective_backend=not_attested".to_string(),
                 Err(error) => format!("effective_backend=not_attested attestation_error={error}"),
