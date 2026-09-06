@@ -23,4 +23,9 @@ exclude = [".omp/", "data/", "*.log"]   # added to defaults
 include = ["vendor/"]                     # opt back into something excluded by default
 ```
 
+Directory and file patterns containing `/` are relative to the repository root,
+so `generated/schema/` excludes only that subtree. Unqualified directory names
+such as `data/` match that component at any depth, and unqualified filenames
+such as `config.schema.json` match at any depth.
+
 Default excludes: `node_modules/`, `.venv/`, `target/`, `build/`, `__pycache__/`, `.git/`, `.claude/`, `.omp/`, `dist/`, `vendor/`, `.build/`, `.cache/`

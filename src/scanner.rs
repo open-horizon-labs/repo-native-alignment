@@ -1332,8 +1332,14 @@ fn is_file_excluded(pattern: &str, path: &str) -> bool {
         return path.ends_with(suffix);
     }
     if let Some(dirname) = pattern.strip_suffix('/') {
-        // Directory pattern: check if any path component matches
+        if dirname.contains('/') {
+            return path == dirname || path.starts_with(&format!("{dirname}/"));
+        }
+        // Unqualified directory pattern: check if any path component matches.
         return dir_component_matches(dirname, path);
+    }
+    if pattern.contains('/') {
+        return path == pattern;
     }
     // Exact filename match against last component
     if let Some(filename) = path.rsplit('/').next() {
@@ -1345,6 +1351,9 @@ fn is_file_excluded(pattern: &str, path: &str) -> bool {
 /// Check if a directory path matches an exclude pattern.
 fn is_dir_excluded(pattern: &str, dir_path: &str) -> bool {
     if let Some(dirname) = pattern.strip_suffix('/') {
+        if dirname.contains('/') {
+            return dir_path == dirname || dir_path.starts_with(&format!("{dirname}/"));
+        }
         return dir_component_matches(dirname, dir_path);
     }
     false
@@ -1475,6 +1484,30 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn test_exclude_repository_relative_paths() {
+        assert!(is_dir_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "codex-rs/app-server-protocol/schema"
+        ));
+        assert!(is_file_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "codex-rs/app-server-protocol/schema/json/ClientRequest.json"
+        ));
+        assert!(!is_file_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "other/schema/source.json"
+        ));
+        assert!(is_file_excluded(
+            "codex-rs/core/config.schema.json",
+            "codex-rs/core/config.schema.json"
+        ));
+        assert!(!is_file_excluded(
+            "codex-rs/core/config.schema.json",
+            "other/config.schema.json"
+        ));
     }
 
     #[test]
