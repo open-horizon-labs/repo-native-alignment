@@ -1370,15 +1370,19 @@ impl ExcludePattern {
         if let Some(suffix) = pattern.strip_prefix('*') {
             return ExcludePattern::Suffix(suffix.to_string());
         }
-        if let Some(dirname) = pattern.strip_suffix('/') {
-            return ExcludePattern::Dir(dirname.to_string());
+        if pattern.ends_with('/') {
+            return ExcludePattern::Dir(pattern.trim_end_matches('/').to_string());
         }
         ExcludePattern::Name(pattern.to_string())
     }
 
-    /// True when the pattern can never match anything (e.g. `/` or `./`).
+    /// True when the pattern can never match anything (e.g. `/`, `./`, `//`).
     fn is_empty(&self) -> bool {
-        matches!(self, ExcludePattern::Scoped { components, .. } if components.is_empty())
+        match self {
+            ExcludePattern::Scoped { components, .. } => components.is_empty(),
+            ExcludePattern::Dir(dirname) => dirname.is_empty() || dirname == ".",
+            _ => false,
+        }
     }
 
     fn matches_file(&self, path: &str) -> bool {
@@ -1749,7 +1753,7 @@ mod tests {
     fn test_empty_scoped_pattern_never_matches() {
         for pattern in ["/", "./", "//", ".//"] {
             let parsed = ExcludePattern::parse(pattern);
-            assert!(parsed.is_empty() || matches!(parsed, ExcludePattern::Dir(_)));
+            assert!(parsed.is_empty(), "{pattern:?} parsed as {parsed:?}");
             assert!(
                 !is_dir_excluded(pattern, "gen"),
                 "{pattern:?} must not exclude everything"
