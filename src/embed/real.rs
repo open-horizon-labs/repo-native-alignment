@@ -1,3 +1,4 @@
+use super::execution::{Backend, ExecutionIdentity, Policy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -504,6 +505,7 @@ struct EmbeddingCandidate {
 }
 
 impl EmbeddingCandidate {
+    #[allow(clippy::too_many_arguments)] // Mirrors the persisted candidate fields.
     fn new(
         id: String,
         kind: String,
@@ -897,28 +899,140 @@ fn node_scalar_filters(
 // HuggingFace cache lock contention when tests call `new_model()` in parallel.
 static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
+struct EncoderModel {
+    inner: EncoderBackend,
+    execution: ExecutionIdentity,
+}
+
+enum EncoderBackend {
+    #[cfg(feature = "openvino")]
+    OpenVino(fastembed::TextEmbedding),
+    Metal(metal_candle::embeddings::EmbeddingModel),
+}
+
+impl EncoderModel {
+    fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        match &mut self.inner {
+            #[cfg(feature = "openvino")]
+            EncoderBackend::OpenVino(model) => {
+                model.embed(texts, None)
+            }
+            EncoderBackend::Metal(model) => model
+                .encode(texts)
+                .map_err(|e| anyhow::anyhow!("Embedding failed: {e}"))?
+                .to_vec2::<f32>()
+                .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {e}")),
+        }
+    }
+}
+
+fn new_model() -> Result<EncoderModel> {
     new_model_with_policy(false).map(|(model, _)| model)
 }
 
-fn new_model_with_policy(
+#[cfg(feature = "openvino")]
+fn canonical_readiness_probe() -> String {
+    let node = crate::graph::Node {
+        id: crate::graph::NodeId {
+            root: "readiness".into(),
+            file: "src/readiness.rs".into(),
+            name: "embedding_readiness".into(),
+            kind: crate::graph::NodeKind::Function,
+        },
+        language: "rust".into(),
+        signature: "fn embedding_readiness() -> bool".into(),
+        line_start: 1,
+        line_end: 1,
+        body: "fn embedding_readiness() -> bool { true }".into(),
+        metadata: BTreeMap::new(),
+        source: crate::graph::ExtractionSource::TreeSitter,
+    };
+    node_embedding_text(&node)
+}
+
+fn new_model_with_policy(require_metal: bool) -> Result<(EncoderModel, DeviceAttestation)> {
+    let policy = Policy::from_env(require_metal)?;
+    match policy.backend {
+        Backend::Auto => new_candle_model(require_metal, false, policy, None),
+        Backend::Cpu => new_candle_model(false, true, policy, None),
+        Backend::OpenVino => policy.openvino_or_fallback(
+            || new_openvino_model(policy),
+            |reason| {
+                tracing::warn!(%reason, "OpenVINO unavailable; applying configured CPU fallback");
+                new_candle_model(false, true, policy, Some(&reason))
+            },
+        ),
+    }
+}
+
+#[cfg(not(feature = "openvino"))]
+fn new_openvino_model(_policy: Policy) -> Result<(EncoderModel, DeviceAttestation)> {
+    anyhow::bail!("OpenVINO requires an artifact built with the `openvino` feature")
+}
+
+#[cfg(feature = "openvino")]
+fn new_openvino_model(policy: Policy) -> Result<(EncoderModel, DeviceAttestation)> {
+    let _guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
+    let loaded = super::openvino::load(&canonical_readiness_probe())?;
+    let artifact = std::env::current_exe().context("failed to resolve running RNA artifact")?;
+    let attestation = DeviceAttestation {
+        required_device: "openvino".to_string(),
+        observed_device: loaded.device,
+        backend: "onnxruntime-openvino".to_string(),
+        device_index: Some(0),
+        artifact_sha256: generation::sha256_file(&artifact)?,
+    };
+    let mut execution = ExecutionIdentity::new(policy, &attestation, None);
+    execution.assets = Some(loaded.assets);
+    execution
+        .flags
+        .insert("encoder_runtime_digest".into(), loaded.runtime_digest);
+    execution
+        .flags
+        .insert("encoder_runtime_version".into(), loaded.version);
+    execution
+        .flags
+        .insert("encoder_device_id".into(), "GPU.0".into());
+    execution.flags.insert(
+        "encoder_precision".into(),
+        super::openvino::PRECISION.into(),
+    );
+    tracing::info!(device = %attestation.observed_device, execution = ?execution.flags, "OpenVINO MiniLM ready");
+    Ok((
+        EncoderModel {
+            inner: EncoderBackend::OpenVino(loaded.model),
+            execution,
+        },
+        attestation,
+    ))
+}
+
+fn new_candle_model(
     require_metal: bool,
-) -> Result<(metal_candle::embeddings::EmbeddingModel, DeviceAttestation)> {
+    force_cpu: bool,
+    policy: Policy,
+    fallback: Option<&str>,
+) -> Result<(EncoderModel, DeviceAttestation)> {
     let start = std::time::Instant::now();
 
     #[cfg(feature = "metal")]
-    let device = match candle_core::Device::new_metal(0) {
-        Ok(device) => device,
-        Err(error) if require_metal => {
-            anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
-        }
-        Err(_) => {
-            tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
-            candle_core::Device::Cpu
+    let device = if force_cpu {
+        candle_core::Device::Cpu
+    } else {
+        match candle_core::Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) if require_metal => {
+                anyhow::bail!("strict embedding execution requires Metal device 0: {error}")
+            }
+            Err(_) => {
+                tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+                candle_core::Device::Cpu
+            }
         }
     };
     #[cfg(not(feature = "metal"))]
     let device = {
+        let _ = force_cpu;
         if require_metal {
             anyhow::bail!(
                 "strict embedding execution requires an artifact built with the `metal` feature"
@@ -978,7 +1092,14 @@ fn new_model_with_policy(
                 m.dimension(),
                 start.elapsed()
             );
-            Ok((m, attestation))
+            let execution = ExecutionIdentity::new(policy, &attestation, fallback);
+            Ok((
+                EncoderModel {
+                    inner: EncoderBackend::Metal(m),
+                    execution,
+                },
+                attestation,
+            ))
         }
         Err(err) => {
             tracing::warn!(
@@ -1019,36 +1140,15 @@ pub fn require_metal_device() -> Result<DeviceAttestation> {
     }
 }
 
-fn attest_available_device(require_metal: bool) -> Result<DeviceAttestation> {
-    if require_metal {
-        return require_metal_device();
-    }
-    #[cfg(feature = "metal")]
-    if let Ok(attestation) = require_metal_device() {
-        return Ok(DeviceAttestation {
-            required_device: "any".to_string(),
-            ..attestation
-        });
-    }
-    let executable = std::env::current_exe().context("failed to resolve running RNA artifact")?;
-    Ok(DeviceAttestation {
-        required_device: "any".to_string(),
-        observed_device: "cpu".to_string(),
-        backend: "candle-cpu".to_string(),
-        device_index: None,
-        artifact_sha256: generation::sha256_file(&executable)?,
-    })
-}
-
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    let model = new_model()?;
-    embed_texts_with_model(&model, texts).await
+    let mut model = new_model()?;
+    embed_texts_with_model(&mut model, texts).await
 }
 
 /// Embed texts using a pre-loaded model. Avoids repeated model initialization
 /// when called in a loop (e.g., streaming batch writes in index_all_inner).
 async fn embed_texts_with_model(
-    model: &metal_candle::embeddings::EmbeddingModel,
+    model: &mut EncoderModel,
     texts: Vec<String>,
 ) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
@@ -1080,12 +1180,7 @@ async fn embed_texts_with_model(
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
-        let tensor = model
-            .encode(&refs)
-            .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
-        let batch_embeddings: Vec<Vec<f32>> = tensor
-            .to_vec2::<f32>()
-            .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
+        let batch_embeddings = model.encode(&refs)?;
 
         let elapsed_secs = batch_start.elapsed().as_secs_f64();
         let per_item = elapsed_secs / bs as f64;
@@ -1153,7 +1248,7 @@ pub struct EmbeddingIndex {
     repo_root: Arc<PathBuf>,
     require_metal: bool,
     resident_query_runtime: bool,
-    query_model: Arc<tokio::sync::Mutex<Option<metal_candle::embeddings::EmbeddingModel>>>,
+    query_model: Arc<tokio::sync::Mutex<Option<EncoderModel>>>,
     _unpublished_scratch: Option<Arc<UnpublishedScratchRoot>>,
 }
 
@@ -1229,9 +1324,7 @@ fn generation_business_context_mode(
         .semantic_identity
         .flags
         .get("business_context_mode")
-        .ok_or_else(|| {
-            anyhow::anyhow!("semantic generation omits business_context_mode identity")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("semantic generation omits business_context_mode identity"))?
         .parse()
         .context("semantic generation has an invalid business_context_mode identity")
 }
@@ -1846,7 +1939,8 @@ impl EmbeddingIndex {
 
     async fn initialized_query_model(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<metal_candle::embeddings::EmbeddingModel>>> {
+        manifest: Option<&GenerationManifest>,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<EncoderModel>>> {
         let wait_started = std::time::Instant::now();
         let mut model = self.query_model.lock().await;
         tracing::info!(
@@ -1854,7 +1948,14 @@ impl EmbeddingIndex {
             phase = "query_encoder_wait",
             elapsed_ms = wait_started.elapsed().as_secs_f64() * 1000.0
         );
-        if model.is_none() {
+        let stale = match (model.as_ref(), manifest) {
+            (Some(model), Some(manifest)) => model
+                .execution
+                .validate_query(&manifest.semantic_identity)
+                .is_err(),
+            _ => false,
+        };
+        if model.is_none() || stale {
             let init_started = std::time::Instant::now();
             let (loaded, _) = new_model_with_policy(self.require_metal)?;
             *model = Some(loaded);
@@ -1864,11 +1965,19 @@ impl EmbeddingIndex {
                 elapsed_ms = init_started.elapsed().as_secs_f64() * 1000.0
             );
         }
+        if let Some(manifest) = manifest {
+            model
+                .as_ref()
+                .expect("query model initialized")
+                .execution
+                .validate_query(&manifest.semantic_identity)?;
+        }
         Ok(model)
     }
 
     async fn preload_query_model(&self) -> Result<()> {
-        drop(self.initialized_query_model().await?);
+        let manifest = self.active_generation_manifest();
+        drop(self.initialized_query_model(manifest.as_ref()).await?);
         Ok(())
     }
 
@@ -1876,12 +1985,16 @@ impl EmbeddingIndex {
         self.resident_query_runtime
     }
 
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let model = self.initialized_query_model().await?;
+    async fn embed_query(
+        &self,
+        query: &str,
+        manifest: Option<&GenerationManifest>,
+    ) -> Result<Vec<f32>> {
+        let mut model = self.initialized_query_model(manifest).await?;
         let encoding_started = std::time::Instant::now();
         let embedding = single_query_embedding(
             embed_texts_with_model(
-                model.as_ref().expect("query model initialized above"),
+                model.as_mut().expect("query model initialized above"),
                 vec![query.to_string()],
             )
             .await?,
@@ -2589,7 +2702,11 @@ impl EmbeddingIndex {
                 .map(|contract| contract.structural_graph_snapshot_digest.clone())
                 .unwrap_or_else(|| target_graph_digest.clone())
         };
-        let identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        // Probe before reuse and retain this instance: fallback and asset loading
+        // cannot select different execution inputs after the identity decision.
+        let (mut model, device_attestation) = new_model_with_policy(require_metal)?;
+        let mut identity = SemanticIdentity::for_current_process(EMBEDDING_DIMENSION, flags)?;
+        model.execution.apply(&mut identity)?;
         if require_metal {
             generation::verify_runtime_encoder_assets()?;
         }
@@ -2721,14 +2838,11 @@ impl EmbeddingIndex {
             purged_rows = purged_row_count,
             "EmbeddingIndex: value-addressed vector plan"
         );
-        let mut device_attestation = attest_available_device(require_metal)?;
         if !encoder_inputs.is_empty() {
-            let (model, observed_attestation) = new_model_with_policy(require_metal)?;
-            device_attestation = observed_attestation;
             const ENCODE_BATCH_SIZE: usize = 2048;
             for batch in encoder_inputs.chunks(ENCODE_BATCH_SIZE) {
                 let output = embed_texts_with_model(
-                    &model,
+                    &mut model,
                     batch.iter().map(|input| input.text.to_string()).collect(),
                 )
                 .await?;
@@ -3230,7 +3344,7 @@ impl EmbeddingIndex {
 
             // Load model once and reuse across all write batches to avoid
             // repeated heavyweight model initialization.
-            let model = new_model()?;
+            let mut model = new_model()?;
             let mut remaining = to_embed;
             let mut batch_idx = 0usize;
 
@@ -3240,7 +3354,7 @@ impl EmbeddingIndex {
 
                 let batch_texts: Vec<String> =
                     batch_candidates.iter().map(|c| c.text.clone()).collect();
-                let embeddings = embed_texts_with_model(&model, batch_texts).await?;
+                let embeddings = embed_texts_with_model(&mut model, batch_texts).await?;
 
                 if embeddings.is_empty() {
                     continue;
@@ -3615,6 +3729,7 @@ impl EmbeddingIndex {
         Ok(observed)
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing search filter API boundary.
     async fn search_with_filters_policy(
         &self,
         query: &str,
@@ -3639,6 +3754,7 @@ impl EmbeddingIndex {
             .outcome)
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing search filter API boundary.
     async fn search_with_filters_policy_observed(
         &self,
         query: &str,
@@ -3649,7 +3765,15 @@ impl EmbeddingIndex {
         strict: bool,
         test_policy: TestResultPolicy,
     ) -> Result<ObservedSearchOutcome> {
-        let table = match self.db().open_table(&self.table_name).execute().await {
+        // Bind the query encoder to the same publication as the serving table.
+        let (db, manifest) = {
+            let active = self
+                .active_generation
+                .read()
+                .expect("embedding generation lock poisoned");
+            (active.db.clone(), active.manifest.clone())
+        };
+        let table = match db.open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -3711,7 +3835,7 @@ impl EmbeddingIndex {
             }
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let mut search = table
                     .vector_search(query_embedding)
                     .context("Failed to create vector search")?
@@ -3735,7 +3859,7 @@ impl EmbeddingIndex {
                 // Hybrid: BM25 + vector with RRF fusion.
                 // LanceDB automatically detects both FTS and vector on VectorQuery
                 // and routes through execute_hybrid with RRF reranking.
-                let query_embedding = self.embed_query(query).await?;
+                let query_embedding = self.embed_query(query, manifest.as_ref()).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
                 let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
@@ -3977,39 +4101,27 @@ mod tests {
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             true,
-            false,
             true,
         ));
         assert!(requires_active_generation_graph_validation(
             GenerationOpenPurpose::ResidentServing,
             true,
-            false,
             true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Reconciliation,
             true,
-            false,
             true,
         ));
 
-        // The exemption is not a general strict-open bypass.
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
-            true,
-            true,
-            true,
-        ));
-        assert!(!requires_active_generation_graph_validation(
-            GenerationOpenPurpose::Serving,
-            false,
             false,
             true,
         ));
         assert!(!requires_active_generation_graph_validation(
             GenerationOpenPurpose::Serving,
             true,
-            false,
             false,
         ));
     }
@@ -6137,5 +6249,95 @@ mod tests {
             text.chars().count() <= 500,
             "markdown section should be truncated to 500 chars"
         );
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    #[ignore = "requires an OpenVINO-enabled ORT runtime, Intel Arc GPU.0 and model assets"]
+    fn openvino_gpu_embedding_probe_uses_intel_gpu_zero() {
+        assert_eq!(
+            super::Policy::from_env(false).unwrap().backend,
+            super::Backend::OpenVino,
+            "set RNA_EMBEDDING_BACKEND=openvino for hardware verification"
+        );
+        let (mut model, attestation) = super::new_model_with_policy(false).unwrap();
+        let extracted = crate::extract::ExtractorRegistry::with_builtins().extract_file(
+            std::path::Path::new("src/embed/execution.rs"),
+            include_str!("execution.rs"),
+        );
+        let node = extracted
+            .nodes
+            .iter()
+            .find(|node| node.id.kind == crate::graph::NodeKind::Function)
+            .expect("real execution source must yield a function");
+        let canonical = super::node_embedding_text(node);
+        eprintln!(
+            "Canonical production node: {} ({} bytes)",
+            node.id,
+            canonical.len()
+        );
+        let embeddings = model.encode(&[&canonical]).unwrap();
+        let (_, second_attestation) = super::new_model_with_policy(false).unwrap();
+        assert_eq!(attestation.backend, "onnxruntime-openvino");
+        assert!(attestation.observed_device.contains("Intel"));
+        assert!(attestation.observed_device.contains("Arc"));
+        assert_eq!(model.execution.flags["encoder_device_id"], "GPU.0");
+        eprintln!("OpenVINO hardware evidence: {:?}", model.execution.flags);
+        assert_eq!(second_attestation.backend, "onnxruntime-openvino");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), EMBEDDING_DIMENSION);
+        assert!(embeddings[0].iter().all(|value| value.is_finite()));
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn openvino_missing_runtime_fails_within_deadline() {
+        const CHILD: &str = "RNA_TEST_OPENVINO_MISSING_RUNTIME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // ORT owns process-global state. Use a fresh process and exercise a
+            // second failure too: retries must return an error without touching
+            // partially initialized ORT state.
+            for _ in 0..2 {
+                let error = match super::new_model_with_policy(false) {
+                    Ok(_) => panic!("missing runtime unexpectedly initialized"),
+                    Err(error) => error,
+                };
+                assert!(
+                    format!("{error:#}").contains("failed to load ONNX Runtime"),
+                    "{error:#}"
+                );
+            }
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let invalid = scratch.path().join("invalid-onnxruntime.so");
+        std::fs::write(&invalid, b"not a shared library").unwrap();
+        for runtime in [scratch.path().join("missing-onnxruntime.so"), invalid] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "embed::real::tests::openvino_missing_runtime_fails_within_deadline",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RNA_EMBEDDING_BACKEND", "openvino")
+                .env("RNA_EMBEDDING_FALLBACK", "error")
+                .env("ORT_DYLIB_PATH", runtime)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "missing-runtime child failed: {status}");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("missing-runtime initialization exceeded 10 seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }

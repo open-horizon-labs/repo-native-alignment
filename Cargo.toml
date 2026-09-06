@@ -65,12 +65,14 @@ lancedb = "0.31"
 arrow-array = "58"
 arrow-schema = "58"
 
-# Optional local embeddings — Metal GPU on Apple Silicon, CPU fallback
+# Optional local embeddings — Metal GPU on Apple Silicon, OpenVINO on Intel, CPU fallback
 metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", rev = "9966033a92befe0d760813e3a61152271ecd2822", default-features = false, features = ["embeddings"], optional = true }
 candle-core = { version = "0.9", optional = true }
 
 # Optional cross-encoder reranking (ONNX runtime, CPU inference)
-fastembed = { version = "5", optional = true }
+fastembed = { version = "5.17.4", optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["openvino", "load-dynamic"], optional = true }
+libloading = { version = "0.8", optional = true }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -133,6 +135,7 @@ default = []
 embeddings = ["dep:metal-candle", "dep:candle-core", "dep:fastembed", "dep:lance-index"]
 
 metal = ["embeddings", "candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
+openvino = ["embeddings", "dep:ort", "dep:libloading"]
 
 # LanceDB 0.31 accidentally declares its test-only `lance-testing` crate as a
 # production dependency. Upstream approved moving it to dev-dependencies in
