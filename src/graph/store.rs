@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 27; // local_bindings scope evidence restores tree-sitter cross-file Calls (#877)
+pub const SCHEMA_VERSION: u32 = 28; // git co-change edges: cochange_support/cochange_confidence columns (#884)
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -194,6 +194,13 @@ pub fn edges_schema() -> Schema {
         Field::new("edge_confidence", DataType::Utf8, false),
         Field::new("edge_evidence_json", DataType::Utf8, true),
         Field::new("root_id", DataType::Utf8, false),
+        // Co-change mining (#884) — populated only for EdgeKind::CoChanges edges,
+        // null for every other edge kind. Not fields on `Edge` itself (which has
+        // no generic metadata map, unlike `Node`): carried via a stable_id-keyed
+        // side-channel map (`CoChangeStatsMap`) through the write/read path
+        // instead, to avoid touching ~159 `Edge { .. }` construction sites.
+        Field::new("cochange_support", DataType::UInt32, true),
+        Field::new("cochange_confidence", DataType::Float64, true),
         Field::new("updated_at", DataType::Int64, false),
         // Append-only versioning: each full rebuild writes with an incrementing scan_version.
         // Queries filter to the latest committed version. Stale rows compacted separately.

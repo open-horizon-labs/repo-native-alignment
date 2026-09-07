@@ -336,6 +336,9 @@ struct SearchArgs {
     /// Unified diff or structured edit sketch for graph-delta beta.
     #[arg(long)]
     proposal: Option<String>,
+    /// Minimum co-change confidence (0.0-1.0) for mode=cochange/cochange_gaps (default: 0.3).
+    #[arg(long)]
+    min_confidence: Option<f64>,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -1575,6 +1578,7 @@ async fn async_main() -> anyhow::Result<()> {
                         .collect()
                 }),
                 proposal: args.proposal.clone(),
+                min_confidence: args.min_confidence,
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             // Include lsp_only subdirectory root slugs in non_code_slugs so they're not

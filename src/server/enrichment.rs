@@ -29,7 +29,10 @@ use super::operation_report::{
     lsp_capability_from_status, scan_capability_reports,
 };
 use super::state::GraphState;
-use super::store::{load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
+use super::store::{
+    load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance,
+    persist_graph_to_lance_with_cochange,
+};
 use super::{PipelineResult, RnaHandler};
 
 /// Check if a cached graph is missing enrichment passes output that should exist.
@@ -2712,13 +2715,16 @@ impl RnaHandler {
             for node in &graph_state.nodes {
                 idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
-            self.graph.store(Arc::new(Some(Arc::new(GraphState::new(
-                graph_state.nodes.clone(),
-                graph_state.edges.clone(),
-                idx,
-                graph_state.last_scan_completed_at,
-                graph_state.detected_frameworks.clone(),
-            )))));
+            self.graph.store(Arc::new(Some(Arc::new(
+                GraphState::new(
+                    graph_state.nodes.clone(),
+                    graph_state.edges.clone(),
+                    idx,
+                    graph_state.last_scan_completed_at,
+                    graph_state.detected_frameworks.clone(),
+                )
+                .with_cochange_stats(graph_state.cochange_stats.clone()),
+            ))));
         }
 
         // Phase 2: LSP enrichment. Embeddings must wait for structural persist
@@ -2935,9 +2941,9 @@ impl RnaHandler {
                 let snap = self.graph.load_full();
                 snap.as_ref()
                     .as_ref()
-                    .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                    .map(|gs| (gs.nodes.clone(), gs.edges.clone(), gs.cochange_stats.clone()))
             };
-            if let Some((nodes, edges)) = snapshot {
+            if let Some((nodes, edges, cochange_stats)) = snapshot {
                 tracing::info!(
                     "Foreground full persist: {} nodes, {} edges (including {} LSP)",
                     nodes.len(),
@@ -2952,7 +2958,14 @@ impl RnaHandler {
                         edges.len(),
                     );
                 }
-                if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
+                if let Err(e) = persist_graph_to_lance_with_cochange(
+                    &self.repo_root,
+                    &nodes,
+                    &edges,
+                    &cochange_stats,
+                )
+                .await
+                {
                     tracing::error!("Foreground full persist failed: {}", e);
                     if lsp_stage_completed && let Some(job_id) = lsp_job_id.as_deref() {
                         let detail = format!("Full persist failed during foreground pipeline: {e}");

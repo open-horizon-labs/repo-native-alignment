@@ -9,7 +9,7 @@ use arrow_array::{
 };
 
 use crate::graph::index::GraphIndex;
-use crate::graph::{Confidence, Edge, ExtractionSource, Node, NodeId};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId};
 use crate::server::store::metadata_keys as mk;
 
 use super::super::state::GraphState;
@@ -545,7 +545,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
     }
 
     // -- Read edges --
-    let edges = {
+    let (edges, cochange_stats) = {
         let table = db
             .open_table("edges")
             .execute()
@@ -559,6 +559,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
 
         let mut edges = Vec::new();
+        let mut cochange_stats = crate::graph::CoChangeStatsMap::new();
         for batch in &batches {
             let source_ids = required_string_column(batch, "source_id")?;
             let source_files = required_string_column(batch, "source_file")?;
@@ -584,6 +585,12 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let edge_evidence = batch
                 .column_by_name("edge_evidence_json")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let cochange_supports = batch
+                .column_by_name("cochange_support")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+            let cochange_confidences = batch
+                .column_by_name("cochange_confidence")
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
             let root_ids = batch
                 .column_by_name("root_id")
                 .unwrap()
@@ -658,18 +665,33 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     None => stored_to,
                 };
 
-                edges.push(Edge {
+                let edge = Edge {
                     from,
                     to,
                     kind: edge_kind,
                     source: extraction_source,
                     confidence,
                     evidence,
-                });
+                };
+
+                if edge.kind == EdgeKind::CoChanges
+                    && let Some(support) = cochange_supports.filter(|a| !a.is_null(i))
+                    && let Some(conf) = cochange_confidences.filter(|a| !a.is_null(i))
+                {
+                    cochange_stats.insert(
+                        edge.stable_id(),
+                        crate::graph::CoChangeStats {
+                            support: support.value(i),
+                            confidence: conf.value(i),
+                        },
+                    );
+                }
+
+                edges.push(edge);
             }
         }
         let _ = crate::graph::revalidate_edge_evidence(&mut edges, &nodes);
-        edges
+        (edges, cochange_stats)
     };
 
     // -- Build index --
@@ -685,7 +707,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         index,
         Some(std::time::Instant::now()),
         std::collections::HashSet::new(),
-    ))
+    )
+    .with_cochange_stats(cochange_stats))
 }
 
 #[cfg(test)]

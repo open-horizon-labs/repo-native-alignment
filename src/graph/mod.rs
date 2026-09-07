@@ -131,7 +131,12 @@ impl NodeKind {
             // These nodes persist document-symbol response proof for readiness;
             // they duplicate source symbols and carry no additional retrieval
             // content. Other extensible node kinds remain semantic candidates.
-            NodeKind::Other(kind) => kind != "lsp_document_symbol",
+            //
+            // "file" anchors are virtual per-file nodes synthesized for git
+            // co-change edges (#884) — they carry no content of their own
+            // (the real content lives in the symbol nodes for that file), so
+            // they are excluded from embedding like other virtual anchors.
+            NodeKind::Other(kind) => kind != "lsp_document_symbol" && kind != "file",
 
             NodeKind::Import
             | NodeKind::Const
@@ -191,6 +196,13 @@ pub enum EdgeKind {
     /// A symbol/handler consumes events from a channel/topic.
     /// Direction: consumer → channel
     Consumes,
+    /// Two files were changed together in the same commit(s) historically
+    /// (logical coupling mined from git history). Direction is not meaningful;
+    /// producers emit one edge per unordered file pair. Numeric support/confidence
+    /// data lives out-of-band in [`CoChangeStats`] (keyed by edge `stable_id()`)
+    /// rather than as fields on `Edge`, to avoid a ~159-site/49-file blast radius
+    /// from adding fields to the shared `Edge` struct (see #884 solution notes).
+    CoChanges,
     /// Repo-local/domain-specific relationship kind.
     ///
     /// Custom edges use the persisted edge label directly (for example,
@@ -222,6 +234,7 @@ impl fmt::Display for EdgeKind {
             EdgeKind::UsesFramework => write!(f, "uses_framework"),
             EdgeKind::Produces => write!(f, "produces"),
             EdgeKind::Consumes => write!(f, "consumes"),
+            EdgeKind::CoChanges => write!(f, "co_changes"),
             EdgeKind::Other(s) => write!(f, "{}", s),
         }
     }
@@ -256,6 +269,7 @@ impl EdgeKind {
             "uses_framework" => EdgeKind::UsesFramework,
             "produces" => EdgeKind::Produces,
             "consumes" => EdgeKind::Consumes,
+            "co_changes" => EdgeKind::CoChanges,
             other => EdgeKind::Other(other.to_string()),
         })
     }
@@ -487,6 +501,28 @@ pub struct Edge {
     #[serde(default)]
     pub evidence: Vec<EdgeEvidence>,
 }
+
+/// Numeric data specific to `EdgeKind::CoChanges` edges.
+///
+/// Kept out of the `Edge` struct itself (which has no generic metadata field,
+/// unlike `Node`) and carried instead as a side-channel map keyed by
+/// `Edge::stable_id()`. Adding fields to `Edge` would require touching every
+/// `Edge { .. }` construction site in the crate (159 sites across 49 files at
+/// the time of #884) for a single edge kind's data -- the same blast radius
+/// that ruled out a generalized `Edge` metadata map. The side-channel map is
+/// threaded through `GraphState`, the LanceDB write/read path
+/// (`cochange_support`/`cochange_confidence` columns), and the query surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoChangeStats {
+    /// Number of mined commits where both endpoint files changed together.
+    pub support: u32,
+    /// `support / min(changes_a, changes_b)` -- how often the pair changes
+    /// together relative to how often the less-frequently-changed file changes.
+    pub confidence: f64,
+}
+
+/// Map from `Edge::stable_id()` to co-change stats, for `EdgeKind::CoChanges` edges only.
+pub type CoChangeStatsMap = std::collections::HashMap<String, CoChangeStats>;
 
 fn hash_identity_component(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());

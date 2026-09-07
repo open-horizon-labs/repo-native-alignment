@@ -138,6 +138,77 @@ impl ScanConfig {
     }
 }
 
+// ── Co-change mining configuration ──────────────────────────────────
+
+/// Configuration for git co-change mining (#884), loaded from
+/// `.oh/config.toml` under `[cochange]`.
+///
+/// # Example `.oh/config.toml`
+///
+/// ```toml
+/// [cochange]
+/// max_commits = 500
+/// max_age_days = 365
+/// max_files_per_commit = 50
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CoChangeConfig {
+    /// Maximum number of first-parent commits to walk (bounded window).
+    pub max_commits: usize,
+    /// Maximum commit age in days; commits older than this are not walked.
+    pub max_age_days: u32,
+    /// Commits touching more than this many files are skipped entirely
+    /// (large refactors/vendoring drops are noise for logical coupling).
+    pub max_files_per_commit: usize,
+}
+
+impl Default for CoChangeConfig {
+    fn default() -> Self {
+        Self {
+            max_commits: 500,
+            max_age_days: 365,
+            max_files_per_commit: 50,
+        }
+    }
+}
+
+impl CoChangeConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    ///
+    /// Parses into a `toml::Value` first to isolate section parse errors --
+    /// a bad `[cochange]` section must not affect `[scanner]`/`[patterns]`,
+    /// and vice versa (mirrors `ScanConfig::load`).
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                return Self::default();
+            }
+        };
+        match value.get("cochange") {
+            Some(v) => match v.clone().try_into::<Self>() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [cochange] section in {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 // ── Pattern hint configuration ──────────────────────────────────────
 
 /// Configuration for design pattern detection via naming conventions.
@@ -433,6 +504,15 @@ pub struct ScanState {
     /// Timestamp of last successful scan.
     #[serde(default)]
     pub last_scan: Option<SystemTimeWrapper>,
+    /// HEAD SHA as of the last successful co-change mining pass (#884).
+    ///
+    /// Deliberately a separate field from `last_commit_sha`: that field has
+    /// different skip/failure semantics (used to bound the file-change scan)
+    /// and is updated on a different cadence. This watermark is updated only
+    /// after co-change mining succeeds, so a mining failure doesn't silently
+    /// advance past commits that were never actually mined.
+    #[serde(default)]
+    pub cochange_watermark_sha: Option<String>,
 }
 
 /// Wrapper for SystemTime that serializes as seconds since UNIX_EPOCH.
@@ -507,6 +587,11 @@ pub struct Scanner {
     /// Override for state persistence path. When `None`, uses the default
     /// `.oh/.cache/scan-state.json` under repo_root.
     custom_state_path: Option<PathBuf>,
+    /// The co-change watermark this Scanner loaded at construction. Used by
+    /// `commit_state` to tell "the caller deliberately set a watermark" from
+    /// "this is just the value that happened to be on disk when we started",
+    /// since co-change mining advances the same field mid-scan (#884 review).
+    loaded_cochange_watermark_sha: Option<String>,
 }
 
 struct GitIgnoreContext {
@@ -529,12 +614,14 @@ impl Scanner {
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state(&repo_root).unwrap_or_default();
         let exclude_matchers = compile_excludes(&excludes);
+        let loaded_cochange_watermark_sha = state.cochange_watermark_sha.clone();
         Ok(Scanner {
             repo_root,
             excludes,
             exclude_matchers,
             state,
             custom_state_path: None,
+            loaded_cochange_watermark_sha,
         })
     }
 
@@ -549,12 +636,14 @@ impl Scanner {
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state_from_path(&state_path_override).unwrap_or_default();
         let exclude_matchers = compile_excludes(&excludes);
+        let loaded_cochange_watermark_sha = state.cochange_watermark_sha.clone();
         Ok(Scanner {
             repo_root,
             excludes,
             exclude_matchers,
             state,
             custom_state_path: Some(state_path_override),
+            loaded_cochange_watermark_sha,
         })
     }
 
@@ -565,6 +654,18 @@ impl Scanner {
         self.state.file_mtimes.keys().cloned().collect()
     }
 
+    /// HEAD SHA as of the last successful co-change mining pass, if any (#884).
+    pub fn cochange_watermark_sha(&self) -> Option<&str> {
+        self.state.cochange_watermark_sha.as_deref()
+    }
+
+    /// Record the HEAD SHA mined by the co-change pass that just succeeded.
+    /// Callers must call `commit_state()` afterwards to persist it (same
+    /// pattern as the rest of `ScanState`).
+    pub fn set_cochange_watermark_sha(&mut self, sha: Option<String>) {
+        self.state.cochange_watermark_sha = sha;
+    }
+
     /// Persist the scanner's in-memory state to disk.
     ///
     /// Call this **after** the caller has successfully processed the scan results
@@ -572,11 +673,26 @@ impl Scanner {
     /// fails, the next scan will re-detect the same changes instead of silently
     /// losing them.
     pub fn commit_state(&self) -> Result<()> {
-        if let Some(ref custom_path) = self.custom_state_path {
-            save_state_to_path(custom_path, &self.state)?;
-        } else {
-            save_state(&self.repo_root, &self.state)?;
+        let path = self
+            .custom_state_path
+            .clone()
+            .unwrap_or_else(|| state_path(&self.repo_root));
+
+        // `scan-state.json` has a second writer: co-change mining advances its
+        // HEAD watermark through `write_cochange_watermark` during the graph
+        // update, which happens *before* the CLI calls `commit_state()`.
+        // If the caller deliberately set a watermark on this Scanner we keep it;
+        // otherwise the value we hold is just what was on disk at construction,
+        // and writing it back would undo a mid-scan advance and force a full
+        // re-mine on every incremental scan (#884 review).
+        let mut state = self.state.clone();
+        if state.cochange_watermark_sha == self.loaded_cochange_watermark_sha {
+            state.cochange_watermark_sha = load_state_from_path(&path)
+                .ok()
+                .and_then(|persisted| persisted.cochange_watermark_sha);
         }
+
+        save_state_to_path(&path, &state)?;
         Ok(())
     }
 
@@ -1531,6 +1647,44 @@ fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
     Ok(())
 }
 
+/// Read the co-change watermark directly from persisted scan state (#884),
+/// without constructing a full `Scanner`. Used by incremental graph updates
+/// that receive a pre-computed `ScanResult` and may not hold a live `Scanner`
+/// for the primary root.
+pub fn read_cochange_watermark(repo_root: &Path) -> Option<String> {
+    load_state(repo_root)
+        .ok()
+        .and_then(|s| s.cochange_watermark_sha)
+}
+
+/// Persist an updated co-change watermark directly (#884), without a live
+/// `Scanner`. Best-effort, same durability characteristics as the rest of
+/// `scan-state.json` (not transactional against a concurrently-running
+/// `Scanner::commit_state()`).
+pub fn write_cochange_watermark(repo_root: &Path, sha: Option<String>) -> Result<()> {
+    // Only a genuinely absent state file may be treated as "empty". Malformed
+    // JSON or an unreadable file must propagate: silently replacing persisted
+    // state with a watermark-only `ScanState` would drop every file mtime and
+    // make the next scan re-extract the whole repository (#884 review).
+    let mut state = match load_state(repo_root) {
+        Ok(state) => state,
+        Err(e) if state_load_error_is_missing(&e) => ScanState::default(),
+        Err(e) => return Err(e),
+    };
+    state.cochange_watermark_sha = sha;
+    save_state(repo_root, &state)
+}
+
+/// Whether a `load_state` failure was "no state file yet" rather than a
+/// corrupt or unreadable one.
+fn state_load_error_is_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 // ── Filesystem helpers ──────────────────────────────────────────────
 
 fn dir_modified_time(path: &Path) -> Result<SystemTime> {
@@ -1614,6 +1768,75 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn commit_state_preserves_cochange_watermark() {
+        // Regression: the graph update advances the co-change watermark, then
+        // the CLI calls commit_state(). Writing the Scanner's own state verbatim
+        // put back the watermark it had loaded at scan start, so every
+        // incremental scan re-mined the whole window (#884 review).
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().to_path_buf();
+
+        let prior = ScanState {
+            last_commit_sha: Some("aaaaaaa".to_string()),
+            cochange_watermark_sha: Some("stale111".to_string()),
+            ..Default::default()
+        };
+        save_state(&repo_root, &prior).unwrap();
+
+        // Scanner loads state while the watermark is still "stale111" ...
+        let mut scanner = Scanner::new(repo_root.clone()).unwrap();
+        scanner.state.last_commit_sha = Some("bbbbbbb".to_string());
+        assert_eq!(
+            scanner.state.cochange_watermark_sha,
+            Some("stale111".to_string())
+        );
+        // ... then mining advances it mid-scan.
+        write_cochange_watermark(&repo_root, Some("beef5678".to_string())).unwrap();
+        scanner.commit_state().unwrap();
+
+        assert_eq!(
+            read_cochange_watermark(&repo_root),
+            Some("beef5678".to_string()),
+            "commit_state must not write back the stale watermark it loaded"
+        );
+        assert_eq!(
+            load_state(&repo_root).unwrap().last_commit_sha,
+            Some("bbbbbbb".to_string()),
+            "commit_state must still persist its own fields"
+        );
+    }
+
+    #[test]
+    fn write_cochange_watermark_rejects_corrupt_state() {
+        // A malformed scan-state.json must NOT be silently replaced with a
+        // watermark-only state: that would drop every recorded mtime and make
+        // the next scan re-extract the whole repository (#884 review).
+        let temp = tempfile::tempdir().unwrap();
+        let path = state_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let result = write_cochange_watermark(temp.path(), Some("deadbeef".to_string()));
+        assert!(result.is_err(), "corrupt state must propagate, not default");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json",
+            "corrupt state file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn write_cochange_watermark_creates_missing_state() {
+        // A genuinely absent state file is the one case that may start empty.
+        let temp = tempfile::tempdir().unwrap();
+        write_cochange_watermark(temp.path(), Some("cafe1234".to_string())).unwrap();
+        assert_eq!(
+            read_cochange_watermark(temp.path()),
+            Some("cafe1234".to_string())
+        );
     }
 
     #[test]
@@ -3175,5 +3398,96 @@ exclude = ["dist/"]
             "carry_forward path: worktree with own cache must still be skipped; got: {:?}",
             all_files2
         );
+    }
+
+    // ── Co-change watermark (#884) ──────────────────────────────────
+
+    #[test]
+    fn test_cochange_watermark_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner.cochange_watermark_sha(), None);
+    }
+
+    #[test]
+    fn test_cochange_watermark_survives_commit_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let mut scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        scanner.set_cochange_watermark_sha(Some("deadbeef".to_string()));
+        scanner.commit_state().unwrap();
+
+        let reloaded = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.cochange_watermark_sha(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn test_cochange_watermark_increments_across_incremental_scans() {
+        let tmp = TempDir::new().unwrap();
+        let mut scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        scanner.set_cochange_watermark_sha(Some("sha-1".to_string()));
+        scanner.commit_state().unwrap();
+
+        // Simulate a later incremental scan advancing the watermark.
+        let mut scanner2 = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner2.cochange_watermark_sha(), Some("sha-1"));
+        scanner2.set_cochange_watermark_sha(Some("sha-2".to_string()));
+        scanner2.commit_state().unwrap();
+
+        let scanner3 = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner3.cochange_watermark_sha(), Some("sha-2"));
+    }
+
+    #[test]
+    fn test_read_write_cochange_watermark_without_live_scanner() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(read_cochange_watermark(tmp.path()), None);
+        write_cochange_watermark(tmp.path(), Some("abc123".to_string())).unwrap();
+        assert_eq!(
+            read_cochange_watermark(tmp.path()),
+            Some("abc123".to_string())
+        );
+        write_cochange_watermark(tmp.path(), None).unwrap();
+        assert_eq!(read_cochange_watermark(tmp.path()), None);
+    }
+
+    // ── CoChangeConfig (#884) ────────────────────────────────────────
+
+    #[test]
+    fn test_cochange_config_defaults() {
+        let cfg = CoChangeConfig::default();
+        assert_eq!(cfg.max_commits, 500);
+        assert_eq!(cfg.max_age_days, 365);
+        assert_eq!(cfg.max_files_per_commit, 50);
+    }
+
+    #[test]
+    fn test_cochange_config_loads_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        create_file(
+            tmp.path(),
+            ".oh/config.toml",
+            "[cochange]\nmax_commits = 100\nmax_age_days = 30\nmax_files_per_commit = 10\n",
+        );
+        let cfg = CoChangeConfig::load(tmp.path());
+        assert_eq!(cfg.max_commits, 100);
+        assert_eq!(cfg.max_age_days, 30);
+        assert_eq!(cfg.max_files_per_commit, 10);
+    }
+
+    #[test]
+    fn test_cochange_config_bad_section_falls_back_to_defaults() {
+        let tmp = TempDir::new().unwrap();
+        // Malformed [cochange] section (wrong type) must not panic and must
+        // fall back to defaults, without affecting [scanner]/[patterns].
+        create_file(
+            tmp.path(),
+            ".oh/config.toml",
+            "[cochange]\nmax_commits = \"not-a-number\"\n\n[scanner]\ninclude = [\"target*/\"]\n",
+        );
+        let cfg = CoChangeConfig::load(tmp.path());
+        assert_eq!(cfg, CoChangeConfig::default());
+        // The isolated-parse pattern means [scanner] still parses correctly.
+        let scan_cfg = ScanConfig::load(tmp.path());
+        assert_eq!(scan_cfg.include, vec!["target*/".to_string()]);
     }
 }

@@ -19,7 +19,7 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
-use crate::graph::{Edge, Node, NodeKind};
+use crate::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
@@ -32,7 +32,8 @@ use super::helpers;
 use super::state::GraphState;
 use super::store::{
     check_and_migrate_schema, delete_nodes_for_roots, get_stored_root_ids, load_graph_from_lance,
-    persist_graph_incremental, persist_graph_to_lance,
+    persist_graph_incremental, persist_graph_incremental_with_cochange, persist_graph_to_lance,
+    persist_graph_to_lance_with_cochange,
 };
 
 fn merge_duplicate_node(into: &mut Node, from: Node) {
@@ -1820,6 +1821,10 @@ impl RnaHandler {
             }
         }
 
+        // Side-channel co-change stats (#884), populated below and threaded
+        // through to the LanceDB persist call further down this function.
+        let mut cochange_stats = crate::graph::CoChangeStatsMap::new();
+
         // 4. Extract PR merges from git history when admitted by the selected mode.
         if self.business_context.admit_git_history_producer() {
             match crate::git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
@@ -1841,6 +1846,48 @@ impl RnaHandler {
                 }
             }
         }
+
+        // 4a. Mine git co-change ("logical coupling") edges (#884).
+        //
+        // Full scans always re-mine the bounded window from HEAD (no cached
+        // CoChanges edges are carried forward into `all_nodes`/`all_edges`
+        // above), then update the watermark so a subsequent incremental scan
+        // can skip re-mining when HEAD hasn't moved. Non-git roots: mining
+        // returns `Err` from `Repository::open` (mirrors `extract_pr_merges`'s
+        // call site) -- caught below, logged, no panic.
+        let cochange_head_sha = if self.business_context.admit_git_history_producer() {
+            let cochange_config = crate::scanner::CoChangeConfig::load(&self.repo_root);
+            let cochange_primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+            let existing_stable_ids: std::collections::HashSet<String> =
+                all_nodes.iter().map(|n| n.stable_id()).collect();
+            match crate::git::cochange::mine_and_build(
+                &self.repo_root,
+                &cochange_primary_slug,
+                &cochange_config,
+                None,
+                &existing_stable_ids,
+            ) {
+                Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                    tracing::info!(
+                        "Co-change mining: {} file anchor nodes, {} CoChanges edges (window: {} commits, {} days)",
+                        file_nodes.len(),
+                        cochange_edges.len(),
+                        cochange_config.max_commits,
+                        cochange_config.max_age_days,
+                    );
+                    all_nodes.extend(file_nodes);
+                    all_edges.extend(cochange_edges);
+                    cochange_stats.extend(stats);
+                    head_sha
+                }
+                Err(e) => {
+                    tracing::warn!("co-change: not available (no .git or mining failed): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // 4b-4j. Post-extraction passes via EventBus (ADR Phase 3, issue #520).
         //
@@ -2165,7 +2212,14 @@ impl RnaHandler {
             // then the background LSP task will re-persist with LSP edges.
 
             let _lance_guard = self.lance_write_lock.lock().await;
-            if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
+            if let Err(e) = persist_graph_to_lance_with_cochange(
+                &self.repo_root,
+                &all_nodes,
+                &all_edges,
+                &cochange_stats,
+            )
+            .await
+            {
                 tracing::error!("Failed to persist graph to LanceDB: {}", e);
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
@@ -2216,6 +2270,20 @@ impl RnaHandler {
                     Err(e) => {
                         tracing::warn!("Post-persist root check failed (non-fatal): {}", e);
                     }
+                }
+            }
+        }
+
+        // Record the co-change watermark (#884) on the primary root's scanner so
+        // the next scan's watermark check (below) can skip re-mining unmoved
+        // history. Only advances the watermark after mining actually succeeded
+        // (`cochange_head_sha` is `None` on a non-git root or a mining failure).
+        if let Some(ref head_sha) = cochange_head_sha {
+            let primary_slug_for_watermark =
+                RootConfig::code_project(self.repo_root.clone()).slug();
+            for (slug, scanner, _scan, _path, _changed) in &mut scanners {
+                if *slug == primary_slug_for_watermark {
+                    scanner.set_cochange_watermark_sha(Some(head_sha.clone()));
                 }
             }
         }
@@ -2277,7 +2345,8 @@ impl RnaHandler {
             index,
             Some(symbols_ready_at),
             all_detected_frameworks,
-        ))
+        )
+        .with_cochange_stats(cochange_stats))
     }
 
     /// Refresh cheap manifest-derived package nodes and dependency edges without
@@ -2434,23 +2503,49 @@ impl RnaHandler {
 
         // Collect edge stable IDs for removed/changed files BEFORE retain, so we can
         // delete them from LanceDB. (After retain they're gone from memory.)
-        let deleted_edge_ids: Vec<String> = graph
+        // Mutable: the co-change re-mining section below (#884) extends this with
+        // stable IDs of superseded `CoChanges` edges it strips from `graph.edges`,
+        // so those rows are actually deleted from LanceDB too (not just dropped
+        // from the in-memory graph) -- see the matching comment there.
+        // Co-change anchors and `CoChanges` edges are owned wholesale by the
+        // re-mining block below, not by per-file extraction. Purging them for a
+        // merely *changed* file would drop that file out of co-change queries
+        // whenever re-mining is skipped (`current_head == watermark`), since
+        // nothing recreates them until HEAD moves. Only a *deleted* file loses
+        // its anchor here (#884 review).
+        let cochange_removable: std::collections::HashSet<(String, PathBuf)> = scan
+            .deleted_files
+            .iter()
+            .cloned()
+            .map(|file| (primary_slug.clone(), file))
+            .collect();
+        let node_is_cochange_anchor =
+            |n: &Node| matches!(&n.id.kind, NodeKind::Other(s) if s == "file");
+        let purge_node = |n: &Node| {
+            let key = (n.id.root.clone(), n.id.file.clone());
+            if node_is_cochange_anchor(n) {
+                return cochange_removable.contains(&key);
+            }
+            files_to_remove.contains(&key)
+        };
+        let purge_edge = |e: &Edge| {
+            let from = (e.from.root.clone(), e.from.file.clone());
+            let to = (e.to.root.clone(), e.to.file.clone());
+            if e.kind == EdgeKind::CoChanges {
+                return cochange_removable.contains(&from) || cochange_removable.contains(&to);
+            }
+            files_to_remove.contains(&from) || files_to_remove.contains(&to)
+        };
+
+        let mut deleted_edge_ids: Vec<String> = graph
             .edges
             .iter()
-            .filter(|e| {
-                files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
-                    || files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
-            })
+            .filter(|e| purge_edge(e))
             .map(|e| e.stable_id())
             .collect();
 
-        graph
-            .nodes
-            .retain(|n| !files_to_remove.contains(&(n.id.root.clone(), n.id.file.clone())));
-        graph.edges.retain(|e| {
-            !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
-                && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
-        });
+        graph.nodes.retain(|n| !purge_node(n));
+        graph.edges.retain(|e| !purge_edge(e));
 
         // Extract new + changed files
         let (mut extraction, enc_stats) =
@@ -2891,6 +2986,116 @@ impl RnaHandler {
         // They're re-embedded through the same reindex_nodes path as code symbols
         // when their files change -- no separate reindex_artifacts call needed.
 
+        // Re-mine git co-change edges (#884) on incremental scans, gated by the
+        // watermark so unmoved history is a cheap no-op. Unlike the full-scan
+        // path, we don't have a live `Scanner` for the primary root here (this
+        // function may receive a pre-computed `ScanResult`), so the watermark
+        // is read/written directly against `.oh/.cache/scan-state.json` via
+        // `crate::scanner::{read,write}_cochange_watermark`.
+        let mut incremental_cochange_stats = crate::graph::CoChangeStatsMap::new();
+        // Set when re-mining produced a new HEAD watermark; written to scan state
+        // only after a successful persist (#884 review).
+        let mut pending_cochange_watermark: Option<String> = None;
+        if self.business_context.admit_git_history_producer() {
+            let current_head = crate::git::head_oid(&self.repo_root);
+            let watermark = crate::scanner::read_cochange_watermark(&self.repo_root);
+            let needs_remine = match (&current_head, &watermark) {
+                (Some(head), Some(mark)) => head != mark,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if needs_remine {
+                let cochange_config = crate::scanner::CoChangeConfig::load(&self.repo_root);
+                let existing_stable_ids: std::collections::HashSet<String> =
+                    graph.nodes.iter().map(|n| n.stable_id()).collect();
+                match crate::git::cochange::mine_and_build(
+                    &self.repo_root,
+                    &primary_slug,
+                    &cochange_config,
+                    None,
+                    &existing_stable_ids,
+                ) {
+                    Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                        tracing::info!(
+                            "Co-change re-mining (incremental): {} file anchor nodes, {} CoChanges edges",
+                            file_nodes.len(),
+                            cochange_edges.len(),
+                        );
+                        // Replace any previously-persisted CoChanges edges wholesale
+                        // (see `mine_cochanges` doc comment for why this isn't a
+                        // partial-delta merge). File anchor nodes are additive/deduped.
+                        //
+                        // Scoped to `primary_slug` only (not every `CoChanges` edge in
+                        // the shared multi-root graph): mining only ran against
+                        // `self.repo_root`/`primary_slug`, so wiping every root's
+                        // CoChanges edges here would silently drop another root's
+                        // previously-mined co-change data on this root's incremental
+                        // scan. Mirrors the root-scoped `files_to_remove` handling
+                        // used for ordinary edges above.
+                        //
+                        // Collect the stable IDs of the edges being superseded BEFORE
+                        // the retain call and feed them into `deleted_edge_ids` so
+                        // `persist_graph_incremental_with_cochange`'s LanceDB delete
+                        // pass actually removes those rows -- otherwise they're only
+                        // dropped from the in-memory graph and reappear on the next
+                        // `load_graph_from_lance` (the `merge_insert` upsert path never
+                        // deletes rows that aren't in the new batch). Matches the
+                        // existing precedent for virtual nodes (subsystem/framework/
+                        // channel/event) a few lines above, which does the same
+                        // collect-stable-ids-before-retain dance via `stale_virtual_files`.
+                        let stale_cochange_edge_ids: Vec<String> = graph
+                            .edges
+                            .iter()
+                            .filter(|e| {
+                                e.kind == EdgeKind::CoChanges
+                                    && (e.from.root == primary_slug || e.to.root == primary_slug)
+                            })
+                            .map(|e| e.stable_id())
+                            .collect();
+                        graph.edges.retain(|e| {
+                            e.kind != EdgeKind::CoChanges
+                                || (e.from.root != primary_slug && e.to.root != primary_slug)
+                        });
+                        // Merge, don't replace: `cochange_stats` is keyed by edge
+                        // stable id across every root, while mining only ran for
+                        // `primary_slug`. Replacing the whole map would leave other
+                        // roots' surviving `CoChanges` edges without support and
+                        // confidence values (#884 review).
+                        for stale_id in &stale_cochange_edge_ids {
+                            graph.cochange_stats.remove(stale_id);
+                        }
+                        deleted_edge_ids.extend(stale_cochange_edge_ids);
+                        for node in &file_nodes {
+                            upsert_node_ids.insert(node.stable_id());
+                        }
+                        for edge in &cochange_edges {
+                            upsert_node_ids.insert(edge.from.to_stable_id());
+                            upsert_node_ids.insert(edge.to.to_stable_id());
+                        }
+                        graph.nodes.extend(file_nodes);
+                        graph.edges.extend(cochange_edges.clone());
+                        upsert_edges.extend(cochange_edges);
+                        incremental_cochange_stats = stats;
+                        graph
+                            .cochange_stats
+                            .extend(incremental_cochange_stats.clone());
+                        // The watermark is written only after LanceDB persistence
+                        // succeeds -- see the `persist_succeeded` branch below.
+                        // Writing it here would let a failed persist leave a
+                        // matching watermark, so the next scan would skip re-mining
+                        // and keep stale or missing co-change rows (#884 review).
+                        pending_cochange_watermark = head_sha;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "co-change: not available (no .git or mining failed): {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Rebuild upsert_nodes from graph.nodes so they include post-PageRank importance.
         let upsert_nodes: Vec<Node> = graph
             .nodes
@@ -2921,12 +3126,13 @@ impl RnaHandler {
             }
             let _lance_guard = self.lance_write_lock.lock().await;
             let files_to_remove_vec: Vec<(String, PathBuf)> = files_to_remove.into_iter().collect();
-            persist_graph_incremental(
+            persist_graph_incremental_with_cochange(
                 &self.repo_root,
                 &upsert_nodes,
                 &upsert_edges,
                 &deleted_edge_ids,
                 &files_to_remove_vec,
+                &incremental_cochange_stats,
             )
             .await
         };
@@ -2956,6 +3162,24 @@ impl RnaHandler {
             }
             Ok(false) => true,
         };
+
+        // Durable-persist gate for the co-change watermark (#884 review): if the
+        // LanceDB write failed, leave the old watermark in place so the next scan
+        // re-mines instead of trusting stale or missing rows.
+        match (pending_cochange_watermark, persist_succeeded) {
+            (Some(sha), true) => {
+                match crate::scanner::write_cochange_watermark(&self.repo_root, Some(sha.clone())) {
+                    Ok(()) => tracing::info!("co-change watermark advanced to {}", sha),
+                    Err(e) => tracing::warn!("Failed to persist cochange watermark: {}", e),
+                }
+            }
+            (Some(_), false) => tracing::warn!(
+                "Persist failed; leaving co-change watermark unadvanced so the next scan re-mines"
+            ),
+            (None, _) => tracing::debug!(
+                "co-change: no watermark to advance (mining skipped or HEAD unresolved)"
+            ),
+        }
 
         if let Some((lsp_call_edge_count, degraded_detail, validations)) = incremental_lsp_outcome {
             if persist_succeeded {

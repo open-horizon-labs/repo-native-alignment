@@ -455,9 +455,14 @@ async fn disabled_full_scan_rebuilds_enabled_cache_before_lance_load() {
     );
     assert_eq!(fs::read_to_string(&marker).unwrap(), "disabled\n");
     assert!(disabled_stderr.contains("business context: disabled"));
+    // Two Git-history producers are excluded on this path: PR-merge extraction
+    // and co-change mining (#884). The census counts excluded *decisions*, so
+    // adding a producer legitimately increments it -- pin the exact number
+    // rather than loosening the assertion.
     assert!(
         disabled_stderr
-            .contains("excluded producer inputs: 1 .oh file(s), 1 Git-history producer(s)")
+            .contains("excluded producer inputs: 1 .oh file(s), 2 Git-history producer(s)"),
+        "excluded-producer census changed:\n{disabled_stderr}"
     );
 
     let persisted = load_graph_from_lance(temp.path()).await.unwrap();

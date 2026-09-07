@@ -313,6 +313,9 @@ pub struct Search {
     /// Bounded unified diff or structured edit sketch for graph-delta beta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<String>,
+    /// Minimum co-change confidence (0.0-1.0) for mode="cochange"/"cochange_gaps" (default: 0.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f64>,
 }
 
 #[macros::mcp_tool(

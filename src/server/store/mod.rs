@@ -26,7 +26,9 @@ pub(crate) use migrate::check_and_migrate_schema;
 
 // From persist
 pub(crate) use persist::{
-    delete_nodes_for_roots, get_stored_root_ids, persist_graph_incremental, persist_graph_to_lance,
+    delete_nodes_for_roots, get_stored_root_ids, persist_graph_incremental,
+    persist_graph_incremental_with_cochange, persist_graph_to_lance,
+    persist_graph_to_lance_with_cochange,
 };
 
 // From load

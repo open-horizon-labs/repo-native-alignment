@@ -26,6 +26,11 @@ pub struct GraphState {
     /// Each GraphState snapshot is immutable once published via ArcSwap,
     /// so the cache is valid for the lifetime of the snapshot.
     node_index_cache: OnceLock<HashMap<String, usize>>,
+    /// Co-change support/confidence for `EdgeKind::CoChanges` edges, keyed by
+    /// `Edge::stable_id()` (#884). Carried as a side-channel map rather than
+    /// fields on `Edge` (see `crate::graph::CoChangeStats` doc comment for why).
+    /// Empty for graphs with no mined co-change data.
+    pub cochange_stats: crate::graph::CoChangeStatsMap,
 }
 
 impl Clone for GraphState {
@@ -39,6 +44,7 @@ impl Clone for GraphState {
             // Start with an empty cache -- the clone is typically a mutable
             // working copy for incremental scan whose nodes will change.
             node_index_cache: OnceLock::new(),
+            cochange_stats: self.cochange_stats.clone(),
         }
     }
 }
@@ -59,7 +65,15 @@ impl GraphState {
             last_scan_completed_at,
             detected_frameworks,
             node_index_cache: OnceLock::new(),
+            cochange_stats: crate::graph::CoChangeStatsMap::new(),
         }
+    }
+
+    /// Attach co-change stats (#884). Builder-style so the common
+    /// `GraphState::new(..)` call sites (no co-change data) stay unchanged.
+    pub fn with_cochange_stats(mut self, cochange_stats: crate::graph::CoChangeStatsMap) -> Self {
+        self.cochange_stats = cochange_stats;
+        self
     }
 
     /// Check whether a given framework was detected in this workspace.
