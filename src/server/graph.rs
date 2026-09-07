@@ -2503,7 +2503,11 @@ impl RnaHandler {
 
         // Collect edge stable IDs for removed/changed files BEFORE retain, so we can
         // delete them from LanceDB. (After retain they're gone from memory.)
-        let deleted_edge_ids: Vec<String> = graph
+        // Mutable: the co-change re-mining section below (#884) extends this with
+        // stable IDs of superseded `CoChanges` edges it strips from `graph.edges`,
+        // so those rows are actually deleted from LanceDB too (not just dropped
+        // from the in-memory graph) -- see the matching comment there.
+        let mut deleted_edge_ids: Vec<String> = graph
             .edges
             .iter()
             .filter(|e| {
@@ -2995,7 +2999,39 @@ impl RnaHandler {
                         // Replace any previously-persisted CoChanges edges wholesale
                         // (see `mine_cochanges` doc comment for why this isn't a
                         // partial-delta merge). File anchor nodes are additive/deduped.
-                        graph.edges.retain(|e| e.kind != EdgeKind::CoChanges);
+                        //
+                        // Scoped to `primary_slug` only (not every `CoChanges` edge in
+                        // the shared multi-root graph): mining only ran against
+                        // `self.repo_root`/`primary_slug`, so wiping every root's
+                        // CoChanges edges here would silently drop another root's
+                        // previously-mined co-change data on this root's incremental
+                        // scan. Mirrors the root-scoped `files_to_remove` handling
+                        // used for ordinary edges above.
+                        //
+                        // Collect the stable IDs of the edges being superseded BEFORE
+                        // the retain call and feed them into `deleted_edge_ids` so
+                        // `persist_graph_incremental_with_cochange`'s LanceDB delete
+                        // pass actually removes those rows -- otherwise they're only
+                        // dropped from the in-memory graph and reappear on the next
+                        // `load_graph_from_lance` (the `merge_insert` upsert path never
+                        // deletes rows that aren't in the new batch). Matches the
+                        // existing precedent for virtual nodes (subsystem/framework/
+                        // channel/event) a few lines above, which does the same
+                        // collect-stable-ids-before-retain dance via `stale_virtual_files`.
+                        let stale_cochange_edge_ids: Vec<String> = graph
+                            .edges
+                            .iter()
+                            .filter(|e| {
+                                e.kind == EdgeKind::CoChanges
+                                    && (e.from.root == primary_slug || e.to.root == primary_slug)
+                            })
+                            .map(|e| e.stable_id())
+                            .collect();
+                        graph.edges.retain(|e| {
+                            e.kind != EdgeKind::CoChanges
+                                || (e.from.root != primary_slug && e.to.root != primary_slug)
+                        });
+                        deleted_edge_ids.extend(stale_cochange_edge_ids);
                         for node in &file_nodes {
                             upsert_node_ids.insert(node.stable_id());
                         }

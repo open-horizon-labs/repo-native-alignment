@@ -10358,6 +10358,10 @@ async fn search_traversal(
             let anchor_stable = anchor_id.to_stable_id();
 
             let mut partners: Vec<(String, u32, f64)> = Vec::new();
+            // HashSet dedup instead of scanning `partners` with `.iter().any()` --
+            // per the no-linear-scan-on-graph guardrail, membership checks on a
+            // growing collection should be O(1), not O(n) per neighbor.
+            let mut seen_partners: std::collections::HashSet<String> = std::collections::HashSet::new();
             for direction in [
                 petgraph::Direction::Outgoing,
                 petgraph::Direction::Incoming,
@@ -10392,7 +10396,7 @@ async fn search_traversal(
                     };
                     if let Some(stats) = gs.cochange_stats.get(&edge.stable_id())
                         && stats.confidence >= min_confidence
-                        && !partners.iter().any(|(id, ..)| id == &neighbor_stable)
+                        && seen_partners.insert(neighbor_stable.clone())
                     {
                         partners.push((neighbor_stable, stats.support, stats.confidence));
                     }

@@ -1583,6 +1583,92 @@ mod tests {
         );
     }
 
+    /// Regression test for a ship-pipeline finding on #884: incremental co-change
+    /// re-mining must add superseded `CoChanges` edges to `deleted_edge_ids` (not
+    /// just drop them from the in-memory graph), or they leak forever in LanceDB
+    /// and reappear on the next load. This test exercises the persistence-layer
+    /// contract that fix depends on directly: a `CoChanges` edge (with its
+    /// side-channel `CoChangeStats`) persisted by an initial full write must
+    /// actually disappear -- edge row AND stats -- once its stable ID is passed to
+    /// `persist_graph_incremental_with_cochange`'s `deleted_edge_ids`, simulating a
+    /// re-mine that no longer finds that pair.
+    #[tokio::test]
+    async fn test_cochange_edge_removed_via_deleted_edge_ids_does_not_reappear() {
+        use crate::graph::{CoChangeStats, CoChangeStatsMap, Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let file_a = make_test_node("cochange_anchor_a");
+        let file_b = make_test_node("cochange_anchor_b");
+        let cochange_edge = Edge {
+            from: file_a.id.clone(),
+            to: file_b.id.clone(),
+            kind: EdgeKind::CoChanges,
+            source: ExtractionSource::Git,
+            confidence: Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let edge_id = cochange_edge.stable_id();
+        let mut stats = CoChangeStatsMap::new();
+        stats.insert(
+            edge_id.clone(),
+            CoChangeStats {
+                support: 9,
+                confidence: 0.32,
+            },
+        );
+
+        persist_graph_to_lance_with_cochange(
+            repo_root,
+            &[file_a.clone(), file_b.clone()],
+            &[cochange_edge],
+            &stats,
+        )
+        .await
+        .expect("full persist with cochange edge");
+
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after full persist");
+        assert!(
+            state.edges.iter().any(|e| e.stable_id() == edge_id),
+            "cochange edge should be present after full persist"
+        );
+        assert_eq!(
+            state.cochange_stats.get(&edge_id).map(|s| s.support),
+            Some(9),
+            "cochange stats should round-trip after full persist"
+        );
+
+        // Simulate a subsequent incremental re-mine that no longer finds this pair:
+        // the edge's stable ID is passed to `deleted_edge_ids` (as the fixed
+        // incremental co-change block in `src/server/graph.rs` now does), with no
+        // replacement edge in `upsert_edges` and an empty stats map.
+        persist_graph_incremental_with_cochange(
+            repo_root,
+            &[],
+            &[],
+            &[edge_id.clone()],
+            &[],
+            &CoChangeStatsMap::new(),
+        )
+        .await
+        .expect("incremental delete of superseded cochange edge");
+
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after incremental delete");
+        assert!(
+            state.edges.iter().all(|e| e.stable_id() != edge_id),
+            "superseded cochange edge must not reappear after incremental delete"
+        );
+        assert!(
+            state.cochange_stats.get(&edge_id).is_none(),
+            "cochange stats for the deleted edge must not reappear either"
+        );
+    }
+
     #[tokio::test]
     async fn test_load_without_version_file_loads_all_rows() {
         let dir = tempfile::tempdir().expect("tempdir");

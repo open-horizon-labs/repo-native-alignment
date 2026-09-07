@@ -332,6 +332,13 @@ pub fn build_file_anchor_nodes(
 pub fn resolve_changed_file_set(repo_root: &Path, scope: &str) -> Result<HashSet<PathBuf>> {
     let repo = Repository::open(repo_root).context("Failed to open git repository")?;
 
+    if scope.contains("...") {
+        anyhow::bail!(
+            "cochange_gaps: three-dot symmetric-difference ranges ('{scope}') are not supported -- \
+             use a two-dot range ('<base>..<head>'), 'staged', or 'working_tree'."
+        );
+    }
+
     if let Some((base, head)) = scope.split_once("..") {
         let base_obj = repo
             .revparse_single(base)
