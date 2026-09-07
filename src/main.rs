@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;

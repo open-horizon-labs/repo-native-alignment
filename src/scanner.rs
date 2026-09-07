@@ -500,6 +500,9 @@ impl ScanResult {
 pub struct Scanner {
     repo_root: PathBuf,
     excludes: Vec<String>,
+    /// `excludes` parsed once so the per-file hot path is a `match`, not a
+    /// string scan (see `ExcludePattern`).
+    exclude_matchers: Vec<ExcludePattern>,
     state: ScanState,
     /// Override for state persistence path. When `None`, uses the default
     /// `.oh/.cache/scan-state.json` under repo_root.
@@ -525,9 +528,11 @@ impl Scanner {
         let config = ScanConfig::load(&repo_root);
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state(&repo_root).unwrap_or_default();
+        let exclude_matchers = compile_excludes(&excludes);
         Ok(Scanner {
             repo_root,
             excludes,
+            exclude_matchers,
             state,
             custom_state_path: None,
         })
@@ -543,9 +548,11 @@ impl Scanner {
         let config = ScanConfig::load(&repo_root);
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state_from_path(&state_path_override).unwrap_or_default();
+        let exclude_matchers = compile_excludes(&excludes);
         Ok(Scanner {
             repo_root,
             excludes,
+            exclude_matchers,
             state,
             custom_state_path: Some(state_path_override),
         })
@@ -1297,57 +1304,189 @@ impl Scanner {
     /// Check if a relative file path matches any exclude pattern.
     fn is_excluded(&self, rel_path: &Path) -> bool {
         let path_str = rel_path.to_string_lossy();
-        for pattern in &self.excludes {
-            if is_file_excluded(pattern, &path_str) {
-                return true;
-            }
-        }
-        false
+        self.exclude_matchers
+            .iter()
+            .any(|matcher| matcher.matches_file(&path_str))
     }
 
     /// Check if a relative directory path matches any exclude pattern.
     fn is_excluded_dir(&self, rel_dir: &Path) -> bool {
         let dir_str = rel_dir.to_string_lossy();
-        for pattern in &self.excludes {
-            if is_dir_excluded(pattern, &dir_str) {
-                return true;
-            }
-        }
-        false
+        self.exclude_matchers
+            .iter()
+            .any(|matcher| matcher.matches_dir(&dir_str))
     }
 }
 
 // ── Exclude pattern matching ────────────────────────────────────────
 
-/// Check if a file path matches an exclude pattern.
+/// An exclude pattern parsed once at `Scanner` construction.
 ///
-/// Pattern types:
+/// Unqualified patterns (no `/` except a trailing one) match at any depth:
 /// - `dirname/` — matches any path component equal to `dirname`
 /// - `prefix*/` — matches any path component starting with `prefix`
 /// - `*.ext` — matches files ending in `.ext`
 /// - `filename` — matches the exact filename (last component)
-fn is_file_excluded(pattern: &str, path: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        // Extension pattern: *.pyc, *.o, etc.
-        return path.ends_with(suffix);
-    }
-    if let Some(dirname) = pattern.strip_suffix('/') {
-        // Directory pattern: check if any path component matches
-        return dir_component_matches(dirname, path);
-    }
-    // Exact filename match against last component
-    if let Some(filename) = path.rsplit('/').next() {
-        return filename == pattern;
-    }
-    path == pattern
+///
+/// Patterns containing `/` are relative to the repository root and are
+/// matched component by component; `*` matches within a single component:
+/// - `gen/schema/` — matches that directory and everything beneath it
+/// - `gen/schema*/` — matches `gen/schema`, `gen/schema-v2`, ... and beneath
+/// - `gen/*.json` — matches JSON files directly inside `gen/`
+/// - `gen/config.json` — matches exactly that file
+/// - `*/schema.json` — matches `schema.json` exactly one directory deep
+///
+/// A leading `/` or `./` and any doubled `//` are normalized away, so the
+/// gitignore-style root anchor `/gen/` is equivalent to `gen/` written as a
+/// scoped pattern (root-anchored, unlike the unqualified `gen/`). `**` is not
+/// supported: it is treated as `*` and matches exactly one component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExcludePattern {
+    /// `dirname/` or `prefix*/`: any matching component at any depth.
+    Dir(String),
+    /// `*suffix`: the path ends with `suffix`.
+    Suffix(String),
+    /// `filename`: the last component equals `filename`.
+    Name(String),
+    /// `a/b/c` or `a/b/c/`: root-relative components; `is_dir` means the
+    /// pattern is a prefix (the directory and everything beneath it).
+    Scoped {
+        components: Vec<String>,
+        is_dir: bool,
+    },
 }
 
-/// Check if a directory path matches an exclude pattern.
-fn is_dir_excluded(pattern: &str, dir_path: &str) -> bool {
-    if let Some(dirname) = pattern.strip_suffix('/') {
-        return dir_component_matches(dirname, dir_path);
+impl ExcludePattern {
+    fn parse(pattern: &str) -> Self {
+        if is_scoped_pattern(pattern) {
+            let is_dir = pattern.ends_with('/');
+            let components = pattern
+                .split('/')
+                .filter(|comp| !comp.is_empty() && *comp != ".")
+                .map(str::to_string)
+                .collect();
+            return ExcludePattern::Scoped { components, is_dir };
+        }
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            return ExcludePattern::Suffix(suffix.to_string());
+        }
+        if pattern.ends_with('/') {
+            return ExcludePattern::Dir(pattern.trim_end_matches('/').to_string());
+        }
+        ExcludePattern::Name(pattern.to_string())
     }
-    false
+
+    /// True when the pattern can never match anything (e.g. `/`, `./`, `//`).
+    fn is_empty(&self) -> bool {
+        match self {
+            ExcludePattern::Scoped { components, .. } => components.is_empty(),
+            ExcludePattern::Dir(dirname) => dirname.is_empty() || dirname == ".",
+            _ => false,
+        }
+    }
+
+    fn matches_file(&self, path: &str) -> bool {
+        match self {
+            ExcludePattern::Dir(dirname) => dir_component_matches(dirname, path),
+            ExcludePattern::Suffix(suffix) => path.ends_with(suffix),
+            ExcludePattern::Name(name) => path.rsplit('/').next() == Some(name.as_str()),
+            ExcludePattern::Scoped { components, is_dir } => {
+                scoped_components_match(components, path, *is_dir)
+            }
+        }
+    }
+
+    fn matches_dir(&self, dir_path: &str) -> bool {
+        match self {
+            ExcludePattern::Dir(dirname) => dir_component_matches(dirname, dir_path),
+            ExcludePattern::Scoped {
+                components,
+                is_dir: true,
+            } => scoped_components_match(components, dir_path, true),
+            _ => false,
+        }
+    }
+}
+
+/// Parse every exclude pattern once, warning about shapes that will not do
+/// what a gitignore-habituated user expects.
+fn compile_excludes(excludes: &[String]) -> Vec<ExcludePattern> {
+    excludes
+        .iter()
+        .map(|pattern| {
+            let parsed = ExcludePattern::parse(pattern);
+            if parsed.is_empty() {
+                tracing::warn!(
+                    "Scanner: exclude pattern {:?} has no path components and will never match",
+                    pattern
+                );
+            }
+            if pattern.contains("**") {
+                tracing::warn!(
+                    "Scanner: exclude pattern {:?} uses `**`, which is not supported; it is treated as `*` and matches exactly one path component",
+                    pattern
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// Check if a file path matches an exclude pattern. See [`ExcludePattern`]
+/// for the supported shapes. Test-only convenience: production code uses the
+/// pre-parsed matchers on `Scanner`.
+#[cfg(test)]
+fn is_file_excluded(pattern: &str, path: &str) -> bool {
+    ExcludePattern::parse(pattern).matches_file(path)
+}
+
+/// Check if a directory path matches an exclude pattern. Only directory
+/// patterns (trailing `/`) can match a directory. Test-only convenience.
+#[cfg(test)]
+fn is_dir_excluded(pattern: &str, dir_path: &str) -> bool {
+    ExcludePattern::parse(pattern).matches_dir(dir_path)
+}
+
+/// A pattern is repository-scoped when it contains a `/` other than a
+/// trailing directory marker (e.g. `gen/schema/`, `gen/*.json`, `/gen/`).
+fn is_scoped_pattern(pattern: &str) -> bool {
+    pattern.trim_end_matches('/').contains('/')
+}
+
+/// Match root-relative pattern components against `path` component by
+/// component without allocating. With `prefix` the pattern may stop early
+/// (directory semantics); otherwise every path component must be consumed.
+fn scoped_components_match(components: &[String], path: &str, prefix: bool) -> bool {
+    if components.is_empty() {
+        return false;
+    }
+    let mut path_comps = path.split('/');
+    for pattern_comp in components {
+        match path_comps.next() {
+            Some(comp) if component_matches(pattern_comp, comp) => {}
+            _ => return false,
+        }
+    }
+    prefix || path_comps.next().is_none()
+}
+
+/// Match one path component against a pattern component where `*` matches
+/// any run of characters (never crossing a `/`). `**` degrades to `*`.
+fn component_matches(pattern: &str, comp: &str) -> bool {
+    let Some((first, rest_pattern)) = pattern.split_once('*') else {
+        return pattern == comp;
+    };
+    let Some(mut rest) = comp.strip_prefix(first) else {
+        return false;
+    };
+    let (middle, last) = rest_pattern.rsplit_once('*').unwrap_or(("", rest_pattern));
+    for part in middle.split('*').filter(|part| !part.is_empty()) {
+        match rest.find(part) {
+            Some(idx) => rest = &rest[idx + part.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
 }
 
 /// Check if any path component matches a directory name pattern.
@@ -1475,6 +1614,253 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn test_exclude_repository_relative_paths() {
+        assert!(is_dir_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "codex-rs/app-server-protocol/schema"
+        ));
+        assert!(is_file_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "codex-rs/app-server-protocol/schema/json/ClientRequest.json"
+        ));
+        assert!(!is_file_excluded(
+            "codex-rs/app-server-protocol/schema/",
+            "other/schema/source.json"
+        ));
+        assert!(is_file_excluded(
+            "codex-rs/core/config.schema.json",
+            "codex-rs/core/config.schema.json"
+        ));
+        assert!(!is_file_excluded(
+            "codex-rs/core/config.schema.json",
+            "other/config.schema.json"
+        ));
+    }
+
+    #[test]
+    fn test_scoped_dir_pattern_does_not_match_partial_component() {
+        assert!(!is_file_excluded("gen/schema/", "gen/schema-v2/a.json"));
+        assert!(!is_dir_excluded("gen/schema/", "gen/schema-v2"));
+        assert!(!is_dir_excluded("gen/schema/", "gen"));
+    }
+
+    #[test]
+    fn test_scoped_glob_patterns() {
+        // Glob inside a scoped directory pattern.
+        assert!(is_dir_excluded("codex-rs/gen*/", "codex-rs/gen"));
+        assert!(is_dir_excluded("codex-rs/gen*/", "codex-rs/generated"));
+        assert!(is_file_excluded(
+            "codex-rs/gen*/",
+            "codex-rs/generated/x/y.rs"
+        ));
+        assert!(!is_dir_excluded("codex-rs/gen*/", "other/generated"));
+        assert!(!is_dir_excluded("codex-rs/gen*/", "codex-rs/src"));
+
+        // Glob in the file component: only files directly under that dir.
+        assert!(is_file_excluded("gen/*.json", "gen/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "gen/sub/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "other/a.json"));
+        assert!(!is_file_excluded("gen/*.json", "gen/a.rs"));
+
+        // Glob in a middle component never crosses `/`.
+        assert!(is_file_excluded(
+            "crates/*/schema.json",
+            "crates/core/schema.json"
+        ));
+        assert!(!is_file_excluded(
+            "crates/*/schema.json",
+            "crates/a/b/schema.json"
+        ));
+    }
+
+    #[test]
+    fn test_component_matches() {
+        assert!(component_matches("gen", "gen"));
+        assert!(!component_matches("gen", "generated"));
+        assert!(component_matches("gen*", "gen"));
+        assert!(component_matches("gen*", "generated"));
+        assert!(component_matches("*.json", "a.json"));
+        assert!(!component_matches("*.json", "a.jsonl"));
+        assert!(component_matches("a*b*c", "aXXbYYc"));
+        assert!(component_matches("a*b*c", "abc"));
+        assert!(!component_matches("a*b*c", "acb"));
+        assert!(component_matches("*", ""));
+        assert!(component_matches("*", "anything"));
+    }
+
+    #[test]
+    fn test_double_star_is_treated_as_single_star() {
+        // `**` is not supported. It degrades to `*`, which matches exactly
+        // one path component. Pinned so the behaviour is deliberate.
+        assert!(component_matches("**", "anything"));
+        assert!(is_file_excluded("gen/**/x.json", "gen/a/x.json"));
+        assert!(!is_file_excluded("gen/**/x.json", "gen/x.json"));
+        assert!(!is_file_excluded("gen/**/x.json", "gen/a/b/x.json"));
+        assert!(is_dir_excluded("**/schema/", "a/schema"));
+        assert!(!is_dir_excluded("**/schema/", "a/b/schema"));
+        assert_eq!(
+            ExcludePattern::parse("gen/**/x.json"),
+            ExcludePattern::Scoped {
+                components: vec!["gen".into(), "**".into(), "x.json".into()],
+                is_dir: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_scoped_pattern_normalizes_leading_anchor_and_double_slash() {
+        // gitignore-style root anchors and doubled slashes must not silently
+        // produce a pattern that never matches.
+        for pattern in [
+            "/gen/schema/",
+            "./gen/schema/",
+            "gen//schema/",
+            "/./gen/schema/",
+        ] {
+            assert!(
+                is_dir_excluded(pattern, "gen/schema"),
+                "{pattern} should match dir gen/schema"
+            );
+            assert!(
+                is_file_excluded(pattern, "gen/schema/a.json"),
+                "{pattern} should match gen/schema/a.json"
+            );
+            assert!(
+                !is_file_excluded(pattern, "other/gen/schema/a.json"),
+                "{pattern} is root-anchored"
+            );
+            assert_eq!(
+                ExcludePattern::parse(pattern),
+                ExcludePattern::Scoped {
+                    components: vec!["gen".into(), "schema".into()],
+                    is_dir: true,
+                }
+            );
+        }
+        // A leading `/` turns an unqualified any-depth pattern into a
+        // root-anchored one, as in gitignore.
+        assert!(is_file_excluded("gen/", "src/gen/a.rs"));
+        assert!(!is_file_excluded("/gen/", "src/gen/a.rs"));
+        assert!(is_file_excluded("/gen/", "gen/a.rs"));
+        assert!(is_file_excluded("/config.json", "config.json"));
+        assert!(!is_file_excluded("/config.json", "sub/config.json"));
+    }
+
+    #[test]
+    fn test_empty_scoped_pattern_never_matches() {
+        for pattern in ["/", "./", "//", ".//"] {
+            let parsed = ExcludePattern::parse(pattern);
+            assert!(parsed.is_empty(), "{pattern:?} parsed as {parsed:?}");
+            assert!(
+                !is_dir_excluded(pattern, "gen"),
+                "{pattern:?} must not exclude everything"
+            );
+            assert!(!is_file_excluded(pattern, "gen/a.rs"));
+            assert!(!is_file_excluded(pattern, "a.rs"));
+        }
+    }
+
+    #[test]
+    fn test_star_prefixed_scoped_pattern_matches_exact_depth() {
+        // Before scoped patterns existed, `*/schema.json` fell through to the
+        // suffix branch and matched at any depth >= 1. It is now a scoped
+        // pattern: exactly one directory deep.
+        assert!(is_file_excluded("*/schema.json", "a/schema.json"));
+        assert!(!is_file_excluded("*/schema.json", "a/b/schema.json"));
+        assert!(!is_file_excluded("*/schema.json", "schema.json"));
+        // Unqualified suffix patterns are unchanged.
+        assert!(is_file_excluded("*.json", "a/b/schema.json"));
+        assert_eq!(
+            ExcludePattern::parse("*/schema.json"),
+            ExcludePattern::Scoped {
+                components: vec!["*".into(), "schema.json".into()],
+                is_dir: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_scoped_dir_pattern_excludes_file_at_same_path() {
+        // Trailing `/` does not distinguish files from directories, matching
+        // the unqualified behaviour where `data/` excludes a file named `data`.
+        assert!(is_file_excluded("gen/schema/", "gen/schema"));
+        assert!(is_file_excluded("data/", "data"));
+        assert!(is_file_excluded("data/", "x/data"));
+    }
+
+    #[test]
+    fn test_exclude_pattern_parse_classification() {
+        assert_eq!(
+            ExcludePattern::parse("target/"),
+            ExcludePattern::Dir("target".into())
+        );
+        assert_eq!(
+            ExcludePattern::parse("target*/"),
+            ExcludePattern::Dir("target*".into())
+        );
+        assert_eq!(
+            ExcludePattern::parse("*.pyc"),
+            ExcludePattern::Suffix(".pyc".into())
+        );
+        assert_eq!(
+            ExcludePattern::parse("Cargo.lock"),
+            ExcludePattern::Name("Cargo.lock".into())
+        );
+        assert_eq!(
+            ExcludePattern::parse("gen/*.json"),
+            ExcludePattern::Scoped {
+                components: vec!["gen".into(), "*.json".into()],
+                is_dir: false,
+            }
+        );
+        // Every default exclude is unqualified, so defaults keep any-depth semantics.
+        for pattern in DEFAULT_EXCLUDES {
+            assert!(
+                !matches!(
+                    ExcludePattern::parse(pattern),
+                    ExcludePattern::Scoped { .. }
+                ),
+                "{pattern} should be unqualified"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_excludes_matches_string_matching() {
+        let patterns: Vec<String> = [
+            "target/",
+            "*.pyc",
+            "Cargo.lock",
+            "gen/*.json",
+            "/gen/schema/",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let compiled = compile_excludes(&patterns);
+        assert_eq!(compiled.len(), patterns.len());
+        for path in [
+            "target/x.rs",
+            "a/b.pyc",
+            "sub/Cargo.lock",
+            "gen/a.json",
+            "gen/sub/a.json",
+            "gen/schema/deep/x.json",
+            "other/gen/schema/x.json",
+            "src/main.rs",
+        ] {
+            let expected = patterns.iter().any(|p| is_file_excluded(p, path));
+            let actual = compiled.iter().any(|m| m.matches_file(path));
+            assert_eq!(actual, expected, "file {path}");
+        }
+        for dir in ["target", "gen", "gen/schema", "other/gen/schema", "src"] {
+            let expected = patterns.iter().any(|p| is_dir_excluded(p, dir));
+            let actual = compiled.iter().any(|m| m.matches_dir(dir));
+            assert_eq!(actual, expected, "dir {dir}");
+        }
     }
 
     #[test]
@@ -1830,6 +2216,73 @@ mod tests {
         let all: Vec<_> = result.files_to_extract().into_iter().cloned().collect();
         assert_eq!(all.len(), 1, "Should only find 1 file, found: {:?}", all);
         assert!(all.contains(&PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn test_scan_applies_scoped_and_anchored_excludes_from_config() {
+        // Functional: drives the compiled matchers through a real scan with
+        // scoped, globbed, root-anchored and `*/name` patterns from config.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(
+            root,
+            ".oh/config.toml",
+            "[scanner]\nexclude = [\"gen/schema/\", \"/build-out/\", \"gen/*.json\", \"*/local.toml\", \"crates/*/schema.rs\"]\n",
+        );
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // Kept
+        create_file(root, "src/main.rs", "fn main() {}\n");
+        create_file(root, "other/schema/keep.rs", "// not under gen/\n");
+        create_file(root, "gen/sub/keep.json", "{}"); // gen/*.json is one level only
+        create_file(root, "gen/keep.rs", "// not json\n");
+        create_file(
+            root,
+            "src/build-out/keep.rs",
+            "// /build-out/ is root-anchored\n",
+        );
+        create_file(root, "a/b/local.toml", "x = 1\n"); // */local.toml is exactly one deep
+        create_file(root, "local.toml", "x = 1\n");
+        create_file(
+            root,
+            "crates/a/b/schema.rs",
+            "// too deep for crates/*/schema.rs\n",
+        );
+
+        // Excluded
+        create_file(root, "gen/schema/drop.rs", "// scoped dir\n");
+        create_file(root, "gen/schema/deep/drop.rs", "// scoped dir, nested\n");
+        create_file(root, "build-out/drop.rs", "// root-anchored dir\n");
+        create_file(root, "gen/drop.json", "{}");
+        create_file(root, "a/local.toml", "x = 1\n");
+        create_file(root, "crates/core/schema.rs", "// glob middle component\n");
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result = scanner.scan().unwrap();
+        let mut found: Vec<PathBuf> = result
+            .files_to_extract()
+            .into_iter()
+            .filter(|p| !p.starts_with(".oh"))
+            .cloned()
+            .collect();
+        found.sort();
+
+        let mut expected: Vec<PathBuf> = [
+            "src/main.rs",
+            "other/schema/keep.rs",
+            "gen/sub/keep.json",
+            "gen/keep.rs",
+            "src/build-out/keep.rs",
+            "a/b/local.toml",
+            "local.toml",
+            "crates/a/b/schema.rs",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]
