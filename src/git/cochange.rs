@@ -145,10 +145,8 @@ pub fn mine_cochanges(
         {
             break;
         }
-        if since_oid.is_none() {
-            if commits_walked >= config.max_commits {
-                break;
-            }
+        if since_oid.is_none() && commits_walked >= config.max_commits {
+            break;
         }
 
         let commit = repo.find_commit(oid).context("Failed to find commit")?;
@@ -386,17 +384,24 @@ pub fn resolve_changed_file_set(repo_root: &Path, scope: &str) -> Result<HashSet
     Ok(paths)
 }
 
-/// Convenience wrapper: mine, then build file anchor nodes + `CoChanges` edges
-/// + stats map in one call. Returns `None` if the repo has no `.git` (mining
-/// is not attempted; callers should already gate on `admit_git_history_producer()`
-/// and log a "not available (no .git)" message per #884's non-git-root handling).
+/// Result of [`mine_and_build`]: file anchor nodes, `CoChanges` edges, the
+/// stable-id-keyed stats map for those edges, and the HEAD SHA mined (for the
+/// caller to update the watermark).
+pub type MineAndBuildResult = (Vec<crate::graph::Node>, Vec<Edge>, CoChangeStatsMap, Option<String>);
+
+/// Convenience wrapper: mine, then build file anchor nodes and `CoChanges`
+/// edges and stats map in one call.
+///
+/// Note: if the repo has no `.git`, mining is not attempted -- callers should
+/// already gate on `admit_git_history_producer()` and log a "not available
+/// (no .git)" message per #884's non-git-root handling.
 pub fn mine_and_build(
     repo_root: &Path,
     root_id: &str,
     config: &CoChangeConfig,
     since_sha: Option<&str>,
     existing_stable_ids: &HashSet<String>,
-) -> Result<(Vec<crate::graph::Node>, Vec<Edge>, CoChangeStatsMap, Option<String>)> {
+) -> Result<MineAndBuildResult> {
     let result = mine_cochanges(repo_root, config, since_sha)?;
     let nodes = build_file_anchor_nodes(root_id, &result.pairs, existing_stable_ids);
     let (edges, stats) = build_cochange_edges(root_id, &result.pairs);

@@ -363,6 +363,7 @@ pub(crate) async fn persist_graph_incremental_with_cochange(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // cochange_stats (#884) is the 8th; mirrors existing precedent (embed/real.rs, lsp_completeness.rs).
 async fn persist_graph_incremental_with_retry_limit(
     repo_root: &Path,
     upsert_nodes: &[Node],
