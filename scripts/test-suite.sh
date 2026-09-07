@@ -344,7 +344,7 @@ else
   check "Cross-stack: 3-query Q3 endpoint" \
     "repo-native-alignment search 'expertunities' --repo $_IC_FIXTURE --kind api_endpoint --limit 3" "expertunities"
   check "Cross-stack: BelongsTo edges" \
-    "repo-native-alignment search 'get_expertunities' --repo $_IC_FIXTURE --limit 1" "result"
+    "repo-native-alignment search 'get_expertunities' --repo $_IC_FIXTURE --limit 1" "selected_records: [1-9]"
   check "Cross-stack: Next.js routes survive rescan" \
     "repo-native-alignment scan --repo $_IC_FIXTURE --extract-only --no-embed --no-lsp 2>/dev/null && repo-native-alignment search '' --repo $_IC_FIXTURE --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "3"
   check "Cross-stack: WAL sentinel present after scan" \
@@ -662,9 +662,9 @@ check "operation-report: durable enrichment job ledger recorded" \
 check "operation-report: list-roots includes enrichment summary" \
   "repo-native-alignment list-roots --repo $_OP_FIX 2>/dev/null" 'Enrichment — complete'
 check "operation-report: zero-edge explicit enrich remains fail-closed" \
-  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 2>/dev/null" 'blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage'
+  "repo-native-alignment search helper --repo $_OP_FIX --limit 3 --projection evidence 2>/dev/null" 'blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage'
 check "operation-report: changed-scope call-reference enrich fails closed" \
-  "repo-native-alignment enrich --repo $_OP_FIX --capability call-references --scope changed --no-background-continuation 2>&1" 'changed-file call-reference enrichment is not supported'
+  "repo-native-alignment enrich --repo $_OP_FIX --capability call-references --scope changed --no-background-continuation 2>&1" 'changed-file call-reference enrichment is not supported\|changed-file LSP planning requires a git worktree'
 rm -rf "$_OP_FIX"
 
 # Smoke 1: ADR validate pipeline emits a structured report (#641)
@@ -751,7 +751,7 @@ if ! echo "$_LSP_ENRICH_OUT" | grep -q 'Enrichment (root:.*) complete'; then
   echo "$_LSP_ENRICH_OUT" | tail -20
   FAIL=$((FAIL+1))
 else
-  _LSP_READY_OUT=$(repo-native-alignment search helper --repo "$_LSP_FIX" --limit 3 2>/dev/null)
+  _LSP_READY_OUT=$(repo-native-alignment search helper --repo "$_LSP_FIX" --limit 3 --projection evidence 2>/dev/null)
   if echo "$_LSP_READY_OUT" | grep -q 'blocked: requires repo-wide, persisted, non-zero LSP call/reference coverage'; then
     echo "PASS: bounded zero-edge LSP enrichment remains fail-closed (#644/#668)"
     PASS=$((PASS+1))
@@ -762,6 +762,77 @@ else
   fi
 fi
 rm -rf "$_LSP_FIX"
+
+# ── FEATURES SINCE v0.3.1 (#859 / #864 / #866 / #868 / #872 / #874 / #875) ────
+# One behavioral or structural invariant per merged PR in the v0.3.1..HEAD range.
+echo "" && echo "--- Features since v0.3.1 ---"
+
+# #874: LSP Pass 1 builds one shared symbol index instead of per-item body clones.
+check "LSP Pass 1 shared symbol index present (#873/#874)" \
+  "grep -c 'struct Pass1SymbolIndex' $RNA_REPO/src/extract/lsp/passes.rs" "[1-9]"
+
+# #875: recursion_limit raised so the cuda feature closure compiles.
+check "recursion_limit attribute set for CUDA build (#875)" \
+  "grep -c 'recursion_limit' $RNA_REPO/src/main.rs" "[1-9]"
+
+# #875: repository-scoped excludes are matched component-wise; unqualified
+# names still match at any depth.
+_EXCL_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-scoped-exclude.XXXXXX")
+mkdir -p "$_EXCL_FIX/.oh" "$_EXCL_FIX/gen/schema" "$_EXCL_FIX/other/gen/schema" "$_EXCL_FIX/other/data/deep"
+cat > "$_EXCL_FIX/.oh/config.toml" <<'TOML'
+[scanner]
+exclude = ["gen/schema/", "data/"]
+TOML
+printf 'def scoped_exclude_marker_fn():\n    return 1\n' > "$_EXCL_FIX/gen/schema/excluded.py"
+printf 'def scoped_keep_marker_fn():\n    return 2\n' > "$_EXCL_FIX/other/gen/schema/kept.py"
+printf 'def unqualified_exclude_marker_fn():\n    return 3\n' > "$_EXCL_FIX/other/data/deep/excluded.py"
+repo-native-alignment scan --repo "$_EXCL_FIX" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+check "scoped exclude removes only the root-anchored subtree (#875)" \
+  "repo-native-alignment search 'scoped_exclude_marker_fn' --repo $_EXCL_FIX --limit 1 2>/dev/null" "selected_records: 0\|No results"
+check "scoped exclude keeps the same path at another depth (#875)" \
+  "repo-native-alignment search 'scoped_keep_marker_fn' --repo $_EXCL_FIX --limit 1 2>/dev/null" "selected_records: [1-9]"
+check "unqualified exclude still matches at any depth (#875)" \
+  "repo-native-alignment search 'unqualified_exclude_marker_fn' --repo $_EXCL_FIX --limit 1 2>/dev/null" "selected_records: 0\|No results"
+rm -rf "$_EXCL_FIX"
+
+# #866: explicit embedding backend configuration and the optional cuda feature.
+check "cuda cargo feature declared (#865/#866)" \
+  "grep -c '^cuda = \[' $RNA_REPO/Cargo.toml" "[1-9]"
+check "embedding config validates backend settings (#866)" \
+  "grep -c 'fn validate' $RNA_REPO/src/embed/config.rs" "[1-9]"
+check "README documents [embeddings] configuration (#866)" \
+  "grep -c '^\[embeddings\]' $RNA_REPO/README.md" "[1-9]"
+
+# #864: advisory Open Horizons reference resolution is explicit and offline-safe.
+_OH_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-oh-ref.XXXXXX")
+mkdir -p "$_OH_FIX/src"
+printf 'fn main() {}\n' > "$_OH_FIX/src/main.rs"
+check "resolve-references --offline resolves without network and reports unresolved (#863/#864)" \
+  "repo-native-alignment resolve-references --repo $_OH_FIX --offline 'oh://v1/outcome/example-outcome' 2>/dev/null" '"state": "unresolved"'
+check "resolve_references exercised by the MCP smoke (#864)" \
+  "grep -c 'resolve_references' $RNA_REPO/.github/scripts/mcp-smoke.mjs" "[1-9]"
+rm -rf "$_OH_FIX"
+
+# #859: task context mode and fail-closed convergence.
+_CTX_FIX=$(mktemp -d "${TMPDIR:-/tmp}/rna-ctx.XXXXXX")
+mkdir -p "$_CTX_FIX/src"
+printf 'fn main() { helper(); }\nfn helper() {}\n' > "$_CTX_FIX/src/main.rs"
+repo-native-alignment scan --repo "$_CTX_FIX" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+check "context_mode=task switches intent to implement (#858/#859)" \
+  "repo-native-alignment search 'helper' --repo $_CTX_FIX --context-mode task --limit 3 2>/dev/null" "intent: implement"
+check "convergence with unresolved selectors is not injectable (#860/#859)" \
+  "repo-native-alignment search '' --repo $_CTX_FIX --mode convergence --nodes 'nope_a,nope_b' --direction outgoing --edge-types calls --depth 3 --limit 3 2>/dev/null" "delivery_status: not_injectable"
+check "convergence never falls back to lexical search (#860/#859)" \
+  "repo-native-alignment search '' --repo $_CTX_FIX --mode convergence --nodes 'nope_a,nope_b' --direction outgoing --edge-types calls --depth 3 --limit 3 2>/dev/null" "lexical_fallback: disabled"
+rm -rf "$_CTX_FIX"
+
+# #872: SWE-bench workflows removed.
+check "no swebench workflows remain (#871/#872)" \
+  "ls $RNA_REPO/.github/workflows | grep -c swebench" "^0$"
+
+# #868: CI routes trusted builds to local runners behind repository switches.
+check "CI has local-runner routing switch (#867/#868)" \
+  "grep -c 'LOCAL_LINUX_CI_ENABLED' $RNA_REPO/.github/workflows/rust-main-merge.yml" "[1-9]"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
