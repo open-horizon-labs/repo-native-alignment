@@ -3288,4 +3288,95 @@ exclude = ["dist/"]
             all_files2
         );
     }
+
+    // ── Co-change watermark (#884) ──────────────────────────────────
+
+    #[test]
+    fn test_cochange_watermark_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner.cochange_watermark_sha(), None);
+    }
+
+    #[test]
+    fn test_cochange_watermark_survives_commit_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let mut scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        scanner.set_cochange_watermark_sha(Some("deadbeef".to_string()));
+        scanner.commit_state().unwrap();
+
+        let reloaded = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.cochange_watermark_sha(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn test_cochange_watermark_increments_across_incremental_scans() {
+        let tmp = TempDir::new().unwrap();
+        let mut scanner = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        scanner.set_cochange_watermark_sha(Some("sha-1".to_string()));
+        scanner.commit_state().unwrap();
+
+        // Simulate a later incremental scan advancing the watermark.
+        let mut scanner2 = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner2.cochange_watermark_sha(), Some("sha-1"));
+        scanner2.set_cochange_watermark_sha(Some("sha-2".to_string()));
+        scanner2.commit_state().unwrap();
+
+        let scanner3 = Scanner::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(scanner3.cochange_watermark_sha(), Some("sha-2"));
+    }
+
+    #[test]
+    fn test_read_write_cochange_watermark_without_live_scanner() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(read_cochange_watermark(tmp.path()), None);
+        write_cochange_watermark(tmp.path(), Some("abc123".to_string())).unwrap();
+        assert_eq!(
+            read_cochange_watermark(tmp.path()),
+            Some("abc123".to_string())
+        );
+        write_cochange_watermark(tmp.path(), None).unwrap();
+        assert_eq!(read_cochange_watermark(tmp.path()), None);
+    }
+
+    // ── CoChangeConfig (#884) ────────────────────────────────────────
+
+    #[test]
+    fn test_cochange_config_defaults() {
+        let cfg = CoChangeConfig::default();
+        assert_eq!(cfg.max_commits, 500);
+        assert_eq!(cfg.max_age_days, 365);
+        assert_eq!(cfg.max_files_per_commit, 50);
+    }
+
+    #[test]
+    fn test_cochange_config_loads_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        create_file(
+            tmp.path(),
+            ".oh/config.toml",
+            "[cochange]\nmax_commits = 100\nmax_age_days = 30\nmax_files_per_commit = 10\n",
+        );
+        let cfg = CoChangeConfig::load(tmp.path());
+        assert_eq!(cfg.max_commits, 100);
+        assert_eq!(cfg.max_age_days, 30);
+        assert_eq!(cfg.max_files_per_commit, 10);
+    }
+
+    #[test]
+    fn test_cochange_config_bad_section_falls_back_to_defaults() {
+        let tmp = TempDir::new().unwrap();
+        // Malformed [cochange] section (wrong type) must not panic and must
+        // fall back to defaults, without affecting [scanner]/[patterns].
+        create_file(
+            tmp.path(),
+            ".oh/config.toml",
+            "[cochange]\nmax_commits = \"not-a-number\"\n\n[scanner]\ninclude = [\"target*/\"]\n",
+        );
+        let cfg = CoChangeConfig::load(tmp.path());
+        assert_eq!(cfg, CoChangeConfig::default());
+        // The isolated-parse pattern means [scanner] still parses correctly.
+        let scan_cfg = ScanConfig::load(tmp.path());
+        assert_eq!(scan_cfg.include, vec!["target*/".to_string()]);
+    }
 }

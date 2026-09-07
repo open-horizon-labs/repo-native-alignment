@@ -567,6 +567,33 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_changed_file_set_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        commit_files(&repo, dir, &[("a.rs", "1"), ("b.rs", "1")], "initial");
+        fs::write(dir.join("a.rs"), "2").unwrap();
+
+        let files = resolve_changed_file_set(dir, "working_tree").unwrap();
+        assert!(files.contains(&PathBuf::from("a.rs")));
+        assert!(!files.contains(&PathBuf::from("b.rs")));
+    }
+
+    #[test]
+    fn test_resolve_changed_file_set_base_head_range() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        let first = commit_files(&repo, dir, &[("a.rs", "1")], "first");
+        commit_files(&repo, dir, &[("b.rs", "1")], "second");
+
+        let scope = format!("{}..HEAD", first);
+        let files = resolve_changed_file_set(dir, &scope).unwrap();
+        assert!(files.contains(&PathBuf::from("b.rs")));
+        assert!(!files.contains(&PathBuf::from("a.rs")));
+    }
+
+    #[test]
     fn test_build_file_anchor_nodes_dedups() {
         let pairs = vec![
             CoChangePair {

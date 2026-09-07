@@ -253,7 +253,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path, convergence). Convergence accepts two or more explicitly bound source `nodes`, an optional reachable `before` boundary, direction, edge filters, and depth; it returns deterministic ranked candidates and complete witness paths. The default `agent` projection keeps action context concise; `projection="evidence"` exposes ranking/audit details. Final rendered budgets and explicit body policies prevent duplicate or silently partial source. Opt into role-aware bundles with `context_mode="task"` or the non-mutating `context_mode="graph-delta-beta"`. Existing exact source, subsystem, compact, rerank, and body controls remain available. |
+| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path, convergence, cochange, cochange_gaps). Convergence accepts two or more explicitly bound source `nodes`, an optional reachable `before` boundary, direction, edge filters, and depth; it returns deterministic ranked candidates and complete witness paths. `mode="cochange"` ranks git-history co-change partners for given `node`/`nodes` above `min_confidence` (default 0.3); `mode="cochange_gaps"` reports confident co-change partners missing from a changed-file set (`query`: `"working_tree"` (default), `"staged"`, or `"<base>..<head>"`) — "you changed A but not its usual partner B". The default `agent` projection keeps action context concise; `projection="evidence"` exposes ranking/audit details. Final rendered budgets and explicit body policies prevent duplicate or silently partial source. Opt into role-aware bundles with `context_mode="task"` or the non-mutating `context_mode="graph-delta-beta"`. Existing exact source, subsystem, compact, rerank, and body controls remain available. |
 | `convergence` | Structurally constrained MCP operation for bounded common call-path proofs. Requires source nodes, direction, edge filters, and depth; optionally proves an onward `before` boundary. It shares the search service implementation, fails closed when selectors or Calls coverage are not exact, and returns stable hydration handles only with a nonempty injectable proof. |
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
@@ -417,6 +417,19 @@ After declaring roots, run `scan` (or restart RNA). Roots appear in `list_roots(
 search(root="infra", query="Deployment")  # only K8s results
 search(root="all")                        # all roots
 ```
+
+### Git co-change mining
+
+RNA mines git history for logical coupling — files that tend to change together even with no static import/call relationship. Tune the mining window in `.oh/config.toml`:
+
+```toml
+[cochange]
+max_commits = 500        # bounded first-parent commit window (default: 500)
+max_age_days = 365       # don't mine commits older than this (default: 365)
+max_files_per_commit = 50  # skip large refactor/vendoring commits entirely (default: 50)
+```
+
+Query it with `search(node="src/foo.rs", mode="cochange")` (ranked partners above `min_confidence`) or `search(mode="cochange_gaps")` (confident partners missing from your current changed-file set). Non-git roots report "Co-change: not available (no .git)" in `list_roots`.
 
 ### Custom boundary detection
 

@@ -1304,7 +1304,16 @@ async fn legacy_search_dispatch(params: &SearchParams, ctx: &SearchContext<'_>) 
         false
     };
 
-    if let Some(ref node_ids) = params.nodes {
+    // mode="cochange" interprets `nodes` as its own list of co-change anchor
+    // selectors (handled inside search_traversal), not a batch node-retrieval
+    // request -- skip the generic nodes=[...] batch dispatch below for it.
+    let is_cochange_mode = matches!(
+        params.normalized_mode(),
+        Some("cochange") | Some("cochange_gaps")
+    );
+    if let Some(ref node_ids) = params.nodes
+        && !is_cochange_mode
+    {
         let node_ids: Vec<&str> = node_ids
             .iter()
             .map(|s| s.trim())
@@ -10317,19 +10326,34 @@ async fn search_traversal(
         }
 
         let index_map = gs.node_index_map();
+        let root_slugs = crate::server::state::GraphState::root_slugs_from_index_map(index_map);
         let mut out = String::from("## Co-change partners\n\n");
         let mut any_found = false;
         for selector in &selectors {
+            // Resolve either a symbol/stable-id selector (containing file is
+            // used as the co-change anchor) or a bare file path selector
+            // (checked directly against each root's file anchor).
             let resolved = gs.resolve_node_id(selector);
-            let Some(anchor_node) = gs.node_by_stable_id(&resolved, index_map) else {
+            let file_root = gs.node_by_stable_id(&resolved, index_map).map(|n| {
+                (n.id.file.clone(), n.id.root.clone())
+            }).or_else(|| {
+                root_slugs.iter().find_map(|root| {
+                    let candidate = crate::git::cochange::file_anchor_node_id(
+                        root,
+                        Path::new(selector.as_str()),
+                    );
+                    gs.index
+                        .get_node(&candidate.to_stable_id())
+                        .map(|_| (PathBuf::from(selector), root.clone()))
+                })
+            });
+            let Some((file, root)) = file_root else {
                 out.push_str(&format!(
                     "`{}`: not found in graph.\n\n",
                     strip_root_prefix(selector, strip)
                 ));
                 continue;
             };
-            let file = anchor_node.id.file.clone();
-            let root = anchor_node.id.root.clone();
             let anchor_id = crate::git::cochange::file_anchor_node_id(&root, &file);
             let anchor_stable = anchor_id.to_stable_id();
 
@@ -10374,11 +10398,20 @@ async fn search_traversal(
                     }
                 }
             }
-            partners.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            // Rank by support first, confidence second. A pair that co-changed
+            // once (support=1) trivially has confidence=1.0 if one of the two
+            // files has only ever changed that once -- ranking by confidence
+            // alone would bury genuinely recurring partners (support=9,
+            // confidence=0.3) beneath single-occurrence flukes. `min_confidence`
+            // remains the filter floor; support drives the ordering.
+            partners.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
 
             out.push_str(&format!(
                 "### `{}`\n",
-                strip_root_prefix(&resolved, strip)
+                strip_root_prefix(&anchor_stable, strip)
             ));
             if partners.is_empty() {
                 out.push_str(&format!(
@@ -10486,8 +10519,11 @@ async fn search_traversal(
             if best_partners.is_empty() {
                 continue;
             }
-            best_partners
-                .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            // Same support-first ranking as mode="cochange" -- see comment there.
+            best_partners.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
             best_partners.dedup_by(|a, b| a.0 == b.0);
             for (partner_file, support, confidence) in best_partners.iter().take(top_k) {
                 gap_lines.push(format!(
@@ -19384,5 +19420,146 @@ mod tests {
             convergence_unresolved(&tiny, &detail),
             ConvergenceDelivery::BudgetTooSmall { minimum_bytes, .. } if minimum_bytes > 10
         ));
+    }
+
+    // ── mode="cochange" / mode="cochange_gaps" (#884) ────────────────────────
+
+    fn make_cochange_fixture() -> (Node, Node, GraphState) {
+        let anchor_a = crate::git::cochange::file_anchor_node_id("local", Path::new("src/a.rs"));
+        let anchor_b = crate::git::cochange::file_anchor_node_id("local", Path::new("src/b.rs"));
+        let node_a = Node {
+            id: anchor_a.clone(),
+            language: String::new(),
+            signature: "file src/a.rs".to_string(),
+            line_start: 0,
+            line_end: 0,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Git,
+        };
+        let node_b = Node {
+            id: anchor_b.clone(),
+            language: String::new(),
+            signature: "file src/b.rs".to_string(),
+            line_start: 0,
+            line_end: 0,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Git,
+        };
+        let edge = crate::graph::Edge {
+            from: anchor_a.clone(),
+            to: anchor_b.clone(),
+            kind: EdgeKind::CoChanges,
+            source: ExtractionSource::Git,
+            confidence: crate::graph::Confidence::Detected,
+            evidence: Vec::new(),
+        };
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(std::slice::from_ref(&edge));
+        index.ensure_node(&node_a.stable_id(), &node_a.id.kind.to_string());
+        index.ensure_node(&node_b.stable_id(), &node_b.id.kind.to_string());
+        let mut stats = crate::graph::CoChangeStatsMap::new();
+        stats.insert(
+            edge.stable_id(),
+            crate::graph::CoChangeStats {
+                support: 4,
+                confidence: 0.8,
+            },
+        );
+        let graph = GraphState::new(
+            vec![node_a.clone(), node_b.clone()],
+            vec![edge],
+            index,
+            None,
+            HashSet::new(),
+        )
+        .with_cochange_stats(stats);
+        (node_a, node_b, graph)
+    }
+
+    #[tokio::test]
+    async fn cochange_mode_ranks_partners_above_min_confidence() {
+        let (node_a, _node_b, graph) = make_cochange_fixture();
+        let repository = PathBuf::from("/tmp/cochange-fixture");
+        let ctx = make_search_context(&graph, &repository);
+
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("cochange".into()),
+            min_confidence: Some(0.5),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("src/b.rs"),
+            "expected b.rs as a partner, got: {response}"
+        );
+        assert!(response.contains("confidence=0.80"), "got: {response}");
+
+        // A higher threshold than the mined confidence excludes the partner.
+        let strict = SearchParams {
+            min_confidence: Some(0.95),
+            ..params.clone()
+        };
+        let response = search(&strict, &ctx).await;
+        assert!(
+            response.contains("No co-change partners"),
+            "got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cochange_mode_requires_a_selector() {
+        let (_, _, graph) = make_cochange_fixture();
+        let repository = PathBuf::from("/tmp/cochange-fixture-empty");
+        let ctx = make_search_context(&graph, &repository);
+        let params = SearchParams {
+            mode: Some("cochange".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(response.contains("requires node="), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn cochange_gaps_mode_reports_missing_partner() {
+        let (_, _, graph) = make_cochange_fixture();
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("src/a.rs")).unwrap();
+            index.add_path(Path::new("src/b.rs")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        // Only a.rs changes in the working tree -- b.rs (its confident
+        // co-change partner) is the expected gap.
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() { /* changed */ }\n").unwrap();
+
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("cochange_gaps".into()),
+            min_confidence: Some(0.5),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("src/b.rs") && response.contains("src/a.rs"),
+            "got: {response}"
+        );
     }
 }

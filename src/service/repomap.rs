@@ -54,8 +54,13 @@ fn top_cochange_partner(
                 confidence: crate::graph::Confidence::Detected,
                 evidence: Vec::new(),
             };
+            // Rank by support first, confidence second -- see the matching
+            // comment in `service/search.rs`'s mode="cochange" for why (a
+            // single-occurrence pair trivially has confidence=1.0).
             if let Some(stats) = graph_state.cochange_stats.get(&edge.stable_id())
-                && best.as_ref().is_none_or(|(_, _, c)| stats.confidence > *c)
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, s, c)| (stats.support, stats.confidence) > (*s, *c))
             {
                 best = Some((
                     neighbor_node.id.file.display().to_string(),

@@ -74,6 +74,15 @@ check "subsystem filter" \
 check "cross-file calls symbol present" \
   "repo-native-alignment search 'import_calls_pass' --repo $RNA_REPO --limit 1" "import_calls"
 
+# ── CO-CHANGE MINING (#884) ──────────────────────────────────────────────────
+echo "" && echo "--- Co-change mining (#884) ---"
+# src/server/tools.rs and src/server/handlers.rs have historically changed
+# together many times (MCP tool schema + handler wiring). If mining is wired
+# up end-to-end (mined, persisted, round-tripped through LanceDB, and visible
+# via the query surface), they should surface as confident co-change partners.
+check "co-change: tools.rs <-> handlers.rs surfaced as partners" \
+  "repo-native-alignment search '' --repo $RNA_REPO --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20" "handlers.rs"
+
 # ── EDGE TRAVERSAL ───────────────────────────────────────────────────────────
 echo "" && echo "--- Edge Traversal ---"
 check "BelongsTo edges (#396)" \

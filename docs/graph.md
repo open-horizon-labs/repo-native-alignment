@@ -61,8 +61,9 @@ MCP Server (rust-mcp-sdk)      <- stdio + HTTP transport
 
 ## Nodes and Edges
 
-- **Nodes:** symbols, schemas, artifacts, PR merges, framework nodes, channel nodes, subsystem metadata
-- **Edges:** calls, implements, depends-on, modified, serves, produces, consumes, uses-framework, referenced-by (with provenance + confidence)
+- **Nodes:** symbols, schemas, artifacts, PR merges, framework nodes, channel nodes, subsystem metadata, file anchors (synthetic `file` nodes for git co-change edges)
+- **Edges:** calls, implements, depends-on, modified, serves, produces, consumes, uses-framework, referenced-by, co-changes (with provenance + confidence)
+- **Co-change mining:** bounded first-parent commit-history mining surfaces logical coupling — files that change together without a static import/call relationship. `EdgeKind::CoChanges` edges carry `support`/`confidence` in a side-channel map (not fields on `Edge`, to avoid touching every edge construction site) and persist as two nullable LanceDB columns. Query via `search(node=..., mode="cochange")` or `search(mode="cochange_gaps")`. See `[cochange]` in `.oh/config.toml`.
 - **Traversal:** in-memory via petgraph (microseconds)
 - **Readiness:** MCP responses surface exact-search, embedding, LSP call/reference, and dead-code prerequisite readiness separately from index freshness.
 
