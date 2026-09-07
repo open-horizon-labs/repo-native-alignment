@@ -219,7 +219,10 @@ impl Pass1SymbolIndex {
         })
     }
 
-    /// Language-matching nodes in `file`, in matching-set order.
+    /// Language-matching nodes in `file`, in matching-set order. Production
+    /// lookups go through `implementor_at`; this remains for tests that pin
+    /// the per-file ordering the index guarantees.
+    #[cfg(test)]
     fn nodes_in_file(&self, file: &Path) -> impl Iterator<Item = &Node> + '_ {
         self.by_file
             .get(file)
