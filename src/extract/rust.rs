@@ -116,7 +116,9 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("use_declaration", Some("argument")),
     ],
     binding_leaf_kinds: &["identifier", "shorthand_field_identifier", "self"],
-    binding_skip_kinds: &["use_wildcard"],
+    // `lifetime` wraps an `identifier` (`&'a self`), which is not a value binding.
+    binding_skip_kinds: &["use_wildcard", "lifetime"],
+    binding_scope_kinds: &["closure_expression"],
     scope_bindings_complete: true,
 };
 

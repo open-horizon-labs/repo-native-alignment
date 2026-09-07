@@ -273,7 +273,12 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     // Local binding evidence (#877). Verified against tree-sitter-python 0.25.0.
     // `default_parameter` / `typed_default_parameter` are pruned when walking
     // the whole `parameters` list and re-entered through their `name` field so
-    // default-value expressions never contribute names.
+    // default-value expressions never contribute names; `aliased_import` is
+    // pruned and re-entered through `alias` so `from m import thing as alias`
+    // binds `alias` only. `class_pattern` is pruned so `case Point(x=px)` does
+    // not bind the class name `Point`; its inner `case_pattern`s are still
+    // reached by the subtree walk (keyword names such as `x` remain an
+    // accepted over-collection: `keyword_pattern` has no fields).
     binding_sites: &[
         ("parameters", None),
         ("lambda_parameters", None),
@@ -289,6 +294,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
         ("class_definition", Some("name")),
         ("import_statement", Some("name")),
         ("import_from_statement", Some("name")),
+        ("aliased_import", Some("alias")),
         ("case_pattern", None),
     ],
     binding_leaf_kinds: &["identifier"],
@@ -297,7 +303,10 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
         "subscript",
         "default_parameter",
         "typed_default_parameter",
+        "aliased_import",
+        "class_pattern",
     ],
+    binding_scope_kinds: &["lambda"],
     scope_bindings_complete: true,
     has_parent_module_request: false,
 };
@@ -349,6 +358,7 @@ pub static CYTHON_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
     has_parent_module_request: false,
 };
@@ -429,6 +439,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
         ("catch_clause", Some("parameter")),
         ("generator_function_declaration", Some("name")),
         ("class_declaration", Some("name")),
+        ("class", Some("name")),
         ("function_expression", Some("name")),
         ("generator_function", Some("name")),
     ],
@@ -444,6 +455,11 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
         "parenthesized_expression",
         "undefined",
         "this",
+    ],
+    binding_scope_kinds: &[
+        "arrow_function",
+        "function_expression",
+        "generator_function",
     ],
     scope_bindings_complete: true,
 };
@@ -523,6 +539,11 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
         "parenthesized_expression",
         "undefined",
     ],
+    binding_scope_kinds: &[
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+    ],
     scope_bindings_complete: true,
 };
 
@@ -589,9 +610,12 @@ pub static GO_CONFIG: LangConfig = LangConfig {
         ("range_clause", Some("left")),
         ("type_switch_statement", Some("alias")),
         ("type_spec", Some("name")),
+        // `select { case v := <-ch: }` binds through `receive_statement.left`.
+        ("receive_statement", Some("left")),
     ],
     binding_leaf_kinds: &["identifier", "type_identifier"],
     binding_skip_kinds: &["selector_expression", "index_expression"],
+    binding_scope_kinds: &["func_literal"],
     scope_bindings_complete: true,
 };
 
@@ -662,6 +686,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -723,6 +748,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -793,6 +819,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -858,6 +885,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -913,6 +941,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -980,6 +1009,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1029,6 +1059,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1088,6 +1119,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1139,6 +1171,7 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1197,6 +1230,7 @@ pub static C_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1267,6 +1301,7 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1332,6 +1367,7 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1395,6 +1431,7 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 
@@ -1447,6 +1484,7 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     binding_sites: &[],
     binding_leaf_kinds: &[],
     binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
     scope_bindings_complete: false,
 };
 

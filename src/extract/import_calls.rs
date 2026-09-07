@@ -2645,4 +2645,128 @@ mod tests {
                 .any(|edge| edge.from.root == "root-b" && edge.to == callee_b.id)
         );
     }
+
+    #[test]
+    fn nested_python_def_inherits_enclosing_parameter_shadow() {
+        // Step 2 review of #878: `def outer(execute): def inner(): execute()`
+        // emitted a false cross-file Calls edge from `inner` because its
+        // binding set omitted the enclosing function's parameters. The nested
+        // node must inherit every enclosing scope; the `other` twin proves the
+        // edge still emits when nothing shadows the import.
+        for (params, expect_call) in [("execute", false), ("other", true)] {
+            let mut nodes = extract_python_nodes(
+                "src/caller.py",
+                &format!(
+                    "from worker import execute\n\ndef outer({params}):\n    def inner():\n        return execute()\n    return inner\n"
+                ),
+            );
+            nodes.extend(extract_python_nodes(
+                "src/worker.py",
+                "def execute():\n    return 1\n",
+            ));
+            let inner = nodes
+                .iter()
+                .find(|node| {
+                    node.id.kind == NodeKind::Function
+                        && (node.id.name == "inner" || node.id.name.ends_with(".inner"))
+                })
+                .expect("nested def node");
+            let callee = nodes
+                .iter()
+                .find(|node| node.id.name == "execute" && node.id.file.ends_with("worker.py"))
+                .unwrap();
+            let edges = import_calls_pass(&nodes);
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == inner.id && edge.to == callee.id
+            });
+            if expect_call {
+                let call = call.unwrap_or_else(|| {
+                    panic!("unshadowed nested call must emit for outer({params}): {edges:?}")
+                });
+                assert_eq!(call.confidence, Confidence::Detected);
+            } else {
+                assert!(
+                    call.is_none(),
+                    "enclosing parameter `{params}` shadows the import inside `inner`: {edges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_ts_and_js_functions_inherit_enclosing_parameter_shadow() {
+        // TS/JS twins of the nested-def case, covering both nested-function
+        // producers: the generic `function_declaration` path and the
+        // arrow-function path in typescript.rs / javascript.rs.
+        use crate::extract::Extractor;
+        use crate::extract::javascript::JavaScriptExtractor;
+        use crate::extract::typescript::TypeScriptExtractor;
+        let ts = TypeScriptExtractor::new();
+        let js = JavaScriptExtractor::new();
+        let extract = |extractor: &dyn Extractor, path: &str, code: &str| {
+            let mut nodes = extractor
+                .extract(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        for (extractor, ext) in [(&ts as &dyn Extractor, "ts"), (&js as &dyn Extractor, "js")] {
+            let api = extract(
+                extractor,
+                &format!("src/api.{ext}"),
+                "export function helper() { return 1; }\n",
+            );
+            for (param, expect_call) in [("helper", false), ("other", true)] {
+                let mut nodes = extract(
+                    extractor,
+                    &format!("src/caller.{ext}"),
+                    &format!(
+                        "import {{ helper }} from './api';\n\nexport function outerFn({param}) {{\n  const innerArrow = () => helper();\n  function innerDecl() {{ return helper(); }}\n  return [innerArrow, innerDecl];\n}}\n"
+                    ),
+                );
+                nodes.extend(api.iter().cloned());
+                let callee = nodes.iter().find(|node| node.id.name == "helper").unwrap();
+                let edges = import_calls_pass(&nodes);
+                for inner_name in ["innerArrow", "innerDecl"] {
+                    let inner = nodes
+                        .iter()
+                        .find(|node| {
+                            node.id.kind == NodeKind::Function
+                                && (node.id.name == inner_name
+                                    || node.id.name.ends_with(&format!(".{inner_name}")))
+                        })
+                        .unwrap_or_else(|| panic!("missing {inner_name} in .{ext}"));
+                    assert_eq!(
+                        inner
+                            .metadata
+                            .get("scope_bindings_complete")
+                            .map(String::as_str),
+                        Some("true"),
+                        "{inner_name} (.{ext}) must carry scope evidence"
+                    );
+                    let call = edges.iter().find(|edge| {
+                        edge.kind == EdgeKind::Calls
+                            && edge.from == inner.id
+                            && edge.to == callee.id
+                    });
+                    if expect_call {
+                        let call = call.unwrap_or_else(|| {
+                            panic!(
+                                "unshadowed nested call must emit from {inner_name} (.{ext}): {edges:?}"
+                            )
+                        });
+                        assert_eq!(call.confidence, Confidence::Detected);
+                    } else {
+                        assert!(
+                            call.is_none(),
+                            "enclosing parameter `helper` shadows the import inside {inner_name} (.{ext}): {edges:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

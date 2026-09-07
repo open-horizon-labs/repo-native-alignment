@@ -237,6 +237,13 @@ pub struct LangConfig {
     /// `member_expression`, `selector_expression`, ...) or forms re-entered by
     /// a narrower site (Python `default_parameter` -> `.name`).
     pub binding_skip_kinds: &'static [&'static str],
+    /// Anonymous function-like kinds that open a local scope but are not
+    /// [`NodeKind::Function`] entries in `node_kinds` (`arrow_function`,
+    /// `function_expression`, `closure_expression`, `lambda`, `func_literal`).
+    /// Together with the Function-mapped kinds they define the enclosing
+    /// scopes a nested function inherits bindings from: a parameter of an
+    /// outer function shadows an import inside a nested `def` or closure too.
+    pub binding_scope_kinds: &'static [&'static str],
     /// Whether `binding_sites` has been curated for this language so the
     /// generic extractor may stamp `scope_bindings_complete="true"` on its
     /// Function nodes. `false` keeps the `import_calls_pass` function-scoped
@@ -257,9 +264,16 @@ const BINDING_SKIP_FIELDS: &[&str] = &["type", "right", "key", "condition", "pat
 /// body text — and, at each configured binding site, gathers leaf names while
 /// pruning `config.binding_skip_kinds` and [`BINDING_SKIP_FIELDS`]. Names of
 /// nested nodes that this config maps to [`NodeKind::Function`] are added too
-/// (a nested `def helper()` shadows an imported `helper`). The root node's own
-/// name is not added: a method named like an import does not bind that name
-/// inside its own body.
+/// (a nested `def helper()` shadows an imported `helper`).
+///
+/// Nested functions inherit their enclosing scopes: `import_calls_pass`
+/// resolves a bare call inside `def inner()` against the names visible there,
+/// which include every parameter and local of the functions around it. The
+/// walk therefore starts at the outermost enclosing function-scope ancestor
+/// (Function-mapped `node_kinds` or [`LangConfig::binding_scope_kinds`]), so a
+/// nested node's set is a superset of everything its body can see. The walk
+/// root's own name is not added: a method named like an import does not bind
+/// that name inside its own body.
 pub(crate) fn collect_local_bindings(
     fn_node: tree_sitter::Node,
     source: &[u8],
@@ -269,7 +283,15 @@ pub(crate) fn collect_local_bindings(
     if config.binding_sites.is_empty() {
         return bindings;
     }
-    let mut stack = vec![fn_node];
+    let mut walk_root = fn_node;
+    let mut ancestor = fn_node;
+    while let Some(parent) = ancestor.parent() {
+        if opens_binding_scope(parent.kind(), config) {
+            walk_root = parent;
+        }
+        ancestor = parent;
+    }
+    let mut stack = vec![walk_root];
     while let Some(node) = stack.pop() {
         let kind = node.kind();
         for (site_kind, field) in config.binding_sites {
@@ -286,7 +308,7 @@ pub(crate) fn collect_local_bindings(
                 None => collect_binding_leaves(node, source, config, &mut bindings),
             }
         }
-        if node.id() != fn_node.id()
+        if node.id() != walk_root.id()
             && config
                 .node_kinds
                 .iter()
@@ -303,6 +325,17 @@ pub(crate) fn collect_local_bindings(
         }
     }
     bindings
+}
+
+/// Whether a tree-sitter kind opens a local binding scope for `config`:
+/// either a Function-mapped `node_kinds` entry or an anonymous function form
+/// listed in `binding_scope_kinds`.
+fn opens_binding_scope(kind: &str, config: &LangConfig) -> bool {
+    config.binding_scope_kinds.contains(&kind)
+        || config
+            .node_kinds
+            .iter()
+            .any(|(ts_kind, nk)| *ts_kind == kind && *nk == NodeKind::Function)
 }
 
 fn collect_binding_leaves(
@@ -672,7 +705,11 @@ fn collect_nodes(
             // Local binding evidence for cross-file call resolution (#877).
             // Only languages with a curated `binding_sites` table may claim
             // completeness; `import_calls_pass` keeps its Calls gate closed
-            // for every other Function node.
+            // for every other Function node. Both keys are internal evidence:
+            // they are persisted with the node (`metadata_json`) because
+            // incremental scans re-run `import_calls_pass` over cached nodes
+            // from unchanged files, but they are deliberately not rendered in
+            // agent-facing output — the delivered artifact is the Calls edge.
             if node_kind == NodeKind::Function && config.scope_bindings_complete {
                 let bindings = collect_local_bindings(node, source, config);
                 metadata.insert(
@@ -7447,7 +7484,7 @@ fn zoo(a: u32, (b, c): (u32, u32), Point { x, y: py }: Point) -> u32 {
     execute()
 }
 impl Point {
-    fn run(&self) -> u32 { run(); self.x }
+    fn run<'a>(&'a self) -> u32 { run(); self.x }
 }
 "#;
         let zoo = local_bindings_of(&RUST_CONFIG, "zoo.rs", code, "zoo");
@@ -7471,7 +7508,8 @@ impl Point {
             ],
         );
         let run = local_bindings_of(&RUST_CONFIG, "zoo.rs", code, "Point.run");
-        assert_bindings(&run, &["self"], &["run", "x"]);
+        // `'a` is a lifetime, not a value binding.
+        assert_bindings(&run, &["self"], &["run", "x", "a"]);
     }
 
     #[test]
@@ -7529,6 +7567,10 @@ def zoo(a, b=default_b(), *args, c: int = 2, **kw):
                 "execute",
                 "mod",
                 "cmd",
+                // `case Point(x=px)` binds `px`, not the class name.
+                "Point",
+                // `from mod import thing as alias` binds `alias`, not `thing`.
+                "thing",
             ],
         );
     }
@@ -7549,6 +7591,7 @@ function zoo({ a, b: renamed, ...rest }: Props, [first, , second = 3]: number[],
   function nested() {}
   class Inner {}
   const fe = function named(z: number) {};
+  const ce = class NamedClass {};
   obj.prop = 1;
   arr[0] = 2;
   return execute();
@@ -7560,6 +7603,7 @@ function zoo({ a, b: renamed, ...rest }: Props, [first, , second = 3]: number[],
             &[
                 "a", "renamed", "rest", "first", "second", "opt", "c", "e", "f", "g", "k", "idx",
                 "err", "cb", "p", "q", "single", "v", "nested", "Inner", "fe", "named", "z",
+                "ce", "NamedClass",
             ],
             &[
                 "b", "d", "prop", "obj", "arr", "execute", "Props", "number", "string", "keys",
@@ -7585,6 +7629,10 @@ func zoo(a, b int, c string, rest ...int) (out int, err error) {
     switch t := val.(type) {}
     f := func(p int) int { return p }
     type Local struct{}
+    select {
+    case rv := <-ch:
+        _ = rv
+    }
     obj.field = 1
     arr[0] = 2
     return worker.Execute()
@@ -7597,7 +7645,7 @@ func (r *Recv) method(m int) {}
             &zoo,
             &[
                 "a", "b", "c", "rest", "out", "err", "x", "y", "z", "w", "k", "i", "v", "t", "f",
-                "p", "Local",
+                "p", "Local", "rv",
             ],
             &[
                 "int", "string", "error", "field", "obj", "arr", "compute", "pair", "Execute",
@@ -7648,6 +7696,111 @@ func (r *Recv) method(m int) {}
         assert!(
             !calls.iter().any(|c| c.starts_with("b ->")),
             "`b` makes no calls; row-keyed lookup would misattribute, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn nested_functions_inherit_enclosing_scope_bindings() {
+        // A parameter or local of an enclosing function shadows an import
+        // inside a nested def / inner function too (Step 2 review of #878):
+        // the nested node's `local_bindings` must be a superset of every
+        // scope its body can see, otherwise `import_calls_pass` emits a false
+        // cross-file Calls edge from the inner function.
+        use crate::extract::configs::{PYTHON_CONFIG, TYPESCRIPT_CONFIG};
+        let py = r#"
+from worker import execute
+
+def outer(execute, other):
+    local = 1
+    def inner(own):
+        return execute()
+    class Holder:
+        def method(self):
+            return execute()
+    return inner
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("nested.py"), py)
+            .unwrap();
+        let bindings_of = |suffix: &str| {
+            let func = result
+                .nodes
+                .iter()
+                .find(|n| {
+                    n.id.kind == NodeKind::Function
+                        && (n.id.name == suffix || n.id.name.ends_with(&format!(".{suffix}")))
+                })
+                .unwrap_or_else(|| panic!("missing nested function {suffix}"));
+            assert_eq!(
+                func.metadata
+                    .get("scope_bindings_complete")
+                    .map(String::as_str),
+                Some("true")
+            );
+            func.metadata
+                .get("local_bindings")
+                .expect("local_bindings")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>()
+        };
+        let inner = bindings_of("inner");
+        assert_bindings(
+            &inner,
+            &["execute", "other", "local", "own", "inner"],
+            &["outer"],
+        );
+        let method = bindings_of("method");
+        assert_bindings(&method, &["execute", "other", "local", "self"], &["outer"]);
+        // The enclosing function itself is unchanged: its own name is not a binding.
+        let outer = bindings_of("outer");
+        assert_bindings(
+            &outer,
+            &["execute", "other", "local", "inner", "Holder"],
+            &["outer"],
+        );
+
+        let ts = r#"
+import { helper } from './api';
+export function outerTs(helper: () => number, other: number) {
+  const localValue = 1;
+  function innerDecl() { return helper(); }
+  class Inner { method() { return helper(); } }
+  return innerDecl;
+}
+"#;
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("nested.ts"), ts)
+            .unwrap();
+        for name in ["innerDecl", "Inner.method", "method"] {
+            let Some(func) = result
+                .nodes
+                .iter()
+                .find(|n| n.id.kind == NodeKind::Function && n.id.name == name)
+            else {
+                continue;
+            };
+            let bindings = func
+                .metadata
+                .get("local_bindings")
+                .expect("local_bindings")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>();
+            assert_bindings(
+                &bindings,
+                &["helper", "other", "localValue", "innerDecl"],
+                &["outerTs"],
+            );
+        }
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| n.id.kind == NodeKind::Function && n.id.name == "innerDecl"),
+            "nested function_declaration must be extracted"
         );
     }
 }

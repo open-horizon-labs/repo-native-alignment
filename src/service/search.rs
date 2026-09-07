@@ -3299,6 +3299,9 @@ async fn task_records(
         ),
     ];
     let base_query = params.query.as_deref().unwrap_or_default();
+    // Tokenized once per request; every lane's eligibility check and the
+    // lexical supplement pass reuse it.
+    let query_terms = task_query_terms(base_query);
     for (facet, role, lane, qualifier) in lane_specs {
         if !requested_facets.contains(&facet) {
             continue;
@@ -3327,8 +3330,12 @@ async fn task_records(
                 rejected += 1;
                 continue;
             };
-            let quality =
-                task_candidate_quality_for_roles(node, &BTreeSet::from([role]), false, base_query);
+            let quality = task_candidate_quality_with_query_terms(
+                node,
+                &BTreeSet::from([role]),
+                false,
+                &query_terms,
+            );
             if quality != EvidenceQuality::Actionable {
                 rejected += 1;
                 let audit_rank = output.candidate_audit.len();
@@ -3397,7 +3404,6 @@ async fn task_records(
         // prevents pre-eligibility truncation from making an authoritative
         // role impossible to satisfy.
         if role != TaskRole::BehavioralAnalogue && eligible < TASK_LANE_CANDIDATE_LIMIT {
-            let query_terms = task_query_terms(base_query);
             let mut supplements = candidate_nodes
                 .values()
                 .copied()
