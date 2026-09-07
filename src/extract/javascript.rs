@@ -246,9 +246,10 @@ fn collect_js_specials(
                         // (#877) — same walker the generic extractor uses for
                         // `function_declaration`, applied to the arrow /
                         // function-expression value node.
-                        if JAVASCRIPT_CONFIG.scope_bindings_complete {
-                            let bindings =
-                                collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG);
+                        if JAVASCRIPT_CONFIG.scope_bindings_complete
+                            && let Some(bindings) =
+                                collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG)
+                        {
                             metadata.insert(
                                 "local_bindings".to_string(),
                                 render_local_bindings(&bindings),
@@ -426,8 +427,10 @@ fn collect_js_specials(
                     // Local binding evidence (#877): class-field functions are
                     // Function nodes too, so they need the same scope proof or
                     // `import_calls_pass` keeps their Calls gate closed.
-                    if JAVASCRIPT_CONFIG.scope_bindings_complete {
-                        let bindings = collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG);
+                    if JAVASCRIPT_CONFIG.scope_bindings_complete
+                        && let Some(bindings) =
+                            collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG)
+                    {
                         metadata.insert(
                             "local_bindings".to_string(),
                             render_local_bindings(&bindings),

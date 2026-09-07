@@ -282,13 +282,19 @@ const BINDING_SKIP_FIELDS: &[&str] = &["type", "right", "key", "condition", "pat
 /// one extraction run ([`clear_local_bindings_cache`] resets it at the start
 /// of [`GenericExtractor::run`]); `k` nested functions cost one subtree walk
 /// instead of `k`.
+///
+/// Returns `None` when the scope subtree contains a tree-sitter `ERROR` node
+/// (syntax the vendored grammar cannot parse, e.g. TS 5.2 `using x = ...`):
+/// a binding inside the unparsed region would be invisible, so the evidence
+/// is unreliable and callers must not stamp `scope_bindings_complete`. The
+/// gate then fails closed for exactly those functions.
 pub(crate) fn collect_local_bindings(
     fn_node: tree_sitter::Node,
     source: &[u8],
     config: &LangConfig,
-) -> Rc<BTreeSet<String>> {
+) -> Option<Rc<BTreeSet<String>>> {
     if config.binding_sites.is_empty() {
-        return Rc::new(BTreeSet::new());
+        return Some(Rc::new(BTreeSet::new()));
     }
     let mut walk_root = fn_node;
     let mut ancestor = fn_node;
@@ -297,6 +303,9 @@ pub(crate) fn collect_local_bindings(
             walk_root = parent;
         }
         ancestor = parent;
+    }
+    if walk_root.has_error() {
+        return None;
     }
     let cache_key = BindingScopeKey {
         source_ptr: source.as_ptr() as usize,
@@ -307,13 +316,13 @@ pub(crate) fn collect_local_bindings(
     };
     if let Some(cached) = LOCAL_BINDINGS_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
     {
-        return cached;
+        return Some(cached);
     }
     let bindings = Rc::new(walk_binding_scope(walk_root, source, config));
     LOCAL_BINDINGS_CACHE.with(|cache| {
         cache.borrow_mut().insert(cache_key, Rc::clone(&bindings));
     });
-    bindings
+    Some(bindings)
 }
 
 /// Cache key for [`collect_local_bindings`]: the exact source buffer plus the
@@ -334,8 +343,11 @@ thread_local! {
 }
 
 /// Reset the per-run [`collect_local_bindings`] memo. Called at the start of
-/// every [`GenericExtractor::run`]; the TypeScript / JavaScript special-case
-/// passes run on the same thread inside that call and share the memo.
+/// every [`GenericExtractor::run`]. The TypeScript / JavaScript extractors run
+/// the generic pass and then re-parse the same buffer for their special-case
+/// pass on the same thread; a tree-B node id may alias a freed tree-A id, but
+/// the key also carries the buffer pointer, length and byte span, so a hit
+/// names the same syntactic node with the same bindings and is benign.
 pub(crate) fn clear_local_bindings_cache() {
     LOCAL_BINDINGS_CACHE.with(|cache| cache.borrow_mut().clear());
 }
@@ -767,8 +779,10 @@ fn collect_nodes(
             // incremental scans re-run `import_calls_pass` over cached nodes
             // from unchanged files, but they are deliberately not rendered in
             // agent-facing output — the delivered artifact is the Calls edge.
-            if node_kind == NodeKind::Function && config.scope_bindings_complete {
-                let bindings = collect_local_bindings(node, source, config);
+            if node_kind == NodeKind::Function
+                && config.scope_bindings_complete
+                && let Some(bindings) = collect_local_bindings(node, source, config)
+            {
                 metadata.insert(
                     "local_bindings".to_string(),
                     render_local_bindings(&bindings),
@@ -7830,6 +7844,7 @@ export function outerTs(helper: () => number, other: number) {
         let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
             .run(Path::new("nested.ts"), ts)
             .unwrap();
+        let mut checked = Vec::new();
         for name in ["innerDecl", "Inner.method", "method"] {
             let Some(func) = result
                 .nodes
@@ -7838,6 +7853,7 @@ export function outerTs(helper: () => number, other: number) {
             else {
                 continue;
             };
+            checked.push(name);
             let bindings = func
                 .metadata
                 .get("local_bindings")
@@ -7853,11 +7869,48 @@ export function outerTs(helper: () => number, other: number) {
             );
         }
         assert!(
-            result
-                .nodes
-                .iter()
-                .any(|n| n.id.kind == NodeKind::Function && n.id.name == "innerDecl"),
+            checked.contains(&"innerDecl"),
             "nested function_declaration must be extracted"
+        );
+        assert!(
+            checked.contains(&"Inner.method") || checked.contains(&"method"),
+            "method of a class declared inside the function must be extracted and checked: {checked:?}"
+        );
+    }
+
+    #[test]
+    fn syntax_error_in_scope_withholds_scope_bindings_complete() {
+        // Fresh-review finding on #878: a binding hidden inside a tree-sitter
+        // ERROR subtree is invisible to the walker, so the evidence must not
+        // be claimed complete. `let = ;` is unparseable in every grammar
+        // version; the sibling function with a clean subtree keeps its proof.
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "import { helper } from './api';\nfunction broken() { let = ; helper(); }\nfunction clean(helper: () => void) { helper(); }\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("broken.ts"), code)
+            .unwrap();
+        let broken = result
+            .nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::Function && n.id.name == "broken")
+            .expect("broken function node");
+        assert!(
+            !broken.metadata.contains_key("scope_bindings_complete"),
+            "ERROR subtree must fail closed: {:?}",
+            broken.metadata
+        );
+        assert!(!broken.metadata.contains_key("local_bindings"));
+        let clean = result
+            .nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::Function && n.id.name == "clean")
+            .expect("clean function node");
+        assert_eq!(
+            clean
+                .metadata
+                .get("scope_bindings_complete")
+                .map(String::as_str),
+            Some("true")
         );
     }
 }

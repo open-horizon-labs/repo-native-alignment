@@ -59,5 +59,5 @@ Tests seeded from AC + Step 1 #1 + Step 2 #1-#6; all pass on 70247a1. Non-vacuou
 - CodeRabbit: 5 threads resolved by CodeRabbit after 12c205d; test-only `.iter().find()` thread resolved by me with reasoning (PERFORMANCE heading; guardrail detection excludes tests).
 - Follow-ups: #879 #880 #881 #882.
 
-### Final fresh review
-Spawned fresh code-reviewer on 12c205d (guardrail independent-final-review-for-prs). Pending.
+### Final fresh review (round 1)
+Fresh code-reviewer on 12c205d: **APPROVE** (https://github.com/open-horizon-labs/repo-native-alignment/pull/878 comment "Ship Final Review (fresh reviewer) — commit 12c205d"). Ran a 100-file shadowing fixture with the release binary: TS 24/24, Python 30/30, Rust 26/26 shadow forms suppressed; positives emitted. Non-blocking findings: F1 Python module-scope rebinding of an import (out of #877 scope; filed as follow-up), F2 ERROR subtree still stamped complete (fixed: `collect_local_bindings` returns `None` when `walk_root.has_error()`, all five stamping sites fail closed; test `syntax_error_in_scope_withholds_scope_bindings_complete`), F3 README overclaimed Go (fixed: Go carries evidence but `parse_import_bindings` has no Go branch), F4 memo key aliasing across TS/JS re-parse is benign (same source/span => same bindings; documented). Because F2/F3 change the diff, a second fresh review runs on the final commit.
