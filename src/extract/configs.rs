@@ -270,6 +270,44 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     // integration; legacy Python-analysis initializationOptions are not sent.
     venv_candidates: None,
     attribute_access_node: Some(("attribute", "attribute")),
+    // Local binding evidence (#877). Verified against tree-sitter-python 0.25.0.
+    // `default_parameter` / `typed_default_parameter` are pruned when walking
+    // the whole `parameters` list and re-entered through their `name` field so
+    // default-value expressions never contribute names; `aliased_import` is
+    // pruned and re-entered through `alias` so `from m import thing as alias`
+    // binds `alias` only. `class_pattern` is pruned so `case Point(x=px)` does
+    // not bind the class name `Point`; its inner `case_pattern`s are still
+    // reached by the subtree walk (keyword names such as `x` remain an
+    // accepted over-collection: `keyword_pattern` has no fields).
+    binding_sites: &[
+        ("parameters", None),
+        ("lambda_parameters", None),
+        ("default_parameter", Some("name")),
+        ("typed_default_parameter", Some("name")),
+        ("assignment", Some("left")),
+        ("augmented_assignment", Some("left")),
+        ("for_statement", Some("left")),
+        ("for_in_clause", Some("left")),
+        ("as_pattern", Some("alias")),
+        ("except_clause", Some("alias")),
+        ("named_expression", Some("name")),
+        ("class_definition", Some("name")),
+        ("import_statement", Some("name")),
+        ("import_from_statement", Some("name")),
+        ("aliased_import", Some("alias")),
+        ("case_pattern", None),
+    ],
+    binding_leaf_kinds: &["identifier"],
+    binding_skip_kinds: &[
+        "attribute",
+        "subscript",
+        "default_parameter",
+        "typed_default_parameter",
+        "aliased_import",
+        "class_pattern",
+    ],
+    binding_scope_kinds: &["lambda"],
+    scope_bindings_complete: true,
     has_parent_module_request: false,
 };
 
@@ -317,6 +355,11 @@ pub static CYTHON_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: Some(&[NodeKind::Function, NodeKind::Trait]),
     venv_candidates: Some(&[".venv", "venv", "env"]),
     attribute_access_node: Some(("attribute", "attribute")),
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
     has_parent_module_request: false,
 };
 
@@ -383,6 +426,42 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: Some(("member_expression", "property")),
+    // Local binding evidence (#877). Verified against tree-sitter-typescript 0.23.2.
+    // `pair_pattern.key` is a `property_identifier` (not a leaf) so `{ a: b }`
+    // binds `b` only; `object_assignment_pattern.right` / `assignment_pattern.right`
+    // defaults are pruned by the generic `right` field skip.
+    binding_sites: &[
+        ("required_parameter", Some("pattern")),
+        ("optional_parameter", Some("pattern")),
+        ("arrow_function", Some("parameter")),
+        ("variable_declarator", Some("name")),
+        ("for_in_statement", Some("left")),
+        ("catch_clause", Some("parameter")),
+        ("generator_function_declaration", Some("name")),
+        ("class_declaration", Some("name")),
+        ("class", Some("name")),
+        ("function_expression", Some("name")),
+        ("generator_function", Some("name")),
+    ],
+    binding_leaf_kinds: &[
+        "identifier",
+        "shorthand_property_identifier_pattern",
+        "type_identifier",
+    ],
+    binding_skip_kinds: &[
+        "member_expression",
+        "subscript_expression",
+        "non_null_expression",
+        "parenthesized_expression",
+        "undefined",
+        "this",
+    ],
+    binding_scope_kinds: &[
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+    ],
+    scope_bindings_complete: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -437,6 +516,35 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: Some(("selector_expression", "field")),
+    // Local binding evidence (#877). Verified against tree-sitter-javascript
+    // 0.25.0: `formal_parameters` children are bare `pattern` /
+    // `assignment_pattern` nodes (no `required_parameter` wrapper), so the
+    // whole list is walked; `assignment_pattern.right` defaults are pruned by
+    // the generic `right` field skip.
+    binding_sites: &[
+        ("formal_parameters", None),
+        ("arrow_function", Some("parameter")),
+        ("variable_declarator", Some("name")),
+        ("for_in_statement", Some("left")),
+        ("catch_clause", Some("parameter")),
+        ("class_declaration", Some("name")),
+        ("class", Some("name")),
+        ("function_expression", Some("name")),
+        ("generator_function", Some("name")),
+    ],
+    binding_leaf_kinds: &["identifier", "shorthand_property_identifier_pattern"],
+    binding_skip_kinds: &[
+        "member_expression",
+        "subscript_expression",
+        "parenthesized_expression",
+        "undefined",
+    ],
+    binding_scope_kinds: &[
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+    ],
+    scope_bindings_complete: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -489,6 +597,26 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: Some(("member_expression", "property")),
+    // Local binding evidence (#877). Verified against tree-sitter-go 0.25.0.
+    // `parameter_declaration.name` repeats for `a, b int` and is reached via
+    // `children_by_field_name`; the same site covers receivers, named results
+    // and `func_literal` parameters because the walk spans the whole subtree.
+    binding_sites: &[
+        ("parameter_declaration", Some("name")),
+        ("variadic_parameter_declaration", Some("name")),
+        ("short_var_declaration", Some("left")),
+        ("var_spec", Some("name")),
+        ("const_spec", Some("name")),
+        ("range_clause", Some("left")),
+        ("type_switch_statement", Some("alias")),
+        ("type_spec", Some("name")),
+        // `select { case v := <-ch: }` binds through `receive_statement.left`.
+        ("receive_statement", Some("left")),
+    ],
+    binding_leaf_kinds: &["identifier", "type_identifier"],
+    binding_skip_kinds: &["selector_expression", "index_expression"],
+    binding_scope_kinds: &["func_literal"],
+    scope_bindings_complete: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -555,6 +683,11 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -612,6 +745,11 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -678,6 +816,11 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -739,6 +882,11 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -790,6 +938,11 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -853,6 +1006,11 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -898,6 +1056,11 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1116,11 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1168,11 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1227,11 @@ pub static C_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1298,11 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1364,11 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1428,11 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 // ── GDScript ─────────────────────────────────────────────────────────────────
@@ -1288,6 +1481,11 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: false,
     attribute_access_node: None,
+    binding_sites: &[],
+    binding_leaf_kinds: &[],
+    binding_skip_kinds: &[],
+    binding_scope_kinds: &[],
+    scope_bindings_complete: false,
 };
 
 /// Look up the LangConfig for a language name. Returns None for languages

@@ -12,7 +12,9 @@ use anyhow::Result;
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::TYPESCRIPT_CONFIG;
-use super::generic::{GenericExtractor, count_branches};
+use super::generic::{
+    GenericExtractor, collect_local_bindings, count_branches, render_local_bindings,
+};
 use super::{ExtractionResult, Extractor};
 
 /// TypeScript tree-sitter extractor (handles .ts and .tsx files).
@@ -341,6 +343,22 @@ fn collect_ts_specials(
                             metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                         }
 
+                        // Local binding evidence for cross-file call resolution
+                        // (#877) — same walker the generic extractor uses for
+                        // `function_declaration`, applied to the arrow /
+                        // function-expression value node.
+                        if TYPESCRIPT_CONFIG.scope_bindings_complete
+                            && let Some(bindings) =
+                                collect_local_bindings(value_n, source, &TYPESCRIPT_CONFIG)
+                        {
+                            metadata.insert(
+                                "local_bindings".to_string(),
+                                render_local_bindings(&bindings),
+                            );
+                            metadata
+                                .insert("scope_bindings_complete".to_string(), "true".to_string());
+                        }
+
                         nodes.push(Node {
                             id: NodeId {
                                 root: String::new(),
@@ -639,6 +657,20 @@ fn collect_ts_specials(
                     if !TYPESCRIPT_CONFIG.branch_node_types.is_empty() {
                         let branches = count_branches(value_n, source, &TYPESCRIPT_CONFIG, true);
                         metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
+                    }
+
+                    // Local binding evidence (#877): class-property functions
+                    // are Function nodes too, so they need the same scope proof
+                    // or `import_calls_pass` keeps their Calls gate closed.
+                    if TYPESCRIPT_CONFIG.scope_bindings_complete
+                        && let Some(bindings) =
+                            collect_local_bindings(value_n, source, &TYPESCRIPT_CONFIG)
+                    {
+                        metadata.insert(
+                            "local_bindings".to_string(),
+                            render_local_bindings(&bindings),
+                        );
+                        metadata.insert("scope_bindings_complete".to_string(), "true".to_string());
                     }
 
                     // Determine parent scope (class name) and emit Defines edge
@@ -1545,6 +1577,67 @@ class MyService {
         assert!(
             func.metadata.get("is_static").is_none(),
             "Top-level function should NOT have is_static"
+        );
+    }
+
+    #[test]
+    fn arrow_function_carries_local_binding_evidence() {
+        // #877: the arrow/function-expression path bypasses the generic
+        // extractor, so it must stamp the same scope evidence itself.
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+import { execute } from './worker';
+export const handler = (execute: () => void, { a, b: renamed }: Props) => {
+    const local = 1;
+    return execute();
+};
+export const plain = () => execute();
+"#;
+        let result = extractor
+            .extract(Path::new("src/handler.tsx"), code)
+            .unwrap();
+        let handler = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handler")
+            .expect("handler arrow function");
+        assert_eq!(
+            handler
+                .metadata
+                .get("scope_bindings_complete")
+                .map(String::as_str),
+            Some("true")
+        );
+        let bindings = handler
+            .metadata
+            .get("local_bindings")
+            .expect("local_bindings");
+        for name in ["execute", "a", "renamed", "local"] {
+            assert!(
+                bindings.split(',').any(|b| b == name),
+                "expected `{name}` in {bindings}"
+            );
+        }
+        assert!(
+            !bindings.split(',').any(|b| b == "b"),
+            "pair key must not bind: {bindings}"
+        );
+
+        let plain = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "plain")
+            .expect("plain arrow function");
+        assert_eq!(
+            plain
+                .metadata
+                .get("scope_bindings_complete")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            plain.metadata.get("local_bindings").map(String::as_str),
+            Some("")
         );
     }
 }

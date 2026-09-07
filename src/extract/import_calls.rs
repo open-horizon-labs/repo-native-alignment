@@ -1601,7 +1601,11 @@ mod tests {
     }
 
     #[test]
-    fn qualified_import_references_canonical_scoped_target_without_scope_proof() {
+    fn qualified_import_with_scope_proof_calls_canonical_scoped_target() {
+        // Module-path narrowing (`from worker import execute` -> worker.py)
+        // leaves one candidate, `Worker.execute`; ReferencedBy already treats
+        // it as the canonical target, and with Python scope evidence present
+        // (#877) the function-scoped Calls edge follows the same resolution.
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute\n\ndef orchestrate():\n    return execute()\n",
@@ -1624,12 +1628,13 @@ mod tests {
             .unwrap();
 
         let edges = import_calls_pass(&nodes);
-        assert!(
-            edges
-                .iter()
-                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
-            "function-scoped Calls require complete binding proof: {edges:?}"
-        );
+        let call = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == worker.id
+            })
+            .unwrap_or_else(|| panic!("scope proof must unlock the narrowed call: {edges:?}"));
+        assert_eq!(call.confidence, Confidence::Detected);
         assert!(
             edges
                 .iter()
@@ -1639,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn aliased_python_import_fails_closed_without_scope_proof_and_references_symbol() {
+    fn aliased_python_import_with_scope_proof_calls_local_alias_and_references_symbol() {
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute as run\n\ndef orchestrate():\n    return run()\n",
@@ -1659,12 +1664,15 @@ mod tests {
             .unwrap();
 
         let edges = import_calls_pass(&nodes);
-        assert!(
-            edges
-                .iter()
-                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
-            "aliased Python call must fail closed without binding proof: {edges:?}"
-        );
+        let call = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            })
+            .unwrap_or_else(|| {
+                panic!("aliased Python call must bind to canonical symbol: {edges:?}")
+            });
+        assert_eq!(call.confidence, Confidence::Detected);
         assert!(edges.iter().any(|edge| {
             edge.kind == EdgeKind::ReferencedBy && edge.from == import.id && edge.to == callee.id
         }));
@@ -1672,9 +1680,14 @@ mod tests {
 
     #[test]
     fn imported_function_shadowed_by_parameter_never_emits_heuristic_call() {
-        for (import_line, parameter, invocation) in [
-            ("from worker import execute as run", "run", "run()"),
-            ("from worker import execute", "execute", "execute()"),
+        // Positive twins (parameter `other`) prove the pipeline emits the edge
+        // when nothing shadows the import, so the shadowed cases are not
+        // passing vacuously.
+        for (import_line, parameter, invocation, expect_call) in [
+            ("from worker import execute as run", "run", "run()", false),
+            ("from worker import execute", "execute", "execute()", false),
+            ("from worker import execute as run", "other", "run()", true),
+            ("from worker import execute", "other", "execute()", true),
         ] {
             let mut nodes = extract_python_nodes(
                 "caller.py",
@@ -1690,23 +1703,196 @@ mod tests {
                 .iter()
                 .find(|node| node.id.name == "orchestrate")
                 .unwrap();
+            assert_eq!(
+                caller
+                    .metadata
+                    .get("scope_bindings_complete")
+                    .map(String::as_str),
+                Some("true"),
+                "Python extractor must produce scope evidence"
+            );
             let import = nodes
                 .iter()
                 .find(|node| node.id.kind == NodeKind::Import)
                 .unwrap();
             let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
             let edges = import_calls_pass(&nodes);
-            assert!(
-                edges
-                    .iter()
-                    .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
-                "parameter shadow must fail closed for {import_line}: {edges:?}"
-            );
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            });
+            if expect_call {
+                let call = call.unwrap_or_else(|| {
+                    panic!("unshadowed call must emit for {import_line}: {edges:?}")
+                });
+                assert_eq!(call.confidence, Confidence::Detected);
+                assert_eq!(call.source, ExtractionSource::TreeSitter);
+            } else {
+                assert!(
+                    call.is_none(),
+                    "parameter shadow must fail closed for {import_line}: {edges:?}"
+                );
+            }
             assert!(edges.iter().any(|edge| {
                 edge.kind == EdgeKind::ReferencedBy
                     && edge.from == import.id
                     && edge.to == callee.id
             }));
+        }
+    }
+
+    #[test]
+    fn local_bindings_metadata_suppresses_function_scoped_call() {
+        // Synthetic nodes: identical bodies, only `local_bindings` differs.
+        let callee = make_fn("worker.ts", "helper", "function helper() { return 1; }");
+        let import = make_import("caller.ts", "import { helper } from './worker'");
+        let unshadowed = make_fn(
+            "caller.ts",
+            "orchestrate",
+            "function orchestrate(helper) { return helper(); }",
+        );
+        let mut shadowed = unshadowed.clone();
+        shadowed
+            .metadata
+            .insert("local_bindings".to_string(), "helper".to_string());
+
+        let edges = import_calls_pass(&[unshadowed.clone(), callee.clone(), import.clone()]);
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == unshadowed.id && edge.to == callee.id
+            }),
+            "without binding evidence the call must emit: {edges:?}"
+        );
+
+        let edges = import_calls_pass(&[shadowed.clone(), callee.clone(), import]);
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::Calls || edge.from != shadowed.id),
+            "local_bindings containing the import must suppress the call: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn tsx_component_cross_file_call_emits_detected_edge_unless_shadowed() {
+        // Mirrors the `Cross-stack: cross-file calls Expertunities` fixture in
+        // scripts/test-suite.sh through the real TypeScript extractor.
+        use crate::extract::Extractor;
+        use crate::extract::typescript::TypeScriptExtractor;
+        let extractor = TypeScriptExtractor::new();
+        let extract = |path: &str, code: &str| {
+            let mut nodes = extractor
+                .extract(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        let api = extract(
+            "client/src/api.ts",
+            "import { useQuery } from '@tanstack/react-query';\n\nexport function useQueryExpertunities() {\n  return useQuery({ queryKey: ['expertunities'], queryFn: async () => [] });\n}\n",
+        );
+        for (component, expect_call) in [
+            (
+                "import { useQueryExpertunities } from '../../api';\n\nexport function Expertunities() {\n  useQueryExpertunities();\n  return <div />;\n}\n",
+                true,
+            ),
+            (
+                "import { useQueryExpertunities } from '../../api';\n\nexport function Expertunities({ useQueryExpertunities }: Props) {\n  useQueryExpertunities();\n  return <div />;\n}\n",
+                false,
+            ),
+            (
+                "import { useQueryExpertunities } from '../../api';\n\nexport const Expertunities = () => {\n  useQueryExpertunities();\n  return <div />;\n};\n",
+                true,
+            ),
+            (
+                "import { useQueryExpertunities } from '../../api';\n\nexport const Expertunities = ({ useQueryExpertunities }: Props) => {\n  useQueryExpertunities();\n  return <div />;\n};\n",
+                false,
+            ),
+        ] {
+            let mut nodes = extract(
+                "client/src/components/Expertunities/Expertunities.tsx",
+                component,
+            );
+            nodes.extend(api.iter().cloned());
+            let caller = nodes
+                .iter()
+                .find(|node| node.id.name == "Expertunities")
+                .unwrap();
+            let callee = nodes
+                .iter()
+                .find(|node| node.id.name == "useQueryExpertunities")
+                .unwrap();
+            let edges = import_calls_pass(&nodes);
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            });
+            if expect_call {
+                let call = call.unwrap_or_else(|| {
+                    panic!("expected cross-file call for:\n{component}\n{edges:?}")
+                });
+                assert_eq!(call.confidence, Confidence::Detected);
+            } else {
+                assert!(
+                    call.is_none(),
+                    "destructured parameter shadows the import for:\n{component}\n{edges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rust_use_import_cross_file_call_emits_detected_edge_unless_shadowed() {
+        use crate::extract::generic::GenericExtractor;
+        use crate::extract::rust::RUST_CONFIG;
+        let extract = |path: &str, code: &str| {
+            let mut nodes = GenericExtractor::new(&RUST_CONFIG)
+                .run(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        let worker = extract("src/worker.rs", "pub fn execute() -> u32 { 1 }\n");
+        for (caller_src, expect_call) in [
+            (
+                "use crate::worker::execute;\n\nfn orchestrate() -> u32 { execute() }\n",
+                true,
+            ),
+            (
+                "use crate::worker::execute;\n\nfn orchestrate() -> u32 { let execute = || 2; execute() }\n",
+                false,
+            ),
+            (
+                "use crate::worker::execute;\n\nfn orchestrate(execute: fn() -> u32) -> u32 { execute() }\n",
+                false,
+            ),
+        ] {
+            let mut nodes = extract("src/caller.rs", caller_src);
+            nodes.extend(worker.iter().cloned());
+            let caller = nodes
+                .iter()
+                .find(|node| node.id.name == "orchestrate")
+                .unwrap();
+            let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+            let edges = import_calls_pass(&nodes);
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            });
+            if expect_call {
+                let call = call.unwrap_or_else(|| {
+                    panic!("expected Rust cross-file call for:\n{caller_src}\n{edges:?}")
+                });
+                assert_eq!(call.confidence, Confidence::Detected);
+            } else {
+                assert!(
+                    call.is_none(),
+                    "local binding shadows the `use` import for:\n{caller_src}\n{edges:?}"
+                );
+            }
         }
     }
 
@@ -1849,31 +2035,47 @@ mod tests {
     }
 
     #[test]
-    fn differently_named_scoped_method_fails_closed_without_scope_proof() {
-        let mut nodes = extract_python_nodes(
-            "caller.py",
-            "from worker import execute as run\n\nclass C:\n    def invoke(self):\n        return run()\n",
-        );
-        nodes.extend(extract_python_nodes(
-            "worker.py",
-            "def execute():\n    return 1\n",
-        ));
-        let caller = nodes
-            .iter()
-            .find(|node| node.id.name == "C.invoke")
-            .unwrap();
-        let edges = import_calls_pass(&nodes);
-
-        assert!(
-            edges
+    fn python_method_with_scope_proof_calls_imported_alias_unless_parameter_shadows() {
+        for (params, expect_call) in [("self", true), ("self, run", false)] {
+            let mut nodes = extract_python_nodes(
+                "caller.py",
+                &format!(
+                    "from worker import execute as run\n\nclass C:\n    def invoke({params}):\n        return run()\n"
+                ),
+            );
+            nodes.extend(extract_python_nodes(
+                "worker.py",
+                "def execute():\n    return 1\n",
+            ));
+            let caller = nodes
                 .iter()
-                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
-            "a scoped method without complete binding proof must fail closed: {edges:?}"
-        );
+                .find(|node| node.id.name == "C.invoke")
+                .unwrap();
+            let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
+            let edges = import_calls_pass(&nodes);
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == caller.id && edge.to == callee.id
+            });
+            if expect_call {
+                assert_eq!(
+                    call.map(|edge| edge.confidence.clone()),
+                    Some(Confidence::Detected),
+                    "method with scope proof must call the imported alias: {edges:?}"
+                );
+            } else {
+                assert!(
+                    call.is_none(),
+                    "parameter `run` shadows the imported alias: {edges:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn same_named_python_method_fails_closed_without_scope_proof() {
+    fn same_named_python_method_can_call_bare_imported_alias() {
+        // Mirrors `same_named_es_and_rust_methods_can_call_bare_imported_alias`
+        // with real Python scope evidence: `C.run` does not bind `run` inside
+        // its own body, so the bare call resolves to the imported alias.
         let mut nodes = extract_python_nodes(
             "caller.py",
             "from worker import execute as run\n\nclass C:\n    def run(self):\n        return run()\n",
@@ -1883,13 +2085,17 @@ mod tests {
             "def execute():\n    return 1\n",
         ));
         let caller = nodes.iter().find(|node| node.id.name == "C.run").unwrap();
+        let callee = nodes.iter().find(|node| node.id.name == "execute").unwrap();
         let edges = import_calls_pass(&nodes);
 
         assert!(
-            edges
-                .iter()
-                .all(|edge| { edge.kind != EdgeKind::Calls || edge.from != caller.id }),
-            "a scoped method without complete binding proof must fail closed: {edges:?}"
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls
+                    && edge.from == caller.id
+                    && edge.to == callee.id
+                    && edge.confidence == Confidence::Detected
+            }),
+            "same-named method must still call the imported alias: {edges:?}"
         );
     }
 
@@ -2438,5 +2644,199 @@ mod tests {
                 .iter()
                 .any(|edge| edge.from.root == "root-b" && edge.to == callee_b.id)
         );
+    }
+
+    #[test]
+    fn nested_python_def_inherits_enclosing_parameter_shadow() {
+        // Step 2 review of #878: `def outer(execute): def inner(): execute()`
+        // emitted a false cross-file Calls edge from `inner` because its
+        // binding set omitted the enclosing function's parameters. The nested
+        // node must inherit every enclosing scope; the `other` twin proves the
+        // edge still emits when nothing shadows the import.
+        for (params, expect_call) in [("execute", false), ("other", true)] {
+            let mut nodes = extract_python_nodes(
+                "src/caller.py",
+                &format!(
+                    "from worker import execute\n\ndef outer({params}):\n    def inner():\n        return execute()\n    return inner\n"
+                ),
+            );
+            nodes.extend(extract_python_nodes(
+                "src/worker.py",
+                "def execute():\n    return 1\n",
+            ));
+            let inner = nodes
+                .iter()
+                .find(|node| {
+                    node.id.kind == NodeKind::Function
+                        && (node.id.name == "inner" || node.id.name.ends_with(".inner"))
+                })
+                .expect("nested def node");
+            let callee = nodes
+                .iter()
+                .find(|node| node.id.name == "execute" && node.id.file.ends_with("worker.py"))
+                .unwrap();
+            let edges = import_calls_pass(&nodes);
+            let call = edges.iter().find(|edge| {
+                edge.kind == EdgeKind::Calls && edge.from == inner.id && edge.to == callee.id
+            });
+            if expect_call {
+                let call = call.unwrap_or_else(|| {
+                    panic!("unshadowed nested call must emit for outer({params}): {edges:?}")
+                });
+                assert_eq!(call.confidence, Confidence::Detected);
+            } else {
+                assert!(
+                    call.is_none(),
+                    "enclosing parameter `{params}` shadows the import inside `inner`: {edges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_ts_and_js_functions_inherit_enclosing_parameter_shadow() {
+        // TS/JS twins of the nested-def case, covering both nested-function
+        // producers: the generic `function_declaration` path and the
+        // arrow-function path in typescript.rs / javascript.rs.
+        use crate::extract::Extractor;
+        use crate::extract::javascript::JavaScriptExtractor;
+        use crate::extract::typescript::TypeScriptExtractor;
+        let ts = TypeScriptExtractor::new();
+        let js = JavaScriptExtractor::new();
+        let extract = |extractor: &dyn Extractor, path: &str, code: &str| {
+            let mut nodes = extractor
+                .extract(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        for (extractor, ext) in [(&ts as &dyn Extractor, "ts"), (&js as &dyn Extractor, "js")] {
+            let api = extract(
+                extractor,
+                &format!("src/api.{ext}"),
+                "export function helper() { return 1; }\n",
+            );
+            for (param, expect_call) in [("helper", false), ("other", true)] {
+                let mut nodes = extract(
+                    extractor,
+                    &format!("src/caller.{ext}"),
+                    &format!(
+                        "import {{ helper }} from './api';\n\nexport function outerFn({param}) {{\n  const innerArrow = () => helper();\n  function innerDecl() {{ return helper(); }}\n  return [innerArrow, innerDecl];\n}}\n"
+                    ),
+                );
+                nodes.extend(api.iter().cloned());
+                let callee = nodes.iter().find(|node| node.id.name == "helper").unwrap();
+                let edges = import_calls_pass(&nodes);
+                for inner_name in ["innerArrow", "innerDecl"] {
+                    let inner = nodes
+                        .iter()
+                        .find(|node| {
+                            node.id.kind == NodeKind::Function
+                                && (node.id.name == inner_name
+                                    || node.id.name.ends_with(&format!(".{inner_name}")))
+                        })
+                        .unwrap_or_else(|| panic!("missing {inner_name} in .{ext}"));
+                    assert_eq!(
+                        inner
+                            .metadata
+                            .get("scope_bindings_complete")
+                            .map(String::as_str),
+                        Some("true"),
+                        "{inner_name} (.{ext}) must carry scope evidence"
+                    );
+                    let call = edges.iter().find(|edge| {
+                        edge.kind == EdgeKind::Calls
+                            && edge.from == inner.id
+                            && edge.to == callee.id
+                    });
+                    if expect_call {
+                        let call = call.unwrap_or_else(|| {
+                            panic!(
+                                "unshadowed nested call must emit from {inner_name} (.{ext}): {edges:?}"
+                            )
+                        });
+                        assert_eq!(call.confidence, Confidence::Detected);
+                    } else {
+                        assert!(
+                            call.is_none(),
+                            "enclosing parameter `helper` shadows the import inside {inner_name} (.{ext}): {edges:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn class_property_functions_carry_scope_evidence_and_call_imports() {
+        // CodeRabbit on #878: `public_field_definition` (TS) / `field_definition`
+        // (JS) create Function nodes on their own path; without scope evidence
+        // the gate stayed closed and class-property handlers lost their
+        // cross-file Calls. Shadow twin: a parameter named like the import.
+        use crate::extract::Extractor;
+        use crate::extract::javascript::JavaScriptExtractor;
+        use crate::extract::typescript::TypeScriptExtractor;
+        let ts = TypeScriptExtractor::new();
+        let js = JavaScriptExtractor::new();
+        let extract = |extractor: &dyn Extractor, path: &str, code: &str| {
+            let mut nodes = extractor
+                .extract(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        for (extractor, ext, shadow_param) in [
+            (&ts as &dyn Extractor, "ts", "helper: () => number"),
+            (&js as &dyn Extractor, "js", "helper"),
+        ] {
+            let mut nodes = extract(
+                extractor,
+                &format!("src/widget.{ext}"),
+                &format!(
+                    "import {{ helper }} from './api';\n\nexport class Widget {{\n  run = () => helper();\n  shadowed = ({shadow_param}) => helper();\n}}\n"
+                ),
+            );
+            nodes.extend(extract(
+                extractor,
+                &format!("src/api.{ext}"),
+                "export function helper() { return 1; }\n",
+            ));
+            let callee = nodes.iter().find(|node| node.id.name == "helper").unwrap();
+            let edges = import_calls_pass(&nodes);
+            for (member, expect_call) in [("Widget.run", true), ("Widget.shadowed", false)] {
+                let field = nodes
+                    .iter()
+                    .find(|node| node.id.kind == NodeKind::Function && node.id.name == member)
+                    .unwrap_or_else(|| panic!("missing {member} in .{ext}: {nodes:?}"));
+                assert_eq!(
+                    field
+                        .metadata
+                        .get("scope_bindings_complete")
+                        .map(String::as_str),
+                    Some("true"),
+                    "{member} (.{ext}) must carry scope evidence"
+                );
+                let call = edges.iter().find(|edge| {
+                    edge.kind == EdgeKind::Calls && edge.from == field.id && edge.to == callee.id
+                });
+                if expect_call {
+                    let call = call.unwrap_or_else(|| {
+                        panic!("class-property call must emit for {member} (.{ext}): {edges:?}")
+                    });
+                    assert_eq!(call.confidence, Confidence::Detected);
+                } else {
+                    assert!(
+                        call.is_none(),
+                        "parameter shadows the import inside {member} (.{ext}): {edges:?}"
+                    );
+                }
+            }
+        }
     }
 }

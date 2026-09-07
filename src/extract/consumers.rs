@@ -130,6 +130,14 @@ impl ExtractionConsumer for TreeSitterConsumer {
         "tree_sitter"
     }
 
+    /// Extraction-logic version. Bumped when tree-sitter output changes for
+    /// identical input (v1: `local_bindings` / `scope_bindings_complete`
+    /// metadata on Function nodes, #877). The consumer is not cacheable, so
+    /// this documents the change for the bus; `SCHEMA_VERSION` forces rescan.
+    fn version(&self) -> u64 {
+        1
+    }
+
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootDiscovered]
     }
