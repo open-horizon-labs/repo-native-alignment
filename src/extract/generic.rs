@@ -19,8 +19,10 @@
 //! the individual extractor files, but as small focused functions rather than
 //! full 300-line traversal reimplementations.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
@@ -274,14 +276,19 @@ const BINDING_SKIP_FIELDS: &[&str] = &["type", "right", "key", "condition", "pat
 /// nested node's set is a superset of everything its body can see. The walk
 /// root's own name is not added: a method named like an import does not bind
 /// that name inside its own body.
+///
+/// Every function under the same outermost scope receives the same set, so
+/// the walk is memoised per `(source buffer, walk root)` for the duration of
+/// one extraction run ([`clear_local_bindings_cache`] resets it at the start
+/// of [`GenericExtractor::run`]); `k` nested functions cost one subtree walk
+/// instead of `k`.
 pub(crate) fn collect_local_bindings(
     fn_node: tree_sitter::Node,
     source: &[u8],
     config: &LangConfig,
-) -> BTreeSet<String> {
-    let mut bindings = BTreeSet::new();
+) -> Rc<BTreeSet<String>> {
     if config.binding_sites.is_empty() {
-        return bindings;
+        return Rc::new(BTreeSet::new());
     }
     let mut walk_root = fn_node;
     let mut ancestor = fn_node;
@@ -291,6 +298,55 @@ pub(crate) fn collect_local_bindings(
         }
         ancestor = parent;
     }
+    let cache_key = BindingScopeKey {
+        source_ptr: source.as_ptr() as usize,
+        source_len: source.len(),
+        root_id: walk_root.id(),
+        start_byte: walk_root.start_byte(),
+        end_byte: walk_root.end_byte(),
+    };
+    if let Some(cached) = LOCAL_BINDINGS_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
+    {
+        return cached;
+    }
+    let bindings = Rc::new(walk_binding_scope(walk_root, source, config));
+    LOCAL_BINDINGS_CACHE.with(|cache| {
+        cache.borrow_mut().insert(cache_key, Rc::clone(&bindings));
+    });
+    bindings
+}
+
+/// Cache key for [`collect_local_bindings`]: the exact source buffer plus the
+/// walk root's identity and byte span. Cleared per extraction run so a reused
+/// buffer address for a different file can never serve stale bindings.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BindingScopeKey {
+    source_ptr: usize,
+    source_len: usize,
+    root_id: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+thread_local! {
+    static LOCAL_BINDINGS_CACHE: RefCell<HashMap<BindingScopeKey, Rc<BTreeSet<String>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Reset the per-run [`collect_local_bindings`] memo. Called at the start of
+/// every [`GenericExtractor::run`]; the TypeScript / JavaScript special-case
+/// passes run on the same thread inside that call and share the memo.
+pub(crate) fn clear_local_bindings_cache() {
+    LOCAL_BINDINGS_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// Walk one binding scope (see [`collect_local_bindings`]) without caching.
+fn walk_binding_scope(
+    walk_root: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
     let mut stack = vec![walk_root];
     while let Some(node) = stack.pop() {
         let kind = node.kind();
@@ -512,6 +568,7 @@ impl GenericExtractor {
         let source = content.as_bytes();
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
+        clear_local_bindings_cache();
 
         collect_nodes(
             tree.root_node(),

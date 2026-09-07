@@ -423,6 +423,18 @@ fn collect_js_specials(
                         metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                     }
 
+                    // Local binding evidence (#877): class-field functions are
+                    // Function nodes too, so they need the same scope proof or
+                    // `import_calls_pass` keeps their Calls gate closed.
+                    if JAVASCRIPT_CONFIG.scope_bindings_complete {
+                        let bindings = collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG);
+                        metadata.insert(
+                            "local_bindings".to_string(),
+                            render_local_bindings(&bindings),
+                        );
+                        metadata.insert("scope_bindings_complete".to_string(), "true".to_string());
+                    }
+
                     // Find parent class name and emit Defines edge
                     if let Some(class_node) = find_ancestor_class(node)
                         && let Some(class_name_node) = class_node.child_by_field_name("name")

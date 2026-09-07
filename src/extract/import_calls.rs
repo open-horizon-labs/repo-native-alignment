@@ -2769,4 +2769,74 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn class_property_functions_carry_scope_evidence_and_call_imports() {
+        // CodeRabbit on #878: `public_field_definition` (TS) / `field_definition`
+        // (JS) create Function nodes on their own path; without scope evidence
+        // the gate stayed closed and class-property handlers lost their
+        // cross-file Calls. Shadow twin: a parameter named like the import.
+        use crate::extract::Extractor;
+        use crate::extract::javascript::JavaScriptExtractor;
+        use crate::extract::typescript::TypeScriptExtractor;
+        let ts = TypeScriptExtractor::new();
+        let js = JavaScriptExtractor::new();
+        let extract = |extractor: &dyn Extractor, path: &str, code: &str| {
+            let mut nodes = extractor
+                .extract(std::path::Path::new(path), code)
+                .unwrap()
+                .nodes;
+            for node in &mut nodes {
+                node.id.root = "r".into();
+            }
+            nodes
+        };
+        for (extractor, ext, shadow_param) in [
+            (&ts as &dyn Extractor, "ts", "helper: () => number"),
+            (&js as &dyn Extractor, "js", "helper"),
+        ] {
+            let mut nodes = extract(
+                extractor,
+                &format!("src/widget.{ext}"),
+                &format!(
+                    "import {{ helper }} from './api';\n\nexport class Widget {{\n  run = () => helper();\n  shadowed = ({shadow_param}) => helper();\n}}\n"
+                ),
+            );
+            nodes.extend(extract(
+                extractor,
+                &format!("src/api.{ext}"),
+                "export function helper() { return 1; }\n",
+            ));
+            let callee = nodes.iter().find(|node| node.id.name == "helper").unwrap();
+            let edges = import_calls_pass(&nodes);
+            for (member, expect_call) in [("Widget.run", true), ("Widget.shadowed", false)] {
+                let field = nodes
+                    .iter()
+                    .find(|node| node.id.kind == NodeKind::Function && node.id.name == member)
+                    .unwrap_or_else(|| panic!("missing {member} in .{ext}: {nodes:?}"));
+                assert_eq!(
+                    field
+                        .metadata
+                        .get("scope_bindings_complete")
+                        .map(String::as_str),
+                    Some("true"),
+                    "{member} (.{ext}) must carry scope evidence"
+                );
+                let call = edges.iter().find(|edge| {
+                    edge.kind == EdgeKind::Calls && edge.from == field.id && edge.to == callee.id
+                });
+                if expect_call {
+                    let call = call.unwrap_or_else(|| {
+                        panic!("class-property call must emit for {member} (.{ext}): {edges:?}")
+                    });
+                    assert_eq!(call.confidence, Confidence::Detected);
+                } else {
+                    assert!(
+                        call.is_none(),
+                        "parameter shadows the import inside {member} (.{ext}): {edges:?}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -1,3 +1,11 @@
+---
+pr: 878
+issue: 877
+outcome: context-assembly
+branch: 877-restore-treesitter-calls
+type: ship-session
+---
+
 ## Ship Pipeline — PR #878
 **Started:** 2026-09-07
 **Branch:** 877-restore-treesitter-calls @ b8764bb · closes #877 · outcome: context-assembly
@@ -28,3 +36,8 @@ Blocking #1: nested functions (Python nested def, TS/JS nested arrow/decl, class
 - generic.rs stamping site comment documents persistence rationale (internal evidence, needed for incremental scans, not rendered).
 - Tests: generic.rs `nested_functions_inherit_enclosing_scope_bindings` (Python nested def + class method, TS nested decl + class method); zoo lists extended (Rust `'a` lifetime absent, Python `Point`/`thing` absent, TS class expression, Go `select` receive). import_calls.rs `nested_python_def_inherits_enclosing_parameter_shadow`, `nested_ts_and_js_functions_inherit_enclosing_parameter_shadow` (false-edge twins + positive twins, TS and JS extractors).
 - Suite at b8764bb (pre-fix) with branch release binary: 158 passed / 0 failed / 0 skipped incl. Expertunities. Note: pre-flight scan of the worktree had been done by the installed 0.2.10 binary (first on PATH), which the branch binary refused ("missing source_file column"); full rescan with the branch binary fixed it.
+- Commit `70247a1` pushed. `cargo test`: lib 2547/0/4 ignored, integration green. `cargo clippy --no-default-features -- -D warnings`: clean.
+- Step 3 comment posted; Step 3b: `gh pr ready 878` (draft=false). Step 4 comment posted (3 new tests + 4 extended zoos; all pass).
+
+### Step 4: Regression Oracle
+Tests seeded from AC + Step 1 #1 + Step 2 #1-#6; all pass on 70247a1. Non-vacuous: reviewer reproduced the false edges pre-fix.
