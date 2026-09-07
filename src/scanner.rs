@@ -587,6 +587,11 @@ pub struct Scanner {
     /// Override for state persistence path. When `None`, uses the default
     /// `.oh/.cache/scan-state.json` under repo_root.
     custom_state_path: Option<PathBuf>,
+    /// The co-change watermark this Scanner loaded at construction. Used by
+    /// `commit_state` to tell "the caller deliberately set a watermark" from
+    /// "this is just the value that happened to be on disk when we started",
+    /// since co-change mining advances the same field mid-scan (#884 review).
+    loaded_cochange_watermark_sha: Option<String>,
 }
 
 struct GitIgnoreContext {
@@ -609,12 +614,14 @@ impl Scanner {
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state(&repo_root).unwrap_or_default();
         let exclude_matchers = compile_excludes(&excludes);
+        let loaded_cochange_watermark_sha = state.cochange_watermark_sha.clone();
         Ok(Scanner {
             repo_root,
             excludes,
             exclude_matchers,
             state,
             custom_state_path: None,
+            loaded_cochange_watermark_sha,
         })
     }
 
@@ -629,12 +636,14 @@ impl Scanner {
         let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state_from_path(&state_path_override).unwrap_or_default();
         let exclude_matchers = compile_excludes(&excludes);
+        let loaded_cochange_watermark_sha = state.cochange_watermark_sha.clone();
         Ok(Scanner {
             repo_root,
             excludes,
             exclude_matchers,
             state,
             custom_state_path: Some(state_path_override),
+            loaded_cochange_watermark_sha,
         })
     }
 
@@ -664,11 +673,26 @@ impl Scanner {
     /// fails, the next scan will re-detect the same changes instead of silently
     /// losing them.
     pub fn commit_state(&self) -> Result<()> {
-        if let Some(ref custom_path) = self.custom_state_path {
-            save_state_to_path(custom_path, &self.state)?;
-        } else {
-            save_state(&self.repo_root, &self.state)?;
+        let path = self
+            .custom_state_path
+            .clone()
+            .unwrap_or_else(|| state_path(&self.repo_root));
+
+        // `scan-state.json` has a second writer: co-change mining advances its
+        // HEAD watermark through `write_cochange_watermark` during the graph
+        // update, which happens *before* the CLI calls `commit_state()`.
+        // If the caller deliberately set a watermark on this Scanner we keep it;
+        // otherwise the value we hold is just what was on disk at construction,
+        // and writing it back would undo a mid-scan advance and force a full
+        // re-mine on every incremental scan (#884 review).
+        let mut state = self.state.clone();
+        if state.cochange_watermark_sha == self.loaded_cochange_watermark_sha {
+            state.cochange_watermark_sha = load_state_from_path(&path)
+                .ok()
+                .and_then(|persisted| persisted.cochange_watermark_sha);
         }
+
+        save_state_to_path(&path, &state)?;
         Ok(())
     }
 
@@ -1744,6 +1768,45 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn commit_state_preserves_cochange_watermark() {
+        // Regression: the graph update advances the co-change watermark, then
+        // the CLI calls commit_state(). Writing the Scanner's own state verbatim
+        // put back the watermark it had loaded at scan start, so every
+        // incremental scan re-mined the whole window (#884 review).
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().to_path_buf();
+
+        let prior = ScanState {
+            last_commit_sha: Some("aaaaaaa".to_string()),
+            cochange_watermark_sha: Some("stale111".to_string()),
+            ..Default::default()
+        };
+        save_state(&repo_root, &prior).unwrap();
+
+        // Scanner loads state while the watermark is still "stale111" ...
+        let mut scanner = Scanner::new(repo_root.clone()).unwrap();
+        scanner.state.last_commit_sha = Some("bbbbbbb".to_string());
+        assert_eq!(
+            scanner.state.cochange_watermark_sha,
+            Some("stale111".to_string())
+        );
+        // ... then mining advances it mid-scan.
+        write_cochange_watermark(&repo_root, Some("beef5678".to_string())).unwrap();
+        scanner.commit_state().unwrap();
+
+        assert_eq!(
+            read_cochange_watermark(&repo_root),
+            Some("beef5678".to_string()),
+            "commit_state must not write back the stale watermark it loaded"
+        );
+        assert_eq!(
+            load_state(&repo_root).unwrap().last_commit_sha,
+            Some("bbbbbbb".to_string()),
+            "commit_state must still persist its own fields"
+        );
     }
 
     #[test]

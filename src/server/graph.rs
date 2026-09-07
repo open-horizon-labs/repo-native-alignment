@@ -3166,17 +3166,19 @@ impl RnaHandler {
         // Durable-persist gate for the co-change watermark (#884 review): if the
         // LanceDB write failed, leave the old watermark in place so the next scan
         // re-mines instead of trusting stale or missing rows.
-        if let Some(sha) = pending_cochange_watermark {
-            if persist_succeeded {
-                if let Err(e) = crate::scanner::write_cochange_watermark(&self.repo_root, Some(sha))
-                {
-                    tracing::warn!("Failed to persist cochange watermark: {}", e);
+        match (pending_cochange_watermark, persist_succeeded) {
+            (Some(sha), true) => {
+                match crate::scanner::write_cochange_watermark(&self.repo_root, Some(sha.clone())) {
+                    Ok(()) => tracing::info!("co-change watermark advanced to {}", sha),
+                    Err(e) => tracing::warn!("Failed to persist cochange watermark: {}", e),
                 }
-            } else {
-                tracing::warn!(
-                    "Persist failed; leaving co-change watermark unadvanced so the next scan re-mines"
-                );
             }
+            (Some(_), false) => tracing::warn!(
+                "Persist failed; leaving co-change watermark unadvanced so the next scan re-mines"
+            ),
+            (None, _) => tracing::debug!(
+                "co-change: no watermark to advance (mining skipped or HEAD unresolved)"
+            ),
         }
 
         if let Some((lsp_call_edge_count, degraded_detail, validations)) = incremental_lsp_outcome {
