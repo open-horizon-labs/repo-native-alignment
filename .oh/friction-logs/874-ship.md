@@ -1,3 +1,11 @@
+---
+id: 874-ship
+ship_pr: 874
+issue: 873
+outcome: context-assembly
+severity: friction
+---
+
 # Friction log — PR #874 ship
 
 | Step | Tool used | RNA alternative | Reason | Severity |
