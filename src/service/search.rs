@@ -1518,21 +1518,25 @@ fn scoped_convergence_calls_candidates(
     }
 
     let node_index = ctx.graph_state.node_index_map();
-    let edge_is_exact = |left: &str, right: &str, direction: ConvergenceHopDirection| {
-        ctx.graph_state.edges.iter().any(|edge| {
-            if edge.kind != EdgeKind::Calls
-                || edge.source != ExtractionSource::Lsp
-                || edge.confidence != crate::graph::Confidence::Confirmed
-            {
-                return false;
-            }
-            let from = edge.from.to_stable_id();
-            let to = edge.to.to_stable_id();
-            match direction {
-                ConvergenceHopDirection::Forward => from == left && to == right,
-                ConvergenceHopDirection::Reverse => from == right && to == left,
-            }
+    // One pass over the edge vector; every hop check is then an O(1) lookup
+    // instead of a full rescan with two stable-id allocations per edge.
+    let confirmed_lsp_calls = ctx
+        .graph_state
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::Calls
+                && edge.source == ExtractionSource::Lsp
+                && edge.confidence == crate::graph::Confidence::Confirmed
         })
+        .map(|edge| (edge.from.to_stable_id(), edge.to.to_stable_id()))
+        .collect::<std::collections::HashSet<(String, String)>>();
+    let edge_is_exact = |left: &str, right: &str, direction: ConvergenceHopDirection| {
+        let (from, to) = match direction {
+            ConvergenceHopDirection::Forward => (left, right),
+            ConvergenceHopDirection::Reverse => (right, left),
+        };
+        confirmed_lsp_calls.contains(&(from.to_string(), to.to_string()))
     };
 
     let mut proven = Vec::new();
@@ -1627,22 +1631,42 @@ fn convergence_unresolved(params: &SearchParams, detail: &str) -> ConvergenceDel
     let max_tokens = params
         .max_output_tokens
         .unwrap_or(MAX_PROJECTED_OUTPUT_TOKENS);
-    let mut detail = detail.to_string();
-    loop {
-        let body = format!(
+    let chars = detail.chars().collect::<Vec<_>>();
+    let render = |len: usize| {
+        let detail = chars[..len].iter().collect::<String>();
+        convergence_accounted(format!(
             "## Convergence unresolved\n\n- delivery_status: not_injectable\n- injected_context: false\n- proof_records: 0\n- delivered_handles: 0\n- detail: {detail}\n- lexical_fallback: disabled\n"
-        );
-        let rendered = convergence_accounted(body);
-        if rendered.len() <= max_bytes
-            && rendered.chars().count().saturating_add(3) / 4 <= max_tokens
-        {
-            return ConvergenceDelivery::NotInjectable(rendered);
+        ))
+    };
+    let within_budget = |rendered: &str| {
+        rendered.len() <= max_bytes && rendered.chars().count().saturating_add(3) / 4 <= max_tokens
+    };
+    let full = render(chars.len());
+    if within_budget(&full) {
+        return ConvergenceDelivery::NotInjectable(full);
+    }
+    // Rendered size grows monotonically with the detail length, so binary
+    // search the longest prefix that fits: O(log d) renders instead of O(d).
+    let mut best: Option<String> = None;
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let rendered = render(mid);
+        if within_budget(&rendered) {
+            best = Some(rendered);
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        if detail.pop().is_none() {
-            return ConvergenceDelivery::BudgetTooSmall {
-                minimum_bytes: rendered.len(),
-                minimum_tokens: rendered.chars().count().saturating_add(3) / 4,
-            };
+    }
+    match best {
+        Some(rendered) => ConvergenceDelivery::NotInjectable(rendered),
+        None => {
+            let empty = render(0);
+            ConvergenceDelivery::BudgetTooSmall {
+                minimum_bytes: empty.len(),
+                minimum_tokens: empty.chars().count().saturating_add(3) / 4,
+            }
         }
     }
 }
@@ -3391,24 +3415,18 @@ async fn task_records(
                         edge_index,
                     )
                     .ok()?;
-                    let all_terms = task_text_terms(&format!(
-                        "{} {} {} {}",
-                        node.id.name,
-                        node.signature,
-                        node.body,
-                        node.id.file.display()
-                    ));
+                    let all_terms = task_candidate_terms(node);
                     let affinity = query_terms.intersection(&all_terms).count();
                     if affinity == 0 {
                         return None;
                     }
                     let name_terms = task_text_terms(&node.id.name);
                     let name_affinity = query_terms.intersection(&name_terms).count();
-                    if task_candidate_quality_for_roles(
+                    if task_candidate_quality_with_query_terms(
                         node,
                         &BTreeSet::from([role]),
                         false,
-                        base_query,
+                        &query_terms,
                     ) != EvidenceQuality::Actionable
                     {
                         return None;
@@ -4230,6 +4248,30 @@ fn task_candidate_quality_for_roles(
     graph_only: bool,
     query: &str,
 ) -> EvidenceQuality {
+    task_candidate_quality_with_query_terms(node, roles, graph_only, &task_query_terms(query))
+}
+
+/// Candidate text tokenized once per node for affinity checks.
+fn task_candidate_terms(node: &Node) -> BTreeSet<String> {
+    task_text_terms(&format!(
+        "{} {} {} {}",
+        node.id.name,
+        node.signature,
+        node.body,
+        node.id.file.display()
+    ))
+}
+
+/// Quality gate with caller-supplied query terms. Callers that already hold
+/// the tokenized query (graph expansion loops, lexical supplement passes) pass
+/// it in so a task request tokenizes the query once, and the candidate body is
+/// only tokenized when the graph-affinity gate actually applies.
+fn task_candidate_quality_with_query_terms(
+    node: &Node,
+    roles: &BTreeSet<TaskRole>,
+    graph_only: bool,
+    query_terms: &BTreeSet<String>,
+) -> EvidenceQuality {
     let source_text = format!("{}\n{}", node.signature, node.body);
     let trimmed = source_text.trim();
     let has_identifier = trimmed.chars().any(|ch| ch.is_alphanumeric() || ch == '_');
@@ -4252,24 +4294,24 @@ fn task_candidate_quality_for_roles(
         return EvidenceQuality::Supporting;
     }
 
-    let query_terms = task_query_terms(query);
-    let candidate_terms = task_text_terms(&format!(
-        "{} {} {} {}",
-        node.id.name,
-        node.signature,
-        node.body,
-        node.id.file.display()
-    ));
-    let affinity_count = query_terms
-        .iter()
-        .filter(|term| candidate_terms.contains(*term))
-        .count();
-    let required_graph_affinity = query_terms.len().min(2);
     let graph_corroborated_test = roles.contains(&TaskRole::Test)
         && crate::ranking::is_test_function(node)
         && task_test_has_actionable_assertion(node);
-    let unrelated_graph_neighbor =
-        graph_only && affinity_count < required_graph_affinity && !graph_corroborated_test;
+    // Graph-only neighbors must share at least one affine term with the query
+    // (two when the query has them). `task_query_terms` drops stopwords and
+    // short tokens, so an all-stopword query ("add the fix") yields an empty
+    // set; clamping to >= 1 keeps the gate closed instead of admitting every
+    // neighbor as Actionable. The candidate body is tokenized only when the
+    // gate applies.
+    let unrelated_graph_neighbor = graph_only && !graph_corroborated_test && {
+        let candidate_terms = task_candidate_terms(node);
+        let affinity_count = query_terms
+            .iter()
+            .filter(|term| candidate_terms.contains(*term))
+            .count();
+        let required_graph_affinity = query_terms.len().clamp(1, 2);
+        affinity_count < required_graph_affinity
+    };
     let generic_test = roles.contains(&TaskRole::Test)
         && (!crate::ranking::is_test_function(node) || !task_test_has_actionable_assertion(node));
     if unrelated_graph_neighbor || generic_test {
@@ -5417,6 +5459,7 @@ fn expand_task_graph(
         .min(MAX_CONTEXT_HOPS);
     let incoming = params.direction.as_deref() != Some("outgoing");
     let outgoing = params.direction.as_deref() != Some("incoming");
+    let query_terms = task_query_terms(params.query.as_deref().unwrap_or_default());
     let mut queue = assemblies
         .keys()
         .cloned()
@@ -5489,11 +5532,11 @@ fn expand_task_graph(
             if newly_observed {
                 observed += 1;
             }
-            if task_candidate_quality_for_roles(
+            if task_candidate_quality_with_query_terms(
                 node,
                 &BTreeSet::from([role]),
                 true,
-                params.query.as_deref().unwrap_or_default(),
+                &query_terms,
             ) != EvidenceQuality::Actionable
             {
                 if newly_observed {
@@ -17332,6 +17375,32 @@ mod tests {
             "stopwords and incidental substrings must not create graph affinity"
         );
 
+        // #859 review: an all-stopword query must not disable the graph-affinity
+        // gate. `task_query_terms("add the fix")` is empty; the required affinity
+        // clamps to 1 so graph-only neighbors stay Supporting.
+        let mut stopword_neighbor = make_node("impl", NodeKind::Function, "src/hooks.py");
+        stopword_neighbor.signature = "def impl(override):".into();
+        stopword_neighbor.body = "def impl(override): return decorator".into();
+        stopword_neighbor.line_start = 1;
+        stopword_neighbor.line_end = 1;
+        let mut stopword_assembly = assembly(&stopword_neighbor, TaskRole::DirectDependency);
+        stopword_assembly.reason = "typed graph Calls dependency".into();
+        assert!(task_query_terms("add the fix").is_empty());
+        assert_eq!(
+            task_candidate_quality(&stopword_neighbor, &stopword_assembly, "add the fix"),
+            EvidenceQuality::Supporting,
+            "all-stopword query must keep graph-only neighbors Supporting"
+        );
+        assert_eq!(
+            task_candidate_quality(
+                &stopword_neighbor,
+                &assembly(&stopword_neighbor, TaskRole::DirectDependency),
+                "add the fix"
+            ),
+            EvidenceQuality::Actionable,
+            "lexical (non graph-only) candidates are unaffected by the affinity gate"
+        );
+
         let mut relevant_test = make_node(
             "test_override",
             NodeKind::Function,
@@ -18257,8 +18326,11 @@ mod tests {
             "seed".into(),
         );
         let mut relationships = Vec::new();
+        // Task mode always carries a query in production; graph-only neighbors
+        // need >= 1 affine term ("lib" matches src/lib.rs) to be Actionable.
         expand_task_graph(
             &SearchParams {
+                query: Some("Change lib".into()),
                 edge_types: Some(vec!["calls".into()]),
                 hops: Some(2),
                 ..Default::default()
@@ -19045,5 +19117,51 @@ mod tests {
             deltas,
             source_backed_behavioral_contrasts(&proposed, &analogue, &loci, &current, &source)
         );
+    }
+
+    #[test]
+    fn convergence_unresolved_truncates_detail_to_budget_without_char_by_char_shrink() {
+        let detail = "x".repeat(4_000);
+        let params = SearchParams {
+            mode: Some("convergence".into()),
+            max_output_bytes: Some(1_200),
+            ..Default::default()
+        };
+        match convergence_unresolved(&params, &detail) {
+            ConvergenceDelivery::NotInjectable(rendered) => {
+                assert!(rendered.len() <= 1_200, "rendered {} bytes", rendered.len());
+                assert!(
+                    rendered.contains("- detail: xxxx"),
+                    "detail prefix must survive"
+                );
+                // Longest prefix that fits: adding one more char must overflow.
+                let kept = rendered
+                    .lines()
+                    .find_map(|line| line.strip_prefix("- detail: "))
+                    .map(|d| d.len())
+                    .unwrap();
+                let longer = "x".repeat(kept + 1);
+                assert!(matches!(
+                    convergence_unresolved(
+                        &SearchParams {
+                            max_output_bytes: Some(rendered.len()),
+                            ..params.clone()
+                        },
+                        &longer
+                    ),
+                    ConvergenceDelivery::NotInjectable(r) if r.len() <= rendered.len()
+                ));
+            }
+            _ => panic!("expected truncated NotInjectable"),
+        }
+        let tiny = SearchParams {
+            mode: Some("convergence".into()),
+            max_output_bytes: Some(10),
+            ..Default::default()
+        };
+        assert!(matches!(
+            convergence_unresolved(&tiny, &detail),
+            ConvergenceDelivery::BudgetTooSmall { minimum_bytes, .. } if minimum_bytes > 10
+        ));
     }
 }
