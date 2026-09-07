@@ -41,3 +41,23 @@ Blocking #1: nested functions (Python nested def, TS/JS nested arrow/decl, class
 
 ### Step 4: Regression Oracle
 Tests seeded from AC + Step 1 #1 + Step 2 #1-#6; all pass on 70247a1. Non-vacuous: reviewer reproduced the false edges pre-fix.
+
+### Step 5-7 data gathered (posted after final gates)
+- Perf gate (clean cache, `scan --full --no-lsp --no-embed --extract-only`, this worktree, interleaved x2 each): baseline main 8f4bf66 = 5.73/5.78/5.73/5.73s (mean 5.74s); branch = 5.99/5.97/5.94/5.89s (mean 5.95s) => +3.6% (< 10% gate). `symbols.lance` 19.6MB -> 19.9MB (+1.8%), edges.lance unchanged within noise. Edges on this repo: 167761 -> 167903 (+142 restored cross-file Tree-sitter Calls).
+- Fixture before/after (CLI): main binary `graph --mode neighbors` on `Expertunities` and `py/caller.py:orchestrate` => "No results"; branch binary => `useQueryExpertunities` (api.ts) and `execute` (worker.py).
+- Step 7b MCP (stdio, `@modelcontextprotocol/sdk` 1.30.0, server in normal mode, no TS/Python LSP servers on PATH): 8/8 checks pass — cross-file TS and Python Calls visible via `search mode=neighbors`; destructured-param shadow, nested arrow, nested decl, nested Python def emit none; `impact` on `useQueryExpertunities` lists the caller. `--cache-only` unusable with `--no-embed` caches ("requires a published semantic generation"). All negative-check node IDs verified to exist.
+- Suite on post-fix 70247a1 binary: 158 passed / 0 failed / 0 skipped incl. Expertunities.
+- CI: lint/test/audit pass on 70247a1; `smoke` job only runs on workflow_dispatch/tags in this repo (skipping on PRs is expected).
+- CodeRabbit (after ready): 6 inline comments -> 5 fixed in `12c205d` (cache per scope, JS+TS class-field evidence, session frontmatter), 1 N/A with reasoning (test-only `.iter().find()`).
+- Follow-ups filed: #879 (Java/C#/Kotlin/Ruby/PHP tables), #880 (finalizer stable_id dedup), #881 (#859 leftovers), #882 (old-schema cache hard error).
+
+### Steps 7a / 7b / 8 / 9 / 10 (final binary 12c205d)
+- Perf: baseline mean 5.83s vs branch mean 5.94s (+1.9%; 9.47s first-run cold start excluded). symbols.lance +1.8%.
+- Suite: 158/0/0 incl. Expertunities. cargo test lib 2548/0/4; clippy clean; CI lint/test/audit pass; smoke job is dispatch/tag-only in this repo.
+- 7b MCP stdio: 10/10 (adds class-property Widget.run / Widget.shadowed).
+- README updated in 12c205d.
+- CodeRabbit: 5 threads resolved by CodeRabbit after 12c205d; test-only `.iter().find()` thread resolved by me with reasoning (PERFORMANCE heading; guardrail detection excludes tests).
+- Follow-ups: #879 #880 #881 #882.
+
+### Final fresh review
+Spawned fresh code-reviewer on 12c205d (guardrail independent-final-review-for-prs). Pending.
