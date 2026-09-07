@@ -121,6 +121,10 @@ fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
 pub(super) struct Pass1SymbolIndex {
     nodes: Vec<Node>,
     by_file: HashMap<PathBuf, Vec<usize>>,
+    /// `Impl`/`Struct` indices per file, in matching-set order: the only
+    /// candidates `implementor_at` ever considers, so a trait lookup never
+    /// walks a file's functions, consts, or imports.
+    implementors_by_file: HashMap<PathBuf, Vec<usize>>,
     graph_by_file: HashMap<PathBuf, Vec<Node>>,
 }
 
@@ -176,9 +180,16 @@ impl Pass1SymbolIndex {
     pub(super) fn build(matching: &[&Node], graph_nodes: &[Node]) -> Self {
         let mut nodes = Vec::with_capacity(matching.len());
         let mut by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        let mut implementors_by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
         for (index, node) in matching.iter().enumerate() {
             nodes.push(body_free_clone(node));
             by_file.entry(node.id.file.clone()).or_default().push(index);
+            if matches!(node.id.kind, NodeKind::Impl | NodeKind::Struct) {
+                implementors_by_file
+                    .entry(node.id.file.clone())
+                    .or_default()
+                    .push(index);
+            }
         }
         let mut graph_by_file: HashMap<PathBuf, Vec<Node>> = HashMap::new();
         for node in graph_nodes {
@@ -193,6 +204,7 @@ impl Pass1SymbolIndex {
         Self {
             nodes,
             by_file,
+            implementors_by_file,
             graph_by_file,
         }
     }
@@ -220,8 +232,11 @@ impl Pass1SymbolIndex {
     /// span first; equal spans resolve to the first in matching-set order.
     /// This is the trait-implementor lookup `enrich_trait_node` performs.
     fn implementor_at(&self, file: &Path, line: usize) -> Option<NodeId> {
-        self.nodes_in_file(file)
-            .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
+        self.implementors_by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.nodes[index])
             .filter(|n| n.line_start <= line && n.line_end >= line)
             .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
             .map(|n| n.id.clone())

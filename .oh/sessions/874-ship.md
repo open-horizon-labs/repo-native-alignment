@@ -1,3 +1,9 @@
+---
+ship_pr: 874
+issue: 873
+branch: 873-lsp-pass1-symbol-index
+---
+
 ## Ship Pipeline — PR #874
 **Started:** 2026-09-06T16:47Z
 **Issue:** #873 — LSP Pass 1 quadratic work / body clones -> OOM
