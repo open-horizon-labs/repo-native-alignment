@@ -57,6 +57,21 @@ pub(crate) async fn persist_graph_to_lance(
     nodes: &[Node],
     edges: &[Edge],
 ) -> anyhow::Result<()> {
+    persist_graph_to_lance_with_cochange(repo_root, nodes, edges, &Default::default()).await
+}
+
+/// Same as [`persist_graph_to_lance`], but also writes the
+/// `cochange_support`/`cochange_confidence` columns for `EdgeKind::CoChanges`
+/// edges present in `cochange_stats` (keyed by `Edge::stable_id()`). Used only
+/// by the co-change mining call sites in `src/server/graph.rs`; every other
+/// caller keeps using the plain `persist_graph_to_lance` (empty map -- those
+/// two columns stay null, zero behavior change).
+pub(crate) async fn persist_graph_to_lance_with_cochange(
+    repo_root: &Path,
+    nodes: &[Node],
+    edges: &[Edge],
+    cochange_stats: &crate::graph::CoChangeStatsMap,
+) -> anyhow::Result<()> {
     let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
         .await
         .context("failed to serialize full graph persistence with LSP readiness")?;
@@ -148,7 +163,7 @@ pub(crate) async fn persist_graph_to_lance(
 
     // -- Append edges with new_version --
     {
-        let batch = build_edges_batch(edges, new_version)?;
+        let batch = build_edges_batch(edges, new_version, cochange_stats)?;
 
         match db.open_table("edges").execute().await {
             Ok(tbl) => {
@@ -310,6 +325,40 @@ pub(crate) async fn persist_graph_incremental(
         deleted_files,
         retry_limit,
         None,
+        &Default::default(),
+    )
+    .await
+}
+
+/// Same as [`persist_graph_incremental`], but also writes the
+/// `cochange_support`/`cochange_confidence` columns for any `EdgeKind::CoChanges`
+/// edges in `upsert_edges` that have an entry in `cochange_stats`. Used only by
+/// the co-change mining call sites in `src/server/graph.rs`.
+pub(crate) async fn persist_graph_incremental_with_cochange(
+    repo_root: &Path,
+    upsert_nodes: &[Node],
+    upsert_edges: &[Edge],
+    deleted_edge_ids: &[String],
+    deleted_files: &[(String, PathBuf)],
+    cochange_stats: &crate::graph::CoChangeStatsMap,
+) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    let retry_limit = std::env::var("RNA_TEST_LANCE_RETRY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3);
+    #[cfg(not(test))]
+    let retry_limit = 3;
+
+    persist_graph_incremental_with_retry_limit(
+        repo_root,
+        upsert_nodes,
+        upsert_edges,
+        deleted_edge_ids,
+        deleted_files,
+        retry_limit,
+        None,
+        cochange_stats,
     )
     .await
 }
@@ -322,6 +371,7 @@ async fn persist_graph_incremental_with_retry_limit(
     deleted_files: &[(String, PathBuf)],
     retry_limit: u64,
     instrumentation: Option<&PersistInstrumentation>,
+    cochange_stats: &crate::graph::CoChangeStatsMap,
 ) -> anyhow::Result<bool> {
     let _readiness_lock = acquire_lsp_readiness_mutation_lock_async(repo_root)
         .await
@@ -467,7 +517,7 @@ async fn persist_graph_incremental_with_retry_limit(
 
         // 2. Upsert changed/added edges.
         if !upsert_edges.is_empty() {
-            let batch = build_edges_batch(upsert_edges, write_version)?;
+            let batch = build_edges_batch(upsert_edges, write_version, cochange_stats)?;
             let schema = batch.schema();
 
             match db.open_table("edges").execute().await {
@@ -757,6 +807,7 @@ mod tests {
                             &[],
                             retry_limit,
                             Some(&metrics),
+                            &Default::default(),
                         )
                         .await;
                         drop(guard);

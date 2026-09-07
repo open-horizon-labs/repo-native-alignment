@@ -50,6 +50,10 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         EdgeKind::UsesFramework => 0.1,
         // Pub/sub edges carry moderate signal (async coupling)
         EdgeKind::Produces | EdgeKind::Consumes => 0.4,
+        // Historical co-change carries weak structural signal -- it's evidence of
+        // logical coupling, not a direct code dependency, so it stays conservative
+        // like other non-architectural (Evolves/Modified/etc.) edges.
+        EdgeKind::CoChanges => 0.05,
         // Repo-local relationship semantics are unknown to RNA core; keep a conservative
         // weak structural signal while preserving the custom label for traversal/search.
         EdgeKind::Other(_) => 0.05,

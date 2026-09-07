@@ -149,6 +149,9 @@ pub struct SearchParams {
     pub context_facets: Option<Vec<String>>,
     /// Bounded unified diff or structured edit sketch for graph-delta beta.
     pub proposal: Option<String>,
+    /// Minimum co-change confidence threshold for `mode="cochange"` and
+    /// `mode="cochange_gaps"` (#884). Ignored by other modes.
+    pub min_confidence: Option<f64>,
 }
 
 impl Default for SearchParams {
@@ -197,6 +200,7 @@ impl Default for SearchParams {
             context_roles: None,
             context_facets: None,
             proposal: None,
+            min_confidence: None,
         }
     }
 }
@@ -280,6 +284,7 @@ impl SearchParams {
             context_roles: non_empty_string_vec(&args.context_roles),
             context_facets: non_empty_string_vec(&args.context_facets),
             proposal: args.proposal.clone(),
+            min_confidence: args.min_confidence,
         }
     }
 }

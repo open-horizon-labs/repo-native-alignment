@@ -10299,6 +10299,221 @@ async fn search_traversal(
         return out;
     }
 
+    // ── cochange mode ────────────────────────────────────────────────────────
+    // Ranked git co-change partners for the given node(s) (#884). Resolves each
+    // selector's containing file, looks up its synthetic file anchor node, and
+    // reports the anchor's `CoChanges` neighbors above `min_confidence`.
+    if mode == "cochange" {
+        let gs = ctx.graph_state;
+        let strip = ctx.root_filter.as_deref();
+        let min_confidence = params.min_confidence.unwrap_or(0.3);
+        let selectors: Vec<String> = params
+            .nodes
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| node.map(|n| vec![n.to_string()]).unwrap_or_default());
+        if selectors.is_empty() {
+            return "cochange mode requires node= or nodes=[...].".to_string();
+        }
+
+        let index_map = gs.node_index_map();
+        let mut out = String::from("## Co-change partners\n\n");
+        let mut any_found = false;
+        for selector in &selectors {
+            let resolved = gs.resolve_node_id(selector);
+            let Some(anchor_node) = gs.node_by_stable_id(&resolved, index_map) else {
+                out.push_str(&format!(
+                    "`{}`: not found in graph.\n\n",
+                    strip_root_prefix(selector, strip)
+                ));
+                continue;
+            };
+            let file = anchor_node.id.file.clone();
+            let root = anchor_node.id.root.clone();
+            let anchor_id = crate::git::cochange::file_anchor_node_id(&root, &file);
+            let anchor_stable = anchor_id.to_stable_id();
+
+            let mut partners: Vec<(String, u32, f64)> = Vec::new();
+            for direction in [
+                petgraph::Direction::Outgoing,
+                petgraph::Direction::Incoming,
+            ] {
+                for neighbor_stable in gs.index.neighbors(
+                    &anchor_stable,
+                    Some(&[EdgeKind::CoChanges]),
+                    direction,
+                ) {
+                    if neighbor_stable == anchor_stable {
+                        continue;
+                    }
+                    let Some(neighbor_node) = gs.node_by_stable_id(&neighbor_stable, index_map)
+                    else {
+                        continue;
+                    };
+                    let (from, to) = match direction {
+                        petgraph::Direction::Outgoing => {
+                            (anchor_id.clone(), neighbor_node.id.clone())
+                        }
+                        petgraph::Direction::Incoming => {
+                            (neighbor_node.id.clone(), anchor_id.clone())
+                        }
+                    };
+                    let edge = Edge {
+                        from,
+                        to,
+                        kind: EdgeKind::CoChanges,
+                        source: ExtractionSource::Git,
+                        confidence: crate::graph::Confidence::Detected,
+                        evidence: Vec::new(),
+                    };
+                    if let Some(stats) = gs.cochange_stats.get(&edge.stable_id())
+                        && stats.confidence >= min_confidence
+                        && !partners.iter().any(|(id, ..)| id == &neighbor_stable)
+                    {
+                        partners.push((neighbor_stable, stats.support, stats.confidence));
+                    }
+                }
+            }
+            partners.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+            out.push_str(&format!(
+                "### `{}`\n",
+                strip_root_prefix(&resolved, strip)
+            ));
+            if partners.is_empty() {
+                out.push_str(&format!(
+                    "No co-change partners at or above confidence {:.2}.\n\n",
+                    min_confidence
+                ));
+                continue;
+            }
+            any_found = true;
+            for (partner_id, support, confidence) in partners.iter().take(top_k) {
+                out.push_str(&format!(
+                    "- `{}` (support={}, confidence={:.2})\n",
+                    strip_root_prefix(partner_id, strip),
+                    support,
+                    confidence
+                ));
+            }
+            out.push('\n');
+        }
+        if !any_found {
+            out.push_str("No co-change data available (repo may not have `.git`, or no commits mined yet).\n");
+        }
+        return out;
+    }
+
+    // ── cochange_gaps mode ───────────────────────────────────────────────────
+    // Given a changed-file set (working tree / staged / base..head, via `query`,
+    // default "working_tree"), report confident co-change partners not present
+    // in that set -- files you may have forgotten to change alongside it (#884).
+    if mode == "cochange_gaps" {
+        let gs = ctx.graph_state;
+        let strip = ctx.root_filter.as_deref();
+        let min_confidence = params.min_confidence.unwrap_or(0.3);
+        let scope = query.unwrap_or("working_tree");
+
+        let changed_files = match crate::git::cochange::resolve_changed_file_set(
+            ctx.repo_root,
+            scope,
+        ) {
+            Ok(files) => files,
+            Err(e) => {
+                return format!("cochange_gaps: could not resolve changed-file set for `{scope}`: {e}");
+            }
+        };
+        if changed_files.is_empty() {
+            return format!("cochange_gaps: no changed files found for scope `{scope}`.");
+        }
+
+        let index_map = gs.node_index_map();
+        let root_slugs = crate::server::state::GraphState::root_slugs_from_index_map(index_map);
+        let mut gap_lines: Vec<String> = Vec::new();
+        for file in &changed_files {
+            let mut best_partners: Vec<(PathBuf, u32, f64)> = Vec::new();
+            for root in &root_slugs {
+                let anchor_id = crate::git::cochange::file_anchor_node_id(root, file);
+                let anchor_stable = anchor_id.to_stable_id();
+                if gs.index.get_node(&anchor_stable).is_none() {
+                    continue;
+                }
+                for direction in [
+                    petgraph::Direction::Outgoing,
+                    petgraph::Direction::Incoming,
+                ] {
+                    for neighbor_stable in gs.index.neighbors(
+                        &anchor_stable,
+                        Some(&[EdgeKind::CoChanges]),
+                        direction,
+                    ) {
+                        let Some(neighbor_node) =
+                            gs.node_by_stable_id(&neighbor_stable, index_map)
+                        else {
+                            continue;
+                        };
+                        if changed_files.contains(&neighbor_node.id.file) {
+                            continue; // already part of this change -- not a gap
+                        }
+                        let (from, to) = match direction {
+                            petgraph::Direction::Outgoing => {
+                                (anchor_id.clone(), neighbor_node.id.clone())
+                            }
+                            petgraph::Direction::Incoming => {
+                                (neighbor_node.id.clone(), anchor_id.clone())
+                            }
+                        };
+                        let edge = Edge {
+                            from,
+                            to,
+                            kind: EdgeKind::CoChanges,
+                            source: ExtractionSource::Git,
+                            confidence: crate::graph::Confidence::Detected,
+                            evidence: Vec::new(),
+                        };
+                        if let Some(stats) = gs.cochange_stats.get(&edge.stable_id())
+                            && stats.confidence >= min_confidence
+                        {
+                            best_partners.push((
+                                neighbor_node.id.file.clone(),
+                                stats.support,
+                                stats.confidence,
+                            ));
+                        }
+                    }
+                }
+            }
+            if best_partners.is_empty() {
+                continue;
+            }
+            best_partners
+                .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            best_partners.dedup_by(|a, b| a.0 == b.0);
+            for (partner_file, support, confidence) in best_partners.iter().take(top_k) {
+                gap_lines.push(format!(
+                    "- `{}` usually changes with `{}` (support={}, confidence={:.2}), but is not in this change.",
+                    strip_root_prefix(&file.display().to_string(), strip),
+                    strip_root_prefix(&partner_file.display().to_string(), strip),
+                    support,
+                    confidence
+                ));
+            }
+        }
+
+        if gap_lines.is_empty() {
+            return format!(
+                "## Co-change gap check ({scope})\n\nNo confident co-change gaps found across {} changed file(s) at confidence >= {:.2}.",
+                changed_files.len(),
+                min_confidence
+            );
+        }
+        return format!(
+            "## Co-change gap check ({scope})\n\n{} changed file(s); possible gaps:\n\n{}",
+            changed_files.len(),
+            gap_lines.join("\n")
+        );
+    }
+
     // ── path mode ────────────────────────────────────────────────────────────
     // Computes the shortest directed call path from `node` (start) to `query`
     // (destination). Both are resolved via the usual name-matching machinery.

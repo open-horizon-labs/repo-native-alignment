@@ -286,7 +286,17 @@ pub(super) fn build_symbols_batch(
 }
 
 /// Build an edges `RecordBatch` for `edges` tagged with `scan_version`.
-pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Result<RecordBatch> {
+///
+/// `cochange_stats` supplies the `cochange_support`/`cochange_confidence`
+/// column values for `EdgeKind::CoChanges` edges (keyed by `Edge::stable_id()`,
+/// see `crate::graph::CoChangeStatsMap`). Edges with no entry (i.e. every edge
+/// kind except `CoChanges`) get `null` in both columns. Pass an empty map for
+/// non-cochange callers.
+pub(super) fn build_edges_batch(
+    edges: &[Edge],
+    scan_version: u64,
+    cochange_stats: &crate::graph::CoChangeStatsMap,
+) -> anyhow::Result<RecordBatch> {
     use std::sync::Arc;
     let schema = Arc::new(edges_schema());
     let now = std::time::SystemTime::now()
@@ -322,6 +332,14 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
         })
         .collect::<Result<_, _>>()?;
     let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
+    let cochange_supports: Vec<Option<u32>> = edges
+        .iter()
+        .map(|e| cochange_stats.get(&e.stable_id()).map(|s| s.support))
+        .collect();
+    let cochange_confidences: Vec<Option<f64>> = edges
+        .iter()
+        .map(|e| cochange_stats.get(&e.stable_id()).map(|s| s.confidence))
+        .collect();
     let updated_ats: Vec<i64> = vec![now; edges.len()];
     let scan_versions: Vec<u64> = vec![scan_version; edges.len()];
 
@@ -343,6 +361,8 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
             Arc::new(StringArray::from(edge_confidences)),
             Arc::new(StringArray::from(edge_evidence_json)),
             Arc::new(StringArray::from(root_ids)),
+            Arc::new(UInt32Array::from(cochange_supports)),
+            Arc::new(Float64Array::from(cochange_confidences)),
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),
         ],

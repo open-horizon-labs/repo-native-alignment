@@ -396,6 +396,12 @@ fn list_roots_from_slugs_with_report_recovery(
                 line.push_str("\n  LSP: none detected");
             }
 
+            // Co-change mining (#884): non-git roots can't be mined -- surface that
+            // plainly instead of silently having zero CoChanges edges.
+            if git2::Repository::open(&r.path).is_err() {
+                line.push_str("\n  Co-change: not available (no .git)");
+            }
+
             line
         })
         .collect();

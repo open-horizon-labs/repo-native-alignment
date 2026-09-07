@@ -14,6 +14,60 @@ use super::node_passes_root_filter;
 
 const IMPORTANCE_THRESHOLD: f64 = 0.001;
 
+/// Strongest git co-change partner for `file` in `root`, if any (#884).
+/// Returns `(partner_file_display, support, confidence)`.
+fn top_cochange_partner(
+    graph_state: &crate::server::state::GraphState,
+    root: &str,
+    file: &Path,
+) -> Option<(String, u32, f64)> {
+    if graph_state.cochange_stats.is_empty() {
+        return None;
+    }
+    let anchor_id = crate::git::cochange::file_anchor_node_id(root, file);
+    let anchor_stable = anchor_id.to_stable_id();
+    let index_map = graph_state.node_index_map();
+
+    let mut best: Option<(String, u32, f64)> = None;
+    for direction in [
+        petgraph::Direction::Outgoing,
+        petgraph::Direction::Incoming,
+    ] {
+        for neighbor_stable in graph_state.index.neighbors(
+            &anchor_stable,
+            Some(&[crate::graph::EdgeKind::CoChanges]),
+            direction,
+        ) {
+            let Some(neighbor_node) = graph_state.node_by_stable_id(&neighbor_stable, index_map)
+            else {
+                continue;
+            };
+            let (from, to) = match direction {
+                petgraph::Direction::Outgoing => (anchor_id.clone(), neighbor_node.id.clone()),
+                petgraph::Direction::Incoming => (neighbor_node.id.clone(), anchor_id.clone()),
+            };
+            let edge = crate::graph::Edge {
+                from,
+                to,
+                kind: crate::graph::EdgeKind::CoChanges,
+                source: crate::graph::ExtractionSource::Git,
+                confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
+            };
+            if let Some(stats) = graph_state.cochange_stats.get(&edge.stable_id())
+                && best.as_ref().is_none_or(|(_, _, c)| stats.confidence > *c)
+            {
+                best = Some((
+                    neighbor_node.id.file.display().to_string(),
+                    stats.support,
+                    stats.confidence,
+                ));
+            }
+        }
+    }
+    best
+}
+
 #[derive(Debug)]
 pub struct RepoMapParams {
     pub top_n: usize,
@@ -288,10 +342,26 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             let md: String = sf
                 .iter()
                 .map(|((root, f), count)| {
+                    // #884: append the strongest git co-change partner, if any,
+                    // so agents see "these two files usually change together"
+                    // directly in the existing Hotspot files section rather than
+                    // requiring a separate search(mode="cochange") round trip.
+                    let cochange_suffix =
+                        top_cochange_partner(graph_state, root, std::path::Path::new(f))
+                            .map(|(partner, support, confidence)| {
+                                format!(
+                                    " (co-changes with `{}`: support={}, confidence={:.2})",
+                                    partner, support, confidence
+                                )
+                            })
+                            .unwrap_or_default();
                     if single_root {
-                        format!("- `{}` -- {} definitions", f, count)
+                        format!("- `{}` -- {} definitions{}", f, count, cochange_suffix)
                     } else {
-                        format!("- [{}] `{}` -- {} definitions", root, f, count)
+                        format!(
+                            "- [{}] `{}` -- {} definitions{}",
+                            root, f, count, cochange_suffix
+                        )
                     }
                 })
                 .collect::<Vec<_>>()

@@ -138,6 +138,77 @@ impl ScanConfig {
     }
 }
 
+// ── Co-change mining configuration ──────────────────────────────────
+
+/// Configuration for git co-change mining (#884), loaded from
+/// `.oh/config.toml` under `[cochange]`.
+///
+/// # Example `.oh/config.toml`
+///
+/// ```toml
+/// [cochange]
+/// max_commits = 500
+/// max_age_days = 365
+/// max_files_per_commit = 50
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CoChangeConfig {
+    /// Maximum number of first-parent commits to walk (bounded window).
+    pub max_commits: usize,
+    /// Maximum commit age in days; commits older than this are not walked.
+    pub max_age_days: u32,
+    /// Commits touching more than this many files are skipped entirely
+    /// (large refactors/vendoring drops are noise for logical coupling).
+    pub max_files_per_commit: usize,
+}
+
+impl Default for CoChangeConfig {
+    fn default() -> Self {
+        Self {
+            max_commits: 500,
+            max_age_days: 365,
+            max_files_per_commit: 50,
+        }
+    }
+}
+
+impl CoChangeConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    ///
+    /// Parses into a `toml::Value` first to isolate section parse errors --
+    /// a bad `[cochange]` section must not affect `[scanner]`/`[patterns]`,
+    /// and vice versa (mirrors `ScanConfig::load`).
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                return Self::default();
+            }
+        };
+        match value.get("cochange") {
+            Some(v) => match v.clone().try_into::<Self>() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [cochange] section in {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 // ── Pattern hint configuration ──────────────────────────────────────
 
 /// Configuration for design pattern detection via naming conventions.
@@ -433,6 +504,15 @@ pub struct ScanState {
     /// Timestamp of last successful scan.
     #[serde(default)]
     pub last_scan: Option<SystemTimeWrapper>,
+    /// HEAD SHA as of the last successful co-change mining pass (#884).
+    ///
+    /// Deliberately a separate field from `last_commit_sha`: that field has
+    /// different skip/failure semantics (used to bound the file-change scan)
+    /// and is updated on a different cadence. This watermark is updated only
+    /// after co-change mining succeeds, so a mining failure doesn't silently
+    /// advance past commits that were never actually mined.
+    #[serde(default)]
+    pub cochange_watermark_sha: Option<String>,
 }
 
 /// Wrapper for SystemTime that serializes as seconds since UNIX_EPOCH.
@@ -563,6 +643,18 @@ impl Scanner {
     /// only returns changed files, but the graph needs everything.
     pub fn all_known_files(&self) -> Vec<PathBuf> {
         self.state.file_mtimes.keys().cloned().collect()
+    }
+
+    /// HEAD SHA as of the last successful co-change mining pass, if any (#884).
+    pub fn cochange_watermark_sha(&self) -> Option<&str> {
+        self.state.cochange_watermark_sha.as_deref()
+    }
+
+    /// Record the HEAD SHA mined by the co-change pass that just succeeded.
+    /// Callers must call `commit_state()` afterwards to persist it (same
+    /// pattern as the rest of `ScanState`).
+    pub fn set_cochange_watermark_sha(&mut self, sha: Option<String>) {
+        self.state.cochange_watermark_sha = sha;
     }
 
     /// Persist the scanner's in-memory state to disk.
@@ -1529,6 +1621,26 @@ fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
     let data = serde_json::to_string_pretty(state).context("serializing scan state")?;
     fs::write(path, data).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Read the co-change watermark directly from persisted scan state (#884),
+/// without constructing a full `Scanner`. Used by incremental graph updates
+/// that receive a pre-computed `ScanResult` and may not hold a live `Scanner`
+/// for the primary root.
+pub fn read_cochange_watermark(repo_root: &Path) -> Option<String> {
+    load_state(repo_root)
+        .ok()
+        .and_then(|s| s.cochange_watermark_sha)
+}
+
+/// Persist an updated co-change watermark directly (#884), without a live
+/// `Scanner`. Best-effort, same durability characteristics as the rest of
+/// `scan-state.json` (not transactional against a concurrently-running
+/// `Scanner::commit_state()`).
+pub fn write_cochange_watermark(repo_root: &Path, sha: Option<String>) -> Result<()> {
+    let mut state = load_state(repo_root).unwrap_or_default();
+    state.cochange_watermark_sha = sha;
+    save_state(repo_root, &state)
 }
 
 // ── Filesystem helpers ──────────────────────────────────────────────
