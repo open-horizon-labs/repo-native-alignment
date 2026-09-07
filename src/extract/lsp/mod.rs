@@ -4288,22 +4288,11 @@ impl Enricher for LspEnricher {
             return Ok(result);
         }
 
-        // Shared state for concurrent passes
-        let matching_nodes_owned: Arc<Vec<Node>> =
-            Arc::new(matching_nodes.iter().map(|n| (*n).clone()).collect());
-        let refs_by_file_shared: Arc<HashMap<std::path::PathBuf, Vec<Node>>> = {
-            let mut map: HashMap<std::path::PathBuf, Vec<Node>> = HashMap::new();
-            // Call-hierarchy endpoints are not limited to the subset admitted for
-            // LSP work. Resolve against the complete extracted graph so a valid
-            // caller/callee that was not itself scheduled is still persisted.
-            for n in nodes {
-                map.entry(n.id.file.clone()).or_default().push(n.clone());
-            }
-            for nodes in map.values_mut() {
-                nodes.sort_by_key(|node| node.line_end.saturating_sub(node.line_start));
-            }
-            Arc::new(map)
-        };
+        // Shared, body-free Pass 1 index (#873). Call-hierarchy and
+        // documentSymbol endpoints are not limited to the subset admitted for
+        // LSP work, so the index also carries the complete extracted graph and
+        // a valid caller/callee that was not itself scheduled is still persisted.
+        let pass1_index = Arc::new(passes::Pass1SymbolIndex::build(&matching_nodes, nodes));
         let capabilities = LspServerCapabilities {
             references: has_references,
             call_hierarchy: has_call_hierarchy,
@@ -4326,8 +4315,7 @@ impl Enricher for LspEnricher {
                 &transport,
                 &root,
                 &matching_nodes,
-                &matching_nodes_owned,
-                &refs_by_file_shared,
+                &pass1_index,
                 capabilities,
                 &mut query_budget,
                 &query_telemetry,

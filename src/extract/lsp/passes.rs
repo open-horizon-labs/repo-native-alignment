@@ -101,6 +101,164 @@ fn lsp_toolchain_contract(enricher: &LspEnricher, repo_root: &Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Read-only, body-free view of the nodes Pass 1 resolves against.
+///
+/// Built once per `enrich()` call and shared by every Pass 1 work item, so no
+/// work item owns a `Node` and no per-item lookup allocates in proportion to
+/// the total node count (#873).
+///
+/// `nodes` holds the language-matching nodes in their original order and the
+/// per-file index lists are pushed in that same order, so callers that
+/// tie-break with `min_by_key` (first minimum wins) observe exactly the
+/// sequence a linear scan over the matching set produced before.
+///
+/// Storage trade-off: a language-matching node appears twice, once in `nodes`
+/// (body-free, keeps `signature`/`metadata` because `node_lsp_position` and the
+/// work-item ledger read them) and once in `graph_by_file` (endpoint clone:
+/// `id`, span, `language`, `source` only, because `EndpointLookupIndex` and
+/// `file_root` read nothing else). Both copies are linear in the node count;
+/// neither carries `body`.
+pub(super) struct Pass1SymbolIndex {
+    nodes: Vec<Node>,
+    by_file: HashMap<PathBuf, Vec<usize>>,
+    /// `Impl`/`Struct` indices per file, in matching-set order: the only
+    /// candidates `implementor_at` ever considers, so a trait lookup never
+    /// walks a file's functions, consts, or imports.
+    implementors_by_file: HashMap<PathBuf, Vec<usize>>,
+    graph_by_file: HashMap<PathBuf, Vec<Node>>,
+}
+
+impl std::fmt::Debug for Pass1SymbolIndex {
+    /// Counts only: a derived `Debug` would print every indexed node.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pass1SymbolIndex")
+            .field("matching_nodes", &self.nodes.len())
+            .field("matching_files", &self.by_file.len())
+            .field("graph_files", &self.graph_by_file.len())
+            .field(
+                "graph_nodes",
+                &self.graph_by_file.values().map(Vec::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+/// Endpoint-resolution clone: keeps only what `EndpointLookupIndex::build`,
+/// `EnclosingLineIndex::build`, and `Pass1SymbolIndex::file_root` read.
+fn endpoint_clone(node: &Node) -> Node {
+    Node {
+        id: node.id.clone(),
+        language: node.language.clone(),
+        line_start: node.line_start,
+        line_end: node.line_end,
+        signature: String::new(),
+        body: String::new(),
+        metadata: BTreeMap::new(),
+        source: node.source.clone(),
+    }
+}
+
+fn body_free_clone(node: &Node) -> Node {
+    Node {
+        id: node.id.clone(),
+        language: node.language.clone(),
+        line_start: node.line_start,
+        line_end: node.line_end,
+        signature: node.signature.clone(),
+        body: String::new(),
+        metadata: node.metadata.clone(),
+        source: node.source.clone(),
+    }
+}
+
+impl Pass1SymbolIndex {
+    /// `matching` is the language-matching subset that Pass 1 schedules and
+    /// resolves trait implementors against. `graph_nodes` is the complete
+    /// extracted graph: call-hierarchy and documentSymbol endpoints are not
+    /// limited to the subset admitted for LSP work, so a valid caller/callee
+    /// that was not itself scheduled is still persisted.
+    pub(super) fn build(matching: &[&Node], graph_nodes: &[Node]) -> Self {
+        let mut nodes = Vec::with_capacity(matching.len());
+        let mut by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        let mut implementors_by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for (index, node) in matching.iter().enumerate() {
+            nodes.push(body_free_clone(node));
+            by_file.entry(node.id.file.clone()).or_default().push(index);
+            if matches!(node.id.kind, NodeKind::Impl | NodeKind::Struct) {
+                implementors_by_file
+                    .entry(node.id.file.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut graph_by_file: HashMap<PathBuf, Vec<Node>> = HashMap::new();
+        for node in graph_nodes {
+            graph_by_file
+                .entry(node.id.file.clone())
+                .or_default()
+                .push(endpoint_clone(node));
+        }
+        for nodes in graph_by_file.values_mut() {
+            nodes.sort_by_key(|node| node.line_end.saturating_sub(node.line_start));
+        }
+        Self {
+            nodes,
+            by_file,
+            implementors_by_file,
+            graph_by_file,
+        }
+    }
+
+    fn node(&self, index: usize) -> &Node {
+        self.nodes.get(index).unwrap_or_else(|| {
+            panic!(
+                "Pass1SymbolIndex: work item node_index {index} is out of range for {} matching nodes; \
+                 work items must be built from the same matching set as the index",
+                self.nodes.len()
+            )
+        })
+    }
+
+    /// Language-matching nodes in `file`, in matching-set order. Production
+    /// lookups go through `implementor_at`; this remains for tests that pin
+    /// the per-file ordering the index guarantees.
+    #[cfg(test)]
+    fn nodes_in_file(&self, file: &Path) -> impl Iterator<Item = &Node> + '_ {
+        self.by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.nodes[index])
+    }
+
+    /// The `Impl` or `Struct` in `file` whose span contains `line`, narrowest
+    /// span first; equal spans resolve to the first in matching-set order.
+    /// This is the trait-implementor lookup `enrich_trait_node` performs.
+    fn implementor_at(&self, file: &Path, line: usize) -> Option<NodeId> {
+        self.implementors_by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.nodes[index])
+            .filter(|n| n.line_start <= line && n.line_end >= line)
+            .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
+            .map(|n| n.id.clone())
+    }
+
+    /// Every extracted node grouped by file, narrowest span first.
+    fn graph_nodes_by_file(&self) -> &HashMap<PathBuf, Vec<Node>> {
+        &self.graph_by_file
+    }
+
+    /// Graph root recorded for `file`, taken from its narrowest node.
+    fn file_root(&self, file: &Path) -> Option<String> {
+        self.graph_by_file
+            .get(file)
+            .and_then(|nodes| nodes.first())
+            .map(|node| node.id.root.clone())
+    }
+}
+
 #[derive(Debug, Default)]
 struct EndpointLookupIndex {
     functions_by_file_and_name: HashMap<PathBuf, HashMap<String, Vec<NodeId>>>,
@@ -487,7 +645,8 @@ impl DidOpenCoordinator {
 #[derive(Debug, Clone)]
 struct LspPass1WorkItem {
     id: usize,
-    node: Node,
+    /// Index of this item's node in the shared `Pass1SymbolIndex`.
+    node_index: usize,
     requested_operations: Vec<LspQueryOperation>,
     attempt_count: u32,
 }
@@ -508,22 +667,25 @@ fn validate_structural_cache_runtime_operation_plan(
         .map(Some)
 }
 
-fn pass1_work_item_files(work_items: &[LspPass1WorkItem]) -> Vec<PathBuf> {
+fn pass1_work_item_files(
+    work_items: &[LspPass1WorkItem],
+    symbol_index: &Pass1SymbolIndex,
+) -> Vec<PathBuf> {
     let mut files = work_items
         .iter()
-        .map(|item| item.node.id.file.clone())
+        .map(|item| symbol_index.node(item.node_index).id.file.clone())
         .collect::<Vec<_>>();
     files.sort_unstable();
     files.dedup();
     files
 }
 
-fn sort_document_symbol_candidates(candidates: &mut [&Node]) {
+fn sort_document_symbol_candidates(candidates: &mut [(usize, &Node)]) {
     // Persisted LSP document-symbol nodes are valid graph output, but they must
     // not replace the parser-owned representative that produced that output on
     // a resumed run. Keep the representative stable across reopen/recovery,
     // with deterministic LSP fallback for files that have no non-LSP node.
-    candidates.sort_by_key(|node| (node.source == ExtractionSource::Lsp, node.stable_id()));
+    candidates.sort_by_key(|(_, node)| (node.source == ExtractionSource::Lsp, node.stable_id()));
 }
 
 fn is_document_symbol_transport_timeout(error: &anyhow::Error) -> bool {
@@ -594,6 +756,7 @@ where
 
 fn take_pass1_document_symbol_barrier_item(
     work_items: &mut Vec<LspPass1WorkItem>,
+    symbol_index: &Pass1SymbolIndex,
 ) -> Option<LspPass1WorkItem> {
     let index = work_items
         .iter()
@@ -604,10 +767,8 @@ fn take_pass1_document_symbol_barrier_item(
                 .is_some_and(|operation| *operation == LspQueryOperation::DocumentSymbols)
         })
         .map(|(index, item)| {
-            (
-                (item.node.id.file.clone(), item.node.stable_id(), item.id),
-                index,
-            )
+            let node = symbol_index.node(item.node_index);
+            ((node.id.file.clone(), node.stable_id(), item.id), index)
         })
         .min()
         .map(|(_, index)| index)?;
@@ -620,13 +781,14 @@ async fn execute_pass1_document_symbol_barrier_item(
     transport: &Arc<PipelinedTransport>,
     root: &Path,
     language: &str,
-    refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+    symbol_index: &Pass1SymbolIndex,
     did_open: &DidOpenCoordinator,
     work_item_ledger: &Arc<LspWorkItemLedger>,
     telemetry: &Arc<LspQueryTelemetry>,
     job_deadline: tokio::time::Instant,
 ) -> Result<Pass1TaskResult> {
-    let rel_path = &item.node.id.file;
+    let node = symbol_index.node(item.node_index);
+    let rel_path = &node.id.file;
     let file_uri = path_to_uri(&root.join(rel_path)).with_context(|| {
         format!(
             "LSP Pass 1 persisted documentSymbol item could not resolve {}",
@@ -639,8 +801,7 @@ async fn execute_pass1_document_symbol_barrier_item(
         telemetry.register_work_item(
             item.id,
             LspQueryOperation::DocumentSymbols,
-            LspDeclarationClass::from_kind(&item.node.id.kind)
-                .unwrap_or(LspDeclarationClass::Other),
+            LspDeclarationClass::from_kind(&node.id.kind).unwrap_or(LspDeclarationClass::Other),
         ),
         "LSP Pass 1 persisted documentSymbol item could not register before the job deadline"
     );
@@ -715,10 +876,7 @@ async fn execute_pass1_document_symbol_barrier_item(
     };
     let observed_result_count = symbols.len();
     let nodes = materialize_document_symbols(language, &mut symbols, root, |file| {
-        refs_by_file
-            .get(file)
-            .and_then(|nodes| nodes.first())
-            .map(|node| node.id.root.clone())
+        symbol_index.file_root(file)
     })
     .with_context(|| {
         format!(
@@ -1063,13 +1221,13 @@ impl LspPass1Diagnostics {
         }
     }
 
-    async fn set_phase(&self, item: &LspPass1WorkItem, phase: &'static str) {
+    async fn set_phase(&self, item: &LspPass1WorkItem, node: &Node, phase: &'static str) {
         let mut in_flight = self.in_flight.lock().await;
         in_flight.insert(
             item.id,
             InFlightTaskDiagnostic {
-                file: item.node.id.file.clone(),
-                node: item.node.id.name.clone(),
+                file: node.id.file.clone(),
+                node: node.id.name.clone(),
                 phase,
                 attempt_count: item.attempt_count,
                 started_at: Instant::now(),
@@ -1090,6 +1248,7 @@ impl LspPass1Diagnostics {
     async fn finish(
         &self,
         item: &LspPass1WorkItem,
+        node: &Node,
         success: bool,
         edges: &[Edge],
         nodes: &[Node],
@@ -1097,6 +1256,7 @@ impl LspPass1Diagnostics {
     ) {
         self.finish_with_error(
             item,
+            node,
             success,
             (!success).then(|| "one or more LSP operations failed".to_string()),
             edges,
@@ -1106,14 +1266,16 @@ impl LspPass1Diagnostics {
         .await;
     }
 
-    async fn finish_failed(&self, item: &LspPass1WorkItem, error: impl Into<String>) {
-        self.finish_with_error(item, false, Some(error.into()), &[], &[], 0)
+    async fn finish_failed(&self, item: &LspPass1WorkItem, node: &Node, error: impl Into<String>) {
+        self.finish_with_error(item, node, false, Some(error.into()), &[], &[], 0)
             .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_with_error(
         &self,
         item: &LspPass1WorkItem,
+        node: &Node,
         success: bool,
         error: Option<String>,
         edges: &[Edge],
@@ -1127,11 +1289,7 @@ impl LspPass1Diagnostics {
         self.completed.fetch_add(1, Ordering::Relaxed);
         if success {
             let mut last_success = self.last_success.lock().await;
-            *last_success = Some(format!(
-                "{}:{}",
-                item.node.id.file.display(),
-                item.node.id.name
-            ));
+            *last_success = Some(format!("{}:{}", node.id.file.display(), node.id.name));
         } else {
             self.failed.fetch_add(1, Ordering::Relaxed);
         }
@@ -1281,8 +1439,7 @@ impl LspEnricher {
         transport: &Arc<PipelinedTransport>,
         root: &Path,
         matching_nodes: &[&Node],
-        matching_nodes_owned: &Arc<Vec<Node>>,
-        refs_by_file_shared: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        symbol_index: &Arc<Pass1SymbolIndex>,
         capabilities: LspServerCapabilities,
         budget: &mut LspQueryBudget,
         telemetry: &Arc<LspQueryTelemetry>,
@@ -1311,9 +1468,12 @@ impl LspEnricher {
         // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
         // re-enriched via the generic Other/documentLink path on subsequent passes --
         // which would generate spurious DependsOn edges from diagnostics.
-        let candidate_nodes: Vec<&Node> = matching_nodes
+        // Each candidate carries its position in `matching_nodes`, which is
+        // also its index in the shared `Pass1SymbolIndex`.
+        let candidate_nodes: Vec<(usize, &Node)> = matching_nodes
             .iter()
-            .filter(|n| {
+            .enumerate()
+            .filter(|(_, n)| {
                 matches!(
                     n.id.kind,
                     NodeKind::Function
@@ -1326,30 +1486,30 @@ impl LspEnricher {
                         | NodeKind::Const
                 )
             })
-            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            .filter(|n| !crate::ranking::is_test_function(n))
-            .copied()
+            .filter(|(_, n)| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
+            .filter(|(_, n)| !crate::ranking::is_test_function(n))
+            .map(|(index, n)| (index, *n))
             .collect();
 
-        let mut admitted_nodes: Vec<(&Node, LspQueryOperation)> = Vec::new();
+        let mut admitted_nodes: Vec<(usize, &Node, LspQueryOperation)> = Vec::new();
         if capabilities.document_symbols {
-            let mut document_representatives = BTreeMap::<PathBuf, Vec<&Node>>::new();
-            for node in matching_nodes {
+            let mut document_representatives = BTreeMap::<PathBuf, Vec<(usize, &Node)>>::new();
+            for (index, node) in matching_nodes.iter().enumerate() {
                 document_representatives
                     .entry(node.id.file.clone())
                     .or_default()
-                    .push(*node);
+                    .push((index, *node));
             }
             for mut candidates in document_representatives.into_values() {
                 sort_document_symbol_candidates(&mut candidates);
-                for node in candidates {
+                for (index, node) in candidates {
                     if self.query_profile.admits(
                         node,
                         LspQueryOperation::DocumentSymbols,
                         capabilities,
                         budget,
                     ) {
-                        admitted_nodes.push((node, LspQueryOperation::DocumentSymbols));
+                        admitted_nodes.push((index, node, LspQueryOperation::DocumentSymbols));
                         break;
                     }
                 }
@@ -1357,7 +1517,7 @@ impl LspEnricher {
         }
 
         let mut document_link_files = HashSet::new();
-        for node in candidate_nodes {
+        for (index, node) in candidate_nodes {
             let operations: &[LspQueryOperation] = match node.id.kind {
                 NodeKind::Function if capabilities.call_hierarchy => {
                     &[LspQueryOperation::CallHierarchy]
@@ -1386,7 +1546,7 @@ impl LspEnricher {
                         .query_profile
                         .admits(node, operation, capabilities, budget)
                 {
-                    admitted_nodes.push((node, operation));
+                    admitted_nodes.push((index, node, operation));
                 }
             }
         }
@@ -1394,7 +1554,7 @@ impl LspEnricher {
         if let Some(admission) = runtime_admission.as_ref() {
             let operations = admitted_nodes
                 .iter()
-                .map(|(_, operation)| *operation)
+                .map(|(_, _, operation)| *operation)
                 .collect::<Vec<_>>();
             if let Err(error) =
                 validate_structural_cache_runtime_operation_plan(Some(admission), &operations)
@@ -1415,7 +1575,7 @@ impl LspEnricher {
 
         let ref_eligible = admitted_nodes
             .iter()
-            .filter(|(n, _)| {
+            .filter(|(_, n, _)| {
                 matches!(
                     n.id.kind,
                     NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
@@ -1428,16 +1588,16 @@ impl LspEnricher {
             matching_nodes.len(),
             admitted_nodes
                 .iter()
-                .filter(|(n, _)| n.id.kind == NodeKind::Function)
+                .filter(|(_, n, _)| n.id.kind == NodeKind::Function)
                 .count(),
             admitted_nodes
                 .iter()
-                .filter(|(n, _)| n.id.kind == NodeKind::Trait)
+                .filter(|(_, n, _)| n.id.kind == NodeKind::Trait)
                 .count(),
             ref_eligible,
             admitted_nodes
                 .iter()
-                .filter(|(n, _)| matches!(n.id.kind, NodeKind::Other(_)))
+                .filter(|(_, n, _)| matches!(n.id.kind, NodeKind::Other(_)))
                 .count(),
             capabilities.references,
             capabilities.call_hierarchy,
@@ -1450,9 +1610,9 @@ impl LspEnricher {
         let work_items: Vec<LspPass1WorkItem> = admitted_nodes
             .iter()
             .enumerate()
-            .map(|(id, (node, operation))| LspPass1WorkItem {
+            .map(|(id, (node_index, _, operation))| LspPass1WorkItem {
                 id,
-                node: (*node).clone(),
+                node_index: *node_index,
                 requested_operations: vec![*operation],
                 attempt_count: 1,
             })
@@ -1462,7 +1622,7 @@ impl LspEnricher {
             .iter()
             .map(|item| LspWorkItemSeed {
                 item_id: item.id,
-                node: item.node.clone(),
+                node: symbol_index.node(item.node_index).clone(),
                 requested_operations: item
                     .requested_operations
                     .iter()
@@ -1521,7 +1681,7 @@ impl LspEnricher {
         // make unrelated file requests race each other. Pre-opening the bounded,
         // deterministic file set preserves pipelined query concurrency without
         // interleaving mutations and requests.
-        for rel_path in pass1_work_item_files(&work_items) {
+        for rel_path in pass1_work_item_files(&work_items, symbol_index) {
             if tokio::time::Instant::now() >= job_deadline {
                 break;
             }
@@ -1547,13 +1707,15 @@ impl LspEnricher {
             }
         }
         let mut barrier_attempted = 0u32;
-        if let Some(barrier_item) = take_pass1_document_symbol_barrier_item(&mut work_items) {
+        if let Some(barrier_item) =
+            take_pass1_document_symbol_barrier_item(&mut work_items, symbol_index)
+        {
             match execute_pass1_document_symbol_barrier_item(
                 &barrier_item,
                 transport,
                 root,
                 &language,
-                refs_by_file_shared,
+                symbol_index,
                 &did_open,
                 &work_item_ledger,
                 telemetry,
@@ -1586,9 +1748,10 @@ impl LspEnricher {
         let error_count = Arc::new(AtomicI64::new(0));
         let transport = Arc::clone(transport);
         let root = root.to_path_buf();
-        let matching_owned = Arc::clone(matching_nodes_owned);
-        let refs_by_file = Arc::clone(refs_by_file_shared);
-        let endpoint_index = Arc::new(EndpointLookupIndex::build(refs_by_file_shared));
+        let symbol_index = Arc::clone(symbol_index);
+        let endpoint_index = Arc::new(EndpointLookupIndex::build(
+            symbol_index.graph_nodes_by_file(),
+        ));
         let worker_telemetry = Arc::clone(telemetry);
         // Shared across every work item in this pass so a file with many
         // symbols is read from disk once rather than once per symbol.
@@ -1603,8 +1766,7 @@ impl LspEnricher {
             move |item, diagnostics| {
                 let transport = Arc::clone(&transport);
                 let root = root.clone();
-                let matching_owned = Arc::clone(&matching_owned);
-                let refs_by_file = Arc::clone(&refs_by_file);
+                let symbol_index = Arc::clone(&symbol_index);
                 let endpoint_index = Arc::clone(&endpoint_index);
                 let language = language.clone();
                 let error_count = Arc::clone(&error_count);
@@ -1614,10 +1776,11 @@ impl LspEnricher {
                 async move {
                     let operation = item.requested_operations.first().copied();
                     let declaration =
-                        LspDeclarationClass::from_kind(&item.node.id.kind).or_else(|| {
-                            (operation == Some(LspQueryOperation::DocumentSymbols))
-                                .then_some(LspDeclarationClass::Other)
-                        });
+                        LspDeclarationClass::from_kind(&symbol_index.node(item.node_index).id.kind)
+                            .or_else(|| {
+                                (operation == Some(LspQueryOperation::DocumentSymbols))
+                                    .then_some(LspDeclarationClass::Other)
+                            });
                     let registered =
                         if let (Some(operation), Some(declaration)) = (operation, declaration) {
                             telemetry.register_work_item(item.id, operation, declaration)
@@ -1638,8 +1801,7 @@ impl LspEnricher {
                         &item,
                         &transport,
                         &root,
-                        &matching_owned,
-                        &refs_by_file,
+                        &symbol_index,
                         &endpoint_index,
                         &language,
                         &did_open,
@@ -1891,8 +2053,7 @@ impl LspEnricher {
         item: &LspPass1WorkItem,
         transport: &PipelinedTransport,
         root: &Path,
-        matching_owned: &Arc<Vec<Node>>,
-        refs_by_file: &Arc<HashMap<PathBuf, Vec<Node>>>,
+        symbol_index: &Pass1SymbolIndex,
         endpoint_index: &EndpointLookupIndex,
         language: &str,
         did_open: &DidOpenCoordinator,
@@ -1905,8 +2066,10 @@ impl LspEnricher {
         let operation = item.requested_operations.first().copied();
         let edge_producing =
             operation.is_some_and(|operation| operation != LspQueryOperation::DocumentSymbols);
-        diagnostics.set_phase(item, "resolving_file_uri").await;
-        let node = &item.node;
+        let node = symbol_index.node(item.node_index);
+        diagnostics
+            .set_phase(item, node, "resolving_file_uri")
+            .await;
         let abs_path = root.join(&node.id.file);
         let file_uri = match path_to_uri(&abs_path) {
             Ok(uri) => uri,
@@ -1917,7 +2080,7 @@ impl LspEnricher {
                     e
                 );
                 diagnostics
-                    .finish_failed(item, format!("failed to resolve file URI: {e}"))
+                    .finish_failed(item, node, format!("failed to resolve file URI: {e}"))
                     .await;
                 telemetry.record_work_item(item.id, 0, 0, started_at.elapsed(), 1, 0);
                 return Pass1TaskResult {
@@ -1929,7 +2092,7 @@ impl LspEnricher {
             }
         };
 
-        diagnostics.set_phase(item, "sending_did_open").await;
+        diagnostics.set_phase(item, node, "sending_did_open").await;
         if let Err(e) = did_open
             .ensure_open(transport, root, &node.id.file, &file_uri)
             .await
@@ -1937,7 +2100,11 @@ impl LspEnricher {
             error_count.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("{}", e);
             diagnostics
-                .finish_failed(item, format!("failed to send textDocument/didOpen: {e}"))
+                .finish_failed(
+                    item,
+                    node,
+                    format!("failed to send textDocument/didOpen: {e}"),
+                )
                 .await;
             let mut observation = QueryObservation::default();
             observation.record_error(&e);
@@ -1962,7 +2129,7 @@ impl LspEnricher {
             .first()
             .map(|operation| operation.phase())
             .unwrap_or("requesting_lsp_operation");
-        diagnostics.set_phase(item, phase).await;
+        diagnostics.set_phase(item, node, phase).await;
 
         let (line, col) = Self::node_lsp_position(root, node, source_cache);
         let mut edges = Vec::new();
@@ -1973,7 +2140,7 @@ impl LspEnricher {
                 transport,
                 &file_uri,
                 language,
-                refs_by_file,
+                symbol_index,
                 root,
                 item.id,
                 telemetry,
@@ -2012,7 +2179,7 @@ impl LspEnricher {
                         line,
                         col,
                         node,
-                        matching_owned,
+                        symbol_index,
                         root,
                         item.id,
                         telemetry,
@@ -2099,6 +2266,7 @@ impl LspEnricher {
         diagnostics
             .finish(
                 item,
+                node,
                 !had_error,
                 &edges,
                 &new_nodes,
@@ -2297,7 +2465,7 @@ impl LspEnricher {
         line: u32,
         col: u32,
         node: &Node,
-        matching_owned: &Arc<Vec<Node>>,
+        symbol_index: &Pass1SymbolIndex,
         root: &Path,
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
@@ -2311,7 +2479,6 @@ impl LspEnricher {
         match Self::find_implementations_p(transport, file_uri, line, col).await {
             Ok(locations) => {
                 observation.non_empty_responses += usize::from(!locations.is_empty());
-                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                 for loc in locations {
                     let impl_path = uri_to_relative_path(&loc.uri, root);
                     let impl_line = loc.range.start.line as usize + 1;
@@ -2321,13 +2488,9 @@ impl LspEnricher {
                     }
                     observation.result_count += 1;
 
-                    let impl_id = matching_refs
-                        .iter()
-                        .filter(|n| n.id.file == impl_path)
-                        .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
-                        .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
-                        .min_by_key(|n| n.line_end - n.line_start)
-                        .map(|n| n.id.clone());
+                    // Per-file candidates in matching-set order, so the
+                    // first-minimum tie-break is unchanged.
+                    let impl_id = symbol_index.implementor_at(&impl_path, impl_line);
 
                     if let Some(implementor) = impl_id {
                         edges.push(Edge {
@@ -2479,7 +2642,7 @@ impl LspEnricher {
         transport: &PipelinedTransport,
         file_uri: &lsp_types::Uri,
         language: &str,
-        refs_by_file: &HashMap<PathBuf, Vec<Node>>,
+        symbol_index: &Pass1SymbolIndex,
         root: &Path,
         work_item_id: usize,
         telemetry: &LspQueryTelemetry,
@@ -2506,10 +2669,7 @@ impl LspEnricher {
                 observation.non_empty_responses += usize::from(!symbols.is_empty());
                 observation.result_count = symbols.len();
                 match materialize_document_symbols(language, &mut symbols, root, |file| {
-                    refs_by_file
-                        .get(file)
-                        .and_then(|nodes| nodes.first())
-                        .map(|node| node.id.root.clone())
+                    symbol_index.file_root(file)
                 }) {
                     Ok(nodes) => new_nodes.extend(nodes),
                     Err(error) => {
@@ -3495,58 +3655,70 @@ mod tests {
         let extracted = make_node("source_symbol", ExtractionSource::TreeSitter);
         assert!(lsp_first.stable_id() < extracted.stable_id());
 
-        let mut mixed = vec![&lsp_first, &extracted];
+        let mut mixed = vec![(0, &lsp_first), (1, &extracted)];
         sort_document_symbol_candidates(&mut mixed);
-        assert_eq!(mixed[0].stable_id(), extracted.stable_id());
+        assert_eq!(mixed[0].1.stable_id(), extracted.stable_id());
+        assert_eq!(mixed[0].0, 1);
 
-        let mut lsp_only = vec![&lsp_second, &lsp_first];
+        let mut lsp_only = vec![(0, &lsp_second), (1, &lsp_first)];
         sort_document_symbol_candidates(&mut lsp_only);
-        assert_eq!(lsp_only[0].stable_id(), lsp_first.stable_id());
+        assert_eq!(lsp_only[0].1.stable_id(), lsp_first.stable_id());
+        assert_eq!(lsp_only[0].0, 1);
     }
 
     #[test]
     fn pass1_preopen_files_are_deterministic_and_deduplicated() {
-        let item = |id: usize, file: &str, operation| LspPass1WorkItem {
-            id,
-            node: Node {
-                id: NodeId {
-                    root: "repo".to_string(),
-                    file: PathBuf::from(file),
-                    name: format!("symbol-{id}"),
-                    kind: NodeKind::Function,
-                },
-                language: "python".to_string(),
-                line_start: 1,
-                line_end: 1,
-                signature: String::new(),
-                body: String::new(),
-                metadata: BTreeMap::new(),
-                source: ExtractionSource::TreeSitter,
+        let node = |id: usize, file: &str| Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(file),
+                name: format!("symbol-{id}"),
+                kind: NodeKind::Function,
             },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let nodes = [
+            node(0, "tests/test_app.py"),
+            node(1, "src/app.py"),
+            node(2, "src/app.py"),
+        ];
+        let symbol_index = Pass1SymbolIndex::build(&nodes.iter().collect::<Vec<_>>(), &[]);
+        let item = |id: usize, operation| LspPass1WorkItem {
+            id,
+            node_index: id,
             requested_operations: vec![operation],
             attempt_count: 1,
         };
         let mut work_items = vec![
-            item(0, "tests/test_app.py", LspQueryOperation::DocumentSymbols),
-            item(1, "src/app.py", LspQueryOperation::CallHierarchy),
-            item(2, "src/app.py", LspQueryOperation::DocumentSymbols),
+            item(0, LspQueryOperation::DocumentSymbols),
+            item(1, LspQueryOperation::CallHierarchy),
+            item(2, LspQueryOperation::DocumentSymbols),
         ];
 
         assert_eq!(
-            pass1_work_item_files(&work_items),
+            pass1_work_item_files(&work_items, &symbol_index),
             [
                 PathBuf::from("src/app.py"),
                 PathBuf::from("tests/test_app.py")
             ]
         );
-        let barrier = take_pass1_document_symbol_barrier_item(&mut work_items)
+        let barrier = take_pass1_document_symbol_barrier_item(&mut work_items, &symbol_index)
             .expect("the lexicographically first documentSymbol item is the startup item");
         assert_eq!(barrier.id, 2);
-        assert_eq!(barrier.node.id.file, PathBuf::from("src/app.py"));
+        assert_eq!(
+            symbol_index.node(barrier.node_index).id.file,
+            PathBuf::from("src/app.py")
+        );
         assert_eq!(work_items.len(), 2);
         assert!(work_items.iter().all(|item| item.id != barrier.id));
-        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_some());
-        assert!(take_pass1_document_symbol_barrier_item(&mut work_items).is_none());
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items, &symbol_index).is_some());
+        assert!(take_pass1_document_symbol_barrier_item(&mut work_items, &symbol_index).is_none());
     }
 
     #[tokio::test]
@@ -3691,27 +3863,30 @@ mod tests {
     async fn pass1_diagnostic_snapshot_is_bounded_and_phase_counted() {
         let diagnostics = LspPass1Diagnostics::new(10);
         for id in 0..8 {
+            let node = Node {
+                id: NodeId {
+                    root: "repo".to_string(),
+                    file: PathBuf::from(format!("src/file{id}.rs")),
+                    kind: NodeKind::Function,
+                    name: format!("func{id}"),
+                },
+                language: "rust".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: format!("fn func{id}()"),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::Lsp,
+            };
             let item = LspPass1WorkItem {
                 id,
-                node: Node {
-                    id: NodeId {
-                        root: "repo".to_string(),
-                        file: PathBuf::from(format!("src/file{id}.rs")),
-                        kind: NodeKind::Function,
-                        name: format!("func{id}"),
-                    },
-                    language: "rust".to_string(),
-                    line_start: 1,
-                    line_end: 1,
-                    signature: format!("fn func{id}()"),
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::Lsp,
-                },
+                node_index: id,
                 requested_operations: vec![LspQueryOperation::References],
                 attempt_count: 1,
             };
-            diagnostics.set_phase(&item, "requesting_references").await;
+            diagnostics
+                .set_phase(&item, &node, "requesting_references")
+                .await;
         }
 
         let snapshot = diagnostics.snapshot().await;
@@ -3772,7 +3947,7 @@ mod tests {
         let work_items = (0..2)
             .map(|id| LspPass1WorkItem {
                 id,
-                node: make_node(id),
+                node_index: id,
                 requested_operations: vec![LspQueryOperation::References],
                 attempt_count: 1,
             })
@@ -3781,7 +3956,7 @@ mod tests {
             .iter()
             .map(|item| LspWorkItemSeed {
                 item_id: item.id,
-                node: item.node.clone(),
+                node: make_node(item.node_index),
                 requested_operations: item
                     .requested_operations
                     .iter()
@@ -3891,7 +4066,7 @@ mod tests {
             .unwrap();
         let work_items = vec![LspPass1WorkItem {
             id: 0,
-            node,
+            node_index: 0,
             requested_operations: vec![LspQueryOperation::References],
             attempt_count: 3,
         }];
@@ -3924,5 +4099,207 @@ mod tests {
         assert_eq!(errors, 1);
         assert!(aborted);
         assert!(diagnostic.unwrap().contains("exhausted the retry budget"));
+    }
+
+    fn pass1_index_node(
+        file: &str,
+        name: &str,
+        kind: NodeKind,
+        line_start: usize,
+        line_end: usize,
+    ) -> Node {
+        Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            signature: format!("{name} signature"),
+            body: format!("{name} body text that must not be retained"),
+            metadata: BTreeMap::from([("name_col".to_string(), "4".to_string())]),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn pass1_symbol_index_strips_bodies_but_keeps_everything_else() {
+        let matching = pass1_index_node("src/lib.rs", "run", NodeKind::Function, 1, 5);
+        let graph_only = pass1_index_node("src/other.rs", "Other", NodeKind::Struct, 1, 3);
+        let index = Pass1SymbolIndex::build(&[&matching], &[matching.clone(), graph_only.clone()]);
+
+        let indexed = index.node(0);
+        assert!(indexed.body.is_empty());
+        assert_eq!(indexed.id, matching.id);
+        assert_eq!(indexed.signature, matching.signature);
+        assert_eq!(indexed.metadata, matching.metadata);
+        assert_eq!(indexed.line_start, matching.line_start);
+        assert_eq!(indexed.line_end, matching.line_end);
+        assert_eq!(indexed.source, matching.source);
+        assert_eq!(index.nodes.len(), 1);
+
+        let graph = index.graph_nodes_by_file();
+        assert_eq!(graph.len(), 2);
+        assert!(
+            graph.values().flatten().all(|node| node.body.is_empty()
+                && node.signature.is_empty()
+                && node.metadata.is_empty()),
+            "graph nodes are endpoint clones: no body, signature, or metadata"
+        );
+        let graph_only_entry = &graph[Path::new("src/other.rs")][0];
+        assert_eq!(graph_only_entry.id, graph_only.id);
+        assert_eq!(graph_only_entry.line_start, graph_only.line_start);
+        assert_eq!(graph_only_entry.line_end, graph_only.line_end);
+        assert_eq!(graph_only_entry.source, graph_only.source);
+        assert_eq!(
+            index.file_root(Path::new("src/other.rs")),
+            Some("repo".to_string())
+        );
+        assert_eq!(index.file_root(Path::new("src/missing.rs")), None);
+    }
+
+    #[test]
+    fn pass1_symbol_index_keeps_matching_order_per_file() {
+        let a = pass1_index_node("src/lib.rs", "a", NodeKind::Impl, 1, 10);
+        let b = pass1_index_node("src/other.rs", "b", NodeKind::Struct, 1, 2);
+        let c = pass1_index_node("src/lib.rs", "c", NodeKind::Struct, 1, 10);
+        let d = pass1_index_node("src/lib.rs", "d", NodeKind::Function, 3, 4);
+        let index = Pass1SymbolIndex::build(&[&a, &b, &c, &d], &[]);
+
+        let names = index
+            .nodes_in_file(Path::new("src/lib.rs"))
+            .map(|node| node.id.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "c", "d"]);
+        assert_eq!(
+            index
+                .nodes_in_file(Path::new("src/other.rs"))
+                .map(|node| node.id.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert_eq!(index.nodes_in_file(Path::new("src/missing.rs")).count(), 0);
+
+        // The trait-implementor lookup tie-breaks on the first minimum span in
+        // matching order; equal-span `a` (Impl) must win over `c` (Struct), and
+        // the enclosing Function `d` is never a candidate.
+        assert_eq!(
+            index.implementor_at(Path::new("src/lib.rs"), 5),
+            Some(a.id.clone())
+        );
+        assert_eq!(
+            index.implementor_at(Path::new("src/lib.rs"), 3),
+            Some(a.id.clone())
+        );
+        assert_eq!(index.implementor_at(Path::new("src/lib.rs"), 11), None);
+        assert_eq!(index.implementor_at(Path::new("src/missing.rs"), 1), None);
+
+        // A strictly narrower Impl that comes later in matching order beats
+        // the wider, earlier `a`: narrowest span wins before order tie-breaks.
+        let inner = pass1_index_node("src/lib.rs", "inner", NodeKind::Impl, 4, 6);
+        let with_inner = Pass1SymbolIndex::build(&[&a, &b, &c, &d, &inner], &[]);
+        assert_eq!(
+            with_inner.implementor_at(Path::new("src/lib.rs"), 5),
+            Some(inner.id.clone())
+        );
+        assert_eq!(
+            with_inner.implementor_at(Path::new("src/lib.rs"), 8),
+            Some(a.id.clone())
+        );
+        assert!(
+            !format!("{with_inner:?}").contains("inner"),
+            "Debug must print counts, not nodes"
+        );
+    }
+
+    #[test]
+    fn pass1_symbol_index_call_target_resolution_unique_vs_ambiguous() {
+        // Two same-named functions in one file share a `NodeId` (the ID carries
+        // no span), so the endpoint index dedups them to one unique target.
+        // This is the pre-#873 `EndpointLookupIndex` behaviour and must survive
+        // being fed endpoint clones from the shared index.
+        let first = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 1, 5);
+        let second = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 10, 15);
+        // Distinct `NodeId`s that still collide on (file, name) are the
+        // genuinely ambiguous case: here the same file is indexed under a
+        // second workspace root.
+        let mut other_root = pass1_index_node("src/lib.rs", "dup", NodeKind::Function, 20, 25);
+        other_root.id.root = "other".to_string();
+        let index = Pass1SymbolIndex::build(
+            &[&first, &second, &other_root],
+            &[first.clone(), second.clone(), other_root.clone()],
+        );
+        let endpoint_index = EndpointLookupIndex::build(index.graph_nodes_by_file());
+
+        // Ambiguous: two distinct ids -> None, so the caller falls back to the
+        // enclosing symbol at the call line.
+        assert_eq!(
+            endpoint_index.unique_function(Path::new("src/lib.rs"), "dup"),
+            None
+        );
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/lib.rs"), 12),
+            Some(second.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/lib.rs"), 22),
+            Some(other_root.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.unique_function(Path::new("src/lib.rs"), "missing"),
+            None
+        );
+
+        // Unique after dedup: identical ids collapse to a single target.
+        let deduped = Pass1SymbolIndex::build(&[&first, &second], &[first.clone(), second.clone()]);
+        let deduped_index = EndpointLookupIndex::build(deduped.graph_nodes_by_file());
+        assert_eq!(
+            deduped_index.unique_function(Path::new("src/lib.rs"), "dup"),
+            Some(first.id.clone())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "node_index 3 is out of range for 1 matching nodes")]
+    fn pass1_symbol_index_rejects_out_of_range_work_item() {
+        let only = pass1_index_node("src/lib.rs", "only", NodeKind::Function, 1, 2);
+        let index = Pass1SymbolIndex::build(&[&only], &[]);
+        let _ = index.node(3);
+    }
+
+    #[test]
+    fn pass1_symbol_index_graph_nodes_are_narrowest_first_and_cover_unscheduled_nodes() {
+        let outer = pass1_index_node("src/lib.rs", "Outer", NodeKind::Struct, 1, 20);
+        let inner = pass1_index_node("src/lib.rs", "inner", NodeKind::Function, 5, 10);
+        let sibling = pass1_index_node("src/lib.rs", "sibling", NodeKind::Function, 12, 14);
+        // Only `outer` is language-matching; `inner`/`sibling` exist solely in
+        // the extracted graph, as an unscheduled call-hierarchy endpoint would.
+        let index =
+            Pass1SymbolIndex::build(&[&outer], &[outer.clone(), inner.clone(), sibling.clone()]);
+
+        let per_file = &index.graph_nodes_by_file()[Path::new("src/lib.rs")];
+        assert_eq!(
+            per_file
+                .iter()
+                .map(|node| node.id.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sibling", "inner", "Outer"]
+        );
+        let endpoint_index = EndpointLookupIndex::build(index.graph_nodes_by_file());
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/lib.rs"), 7),
+            Some(inner.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.unique_function(Path::new("src/lib.rs"), "sibling"),
+            Some(sibling.id.clone())
+        );
+        assert_eq!(
+            endpoint_index.enclosing_symbol(Path::new("src/missing.rs"), 7),
+            None
+        );
     }
 }
