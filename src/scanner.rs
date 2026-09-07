@@ -1638,9 +1638,27 @@ pub fn read_cochange_watermark(repo_root: &Path) -> Option<String> {
 /// `scan-state.json` (not transactional against a concurrently-running
 /// `Scanner::commit_state()`).
 pub fn write_cochange_watermark(repo_root: &Path, sha: Option<String>) -> Result<()> {
-    let mut state = load_state(repo_root).unwrap_or_default();
+    // Only a genuinely absent state file may be treated as "empty". Malformed
+    // JSON or an unreadable file must propagate: silently replacing persisted
+    // state with a watermark-only `ScanState` would drop every file mtime and
+    // make the next scan re-extract the whole repository (#884 review).
+    let mut state = match load_state(repo_root) {
+        Ok(state) => state,
+        Err(e) if state_load_error_is_missing(&e) => ScanState::default(),
+        Err(e) => return Err(e),
+    };
     state.cochange_watermark_sha = sha;
     save_state(repo_root, &state)
+}
+
+/// Whether a `load_state` failure was "no state file yet" rather than a
+/// corrupt or unreadable one.
+fn state_load_error_is_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 // ── Filesystem helpers ──────────────────────────────────────────────
@@ -1726,6 +1744,36 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn write_cochange_watermark_rejects_corrupt_state() {
+        // A malformed scan-state.json must NOT be silently replaced with a
+        // watermark-only state: that would drop every recorded mtime and make
+        // the next scan re-extract the whole repository (#884 review).
+        let temp = tempfile::tempdir().unwrap();
+        let path = state_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let result = write_cochange_watermark(temp.path(), Some("deadbeef".to_string()));
+        assert!(result.is_err(), "corrupt state must propagate, not default");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json",
+            "corrupt state file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn write_cochange_watermark_creates_missing_state() {
+        // A genuinely absent state file is the one case that may start empty.
+        let temp = tempfile::tempdir().unwrap();
+        write_cochange_watermark(temp.path(), Some("cafe1234".to_string())).unwrap();
+        assert_eq!(
+            read_cochange_watermark(temp.path()),
+            Some("cafe1234".to_string())
+        );
     }
 
     #[test]

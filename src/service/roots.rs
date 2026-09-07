@@ -398,6 +398,10 @@ fn list_roots_from_slugs_with_report_recovery(
 
             // Co-change mining (#884): non-git roots can't be mined -- surface that
             // plainly instead of silently having zero CoChanges edges.
+            // Must mirror the miner exactly: `cochange::mine_cochanges` uses
+            // `Repository::open` on the root path, so `discover` here would
+            // report a nested subdirectory as minable when mining will fail
+            // (#884 review).
             if git2::Repository::open(&r.path).is_err() {
                 line.push_str("\n  Co-change: not available (no .git)");
             }

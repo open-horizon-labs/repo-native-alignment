@@ -145,7 +145,13 @@ pub fn mine_cochanges(
         {
             break;
         }
-        if since_oid.is_none() && commits_walked >= config.max_commits {
+        // `max_commits` is a hard ceiling on every walk, including watermark
+        // walks. A watermark that parses but is not on the current first-parent
+        // chain (history rewrite, or a watermark carried over from another
+        // line) never satisfies the `oid == since` stop condition, and
+        // `cutoff_secs` is `None` for watermark walks -- without this ceiling
+        // the miner would walk all of history (#884 review).
+        if commits_walked >= config.max_commits {
             break;
         }
 
@@ -297,6 +303,10 @@ pub fn build_file_anchor_nodes(
         }
         nodes.push(crate::graph::Node {
             id,
+            // Synthetic anchors have no source language. Language aggregation
+            // filters empty strings, so this contributes nothing to a root's
+            // language list (#884 review); asserted by
+            // `file_anchor_nodes_carry_no_language`.
             language: String::new(),
             line_start: 0,
             line_end: 0,
@@ -446,6 +456,63 @@ mod tests {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .unwrap()
+    }
+
+    #[test]
+    fn offchain_watermark_walk_stays_bounded() {
+        // A watermark that parses but is not on the current first-parent chain
+        // (history rewrite, or a watermark from another line) never satisfies
+        // the `oid == since` stop condition, and age cutoff is disabled for
+        // watermark walks. `max_commits` must still cap the walk (#884 review).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        for i in 0..8 {
+            commit_files(
+                &repo,
+                dir,
+                &[("a.rs", &format!("{i}")), ("b.rs", &format!("{i}"))],
+                &format!("commit {i}"),
+            );
+        }
+
+        // A well-formed but unrelated SHA: parses, never matches any commit.
+        let offchain = "0123456789abcdef0123456789abcdef01234567";
+        let config = CoChangeConfig {
+            max_commits: 3,
+            max_age_days: 365,
+            max_files_per_commit: 50,
+        };
+        let result = mine_cochanges(dir, &config, Some(offchain)).unwrap();
+        assert_eq!(
+            result.commits_walked, 3,
+            "off-chain watermark must still respect max_commits, walked {}",
+            result.commits_walked
+        );
+    }
+
+    #[test]
+    fn file_anchor_nodes_carry_no_language() {
+        // Synthetic anchors must not contribute a bogus language to per-root
+        // language aggregation in `service::roots` (#884 review).
+        let pairs = vec![CoChangePair {
+            file_a: PathBuf::from("src/a.rs"),
+            file_b: PathBuf::from("src/b.rs"),
+            support: 3,
+            changes_a: 4,
+            changes_b: 4,
+        }];
+        let nodes = build_file_anchor_nodes("repo", &pairs, &HashSet::new());
+        assert_eq!(nodes.len(), 2);
+        for node in &nodes {
+            assert!(
+                node.language.is_empty(),
+                "anchor {} leaked language {:?}",
+                node.id.name,
+                node.language
+            );
+            assert!(matches!(&node.id.kind, crate::graph::NodeKind::Other(k) if k == "file"));
+        }
     }
 
     #[test]
