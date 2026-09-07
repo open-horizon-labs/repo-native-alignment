@@ -19,7 +19,7 @@
 //! the individual extractor files, but as small focused functions rather than
 //! full 300-line traversal reimplementations.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -215,6 +215,139 @@ pub struct LangConfig {
     /// - TypeScript: `Some(("member_expression", "property"))` — `obj.method` node in `obj.method()`
     /// - Go: `Some(("selector_expression", "field"))` — `obj.Method` node in `obj.Method()`
     pub attribute_access_node: Option<(&'static str, &'static str)>,
+    /// Tree-sitter binding sites for local-scope evidence (#877).
+    ///
+    /// Each entry is `(node_kind, field)`. When the function subtree contains a
+    /// node of `node_kind`, the walker collects [`Self::binding_leaf_kinds`]
+    /// text from the designated `field` children (`children_by_field_name`, so
+    /// repeated fields such as Go's multi-name `parameter_declaration.name` are
+    /// covered) or from the whole node when `field` is `None`.
+    ///
+    /// The collected names become `metadata["local_bindings"]` on Function
+    /// nodes and are consumed by `import_calls_pass` as shadowing evidence: a
+    /// bare call to an imported name is suppressed when the name is also bound
+    /// locally. The set is a deliberate superset (flow/block-insensitive), so
+    /// over-collection only ever costs a false negative, never a false edge.
+    pub binding_sites: &'static [(&'static str, Option<&'static str>)],
+    /// Tree-sitter leaf kinds whose text is a bound name inside a binding site
+    /// (e.g. `identifier`, `shorthand_property_identifier_pattern`).
+    pub binding_leaf_kinds: &'static [&'static str],
+    /// Tree-sitter kinds pruned while walking a binding site. These are the
+    /// non-binding forms a pattern position may hold (`attribute`,
+    /// `member_expression`, `selector_expression`, ...) or forms re-entered by
+    /// a narrower site (Python `default_parameter` -> `.name`).
+    pub binding_skip_kinds: &'static [&'static str],
+    /// Whether `binding_sites` has been curated for this language so the
+    /// generic extractor may stamp `scope_bindings_complete="true"` on its
+    /// Function nodes. `false` keeps the `import_calls_pass` function-scoped
+    /// Calls gate closed (honest fallback for uncurated grammars).
+    pub scope_bindings_complete: bool,
+}
+
+/// Field names never walked inside a binding site, regardless of language:
+/// type annotations, default/initializer expressions on the right of an
+/// assignment pattern, object-pattern keys, match-arm guards, and the
+/// namespace prefix of a scoped path (`crate::foo::` in `use crate::foo::bar`).
+const BINDING_SKIP_FIELDS: &[&str] = &["type", "right", "key", "condition", "path"];
+
+/// Collect every name bound anywhere inside `fn_node` (#877).
+///
+/// Walks the entire subtree — including nested closures and named inner
+/// functions, because `import_calls_pass` matches call sites against the flat
+/// body text — and, at each configured binding site, gathers leaf names while
+/// pruning `config.binding_skip_kinds` and [`BINDING_SKIP_FIELDS`]. Names of
+/// nested nodes that this config maps to [`NodeKind::Function`] are added too
+/// (a nested `def helper()` shadows an imported `helper`). The root node's own
+/// name is not added: a method named like an import does not bind that name
+/// inside its own body.
+pub(crate) fn collect_local_bindings(
+    fn_node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+    if config.binding_sites.is_empty() {
+        return bindings;
+    }
+    let mut stack = vec![fn_node];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        for (site_kind, field) in config.binding_sites {
+            if *site_kind != kind {
+                continue;
+            }
+            match field {
+                Some(field) => {
+                    let mut cursor = node.walk();
+                    for child in node.children_by_field_name(field, &mut cursor) {
+                        collect_binding_leaves(child, source, config, &mut bindings);
+                    }
+                }
+                None => collect_binding_leaves(node, source, config, &mut bindings),
+            }
+        }
+        if node.id() != fn_node.id()
+            && config
+                .node_kinds
+                .iter()
+                .any(|(ts_kind, nk)| *ts_kind == kind && *nk == NodeKind::Function)
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(text) = name_node.utf8_text(source)
+        {
+            push_binding(text, &mut bindings);
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    bindings
+}
+
+fn collect_binding_leaves(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+    out: &mut BTreeSet<String>,
+) {
+    let kind = node.kind();
+    if config.binding_skip_kinds.contains(&kind) {
+        return;
+    }
+    if config.binding_leaf_kinds.contains(&kind) {
+        if let Ok(text) = node.utf8_text(source) {
+            push_binding(text, out);
+        }
+        return;
+    }
+    for i in 0..node.child_count() {
+        if node
+            .field_name_for_child(i as u32)
+            .is_some_and(|field| BINDING_SKIP_FIELDS.contains(&field))
+        {
+            continue;
+        }
+        if let Some(child) = node.child(i as u32) {
+            collect_binding_leaves(child, source, config, out);
+        }
+    }
+}
+
+fn push_binding(text: &str, out: &mut BTreeSet<String>) {
+    let name = text.trim();
+    if !name.is_empty() && name != "_" && !name.contains(',') {
+        out.insert(name.to_string());
+    }
+}
+
+/// Render `local_bindings` metadata: sorted, comma-joined.
+pub(crate) fn render_local_bindings(bindings: &BTreeSet<String>) -> String {
+    bindings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Return the cached attr_refs recursion stop-kind set for `config`.
@@ -534,6 +667,19 @@ fn collect_nodes(
             if node_kind == NodeKind::Function && !config.branch_node_types.is_empty() {
                 let branches = count_branches(node, source, config, true);
                 metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
+            }
+
+            // Local binding evidence for cross-file call resolution (#877).
+            // Only languages with a curated `binding_sites` table may claim
+            // completeness; `import_calls_pass` keeps its Calls gate closed
+            // for every other Function node.
+            if node_kind == NodeKind::Function && config.scope_bindings_complete {
+                let bindings = collect_local_bindings(node, source, config);
+                metadata.insert(
+                    "local_bindings".to_string(),
+                    render_local_bindings(&bindings),
+                );
+                metadata.insert("scope_bindings_complete".to_string(), "true".to_string());
             }
 
             // Static vs instance method detection for functions inside a scope.
@@ -2412,7 +2558,10 @@ fn detect_same_file_calls(
     }
 
     let mut file_fns = std::collections::BTreeMap::<String, Vec<(NodeId, Option<String>)>>::new();
-    let mut fn_by_line = std::collections::HashMap::<usize, (NodeId, Option<String>)>::new();
+    // Keyed by (start row, name column) so two definitions on one line map to
+    // their own AST node instead of the last one inserted for that row.
+    let mut fn_by_position =
+        std::collections::HashMap::<(usize, usize), (NodeId, Option<String>)>::new();
     for function in nodes
         .iter()
         .filter(|node| node.id.kind == NodeKind::Function && node.id.file == path)
@@ -2427,7 +2576,15 @@ fn detect_same_file_calls(
             .entry(lexical)
             .or_default()
             .push((function.id.clone(), scope.clone()));
-        fn_by_line.insert(function.line_start, (function.id.clone(), scope));
+        let name_col = function
+            .metadata
+            .get("name_col")
+            .and_then(|col| col.parse::<usize>().ok())
+            .unwrap_or(0);
+        fn_by_position.insert(
+            (function.line_start, name_col),
+            (function.id.clone(), scope),
+        );
     }
     for candidates in file_fns.values_mut() {
         candidates.sort_by_key(|candidate| candidate.0.to_stable_id());
@@ -2443,7 +2600,7 @@ fn detect_same_file_calls(
         source,
         config,
         &file_fns,
-        &fn_by_line,
+        &fn_by_position,
         &None,
         &mut edges,
     );
@@ -2456,19 +2613,27 @@ fn collect_calls(
     source: &[u8],
     config: &LangConfig,
     file_fns: &std::collections::BTreeMap<String, Vec<(NodeId, Option<String>)>>,
-    fn_by_line: &std::collections::HashMap<usize, (NodeId, Option<String>)>,
+    fn_by_position: &std::collections::HashMap<(usize, usize), (NodeId, Option<String>)>,
     enclosing_fn: &Option<(NodeId, Option<String>)>,
     edges: &mut Vec<Edge>,
 ) {
     let kind = node.kind();
 
     // Check if this node is a function definition — update enclosing context.
+    // Position key mirrors `collect_nodes`: start row + `name` field column
+    // (0 when the grammar exposes no `name` field).
     let is_fn_def = config
         .node_kinds
         .iter()
         .any(|(ts_kind, nk)| *ts_kind == kind && *nk == NodeKind::Function);
     let new_enclosing = if is_fn_def {
-        fn_by_line.get(&(node.start_position().row + 1)).cloned()
+        let name_col = node
+            .child_by_field_name("name")
+            .map(|name| name.start_position().column)
+            .unwrap_or(0);
+        fn_by_position
+            .get(&(node.start_position().row + 1, name_col))
+            .cloned()
     } else {
         None
     };
@@ -2532,7 +2697,15 @@ fn collect_calls(
     // Recurse into children, passing the (possibly updated) enclosing context.
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_calls(child, source, config, file_fns, fn_by_line, enclosing, edges);
+            collect_calls(
+                child,
+                source,
+                config,
+                file_fns,
+                fn_by_position,
+                enclosing,
+                edges,
+            );
         }
     }
 }
@@ -7202,6 +7375,279 @@ function process(handler: Handler): void {
             !attr_refs.split(',').any(|s| s.trim() == "timeout"),
             "bare property read 'timeout' must NOT appear in attr_refs, got: {:?}",
             attr_refs
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #877 — local binding evidence (scope_bindings_complete / local_bindings)
+    // -----------------------------------------------------------------------
+
+    fn local_bindings_of(
+        config: &'static LangConfig,
+        path: &str,
+        code: &str,
+        fn_name: &str,
+    ) -> BTreeSet<String> {
+        let result = GenericExtractor::new(config)
+            .run(Path::new(path), code)
+            .unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::Function && n.id.name == fn_name)
+            .unwrap_or_else(|| panic!("missing function {fn_name}"));
+        assert_eq!(
+            func.metadata
+                .get("scope_bindings_complete")
+                .map(String::as_str),
+            Some("true"),
+            "{fn_name} must claim complete scope bindings"
+        );
+        func.metadata
+            .get("local_bindings")
+            .expect("local_bindings metadata")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_bindings(bindings: &BTreeSet<String>, present: &[&str], absent: &[&str]) {
+        for name in present {
+            assert!(
+                bindings.contains(*name),
+                "expected `{name}` bound in {bindings:?}"
+            );
+        }
+        for name in absent {
+            assert!(
+                !bindings.contains(*name),
+                "`{name}` must NOT be bound in {bindings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_bindings_rust_pattern_zoo() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+use crate::worker::execute;
+struct Point { x: u32, y: u32 }
+fn zoo(a: u32, (b, c): (u32, u32), Point { x, y: py }: Point) -> u32 {
+    let Some(v) = maybe() else { return 0 };
+    if let Ok(r) = fallible() { }
+    while let Some(w) = queue.pop() { }
+    for item in items { }
+    match opt { Some(inner) if inner > guard_var => {}, Ok(o) | Err(o) => {}, _ => {} }
+    let f = |cp: u32, bare| cp + bare;
+    fn nested() {}
+    use crate::other::helper as aliased;
+    use crate::other::{plain, renamed as alias2};
+    const LIMIT: u32 = 3;
+    execute()
+}
+impl Point {
+    fn run(&self) -> u32 { run(); self.x }
+}
+"#;
+        let zoo = local_bindings_of(&RUST_CONFIG, "zoo.rs", code, "zoo");
+        assert_bindings(
+            &zoo,
+            &[
+                "a", "b", "c", "x", "py", "v", "r", "w", "item", "inner", "o", "f", "cp", "bare",
+                "nested", "aliased", "plain", "alias2", "LIMIT",
+            ],
+            &[
+                "Some",
+                "Ok",
+                "Err",
+                "Point",
+                "u32",
+                "execute",
+                "y",
+                "guard_var",
+                "other",
+                "crate",
+            ],
+        );
+        let run = local_bindings_of(&RUST_CONFIG, "zoo.rs", code, "Point.run");
+        assert_bindings(&run, &["self"], &["run", "x"]);
+    }
+
+    #[test]
+    fn local_bindings_python_excludes_attribute_and_subscript_targets() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+from worker import execute
+
+def zoo(a, b=default_b(), *args, c: int = 2, **kw):
+    self.attr = 1
+    d[0] = 2
+    x, (y, z) = pair()
+    for i, j in items:
+        pass
+    with open(p) as fh:
+        pass
+    try:
+        pass
+    except ValueError as err:
+        pass
+    if (n := compute()):
+        pass
+    lam = lambda q, r=2: q
+    def nested():
+        pass
+    class Inner:
+        pass
+    from mod import thing as alias
+    import os.path
+    match cmd:
+        case Point(x=px) as whole:
+            pass
+        case [first, *rest]:
+            pass
+    return execute()
+"#;
+        let zoo = local_bindings_of(&PYTHON_CONFIG, "zoo.py", code, "zoo");
+        assert_bindings(
+            &zoo,
+            &[
+                "a", "b", "args", "c", "kw", "x", "y", "z", "i", "j", "fh", "err", "n", "lam", "q",
+                "r", "nested", "Inner", "alias", "os", "whole", "px", "first", "rest",
+            ],
+            &[
+                "attr",
+                "d",
+                "self",
+                "default_b",
+                "pair",
+                "items",
+                "open",
+                "p",
+                "ValueError",
+                "compute",
+                "execute",
+                "mod",
+                "cmd",
+            ],
+        );
+    }
+
+    #[test]
+    fn local_bindings_typescript_destructure_rename_rest() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = r#"
+import { execute } from './worker';
+function zoo({ a, b: renamed, ...rest }: Props, [first, , second = 3]: number[], opt?: string) {
+  const { c, d: e } = obj;
+  let [f, g] = arr;
+  for (const k of keys) {}
+  for (const idx in map) {}
+  try {} catch (err) {}
+  const cb = (p: number, q = 2) => p;
+  const single = v => v;
+  function nested() {}
+  class Inner {}
+  const fe = function named(z: number) {};
+  obj.prop = 1;
+  arr[0] = 2;
+  return execute();
+}
+"#;
+        let zoo = local_bindings_of(&TYPESCRIPT_CONFIG, "zoo.tsx", code, "zoo");
+        assert_bindings(
+            &zoo,
+            &[
+                "a", "renamed", "rest", "first", "second", "opt", "c", "e", "f", "g", "k", "idx",
+                "err", "cb", "p", "q", "single", "v", "nested", "Inner", "fe", "named", "z",
+            ],
+            &[
+                "b", "d", "prop", "obj", "arr", "execute", "Props", "number", "string", "keys",
+                "map",
+            ],
+        );
+    }
+
+    #[test]
+    fn local_bindings_go_multi_name_params_and_named_results() {
+        use crate::extract::configs::GO_CONFIG;
+        let code = r#"
+package main
+
+import "worker"
+
+func zoo(a, b int, c string, rest ...int) (out int, err error) {
+    x := compute()
+    y, z := pair()
+    var w int
+    const k = 1
+    for i, v := range items {}
+    switch t := val.(type) {}
+    f := func(p int) int { return p }
+    type Local struct{}
+    obj.field = 1
+    arr[0] = 2
+    return worker.Execute()
+}
+
+func (r *Recv) method(m int) {}
+"#;
+        let zoo = local_bindings_of(&GO_CONFIG, "zoo.go", code, "zoo");
+        assert_bindings(
+            &zoo,
+            &[
+                "a", "b", "c", "rest", "out", "err", "x", "y", "z", "w", "k", "i", "v", "t", "f",
+                "p", "Local",
+            ],
+            &[
+                "int", "string", "error", "field", "obj", "arr", "compute", "pair", "Execute",
+                "worker",
+            ],
+        );
+        let method = local_bindings_of(&GO_CONFIG, "zoo.go", code, "method");
+        assert_bindings(&method, &["r", "m"], &["Recv", "method"]);
+    }
+
+    #[test]
+    fn uncurated_language_does_not_claim_scope_bindings_complete() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = "class A { void run(int a) { helper(a); } }";
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("A.java"), code)
+            .unwrap();
+        let run = result
+            .nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::Function)
+            .expect("method node");
+        assert!(
+            !run.metadata.contains_key("scope_bindings_complete"),
+            "Java has no curated binding table and must stay gated: {:?}",
+            run.metadata
+        );
+        assert!(!run.metadata.contains_key("local_bindings"));
+    }
+
+    #[test]
+    fn same_file_calls_resolve_exact_definition_when_two_functions_share_a_line() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "fn helper() {}\nfn a() { helper(); } fn b() {}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("same_line.rs"), code)
+            .unwrap();
+        let calls: Vec<String> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| format!("{} -> {}", e.from.name, e.to.name))
+            .collect();
+        assert!(
+            calls.iter().any(|c| c == "a -> helper"),
+            "call inside `a` must attribute to `a`, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("b ->")),
+            "`b` makes no calls; row-keyed lookup would misattribute, got {calls:?}"
         );
     }
 }

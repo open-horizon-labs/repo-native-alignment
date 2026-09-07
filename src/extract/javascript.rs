@@ -12,7 +12,9 @@ use anyhow::Result;
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::JAVASCRIPT_CONFIG;
-use super::generic::{GenericExtractor, count_branches};
+use super::generic::{
+    GenericExtractor, collect_local_bindings, count_branches, render_local_bindings,
+};
 use super::{ExtractionResult, Extractor};
 
 pub struct JavaScriptExtractor;
@@ -238,6 +240,21 @@ fn collect_js_specials(
                             let branches =
                                 count_branches(value_n, source, &JAVASCRIPT_CONFIG, true);
                             metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
+                        }
+
+                        // Local binding evidence for cross-file call resolution
+                        // (#877) — same walker the generic extractor uses for
+                        // `function_declaration`, applied to the arrow /
+                        // function-expression value node.
+                        if JAVASCRIPT_CONFIG.scope_bindings_complete {
+                            let bindings =
+                                collect_local_bindings(value_n, source, &JAVASCRIPT_CONFIG);
+                            metadata.insert(
+                                "local_bindings".to_string(),
+                                render_local_bindings(&bindings),
+                            );
+                            metadata
+                                .insert("scope_bindings_complete".to_string(), "true".to_string());
                         }
 
                         nodes.push(Node {

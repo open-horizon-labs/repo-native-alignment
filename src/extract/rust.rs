@@ -97,6 +97,27 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     venv_candidates: None,
     has_parent_module_request: true,
     attribute_access_node: Some(("field_expression", "field")),
+    // Local binding evidence (#877). Verified against tree-sitter-rust 0.24.2.
+    // Pattern containers (tuple/or/mut/ref/reference/slice/captured) are
+    // transparent; `tuple_struct_pattern.type` / `struct_pattern.type` are
+    // pruned by the generic `type` field skip so `Some(x)` binds `x`, not `Some`.
+    binding_sites: &[
+        ("parameter", Some("pattern")),
+        ("self_parameter", None),
+        ("let_declaration", Some("pattern")),
+        ("let_condition", Some("pattern")),
+        ("for_expression", Some("pattern")),
+        ("match_arm", Some("pattern")),
+        ("closure_parameters", None),
+        ("const_item", Some("name")),
+        ("static_item", Some("name")),
+        // In-body `use` declarations: alias or last path segment (the
+        // `path` field skip drops the namespace prefix).
+        ("use_declaration", Some("argument")),
+    ],
+    binding_leaf_kinds: &["identifier", "shorthand_field_identifier", "self"],
+    binding_skip_kinds: &["use_wildcard"],
+    scope_bindings_complete: true,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.
