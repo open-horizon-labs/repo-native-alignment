@@ -29,7 +29,7 @@ that subtree. Within a scoped pattern `*` matches inside a single component and
 never crosses `/`: `generated/schema*/` excludes `generated/schema-v2/` too,
 `generated/*.json` excludes JSON files directly inside `generated/` but not in
 its subdirectories, and `crates/*/schema.json` excludes one such file per crate.
-Unqualified directory names such as `data/` match that component at any depth,
+Unqualified directory names such as `data/` match that component at any depth (including a file named `data`); a glob directory name such as `target*/` matches directory components only, never a file whose name starts with the prefix,
 and unqualified filenames such as `config.schema.json` match at any depth.
 
 Notes for users with `.gitignore` habits:

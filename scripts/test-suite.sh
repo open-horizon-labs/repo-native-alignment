@@ -169,6 +169,41 @@ check "list-roots includes primary root type" \
 # `list-roots` must show a `Files:` line whose invariant balances:
 #   N seen = a indexed + b excluded (config) + c git-ignored + d binary
 #            + e no extractor + f extractor errors
+# ── RELEASE BLOCKERS (#901): data must survive routine operations ─────────────
+echo "" && echo "--- Persistence survives no-op scans (#901) ---"
+_cc_before=$(repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20 2>/dev/null | grep -c "support=")
+if ! repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1; then
+  echo "FAIL: no-op scan for the persistence checks exited nonzero (#901)"; FAIL=$((FAIL+1)); _cc_after=-1
+else
+  _cc_after=$(repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20 2>/dev/null | grep -c "support=")
+fi
+if [ "$_cc_before" -gt 0 ] && [ "$_cc_after" -eq "$_cc_before" ]; then
+  echo "PASS: co-change partners survive a no-op scan (#901) ($_cc_before -> $_cc_after)"; PASS=$((PASS+1))
+else
+  echo "FAIL: co-change partners survive a no-op scan (#901)"; echo "  before=$_cc_before after=$_cc_after"; FAIL=$((FAIL+1))
+fi
+check "co-change: no misleading 'no data' after a no-op scan (#901)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 5 2>/dev/null | grep -c 'No co-change data available'" "^0$"
+check "repo-map: hotspot rows keep the co-change suffix after a no-op scan (#901)" \
+  "repo-native-alignment repo-map --repo $RNA_REPO 2>/dev/null" "co-changes with"
+_files_line=$(repo-native-alignment list-roots --repo "$RNA_REPO" 2>/dev/null | grep -m1 "Files: .* seen = ")
+_indexed=$(echo "$_files_line" | sed -E 's/.* = ([0-9,]+) indexed.*/\1/' | tr -d ,)
+if [ -n "$_indexed" ] && [ "$_indexed" -gt 100 ] 2>/dev/null; then
+  echo "PASS: census reports a real indexed magnitude on the CLI path (#901) ($_indexed indexed)"; PASS=$((PASS+1))
+else
+  echo "FAIL: census reports a real indexed magnitude on the CLI path (#901)"; echo "  line: $_files_line"; FAIL=$((FAIL+1))
+fi
+if ! repo-native-alignment scan --repo "$RNA_REPO" --full --no-embed --no-lsp >/dev/null 2>&1; then
+  echo "FAIL: scan --full for the census check exited nonzero (#901)"; FAIL=$((FAIL+1)); _indexed_full=""
+else
+  _indexed_full=$(repo-native-alignment list-roots --repo "$RNA_REPO" 2>/dev/null | grep -m1 "Files: .* seen = " | sed -E 's/.* = ([0-9,]+) indexed.*/\1/' | tr -d ,)
+fi
+if [ -n "$_indexed_full" ] && [ "$_indexed_full" -gt 100 ] 2>/dev/null; then
+  echo "PASS: census survives scan --full on the CLI path (#901) ($_indexed_full indexed)"; PASS=$((PASS+1))
+else
+  echo "FAIL: census survives scan --full on the CLI path (#901)"; echo "  indexed=$_indexed_full"; FAIL=$((FAIL+1))
+fi
+
 echo "" && echo "--- Skipped-file census (#895) ---"
 check "list-roots shows a Files: census line (#895)" \
   "repo-native-alignment list-roots --repo $RNA_REPO" "Files: [0-9].* seen = "
