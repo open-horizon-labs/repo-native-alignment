@@ -21,11 +21,26 @@ If RNA adds no value for the current diff, say that directly and review from the
 `$ARGUMENTS` may identify the change to inspect:
 
 - empty: current working tree diff
-- `--base main`: `main...HEAD`
+- `--base main`: the two-ref range `main..HEAD` (two dots; `search(mode="change")` rejects three-dot ranges)
 - `--base <sha1> --head <sha2>`: explicit range
 - `--pr 660`: GitHub PR diff
 
 ## Procedure
+
+### Step 0: Try the change bundle first
+
+Before manually assembling diff shape and graph context, call
+`search(mode="change", query=<scope>)` (#899): `<scope>` is `"working_tree"`
+(default), `"staged"`, or `"<base>..<head>"` (map `--base X` to `X..HEAD`,
+`--base X --head Y` to `X..Y`, and `--pr N` to `<pr-base-sha>..<pr-head-sha>`; always the two-dot form -- three-dot ranges are rejected). This
+one call already composes hunk-intersected changed files/symbols, blast
+radius (labelled graph-evidenced vs. name-based by Calls-coverage readiness),
+tests to run with a no-test gap count, co-change misses, and risk
+(churn/complexity/notes/doc-drift) -- most of Steps 1-3 below in one bounded
+report. Use it as the primary source and fall back to the manual steps only
+for probes it doesn't cover (e.g. reading the actual diff text, `outcome_progress`,
+or drilling into a specific symbol with `mode="neighbors"`/`"impact"`
+directly).
 
 ### Step 1: Get the diff shape
 

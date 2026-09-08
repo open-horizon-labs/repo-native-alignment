@@ -232,3 +232,49 @@ existing source span or a proposal line. Unsupported, ambiguous, binary,
 traversal-containing, oversized, or incomplete inputs fail closed. Missing
 optional graph/LSP/semantic evidence is instead reported as a degraded
 capability; it is never presented as proof that no impact exists.
+
+`context_mode=graph-delta-beta` is not `mode="change"` (below): it evaluates a
+*proposed* diff supplied in `proposal`, ephemerally, without touching the
+repository. `mode="change"` reads the *actual* current repository state
+(working tree, index, or a committed range) via git.
+
+## Diff-scoped change bundle: `mode="change"` (#899)
+
+`search(mode="change", query=<scope>)` composes one bounded report for a real
+diff: `scope` is `"working_tree"` (default, HEAD vs. working directory +
+index), `"staged"` (HEAD vs. index), or `"<base>..<head>"` (an explicit
+two-ref range); three-dot symmetric-difference ranges are rejected with the
+same message as `mode="cochange_gaps"`. The CLI also accepts `--scope` as
+sugar for the positional query.
+
+The six sections:
+
+1. **Changed files and changed symbols.** Files carry their kind (added,
+   modified, deleted, renamed, copied, type-changed, untracked). Symbols are
+   *hunk-intersected*: a node counts as changed only if its `line_start..
+   line_end` span intersects an added/modified hunk range computed with zero
+   diff context lines (`resolve_changed_file_entries` in
+   `src/git/cochange.rs`) -- not "every symbol in the file". Added/untracked
+   files count every symbol as changed; deleted files list their still-graphed
+   symbols flagged as deleted rather than silently dropping them.
+2. **Blast radius**, via `GraphIndex::impact` over the changed symbols, bounded
+   by `hops` (default 3) and grouped by dependent file. Labelled
+   `graph-evidenced (Calls coverage-ready)` or `name-based (... dependents are
+   a structural guess, not confirmed)` depending on the same LSP `Calls`
+   coverage-readiness check used by `mode="convergence"` -- a root without
+   coverage never presents dependents as confirmed.
+3. **Tests to run**: the same `tests_for` traversal (`Calls`-incoming,
+   filtered to test files) applied to every changed symbol, deduplicated, plus
+   an honest gap line: "N of M changed symbols are reached by no test".
+4. **Co-change misses**: the same computation as `mode="cochange_gaps"` (one
+   shared function, `cochange_gap_lines`), run over the changed-file set.
+5. **Risk**: per-file churn and per-symbol cyclomatic complexity (both
+   pre-existing metadata from #889/#890), bound artifact notes on changed
+   symbols (#897/#898), and doc-drift findings (`doc_drift::run_doc_drift`)
+   whose reference points into a changed file. All joined from existing data;
+   nothing here is computed fresh.
+6. Every section renders or states why it is empty (no silent
+   `computed-but-not-delivered` gaps), each list is bounded by `limit`
+   (default 50, clamped to 500) with an explicit "truncated, showing first N
+   of M" line, and a clean working tree returns an explicit "No changes in
+   scope" message rather than an empty body.

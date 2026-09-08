@@ -84,6 +84,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 - Before starting work: business context is auto-injected on first tool call
 - Explore code: `search("query")` -> `search(query, mode="neighbors")` -> `search(query, mode="impact")`
 - Before touching a file, check what usually changes with it: `search(node="path/to/file", mode="cochange")`; before finishing a change, check for forgotten partners: `search(mode="cochange_gaps")`
+- Before opening a PR, call `search(mode="change")` (scope defaults to the working tree; pass `query="staged"` or `query="<base>..<head>"`) for the full diff-scoped bundle in one call: changed files/symbols, blast radius, tests to run, co-change misses, and risk
 - After completing work: write learnings to `.oh/metis/<slug>.md`
 - When checking progress: call `outcome_progress` with `agent-alignment`
 - When discovering constraints: write to `.oh/guardrails/<slug>.md`

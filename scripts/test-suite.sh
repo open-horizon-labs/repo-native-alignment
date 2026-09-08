@@ -973,6 +973,57 @@ rm -rf "$_DRIFT_FIX"
 check "doc_drift: runs against the RNA repo's own .oh/docs/README (#891)" \
   "repo-native-alignment search '' --repo $RNA_REPO --mode doc_drift --limit 200 2>/dev/null" "Documentation drift"
 
+# ── DIFF-SCOPED CHANGE BUNDLE (#899) ─────────────────────────────────────────
+# Stage a one-line edit to a known function (`is_test_path` in
+# src/ranking.rs), run `mode="change" --scope staged`, and assert the touched
+# function -- and not its file's other symbols -- appears in "Changed
+# symbols" (the hunk-intersection acceptance criterion). Restore the file
+# unconditionally, even on failure, so a broken assertion never leaves a
+# staged/dirty change behind.
+echo "" && echo "--- Diff-scoped change bundle (#899) ---"
+_CHANGE_PROBE_FILE="src/ranking.rs"
+if git -C "$RNA_REPO" diff --quiet -- "$_CHANGE_PROBE_FILE" 2>/dev/null \
+  && git -C "$RNA_REPO" diff --quiet --cached -- "$_CHANGE_PROBE_FILE" 2>/dev/null; then
+  awk '{print} /\|\| p\.starts_with\("fixture\/"\)/ && !done {print "        // test-suite-change-mode-probe (#899)"; done=1}' \
+    "$RNA_REPO/$_CHANGE_PROBE_FILE" > "$RNA_REPO/$_CHANGE_PROBE_FILE.tmp" \
+    && mv "$RNA_REPO/$_CHANGE_PROBE_FILE.tmp" "$RNA_REPO/$_CHANGE_PROBE_FILE"
+  git -C "$RNA_REPO" add -- "$_CHANGE_PROBE_FILE"
+  check "change: hunk-intersected changed symbol is the touched function, not its siblings (#899)" \
+    "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope staged 2>/dev/null" "ranking.rs:is_test_path:function"
+  _change_probe_out=$(repo-native-alignment search '' --repo "$RNA_REPO" --mode change --scope staged 2>/dev/null)
+  if grep -q "ranking.rs:is_test_file:function" <<< "$_change_probe_out"; then
+    echo "FAIL: change: sibling function is_test_file must not appear as a changed symbol (#899)"
+    echo "  GOT: $(echo "$_change_probe_out" | grep -v '^$' | head -10)"
+    FAIL=$((FAIL+1))
+  else
+    echo "PASS: change: sibling function is_test_file must not appear as a changed symbol (#899)"
+    PASS=$((PASS+1))
+  fi
+  # Unstage first, then restore the working tree from HEAD. The reverse order
+  # restores the working tree from the *staged* probe and leaves it modified.
+  git -C "$RNA_REPO" reset -q -- "$_CHANGE_PROBE_FILE"
+  git -C "$RNA_REPO" checkout -- "$_CHANGE_PROBE_FILE"
+else
+  echo "SKIP: change mode hunk-intersection probe ($_CHANGE_PROBE_FILE has local modifications)"
+  SKIP=$((SKIP+1))
+fi
+# Only meaningful on a clean tree (CI); a developer's local edits are real
+# changes, so skip rather than report a false failure.
+if [ -z "$(git -C "$RNA_REPO" status --porcelain 2>/dev/null)" ]; then
+  check "change: clean tree reports an explicit no-changes message (#899)" \
+    "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope working_tree 2>/dev/null" "No changes in scope -- clean working tree"
+else
+  echo "SKIP: change: clean tree reports an explicit no-changes message (#899) (working tree has local modifications)"
+  SKIP=$((SKIP+1))
+fi
+check "change: three-dot scope is rejected with the shared cochange_gaps message (#899)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope 'main...HEAD' 2>/dev/null" "three-dot symmetric-difference ranges ('main...HEAD') are not supported"
+# --scope is only meaningful for change/cochange_gaps and must not silently
+# replace a positional query for other modes.
+_scope_misuse=$(repo-native-alignment search 'foo' --repo "$RNA_REPO" --mode neighbors --scope staged 2>&1 >/dev/null || true)
+check "change: --scope is rejected for modes that do not take a diff scope (#899)" \
+  "echo \"\$_scope_misuse\"" "only valid with --mode change or --mode cochange_gaps"
+
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
 if [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
