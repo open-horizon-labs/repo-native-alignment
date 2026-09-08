@@ -395,11 +395,19 @@ fn build_symbol_index(nodes: &[Node]) -> (SymbolIndex, HashSet<String>) {
         if node.id.file.as_os_str().is_empty() || !is_symbol_bindable_file(&node.id.file) {
             continue;
         }
-        index
+        // Graph identities are owner-qualified since #859 (`Owner.method`,
+        // `Type::variant`); prose names the lexical leaf. Index both so a bare
+        // `method` in a doc resolves against `Owner.method` in the graph.
+        let names = index
             .entry((node.id.root.clone(), node.id.file.clone()))
-            .or_default()
-            .insert(node.id.name.clone());
+            .or_default();
+        names.insert(node.id.name.clone());
         global_names.insert(node.id.name.clone());
+        let leaf = leaf_identifier(&node.id.name);
+        if leaf != node.id.name {
+            names.insert(leaf.to_string());
+            global_names.insert(leaf.to_string());
+        }
     }
     (index, global_names)
 }
@@ -1223,6 +1231,37 @@ mod tests {
         assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert!(report.findings[0].message.contains("`truly_gone_fn`"));
         assert_eq!(report.unresolvable, 2);
+    }
+
+    /// Live-run regression: since #859 graph names are owner-qualified
+    /// (`Owner.method`), so a doc's bare `method` must still resolve.
+    #[test]
+    fn owner_qualified_graph_name_resolves_bare_method_reference() {
+        let root_dir = tmp_root();
+        write_file(
+            &root_dir,
+            "src/search.rs",
+            "impl Ranker { fn edge_is_exact(&self) {} }\n",
+        );
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            ".oh/notes.md",
+            "Notes",
+            "In `src/search.rs`, `edge_is_exact` gates the proof.",
+            1,
+        )];
+        nodes.push(code_node(
+            "main",
+            "src/search.rs",
+            "Ranker.edge_is_exact",
+            NodeKind::Function,
+        ));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.unresolvable, 0);
     }
 
     #[test]
