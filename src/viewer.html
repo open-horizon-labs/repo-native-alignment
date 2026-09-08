@@ -270,7 +270,7 @@ function parseRepoMap(text) {
         if (m) {
           const filePath = m[1];
           // Size by score when churn is known, else fall back to complexity alone.
-          const sizeBasis = m[4] !== undefined ? parseInt(m[4], 10) : parseInt(m[3], 10);
+          const sizeBasis = m[4] !== undefined ? parseInt(m[4], 10) : parseInt(m[5], 10);
           const id = 'file:' + filePath;
           if (!seenIds.has(id)) {
             seenIds.add(id);

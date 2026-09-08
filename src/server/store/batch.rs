@@ -332,14 +332,21 @@ pub(super) fn build_edges_batch(
         })
         .collect::<Result<_, _>>()?;
     let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
-    let cochange_supports: Vec<Option<u32>> = edges
-        .iter()
-        .map(|e| cochange_stats.get(&e.stable_id()).map(|s| s.support))
-        .collect();
-    let cochange_confidences: Vec<Option<f64>> = edges
-        .iter()
-        .map(|e| cochange_stats.get(&e.stable_id()).map(|s| s.confidence))
-        .collect();
+    // Reuse `ids` (already computed above, one `Edge::stable_id()` call per
+    // edge) instead of recomputing the stable ID -- and re-hashing evidence
+    // selectors for evidence-bearing edges -- a second time here. Skip the
+    // lookup entirely when there's no co-change data to attach (#890 review).
+    let (cochange_supports, cochange_confidences): (Vec<Option<u32>>, Vec<Option<f64>>) =
+        if cochange_stats.is_empty() {
+            (vec![None; edges.len()], vec![None; edges.len()])
+        } else {
+            ids.iter()
+                .map(|id| {
+                    let stats = cochange_stats.get(id);
+                    (stats.map(|s| s.support), stats.map(|s| s.confidence))
+                })
+                .unzip()
+        };
     let updated_ats: Vec<i64> = vec![now; edges.len()];
     let scan_versions: Vec<u64> = vec![scan_version; edges.len()];
 

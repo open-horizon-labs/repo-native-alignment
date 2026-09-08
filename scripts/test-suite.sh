@@ -89,7 +89,8 @@ if repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs
   check "co-change: tools.rs <-> handlers.rs surfaced as partners" \
     "repo-native-alignment search '' --repo $RNA_REPO --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20" "handlers.rs"
 else
-  echo "  (skip) co-change partner pair: no mined co-change data in this checkout"
+  echo "SKIP: co-change partner pair (no mined co-change data in this checkout)"
+  SKIP=$((SKIP+1))
 fi
 
 # ── CHURN & HOTSPOT RANKING (#889) ──────────────────────────────────────────
