@@ -16,10 +16,11 @@
 //! # Conservative classification
 //!
 //! Every candidate resolves to exactly one of:
-//! - [`Classification::ProvenDead`]: positive filesystem or graph evidence the
-//!   reference no longer resolves. Reported as drift.
-//! - [`Classification::Unresolvable`]: no location context, an excluded/unindexed
-//!   target file, or an ambiguous path. **Never** reported as drift.
+//! - **proven_dead**: positive filesystem or graph evidence the reference no
+//!   longer resolves. Recorded as a [`DriftFinding`] and reported as drift.
+//! - **unresolvable**: no location context, an excluded/unindexed target file,
+//!   or an ambiguous path. Counted in [`DocDriftReport::unresolvable`] and
+//!   **never** reported as drift.
 //!
 //! Reuses the metadata convention established by the markdown heading-anchor
 //! diagnostic (`content.unresolved_anchor`, `src/extract/markdown.rs:750`):
@@ -53,8 +54,13 @@ fn path_line_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let ext_alt = PATH_EXTENSIONS.join("|");
+        // No `\b` at the start: a word boundary never exists between a space
+        // and a `.`, so `\b` silently dropped the leading dot of `.oh/...` and
+        // `.claude/...` paths and then declared the dotless path dead (a false
+        // positive found by the live run on this repo). Anchor on a one-char
+        // non-path prefix instead; the path is capture group 1.
         Regex::new(&format!(
-            r"\b((?:[[:alnum:]_.\-]+/)+[[:alnum:]_.\-]+\.(?:{ext_alt}))(?::([0-9]+))?\b"
+            r"(?:^|[^[:alnum:]_./\-])((?:[[:alnum:]_.\-]+/)+[[:alnum:]_.\-]+\.(?:{ext_alt}))(?::([0-9]+))?\b"
         ))
         .expect("static regex must compile")
     })
@@ -89,12 +95,6 @@ impl DriftClass {
             DriftClass::BarePath => "bare-path",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Classification {
-    ProvenDead,
-    Unresolvable,
 }
 
 /// A confirmed drift finding (i.e. a candidate classified `proven_dead`).
@@ -159,7 +159,11 @@ impl FileCache {
         *self
             .line_counts
             .entry(absolute.to_path_buf())
-            .or_insert_with(|| std::fs::read_to_string(absolute).ok().map(|s| s.lines().count()))
+            .or_insert_with(|| {
+                std::fs::read_to_string(absolute)
+                    .ok()
+                    .map(|s| s.lines().count())
+            })
     }
 
     fn exists(&mut self, absolute: &Path) -> bool {
@@ -247,6 +251,18 @@ fn looks_like_symbol(span: &str) -> bool {
     if span.is_empty() || span.contains(char::is_whitespace) {
         return false;
     }
+    // `.iter().find()` is a method chain fragment, not a nameable symbol.
+    if span.starts_with('.') {
+        return false;
+    }
+    // A bare filename (`import_calls.rs`, `config.toml`) names a file, not a
+    // symbol; class (c) handles paths and a slash-less filename has no root to
+    // resolve against, so it is simply not a candidate.
+    if let Some((_, ext)) = span.rsplit_once('.')
+        && PATH_EXTENSIONS.contains(&ext)
+    {
+        return false;
+    }
     // Path-shaped or already extension-shaped text is handled by class (a)/(c).
     if span.contains('/') {
         return false;
@@ -258,7 +274,9 @@ fn looks_like_symbol(span: &str) -> bool {
         return true;
     }
     let starts_upper = span.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-    let alnum_underscore = span.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c=='.');
+    let alnum_underscore = span
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
     if !alnum_underscore {
         return false;
     }
@@ -275,7 +293,9 @@ fn looks_like_symbol(span: &str) -> bool {
 /// to the leaf identifier used for exact-name graph lookup.
 fn leaf_identifier(span: &str) -> &str {
     let trimmed = span.trim_end_matches("()");
-    trimmed.rsplit("::").next().unwrap_or(trimmed)
+    let after_path = trimmed.rsplit("::").next().unwrap_or(trimmed);
+    // `receiver.method()` names the method, not the receiver variable.
+    after_path.rsplit('.').next().unwrap_or(after_path)
 }
 
 /// Byte-range overlap check.
@@ -309,21 +329,68 @@ fn line_at(content: &str, byte_offset: usize) -> usize {
 /// known to the graph (i.e. not excluded/unindexed), from already-extracted
 /// non-markdown nodes. O(nodes) once per run; all subsequent lookups are O(1)
 /// HashMap/HashSet membership checks.
-fn build_symbol_index(nodes: &[Node]) -> HashMap<(String, PathBuf), HashSet<String>> {
-    let mut index: HashMap<(String, PathBuf), HashSet<String>> = HashMap::new();
+/// `(root, file) -> names defined in that file`, for indexed code files only.
+type SymbolIndex = HashMap<(String, PathBuf), HashSet<String>>;
+
+fn build_symbol_index(nodes: &[Node]) -> (SymbolIndex, HashSet<String>) {
+    let mut index: SymbolIndex = HashMap::new();
+    let mut global_names: HashSet<String> = HashSet::new();
     for node in nodes {
-        if matches!(node.id.kind, NodeKind::MarkdownSection | NodeKind::PrMerge) {
+        // Only kinds that are *definitions of code symbols* make a file
+        // "indexed" for symbol binding. Synthetic nodes (`Other(..)`: co-change
+        // file anchors, diagnostics, frameworks, ...) exist for markdown and
+        // shell files too, and treating them as evidence let the live run bind
+        // symbols to `docs/*.md` and `scripts/*.sh` and call them dead.
+        if !is_code_symbol_kind(&node.id.kind) {
             continue;
         }
-        if node.id.file.as_os_str().is_empty() {
+        if node.id.file.as_os_str().is_empty() || !is_symbol_bindable_file(&node.id.file) {
             continue;
         }
         index
             .entry((node.id.root.clone(), node.id.file.clone()))
             .or_default()
             .insert(node.id.name.clone());
+        global_names.insert(node.id.name.clone());
     }
-    index
+    (index, global_names)
+}
+
+/// Files whose language can *define* the kind of identifier a backticked
+/// symbol names. Config, data, and shell files are excluded even though the
+/// extractors emit nodes for them (TOML keys, JSON fields, shell functions):
+/// the live run bound Rust identifiers like `OnceLock` to `.oh/config.toml`
+/// and `CARGO_TARGET_DIR` to `scripts/prep-worktree.sh` and called them dead.
+fn is_symbol_bindable_file(path: &Path) -> bool {
+    const CODE_EXTENSIONS: &[&str] = &[
+        "rs", "py", "pyi", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "cs",
+        "rb", "php", "c", "h", "cc", "cpp", "hpp", "swift", "scala", "proto", "sql",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| CODE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Node kinds whose presence proves a file is indexed as code and whose names
+/// are the universe a backticked symbol can be checked against.
+fn is_code_symbol_kind(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function
+            | NodeKind::Struct
+            | NodeKind::Trait
+            | NodeKind::Enum
+            | NodeKind::TypeAlias
+            | NodeKind::Module
+            | NodeKind::Const
+            | NodeKind::Impl
+            | NodeKind::Macro
+            | NodeKind::Field
+            | NodeKind::EnumVariant
+            | NodeKind::ProtoMessage
+            | NodeKind::SqlTable
+            | NodeKind::ApiEndpoint
+    )
 }
 
 /// Run the doc-drift verifier over every already-extracted markdown heading
@@ -331,7 +398,7 @@ fn build_symbol_index(nodes: &[Node]) -> HashMap<(String, PathBuf), HashSet<Stri
 /// (root slug -> absolute filesystem path).
 pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> DocDriftReport {
     let start = Instant::now();
-    let symbol_index = build_symbol_index(nodes);
+    let (symbol_index, global_names) = build_symbol_index(nodes);
     let mut cache = FileCache::new();
     let mut report = DocDriftReport::default();
     let mut files_seen: HashSet<(String, PathBuf)> = HashSet::new();
@@ -359,14 +426,25 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
         let mut bound_candidates: HashSet<(String, PathBuf)> = HashSet::new();
 
         for caps in path_line_re().captures_iter(&masked) {
-            let whole = caps.get(0).unwrap();
-            path_spans.push((whole.start(), whole.end()));
-            let path_text = caps.get(1).unwrap().as_str();
+            // Group 0 includes the anchoring prefix char; the reference itself
+            // runs from group 1's start to the end of the full match.
+            let path_match = caps.get(1).unwrap();
+            let ref_start = path_match.start();
+            let ref_end = caps.get(0).unwrap().end();
+            let ref_text = &masked[ref_start..ref_end];
+            path_spans.push((ref_start, ref_end));
+            let path_text = path_match.as_str();
             let line_group = caps.get(2);
+            // Placeholder paths in documentation examples (`docs/ADRs/001-...md`)
+            // are not references to anything; never call them dead.
+            if path_text.contains("...") {
+                report.unresolvable += 1;
+                continue;
+            }
 
             let resolution =
                 resolve_candidate_path(path_text, &node.id.root, root_paths, &mut cache);
-            let finding_line = node.line_start + line_at(content, whole.start()) - 1;
+            let finding_line = node.line_start + line_at(content, ref_start) - 1;
 
             if let Some(line_group) = line_group {
                 report.candidates_file_line += 1;
@@ -388,7 +466,7 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                                         markdown_root: node.id.root.clone(),
                                         line: finding_line,
                                         class: DriftClass::FileLine,
-                                        reference: whole.as_str().to_string(),
+                                        reference: ref_text.to_string(),
                                         diagnostic_code: DIAGNOSTIC_CODE,
                                         severity: "error",
                                         message: format!(
@@ -407,7 +485,7 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                             markdown_root: node.id.root.clone(),
                             line: finding_line,
                             class: DriftClass::FileLine,
-                            reference: whole.as_str().to_string(),
+                            reference: ref_text.to_string(),
                             diagnostic_code: DIAGNOSTIC_CODE,
                             severity: "error",
                             message: format!("file does not exist: {path_text}"),
@@ -428,7 +506,7 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                             markdown_root: node.id.root.clone(),
                             line: finding_line,
                             class: DriftClass::BarePath,
-                            reference: whole.as_str().to_string(),
+                            reference: ref_text.to_string(),
                             diagnostic_code: DIAGNOSTIC_CODE,
                             severity: "error",
                             message: format!("file does not exist: {path_text}"),
@@ -480,6 +558,13 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
             };
             let leaf = leaf_identifier(span_text);
             if !names.contains(leaf) {
+                // Section-level binding is a heuristic. If the name exists in
+                // some other indexed file, the doc may simply be talking about
+                // that one; that is ambiguity, not proof of death.
+                if global_names.contains(leaf) {
+                    report.unresolvable += 1;
+                    continue;
+                }
                 report.findings.push(DriftFinding {
                     markdown_file: node.id.file.clone(),
                     markdown_root: node.id.root.clone(),
@@ -488,10 +573,7 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                     reference: whole.as_str().to_string(),
                     diagnostic_code: DIAGNOSTIC_CODE,
                     severity: "error",
-                    message: format!(
-                        "symbol `{leaf}` not found in {}",
-                        bound_file.display()
-                    ),
+                    message: format!("symbol `{leaf}` not found in {}", bound_file.display()),
                 });
             }
         }
@@ -621,8 +703,9 @@ mod tests {
     #[test]
     fn file_line_missing_file_is_proven_dead() {
         let root_dir = tmp_root();
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -640,8 +723,9 @@ mod tests {
     fn file_line_out_of_range_is_distinguished_from_missing() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/small.rs", "line1\nline2\nline3\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -661,8 +745,9 @@ mod tests {
     fn file_line_at_exact_last_line_does_not_flag() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/small.rs", "line1\nline2\nline3\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -684,8 +769,9 @@ mod tests {
     #[test]
     fn bare_path_missing_file_is_proven_dead() {
         let root_dir = tmp_root();
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             "README.md",
@@ -702,8 +788,9 @@ mod tests {
     fn bare_path_existing_file_is_not_flagged() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/config.rs", "pub struct Config;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             "README.md",
@@ -724,8 +811,9 @@ mod tests {
         // note: destination file intentionally does not exist -- emit_link_edges
         // already existence-checks proper link syntax; this module must not
         // duplicate that (no finding should be produced here).
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             "README.md",
@@ -741,8 +829,9 @@ mod tests {
     #[test]
     fn file_line_in_link_text_is_still_checked() {
         let root_dir = tmp_root();
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             "README.md",
@@ -761,8 +850,9 @@ mod tests {
     fn bound_symbol_missing_from_file_is_proven_dead() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/config.rs", "pub struct Config;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let mut nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -770,7 +860,12 @@ mod tests {
             "In `src/config.rs`, the `OldStruct` type controls parsing.",
             1,
         )];
-        nodes.push(code_node("main", "src/config.rs", "Config", NodeKind::Struct));
+        nodes.push(code_node(
+            "main",
+            "src/config.rs",
+            "Config",
+            NodeKind::Struct,
+        ));
         let report = run_doc_drift(&nodes, &root_paths);
         assert_eq!(report.candidates_symbol, 1);
         assert_eq!(report.findings.len(), 1);
@@ -781,8 +876,9 @@ mod tests {
     fn bound_symbol_present_in_file_is_not_flagged() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/config.rs", "pub struct Config;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let mut nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -790,7 +886,12 @@ mod tests {
             "In `src/config.rs`, the `Config` type controls parsing.",
             1,
         )];
-        nodes.push(code_node("main", "src/config.rs", "Config", NodeKind::Struct));
+        nodes.push(code_node(
+            "main",
+            "src/config.rs",
+            "Config",
+            NodeKind::Struct,
+        ));
         let report = run_doc_drift(&nodes, &root_paths);
         assert_eq!(report.candidates_symbol, 1);
         assert!(report.findings.is_empty());
@@ -803,8 +904,9 @@ mod tests {
     fn renamed_symbol_is_not_treated_as_resolving() {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/config.rs", "pub struct NewConfig;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let mut nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -830,8 +932,9 @@ mod tests {
     fn symbol_in_unindexed_file_is_unresolvable() {
         let root_dir = tmp_root();
         write_file(&root_dir, "vendor/blob.rs", "whatever\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         // No code_node for vendor/blob.rs -- simulates an excluded/unindexed file.
         let nodes = vec![md_node(
             "main",
@@ -850,8 +953,9 @@ mod tests {
     #[test]
     fn prose_word_shaped_like_symbol_is_unresolvable() {
         let root_dir = tmp_root();
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -864,14 +968,184 @@ mod tests {
         assert_eq!(report.unresolvable, 1);
     }
 
+    /// Live-run regression: `.oh/config.toml` was matched as `oh/config.toml`
+    /// (the `\b` anchor cannot sit between a space and a `.`) and then declared
+    /// dead. Dot-directory paths must keep their leading dot.
+    #[test]
+    fn dot_directory_path_keeps_leading_dot() {
+        let root_dir = tmp_root();
+        write_file(&root_dir, ".oh/config.toml", "[scanner]\n");
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let nodes = vec![md_node(
+            "main",
+            "AGENTS.md",
+            "Config",
+            "Excludes live in `.oh/config.toml` and the missing .oh/nope.toml file.",
+            1,
+        )];
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert_eq!(report.candidates_bare_path, 2);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].reference, ".oh/nope.toml");
+    }
+
+    /// Live-run regression: co-change file anchors (`Other("file")`) exist for
+    /// markdown and shell files too; they must not make such a file "indexed"
+    /// for symbol binding.
+    #[test]
+    fn symbol_bound_to_non_code_file_is_unresolvable() {
+        let root_dir = tmp_root();
+        write_file(&root_dir, "docs/extractors.md", "# Extractors\n");
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            "plugin/SKILL.md",
+            "Setup",
+            "See `docs/extractors.md` and the `EXTRACTOR_COVERAGE` table.",
+            1,
+        )];
+        nodes.push(code_node(
+            "main",
+            "docs/extractors.md",
+            "docs/extractors.md",
+            NodeKind::Other("file".to_string()),
+        ));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.unresolvable, 1);
+    }
+
+    /// A symbol absent from the section-bound file but present elsewhere in
+    /// the graph is ambiguous binding, not proof of death.
+    #[test]
+    fn symbol_present_elsewhere_in_graph_is_unresolvable_not_dead() {
+        let root_dir = tmp_root();
+        write_file(&root_dir, "src/a.rs", "pub struct A;\n");
+        write_file(&root_dir, "src/b.rs", "pub struct Config;\n");
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            ".oh/notes.md",
+            "Notes",
+            "In `src/a.rs` we read `Config` from the environment.",
+            1,
+        )];
+        nodes.push(code_node("main", "src/a.rs", "A", NodeKind::Struct));
+        nodes.push(code_node("main", "src/b.rs", "Config", NodeKind::Struct));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.unresolvable, 1);
+    }
+
+    /// Live-run regression: TOML/JSON/shell files carry extractor nodes, but a
+    /// Rust identifier can never be defined there; binding to them is not evidence.
+    #[test]
+    fn symbol_never_binds_to_config_or_script_files() {
+        let root_dir = tmp_root();
+        write_file(&root_dir, ".oh/config.toml", "[scanner]\n");
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            ".oh/sessions/x.md",
+            "Notes",
+            "Excludes are read from `.oh/config.toml` into a `OnceLock`.",
+            1,
+        )];
+        nodes.push(code_node(
+            "main",
+            ".oh/config.toml",
+            "scanner",
+            NodeKind::Const,
+        ));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.unresolvable, 1);
+    }
+
+    /// `receiver.method()` refers to the method; the receiver is a local variable.
+    #[test]
+    fn method_call_span_uses_final_segment_as_leaf() {
+        let root_dir = tmp_root();
+        write_file(
+            &root_dir,
+            "src/cache.rs",
+            "impl Event { fn canonical_bytes(&self) {} }\n",
+        );
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            ".oh/sessions/x.md",
+            "Notes",
+            "In `src/cache.rs`, `event.canonical_bytes()` feeds the hash and `event.gone()` is removed.",
+            1,
+        )];
+        nodes.push(code_node(
+            "main",
+            "src/cache.rs",
+            "canonical_bytes",
+            NodeKind::Function,
+        ));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].message.contains("`gone`"),
+            "{}",
+            report.findings[0].message
+        );
+    }
+
+    #[test]
+    fn bare_filename_span_is_not_a_symbol_candidate() {
+        assert!(!looks_like_symbol("import_calls.rs"));
+        assert!(!looks_like_symbol("config.toml"));
+        assert!(!looks_like_symbol("SKILL.md"));
+        assert!(looks_like_symbol("Node.metadata"));
+    }
+
+    #[test]
+    fn leading_dot_method_chain_is_not_a_symbol_candidate() {
+        assert!(!looks_like_symbol(".iter().find()"));
+        assert!(!looks_like_symbol(".unwrap()"));
+        assert!(looks_like_symbol("Config::new()"));
+    }
+
+    #[test]
+    fn placeholder_path_with_ellipsis_is_unresolvable() {
+        let root_dir = tmp_root();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let nodes = vec![md_node(
+            "main",
+            "plugin/SKILL.md",
+            "ADRs",
+            "Files are named like docs/ADRs/001-...md and so on.",
+            1,
+        )];
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.unresolvable, 1);
+    }
+
     #[test]
     fn bare_lowercase_backtick_word_is_never_a_symbol_candidate() {
         // Regression guard for the dominant false-positive class: single
         // lowercase words used for emphasis, not identifiers.
         let root_dir = tmp_root();
         write_file(&root_dir, "src/config.rs", "pub struct Config;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let mut nodes = vec![md_node(
             "main",
             ".oh/notes.md",
@@ -879,7 +1153,12 @@ mod tests {
             "See `src/config.rs` -- note that `true` is returned by default.",
             1,
         )];
-        nodes.push(code_node("main", "src/config.rs", "Config", NodeKind::Struct));
+        nodes.push(code_node(
+            "main",
+            "src/config.rs",
+            "Config",
+            NodeKind::Struct,
+        ));
         let report = run_doc_drift(&nodes, &root_paths);
         // Only the `src/config.rs` bare-path candidate should be counted; `true`
         // must never become a symbol candidate at all.
@@ -892,8 +1171,9 @@ mod tests {
         let root_dir = tmp_root();
         write_file(&root_dir, "src/a.rs", "pub struct A;\n");
         write_file(&root_dir, "src/b.rs", "pub struct B;\n");
-        let root_paths: HashMap<String, PathBuf> =
-            [("main".to_string(), root_dir.clone())].into_iter().collect();
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
         let mut nodes = vec![md_node(
             "main",
             ".oh/notes.md",

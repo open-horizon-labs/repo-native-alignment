@@ -25,7 +25,11 @@ check() {
     return
   fi
   result=$(eval "$cmd" 2>/dev/null)
-  if echo "$result" | grep -q "$expect"; then
+  # Here-string, not a pipe: with large outputs `grep -q` exits on the first
+  # match while `echo` is still writing, `echo` dies of SIGPIPE, and pipefail
+  # turns a matching check into a FAIL (first hit by the doc_drift run, whose
+  # report on this repo is hundreds of lines).
+  if grep -q -- "$expect" <<< "$result"; then
     echo "PASS: $label"
     PASS=$((PASS+1))
   else
