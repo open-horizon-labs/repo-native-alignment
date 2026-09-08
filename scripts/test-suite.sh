@@ -999,8 +999,10 @@ if git -C "$RNA_REPO" diff --quiet -- "$_CHANGE_PROBE_FILE" 2>/dev/null \
     echo "PASS: change: sibling function is_test_file must not appear as a changed symbol (#899)"
     PASS=$((PASS+1))
   fi
-  git -C "$RNA_REPO" checkout -- "$_CHANGE_PROBE_FILE"
+  # Unstage first, then restore the working tree from HEAD. The reverse order
+  # restores the working tree from the *staged* probe and leaves it modified.
   git -C "$RNA_REPO" reset -q -- "$_CHANGE_PROBE_FILE"
+  git -C "$RNA_REPO" checkout -- "$_CHANGE_PROBE_FILE"
 else
   echo "SKIP: change mode hunk-intersection probe ($_CHANGE_PROBE_FILE has local modifications)"
   SKIP=$((SKIP+1))
