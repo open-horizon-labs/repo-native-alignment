@@ -172,8 +172,11 @@ check "list-roots includes primary root type" \
 # ── RELEASE BLOCKERS (#901): data must survive routine operations ─────────────
 echo "" && echo "--- Persistence survives no-op scans (#901) ---"
 _cc_before=$(repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20 2>/dev/null | grep -c "support=")
-repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1
-_cc_after=$(repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20 2>/dev/null | grep -c "support=")
+if ! repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1; then
+  echo "FAIL: no-op scan for the persistence checks exited nonzero (#901)"; FAIL=$((FAIL+1)); _cc_after=-1
+else
+  _cc_after=$(repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20 2>/dev/null | grep -c "support=")
+fi
 if [ "$_cc_before" -gt 0 ] && [ "$_cc_after" -eq "$_cc_before" ]; then
   echo "PASS: co-change partners survive a no-op scan (#901) ($_cc_before -> $_cc_after)"; PASS=$((PASS+1))
 else
@@ -190,8 +193,11 @@ if [ -n "$_indexed" ] && [ "$_indexed" -gt 100 ] 2>/dev/null; then
 else
   echo "FAIL: census reports a real indexed magnitude on the CLI path (#901)"; echo "  line: $_files_line"; FAIL=$((FAIL+1))
 fi
-repo-native-alignment scan --repo "$RNA_REPO" --full --no-embed --no-lsp >/dev/null 2>&1
-_indexed_full=$(repo-native-alignment list-roots --repo "$RNA_REPO" 2>/dev/null | grep -m1 "Files: .* seen = " | sed -E 's/.* = ([0-9,]+) indexed.*/\1/' | tr -d ,)
+if ! repo-native-alignment scan --repo "$RNA_REPO" --full --no-embed --no-lsp >/dev/null 2>&1; then
+  echo "FAIL: scan --full for the census check exited nonzero (#901)"; FAIL=$((FAIL+1)); _indexed_full=""
+else
+  _indexed_full=$(repo-native-alignment list-roots --repo "$RNA_REPO" 2>/dev/null | grep -m1 "Files: .* seen = " | sed -E 's/.* = ([0-9,]+) indexed.*/\1/' | tr -d ,)
+fi
 if [ -n "$_indexed_full" ] && [ "$_indexed_full" -gt 100 ] 2>/dev/null; then
   echo "PASS: census survives scan --full on the CLI path (#901) ($_indexed_full indexed)"; PASS=$((PASS+1))
 else

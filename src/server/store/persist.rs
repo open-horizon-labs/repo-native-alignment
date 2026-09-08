@@ -72,27 +72,38 @@ pub(crate) async fn persist_graph_to_lance(
 /// next load would hydrate nothing -- co-change data silently vanished after
 /// any no-op scan (#901). The writer merges these into the incoming map for
 /// every co-change edge the caller did not supply stats for.
+///
+/// Only a genuinely absent edges table (first persist) yields an empty map.
+/// Any other failure propagates so the caller aborts the persist: writing the
+/// new version with null columns would destroy the persisted stats, and the
+/// committed-version pointer only advances on success, so failing here keeps
+/// the previous data intact through a transient LanceDB error.
 async fn read_persisted_cochange_stats(
     db: &lancedb::Connection,
     db_path: &Path,
-) -> crate::graph::CoChangeStatsMap {
+) -> anyhow::Result<crate::graph::CoChangeStatsMap> {
     use arrow_array::Array;
     use futures::TryStreamExt;
     let mut out = crate::graph::CoChangeStatsMap::new();
-    let Ok(table) = db.open_table("edges").execute().await else {
-        return out;
+    let table = match db.open_table("edges").execute().await {
+        Ok(t) => t,
+        Err(lancedb::Error::TableNotFound { .. }) => return Ok(out),
+        Err(e) => return Err(e).context("opening edges table to preserve co-change stats"),
     };
     use lancedb::query::{ExecutableQuery, QueryBase};
     let committed = read_committed_scan_version(db_path);
-    let q = table.query().only_if(format!(
-        "edge_type = 'co_changes' AND scan_version = {committed}"
-    ));
-    let Ok(stream) = q.execute().await else {
-        return out;
-    };
-    let Ok(batches) = stream.try_collect::<Vec<arrow_array::RecordBatch>>().await else {
-        return out;
-    };
+    let stream = table
+        .query()
+        .only_if(format!(
+            "edge_type = 'co_changes' AND scan_version = {committed}"
+        ))
+        .execute()
+        .await
+        .context("querying persisted co-change stats")?;
+    let batches = stream
+        .try_collect::<Vec<arrow_array::RecordBatch>>()
+        .await
+        .context("reading persisted co-change stats")?;
     for batch in &batches {
         let (Some(ids), Some(supports), Some(confs)) = (
             batch
@@ -120,7 +131,7 @@ async fn read_persisted_cochange_stats(
             );
         }
     }
-    out
+    Ok(out)
 }
 
 /// Same as [`persist_graph_to_lance`], but also writes the
@@ -235,7 +246,7 @@ pub(crate) async fn persist_graph_to_lance_with_cochange(
         });
         let merged_stats: crate::graph::CoChangeStatsMap;
         let stats_for_batch: &crate::graph::CoChangeStatsMap = if needs_fill {
-            let persisted = read_persisted_cochange_stats(&db, &db_path).await;
+            let persisted = read_persisted_cochange_stats(&db, &db_path).await?;
             let mut m = cochange_stats.clone();
             for e in edges
                 .iter()
