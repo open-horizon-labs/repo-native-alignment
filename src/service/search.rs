@@ -10315,6 +10315,20 @@ async fn search_traversal(
         return out;
     }
 
+    // ── doc_drift mode ───────────────────────────────────────────────────────
+    // On-demand documentation-drift verifier (#891): flags markdown references
+    // to code that no longer resolve (dead `file:line` pointers, bound
+    // backticked symbols, bare file paths). Not part of `scan`; recomputed
+    // fresh on every call against the current graph snapshot and filesystem.
+    if mode == "doc_drift" {
+        let gs = ctx.graph_state;
+        let strip = ctx.root_filter.as_deref();
+        let root_paths: HashMap<String, PathBuf> =
+            source_roots(params, ctx.repo_root).into_iter().collect();
+        let report = crate::doc_drift::run_doc_drift(&gs.nodes, &root_paths);
+        return crate::doc_drift::render_report(&report, strip);
+    }
+
     // ── cochange mode ────────────────────────────────────────────────────────
     // Ranked git co-change partners for the given node(s) (#884). Resolves each
     // selector's containing file, looks up its synthetic file anchor node, and
