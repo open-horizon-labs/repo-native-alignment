@@ -157,6 +157,13 @@ fn validate_search_experience(params: &SearchParams) -> Result<(), String> {
             "unknown body_policy `{body_policy}`; allowed values: complete, focused_span, signature_only, minified, none"
         ));
     }
+    if let Some(min_confidence) = params.min_confidence
+        && !(0.0..=1.0).contains(&min_confidence)
+    {
+        return Err(format!(
+            "min_confidence must be between 0.0 and 1.0 (got {min_confidence})"
+        ));
+    }
     if let Some(bytes) = params.max_output_bytes
         && !(1..=MAX_PROJECTED_OUTPUT_BYTES).contains(&bytes)
     {
@@ -10435,7 +10442,13 @@ async fn search_traversal(
             }
             out.push('\n');
         }
-        if !any_found {
+        // Distinguish "nothing mined" from "everything filtered out": when
+        // `CoChanges` edges exist but every partner fell below
+        // `min_confidence`, the per-anchor "No co-change partners at or
+        // above confidence ..." message above already explains why -- the
+        // generic "no data" message would be actively misleading there
+        // (#890 review).
+        if !any_found && gs.cochange_stats.is_empty() {
             out.push_str("No co-change data available (repo may not have `.git`, or no commits mined yet).\n");
         }
         return out;
@@ -10523,12 +10536,24 @@ async fn search_traversal(
             if best_partners.is_empty() {
                 continue;
             }
-            // Same support-first ranking as mode="cochange" -- see comment there.
+            // Collapse repeated partner paths first, keeping the strongest
+            // stats. Every root scanned above creates one edge per unordered
+            // pair, so the same displayed path can be contributed by more
+            // than one root with different stats; `root_filter` only affects
+            // rendering, not this scan, so a plain dedup after a score sort
+            // can leave duplicates apart (#890 review). Sort by path so
+            // duplicates are adjacent, dedup, then apply the support-first
+            // ranking used by mode="cochange" -- see the comment there.
+            best_partners.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            best_partners.dedup_by(|a, b| a.0 == b.0);
             best_partners.sort_by(|a, b| {
                 b.1.cmp(&a.1)
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
             });
-            best_partners.dedup_by(|a, b| a.0 == b.0);
             for (partner_file, support, confidence) in best_partners.iter().take(top_k) {
                 gap_lines.push(format!(
                     "- `{}` usually changes with `{}` (support={}, confidence={:.2}), but is not in this change.",
@@ -16782,6 +16807,36 @@ mod tests {
         assert!(validate_search_experience(&valid).is_ok());
     }
 
+    /// #890 review: `min_confidence` reached `cochange`/`cochange_gaps` unvalidated
+    /// from both the MCP and CLI paths, which both build a `SearchParams` and
+    /// call through this same shared validation. Out-of-range and non-finite
+    /// values must be rejected here, once, for both callers.
+    #[test]
+    fn min_confidence_out_of_range_is_rejected() {
+        for bad in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let params = SearchParams {
+                min_confidence: Some(bad),
+                ..Default::default()
+            };
+            assert!(
+                validate_search_experience(&params)
+                    .unwrap_err()
+                    .contains("min_confidence must be between 0.0 and 1.0"),
+                "expected {bad} to be rejected"
+            );
+        }
+        for ok in [0.0, 0.3, 1.0] {
+            let params = SearchParams {
+                min_confidence: Some(ok),
+                ..Default::default()
+            };
+            assert!(
+                validate_search_experience(&params).is_ok(),
+                "expected {ok} to be accepted"
+            );
+        }
+    }
+
     #[test]
     fn focused_span_scores_all_lines_and_prefers_behavioral_terms() {
         let mut node = make_node(
@@ -19511,6 +19566,14 @@ mod tests {
             response.contains("No co-change partners"),
             "got: {response}"
         );
+        // #890 review: when a `CoChanges` edge exists but every partner is
+        // filtered by `min_confidence`, only the per-anchor "filtered out"
+        // message should appear -- the generic "no co-change data available"
+        // message is false in this case (data *was* mined) and misleading.
+        assert!(
+            !response.contains("No co-change data available"),
+            "got: {response}"
+        );
     }
 
     #[tokio::test]
@@ -19564,6 +19627,126 @@ mod tests {
         assert!(
             response.contains("src/b.rs") && response.contains("src/a.rs"),
             "got: {response}"
+        );
+    }
+
+    /// #890 review: `cochange_gaps` stores only `neighbor_node.id.file` while
+    /// scanning every root, so two roots each contributing a `CoChanges` edge
+    /// for the same displayed path (with different stats) must collapse to
+    /// one entry -- the strongest one -- rather than appearing twice or
+    /// keeping whichever entry the score sort happened to land on first.
+    #[tokio::test]
+    async fn cochange_gaps_mode_dedups_same_path_across_roots() {
+        fn anchor_pair(root: &str) -> (Node, Node, crate::graph::Edge) {
+            let anchor_a = crate::git::cochange::file_anchor_node_id(root, Path::new("src/a.rs"));
+            let anchor_b = crate::git::cochange::file_anchor_node_id(root, Path::new("src/b.rs"));
+            let node_a = Node {
+                id: anchor_a.clone(),
+                language: String::new(),
+                signature: "file src/a.rs".to_string(),
+                line_start: 0,
+                line_end: 0,
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::Git,
+            };
+            let node_b = Node {
+                id: anchor_b.clone(),
+                language: String::new(),
+                signature: "file src/b.rs".to_string(),
+                line_start: 0,
+                line_end: 0,
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::Git,
+            };
+            let edge = crate::graph::Edge {
+                from: anchor_a,
+                to: anchor_b,
+                kind: EdgeKind::CoChanges,
+                source: ExtractionSource::Git,
+                confidence: crate::graph::Confidence::Detected,
+                evidence: Vec::new(),
+            };
+            (node_a, node_b, edge)
+        }
+
+        let (a1, b1, edge1) = anchor_pair("root1");
+        let (a2, b2, edge2) = anchor_pair("root2");
+
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&[edge1.clone(), edge2.clone()]);
+        for node in [&a1, &b1, &a2, &b2] {
+            index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+        let mut stats = crate::graph::CoChangeStatsMap::new();
+        // root1's pair is the weaker one; root2's is strictly stronger on
+        // both support and confidence, so it must be the one that survives.
+        stats.insert(
+            edge1.stable_id(),
+            crate::graph::CoChangeStats {
+                support: 2,
+                confidence: 0.6,
+            },
+        );
+        stats.insert(
+            edge2.stable_id(),
+            crate::graph::CoChangeStats {
+                support: 9,
+                confidence: 0.99,
+            },
+        );
+        let graph = GraphState::new(
+            vec![a1, b1, a2, b2],
+            vec![edge1, edge2],
+            index,
+            None,
+            HashSet::new(),
+        )
+        .with_cochange_stats(stats);
+
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        {
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new("src/a.rs")).unwrap();
+            idx.add_path(Path::new("src/b.rs")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() { /* changed */ }\n").unwrap();
+
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("cochange_gaps".into()),
+            min_confidence: Some(0.5),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert_eq!(
+            response.matches("src/b.rs").count(),
+            1,
+            "expected src/b.rs to appear exactly once (deduplicated), got: {response}"
+        );
+        assert!(
+            response.contains("support=9, confidence=0.99"),
+            "expected the stronger root2 stats to survive dedup, got: {response}"
+        );
+        assert!(
+            !response.contains("support=2, confidence=0.60"),
+            "the weaker root1 stats should have been dropped, got: {response}"
         );
     }
 }

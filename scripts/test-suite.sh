@@ -89,8 +89,16 @@ if repo-native-alignment search '' --repo "$RNA_REPO" --node src/server/tools.rs
   check "co-change: tools.rs <-> handlers.rs surfaced as partners" \
     "repo-native-alignment search '' --repo $RNA_REPO --node src/server/tools.rs --mode cochange --min-confidence 0.1 --limit 20" "handlers.rs"
 else
-  echo "  (skip) co-change partner pair: no mined co-change data in this checkout"
+  echo "SKIP: co-change partner pair (no mined co-change data in this checkout)"
+  SKIP=$((SKIP+1))
 fi
+
+# ── CHURN & HOTSPOT RANKING (#889) ──────────────────────────────────────────
+echo "" && echo "--- Churn & hotspot ranking (#889) ---"
+check "repo-map: hotspots section names its ranking basis" \
+  "repo-native-alignment repo-map --repo $RNA_REPO" "ranked by churn x complexity"
+check "repo-map: hotspot rows show either a churn score or an explicit unavailable reason" \
+  "repo-native-alignment repo-map --repo $RNA_REPO" "churn [0-9]* x complexity\|churn: not available"
 
 # ── EDGE TRAVERSAL ───────────────────────────────────────────────────────────
 echo "" && echo "--- Edge Traversal ---"

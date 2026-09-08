@@ -2692,6 +2692,12 @@ impl RnaHandler {
         let graph_state = self
             .build_full_graph_inner(false, enrichment.without_lsp().without_embeddings())
             .await?;
+        // `build_full_graph_inner(false, ..)` defers its own persist to this
+        // caller (see the `spawn_background` gate in `graph.rs`), so it could
+        // not durably advance the co-change watermark itself. Carry the SHA
+        // through and write it ourselves, only after the full persist below
+        // (Phase 3) actually succeeds (#890 review).
+        let cochange_pending_watermark_sha = graph_state.cochange_pending_watermark_sha.clone();
         let scan_extract_time = t0.elapsed();
 
         let file_count = graph_state
@@ -2991,6 +2997,19 @@ impl RnaHandler {
                 // is valid only when this invocation completed LSP and persisted
                 // the resulting graph in this block.
                 super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
+                // Now that the graph is durably persisted, it's safe to advance
+                // the co-change watermark carried from the earlier deferred-persist
+                // build (#890 review) -- a failure here is best-effort/non-fatal,
+                // matching `Scanner::commit_state`'s durability characteristics.
+                if let Some(ref sha) = cochange_pending_watermark_sha
+                    && let Err(e) =
+                        crate::scanner::write_cochange_watermark(&self.repo_root, Some(sha.clone()))
+                {
+                    tracing::warn!(
+                        "Failed to write co-change watermark after foreground full persist: {}",
+                        e
+                    );
+                }
                 if lsp_stage_completed && lsp_degraded_detail.is_none() {
                     super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
                 } else {

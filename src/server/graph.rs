@@ -462,8 +462,297 @@ mod tests {
             &nodes,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("failed to plan changed-file LSP nodes"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to plan changed-file LSP nodes")
+        );
         assert!(format!("{error:#}").contains("exceeds its bound"));
+    }
+
+    /// #890 review: on the deferred-persist full-build path
+    /// (`spawn_background == false`, the CLI `--full` path via
+    /// `run_pipeline_foreground_full`), the co-change watermark must NOT be
+    /// advanced on disk until the caller's own persist actually succeeds.
+    /// `build_full_graph_inner(false, ..)` doesn't persist at all -- it must
+    /// instead carry the mined HEAD SHA on `GraphState` so the caller can
+    /// write it later.
+    #[tokio::test]
+    async fn deferred_persist_full_build_defers_cochange_watermark_advance() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = git2::Repository::init(root).expect("init repo");
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        let head_sha = repo.head().unwrap().target().unwrap().to_string();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
+            ..RnaHandler::default()
+        };
+        let graph = handler
+            .build_full_graph_inner(false, ScanEnrichmentOptions::extract_only())
+            .await
+            .expect("build_full_graph_inner");
+
+        // Mining ran (there's a `.git` and a resolvable HEAD) and succeeded,
+        // but this invocation never persisted -- the SHA must be carried as
+        // "pending", not written to scan-state.json yet.
+        assert_eq!(
+            graph.cochange_pending_watermark_sha,
+            Some(head_sha.clone()),
+            "expected the mined HEAD SHA to be carried as pending on the deferred-persist path"
+        );
+        assert_eq!(
+            crate::scanner::read_cochange_watermark(root),
+            None,
+            "the durable watermark must not advance before this graph is persisted"
+        );
+
+        // Only once the caller's own persist succeeds (simulated here) may
+        // the watermark be written -- mirrors `run_pipeline_foreground_full`'s
+        // Phase 3 persist-then-watermark ordering.
+        crate::scanner::write_cochange_watermark(root, graph.cochange_pending_watermark_sha)
+            .expect("write watermark after simulated persist success");
+        assert_eq!(
+            crate::scanner::read_cochange_watermark(root),
+            Some(head_sha)
+        );
+    }
+
+    /// #890 review: the incremental path's schema-migration fallback (`Ok(true)`
+    /// from `persist_graph_incremental_with_cochange`) must do its full persist
+    /// via `persist_graph_to_lance_with_cochange` with `graph.cochange_stats`,
+    /// not plain `persist_graph_to_lance` -- otherwise a schema migration that
+    /// happens to land on an incremental scan silently nulls out every
+    /// `CoChanges` edge's `cochange_support`/`cochange_confidence`.
+    #[tokio::test]
+    async fn incremental_schema_migration_fallback_preserves_cochange_stats() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = git2::Repository::init(root).expect("init repo");
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let commit = |files: &[&str], message: &str| {
+            let mut index = repo.index().unwrap();
+            for f in files {
+                index.add_path(std::path::Path::new(f)).unwrap();
+            }
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+                .unwrap();
+        };
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        commit(&["src/a.rs", "src/b.rs"], "initial");
+        // Change both files together so they mine as a `CoChanges` pair with
+        // non-trivial support/confidence.
+        std::fs::write(root.join("src/a.rs"), "pub fn a() { /* v2 */ }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() { /* v2 */ }\n").unwrap();
+        commit(&["src/a.rs", "src/b.rs"], "touch both together");
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
+            ..RnaHandler::default()
+        };
+        // spawn_background=true takes the immediate-persist path (already
+        // correct: uses persist_graph_to_lance_with_cochange), so this graph
+        // and its LanceDB rows start with real co-change stats.
+        let mut graph = handler
+            .build_full_graph_inner(true, ScanEnrichmentOptions::extract_only())
+            .await
+            .expect("initial build_full_graph_inner");
+        assert!(
+            !graph.cochange_stats.is_empty(),
+            "expected the two-file co-change pair to mine at least one CoChanges edge"
+        );
+
+        // Force the next incremental persist onto the schema-migration
+        // fallback branch by corrupting the stored schema version.
+        let db_path = crate::server::store::graph_lance_path(root);
+        std::fs::write(db_path.join("schema_version"), "999999").unwrap();
+
+        // A trivial incremental scan (re-touch one already-known file) is
+        // enough to drive execution into `update_graph_with_scan_outcome`
+        // and through its persist_result handling.
+        std::fs::write(root.join("src/a.rs"), "pub fn a() { /* v3 */ }\n").unwrap();
+        let scan = crate::scanner::ScanResult {
+            changed_files: vec![PathBuf::from("src/a.rs")],
+            new_files: vec![],
+            deleted_files: vec![],
+            scan_duration: std::time::Duration::from_millis(0),
+        };
+        let outcome = handler
+            .update_graph_with_scan_outcome(
+                &mut graph,
+                Some(scan),
+                ScanEnrichmentOptions::extract_only(),
+            )
+            .await
+            .expect("update_graph_with_scan_outcome");
+        assert!(
+            outcome.persist_succeeded,
+            "expected the schema-migration fallback's full persist to succeed"
+        );
+
+        let reloaded = load_graph_from_lance(root)
+            .await
+            .expect("reload from LanceDB");
+        assert!(
+            !reloaded.cochange_stats.is_empty(),
+            "schema-migration full-persist fallback must preserve cochange_support/confidence, \
+             not silently null them out via plain persist_graph_to_lance"
+        );
+    }
+
+    /// #890 review: after an incremental scan re-mines co-change (HEAD moved
+    /// past the watermark), the new file anchors and `CoChanges` edges must
+    /// be queryable through `graph.index` immediately -- not only after a
+    /// process restart reloads from LanceDB -- and an existing anchor's
+    /// `churn` metadata must be refreshed in place, not left stale.
+    #[tokio::test]
+    async fn incremental_remine_updates_index_and_refreshes_existing_churn() {
+        use crate::business_context::{BusinessContextAdmission, BusinessContextMode};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = git2::Repository::init(root).expect("init repo");
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let commit = |files: &[&str], message: &str| {
+            let mut index = repo.index().unwrap();
+            for f in files {
+                index.add_path(std::path::Path::new(f)).unwrap();
+            }
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+                .unwrap();
+        };
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        commit(&["src/a.rs", "src/b.rs"], "initial");
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            business_context: BusinessContextAdmission::new(BusinessContextMode::Enabled),
+            ..RnaHandler::default()
+        };
+        let mut graph = handler
+            .build_full_graph_inner(true, ScanEnrichmentOptions::extract_only())
+            .await
+            .expect("initial build_full_graph_inner");
+
+        let primary_slug = RootConfig::code_project(root.to_path_buf()).slug();
+        let anchor_a = crate::git::cochange::file_anchor_node_id(
+            &primary_slug,
+            std::path::Path::new("src/a.rs"),
+        );
+        let anchor_b = crate::git::cochange::file_anchor_node_id(
+            &primary_slug,
+            std::path::Path::new("src/b.rs"),
+        );
+        let churn_of = |graph: &GraphState, id: &crate::graph::NodeId| -> Option<String> {
+            graph
+                .nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .and_then(|n| n.metadata.get("churn").cloned())
+        };
+        assert_eq!(
+            churn_of(&graph, &anchor_a),
+            Some("1".to_string()),
+            "initial churn should be 1 after a single commit"
+        );
+
+        // HEAD moves: a second commit touches both files together, so
+        // re-mining is due (watermark != current HEAD) on the next
+        // incremental update.
+        std::fs::write(root.join("src/a.rs"), "pub fn a() { /* v2 */ }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() { /* v2 */ }\n").unwrap();
+        commit(&["src/a.rs", "src/b.rs"], "touch both together");
+
+        let scan = crate::scanner::ScanResult {
+            changed_files: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
+            new_files: vec![],
+            deleted_files: vec![],
+            scan_duration: std::time::Duration::from_millis(0),
+        };
+        handler
+            .update_graph_with_scan_outcome(
+                &mut graph,
+                Some(scan),
+                ScanEnrichmentOptions::extract_only(),
+            )
+            .await
+            .expect("update_graph_with_scan_outcome");
+
+        // Existing anchors' churn must be refreshed in place (2, not stale 1).
+        assert_eq!(
+            churn_of(&graph, &anchor_a),
+            Some("2".to_string()),
+            "existing anchor's churn metadata must be refreshed on re-mine, not left stale"
+        );
+        assert_eq!(churn_of(&graph, &anchor_b), Some("2".to_string()));
+
+        // The re-mined CoChanges edge must be visible through graph.index
+        // right now, in this same process -- without reloading from LanceDB.
+        let neighbors_of_a: Vec<String> = graph
+            .index
+            .neighbors(
+                &anchor_a.to_stable_id(),
+                Some(&[EdgeKind::CoChanges]),
+                petgraph::Direction::Outgoing,
+            )
+            .into_iter()
+            .chain(graph.index.neighbors(
+                &anchor_a.to_stable_id(),
+                Some(&[EdgeKind::CoChanges]),
+                petgraph::Direction::Incoming,
+            ))
+            .collect();
+        assert!(
+            neighbors_of_a.contains(&anchor_b.to_stable_id()),
+            "re-mined CoChanges edge must be indexed immediately, got neighbors: {neighbors_of_a:?}"
+        );
     }
 }
 
@@ -1867,7 +2156,7 @@ impl RnaHandler {
                 None,
                 &existing_stable_ids,
             ) {
-                Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                Ok((file_nodes, cochange_edges, stats, head_sha, _file_changes)) => {
                     tracing::info!(
                         "Co-change mining: {} file anchor nodes, {} CoChanges edges (window: {} commits, {} days)",
                         file_nodes.len(),
@@ -2277,14 +2566,30 @@ impl RnaHandler {
         // Record the co-change watermark (#884) on the primary root's scanner so
         // the next scan's watermark check (below) can skip re-mining unmoved
         // history. Only advances the watermark after mining actually succeeded
-        // (`cochange_head_sha` is `None` on a non-git root or a mining failure).
+        // (`cochange_head_sha` is `None` on a non-git root or a mining failure)
+        // AND after this invocation actually persisted the graph durably.
+        //
+        // When `spawn_background == false` (the CLI `--full` path via
+        // `run_pipeline_foreground_full`), the persist above is skipped by
+        // design -- the caller persists later with the LSP-enriched graph
+        // (see the `if spawn_background` block above). Advancing the
+        // watermark here would let a subsequent incremental scan believe
+        // mining already ran for this HEAD and skip it, even though the
+        // graph returned by *this* call was never durably persisted (#890
+        // review). The pending SHA is carried on `GraphState` instead so the
+        // foreground caller can write it after its own persist succeeds.
+        let mut cochange_pending_watermark_sha = None;
         if let Some(ref head_sha) = cochange_head_sha {
-            let primary_slug_for_watermark =
-                RootConfig::code_project(self.repo_root.clone()).slug();
-            for (slug, scanner, _scan, _path, _changed) in &mut scanners {
-                if *slug == primary_slug_for_watermark {
-                    scanner.set_cochange_watermark_sha(Some(head_sha.clone()));
+            if spawn_background {
+                let primary_slug_for_watermark =
+                    RootConfig::code_project(self.repo_root.clone()).slug();
+                for (slug, scanner, _scan, _path, _changed) in &mut scanners {
+                    if *slug == primary_slug_for_watermark {
+                        scanner.set_cochange_watermark_sha(Some(head_sha.clone()));
+                    }
                 }
+            } else {
+                cochange_pending_watermark_sha = Some(head_sha.clone());
             }
         }
 
@@ -2346,7 +2651,8 @@ impl RnaHandler {
             Some(symbols_ready_at),
             all_detected_frameworks,
         )
-        .with_cochange_stats(cochange_stats))
+        .with_cochange_stats(cochange_stats)
+        .with_cochange_pending_watermark_sha(cochange_pending_watermark_sha))
     }
 
     /// Refresh cheap manifest-derived package nodes and dependency edges without
@@ -3015,12 +3321,41 @@ impl RnaHandler {
                     None,
                     &existing_stable_ids,
                 ) {
-                    Ok((file_nodes, cochange_edges, stats, head_sha)) => {
+                    Ok((file_nodes, cochange_edges, stats, head_sha, file_changes)) => {
                         tracing::info!(
                             "Co-change re-mining (incremental): {} file anchor nodes, {} CoChanges edges",
                             file_nodes.len(),
                             cochange_edges.len(),
                         );
+                        // `build_file_anchor_nodes` (called by `mine_and_build`) skips
+                        // files already present in `existing_stable_ids`, so `file_nodes`
+                        // above only covers newly-anchored files. Existing anchors'
+                        // `churn` metadata would otherwise go stale in both
+                        // `graph.nodes` and LanceDB after every re-mine, even though
+                        // `repo_map`'s hotspot ranking reads churn from `graph.nodes`
+                        // (#890 review). Refresh them here from the same
+                        // `file_changes` map and include them in the upsert set --
+                        // rebuilding `GraphIndex` alone does not touch node metadata.
+                        for node in &mut graph.nodes {
+                            if !matches!(&node.id.kind, NodeKind::Other(s) if s == "file")
+                                || node.id.root != primary_slug
+                            {
+                                continue;
+                            }
+                            let new_churn = file_changes.get(&node.id.file).copied();
+                            let new_churn_str = new_churn.filter(|c| *c > 0).map(|c| c.to_string());
+                            if node.metadata.get("churn") != new_churn_str.as_ref() {
+                                match new_churn_str {
+                                    Some(v) => {
+                                        node.metadata.insert("churn".to_string(), v);
+                                    }
+                                    None => {
+                                        node.metadata.remove("churn");
+                                    }
+                                }
+                                upsert_node_ids.insert(node.stable_id());
+                            }
+                        }
                         // Replace any previously-persisted CoChanges edges wholesale
                         // (see `mine_cochanges` doc comment for why this isn't a
                         // partial-delta merge). File anchor nodes are additive/deduped.
@@ -3093,6 +3428,27 @@ impl RnaHandler {
                         );
                     }
                 }
+
+                // The petgraph index was rebuilt (full) before PageRank/subsystem
+                // detection ran, and the virtual-node top-up above only covers
+                // "subsystem"/"framework"/"channel"/"event" kinds. `NodeKind::Other("file")`
+                // anchors and `EdgeKind::CoChanges` edges added or superseded by the
+                // re-mining block just above are therefore invisible to
+                // `index.neighbors(.., CoChanges, ..)` (used by `search`'s
+                // `mode="cochange"` and `repo_map`'s partner column) until a
+                // process restart reloads from LanceDB. Rebuild the whole index
+                // here so both new anchors/edges are indexed and superseded
+                // edges (already dropped from `graph.edges` above) are gone
+                // too (#890 review). Full rebuild is simplest-correct, and
+                // this only runs when `needs_remine` was true (HEAD moved
+                // since the last mine), not on every incremental scan.
+                graph.index = GraphIndex::new();
+                graph.index.rebuild_from_edges(&graph.edges);
+                for node in &graph.nodes {
+                    graph
+                        .index
+                        .ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                }
             }
         }
 
@@ -3142,8 +3498,18 @@ impl RnaHandler {
                     "Schema migrated during incremental update; performing full persist now"
                 );
                 let _lance_guard = self.lance_write_lock.lock().await;
-                if let Err(e) =
-                    persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await
+                // Use the co-change-aware persist here, not plain
+                // `persist_graph_to_lance`: `graph` can contain `EdgeKind::CoChanges`
+                // edges, and the plain path would supply an empty
+                // `CoChangeStatsMap`, silently writing null
+                // `cochange_support`/`cochange_confidence` for them (#890 review).
+                if let Err(e) = persist_graph_to_lance_with_cochange(
+                    &self.repo_root,
+                    &graph.nodes,
+                    &graph.edges,
+                    &graph.cochange_stats,
+                )
+                .await
                 {
                     tracing::error!("Full persist after migration failed: {:#}", e);
                     // Don't block MCP response — log and treat as persist failure.

@@ -31,6 +31,14 @@ pub struct GraphState {
     /// fields on `Edge` (see `crate::graph::CoChangeStats` doc comment for why).
     /// Empty for graphs with no mined co-change data.
     pub cochange_stats: crate::graph::CoChangeStatsMap,
+    /// HEAD SHA mined by co-change on the full-build path, when persistence of
+    /// this graph was *deferred* to the caller (`spawn_background == false`,
+    /// the CLI `--full` path). `None` when mining didn't run/succeed, or when
+    /// this graph was already durably persisted before being returned (the
+    /// watermark was already advanced in that case). The foreground caller
+    /// must write this watermark itself, after its own persist succeeds
+    /// (#890 review) -- see `crate::scanner::write_cochange_watermark`.
+    pub cochange_pending_watermark_sha: Option<String>,
 }
 
 impl Clone for GraphState {
@@ -45,6 +53,7 @@ impl Clone for GraphState {
             // working copy for incremental scan whose nodes will change.
             node_index_cache: OnceLock::new(),
             cochange_stats: self.cochange_stats.clone(),
+            cochange_pending_watermark_sha: self.cochange_pending_watermark_sha.clone(),
         }
     }
 }
@@ -66,6 +75,7 @@ impl GraphState {
             detected_frameworks,
             node_index_cache: OnceLock::new(),
             cochange_stats: crate::graph::CoChangeStatsMap::new(),
+            cochange_pending_watermark_sha: None,
         }
     }
 
@@ -73,6 +83,14 @@ impl GraphState {
     /// `GraphState::new(..)` call sites (no co-change data) stay unchanged.
     pub fn with_cochange_stats(mut self, cochange_stats: crate::graph::CoChangeStatsMap) -> Self {
         self.cochange_stats = cochange_stats;
+        self
+    }
+
+    /// Attach a co-change watermark SHA that has not yet been durably
+    /// committed because this graph's persist was deferred to the caller
+    /// (#890 review). Builder-style so existing call sites are unaffected.
+    pub fn with_cochange_pending_watermark_sha(mut self, sha: Option<String>) -> Self {
+        self.cochange_pending_watermark_sha = sha;
         self
     }
 

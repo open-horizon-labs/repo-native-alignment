@@ -261,14 +261,16 @@ function parseRepoMap(text) {
 
   // ── Fallback: parse Hotspot files and Entry points when no subsystems found ──
   if (nodes.length === 0) {
-    // Hotspot files: "- `path/to/file.rs` -- N definitions"
+    // Hotspot files (#889): "- `path/to/file.rs` -- churn N x complexity M = SCORE"
+    // or, when churn is unavailable: "- `path/to/file.rs` -- churn: not available (...); complexity M"
     const hotspotSection = text.match(/## Hotspot files[\s\S]*?(?=\n## |$)/i);
     if (hotspotSection) {
       for (const line of hotspotSection[0].split('\n')) {
-        const m = line.match(/^- `([^`]+)` -- (\d+) definitions/);
+        const m = line.match(/^- `([^`]+)` -- churn(?: (\d+) x complexity (\d+) = (\d+)|: not available[^;]*; complexity (\d+))/);
         if (m) {
           const filePath = m[1];
-          const defCount = parseInt(m[2], 10);
+          // Size by score when churn is known, else fall back to complexity alone.
+          const sizeBasis = m[4] !== undefined ? parseInt(m[4], 10) : parseInt(m[5], 10);
           const id = 'file:' + filePath;
           if (!seenIds.has(id)) {
             seenIds.add(id);
@@ -276,7 +278,7 @@ function parseRepoMap(text) {
             const parts = filePath.replace(/\\/g, '/').split('/');
             const label = parts.slice(-2).join('/');
             // synthetic: true — id uses 'file:' prefix, not a real backend stable ID
-            nodes.push({ id, label, kind: 'module', size: Math.max(18, Math.min(36, 14 + defCount / 5)), color: nodeColor('module', null), synthetic: true });
+            nodes.push({ id, label, kind: 'module', size: Math.max(18, Math.min(36, 14 + sizeBasis / 5)), color: nodeColor('module', null), synthetic: true });
           }
         }
       }
