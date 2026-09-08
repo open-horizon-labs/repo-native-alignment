@@ -2796,6 +2796,52 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
 
         let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+
+        // Artifacts bound to a changed file are re-extracted too (#897). An
+        // `rna:` frontmatter relationship is a `References` edge from the
+        // artifact's node to a code symbol, carrying `frontmatter-candidate@1`
+        // evidence. The purge below removes every edge touching a changed
+        // file, and the binding pass only rewrites edges that exist, so an
+        // unchanged guardrail bound to `src/server/helpers.rs` silently lost
+        // its note the moment helpers.rs was edited. Treating the artifact as
+        // changed re-emits its placeholder edge, which the pass then re-binds
+        // against the re-extracted symbol -- or marks unresolved if the symbol
+        // is gone, which is the correct answer.
+        {
+            let touched: std::collections::HashSet<PathBuf> = scan
+                .deleted_files
+                .iter()
+                .chain(scan.changed_files.iter())
+                .chain(scan.new_files.iter())
+                .cloned()
+                .collect();
+            let mut dependents: Vec<PathBuf> = graph
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.kind == EdgeKind::References
+                        && e.source == crate::graph::ExtractionSource::Markdown
+                        && e.to.root == primary_slug
+                        && e.from.root == primary_slug
+                        && touched.contains(&e.to.file)
+                        && e.evidence
+                            .first()
+                            .is_some_and(|ev| ev.rule_id == "frontmatter-candidate@1")
+                })
+                .map(|e| e.from.file.clone())
+                .filter(|f| !touched.contains(f))
+                .collect();
+            dependents.sort();
+            dependents.dedup();
+            if !dependents.is_empty() {
+                tracing::info!(
+                    "Incremental update: re-extracting {} artifact(s) bound to changed files",
+                    dependents.len()
+                );
+                scan.changed_files.extend(dependents);
+            }
+        }
+
         // Remove nodes/edges for deleted + changed files.
         // HashSet for O(1) lookup instead of O(F) Vec scan per edge (#586).
         let mut files_to_remove: std::collections::HashSet<(String, PathBuf)> = scan

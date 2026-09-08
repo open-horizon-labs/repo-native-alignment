@@ -109,6 +109,19 @@ check "notes: bound guardrail surfaces in detailed search --nodes output (#897)"
   "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --limit 1 2>/dev/null" "\[guardrail\] computed-but-not-delivered"
 check "notes: compact marker present for the same symbol (#897)" \
   "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --compact --limit 1 2>/dev/null" "notes:1"
+# Regression: editing the bound file must not drop its notes on the next
+# incremental scan (the artifact is re-extracted and re-bound, #897).
+if git -C "$RNA_REPO" diff --quiet -- src/server/helpers.rs 2>/dev/null; then
+  printf '\n// notes-incremental-probe\n' >> "$RNA_REPO/src/server/helpers.rs"
+  repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+  git -C "$RNA_REPO" checkout -q -- src/server/helpers.rs
+  check "notes: survive an incremental scan after the bound file changes (#897)" \
+    "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/server/helpers.rs:format_node_entry_with_root:function' --limit 1 2>/dev/null" "Notes:"
+  repo-native-alignment scan --repo "$RNA_REPO" --extract-only --no-embed --no-lsp >/dev/null 2>&1
+else
+  echo "SKIP: notes incremental regression (src/server/helpers.rs has local modifications)"
+  SKIP=$((SKIP+1))
+fi
 
 # ── CO-CHANGE MINING (#884) ──────────────────────────────────────────────────
 echo "" && echo "--- Co-change mining (#884) ---"
