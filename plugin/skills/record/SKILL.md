@@ -72,6 +72,28 @@ Load the outcome-family reference before creating or updating one.
 Require a canonical parent outcome for objectives and capabilities.
 Copy supplied S&T lineage exactly; candidate tactics are not selected work.
 
+### Binding a metis/signal/guardrail to a code symbol
+
+When the artifact genuinely governs one specific function/struct/etc. (not just the outcome/file it lives in), add an `rna` block so the note surfaces on that symbol at `search`/`repo_map` retrieval time instead of staying undiscoverable in `.oh/`:
+
+```markdown
+---
+id: <slug>
+...
+rna:
+  kind: guardrail   # or metis / signal — same kind as the frontmatter `id` above
+  id: <slug>
+  relationships:
+    - kind: references
+      target:
+        kind: function   # or struct, trait, enum, module, const, impl, ...
+        name: <symbol_name>
+        file: <path/to/file.rs>
+---
+```
+
+Only do this when a real symbol is the subject — don't invent a binding to satisfy the template. See [docs/extractors.md § Binding a note to a code symbol](../../../docs/extractors.md#binding-a-note-to-a-code-symbol) for resolution rules (owner-qualified leaf matching, ambiguous/missing-symbol diagnostics).
+
 ## Process
 
 1. Parse `$ARGUMENTS` to determine type and slug.

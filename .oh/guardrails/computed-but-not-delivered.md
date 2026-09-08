@@ -3,6 +3,15 @@ id: computed-but-not-delivered
 outcome: context-assembly
 severity: hard
 statement: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. Computing a value is not delivering it.
+rna:
+  kind: guardrail
+  id: computed-but-not-delivered
+  relationships:
+    - kind: references
+      target:
+        kind: function
+        name: format_node_entry_with_root
+        file: src/server/helpers.rs
 ---
 
 ## The Pattern

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
-use crate::server::helpers::format_freshness_full;
+use crate::server::helpers::{collect_artifact_notes, format_freshness_full};
 use crate::server::state::{EmbeddingStatus, LspEnrichmentStatus};
 
 use super::node_passes_root_filter;
@@ -156,6 +156,13 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                     );
                     if let Some(cc) = n.metadata.get("cyclomatic") {
                         line.push_str(&format!(", complexity: {}", cc));
+                    }
+                    let notes_index_map = graph_state.node_index_map();
+                    let notes = collect_artifact_notes(&n.stable_id(), &graph_state.index, |id| {
+                        graph_state.node_by_stable_id(id, notes_index_map)
+                    });
+                    if !notes.is_empty() {
+                        line.push_str(&format!(" notes:{}", notes.len()));
                     }
                     line
                 })

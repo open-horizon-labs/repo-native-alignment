@@ -21,7 +21,7 @@ use crate::graph::{Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
-    EdgeEvidenceIndex, format_capability_readiness, format_freshness_full,
+    EdgeEvidenceIndex, collect_artifact_notes, format_capability_readiness, format_freshness_full,
     format_indexed_edge_evidence_for_groups, format_neighbors_grouped_with_root,
     format_node_entry_with_root, strip_root_prefix,
 };
@@ -9476,9 +9476,13 @@ async fn search_flat(
 
     if !matches.is_empty() {
         let strip = ctx.root_filter.as_deref();
+        let notes_index_map = graph_state.node_index_map();
         let md: String = matches
             .iter()
             .map(|n| {
+                let notes = collect_artifact_notes(&n.stable_id(), &graph_state.index, |id| {
+                    graph_state.node_by_stable_id(id, notes_index_map)
+                });
                 format_node_entry_with_root(
                     n,
                     &graph_state.index,
@@ -9486,6 +9490,7 @@ async fn search_flat(
                     strip,
                     false,
                     false,
+                    &notes,
                 )
             })
             .collect::<Vec<_>>()
@@ -11342,6 +11347,9 @@ fn search_batch(
         let md: String = found
             .iter()
             .map(|n| {
+                let notes = collect_artifact_notes(&n.stable_id(), &gs.index, |id| {
+                    gs.node_by_stable_id(id, node_index_map)
+                });
                 format_node_entry_with_root(
                     n,
                     &gs.index,
@@ -11349,6 +11357,7 @@ fn search_batch(
                     strip,
                     params.include_body,
                     params.minify_body,
+                    &notes,
                 )
             })
             .collect::<Vec<_>>()
@@ -14869,6 +14878,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    &[],
                 )
             })
             .collect::<Vec<_>>()

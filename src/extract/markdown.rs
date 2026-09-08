@@ -1090,6 +1090,147 @@ pub fn adr_backreference_pass(all_nodes: &[Node]) -> Vec<Edge> {
     edges
 }
 
+/// Resolve `rna:` frontmatter relationships whose target names a code symbol
+/// (`kind: function`, `name: commit_state`, `file: src/scanner.rs`) against the
+/// real graph node, and reflect the outcome as staleness diagnostics on the
+/// local-knowledge node.
+///
+/// `emit_local_knowledge_graph` (per-file, no cross-file graph visibility) always
+/// emits a placeholder `References` edge whose `to` is a synthetic
+/// `NodeKind::Other(target.kind)` node -- it never matches a real code node's
+/// `NodeKind` (`Function`, `Struct`, ...), so the edge is permanently dangling
+/// for code-symbol targets. This pass runs after all files are extracted (same
+/// stage as `adr_validation_pass`/`markdown_anchor_pass`), when the full node
+/// set is visible, and rewrites those specific placeholder edges in place:
+///
+/// - **Exactly one code node matches** (by root + file + kind + name): the
+///   edge's `to` is rewritten to the real node's `NodeId` and promoted to
+///   `Confidence::Confirmed`. `format_node_entry_with_root` can then join on
+///   it as an incoming `References` edge at render time.
+/// - **Owner-qualified names** (`Owner.method`, `Type::variant` -- graph
+///   identities are owner-qualified since #859): if the exact name doesn't
+///   match, retry against the lexical leaf (`doc_drift::leaf_identifier`,
+///   shared rather than reimplemented) of each candidate's name. This is only
+///   applied when unambiguous within the file.
+/// - **Zero or multiple matches**: no edge is rewritten (`content.*`
+///   convention -- the placeholder stays dangling, which already fails a
+///   real-node join). The local-knowledge node instead gets
+///   `validation_status: unresolved` / `diagnostic_code:
+///   content.unresolved_relationship`, mirroring `markdown_anchor_pass`'s
+///   `content.unresolved_anchor` convention for dead Markdown anchors.
+///
+/// Only edges produced by the code-symbol-candidate path
+/// (`evidence[0].rule_id == "frontmatter-candidate@1"`) are touched; the
+/// separate `uri`-based Open Horizons cloud-identity candidate path
+/// (`frontmatter-oh-reference-candidate@1`) and unrelated `Markdown`-sourced
+/// edges (ADR validation, anchors) are left untouched.
+pub fn local_knowledge_symbol_binding_pass(all_nodes: &mut [Node], all_edges: &mut [Edge]) {
+    // (root, file, kind-as-string) -> candidate code NodeIds defined there.
+    // Keyed by kind so `kind: function` never accidentally matches a `struct`
+    // of the same name in the same file.
+    let mut code_index: HashMap<(String, PathBuf, String), Vec<NodeId>> = HashMap::new();
+    for node in all_nodes.iter() {
+        if !crate::doc_drift::is_code_symbol_kind(&node.id.kind) {
+            continue;
+        }
+        code_index
+            .entry((
+                node.id.root.clone(),
+                node.id.file.clone(),
+                node.id.kind.to_string(),
+            ))
+            .or_default()
+            .push(node.id.clone());
+    }
+
+    // node_id (local-knowledge node) -> did every code-symbol relationship it
+    // declared resolve? Tracked across all its edges so a node with several
+    // relationships gets one aggregate diagnostic, same granularity as the
+    // node-level `validation_status` convention used elsewhere in this file.
+    let mut resolution: HashMap<NodeId, bool> = HashMap::new();
+
+    for edge in all_edges.iter_mut() {
+        if edge.source != ExtractionSource::Markdown || edge.kind != EdgeKind::References {
+            continue;
+        }
+        let Some(evidence) = edge.evidence.first() else {
+            continue;
+        };
+        if evidence.rule_id != "frontmatter-candidate@1" {
+            continue;
+        }
+        let NodeKind::Other(target_kind) = &edge.to.kind else {
+            continue;
+        };
+        let key = (
+            edge.to.root.clone(),
+            edge.to.file.clone(),
+            target_kind.clone(),
+        );
+        let Some(candidates) = code_index.get(&key) else {
+            // Not a code-symbol target at all (e.g. another artifact, or a
+            // code file with no symbol of this kind) -- leave the frontmatter
+            // candidate exactly as `emit_local_knowledge_graph` produced it.
+            continue;
+        };
+
+        let target_name = edge.to.name.as_str();
+        let mut matches: Vec<&NodeId> = candidates
+            .iter()
+            .filter(|id| id.name == target_name)
+            .collect();
+        if matches.is_empty() {
+            // Owner-qualified graph identity (#859): retry against the lexical
+            // leaf of each candidate so a bare `commit_state` resolves against
+            // `Scanner.commit_state` when it's the only such leaf in the file.
+            matches = candidates
+                .iter()
+                .filter(|id| crate::doc_drift::leaf_identifier(&id.name) == target_name)
+                .collect();
+        }
+
+        let entry = resolution.entry(edge.from.clone()).or_insert(true);
+        if matches.len() == 1 {
+            edge.to = matches[0].clone();
+            edge.confidence = Confidence::Confirmed;
+            if let Some(evidence) = edge.evidence.first_mut() {
+                evidence.validation_status = ValidationStatus::Valid;
+                evidence.diagnostics.clear();
+            }
+        } else {
+            // Zero matches (missing/renamed symbol) or 2+ (ambiguous): no edge.
+            *entry = false;
+        }
+    }
+
+    for node in all_nodes.iter_mut() {
+        match resolution.get(&node.id) {
+            Some(true) => {
+                node.metadata
+                    .insert("validation_status".into(), "valid".into());
+                node.metadata.remove("diagnostic_code");
+                node.metadata.remove("diagnostic_severity");
+                node.metadata.remove("diagnostic_message");
+            }
+            Some(false) => {
+                node.metadata
+                    .insert("validation_status".into(), "unresolved".into());
+                node.metadata.insert(
+                    "diagnostic_code".into(),
+                    "content.unresolved_relationship".into(),
+                );
+                node.metadata
+                    .insert("diagnostic_severity".into(), "error".into());
+                node.metadata.insert(
+                    "diagnostic_message".into(),
+                    "one or more `rna` relationships do not resolve to a unique graph node".into(),
+                );
+            }
+            None => {}
+        }
+    }
+}
+
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
 /// Preserves leading `..` segments when there is nothing left to pop (out-of-repo links).
 /// Never pops past a root directory or prefix component.
@@ -1199,6 +1340,19 @@ fn emit_local_knowledge_graph(
             format!("rna.metadata.{}", key),
             yaml_value_to_string(&value),
         );
+    }
+    // Also surface the artifact's top-level frontmatter (`id`, `title`,
+    // `statement`, ...) as `frontmatter.<key>`, the same convention
+    // `MarkdownExtractor::extract` already uses for section nodes. This is
+    // what lets a rendered note excerpt prefer a guardrail's one-line
+    // `statement` (or a metis/signal's `title`) over an arbitrarily-shaped
+    // body when one is present -- still verbatim artifact text, just a
+    // different declared field.
+    for (key, value) in extract_frontmatter(content) {
+        if key == "rna" {
+            continue;
+        }
+        metadata.insert(format!("frontmatter.{}", key), value);
     }
 
     let line_end = content.lines().count().max(1);
@@ -1720,6 +1874,237 @@ rna:
             result.edges.is_empty(),
             "a declaration whose target kind disagrees with its URI must not emit an edge"
         );
+    }
+
+    // ── local_knowledge_symbol_binding_pass tests (#897) ────────────────
+
+    fn make_code_node(root: &str, file: &str, name: &str, kind: NodeKind) -> Node {
+        Node {
+            id: NodeId {
+                root: root.to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    /// Extract a guardrail with a code-symbol `rna` relationship and stamp
+    /// every node/edge with `root`, mirroring the post-extraction root-slug
+    /// stamping every real scan performs (`TreeSitterConsumer`) before this
+    /// pass runs.
+    fn extract_guardrail_with_symbol_target(target_name: &str) -> (Vec<Node>, Vec<Edge>) {
+        let extractor = MarkdownExtractor::new();
+        let content = format!(
+            r#"---
+rna:
+  kind: guardrail
+  id: g.example
+  relationships:
+    - kind: references
+      target:
+        kind: function
+        name: {target_name}
+        file: src/scanner.rs
+---
+
+# Example guardrail
+
+Never let this drift.
+"#
+        );
+        let mut result = extractor
+            .extract(Path::new(".oh/guardrails/example.md"), &content)
+            .unwrap();
+        for node in &mut result.nodes {
+            node.id.root = "root1".into();
+        }
+        for edge in &mut result.edges {
+            edge.from.root = "root1".into();
+            edge.to.root = "root1".into();
+        }
+        (result.nodes, result.edges)
+    }
+
+    fn find_guardrail_node(nodes: &[Node]) -> &Node {
+        nodes
+            .iter()
+            .find(|n| matches!(&n.id.kind, NodeKind::Other(k) if k == "guardrail"))
+            .expect("local-knowledge guardrail node should be present")
+    }
+
+    #[test]
+    fn test_local_knowledge_symbol_binding_resolves_exact_match() {
+        let (mut all_nodes, mut all_edges) = extract_guardrail_with_symbol_target("commit_state");
+        all_nodes.push(make_code_node(
+            "root1",
+            "src/scanner.rs",
+            "commit_state",
+            NodeKind::Function,
+        ));
+
+        local_knowledge_symbol_binding_pass(&mut all_nodes, &mut all_edges);
+
+        let edge = all_edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::References && e.to.name == "commit_state")
+            .expect("edge should target the real commit_state node");
+        assert_eq!(edge.to.kind, NodeKind::Function);
+        assert_eq!(edge.to.file, PathBuf::from("src/scanner.rs"));
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+
+        let guardrail = find_guardrail_node(&all_nodes);
+        assert_eq!(
+            guardrail.metadata.get("validation_status"),
+            Some(&"valid".to_string())
+        );
+        assert!(guardrail.metadata.get("diagnostic_code").is_none());
+    }
+
+    #[test]
+    fn test_local_knowledge_symbol_binding_resolves_owner_qualified_leaf() {
+        // Graph identities are owner-qualified since #859; the frontmatter names
+        // the bare/lexical leaf.
+        let (mut all_nodes, mut all_edges) = extract_guardrail_with_symbol_target("commit_state");
+        all_nodes.push(make_code_node(
+            "root1",
+            "src/scanner.rs",
+            "Scanner.commit_state",
+            NodeKind::Function,
+        ));
+
+        local_knowledge_symbol_binding_pass(&mut all_nodes, &mut all_edges);
+
+        let edge = all_edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::References && e.to.name == "Scanner.commit_state")
+            .expect("bare frontmatter name should resolve against the owner-qualified leaf");
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+
+        let guardrail = find_guardrail_node(&all_nodes);
+        assert_eq!(
+            guardrail.metadata.get("validation_status"),
+            Some(&"valid".to_string())
+        );
+    }
+
+    #[test]
+    fn test_local_knowledge_symbol_binding_ambiguous_leaf_emits_no_edge() {
+        let (mut all_nodes, mut all_edges) = extract_guardrail_with_symbol_target("commit_state");
+        all_nodes.push(make_code_node(
+            "root1",
+            "src/scanner.rs",
+            "Scanner.commit_state",
+            NodeKind::Function,
+        ));
+        all_nodes.push(make_code_node(
+            "root1",
+            "src/scanner.rs",
+            "OtherOwner.commit_state",
+            NodeKind::Function,
+        ));
+
+        local_knowledge_symbol_binding_pass(&mut all_nodes, &mut all_edges);
+
+        assert!(
+            !all_edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.confidence == Confidence::Confirmed),
+            "an ambiguous leaf match must not confirm an edge to either candidate"
+        );
+
+        let guardrail = find_guardrail_node(&all_nodes);
+        assert_eq!(
+            guardrail.metadata.get("validation_status"),
+            Some(&"unresolved".to_string())
+        );
+        assert_eq!(
+            guardrail.metadata.get("diagnostic_code"),
+            Some(&"content.unresolved_relationship".to_string())
+        );
+    }
+
+    #[test]
+    fn test_local_knowledge_symbol_binding_missing_symbol_sets_unresolved_diagnostic() {
+        let (mut all_nodes, mut all_edges) = extract_guardrail_with_symbol_target("renamed_away");
+        // No code node named `renamed_away` (or any function) exists in
+        // `src/scanner.rs` at all -- simulates a rename/removal.
+        all_nodes.push(make_code_node(
+            "root1",
+            "src/scanner.rs",
+            "unrelated_fn",
+            NodeKind::Function,
+        ));
+
+        local_knowledge_symbol_binding_pass(&mut all_nodes, &mut all_edges);
+
+        assert!(
+            !all_edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.confidence == Confidence::Confirmed),
+            "a missing symbol must not confirm an edge"
+        );
+
+        let guardrail = find_guardrail_node(&all_nodes);
+        assert_eq!(
+            guardrail.metadata.get("validation_status"),
+            Some(&"unresolved".to_string())
+        );
+        assert_eq!(
+            guardrail.metadata.get("diagnostic_code"),
+            Some(&"content.unresolved_relationship".to_string())
+        );
+        assert_eq!(
+            guardrail.metadata.get("diagnostic_severity"),
+            Some(&"error".to_string())
+        );
+    }
+
+    #[test]
+    fn test_local_knowledge_symbol_binding_non_code_target_is_left_untouched() {
+        // A relationship targeting another artifact (not a code symbol) must
+        // not be touched by this pass -- it stays exactly as
+        // `emit_local_knowledge_graph` produced it (frontmatter candidate,
+        // `Confidence::Detected`).
+        let extractor = MarkdownExtractor::new();
+        let content = r#"---
+rna:
+  kind: guardrail
+  id: g.example
+  relationships:
+    - kind: references
+      target:
+        kind: guardrail
+        id: some-other-guardrail
+        file: .oh/guardrails/some-other-guardrail.md
+---
+
+# Example guardrail
+"#;
+        let result = extractor
+            .extract(Path::new(".oh/guardrails/example.md"), content)
+            .unwrap();
+        let mut all_nodes = result.nodes;
+        let mut all_edges = result.edges;
+        let before = all_edges.clone();
+
+        local_knowledge_symbol_binding_pass(&mut all_nodes, &mut all_edges);
+
+        assert_eq!(
+            all_edges.len(),
+            before.len(),
+            "non-code-symbol relationships must not be dropped or duplicated"
+        );
+        for edge in &all_edges {
+            assert_eq!(edge.confidence, Confidence::Detected);
+        }
     }
 
     #[tokio::test]

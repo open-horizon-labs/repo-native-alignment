@@ -80,6 +80,34 @@ downgrade it from confirmed.
 
 The target node does not need to be in the same file, but its `kind`, `id`, and `file` should match the artifact that declares it so traversal/search can join the graph after all files are scanned. A declared `file` is repo-root-relative; RNA normalizes `.` and `..` components and ignores absolute paths or paths that escape the repository. Relationship labels are true edge kinds after reload; do not collapse support/verification/review semantics into `References`, `DependsOn`, or metadata.
 
+### Binding a note to a code symbol
+
+`.oh/metis`, `.oh/guardrails`, `.oh/signals`, and `.oh/outcomes` can use the same `rna` frontmatter to bind a human-written note directly to the code symbol it governs. The relationship `target.kind` names the graph `NodeKind` (`function`, `struct`, `trait`, `enum`, `type_alias`, `module`, `const`, `impl`, `macro`, `field`, `enum_variant`, `proto_message`, `sql_table`, `api_endpoint`), `target.name` the symbol's name, and `target.file` its repo-root-relative path:
+
+```markdown
+---
+rna:
+  kind: guardrail
+  id: computed-but-not-delivered
+  name: Render what you compute
+  relationships:
+    - kind: references
+      target:
+        kind: function
+        name: format_node_entry_with_root
+        file: src/server/helpers.rs
+---
+
+# Computed but not delivered
+
+If a value is computed, it must reach the surface the agent reads -- a
+metric that's tracked internally but never rendered is worse than not
+computing it at all, because it creates the appearance of coverage.
+```
+
+Since #859 graph identities are owner-qualified (`Owner.method`, `Type::variant`); `target.name` may be given as the bare/lexical leaf (`commit_state` rather than `Scanner.commit_state`) and resolves when it is unambiguous among the candidates of that `kind` in that `file`. Binding resolution happens once all files are scanned, alongside ADR validation: if `target` matches exactly one graph node, the `References` edge is confirmed and the symbol surfaces the note (a `notes:N` marker in compact results, a `Notes:` block in detailed results and `search --node`, and the same marker in `repo_map`'s top-symbols list) at retrieval time. If it matches zero nodes (renamed/removed) or more than one (ambiguous), no edge is confirmed and the artifact node instead gets `validation_status: unresolved` with `diagnostic_code: content.unresolved_relationship`, the same staleness convention `markdown_anchor_pass` uses for dead Markdown anchors.
+
+This is retrieval only -- RNA never generates, summarizes, or promotes note text; the rendered excerpt is always verbatim from the artifact body.
 
 ---
 
