@@ -45,11 +45,12 @@
 //! per-file totals purely to support incremental accumulation.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use git2::Repository;
+use git2::{Delta, Diff, DiffFindOptions, DiffOptions, Repository};
 
 use crate::graph::{CoChangeStats, CoChangeStatsMap, Confidence, Edge, EdgeKind, ExtractionSource};
 use crate::scanner::CoChangeConfig;
@@ -412,6 +413,259 @@ pub fn resolve_changed_file_set(repo_root: &Path, scope: &str) -> Result<HashSet
     .context("Failed to iterate diff deltas")?;
 
     Ok(paths)
+}
+
+/// Kind of change for a file entry in a `mode="change"` bundle (#899).
+///
+/// Mirrors `server::changed_file_plan::ChangedFileKind` conceptually, but is
+/// defined here rather than imported: that type lives in a `server`-private
+/// module built around a much larger LSP-scheduling data model, the same
+/// reason `resolve_changed_file_set` above is "a small, deliberately
+/// parallel implementation rather than a forced shared helper" instead of
+/// reusing `discover_git_worktree_changes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeFileKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Untracked,
+}
+
+impl fmt::Display for ChangeFileKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ChangeFileKind::Added => "added",
+            ChangeFileKind::Modified => "modified",
+            ChangeFileKind::Deleted => "deleted",
+            ChangeFileKind::Renamed => "renamed",
+            ChangeFileKind::Copied => "copied",
+            ChangeFileKind::TypeChanged => "type-changed",
+            ChangeFileKind::Untracked => "untracked",
+        };
+        write!(f, "{s}")
+    }
+}
+
+fn change_file_kind(delta: Delta) -> Option<ChangeFileKind> {
+    match delta {
+        Delta::Added => Some(ChangeFileKind::Added),
+        Delta::Modified => Some(ChangeFileKind::Modified),
+        Delta::Deleted => Some(ChangeFileKind::Deleted),
+        Delta::Renamed => Some(ChangeFileKind::Renamed),
+        Delta::Copied => Some(ChangeFileKind::Copied),
+        Delta::Typechange => Some(ChangeFileKind::TypeChanged),
+        Delta::Untracked => Some(ChangeFileKind::Untracked),
+        Delta::Conflicted | Delta::Unreadable => Some(ChangeFileKind::Modified),
+        Delta::Unmodified | Delta::Ignored => None,
+    }
+}
+
+/// One changed file in a `mode="change"` bundle: its kind, old/new paths
+/// (renames carry both), and the new-side line ranges touched by
+/// added/modified hunks.
+///
+/// `hunks` ranges are computed with zero context lines (see
+/// [`resolve_changed_file_entries`]), so a range is exactly the lines git
+/// considers changed on the new side -- not the +/-3 lines of surrounding
+/// context a normal unified diff would include. This is what makes
+/// hunk-intersection precise: without zero context, editing one line in a
+/// large function would make the hunk range bleed into whichever unrelated
+/// symbols happen to sit within 3 lines of it.
+#[derive(Debug, Clone)]
+pub struct ChangedFileEntry {
+    pub kind: ChangeFileKind,
+    pub old_path: Option<PathBuf>,
+    pub new_path: Option<PathBuf>,
+    /// New-side line ranges (1-based, inclusive) touched by added/modified
+    /// hunks.
+    pub hunks: Vec<(usize, usize)>,
+}
+
+impl ChangedFileEntry {
+    /// The path to key node/graph lookups on: `new_path` when present
+    /// (added/modified/renamed/copied/typechanged/untracked), else
+    /// `old_path` (deleted files have no new-side path).
+    pub fn path(&self) -> &Path {
+        self.new_path
+            .as_deref()
+            .or(self.old_path.as_deref())
+            .expect("changed file entry has neither old_path nor new_path")
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.kind, ChangeFileKind::Deleted)
+    }
+
+    /// Whether every symbol in this file counts as changed -- true for newly
+    /// created files (added/untracked), where there is no "old" version to
+    /// diff hunks against.
+    pub fn all_symbols_changed(&self) -> bool {
+        matches!(self.kind, ChangeFileKind::Added | ChangeFileKind::Untracked)
+    }
+
+    /// Whether a node spanning `[line_start, line_end]` (1-based, inclusive)
+    /// intersects any added/modified hunk in this file.
+    pub fn touches_span(&self, line_start: usize, line_end: usize) -> bool {
+        self.hunks
+            .iter()
+            .any(|(hunk_start, hunk_end)| *hunk_start <= line_end && line_start <= *hunk_end)
+    }
+}
+
+/// Build the git2 diff for a `mode="change"` scope (#899): `"working_tree"`
+/// (HEAD vs. working directory + index), `"staged"` (HEAD vs. index), or
+/// `"<base>..<head>"` (explicit two-ref diff). Three-dot ranges are
+/// rejected, matching [`resolve_changed_file_set`]'s message.
+///
+/// Zero context lines: hunk ranges from this diff are exactly the
+/// added/modified new-side lines, not lines +/- surrounding context.
+fn open_change_scope_diff<'repo>(repo: &'repo Repository, scope: &str) -> Result<Diff<'repo>> {
+    if scope.contains("...") {
+        anyhow::bail!(
+            "change: three-dot symmetric-difference ranges ('{scope}') are not supported -- \
+             use a two-dot range ('<base>..<head>'), 'staged', or 'working_tree'."
+        );
+    }
+
+    let mut opts = DiffOptions::new();
+    opts.context_lines(0).include_typechange(true);
+
+    let diff = if let Some((base, head)) = scope.split_once("..") {
+        let base_obj = repo
+            .revparse_single(base)
+            .with_context(|| format!("Failed to resolve base ref '{base}'"))?;
+        let head_obj = repo
+            .revparse_single(head)
+            .with_context(|| format!("Failed to resolve head ref '{head}'"))?;
+        let base_tree = base_obj
+            .peel_to_tree()
+            .context("base ref is not a tree-ish")?;
+        let head_tree = head_obj
+            .peel_to_tree()
+            .context("head ref is not a tree-ish")?;
+        repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))
+            .context("Failed to diff base..head trees")?
+    } else {
+        let head_tree = repo
+            .head()
+            .context("Failed to resolve HEAD")?
+            .peel_to_tree()
+            .context("Failed to peel HEAD to tree")?;
+        match scope {
+            "staged" => repo
+                .diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
+                .context("Failed to diff HEAD tree to index")?,
+            "working_tree" => {
+                opts.include_untracked(true).recurse_untracked_dirs(true);
+                repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))
+                    .context("Failed to diff HEAD tree to working directory")?
+            }
+            other => anyhow::bail!(
+                "change: unknown scope '{other}' -- use 'working_tree', 'staged', or '<base>..<head>'."
+            ),
+        }
+    };
+    Ok(diff)
+}
+
+/// Resolve a scope (see [`open_change_scope_diff`]) into per-file change
+/// entries with kind, old/new paths, and hunk-level new-side line ranges
+/// (#899). This is the hunk-intersection piece nothing else in the codebase
+/// computes: `grep -rn "hunk|changed_lines" src` before this change was
+/// empty -- every existing consumer (`resolve_changed_file_set`,
+/// `changed_file_plan.rs`) works at file granularity.
+pub fn resolve_changed_file_entries(
+    repo_root: &Path,
+    scope: &str,
+) -> Result<Vec<ChangedFileEntry>> {
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
+    let mut diff = open_change_scope_diff(&repo, scope)?;
+
+    let mut find_opts = DiffFindOptions::new();
+    // `for_untracked` matters for `scope="working_tree"`: a rename that has
+    // not been `git add`-ed shows up as a `Deleted` delta (old path) plus an
+    // `Untracked` delta (new path) rather than one `Renamed` delta unless
+    // untracked files are included in similarity detection.
+    find_opts.renames(true).copies(true).for_untracked(true);
+    diff.find_similar(Some(&mut find_opts))
+        .context("Failed to detect renamed/copied files")?;
+
+    let mut entries: Vec<ChangedFileEntry> = Vec::new();
+    // Both maps point at the same `entries` index; a delta is keyed by its
+    // new path when one exists (added/modified/renamed/copied/typechanged/
+    // untracked), falling back to the old path only for deletions.
+    let mut index_by_new_path: HashMap<PathBuf, usize> = HashMap::new();
+    let mut index_by_old_path: HashMap<PathBuf, usize> = HashMap::new();
+
+    for delta in diff.deltas() {
+        let Some(kind) = change_file_kind(delta.status()) else {
+            continue;
+        };
+        let old_path = delta.old_file().path().map(|p| p.to_path_buf());
+        let new_path = delta.new_file().path().map(|p| p.to_path_buf());
+        if old_path.is_none() && new_path.is_none() {
+            continue;
+        }
+        let idx = entries.len();
+        if let Some(np) = &new_path {
+            index_by_new_path.insert(np.clone(), idx);
+        }
+        if let Some(op) = &old_path {
+            index_by_old_path.insert(op.clone(), idx);
+        }
+        entries.push(ChangedFileEntry {
+            kind,
+            old_path,
+            new_path,
+            hunks: Vec::new(),
+        });
+    }
+
+    diff.foreach(
+        &mut |_delta, _progress| true,
+        None,
+        Some(&mut |delta, hunk| {
+            let path = delta.new_file().path().or_else(|| delta.old_file().path());
+            let Some(path) = path else {
+                return true;
+            };
+            let key = path.to_path_buf();
+            let idx = index_by_new_path
+                .get(&key)
+                .or_else(|| index_by_old_path.get(&key));
+            if let Some(&idx) = idx {
+                // A deleted file has no new side at all -- new-side line
+                // numbers from its hunks are meaningless, and callers never
+                // consult `hunks` for a deleted entry (they list its graphed
+                // symbols directly, flagged, via `is_deleted()`).
+                if entries[idx].kind != ChangeFileKind::Deleted {
+                    let start = hunk.new_start() as usize;
+                    let lines = hunk.new_lines() as usize;
+                    if lines > 0 {
+                        entries[idx].hunks.push((start, start + lines - 1));
+                    } else {
+                        // Pure-deletion hunk within an otherwise-present file:
+                        // `new_lines() == 0`, `new_start()` is the new-side
+                        // line the deletion sits after (0 if at the very start
+                        // of the file). Anchor on that boundary line so a
+                        // symbol immediately adjacent to a deletion still
+                        // counts as touched, rather than silently dropping
+                        // deletions from hunk-intersection entirely.
+                        let anchor = start.max(1);
+                        entries[idx].hunks.push((anchor, anchor));
+                    }
+                }
+            }
+            true
+        }),
+        None,
+    )
+    .context("Failed to iterate diff hunks")?;
+
+    Ok(entries)
 }
 
 /// Result of [`mine_and_build`]: file anchor nodes, `CoChanges` edges, the
@@ -808,5 +1062,244 @@ mod tests {
             .find(|n| n.id.file == PathBuf::from("b.rs"))
             .expect("b.rs anchor present");
         assert!(b_node.metadata.get("churn").is_none());
+    }
+
+    // ── mode="change" hunk-intersection tests (#899) ────────────────────────
+
+    #[test]
+    fn touches_span_symbol_fully_inside_hunk() {
+        let entry = ChangedFileEntry {
+            kind: ChangeFileKind::Modified,
+            old_path: Some(PathBuf::from("a.rs")),
+            new_path: Some(PathBuf::from("a.rs")),
+            hunks: vec![(10, 30)],
+        };
+        assert!(
+            entry.touches_span(15, 20),
+            "symbol fully inside hunk must touch"
+        );
+    }
+
+    #[test]
+    fn touches_span_symbol_straddles_hunk_boundary() {
+        let entry = ChangedFileEntry {
+            kind: ChangeFileKind::Modified,
+            old_path: Some(PathBuf::from("a.rs")),
+            new_path: Some(PathBuf::from("a.rs")),
+            hunks: vec![(10, 30)],
+        };
+        // Symbol starts before the hunk and ends inside it.
+        assert!(entry.touches_span(5, 12), "straddling symbol must touch");
+        // Symbol starts inside the hunk and ends after it.
+        assert!(entry.touches_span(25, 40), "straddling symbol must touch");
+    }
+
+    #[test]
+    fn touches_span_adjacent_symbol_does_not_touch() {
+        let entry = ChangedFileEntry {
+            kind: ChangeFileKind::Modified,
+            old_path: Some(PathBuf::from("a.rs")),
+            new_path: Some(PathBuf::from("a.rs")),
+            hunks: vec![(10, 30)],
+        };
+        // Immediately before, no overlap.
+        assert!(
+            !entry.touches_span(1, 9),
+            "adjacent symbol before hunk must not touch"
+        );
+        // Immediately after, no overlap.
+        assert!(
+            !entry.touches_span(31, 40),
+            "adjacent symbol after hunk must not touch"
+        );
+    }
+
+    #[test]
+    fn all_symbols_changed_true_for_added_and_untracked() {
+        let added = ChangedFileEntry {
+            kind: ChangeFileKind::Added,
+            old_path: None,
+            new_path: Some(PathBuf::from("new.rs")),
+            hunks: vec![],
+        };
+        let untracked = ChangedFileEntry {
+            kind: ChangeFileKind::Untracked,
+            old_path: None,
+            new_path: Some(PathBuf::from("scratch.rs")),
+            hunks: vec![],
+        };
+        let modified = ChangedFileEntry {
+            kind: ChangeFileKind::Modified,
+            old_path: Some(PathBuf::from("a.rs")),
+            new_path: Some(PathBuf::from("a.rs")),
+            hunks: vec![],
+        };
+        assert!(added.all_symbols_changed());
+        assert!(untracked.all_symbols_changed());
+        assert!(!modified.all_symbols_changed());
+    }
+
+    #[test]
+    fn deleted_entry_path_falls_back_to_old_path() {
+        let entry = ChangedFileEntry {
+            kind: ChangeFileKind::Deleted,
+            old_path: Some(PathBuf::from("gone.rs")),
+            new_path: None,
+            hunks: vec![],
+        };
+        assert!(entry.is_deleted());
+        assert_eq!(entry.path(), Path::new("gone.rs"));
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_rejects_three_dot_scope() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        commit_files(&repo, dir, &[("a.rs", "1")], "initial");
+        let err = resolve_changed_file_entries(dir, "main...HEAD").unwrap_err();
+        assert!(
+            err.to_string().contains("three-dot"),
+            "expected three-dot rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_added_file_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        commit_files(&repo, dir, &[("a.rs", "1\n2\n3\n")], "initial");
+        fs::write(dir.join("b.rs"), "fn new_fn() {}\n").unwrap();
+
+        let entries = resolve_changed_file_entries(dir, "working_tree").unwrap();
+        let added = entries
+            .iter()
+            .find(|e| e.new_path.as_deref() == Some(Path::new("b.rs")))
+            .expect("b.rs entry present");
+        assert!(
+            added.all_symbols_changed(),
+            "new file: kind={:?}",
+            added.kind
+        );
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_deleted_file_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        commit_files(
+            &repo,
+            dir,
+            &[("a.rs", "1"), ("b.rs", "1\n2\n3\n")],
+            "initial",
+        );
+        fs::remove_file(dir.join("b.rs")).unwrap();
+
+        let entries = resolve_changed_file_entries(dir, "working_tree").unwrap();
+        let deleted = entries
+            .iter()
+            .find(|e| e.old_path.as_deref() == Some(Path::new("b.rs")))
+            .expect("b.rs entry present");
+        assert!(deleted.is_deleted());
+        assert!(deleted.hunks.is_empty());
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_modified_hunk_intersects_touched_line_only() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        let original = "line1\nline2\nline3\nline4\nline5\n";
+        commit_files(&repo, dir, &[("a.rs", original)], "initial");
+        let modified = "line1\nline2\nCHANGED\nline4\nline5\n";
+        fs::write(dir.join("a.rs"), modified).unwrap();
+
+        let entries = resolve_changed_file_entries(dir, "working_tree").unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.new_path.as_deref() == Some(Path::new("a.rs")))
+            .expect("a.rs entry present");
+        assert_eq!(entry.kind, ChangeFileKind::Modified);
+        // Zero-context diff: the only touched new-side line is line 3.
+        assert!(
+            entry.touches_span(3, 3),
+            "line 3 must be touched, hunks={:?}",
+            entry.hunks
+        );
+        assert!(
+            !entry.touches_span(1, 2),
+            "line 1-2 must not be touched, hunks={:?}",
+            entry.hunks
+        );
+        assert!(
+            !entry.touches_span(4, 5),
+            "line 4-5 must not be touched, hunks={:?}",
+            entry.hunks
+        );
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_detects_rename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        // A large-enough body for git's default rename similarity threshold
+        // (50%) to pair an unmodified rename.
+        let body: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        commit_files(&repo, dir, &[("old_name.rs", &body)], "initial");
+        fs::remove_file(dir.join("old_name.rs")).unwrap();
+        fs::write(dir.join("new_name.rs"), &body).unwrap();
+
+        let entries = resolve_changed_file_entries(dir, "working_tree").unwrap();
+        let renamed = entries
+            .iter()
+            .find(|e| e.new_path.as_deref() == Some(Path::new("new_name.rs")));
+        match renamed {
+            Some(e) => {
+                assert_eq!(e.kind, ChangeFileKind::Renamed);
+                assert_eq!(e.old_path.as_deref(), Some(Path::new("old_name.rs")));
+            }
+            None => panic!("expected a renamed entry for new_name.rs, got: {entries:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_staged_scope() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        commit_files(&repo, dir, &[("a.rs", "1\n2\n")], "initial");
+        fs::write(dir.join("a.rs"), "1\nCHANGED\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+
+        let entries = resolve_changed_file_entries(dir, "staged").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, ChangeFileKind::Modified);
+    }
+
+    #[test]
+    fn resolve_changed_file_entries_base_head_scope() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let repo = init_repo(dir);
+        let first = commit_files(&repo, dir, &[("a.rs", "1")], "first");
+        commit_files(&repo, dir, &[("b.rs", "1")], "second");
+
+        let scope = format!("{first}..HEAD");
+        let entries = resolve_changed_file_entries(dir, &scope).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.new_path.as_deref() == Some(Path::new("b.rs")))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.new_path.as_deref() == Some(Path::new("a.rs")))
+        );
     }
 }

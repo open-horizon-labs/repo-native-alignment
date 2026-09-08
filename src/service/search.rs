@@ -62,6 +62,12 @@ use task_context::{
 
 /// When impact results exceed this node-count threshold, render a
 /// subsystem-grouped summary instead of listing every node.
+/// Max artifact notes shown per changed symbol in `mode="change"`'s risk
+/// section (#899) -- mirrors `MAX_NOTES_SHOWN` in `server::helpers`, kept
+/// separate since this renders per-symbol across potentially many symbols
+/// rather than once per retrieved node.
+const MAX_RISK_NOTES_SHOWN: usize = 3;
+
 const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 
 /// Even when the node count is below the node threshold, if the rendered output
@@ -10226,6 +10232,102 @@ async fn flat_code_symbol_search_with_diagnostics<'a>(
     }
 }
 
+/// Co-change gap lines for a resolved changed-file set: confident co-change
+/// partners of each changed file that are *not* present in the change.
+/// Shared by `mode="cochange_gaps"` and `mode="change"` (#899) so co-change
+/// misses are computed in exactly one place.
+fn cochange_gap_lines(
+    gs: &GraphState,
+    changed_files: &HashSet<PathBuf>,
+    min_confidence: f64,
+    top_k: usize,
+    strip: Option<&str>,
+) -> Vec<String> {
+    let index_map = gs.node_index_map();
+    let root_slugs = crate::server::state::GraphState::root_slugs_from_index_map(index_map);
+    let mut gap_lines: Vec<String> = Vec::new();
+    for file in changed_files {
+        let mut best_partners: Vec<(PathBuf, u32, f64)> = Vec::new();
+        for root in &root_slugs {
+            let anchor_id = crate::git::cochange::file_anchor_node_id(root, file);
+            let anchor_stable = anchor_id.to_stable_id();
+            if gs.index.get_node(&anchor_stable).is_none() {
+                continue;
+            }
+            for direction in [petgraph::Direction::Outgoing, petgraph::Direction::Incoming] {
+                for neighbor_stable in
+                    gs.index
+                        .neighbors(&anchor_stable, Some(&[EdgeKind::CoChanges]), direction)
+                {
+                    let Some(neighbor_node) = gs.node_by_stable_id(&neighbor_stable, index_map)
+                    else {
+                        continue;
+                    };
+                    if changed_files.contains(&neighbor_node.id.file) {
+                        continue; // already part of this change -- not a gap
+                    }
+                    let (from, to) = match direction {
+                        petgraph::Direction::Outgoing => {
+                            (anchor_id.clone(), neighbor_node.id.clone())
+                        }
+                        petgraph::Direction::Incoming => {
+                            (neighbor_node.id.clone(), anchor_id.clone())
+                        }
+                    };
+                    let edge = Edge {
+                        from,
+                        to,
+                        kind: EdgeKind::CoChanges,
+                        source: ExtractionSource::Git,
+                        confidence: crate::graph::Confidence::Detected,
+                        evidence: Vec::new(),
+                    };
+                    if let Some(stats) = gs.cochange_stats.get(&edge.stable_id())
+                        && stats.confidence >= min_confidence
+                    {
+                        best_partners.push((
+                            neighbor_node.id.file.clone(),
+                            stats.support,
+                            stats.confidence,
+                        ));
+                    }
+                }
+            }
+        }
+        if best_partners.is_empty() {
+            continue;
+        }
+        // Collapse repeated partner paths first, keeping the strongest
+        // stats. Every root scanned above creates one edge per unordered
+        // pair, so the same displayed path can be contributed by more
+        // than one root with different stats; `root_filter` only affects
+        // rendering, not this scan, so a plain dedup after a score sort
+        // can leave duplicates apart (#890 review). Sort by path so
+        // duplicates are adjacent, dedup, then apply the support-first
+        // ranking used by mode="cochange" -- see the comment there.
+        best_partners.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        best_partners.dedup_by(|a, b| a.0 == b.0);
+        best_partners.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for (partner_file, support, confidence) in best_partners.iter().take(top_k) {
+            gap_lines.push(format!(
+                "- `{}` usually changes with `{}` (support={}, confidence={:.2}), but is not in this change.",
+                strip_root_prefix(&file.display().to_string(), strip),
+                strip_root_prefix(&partner_file.display().to_string(), strip),
+                support,
+                confidence
+            ));
+        }
+    }
+    gap_lines
+}
+
 async fn search_traversal(
     params: &SearchParams,
     query: Option<&str>,
@@ -10515,88 +10617,7 @@ async fn search_traversal(
             return format!("cochange_gaps: no changed files found for scope `{scope}`.");
         }
 
-        let index_map = gs.node_index_map();
-        let root_slugs = crate::server::state::GraphState::root_slugs_from_index_map(index_map);
-        let mut gap_lines: Vec<String> = Vec::new();
-        for file in &changed_files {
-            let mut best_partners: Vec<(PathBuf, u32, f64)> = Vec::new();
-            for root in &root_slugs {
-                let anchor_id = crate::git::cochange::file_anchor_node_id(root, file);
-                let anchor_stable = anchor_id.to_stable_id();
-                if gs.index.get_node(&anchor_stable).is_none() {
-                    continue;
-                }
-                for direction in [petgraph::Direction::Outgoing, petgraph::Direction::Incoming] {
-                    for neighbor_stable in
-                        gs.index
-                            .neighbors(&anchor_stable, Some(&[EdgeKind::CoChanges]), direction)
-                    {
-                        let Some(neighbor_node) = gs.node_by_stable_id(&neighbor_stable, index_map)
-                        else {
-                            continue;
-                        };
-                        if changed_files.contains(&neighbor_node.id.file) {
-                            continue; // already part of this change -- not a gap
-                        }
-                        let (from, to) = match direction {
-                            petgraph::Direction::Outgoing => {
-                                (anchor_id.clone(), neighbor_node.id.clone())
-                            }
-                            petgraph::Direction::Incoming => {
-                                (neighbor_node.id.clone(), anchor_id.clone())
-                            }
-                        };
-                        let edge = Edge {
-                            from,
-                            to,
-                            kind: EdgeKind::CoChanges,
-                            source: ExtractionSource::Git,
-                            confidence: crate::graph::Confidence::Detected,
-                            evidence: Vec::new(),
-                        };
-                        if let Some(stats) = gs.cochange_stats.get(&edge.stable_id())
-                            && stats.confidence >= min_confidence
-                        {
-                            best_partners.push((
-                                neighbor_node.id.file.clone(),
-                                stats.support,
-                                stats.confidence,
-                            ));
-                        }
-                    }
-                }
-            }
-            if best_partners.is_empty() {
-                continue;
-            }
-            // Collapse repeated partner paths first, keeping the strongest
-            // stats. Every root scanned above creates one edge per unordered
-            // pair, so the same displayed path can be contributed by more
-            // than one root with different stats; `root_filter` only affects
-            // rendering, not this scan, so a plain dedup after a score sort
-            // can leave duplicates apart (#890 review). Sort by path so
-            // duplicates are adjacent, dedup, then apply the support-first
-            // ranking used by mode="cochange" -- see the comment there.
-            best_partners.sort_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            });
-            best_partners.dedup_by(|a, b| a.0 == b.0);
-            best_partners.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            });
-            for (partner_file, support, confidence) in best_partners.iter().take(top_k) {
-                gap_lines.push(format!(
-                    "- `{}` usually changes with `{}` (support={}, confidence={:.2}), but is not in this change.",
-                    strip_root_prefix(&file.display().to_string(), strip),
-                    strip_root_prefix(&partner_file.display().to_string(), strip),
-                    support,
-                    confidence
-                ));
-            }
-        }
+        let gap_lines = cochange_gap_lines(gs, &changed_files, min_confidence, top_k, strip);
 
         if gap_lines.is_empty() {
             return format!(
@@ -10610,6 +10631,371 @@ async fn search_traversal(
             changed_files.len(),
             gap_lines.join("\n")
         );
+    }
+
+    // ── change mode ──────────────────────────────────────────────────────────
+    // Diff-scoped change bundle (#899): one bounded report composing changed
+    // files/symbols (hunk-intersected -- the one genuinely new computation
+    // here, via `resolve_changed_file_entries`), blast radius
+    // (`GraphIndex::impact`, labelled by Calls-coverage evidence class),
+    // tests to run (the same `tests_for` logic as that mode), co-change
+    // misses (`cochange_gap_lines`, shared with `mode="cochange_gaps"`), and
+    // risk (churn/complexity/notes/doc-drift -- all pre-existing data,
+    // joined not recomputed). Distinct from `context_mode=graph-delta-beta`,
+    // which evaluates a *proposed* diff supplied in the request rather than
+    // reading the actual repository state; see docs/search-context.md.
+    if mode == "change" {
+        let gs = ctx.graph_state;
+        let strip = ctx.root_filter.as_deref();
+        let scope = query.unwrap_or("working_tree");
+        let min_confidence = params.min_confidence.unwrap_or(0.3);
+        let hops = params.hops.unwrap_or(3).max(1) as usize;
+        let render_limit = params.limit.unwrap_or(50).clamp(1, 500);
+
+        let entries = match crate::git::cochange::resolve_changed_file_entries(ctx.repo_root, scope)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                return format!("change: could not resolve diff for scope `{scope}`: {e}");
+            }
+        };
+        if entries.is_empty() {
+            return format!(
+                "## Change bundle ({scope})\n\nNo changes in scope -- clean working tree."
+            );
+        }
+
+        let index_map = gs.node_index_map();
+        let root_slugs = crate::server::state::GraphState::root_slugs_from_index_map(index_map);
+
+        // One-pass file -> nodes index, avoiding an O(files * total_nodes)
+        // rescan of `gs.nodes` per changed file.
+        let mut nodes_by_root_file: HashMap<(String, PathBuf), Vec<&Node>> = HashMap::new();
+        for n in &gs.nodes {
+            nodes_by_root_file
+                .entry((n.id.root.clone(), n.id.file.clone()))
+                .or_default()
+                .push(n);
+        }
+
+        // ── section 1: changed files + hunk-intersected changed symbols ──────
+        let mut files_lines: Vec<String> = Vec::new();
+        let mut changed_paths: HashSet<PathBuf> = HashSet::new();
+        let mut changed_symbols: Vec<&Node> = Vec::new();
+        let mut changed_symbol_ids: HashSet<String> = HashSet::new();
+        let mut deleted_symbols: Vec<&Node> = Vec::new();
+
+        for entry in &entries {
+            let path = entry.path().to_path_buf();
+            changed_paths.insert(path.clone());
+            let display = strip_root_prefix(&path.display().to_string(), strip);
+            match (&entry.old_path, &entry.new_path) {
+                (Some(old), Some(new)) if old != new => {
+                    files_lines.push(format!(
+                        "- `{}` ({}, from `{}`)",
+                        display,
+                        entry.kind,
+                        strip_root_prefix(&old.display().to_string(), strip)
+                    ));
+                }
+                _ => files_lines.push(format!("- `{}` ({})", display, entry.kind)),
+            }
+
+            for root in &root_slugs {
+                let Some(nodes) = nodes_by_root_file.get(&(root.clone(), path.clone())) else {
+                    continue;
+                };
+                for node in nodes.iter().copied() {
+                    if entry.is_deleted() {
+                        deleted_symbols.push(node);
+                        continue;
+                    }
+                    if (entry.all_symbols_changed()
+                        || entry.touches_span(node.line_start, node.line_end))
+                        && changed_symbol_ids.insert(node.stable_id())
+                    {
+                        changed_symbols.push(node);
+                    }
+                }
+            }
+        }
+
+        let mut out = format!("## Change bundle ({scope})\n\n");
+        out.push_str(&format!(
+            "### 1. Changed files ({})\n\n{}\n\n",
+            entries.len(),
+            files_lines.join("\n")
+        ));
+        if changed_symbols.is_empty() && deleted_symbols.is_empty() {
+            out.push_str(
+                "**Changed symbols:** none -- no graph node's span intersects an added/modified hunk (binary files, whitespace/comment-only diffs, or files outside the indexed graph).\n\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "**Changed symbols** ({}):\n\n",
+                changed_symbols.len()
+            ));
+            for node in changed_symbols.iter().take(render_limit) {
+                out.push_str(&format!(
+                    "- `{}` -- {} `{}` ({}:{}-{})\n",
+                    strip_root_prefix(&node.stable_id(), strip),
+                    node.id.kind,
+                    node.id.name,
+                    node.id.file.display(),
+                    node.line_start,
+                    node.line_end
+                ));
+            }
+            if changed_symbols.len() > render_limit {
+                out.push_str(&format!(
+                    "- ... truncated, showing first {} of {} (raise `limit` to see more)\n",
+                    render_limit,
+                    changed_symbols.len()
+                ));
+            }
+            if !deleted_symbols.is_empty() {
+                out.push_str(&format!(
+                    "\n**Deleted symbols** (still in the graph as of the last scan, flagged -- not present on disk): {}\n",
+                    deleted_symbols
+                        .iter()
+                        .take(render_limit)
+                        .map(|n| format!("`{}`", strip_root_prefix(&n.stable_id(), strip)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
+        // ── section 2: blast radius ──────────────────────────────────────────
+        let calls_coverage_ready = convergence_calls_coverage_ready(ctx);
+        let evidence_label = if calls_coverage_ready {
+            "graph-evidenced (Calls coverage-ready)"
+        } else {
+            "name-based (Calls coverage not_injectable -- dependents are a structural guess, not confirmed)"
+        };
+        let impact_filter = [
+            EdgeKind::Calls,
+            EdgeKind::ReferencedBy,
+            EdgeKind::Constructs,
+        ];
+        let mut dependents_by_file: BTreeMap<String, usize> = BTreeMap::new();
+        let mut dependent_ids: HashSet<String> = HashSet::new();
+        for node in &changed_symbols {
+            for dep_id in gs
+                .index
+                .impact(&node.stable_id(), hops, Some(&impact_filter))
+            {
+                if changed_symbol_ids.contains(&dep_id) {
+                    continue; // another changed symbol, not blast radius
+                }
+                if dependent_ids.insert(dep_id.clone())
+                    && let Some(dep_node) = gs.node_by_stable_id(&dep_id, index_map)
+                {
+                    *dependents_by_file
+                        .entry(strip_root_prefix(
+                            &dep_node.id.file.display().to_string(),
+                            strip,
+                        ))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "### 2. Blast radius ({evidence_label}, within {hops} hop(s))\n\n"
+        ));
+        if dependent_ids.is_empty() {
+            out.push_str("No dependents found for the changed symbols within scope.\n\n");
+        } else {
+            out.push_str(&format!(
+                "{} dependent symbol(s) across {} file(s):\n\n",
+                dependent_ids.len(),
+                dependents_by_file.len()
+            ));
+            for (file, count) in dependents_by_file.iter().take(render_limit) {
+                out.push_str(&format!("- `{file}`: {count}\n"));
+            }
+            if dependents_by_file.len() > render_limit {
+                out.push_str(&format!(
+                    "- ... truncated, showing first {} of {} file(s)\n",
+                    render_limit,
+                    dependents_by_file.len()
+                ));
+            }
+            out.push('\n');
+        }
+
+        // ── section 3: tests to run ───────────────────────────────────────────
+        let mut test_ids: HashSet<String> = HashSet::new();
+        let mut reached_count = 0usize;
+        for node in &changed_symbols {
+            let mut reached = ranking::is_test_file(node);
+            if reached {
+                test_ids.insert(node.stable_id());
+            }
+            for caller_id in gs.index.neighbors(
+                &node.stable_id(),
+                Some(&[EdgeKind::Calls]),
+                petgraph::Direction::Incoming,
+            ) {
+                if let Some(caller_node) = gs.node_by_stable_id(&caller_id, index_map)
+                    && ranking::is_test_file(caller_node)
+                {
+                    reached = true;
+                    test_ids.insert(caller_id);
+                }
+            }
+            if reached {
+                reached_count += 1;
+            }
+        }
+        let no_test_count = changed_symbols.len().saturating_sub(reached_count);
+        out.push_str(&format!(
+            "### 3. Tests to run ({} test function(s))\n\n",
+            test_ids.len()
+        ));
+        if test_ids.is_empty() {
+            out.push_str("No test functions found calling the changed symbols.\n\n");
+        } else {
+            let mut test_lines: Vec<String> = test_ids
+                .iter()
+                .filter_map(|id| gs.node_by_stable_id(id, index_map))
+                .map(|n| format!("- `{}`", strip_root_prefix(&n.stable_id(), strip)))
+                .collect();
+            test_lines.sort();
+            for line in test_lines.iter().take(render_limit) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            if test_lines.len() > render_limit {
+                out.push_str(&format!(
+                    "- ... truncated, showing first {} of {}\n",
+                    render_limit,
+                    test_lines.len()
+                ));
+            }
+            out.push('\n');
+        }
+        if !changed_symbols.is_empty() {
+            out.push_str(&format!(
+                "**Gap:** {} of {} changed symbol(s) are reached by no test.\n\n",
+                no_test_count,
+                changed_symbols.len()
+            ));
+        }
+
+        // ── section 4: co-change misses (reuses mode="cochange_gaps") ────────
+        let gap_lines = cochange_gap_lines(gs, &changed_paths, min_confidence, 5, strip);
+        out.push_str("### 4. Co-change misses\n\n");
+        if gap_lines.is_empty() {
+            out.push_str(&format!(
+                "No confident co-change gaps found across {} changed file(s) at confidence >= {:.2}.\n\n",
+                changed_paths.len(),
+                min_confidence
+            ));
+        } else {
+            out.push_str(&gap_lines.join("\n"));
+            out.push_str("\n\n");
+        }
+
+        // ── section 5: risk on what you touched ───────────────────────────────
+        out.push_str("### 5. Risk\n\n");
+        if changed_paths.is_empty() {
+            out.push_str("No changed files to assess.\n\n");
+        } else {
+            let mut risk_lines: Vec<String> = Vec::new();
+            for path in &changed_paths {
+                let churn = root_slugs.iter().find_map(|root| {
+                    let anchor_id = crate::git::cochange::file_anchor_node_id(root, path);
+                    gs.index
+                        .get_node(&anchor_id.to_stable_id())
+                        .and_then(|_| gs.node_by_stable_id(&anchor_id.to_stable_id(), index_map))
+                        .and_then(|n| n.metadata.get("churn").cloned())
+                });
+                risk_lines.push(format!(
+                    "- `{}`: churn={}",
+                    strip_root_prefix(&path.display().to_string(), strip),
+                    churn.as_deref().unwrap_or("unknown")
+                ));
+            }
+            risk_lines.sort();
+            for line in risk_lines.iter().take(render_limit) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+
+            if changed_symbols.is_empty() {
+                out.push_str("No changed symbols to assess for complexity/notes.\n\n");
+            } else {
+                for node in changed_symbols.iter().take(render_limit) {
+                    let sid = node.stable_id();
+                    let cc = node.metadata.get("cyclomatic");
+                    let notes = collect_artifact_notes(&sid, &gs.index, |id| {
+                        gs.node_by_stable_id(id, index_map)
+                    });
+                    out.push_str(&format!(
+                        "- `{}`: complexity={}, notes={}\n",
+                        strip_root_prefix(&sid, strip),
+                        cc.map(String::as_str).unwrap_or("unknown"),
+                        notes.len()
+                    ));
+                    for note in notes.iter().take(MAX_RISK_NOTES_SHOWN) {
+                        let (kind, id) = crate::server::helpers::note_identity(note);
+                        let excerpt = crate::server::helpers::note_excerpt(note, 160);
+                        out.push_str(&format!("    - [{kind}] {id}: {excerpt}\n"));
+                    }
+                }
+                if changed_symbols.len() > render_limit {
+                    out.push_str(&format!(
+                        "- ... truncated, showing first {} of {}\n",
+                        render_limit,
+                        changed_symbols.len()
+                    ));
+                }
+                out.push('\n');
+            }
+
+            let root_paths: HashMap<String, PathBuf> =
+                source_roots(params, ctx.repo_root).into_iter().collect();
+            let drift_report = crate::doc_drift::run_doc_drift(&gs.nodes, &root_paths);
+            let touching: Vec<&crate::doc_drift::DriftFinding> = drift_report
+                .findings
+                .iter()
+                .filter(|f| {
+                    changed_paths.iter().any(|p| {
+                        let p_str = p.display().to_string();
+                        f.reference.contains(&p_str) || f.message.contains(&p_str)
+                    })
+                })
+                .collect();
+            if touching.is_empty() {
+                out.push_str("No doc-drift findings reference a changed file.\n");
+            } else {
+                out.push_str(&format!(
+                    "**Doc-drift findings touching this change** ({}):\n\n",
+                    touching.len()
+                ));
+                for finding in touching.iter().take(render_limit) {
+                    out.push_str(&format!(
+                        "- `{}:{}` [{}] {}\n",
+                        finding.markdown_file.display(),
+                        finding.line,
+                        finding.severity,
+                        finding.message
+                    ));
+                }
+                if touching.len() > render_limit {
+                    out.push_str(&format!(
+                        "- ... truncated, showing first {} of {}\n",
+                        render_limit,
+                        touching.len()
+                    ));
+                }
+            }
+        }
+
+        return out;
     }
 
     // ── path mode ────────────────────────────────────────────────────────────
@@ -19785,6 +20171,228 @@ mod tests {
         assert!(
             !response.contains("support=2, confidence=0.60"),
             "the weaker root1 stats should have been dropped, got: {response}"
+        );
+    }
+
+    // ── mode="change" tests (#899) ──────────────────────────────────────────
+
+    /// Three functions in one file, committed; `two` has a test caller via a
+    /// `Calls` edge from `tests/two_test.rs`. Line numbers match the exact
+    /// committed file content so hunk-intersection can be exercised for real.
+    fn make_change_fixture(tmp: &TempDir) -> (Node, Node, Node, Node, GraphState) {
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        let content = "fn one() {\n    1;\n}\n\nfn two() {\n    2;\n}\n\nfn three() {\n    3;\n}\n";
+        std::fs::write(tmp.path().join("src/lib.rs"), content).unwrap();
+        std::fs::write(
+            tmp.path().join("tests/two_test.rs"),
+            "fn test_two() { two(); }\n",
+        )
+        .unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("src/lib.rs")).unwrap();
+            index.add_path(Path::new("tests/two_test.rs")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+
+        let mut one = make_node("one", NodeKind::Function, "src/lib.rs");
+        one.line_start = 1;
+        one.line_end = 3;
+        let mut two = make_node("two", NodeKind::Function, "src/lib.rs");
+        two.line_start = 5;
+        two.line_end = 7;
+        let mut three = make_node("three", NodeKind::Function, "src/lib.rs");
+        three.line_start = 9;
+        three.line_end = 11;
+        let mut test_two = make_node("test_two", NodeKind::Function, "tests/two_test.rs");
+        test_two.line_start = 1;
+        test_two.line_end = 1;
+
+        let edge = make_edge(&test_two, &two, EdgeKind::Calls);
+        let graph = make_graph_state_with_edges(
+            vec![one.clone(), two.clone(), three.clone(), test_two.clone()],
+            vec![edge],
+        );
+        (one, two, three, test_two, graph)
+    }
+
+    #[tokio::test]
+    async fn change_mode_clean_tree_reports_no_changes() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, _, _, graph) = make_change_fixture(&tmp);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(response.contains("No changes in scope"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn change_mode_rejects_three_dot_scope() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, _, _, graph) = make_change_fixture(&tmp);
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            query: Some("main...HEAD".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(response.contains("three-dot"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn change_mode_hunk_intersects_only_the_touched_function() {
+        let tmp = TempDir::new().unwrap();
+        let (one, two, three, _test_two, graph) = make_change_fixture(&tmp);
+        // Touch only the body of `two` (line 6): "    2;" -> "    22;".
+        let content =
+            "fn one() {\n    1;\n}\n\nfn two() {\n    22;\n}\n\nfn three() {\n    3;\n}\n";
+        std::fs::write(tmp.path().join("src/lib.rs"), content).unwrap();
+
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains(&two.stable_id()),
+            "expected `two` (the touched function) in changed symbols, got: {response}"
+        );
+        assert!(
+            !response.contains(&one.stable_id()),
+            "`one` was not touched by the hunk, got: {response}"
+        );
+        assert!(
+            !response.contains(&three.stable_id()),
+            "`three` was not touched by the hunk, got: {response}"
+        );
+        // `two` has a test caller -- the gap line should report a full pass.
+        assert!(
+            response.contains("Gap:** 0 of 1 changed symbol(s) are reached by no test"),
+            "got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_mode_reports_no_test_gap_count() {
+        let tmp = TempDir::new().unwrap();
+        let (_one, _two, _three, _test_two, graph) = make_change_fixture(&tmp);
+        // Touch both `two` (has a test) and `three` (has none).
+        let content =
+            "fn one() {\n    1;\n}\n\nfn two() {\n    22;\n}\n\nfn three() {\n    33;\n}\n";
+        std::fs::write(tmp.path().join("src/lib.rs"), content).unwrap();
+
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("Gap:** 1 of 2 changed symbol(s) are reached by no test"),
+            "got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_mode_evidence_class_name_based_without_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let (_one, _two, _three, _test_two, graph) = make_change_fixture(&tmp);
+        let content =
+            "fn one() {\n    1;\n}\n\nfn two() {\n    22;\n}\n\nfn three() {\n    3;\n}\n";
+        std::fs::write(tmp.path().join("src/lib.rs"), content).unwrap();
+
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("name-based"),
+            "no Calls coverage evidence set up -- expected name-based label, got: {response}"
+        );
+        assert!(!response.contains("graph-evidenced"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn change_mode_evidence_class_graph_evidenced_with_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let (_one, _two, _three, _test_two, graph) = make_change_fixture(&tmp);
+        let content =
+            "fn one() {\n    1;\n}\n\nfn two() {\n    22;\n}\n\nfn three() {\n    3;\n}\n";
+        std::fs::write(tmp.path().join("src/lib.rs"), content).unwrap();
+
+        let jobs = globally_ready_calls_jobs(tmp.path(), graph.nodes.len(), graph.edges.len());
+        let ctx = SearchContext {
+            enrichment_jobs: jobs,
+            ..make_search_context(&graph, tmp.path())
+        };
+        let params = SearchParams {
+            mode: Some("change".into()),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("graph-evidenced"),
+            "coverage-ready jobs set up -- expected graph-evidenced label, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_mode_co_change_misses_reuses_cochange_gaps_data() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test User").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("src/a.rs")).unwrap();
+            index.add_path(Path::new("src/b.rs")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        // Only a.rs changes -- b.rs (its confident co-change partner) is the
+        // expected gap, same fixture/expectation as `cochange_gaps_mode_*`.
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() { /* changed */ }\n").unwrap();
+
+        let (_, _, graph) = make_cochange_fixture();
+        let ctx = make_search_context(&graph, tmp.path());
+        let params = SearchParams {
+            mode: Some("change".into()),
+            min_confidence: Some(0.5),
+            ..Default::default()
+        };
+        let response = search(&params, &ctx).await;
+        assert!(
+            response.contains("src/b.rs") && response.contains("usually changes with"),
+            "got: {response}"
         );
     }
 }

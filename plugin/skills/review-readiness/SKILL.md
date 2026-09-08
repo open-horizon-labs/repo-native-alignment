@@ -27,6 +27,21 @@ If RNA adds no value for the current diff, say that directly and review from the
 
 ## Procedure
 
+### Step 0: Try the change bundle first
+
+Before manually assembling diff shape and graph context, call
+`search(mode="change", query=<scope>)` (#899): `<scope>` is `"working_tree"`
+(default), `"staged"`, or `"<base>..<head>"` (map `--pr`/`--base`/`--head`
+arguments to the matching two-ref range; three-dot ranges are rejected). This
+one call already composes hunk-intersected changed files/symbols, blast
+radius (labelled graph-evidenced vs. name-based by Calls-coverage readiness),
+tests to run with a no-test gap count, co-change misses, and risk
+(churn/complexity/notes/doc-drift) -- most of Steps 1-3 below in one bounded
+report. Use it as the primary source and fall back to the manual steps only
+for probes it doesn't cover (e.g. reading the actual diff text, `outcome_progress`,
+or drilling into a specific symbol with `mode="neighbors"`/`"impact"`
+directly).
+
 ### Step 1: Get the diff shape
 
 Use the cheapest source that matches the argument:

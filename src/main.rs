@@ -339,6 +339,12 @@ struct SearchArgs {
     /// Minimum co-change confidence (0.0-1.0) for mode=cochange/cochange_gaps (default: 0.3).
     #[arg(long)]
     min_confidence: Option<f64>,
+    /// Diff scope for mode=cochange_gaps/change: "working_tree" (default),
+    /// "staged", or "<base>..<head>". CLI sugar for the positional query
+    /// argument those modes already read the scope from -- set this or pass
+    /// the scope as the positional query, not both.
+    #[arg(long)]
+    scope: Option<String>,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -1519,7 +1525,9 @@ async fn async_main() -> anyhow::Result<()> {
 
             let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
-                query: if args.query.is_empty() {
+                query: if let Some(scope) = args.scope.clone() {
+                    Some(scope)
+                } else if args.query.is_empty() {
                     None
                 } else {
                     Some(args.query.clone())

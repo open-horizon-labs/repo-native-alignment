@@ -336,7 +336,7 @@ pub(crate) fn collect_artifact_notes<'a>(
 /// "no-parallel-cargo-agents")`. Prefers the `rna:` declared kind/id for
 /// local-knowledge nodes, falling back to the `.oh_kind` + frontmatter `id`/
 /// `title` (or file stem) for plain `.oh/` Markdown sections.
-fn note_identity(node: &graph::Node) -> (String, String) {
+pub(crate) fn note_identity(node: &graph::Node) -> (String, String) {
     if let Some(kind) = node.metadata.get("rna.kind") {
         let id = node
             .metadata
@@ -428,7 +428,7 @@ fn first_sentence(body: &str, max_chars: usize) -> String {
 /// exactly the human-written one-liner these artifacts already carry) over
 /// the raw body, which may be list-heavy and not itself sentence-shaped.
 /// Falls through to the body when neither is present.
-fn note_excerpt(node: &graph::Node, max_chars: usize) -> String {
+pub(crate) fn note_excerpt(node: &graph::Node, max_chars: usize) -> String {
     if let Some(statement) = node.metadata.get("frontmatter.statement") {
         return first_sentence(statement, max_chars);
     }
