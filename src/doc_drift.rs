@@ -141,13 +141,44 @@ struct FileCache {
     /// `None` means "checked, does not exist / unreadable"; `Some(n)` is the
     /// line count for a file that exists and was read successfully.
     line_counts: HashMap<PathBuf, Option<usize>>,
+    /// File text, read at most once per file, for the "does the identifier
+    /// appear anywhere in this file" evidence check on symbol findings.
+    contents: HashMap<PathBuf, Option<String>>,
 }
 
 impl FileCache {
     fn new() -> Self {
         Self {
             line_counts: HashMap::new(),
+            contents: HashMap::new(),
         }
+    }
+
+    /// `Some(true)` if `ident` occurs as a whole word anywhere in the file,
+    /// `Some(false)` if the file is readable and it never does, `None` if the
+    /// file cannot be read (cannot verify).
+    fn mentions_identifier(&mut self, absolute: &Path, ident: &str) -> Option<bool> {
+        let text = self
+            .contents
+            .entry(absolute.to_path_buf())
+            .or_insert_with(|| std::fs::read_to_string(absolute).ok())
+            .as_deref()?;
+        let is_ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(ident) {
+            let start = from + pos;
+            let end = start + ident.len();
+            let before_ok = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_ident_char(c));
+            let after_ok = text[end..].chars().next().is_none_or(|c| !is_ident_char(c));
+            if before_ok && after_ok {
+                return Some(true);
+            }
+            from = end;
+        }
+        Some(false)
     }
 
     /// Returns `Some(line_count)` if `absolute` exists and is readable as UTF-8
@@ -189,6 +220,7 @@ enum PathResolution {
 fn resolve_candidate_path(
     path_text: &str,
     home_root: &str,
+    doc_dir: Option<&Path>,
     root_paths: &HashMap<String, PathBuf>,
     cache: &mut FileCache,
 ) -> PathResolution {
@@ -206,14 +238,30 @@ fn resolve_candidate_path(
     }
 
     // The doc's own root takes precedence -- if the file exists there, that's
-    // the intended target regardless of what other roots contain.
+    // the intended target regardless of what other roots contain. Within it,
+    // a path relative to the document's own directory wins over a
+    // root-relative one: `.oh/guardrails/x.md` writing `metis/y.md` means
+    // `.oh/metis/y.md`, the same convention `emit_link_edges` applies to
+    // proper links (live-run false positive otherwise).
     if let Some(home_path) = root_paths.get(home_root) {
-        let candidate = home_path.join(path_text);
-        if cache.exists(&candidate) {
-            return PathResolution::Existing {
-                root: home_root.to_string(),
-                absolute: candidate,
-            };
+        // Lookup chain: the document's directory, then each ancestor, ending
+        // at the root itself. `.oh/guardrails/x.md` writing `metis/y.md` means
+        // `.oh/metis/y.md` (one level up); `docs/a.md` writing `src/x.rs` means
+        // the root-relative path. Nearest hit wins.
+        let mut dirs: Vec<PathBuf> = doc_dir
+            .map(|d| d.ancestors().map(Path::to_path_buf).collect())
+            .unwrap_or_default();
+        if dirs.last().is_none_or(|d| !d.as_os_str().is_empty()) {
+            dirs.push(PathBuf::new());
+        }
+        for dir in dirs {
+            let candidate = home_path.join(&dir).join(path_text);
+            if cache.exists(&candidate) {
+                return PathResolution::Existing {
+                    root: home_root.to_string(),
+                    absolute: candidate,
+                };
+            }
         }
     }
 
@@ -442,8 +490,13 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                 continue;
             }
 
-            let resolution =
-                resolve_candidate_path(path_text, &node.id.root, root_paths, &mut cache);
+            let resolution = resolve_candidate_path(
+                path_text,
+                &node.id.root,
+                node.id.file.parent(),
+                root_paths,
+                &mut cache,
+            );
             let finding_line = node.line_start + line_at(content, ref_start) - 1;
 
             if let Some(line_group) = line_group {
@@ -562,6 +615,19 @@ pub fn run_doc_drift(nodes: &[Node], root_paths: &HashMap<String, PathBuf>) -> D
                 // some other indexed file, the doc may simply be talking about
                 // that one; that is ambiguity, not proof of death.
                 if global_names.contains(leaf) {
+                    report.unresolvable += 1;
+                    continue;
+                }
+                // Not a graph symbol anywhere -- but if the identifier still
+                // occurs in the bound file's text it is a local, a field, or an
+                // external-crate call the doc is describing, not a dead symbol.
+                // Only "absent from the graph AND absent from the file" is
+                // evidence the doc's claim about this file is stale.
+                let bound_abs = root_paths.get(bound_root).map(|b| b.join(bound_file));
+                let mentioned = bound_abs
+                    .as_deref()
+                    .and_then(|abs| cache.mentions_identifier(abs, leaf));
+                if mentioned != Some(false) {
                     report.unresolvable += 1;
                     continue;
                 }
@@ -1102,6 +1168,61 @@ mod tests {
             "{}",
             report.findings[0].message
         );
+    }
+
+    /// Live-run regression: `.oh/guardrails/x.md` referring to `metis/y.md`
+    /// means `.oh/metis/y.md` (relative to an ancestor of the document), not
+    /// `<root>/metis/y.md`.
+    #[test]
+    fn doc_relative_path_resolves_against_document_directory() {
+        let root_dir = tmp_root();
+        write_file(&root_dir, ".oh/metis/y.md", "# y\n");
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let nodes = vec![md_node(
+            "main",
+            ".oh/guardrails/x.md",
+            "Guardrail",
+            "See metis/y.md for the pattern, and metis/missing.md which is gone.",
+            1,
+        )];
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].reference, "metis/missing.md");
+    }
+
+    /// Live-run regression: a local variable or external-crate method named in
+    /// prose near a file path is not a dead symbol if the identifier still
+    /// appears in that file's text.
+    #[test]
+    fn identifier_present_in_file_text_is_unresolvable_not_dead() {
+        let root_dir = tmp_root();
+        write_file(
+            &root_dir,
+            "src/generic.rs",
+            "pub fn collect() { let fn_by_line = 1; node.children_by_field_name(\"x\"); }\n",
+        );
+        let root_paths: HashMap<String, PathBuf> = [("main".to_string(), root_dir.clone())]
+            .into_iter()
+            .collect();
+        let mut nodes = vec![md_node(
+            "main",
+            ".oh/sessions/x.md",
+            "Notes",
+            "In `src/generic.rs`, `fn_by_line` is keyed by `children_by_field_name`; `truly_gone_fn` was removed.",
+            1,
+        )];
+        nodes.push(code_node(
+            "main",
+            "src/generic.rs",
+            "collect",
+            NodeKind::Function,
+        ));
+        let report = run_doc_drift(&nodes, &root_paths);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(report.findings[0].message.contains("`truly_gone_fn`"));
+        assert_eq!(report.unresolvable, 2);
     }
 
     #[test]
