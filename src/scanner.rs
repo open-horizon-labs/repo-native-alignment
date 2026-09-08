@@ -2243,8 +2243,15 @@ mod tests {
         cli2.commit_state().unwrap();
         let after = load_state(root).unwrap();
         assert_eq!(after.file_classifications.len(), 2);
-        assert_eq!(after.file_classifications[&PathBuf::from("src/c.rs")].class, FileClass::Indexed);
-        assert!(!after.file_classifications.contains_key(&PathBuf::from("src/b.rs")));
+        assert_eq!(
+            after.file_classifications[&PathBuf::from("src/c.rs")].class,
+            FileClass::Indexed
+        );
+        assert!(
+            !after
+                .file_classifications
+                .contains_key(&PathBuf::from("src/b.rs"))
+        );
     }
 
     /// #901: a *glob* directory pattern must not match a file whose name happens
