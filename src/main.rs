@@ -1202,10 +1202,14 @@ async fn async_main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             };
-            let persist_succeeded = handler
-                .update_graph_with_scan(&mut graph, Some(scan), enrichment)
+            let (persist_succeeded, file_classifications, deleted_files) = handler
+                .update_graph_with_scan_census(&mut graph, Some(scan), enrichment)
                 .await?;
             if persist_succeeded {
+                // Skipped-file census (#895): merge in the classifications
+                // computed for changed+new files before committing.
+                scanner.apply_file_classifications(file_classifications);
+                scanner.remove_file_classifications(&deleted_files);
                 scanner.commit_state()?;
             }
             let elapsed = t0.elapsed();

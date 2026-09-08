@@ -165,6 +165,40 @@ check "list-roots returns slug" \
 check "list-roots includes primary root type" \
   "repo-native-alignment list-roots --repo $RNA_REPO" "code-project\|primary"
 
+# ── SKIPPED-FILE CENSUS (#895) ────────────────────────────────────────────────
+# `list-roots` must show a `Files:` line whose invariant balances:
+#   N seen = a indexed + b excluded (config) + c git-ignored + d binary
+#            + e no extractor + f extractor errors
+echo "" && echo "--- Skipped-file census (#895) ---"
+check "list-roots shows a Files: census line (#895)" \
+  "repo-native-alignment list-roots --repo $RNA_REPO" "Files: [0-9].* seen = "
+_FILES_LINE=$(repo-native-alignment list-roots --repo "$RNA_REPO" 2>/dev/null | grep -m1 "Files: .* seen = ")
+if [ -z "$_FILES_LINE" ]; then
+  echo "FAIL: Files: census equation balances (#895)"
+  echo "  no Files: line found"
+  FAIL=$((FAIL+1))
+else
+  _CENSUS_BALANCED=$(python3 - "$_FILES_LINE" <<'PY'
+import re, sys
+line = sys.argv[1]
+m = re.search(r"Files:\s*([\d,]+)\s*seen\s*=\s*(.+)$", line)
+if not m:
+    print("no-match")
+    sys.exit()
+total = int(m.group(1).replace(",", ""))
+# The "; N directories pruned ..." note is outside the equation.
+expr = m.group(2).split(";")[0]
+terms = re.findall(r"([\d,]+)\s+[a-zA-Z][\w() .-]*", expr)
+parts_sum = sum(int(t.replace(",", "")) for t in terms)
+print("balanced" if parts_sum == total else f"unbalanced:{parts_sum}!={total}")
+PY
+)
+  check "Files: census equation balances (#895)" \
+    "echo '$_CENSUS_BALANCED'" "balanced"
+fi
+check "search mode=skipped detail view reachable from CLI (#895)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --mode skipped --kind excluded_by_config --limit 3 2>/dev/null" "Skipped-file detail"
+
 # ── SCAN PERFORMANCE ─────────────────────────────────────────────────────────
 echo "" && echo "--- Scan Performance ---"
 SCAN_TIME=$(TIMEFORMAT='%R'; { time repo-native-alignment scan --repo "$RNA_REPO" 2>/dev/null; } 2>&1 | tail -1)

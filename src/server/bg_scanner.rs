@@ -140,7 +140,7 @@ pub(super) async fn update_graph(
     }
 
     // Apply file-level changes per root.
-    for (root_slug, scan, root_path, _scanner) in &mut scan_result.per_root_scans {
+    for (root_slug, scan, root_path, scanner) in &mut scan_result.per_root_scans {
         business_context.retain_repository_files(&mut scan.changed_files);
         business_context.retain_repository_files(&mut scan.new_files);
         business_context.retain_repository_files(&mut scan.deleted_files);
@@ -184,12 +184,19 @@ pub(super) async fn update_graph(
             !files_to_remove.contains(&(e.from.root.clone(), e.from.file.clone()))
                 && !files_to_remove.contains(&(e.to.root.clone(), e.to.file.clone()))
         });
-        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
+        let (mut extraction, enc_stats, classifications) =
+            registry.extract_scan_result_with_census(root_path, scan);
 
         // Merge encoding stats.
         if let Ok(mut stats) = scan_stats.write() {
             stats.merge_encoding_stats(root_slug, &enc_stats);
         }
+
+        // Skipped-file census (#895): merge changed+new classifications and
+        // drop entries for deleted files. Unchanged files keep their prior
+        // classification so the persisted census stays the full population.
+        scanner.apply_file_classifications(classifications);
+        scanner.remove_file_classifications(&scan.deleted_files);
 
         for node in &mut extraction.nodes {
             node.id.root = root_slug.clone();

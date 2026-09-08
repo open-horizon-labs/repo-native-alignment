@@ -4870,9 +4870,8 @@ fn task_proof_pool_positions(lexical_flags: &[bool]) -> BTreeSet<usize> {
         .take(TASK_PROOF_LEXICAL_POOL_LIMIT)
         .map(|(index, _)| index)
         .collect::<BTreeSet<_>>();
-    let supplemental_limit = TASK_GRAPH_CANDIDATE_LIMIT.min(
-        TASK_PROOF_CANDIDATE_POOL_LIMIT.saturating_sub(retained.len()),
-    );
+    let supplemental_limit = TASK_GRAPH_CANDIDATE_LIMIT
+        .min(TASK_PROOF_CANDIDATE_POOL_LIMIT.saturating_sub(retained.len()));
     retained.extend(
         lexical_flags
             .iter()
@@ -10238,6 +10237,28 @@ async fn search_traversal(
     let mode = params.normalized_mode().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
 
+    // ── skipped mode (#895) ──────────────────────────────────────────────────
+    // On-demand detail view for the skipped-file census: which files were
+    // excluded/git-ignored/binary/no-extractor/extractor-error, and why.
+    // `kind` names the class (see `CensusClass::parse`); `limit` bounds how
+    // many example paths are printed per root before "+M more".
+    if mode == "skipped" {
+        let class_str = params.kind.as_deref().unwrap_or("");
+        let Some(class) = crate::service::CensusClass::parse(class_str) else {
+            return format!(
+                "mode=\"skipped\" requires `kind` to be one of: indexed, excluded_by_config, \
+                 git_ignored, binary_skipped, no_extractor, extractor_error (got `{class_str}`)"
+            );
+        };
+        let limit = params.limit.unwrap_or(20).clamp(1, 200);
+        // Resolve census roots from configuration and persisted scan state,
+        // not from graph nodes: a root whose every file is binary, excluded,
+        // or unclaimed has census data and no node, and is exactly the root a
+        // user asks about. An empty set makes the renderer use all roots.
+        let all_roots = std::collections::HashSet::new();
+        return crate::service::render_census_detail(ctx.repo_root, &all_roots, class, limit);
+    }
+
     // ── cycles mode ─────────────────────────────────────────────────────────
     // No entry-point resolution needed: we run tarjan_scc over the full graph.
     // If `node` is provided, return only the ring containing that node.
@@ -10360,19 +10381,20 @@ async fn search_traversal(
             // used as the co-change anchor) or a bare file path selector
             // (checked directly against each root's file anchor).
             let resolved = gs.resolve_node_id(selector);
-            let file_root = gs.node_by_stable_id(&resolved, index_map).map(|n| {
-                (n.id.file.clone(), n.id.root.clone())
-            }).or_else(|| {
-                root_slugs.iter().find_map(|root| {
-                    let candidate = crate::git::cochange::file_anchor_node_id(
-                        root,
-                        Path::new(selector.as_str()),
-                    );
-                    gs.index
-                        .get_node(&candidate.to_stable_id())
-                        .map(|_| (PathBuf::from(selector), root.clone()))
-                })
-            });
+            let file_root = gs
+                .node_by_stable_id(&resolved, index_map)
+                .map(|n| (n.id.file.clone(), n.id.root.clone()))
+                .or_else(|| {
+                    root_slugs.iter().find_map(|root| {
+                        let candidate = crate::git::cochange::file_anchor_node_id(
+                            root,
+                            Path::new(selector.as_str()),
+                        );
+                        gs.index
+                            .get_node(&candidate.to_stable_id())
+                            .map(|_| (PathBuf::from(selector), root.clone()))
+                    })
+                });
             let Some((file, root)) = file_root else {
                 out.push_str(&format!(
                     "`{}`: not found in graph.\n\n",
@@ -10387,16 +10409,13 @@ async fn search_traversal(
             // HashSet dedup instead of scanning `partners` with `.iter().any()` --
             // per the no-linear-scan-on-graph guardrail, membership checks on a
             // growing collection should be O(1), not O(n) per neighbor.
-            let mut seen_partners: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for direction in [
-                petgraph::Direction::Outgoing,
-                petgraph::Direction::Incoming,
-            ] {
-                for neighbor_stable in gs.index.neighbors(
-                    &anchor_stable,
-                    Some(&[EdgeKind::CoChanges]),
-                    direction,
-                ) {
+            let mut seen_partners: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for direction in [petgraph::Direction::Outgoing, petgraph::Direction::Incoming] {
+                for neighbor_stable in
+                    gs.index
+                        .neighbors(&anchor_stable, Some(&[EdgeKind::CoChanges]), direction)
+                {
                     if neighbor_stable == anchor_stable {
                         continue;
                     }
@@ -10483,15 +10502,15 @@ async fn search_traversal(
         let min_confidence = params.min_confidence.unwrap_or(0.3);
         let scope = query.unwrap_or("working_tree");
 
-        let changed_files = match crate::git::cochange::resolve_changed_file_set(
-            ctx.repo_root,
-            scope,
-        ) {
-            Ok(files) => files,
-            Err(e) => {
-                return format!("cochange_gaps: could not resolve changed-file set for `{scope}`: {e}");
-            }
-        };
+        let changed_files =
+            match crate::git::cochange::resolve_changed_file_set(ctx.repo_root, scope) {
+                Ok(files) => files,
+                Err(e) => {
+                    return format!(
+                        "cochange_gaps: could not resolve changed-file set for `{scope}`: {e}"
+                    );
+                }
+            };
         if changed_files.is_empty() {
             return format!("cochange_gaps: no changed files found for scope `{scope}`.");
         }
@@ -10507,17 +10526,12 @@ async fn search_traversal(
                 if gs.index.get_node(&anchor_stable).is_none() {
                     continue;
                 }
-                for direction in [
-                    petgraph::Direction::Outgoing,
-                    petgraph::Direction::Incoming,
-                ] {
-                    for neighbor_stable in gs.index.neighbors(
-                        &anchor_stable,
-                        Some(&[EdgeKind::CoChanges]),
-                        direction,
-                    ) {
-                        let Some(neighbor_node) =
-                            gs.node_by_stable_id(&neighbor_stable, index_map)
+                for direction in [petgraph::Direction::Outgoing, petgraph::Direction::Incoming] {
+                    for neighbor_stable in
+                        gs.index
+                            .neighbors(&anchor_stable, Some(&[EdgeKind::CoChanges]), direction)
+                    {
+                        let Some(neighbor_node) = gs.node_by_stable_id(&neighbor_stable, index_map)
                         else {
                             continue;
                         };
