@@ -21,7 +21,7 @@ If RNA adds no value for the current diff, say that directly and review from the
 `$ARGUMENTS` may identify the change to inspect:
 
 - empty: current working tree diff
-- `--base main`: `main...HEAD`
+- `--base main`: the two-ref range `main..HEAD` (two dots; `search(mode="change")` rejects three-dot ranges)
 - `--base <sha1> --head <sha2>`: explicit range
 - `--pr 660`: GitHub PR diff
 
@@ -31,8 +31,8 @@ If RNA adds no value for the current diff, say that directly and review from the
 
 Before manually assembling diff shape and graph context, call
 `search(mode="change", query=<scope>)` (#899): `<scope>` is `"working_tree"`
-(default), `"staged"`, or `"<base>..<head>"` (map `--pr`/`--base`/`--head`
-arguments to the matching two-ref range; three-dot ranges are rejected). This
+(default), `"staged"`, or `"<base>..<head>"` (map `--base X` to `X..HEAD`,
+`--base X --head Y` to `X..Y`, and `--pr N` to `<pr-base-sha>..<pr-head-sha>`; always the two-dot form -- three-dot ranges are rejected). This
 one call already composes hunk-intersected changed files/symbols, blast
 radius (labelled graph-evidenced vs. name-based by Calls-coverage readiness),
 tests to run with a no-test gap count, co-change misses, and risk

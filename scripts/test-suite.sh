@@ -1007,10 +1007,22 @@ else
   echo "SKIP: change mode hunk-intersection probe ($_CHANGE_PROBE_FILE has local modifications)"
   SKIP=$((SKIP+1))
 fi
-check "change: clean tree reports an explicit no-changes message (#899)" \
-  "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope working_tree 2>/dev/null" "No changes in scope\|Change bundle"
+# Only meaningful on a clean tree (CI); a developer's local edits are real
+# changes, so skip rather than report a false failure.
+if [ -z "$(git -C "$RNA_REPO" status --porcelain 2>/dev/null)" ]; then
+  check "change: clean tree reports an explicit no-changes message (#899)" \
+    "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope working_tree 2>/dev/null" "No changes in scope -- clean working tree"
+else
+  echo "SKIP: change: clean tree reports an explicit no-changes message (#899) (working tree has local modifications)"
+  SKIP=$((SKIP+1))
+fi
 check "change: three-dot scope is rejected with the shared cochange_gaps message (#899)" \
-  "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope 'main...HEAD' 2>/dev/null" "three-dot"
+  "repo-native-alignment search '' --repo $RNA_REPO --mode change --scope 'main...HEAD' 2>/dev/null" "three-dot symmetric-difference ranges ('main...HEAD') are not supported"
+# --scope is only meaningful for change/cochange_gaps and must not silently
+# replace a positional query for other modes.
+_scope_misuse=$(repo-native-alignment search 'foo' --repo "$RNA_REPO" --mode neighbors --scope staged 2>&1 >/dev/null || true)
+check "change: --scope is rejected for modes that do not take a diff scope (#899)" \
+  "echo \"\$_scope_misuse\"" "only valid with --mode change or --mode cochange_gaps"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="

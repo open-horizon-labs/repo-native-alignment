@@ -10702,9 +10702,24 @@ async fn search_traversal(
             }
 
             for root in &root_slugs {
-                let Some(nodes) = nodes_by_root_file.get(&(root.clone(), path.clone())) else {
-                    continue;
-                };
+                let mut nodes: &[&Node] = nodes_by_root_file
+                    .get(&(root.clone(), path.clone()))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                // Before a rescan the graph still holds a renamed/copied file
+                // under its old path; fall back to it so the change is not
+                // silently empty (no symbols -> no blast radius, tests, risk).
+                if nodes.is_empty()
+                    && matches!(
+                        entry.kind,
+                        crate::git::cochange::ChangeFileKind::Renamed
+                            | crate::git::cochange::ChangeFileKind::Copied
+                    )
+                    && let Some(old) = &entry.old_path
+                    && let Some(v) = nodes_by_root_file.get(&(root.clone(), old.clone()))
+                {
+                    nodes = v.as_slice();
+                }
                 for node in nodes.iter().copied() {
                     if entry.is_deleted() {
                         deleted_symbols.push(node);
@@ -10963,10 +10978,13 @@ async fn search_traversal(
                 .findings
                 .iter()
                 .filter(|f| {
-                    changed_paths.iter().any(|p| {
-                        let p_str = p.display().to_string();
-                        f.reference.contains(&p_str) || f.message.contains(&p_str)
-                    })
+                    // The finding lives in a changed markdown file, or points
+                    // into a changed file.
+                    changed_paths.contains(&f.markdown_file)
+                        || changed_paths.iter().any(|p| {
+                            let p_str = p.display().to_string();
+                            f.reference.contains(&p_str) || f.message.contains(&p_str)
+                        })
                 })
                 .collect();
             if touching.is_empty() {

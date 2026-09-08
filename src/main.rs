@@ -1523,6 +1523,23 @@ async fn async_main() -> anyhow::Result<()> {
                 anyhow::bail!("--include-body requires --node or --nodes");
             }
 
+            if let Some(scope) = args.scope.as_deref() {
+                let takes_scope =
+                    matches!(args.mode.as_deref(), Some("change") | Some("cochange_gaps"));
+                if !takes_scope {
+                    anyhow::bail!(
+                        "--scope is only valid with --mode change or --mode cochange_gaps (got --mode {})",
+                        args.mode.as_deref().unwrap_or("<none>")
+                    );
+                }
+                if !args.query.trim().is_empty() {
+                    anyhow::bail!(
+                        "pass the diff scope either as --scope or as the positional query, not both (got --scope {scope:?} and query {:?})",
+                        args.query
+                    );
+                }
+            }
+
             let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
                 query: if let Some(scope) = args.scope.clone() {
